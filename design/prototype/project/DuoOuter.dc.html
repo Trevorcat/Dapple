@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Dapple iPhone Duo 外屏</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="width: 466px; height: 678px">
+<dc-import name="Main" device="duoOuter" dark="{{dark}}" start-with-onboarding="{{onboard}}" scenario="{{scenario}}" hint-size="466px,678px"></dc-import>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"dark":{"editor":"boolean","default":false,"section":"预览"},"startWithOnboarding":{"editor":"boolean","default":false,"section":"预览"},"scenario":{"editor":"enum","options":["normal","disconnected","transferFailed","empty","mergeFailed"],"default":"normal","section":"演示状态"},"$preview":{"width":466,"height":678}}'>
+const isTrue = (v) => v === true || v === 'true';
+class Component extends DCLogic {
+  renderVals() {
+    return { dark: isTrue(this.props.dark), onboard: isTrue(this.props.startWithOnboarding), scenario: this.props.scenario || 'normal' };
+  }
+}
+</script>
+</body>
+</html>

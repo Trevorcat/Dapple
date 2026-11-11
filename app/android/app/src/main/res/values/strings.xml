@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="ftp_channel">相机无线接收</string>
+    <string name="ftp_title">相机无线接收</string>
+    <string name="ftp_waiting">等待相机连接 · 端口 %1$d</string>
+    <string name="ftp_receiving">正在接收 %1$s</string>
+    <string name="ftp_received">已接收 %1$d 张</string>
+    <string name="ftp_stop">停止</string>
+</resources>

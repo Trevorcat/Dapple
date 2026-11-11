@@ -1,0 +1,174 @@
+import 'package:dapple/state/app_state.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'support/harness.dart';
+
+Future<AppState> _open(WidgetTester tester,
+    {DemoScenario sc = DemoScenario.normal, Size size = phoneSize, bool dark = false}) async {
+  useWindow(tester, size);
+  final app = AppState.demo(scenario: sc);
+  await pumpDapple(tester, app, dark: dark);
+  return app;
+}
+
+const _t = Duration(milliseconds: 100);
+
+void main() {
+  testWidgets('home normal: connection card, groups, tiles', (tester) async {
+    final app = await _open(tester);
+    expect(find.text('照片'), findsWidgets);
+    expect(find.text('Sony α7R V · 已连接'), findsOneWidget);
+    expect(find.textContaining('正在接收第'), findsOneWidget);
+    expect(find.text('今天 · 外滩'), findsOneWidget);
+    expect(find.textContaining('接收中 50%'), findsOneWidget);
+    expect(app.groups.length, 2);
+    await shot(tester, 'home_phone');
+  });
+
+  testWidgets('no camera source: card does not name a camera, group says 手机相册', (tester) async {
+    useWindow(tester, phoneSize);
+    final app = AppState.demo();
+    app.cameraSource = false;
+    for (final p in app.photos) {
+      p.place = null;
+    }
+    await pumpDapple(tester, app);
+    expect(find.textContaining('Sony'), findsNothing);
+    expect(find.text('未连接相机'), findsOneWidget);
+    expect(find.text('连接相机'), findsWidgets);
+    expect(find.textContaining('手机相册'), findsWidgets);
+  });
+
+  testWidgets('long press selects, count shown, select bar enabled', (tester) async {
+    final app = await _open(tester);
+    final done = app.photos.firstWhere((p) => p.status.name == 'done' && p.kind.name == 'photo');
+    await tester.longPress(find.byKey(ValueKey('tile-${done.id}')));
+    await tester.pump(_t);
+    expect(find.text('已选 1 张'), findsOneWidget);
+    expect(app.selectMode, isTrue);
+    expect(find.byKey(const ValueKey('select-bar')), findsOneWidget);
+    expect(find.byKey(const ValueKey('nav-bar')), findsNothing);
+    final second =
+        app.photos.where((p) => p.status.name == 'done' && p.kind.name == 'photo' && p.id != done.id).first;
+    await tester.tap(find.byKey(ValueKey('tile-${second.id}')));
+    await tester.pump(_t);
+    expect(find.text('已选 2 张'), findsOneWidget);
+    await shot(tester, 'home_phone_select');
+    // 合成 with 2 selected opens the sheet
+    await tester.tap(find.byKey(const ValueKey('sel-compose')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('合成 2 张'), findsOneWidget);
+    await tester.tapAt(const Offset(20, 20)); // scrim dismisses the sheet
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+    // select all in the first group
+    await tester.tap(find.text('全选').first);
+    await tester.pump(_t);
+    expect(find.text('取消全选'), findsWidgets);
+    // 发布 -> publish sheet (opened by fork C's page)
+    await tester.tap(find.byKey(const ValueKey('sel-publish')));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.byKey(const ValueKey('publish-title')), findsOneWidget);
+    app.exitSelect();
+    await tester.pump(_t);
+    expect(find.byKey(const ValueKey('nav-bar')), findsOneWidget);
+  });
+
+  testWidgets('new pill appears when a photo arrives while frozen', (tester) async {
+    final app = await _open(tester);
+    expect(find.byKey(const ValueKey('new-pill')), findsNothing);
+    app.setFrozen(true);
+    app.simulateArrival(2);
+    await tester.pump(_t);
+    expect(find.text('新到 1 张'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('new-pill')));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(app.newCount, 0);
+    expect(find.byKey(const ValueKey('new-pill')), findsNothing);
+  });
+
+  testWidgets('empty scenario', (tester) async {
+    final app = await _open(tester, sc: DemoScenario.empty);
+    expect(find.text('还没有照片'), findsOneWidget);
+    expect(find.text('Sony α7R V · 未连接'), findsOneWidget);
+    expect(find.byKey(const ValueKey('select-toggle')), findsNothing);
+    await shot(tester, 'home_phone_empty');
+    await tester.tap(find.byKey(const ValueKey('empty-connect')));
+    await tester.pump(_t);
+    expect(app.toast?.message, '已连接');
+  });
+
+  testWidgets('disconnected scenario', (tester) async {
+    final app = await _open(tester, sc: DemoScenario.disconnected);
+    expect(find.text('Sony α7R V · 已断开'), findsOneWidget);
+    expect(find.text('重新连接'), findsOneWidget);
+    await shot(tester, 'home_phone_disconnected');
+    await tester.tap(find.byKey(const ValueKey('conn-action')));
+    await tester.pump(_t);
+    expect(app.linkDown, isFalse);
+  });
+
+  testWidgets('transfer failed scenario', (tester) async {
+    final app = await _open(tester, sc: DemoScenario.transferFailed);
+    expect(find.text('1 张传输中断'), findsOneWidget);
+    expect(find.text('传输中断'), findsOneWidget);
+    await shot(tester, 'home_phone_failed');
+    await tester.tap(find.byKey(const ValueKey('conn-action')));
+    await tester.pump(_t);
+    expect(app.interruptedCount, 0);
+  });
+
+  testWidgets('tabs, styles default, settings toggles', (tester) async {
+    final app = await _open(tester);
+    await tester.tap(find.byKey(const ValueKey('nav-1')));
+    await tester.pump(_t);
+    expect(app.tab, 1);
+    expect(find.text('新照片默认使用'), findsOneWidget);
+    await shot(tester, 'styles_phone');
+    await tester.tap(find.byKey(const ValueKey('look-warm')));
+    await tester.pump(_t);
+    expect(app.settings.defaultLookId, 'warm');
+    expect(find.text('新照片默认使用「暖阳」'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('toast-action')));
+    await tester.pump(_t);
+    expect(app.settings.defaultLookId, 'std');
+
+    await tester.tap(find.byKey(const ValueKey('nav-2')));
+    await tester.pump(_t);
+    expect(find.text('先按明暗轻微增强，再套用默认风格'), findsOneWidget);
+    await shot(tester, 'settings_phone');
+    await tester.tap(find.byKey(const ValueKey('sw-auto')));
+    await tester.pump(_t);
+    expect(app.settings.autoProcess, isFalse);
+    await tester.tap(find.byKey(const ValueKey('sw-strip')));
+    await tester.pump(_t);
+    expect(app.settings.stripLocation, isFalse);
+    await tester.tap(find.byKey(const ValueKey('export-size')));
+    await tester.pump(_t);
+    expect(app.settings.exportLongEdge, 3840);
+    await tester.tap(find.byKey(const ValueKey('presets')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(find.text('小红书'), findsOneWidget);
+  });
+
+  testWidgets('dark phone', (tester) async {
+    await _open(tester, dark: true);
+    await shot(tester, 'home_phone_dark');
+  });
+
+  testWidgets('fold: rail + full-width grid, light and dark', (tester) async {
+    await _open(tester, size: foldSize);
+    expect(find.byKey(const ValueKey('nav-rail')), findsOneWidget);
+    expect(find.byKey(const ValueKey('nav-bar')), findsNothing);
+    await shot(tester, 'home_fold_browse');
+  });
+
+  testWidgets('fold dark', (tester) async {
+    await _open(tester, size: foldSize, dark: true);
+    await shot(tester, 'home_fold_dark');
+  });
+}

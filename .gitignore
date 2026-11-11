@@ -1,0 +1,19 @@
+/tools/
+/build*/
+/out/
+/.cache/
+/.vs/
+/.vscode/
+/.idea/
+compile_commands.json
+
+# local test material / renders
+/samples/
+*.ARW
+*.arw
+*.RAF
+*.raf
+/renders/
+
+# generated prototype screenshots
+/design/prototype/shots/

@@ -1,0 +1,52 @@
+#include "dapple/developer.h"
+#include "file_util.h"
+
+#include <chrono>
+
+#include "dapple/renderer.h"
+
+namespace dapple {
+
+namespace {
+double msSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+}  // namespace
+
+Developer::Developer() : Developer(CameraRegistry::withBuiltins()) {}
+
+Developer::Developer(CameraRegistry cameras)
+    : cameras_(std::move(cameras)), decoders_(DecoderRegistry::withBuiltins()) {}
+
+Result<DevelopResult> Developer::develop(const DevelopRequest& req) const {
+  const ImageDecoder* decoder = decoders_.find(req.input);
+  if (!decoder) return fail("Unsupported file type: " + pathToUtf8(req.input));
+
+  DevelopResult result;
+  auto t0 = std::chrono::steady_clock::now();
+  auto source = decoder->decode(req.input, DecodeOptions{req.quality});
+  if (!source) return std::unexpected(source.error());
+  result.timings.decodeMs = msSince(t0);
+
+  // Downscale before rendering: the output never needs more pixels.
+  if (req.longEdge > 0) source->linear = resizeToLongEdge(source->linear, req.longEdge);
+
+  result.meta = source->meta;
+  result.camera = &cameras_.resolve(source->meta.make, source->meta.model);
+
+  result.applied = req.look;
+  if (req.autoAdjust) {
+    t0 = std::chrono::steady_clock::now();
+    result.autoResult = computeAutoAdjust(*source, *result.camera, *req.autoAdjust);
+    result.applied += result.autoResult->correction;
+    result.timings.analyzeMs = msSince(t0);
+  }
+
+  t0 = std::chrono::steady_clock::now();
+  Renderer renderer(result.applied, *result.camera, req.lut);
+  result.image = renderer.render(*source);
+  result.timings.renderMs = msSince(t0);
+  return result;
+}
+
+}  // namespace dapple
