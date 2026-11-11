@@ -189,6 +189,8 @@ class AppState extends ChangeNotifier {
       return ConnState.interrupted;
     }
     if (!cameraSource) return ConnState.idle;
+    // FTP receiver on but no camera talking to it yet: waiting, not connected.
+    if (!isDemo && ftpRunning && ftpClients == 0 && arrivingCount == 0) return ConnState.idle;
     return ConnState.connected;
   }
 
@@ -210,6 +212,7 @@ class AppState extends ChangeNotifier {
       case ConnState.disconnected:
         return '${cameraName.isEmpty ? '手机相册' : cameraName} · 已断开';
       case ConnState.idle:
+        if (!isDemo && ftpRunning) return '相机无线接收 · 等待相机';
         return cameraSource ? '$cameraName · 未连接' : '未连接相机';
       default:
         return '$cameraName · 已连接';
@@ -221,6 +224,7 @@ class AppState extends ChangeNotifier {
       case ConnState.disconnected:
         return '最后收到第 ${_photos.length} 张';
       case ConnState.idle:
+        if (!isDemo && ftpRunning) return ftpAddressText ?? '未连接 Wi-Fi 或热点';
         return cameraSource || _photos.isEmpty ? '没有新照片' : '照片来自手机相册 · ${_photos.length} 张';
       case ConnState.interrupted:
         return '$interruptedCount 张传输中断';
@@ -245,6 +249,7 @@ class AppState extends ChangeNotifier {
       case ConnState.disconnected:
         return '重新连接';
       case ConnState.idle:
+        if (!isDemo && ftpRunning) return null;
         return cameraSource ? '连接' : '连接相机';
       case ConnState.connected:
         return null;

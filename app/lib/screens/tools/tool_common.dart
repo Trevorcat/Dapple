@@ -37,11 +37,14 @@ class ToolScaffold extends StatelessWidget {
             const SizedBox(width: 72),
           ]),
         ),
-        Expanded(child: body),
+        Expanded(child: Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 640), child: body))),
         Container(
           decoration: BoxDecoration(border: Border(top: BorderSide(color: c.sep))),
           padding: EdgeInsets.fromLTRB(Sp.l, Sp.m, Sp.l, Sp.m + bottom),
-          child: KeyedSubtree(key: const ValueKey('tool-main'), child: PrimaryButton(mainLabel, onPressed: onMain)),
+          child: Center(
+              child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 640),
+                  child: KeyedSubtree(key: const ValueKey('tool-main'), child: PrimaryButton(mainLabel, onPressed: onMain)))),
         ),
       ]),
     );

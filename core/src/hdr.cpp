@@ -557,7 +557,7 @@ Result<HdrResult> mergeEngine(int count, int baseIdx, const std::vector<std::str
       parallelRows(im.height, [&](int y) {
         const float* s = im.row(y);
         float* d = m.ptr<float>(y);
-        for (int i = 0; i < im.width * 3; ++i) d[i] = std::pow(std::clamp(s[i], 0.f, 1.f), 1.f / 2.2f);
+        for (int i = 0; i < im.width * 3; ++i) d[i] = 255.f * std::pow(std::clamp(s[i], 0.f, 1.f), 1.f / 2.2f);  // OpenCV's Mertens divides every depth by 255
       });
       return m;
     };

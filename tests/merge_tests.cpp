@@ -541,6 +541,12 @@ void testHdrJpegFusionAndErrors() {
     CHECK(!r->image.sceneReferred);
     CHECK(r->report.exposureFusion);
     saveGamma(r->image.linear, outDir() / "hdr_jpeg_fusion.jpg", 1.f, 1000);
+    // regression: OpenCV's Mertens divides every input by 255, so unscaled float input came out black
+    double sum = 0;
+    for (float v : r->image.linear.data) sum += v;
+    const double mean = sum / double(r->image.linear.data.size());
+    std::printf("    fusion mean value %.3f\n", mean);
+    CHECK(mean > 0.05);
   }
   // errors, not crashes
   CHECK(!mergeHdr({fromUtf8("nope1.arw")}, HdrOptions{}).has_value());

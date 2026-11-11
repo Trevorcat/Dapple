@@ -193,14 +193,17 @@ class _SettingsPageState extends State<SettingsPage> {
           ConnState.idle => '未连接',
         };
         final act = app.connAction;
-        if (!app.cameraSource) {
+        if (!app.isDemo) {
           return [
             _row(context, '手机相册',
                 sub: app.mediaPermitted ? '当前照片来源' : '未允许访问照片',
                 leading: Dot(app.mediaPermitted ? c.okIcon : c.track),
                 trailing: app.mediaPermitted ? null : ActionChip32('允许访问', onPressed: () => app.connectAction())),
-            // TODO(cameras): camera pairing / wireless receive is not implemented yet (requirements 4.13).
-            _row(context, '连接相机…', key: 'add-camera', sub: '未连接', onTap: () => app.connectAction()),
+            _row(context, '相机无线接收',
+                key: 'add-camera',
+                sub: app.ftpRunning ? (app.ftpClients > 0 ? '相机已连接' : '已开启 · 等待相机') : '未开启',
+                leading: Dot(app.ftpRunning ? (app.ftpClients > 0 ? c.okIcon : c.accent) : c.track),
+                trailing: null),
           ];
         }
         return [
@@ -209,10 +212,9 @@ class _SettingsPageState extends State<SettingsPage> {
               leading: Dot(dot),
               trailing: act == null ? null : ActionChip32(act, onPressed: () => app.connectAction())),
           _row(context, 'Fujifilm X-T50', sub: '未连接', leading: Dot(c.track)),
-          // TODO(cameras): add-camera flow is open in the requirements (4.13).
           _row(context, '添加相机…', key: 'add-camera', onTap: () => app.showToast('待实现')),
         ];
-      case 1:
+            case 1:
         return _ftpSection(context);
       case 2:
         return [
