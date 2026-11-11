@@ -322,7 +322,7 @@ class _EditorPageState extends State<EditorPage> {
     final mq = MediaQuery.of(context);
     final H = cons.maxHeight;
     final topH = mq.padding.top + 48;
-    final small = H * 0.45, big = H * 0.75;
+    final small = H * 0.45, big = H * 0.62;
     final target = focus ? 0.0 : (dragH ?? (largeSheet ? big : small));
     final p = ph;
     final list = app.editable;

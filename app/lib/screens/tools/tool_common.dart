@@ -31,11 +31,17 @@ class ToolScaffold extends StatelessWidget {
         Container(
           height: top + 56,
           padding: EdgeInsets.only(top: top, left: 4, right: 4),
-          child: Row(children: [
-            SizedBox(width: 72, child: Align(alignment: Alignment.centerLeft, child: TextAction('取消', size: 17, onPressed: onCancel))),
-            Expanded(child: Text(title, textAlign: TextAlign.center, style: T.body17(c.text, w: FontWeight.w600))),
-            const SizedBox(width: 72),
-          ]),
+          child: Row(children: Theme.of(context).platform == TargetPlatform.android
+              ? [
+                  IconButton(tooltip: '关闭', icon: const Icon(Icons.close), color: c.text, onPressed: onCancel),
+                  const SizedBox(width: 4),
+                  Expanded(child: Text(title, style: T.h2(c.text))),
+                ]
+              : [
+                  SizedBox(width: 72, child: Align(alignment: Alignment.centerLeft, child: TextAction('取消', size: 17, onPressed: onCancel))),
+                  Expanded(child: Text(title, textAlign: TextAlign.center, style: T.body17(c.text, w: FontWeight.w600))),
+                  const SizedBox(width: 72),
+                ]),
         ),
         Expanded(child: Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 640), child: body))),
         Container(

@@ -376,7 +376,11 @@ class _VideoList extends StatelessWidget {
             const SizedBox(width: 4),
             SizedBox(
                 width: 80,
-                child: Align(alignment: Alignment.centerLeft, child: TextAction('取消', size: 17, onPressed: () => Navigator.of(context).pop()))),
+                child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Theme.of(context).platform == TargetPlatform.android
+                        ? IconButton(tooltip: '关闭', icon: const Icon(Icons.close), color: c.text, onPressed: () => Navigator.of(context).pop())
+                        : TextAction('取消', size: 17, onPressed: () => Navigator.of(context).pop()))),
             Expanded(child: Text('选择视频', textAlign: TextAlign.center, style: T.body17(c.text, w: FontWeight.w600))),
             const SizedBox(width: 84),
           ])),

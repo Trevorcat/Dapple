@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../services/tool_models.dart';
@@ -28,6 +30,12 @@ class _ToolProgressDialog extends StatefulWidget {
 
 class _ToolProgressDialogState extends State<_ToolProgressDialog> {
   bool _popped = false;
+  // Some stages (e.g. exposure fusion) are a single native call with no progress inside.
+  // When the fraction has not moved for a while, show an indeterminate bar instead of a frozen number.
+  double _lastFrac = -1;
+  DateTime _lastChange = DateTime.now();
+  bool _stalled = false;
+  Timer? _stallTimer;
 
   void _pop(ToolDialogResult r) {
     if (_popped || !mounted) return;
@@ -39,6 +47,16 @@ class _ToolProgressDialogState extends State<_ToolProgressDialog> {
   void initState() {
     super.initState();
     widget.job.addListener(_onJob);
+    _stallTimer = Timer.periodic(const Duration(milliseconds: 400), (_) {
+      final f = widget.job.fraction;
+      final now = DateTime.now();
+      if (f != _lastFrac) {
+        _lastFrac = f;
+        _lastChange = now;
+      }
+      final st = now.difference(_lastChange) > const Duration(milliseconds: 1500);
+      if (st != _stalled && mounted) setState(() => _stalled = st);
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) => _onJob());
   }
 
@@ -50,6 +68,7 @@ class _ToolProgressDialogState extends State<_ToolProgressDialog> {
 
   @override
   void dispose() {
+    _stallTimer?.cancel();
     widget.job.removeListener(_onJob);
     super.dispose();
   }
@@ -86,7 +105,13 @@ class _ToolProgressDialogState extends State<_ToolProgressDialog> {
                   Text('${j.stepLine} · ${j.step}', key: const ValueKey('tool-dialog-step'), style: T.body(c.text2)),
                   const SizedBox(height: Sp.m),
                   Semantics(
-                      label: '${j.percent}%', value: '${j.percent}', child: DProgress(j.fraction, height: 6)),
+                      label: _stalled ? j.step : '${j.percent}%',
+                      value: _stalled ? null : '${j.percent}',
+                      child: _stalled
+                          ? ClipRRect(
+                              borderRadius: BorderRadius.circular(3),
+                              child: LinearProgressIndicator(minHeight: 6, color: c.accent, backgroundColor: c.track))
+                          : DProgress(j.fraction, height: 6)),
                   const SizedBox(height: Sp.s),
                   Align(
                       alignment: Alignment.centerRight,

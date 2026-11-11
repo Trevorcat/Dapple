@@ -88,7 +88,10 @@ class _PickSheetState extends State<_PickSheet> {
               child: Align(
                   alignment: Alignment.centerLeft,
                   child: KeyedSubtree(
-                      key: const ValueKey('pick-cancel'), child: TextAction('取消', size: 17, onPressed: () => Navigator.of(context).pop(false))))),
+                      key: const ValueKey('pick-cancel'),
+                      child: Theme.of(context).platform == TargetPlatform.android
+                          ? IconButton(tooltip: '取消', icon: const Icon(Icons.close), color: c.text, onPressed: () => Navigator.of(context).pop(false))
+                          : TextAction('取消', size: 17, onPressed: () => Navigator.of(context).pop(false))))),
           Expanded(
               child: Text('已选 ${_sel.length} 张',
                   key: const ValueKey('pick-title'), textAlign: TextAlign.center, style: T.body17(c.text, w: FontWeight.w600))),

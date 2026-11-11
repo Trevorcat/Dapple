@@ -211,7 +211,6 @@ class _SettingsPageState extends State<SettingsPage> {
               sub: line,
               leading: Dot(dot),
               trailing: act == null ? null : ActionChip32(act, onPressed: () => app.connectAction())),
-          _row(context, 'Fujifilm X-T50', sub: '未连接', leading: Dot(c.track)),
           _row(context, '添加相机…', key: 'add-camera', onTap: () => app.showToast('待实现')),
         ];
             case 1:
