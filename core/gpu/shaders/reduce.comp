@@ -1,0 +1,58 @@
+#version 450
+// Global statistics for dehaze, without atomics (deterministic): the airlight is the mean colour of the low-resolution
+// pixels whose dark channel is within 4 % of the maximum (spatial.cpp dehazeImage).
+//   MODE 0: per-group maximum of the dark channel          -> part[group]
+//   MODE 1: one group, maximum of the partials             -> g[0]
+//   MODE 2: per-group colour sums of the bright pixels     -> part[4 * group + 0..3] (r, g, b, count)
+//   MODE 3: one group, airlight = clamp(mean, 0.7, 1)      -> g[4..6], g[7] = min of them
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int MODE = 0;
+const int PER_THREAD = 16;
+
+layout(std140, binding = 0) uniform P { ivec4 s; } u;  // w, h, groups, 0
+layout(binding = 1) uniform sampler2D uDc;  // texture path (texelFetch): imageLoad is several times slower on Adreno
+layout(binding = 2) uniform sampler2D uCol;
+layout(binding = 3, std430) buffer G { float g[]; };
+layout(binding = 4, std430) buffer Part { float part[]; };
+shared vec4 sh[256];
+
+void main() {
+  const uint t = gl_LocalInvocationID.x;
+  const int n = u.s.x * u.s.y;
+  vec4 acc = vec4(0.0);
+  if (MODE == 0 || MODE == 2) {
+    const int base = int(gl_WorkGroupID.x) * 256 * PER_THREAD;
+    const float thr = 0.96 * g[0];
+    for (int k = 0; k < PER_THREAD; ++k) {
+      const int i = base + k * 256 + int(t);
+      if (i >= n) break;
+      const ivec2 p = ivec2(i % u.s.x, i / u.s.x);
+      const float dc = texelFetch(uDc, p, 0).r;
+      if (MODE == 0) acc.x = max(acc.x, dc);
+      else if (dc >= thr) acc += vec4(texelFetch(uCol, p, 0).rgb, 1.0);
+    }
+  } else if (MODE == 1) {
+    for (int i = int(t); i < u.s.z; i += 256) acc.x = max(acc.x, part[i]);
+  } else {
+    for (int i = int(t); i < u.s.z; i += 256) acc += vec4(part[4 * i], part[4 * i + 1], part[4 * i + 2], part[4 * i + 3]);
+  }
+  sh[t] = acc;
+  barrier();
+  for (uint s = 128; s > 0; s >>= 1) {
+    if (t < s) sh[t] = (MODE <= 1) ? vec4(max(sh[t].x, sh[t + s].x), 0.0, 0.0, 0.0) : sh[t] + sh[t + s];
+    barrier();
+  }
+  if (t == 0) {
+    const vec4 r = sh[0];
+    if (MODE == 0) part[gl_WorkGroupID.x] = r.x;
+    else if (MODE == 1) g[0] = r.x;
+    else if (MODE == 2) {
+      const uint o = 4 * gl_WorkGroupID.x;
+      part[o] = r.x; part[o + 1] = r.y; part[o + 2] = r.z; part[o + 3] = r.w;
+    } else {
+      const vec3 A = clamp(r.w > 0.0 ? r.xyz / r.w : vec3(1.0), vec3(0.7), vec3(1.0));
+      g[4] = A.x; g[5] = A.y; g[6] = A.z;
+      g[7] = min(A.x, min(A.y, A.z));
+    }
+  }
+}

@@ -1,0 +1,134 @@
+#version 450
+// Fused point-wise pass: geometry resampling (rotate/straighten/crop/flip, Catmull-Rom or exact index mapping)
+// -> white balance * exposure gain -> tone table (luminance ratio, indexed by float bits) -> baked colour lattice
+// (tetrahedral, sqrt-domain nodes; a coarse second lattice takes the pixels beyond the first one's range, where the CPU
+// takes its exact path) -> vignette -> RGBA16F working image (and RGBA8 + grain when it is the last pass).
+// Mirrors Renderer::renderBakedImpl + LutSampler (core/src/renderer.cpp).
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+layout(constant_id = 0) const int GEO = 0;  // 0 identity (output pixel = source pixel), 1 exact index mapping, 2 Catmull-Rom
+
+layout(std140, binding = 0) uniform P {
+  vec4 gain;
+  ivec4 a;      // srcW, srcH (full source space), dW, dH
+  ivec4 b;      // bound source image origin x, y; origin of this working image in the picture x, y
+  vec4 geoA;    // cs, sn, fw, fh
+  vec4 geoB;    // ox0, oy0, stepX, stepY
+  vec4 geoC;    // fullW, fullH, vignette, 0
+  ivec4 c;      // rot, flip, latN, toneN
+  ivec4 d;      // toneBase, lat2N, 0, 0
+  vec4 e;       // bakeMax, bake2Max, grain amp, grain period
+} u;
+
+layout(binding = 1) uniform sampler2D uSrc;  // texture path: imageLoad is several times slower on Adreno
+layout(binding = 2, std430) readonly buffer Tone { float tone[]; };
+layout(binding = 3) uniform sampler3D uLut;
+layout(binding = 4) uniform sampler3D uLut2;
+layout(binding = 5, rgba16f) uniform writeonly image2D uD;
+layout(binding = 6, rgba8) uniform writeonly image2D uOut8;
+
+vec3 srcAt(int x, int y) {
+  return texelFetch(uSrc, ivec2(clamp(x, 0, u.a.x - 1), clamp(y, 0, u.a.y - 1)) - u.b.xy, 0).rgb;
+}
+void cubicW(float t, out float w[4]) {
+  const float t2 = t * t, t3 = t2 * t;
+  w[0] = -0.5 * t3 + t2 - 0.5 * t;
+  w[1] = 1.5 * t3 - 2.5 * t2 + 1.0;
+  w[2] = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
+  w[3] = 0.5 * t3 - 0.5 * t2;
+}
+vec3 sampleCubic(float x, float y) {
+  x -= 0.5;
+  y -= 0.5;
+  const float fxl = floor(x), fyl = floor(y);
+  const int ix = int(fxl), iy = int(fyl);
+  float wx[4], wy[4];
+  cubicW(x - fxl, wx);
+  cubicW(y - fyl, wy);
+  vec3 o = vec3(0.0);
+  for (int j = 0; j < 4; ++j) {
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < 4; ++i) acc += wx[i] * srcAt(ix - 1 + i, iy - 1 + j);
+    o += wy[j] * acc;
+  }
+  return max(o, vec3(0.0));
+}
+
+vec3 tetra(sampler3D s, vec3 x) {
+  const ivec3 i = ivec3(x);
+  const vec3 f = x - vec3(i);
+  const bool g01 = f.x >= f.y, g02 = f.x >= f.z, g12 = f.y >= f.z;
+  // axis of the largest / smallest fraction, identical tie-breaking to the CPU rank sort
+  const ivec3 eMax = ivec3(g01 && g02, !g01 && g12, !g02 && !g12);
+  const ivec3 eMin = ivec3(!g01 && !g02, g01 && !g12, g02 && g12);
+  const ivec3 eMid = ivec3(1) - eMax - eMin;
+  const float w0 = dot(f, vec3(eMax)), w1 = dot(f, vec3(eMid)), w2 = dot(f, vec3(eMin));
+  const vec3 p0 = texelFetch(s, i, 0).rgb;
+  const vec3 p1 = texelFetch(s, i + eMax, 0).rgb;
+  const vec3 p2 = texelFetch(s, i + eMax + eMid, 0).rgb;
+  const vec3 p3 = texelFetch(s, i + ivec3(1), 0).rgb;
+  return p0 + w0 * (p1 - p0) + w1 * (p2 - p1) + w2 * (p3 - p2);
+}
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.a.z || p.y >= u.a.w) return;
+  const ivec2 q = p + u.b.zw;  // pixel of the picture
+  vec3 v;
+  if (GEO == 0) {
+    v = texelFetch(uSrc, q - u.b.xy, 0).rgb;
+  } else {
+    const float pxf = u.geoB.x + (float(q.x) + 0.5) * u.geoB.z;
+    const float pyf = u.geoB.y + (float(q.y) + 0.5) * u.geoB.w;
+    // Geometry::mapF: output position -> rotate 90 -> straighten -> flip -> source position
+    float uu = pxf - u.geoC.x * 0.5;
+    const float vv = pyf - u.geoC.y * 0.5;
+    if (u.c.y != 0) uu = -uu;
+    const float fx = uu * u.geoA.x + vv * u.geoA.y + u.geoA.z * 0.5;
+    const float fy = -uu * u.geoA.y + vv * u.geoA.x + u.geoA.w * 0.5;
+    float sx, sy;
+    const float sW = float(u.a.x), sH = float(u.a.y);
+    if (u.c.x == 0) { sx = fx; sy = fy; }
+    else if (u.c.x == 1) { sx = fy; sy = sH - fx; }
+    else if (u.c.x == 2) { sx = sW - fx; sy = sH - fy; }
+    else { sx = sW - fy; sy = fx; }
+    if (GEO == 1) v = srcAt(int(floor(sx)), int(floor(sy)));
+    else v = sampleCubic(sx, sy);
+  }
+  v = max(v * u.gain.xyz, vec3(0.0));
+
+  const float Y = dot(v, vec3(0.2880402, 0.7118741, 0.0000857));
+  if (Y > 1e-7) {
+    const uint bits = floatBitsToUint(Y);
+    int k = int(bits >> 15) - u.d.x;
+    float fr = float(bits & 0x7FFFu) * (1.0 / 32768.0);
+    if (k < 0) { k = 0; fr = 0.0; }
+    else if (k > u.c.w - 2) { k = u.c.w - 2; fr = 0.0; }
+    const float t0 = tone[k];
+    v *= t0 + fr * (tone[k + 1] - t0);
+  }
+
+  vec3 e;
+  if (any(greaterThan(v, vec3(u.e.x)))) {
+    const float sc = float(u.d.y - 1);
+    e = tetra(uLut2, min(sqrt(max(v, vec3(0.0)) * (1.0 / u.e.y)) * sc, vec3(sc - 1e-4)));
+  } else {
+    const float sc = float(u.c.z - 1);
+    e = tetra(uLut, min(sqrt(max(v, vec3(0.0)) * (1.0 / u.e.x)) * sc, vec3(sc - 1e-4)));
+  }
+
+  const float vig = u.geoC.z;
+  if (vig != 0.0) {
+    const float cx = u.geoC.x * 0.5, cy = u.geoC.y * 0.5;
+    const float px = u.geoB.x + (float(q.x) + 0.5) * u.geoB.z - 0.5;
+    const float py = u.geoB.y + (float(q.y) + 0.5) * u.geoB.w - 0.5;
+    const float dx = (px - cx) / cx, dy = (py - cy) / cy;
+    const float f = smoothstep(0.35, 1.05, sqrt((dx * dx + dy * dy) * 0.5));
+    e = vig < 0.0 ? e * (1.0 + vig * 0.6 * f) : e + (1.0 - e) * vig * 0.6 * f;
+  }
+  e = clamp(e, vec3(0.0), vec3(1.0));
+  if (GRAIN) e = grainApply(e, q, u.e.z, u.e.w);
+  if (LAST) imageStore(uOut8, p, pack8(e));
+  else imageStore(uD, p, h16v(vec4(e, 1.0)));
+}

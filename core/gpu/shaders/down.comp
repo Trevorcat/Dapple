@@ -1,0 +1,35 @@
+#version 450
+// Area average of an RGBA16F working image by an integer factor f (spatial.cpp downscale). The average colour is
+// stored as is (MODE 0), as (Y, Y^2) for the guided filter (MODE 1) or as (R-Y, B-Y, Y) for the chroma noise
+// reduction (MODE 2). A source window (interior of a tile) can be written at an offset of a larger low-resolution
+// grid, so the global analysis of a tiled export is assembled tile by tile.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(constant_id = 0) const int MODE = 0;
+
+layout(std140, binding = 0) uniform P {
+  ivec4 a;  // srcLimit x, y (exclusive end of valid source pixels), srcOrg x, y (first pixel of the window)
+  ivec4 b;  // dstCount x, y (low pixels to produce), dstOffset x, y
+  ivec4 c;  // f
+} u;
+layout(binding = 1) uniform sampler2D uIn;  // texture path (texelFetch): imageLoad is several times slower on Adreno
+layout(binding = 2, rgba32f) uniform writeonly image2D uOut;
+
+void main() {
+  const ivec2 l = ivec2(gl_GlobalInvocationID.xy);
+  if (l.x >= u.b.x || l.y >= u.b.y) return;
+  const int f = u.c.x;
+  const ivec2 o = u.a.zw + l * f;
+  const ivec2 e = min(u.a.xy, o + ivec2(f));
+  vec3 acc = vec3(0.0);
+  for (int y = o.y; y < e.y; ++y)
+    for (int x = o.x; x < e.x; ++x) acc += texelFetch(uIn, ivec2(x, y), 0).rgb;
+  const vec3 m = acc * (1.0 / float((e.y - o.y) * (e.x - o.x)));
+  vec4 r;
+  if (MODE == 0) {
+    r = vec4(m, 1.0);
+  } else {
+    const float y = dot(m, vec3(0.2126729, 0.7151522, 0.0721750));
+    r = MODE == 1 ? vec4(y, y * y, 0.0, 0.0) : vec4(m.r - y, m.b - y, y, 0.0);
+  }
+  imageStore(uOut, u.b.zw + l, r);
+}

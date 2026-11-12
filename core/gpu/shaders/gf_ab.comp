@@ -1,0 +1,16 @@
+#version 450
+// Guided filter coefficients (spatial.cpp guidedBase): a = var / (var + eps), b = mean - a * mean, from the boxed
+// (mean, mean of squares) low-resolution grid.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std140, binding = 0) uniform P { ivec4 s; vec4 eps; } u;
+layout(binding = 1) uniform sampler2D uIn;
+layout(binding = 2, rgba32f) uniform writeonly image2D uOut;
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.s.x || p.y >= u.s.y) return;
+  const vec4 m = texelFetch(uIn, p, 0);
+  const float v = max(0.0, m.y - m.x * m.x);
+  const float a = v / (v + u.eps.x);
+  imageStore(uOut, p, vec4(a, m.x - a * m.x, 0.0, 0.0));
+}

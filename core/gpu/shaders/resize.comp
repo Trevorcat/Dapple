@@ -1,0 +1,53 @@
+#version 450
+// Separable Lanczos-3 resize of an RGBA16F image (high-quality downscale for previews and export; the filter support
+// widens with the scale factor, so it is an anti-aliased resample, not point sampling). Any rectangle of the resized
+// picture can be produced from the matching source rectangle, which is what the tiled export relies on.
+//   DIR 0: source window (origin srcOrg, full source space) -> columns [dstStart.x, +outW) of the rows [rowStart, +outH)
+//   DIR 1: those intermediate rows -> rows [dstStart.y, +outH)
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+layout(constant_id = 0) const int DIR = 0;
+
+layout(std140, binding = 0) uniform P {
+  ivec4 src;   // full source width, height, window origin x, y   (DIR 1: origin = (0, rowStart) of the intermediate)
+  ivec4 dst;   // full destination width, height, start x, y
+  ivec4 out_;  // output w, h, rowStart (DIR 0), 0
+  vec4 sc;     // scale along the axis (src / dst), support half-width, 0, 0
+} u;
+layout(binding = 1) uniform sampler2D uIn;
+layout(binding = 2, rgba16f) uniform writeonly image2D uOut;
+
+const float kPi = 3.14159265358979;
+float lanczos(float x) {
+  x = abs(x);
+  if (x < 1e-4) return 1.0;
+  if (x >= 3.0) return 0.0;
+  const float px = kPi * x;
+  return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+
+void main() {
+  const ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+  if (o.x >= u.out_.x || o.y >= u.out_.y) return;
+  const float S = u.sc.y;
+  vec4 acc = vec4(0.0);
+  float ws = 0.0;
+  if (DIR == 0) {
+    const float c = (float(u.dst.z + o.x) + 0.5) * u.sc.x - 0.5;
+    const int row = clamp(u.out_.z + o.y, 0, u.src.y - 1);
+    for (int i = int(floor(c - 3.0 * S)) + 1; i <= int(floor(c + 3.0 * S)); ++i) {
+      const float w = lanczos((float(i) - c) / S);
+      acc += w * texelFetch(uIn, ivec2(clamp(i, 0, u.src.x - 1) - u.src.z, row - u.src.w), 0);
+      ws += w;
+    }
+  } else {
+    const float c = (float(u.dst.w + o.y) + 0.5) * u.sc.x - 0.5;
+    for (int i = int(floor(c - 3.0 * S)) + 1; i <= int(floor(c + 3.0 * S)); ++i) {
+      const float w = lanczos((float(i) - c) / S);
+      acc += w * texelFetch(uIn, ivec2(o.x, clamp(i, 0, u.src.y - 1) - u.src.w), 0);
+      ws += w;
+    }
+  }
+  imageStore(uOut, o, h16v(acc / ws));
+}

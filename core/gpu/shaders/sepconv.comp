@@ -1,0 +1,135 @@
+#version 450
+// One direction of a separable filter (box, weight table, or minimum) with replicated edges. A group is ALONG pixels
+// along the axis x PERP lines (256 invocations: 16x16 for radii up to 8 = the SMALL build, otherwise 64x4); the line segment (+- radius) is
+// staged in shared memory, sized for the largest radius of the build (RCAP) so small radii do not
+// pay for the 64-pixel worst case (the old fixed 12 KB tile limited occupancy on Adreno). Single-channel kinds
+// (SCALAR: luma / dark channel / plain r32f) use a float tile instead of a vec4 one: 4x less shared traffic.
+// Each channel of the 4-channel kind has its own radius (the chroma noise reduction blurs u, v and y with different radii
+// in one pass). IN_MODE: 0 plain, 1 luma of rgb, 2 min of rgb.
+// Mirrors boxBlur / gaussBlur / the dark-channel min filter of core/src/spatial.cpp.
+layout(local_size_x_id = 1, local_size_y_id = 2) in;
+layout(constant_id = 0) const int DIR = 0;  // 0 horizontal, 1 vertical
+layout(constant_id = 1) const int LX = 64;
+layout(constant_id = 2) const int LY = 4;
+layout(constant_id = 3) const int OP = 0;    // 0 box, 1 weight table (symmetric, w[0..R]), 2 minimum
+#ifdef SMALL
+const int RCAP = 8;   // radii up to 8: 16x16 groups, small tile
+const int NOUT = 1;
+#define SHN 528       // 16 * (16 + 2 * 8 + 1)
+#elif defined(BIGV)
+const int RCAP = 64;  // vertical, radii up to 64, single channel: 16 columns x 16 rows of threads, 4 outputs per thread
+const int NOUT = 4;
+#define SHN 3088      // 16 * (64 + 2 * 64 + 1)
+#else
+const int RCAP = 64;  // radii up to 64: 64 x 4 groups
+const int NOUT = 1;
+#define SHN 772       // 4 * (64 + 2 * 64 + 1)
+#endif
+
+#ifndef IN_FMT
+#define IN_FMT rgba32f
+#define OUT_FMT rgba32f
+#endif
+#ifndef IN_MODE
+#define IN_MODE 0
+#endif
+#ifdef SCALAR
+#define T float
+#else
+#define T vec4
+#endif
+
+// The input is read through the texture path (texelFetch), not imageLoad: on Adreno storage-image loads bypass the texture
+// cache and are several times slower for this access pattern.
+layout(binding = 1) uniform sampler2D uIn;
+layout(binding = 2, OUT_FMT) uniform writeonly image2D uOut;
+layout(binding = 3, std430) readonly buffer W { float w[]; };
+layout(std140, binding = 0) uniform P {
+  ivec4 size;   // width, height, max radius, 0
+  ivec4 radii;  // per channel
+} pc;
+
+const int TA = LX;                    // threads along the axis (lane-fast)
+const int ALONG = TA * NOUT;          // outputs along the axis per group
+const int PERP = LY;
+const int ROW = ALONG + 2 * RCAP + 1;  // +1: odd row stride keeps the columns of the vertical groups off the same bank
+// A fixed-size array: Adreno 620 (driver 512.x) miscompiles shared arrays whose size comes from specialisation constants.
+shared T sh[SHN];
+
+T fetch(ivec2 c) {
+  const vec4 v = texelFetch(uIn, c, 0);
+#if IN_MODE == 1
+  return dot(v.rgb, vec3(0.2126729, 0.7151522, 0.0721750));
+#elif IN_MODE == 2
+  return min(v.r, min(v.g, v.b));
+#elif defined(SCALAR)
+  return v.x;
+#else
+  return v;
+#endif
+}
+
+void main() {
+  // Lane-fast axis = along the filter axis in both directions: the shared-memory reads of a wave are then consecutive. (With the
+  // image column as the fast lane axis the vertical passes were 3x slower on Adreno 620: bank conflicts in the shared tile.)
+  const int a = int(gl_LocalInvocationID.x);
+  const int q = int(gl_LocalInvocationID.y);
+  const int R = min(pc.size.z, RCAP);
+  const int baseAlong = ((DIR == 0) ? int(gl_WorkGroupID.x) : int(gl_WorkGroupID.y)) * ALONG;
+  const int line = ((DIR == 0) ? int(gl_WorkGroupID.y) : int(gl_WorkGroupID.x)) * PERP + q;
+  const int len = (DIR == 0) ? pc.size.x : pc.size.y;
+  const int lines = (DIR == 0) ? pc.size.y : pc.size.x;
+  const int lc = min(line, lines - 1);
+  const int row = q * ROW;
+
+  for (int j = a; j < ALONG + 2 * R; j += TA) {
+    const int c = clamp(baseAlong - R + j, 0, len - 1);
+    sh[row + j] = fetch((DIR == 0) ? ivec2(c, lc) : ivec2(lc, c));
+  }
+  barrier();
+  if (line >= lines) return;
+#ifndef SCALAR
+  const vec4 radv = vec4(min(pc.radii, ivec4(RCAP)));
+#endif
+  for (int i = 0; i < NOUT; ++i) {
+    const int pos = baseAlong + a + i * TA;
+    if (pos >= len) break;
+    const int o = row + a + i * TA + R;
+#ifdef SCALAR
+    const int rad = min(pc.radii.x, RCAP);
+    T acc;
+    if (OP == 1) {
+      acc = sh[o] * w[0];
+      for (int k = 1; k <= R; ++k) acc += (sh[o - k] + sh[o + k]) * w[k];
+    } else if (OP == 2) {
+      acc = sh[o];
+      for (int k = 1; k <= rad; ++k) acc = min(acc, min(sh[o - k], sh[o + k]));
+    } else {
+      acc = sh[o];
+      for (int k = 1; k <= rad; ++k) acc += sh[o - k] + sh[o + k];
+      acc /= float(2 * rad + 1);
+    }
+    imageStore(uOut, (DIR == 0) ? ivec2(pos, line) : ivec2(line, pos), vec4(acc, 0.0, 0.0, 0.0));
+#else
+    vec4 acc;
+    if (OP == 1) {
+      acc = sh[o] * w[0];
+      for (int k = 1; k <= R; ++k) acc += (sh[o - k] + sh[o + k]) * w[k];
+    } else if (OP == 2) {
+      acc = sh[o];
+      for (int k = 1; k <= R; ++k) {
+        // boolean select (a float mix would lose the value next to 1e30)
+        acc = min(acc, mix(vec4(1e30), min(sh[o - k], sh[o + k]), lessThanEqual(vec4(float(k)), radv)));
+      }
+    } else {
+      acc = sh[o];
+      for (int k = 1; k <= R; ++k) {
+        const vec4 m = vec4(lessThanEqual(vec4(float(k)), radv));
+        acc += (sh[o - k] + sh[o + k]) * m;
+      }
+      acc /= (2.0 * radv + 1.0);
+    }
+    imageStore(uOut, (DIR == 0) ? ivec2(pos, line) : ivec2(line, pos), acc);
+#endif
+  }
+}

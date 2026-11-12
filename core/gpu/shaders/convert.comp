@@ -1,0 +1,18 @@
+#version 450
+// Source upload: packed float RGB rows (host-visible staging buffer) -> RGBA16F device image. Converting on the GPU
+// keeps the CPU out of the upload path (a memcpy of the rows, no per-pixel work).
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+layout(std140, binding = 0) uniform P {
+  ivec4 s;  // w, h (of the chunk), destination x, y of the chunk
+} u;
+layout(binding = 1, std430) readonly buffer In { float v[]; };
+layout(binding = 2, rgba16f) uniform writeonly image2D uOut;
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.s.x || p.y >= u.s.y) return;
+  const int i = 3 * (p.y * u.s.x + p.x);
+  imageStore(uOut, p + u.s.zw, vec4(h16(v[i]), h16(v[i + 1]), h16(v[i + 2]), 1.0));
+}
