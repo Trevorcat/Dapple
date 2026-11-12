@@ -46,6 +46,19 @@ class ResultCache {
     return nullptr;
   }
 
+  // find() that also marks the entry most recently used (it moves to the back; put() evicts from the front): LRU instead of FIFO.
+  Entry* findLru(NodeType t, const Hash128& key) {
+    auto& v = slot(t);
+    for (std::size_t i = 0; i < v.size(); ++i)
+      if (v[i].key == key) {
+        ++stats_[std::size_t(t)].hits;
+        if (i + 1 != v.size()) std::rotate(v.begin() + std::ptrdiff_t(i), v.begin() + std::ptrdiff_t(i) + 1, v.end());
+        return &v.back();
+      }
+    ++stats_[std::size_t(t)].misses;
+    return nullptr;
+  }
+
   // Lookup without touching the statistics (the planner decides on cache state before the executor uses it).
   const Entry* peek(NodeType t, const Hash128& key) const {
     for (const Entry& e : entries_[std::size_t(t)])

@@ -2,6 +2,7 @@
 // rows, undo / redo, the licences page, and goldens at phone and Find N5 inner-screen size.
 import 'dart:io';
 
+import 'package:dapple/editor/param_rows.dart' show latitudeFromPercent, latitudePercent;
 import 'package:dapple/model/film_catalog.dart';
 import 'package:dapple/model/film_names.dart';
 import 'package:dapple/model/params.dart';
@@ -11,6 +12,7 @@ import 'package:dapple/screens/library/licenses_page.dart';
 import 'package:dapple/screens/library/settings_page.dart';
 import 'package:dapple/state/app_state.dart';
 import 'package:dapple/theme/tokens.dart';
+import 'package:dapple/widgets/photo_art.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -18,12 +20,12 @@ import 'editor_v2_test.dart' show Finger, dump, n5Dpr, n5Phys, phoneDpr, phonePh
 import 'support/film_fixture.dart';
 import 'support/harness.dart';
 
-Future<(AppState, String)> openFilm(WidgetTester t, {Size phys = phonePhys, double dpr = phoneDpr, bool pack = true}) async {
+Future<(AppState, String)> openFilm(WidgetTester t, {Size phys = phonePhys, double dpr = phoneDpr, bool pack = true, String title = '外滩夕阳'}) async {
   setView(t, phys, dpr);
   await loadTestFonts();
   final app = AppState.demo();
   if (pack) app.film = testFilmCatalog;
-  final id = app.photos.firstWhere((p) => p.title == '外滩夕阳' && p.id.startsWith('d')).id;
+  final id = app.photos.firstWhere((p) => p.title == title && p.id.startsWith('d')).id;
   await t.pumpWidget(RepaintBoundary(
     key: shotKey,
     child: MaterialApp(
@@ -38,11 +40,23 @@ Future<(AppState, String)> openFilm(WidgetTester t, {Size phys = phonePhys, doub
   return (app, id);
 }
 
-/// Opens the 风格 window and the film row (its stock strip unfolds).
+/// True on the phone layout (docked panel); the inner screen keeps the floating windows.
+bool get docked => find.byKey(const ValueKey('docked-panel')).evaluate().isNotEmpty;
+
+/// Selects a 风格 parameter: a chip in the docked panel, a row in the floating window.
+Future<void> selectStyleRow(WidgetTester t, String id) async {
+  final f = find.byKey(ValueKey(docked ? 'chip-style-$id' : 'row-style-$id'));
+  await t.ensureVisible(f);
+  await settle(t, 2);
+  await t.tap(f);
+  await settle(t, 8);
+}
+
+/// Opens the 风格 category and the film row (its stock strip shows).
 Future<void> openFilmRow(WidgetTester t) async {
   await tapKey(t, 'dock-${EGroup.style}');
-  await t.ensureVisible(find.byKey(const ValueKey('row-style-film')));
-  await tapKey(t, 'row-style-film');
+  await settle(t, 8);
+  await selectStyleRow(t, 'film');
 }
 
 Future<void> pickStock(WidgetTester t, String id) async {
@@ -53,7 +67,8 @@ Future<void> pickStock(WidgetTester t, String id) async {
   await settle(t, 3);
 }
 
-bool hasRow(String id) => find.byKey(ValueKey('row-style-$id')).evaluate().isNotEmpty;
+bool hasRow(String id) =>
+    find.byKey(ValueKey('row-style-$id')).evaluate().isNotEmpty || find.byKey(ValueKey('chip-style-$id')).evaluate().isNotEmpty;
 
 void main() {
   group('catalog', () {
@@ -137,7 +152,157 @@ void main() {
     });
   });
 
+  group('film pad and the black-point / latitude rulers', () {
+    testWidgets('chips 曝光 / 宽容度 / 黑位 replace 胶片曝光; the pad is big, centred at auto, with its mark', (t) async {
+      final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75);
+      await openFilmRow(t);
+      await pickStock(t, 'kodak_portra_400');
+      for (final k in ['film_expo', 'film_black', 'film_latitude']) {
+        expect(hasRow(k), isTrue, reason: k);
+      }
+      expect(hasRow('film_exp'), isFalse);
+      expect(hasRow('film_texture'), isFalse, reason: 'the engine has no film_grade: no 质感 pad');
+      await selectStyleRow(t, 'film_expo');
+      final pad = find.byKey(const ValueKey('pad-film_expo'));
+      expect(pad, findsOneWidget);
+      final r = t.getRect(pad);
+      expect(r.height, greaterThanOrEqualTo(1140 / 2.75 * 0.4 - 0.5));
+      expect(r.width, greaterThan(300));
+      expect(find.byKey(const ValueKey('offset-pad-paint')), findsOneWidget, reason: 'the pad with its auto ring');
+      expect(find.descendant(of: find.byKey(const ValueKey('chip-style-film_expo')), matching: find.text('自动')), findsOneWidget, reason: 'the chip reads auto at the centre');
+      expect(app.editOf(id).values.containsKey('film_shoot'), isFalse);
+      expect(find.ancestor(of: pad, matching: find.byType(Scrollable)), findsNothing);
+      await dump(t, 'phone_film_pad');
+    });
+
+    testWidgets('曝光 pad: right and up = 过曝 and 浅, values land in the params map in [-1, 1], one undo step, on the wire; double tap resets', (t) async {
+      final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75);
+      await openFilmRow(t);
+      await pickStock(t, 'kodak_portra_400');
+      await selectStyleRow(t, 'film_expo');
+      final r = t.getRect(find.byKey(const ValueKey('pad-film_expo')));
+      final f = await Finger.down(t, r.center);
+      await f.drag(const Offset(60, -50), step: 6);
+      await t.pump(const Duration(milliseconds: 80));
+      expect(find.descendant(of: find.byKey(const ValueKey('chip-style-film_expo')), matching: find.textContaining('+')), findsOneWidget, reason: 'readout in the chip');
+      await f.up();
+      await settle(t);
+      final e = app.editOf(id);
+      expect(e.value('film_shoot'), greaterThan(0));
+      expect(e.value('film_print'), greaterThan(0));
+      expect(e.value('film_shoot'), lessThanOrEqualTo(1));
+      expect(e.value('film_print'), lessThanOrEqualTo(1));
+      final w = app.photos.firstWhere((p) => p.id == id);
+      expect(app.wireParams(w)['film_shoot'], e.value('film_shoot'));
+      expect(app.wireParams(w)['film_print'], e.value('film_print'));
+      app.undo(id);
+      expect(app.editOf(id).values.containsKey('film_shoot'), isFalse, reason: 'one gesture = one undo step');
+      app.redo(id);
+      await settle(t, 3);
+      final c = t.getCenter(find.byKey(const ValueKey('pad-film_expo')));
+      await t.tapAt(c);
+      await t.pump(const Duration(milliseconds: 60));
+      await t.tapAt(c);
+      await settle(t);
+      expect(app.editOf(id).values.containsKey('film_shoot'), isFalse);
+      expect(app.editOf(id).values.containsKey('film_print'), isFalse);
+    });
+
+    testWidgets('黑位 is a ruler: right = 压黑 (+), left = 抬黑 (-), stored normalised, shown x100; 无 clears it', (t) async {
+      final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75);
+      await openFilmRow(t);
+      await pickStock(t, 'kodak_portra_400');
+      await selectStyleRow(t, 'film_black');
+      expect(find.byKey(const ValueKey('panel-ruler')), findsOneWidget);
+      final r = t.getRect(find.byKey(const ValueKey('panel-ruler')));
+      var f = await Finger.down(t, r.center);
+      await f.drag(const Offset(80, 2));
+      await f.up();
+      await settle(t);
+      final up = app.editOf(id).value('film_black');
+      expect(up, inInclusiveRange(0.05, 1.0), reason: '+ = stretched to display black');
+      expect(find.byKey(const ValueKey('value-film_black')), findsOneWidget);
+      app.applyEdit(id, (e) => e.withValue('film_black', 0));
+      await settle(t, 3);
+      f = await Finger.down(t, r.center);
+      await f.drag(const Offset(-80, 2));
+      await f.up();
+      await settle(t);
+      expect(app.editOf(id).value('film_black'), inInclusiveRange(-1.0, -0.05), reason: '- = lifted, matte black');
+      expect(app.wireParams(app.photos.firstWhere((p) => p.id == id))['film_black'], app.editOf(id).value('film_black'));
+      await selectStyleRow(t, 'film');
+      await t.ensureVisible(find.byKey(const ValueKey('film-none')));
+      await t.tap(find.byKey(const ValueKey('film-none')));
+      await settle(t, 3);
+      expect(app.editOf(id).values.keys.where((k) => k.startsWith('film_')), isEmpty, reason: '无 clears the film keys');
+    });
+
+    testWidgets('宽容度 is a ruler in percent (55 .. 98, auto 80); a drag stores a normalised value; double tap on the ruler resets', (t) async {
+      final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75);
+      await openFilmRow(t);
+      await pickStock(t, 'kodak_portra_400');
+      await selectStyleRow(t, 'film_latitude');
+      expect(find.byKey(const ValueKey('panel-ruler')), findsOneWidget);
+      final r = t.getRect(find.byKey(const ValueKey('panel-ruler')));
+      final f = await Finger.down(t, r.center);
+      await f.drag(const Offset(60, 2));
+      await f.up();
+      await settle(t);
+      final v = app.editOf(id).value('film_latitude');
+      expect(v, inInclusiveRange(0.05, 1.0));
+      final shown = t.widget<Text>(find.descendant(of: find.byKey(const ValueKey('value-film_latitude')), matching: find.byType(Text))).data!;
+      expect(shown, endsWith('%'));
+      expect(int.parse(shown.replaceAll('%', '')), inInclusiveRange(81, 98), reason: 'right of auto: 80 % .. 98 %');
+      final c = t.getCenter(find.byKey(const ValueKey('panel-ruler')));
+      await t.tapAt(c);
+      await t.pump(const Duration(milliseconds: 60));
+      await t.tapAt(c);
+      await settle(t);
+      expect(app.editOf(id).values.containsKey('film_latitude'), isFalse);
+    });
+
+    testWidgets('the panel never covers the photo with a film pad, and an old film_exp edit still reaches the wire', (t) async {
+      final (app, id) = await openFilm(t, title: '街角咖啡');
+      app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400').withValue('film_exp', 10));
+      await openFilmRow(t);
+      await selectStyleRow(t, 'film_expo');
+      await settle(t, 20);
+      final panel = t.getRect(find.byKey(const ValueKey('docked-panel')));
+      expect(t.getRect(find.byType(PhotoArt)).bottom, lessThanOrEqualTo(panel.top + 0.5));
+      expect(app.wireParams(app.photos.firstWhere((p) => p.id == id))['film_exp'], 10);
+    });
+
+    testWidgets('inner screen: the 曝光 pad lives in the floating window and claims its drag', (t) async {
+      final (app, id) = await openFilm(t, phys: n5Phys, dpr: n5Dpr);
+      await openFilmRow(t);
+      await pickStock(t, 'kodak_portra_400');
+      await selectStyleRow(t, 'film_expo');
+      final pad = find.byKey(const ValueKey('pad-film_expo'));
+      await t.ensureVisible(pad);
+      await settle(t, 5);
+      final r = t.getRect(pad);
+      final f = await Finger.down(t, r.center);
+      await f.drag(const Offset(30, -30), step: 5);
+      await f.up();
+      await settle(t, 3);
+      expect(app.editOf(id).value('film_shoot'), greaterThan(0));
+    });
+  });
+
   group('edit state', () {
+    test('latitude scale: -1 / 0 / +1 = 55 / 80 / 98 %, piecewise linear, and back', () {
+      expect(latitudePercent(-1), 55);
+      expect(latitudePercent(0), 80);
+      expect(latitudePercent(1), 98);
+      expect(latitudePercent(0.5), 89);
+      expect(latitudeFromPercent(55), -1);
+      expect(latitudeFromPercent(80), 0);
+      expect(latitudeFromPercent(98), 1);
+      for (final v in [-0.7, -0.2, 0.3, 0.9]) {
+        expect(latitudeFromPercent(latitudePercent(v)), closeTo(v, 1e-9));
+      }
+    });
+
     test('film keys reach the wire only with a stock; defaults stay absent; sync and clipboard carry them', () {
       var e = EditState.empty;
       expect(e.toWire(defaultLook: 'std', defaultToneStrength: 60).keys.any((k) => k.startsWith('film')), isFalse);
@@ -178,14 +343,13 @@ void main() {
     testWidgets('selecting a stock: strip grouped, swatches not photos, paper row only for negatives', (t) async {
       final (app, id) = await openFilm(t);
       await openFilmRow(t);
-      expect(find.byKey(const ValueKey('extra-film')), findsOneWidget);
       expect(find.byKey(const ValueKey('film-strip')), findsOneWidget);
       for (final g in ['负片', '反转片', '电影']) {
         expect(find.text(g), findsWidgets, reason: g);
       }
       expect(app.editOf(id).film, isNull);
       // before a stock is chosen only the stock row exists
-      for (final k in ['filmPaper', 'film_strength', 'film_grain', 'film_halation', 'film_warmth', 'film_tint', 'film_exp']) {
+      for (final k in ['filmPaper', 'film_strength', 'film_expo', 'film_latitude', 'film_black', 'film_grain', 'film_halation', 'film_warmth', 'film_tint']) {
         expect(hasRow(k), isFalse, reason: k);
       }
 
@@ -194,14 +358,13 @@ void main() {
       expect(app.editOf(id).film, 'kodak_portra_400');
       expect(app.editOf(id).filmPaper, isNull, reason: 'the default paper is the engine default, not an override');
       expect(app.wireParams(app.photos.firstWhere((p) => p.id == id))['film'], 'kodak_portra_400');
-      for (final k in ['filmPaper', 'film_strength', 'film_grain', 'film_halation', 'film_warmth', 'film_tint', 'film_exp']) {
+      for (final k in ['filmPaper', 'film_strength', 'film_expo', 'film_latitude', 'film_black', 'film_grain', 'film_halation', 'film_warmth', 'film_tint']) {
         expect(hasRow(k), isTrue, reason: k);
       }
-      expect(find.text(kFilmDisplayNames['kodak_portra_endura']!), findsWidgets, reason: 'the row shows the default paper');
+      expect(find.text(kFilmDisplayNames['kodak_portra_endura']!), findsWidgets, reason: 'the row / chip shows the default paper');
 
       // choose another paper from the paper row
-      await t.ensureVisible(find.byKey(const ValueKey('row-style-filmPaper')));
-      await tapKey(t, 'row-style-filmPaper');
+      await selectStyleRow(t, 'filmPaper');
       expect(find.byKey(const ValueKey('extra-filmPaper')), findsOneWidget);
       final papers = testFilmCatalog.paperIds;
       final strip = find.descendant(of: find.byKey(const ValueKey('film-paper-strip')), matching: find.byType(Scrollable));
@@ -226,8 +389,7 @@ void main() {
       expect(hasRow('film_grain'), isTrue);
 
       // a slide: no paper row, no print filtration, paper override dropped
-      await t.ensureVisible(find.byKey(const ValueKey('row-style-film')));
-      await tapKey(t, 'row-style-film');
+      await selectStyleRow(t, 'film');
       await pickStock(t, 'fujifilm_velvia_100');
       expect(app.editOf(id).film, 'fujifilm_velvia_100');
       expect(app.editOf(id).filmPaper, isNull);
@@ -235,7 +397,8 @@ void main() {
       expect(hasRow('film_warmth'), isFalse);
       expect(hasRow('film_tint'), isFalse);
       expect(hasRow('film_grain'), isTrue);
-      expect(hasRow('film_exp'), isTrue);
+      expect(hasRow('film_expo'), isTrue);
+      expect(hasRow('film_exp'), isFalse, reason: 'the old exposure slider left the UI');
 
       // a cinema negative gets the print film by default
       await pickStock(t, 'kodak_vision3_500t');
@@ -259,12 +422,11 @@ void main() {
       await pickStock(t, 'kodak_portra_400');
       expect(app.editOf(id).value('film_grain'), 100);
 
-      await t.ensureVisible(find.byKey(const ValueKey('row-style-film_grain')));
-      await tapKey(t, 'row-style-film_grain');
-      final f = await Finger.down(t, const Offset(200, 300));
+      await selectStyleRow(t, 'film_grain');
+      final f = await Finger.down(t, const Offset(200, 250));
       await f.drag(const Offset(-120, 3));
       await t.pump(const Duration(milliseconds: 250));
-      expect(find.byKey(const ValueKey('readout')), findsOneWidget);
+      expect(find.byKey(ValueKey(docked ? 'panel-ruler' : 'readout')), findsOneWidget, reason: 'the panel stays; the window shows its readout');
       await f.up();
       await settle(t);
       final g = app.editOf(id).value('film_grain');
@@ -295,7 +457,24 @@ void main() {
         await openFilmRow(t);
         await pickStock(t, 'kodak_portra_400');
         expect(app.editOf(id).film, 'kodak_portra_400');
-        for (final k in ['filmPaper', 'film', 'film_exp', 'film_strength']) {
+        for (final k in ['filmPaper', 'film', 'film_expo', 'film_strength']) {
+          if (docked) {
+            // phone: a chip holds the name over the value; both stay inside the chip at large text
+            final chip = find.byKey(ValueKey('chip-style-$k'));
+            await t.ensureVisible(chip);
+            await settle(t, 2);
+            final texts = find.descendant(of: chip, matching: find.byType(Text));
+            expect(texts, findsNWidgets(2), reason: k);
+            final cr = t.getRect(chip);
+            for (var i = 0; i < 2; i++) {
+              final r = t.getRect(texts.at(i));
+              expect(r.left, greaterThanOrEqualTo(cr.left - 0.5), reason: k);
+              expect(r.right, lessThanOrEqualTo(cr.right + 0.5), reason: k);
+              expect(r.bottom, lessThanOrEqualTo(cr.bottom + 0.5), reason: '$k: inside the chip');
+            }
+            expect(t.takeException(), isNull, reason: '$k: no overflow');
+            continue;
+          }
           final row = find.byKey(ValueKey('row-style-$k'));
           await t.ensureVisible(row);
           await settle(t, 2);
@@ -314,11 +493,11 @@ void main() {
       final (app, id) = await openFilm(t);
       await openFilmRow(t);
       await pickStock(t, 'kodak_portra_400');
-      final row = find.byKey(const ValueKey('row-style-film_halation'));
+      final row = find.byKey(ValueKey(docked ? 'chip-style-film_halation' : 'row-style-film_halation'));
       await t.ensureVisible(row);
       await settle(t, 2);
       await t.tap(row);
-      await settle(t, 3);
+      await settle(t, 8);
       final before = app.editOf(id).value('film_halation');
       // a horizontal drag that starts on the row: the row is not a slider, the value stays
       final f = await Finger.down(t, t.getCenter(row));
@@ -330,7 +509,7 @@ void main() {
       final g = await Finger.down(t, const Offset(60, 200));
       await g.drag(const Offset(-50, 2));
       await t.pump(const Duration(milliseconds: 250));
-      expect(find.byKey(const ValueKey('readout')), findsOneWidget, reason: 'the readout names the row that is being changed');
+      expect(find.byKey(ValueKey(docked ? 'panel-ruler' : 'readout')), findsOneWidget, reason: 'the readout / the panel names the row that is being changed');
       await g.up();
       await settle(t, 3);
       expect(app.editOf(id).value('film_halation'), lessThan(before));
@@ -342,8 +521,7 @@ void main() {
       await pickStock(t, 'kodak_portra_400');
       final sc = find.descendant(of: find.byKey(const ValueKey('window-scroll')), matching: find.byType(Scrollable));
       double off() => t.state<ScrollableState>(sc.first).position.pixels;
-      await t.ensureVisible(find.byKey(const ValueKey('row-style-film_grain')));
-      await tapKey(t, 'row-style-film_grain');
+      await selectStyleRow(t, 'film_grain');
       await settle(t, 3);
       final before = off();
       expect(before, greaterThan(0), reason: 'the window is scrolled down to the grain row');
@@ -372,18 +550,16 @@ void main() {
       final (app, id) = await openFilm(t);
       await openFilmRow(t);
       await pickStock(t, 'kodak_portra_400');
-      await t.ensureVisible(find.byKey(const ValueKey('row-style-film_exp')));
-      await tapKey(t, 'row-style-film_exp');
+      await selectStyleRow(t, 'film_latitude');
       var f = await Finger.down(t, const Offset(60, 300));
       await f.drag(const Offset(100, 2));
       await f.up();
       await settle(t);
-      final ev = app.editOf(id).value('film_exp');
-      expect(ev, greaterThan(0));
-      expect(ev, lessThanOrEqualTo(60));
+      final lat = app.editOf(id).value('film_latitude');
+      expect(lat, greaterThan(0));
+      expect(lat, lessThanOrEqualTo(1), reason: 'stored normalised');
 
-      await t.ensureVisible(find.byKey(const ValueKey('row-style-film_warmth')));
-      await tapKey(t, 'row-style-film_warmth');
+      await selectStyleRow(t, 'film_warmth');
       f = await Finger.down(t, const Offset(60, 300));
       await f.drag(const Offset(-90, 2));
       await f.up();
@@ -391,8 +567,7 @@ void main() {
       expect(app.editOf(id).value('film_warmth'), lessThan(0));
 
       // strength: starts at the default (100) and the row is not marked modified
-      await t.ensureVisible(find.byKey(const ValueKey('row-style-film_strength')));
-      await tapKey(t, 'row-style-film_strength');
+      await selectStyleRow(t, 'film_strength');
       expect(app.editOf(id).value('film_strength'), 100);
       f = await Finger.down(t, const Offset(200, 300));
       await f.drag(const Offset(-80, 2));
@@ -400,10 +575,11 @@ void main() {
       await settle(t);
       expect(app.editOf(id).value('film_strength'), lessThan(100));
       // double tap on the row resets it to the default
-      await t.ensureVisible(find.byKey(const ValueKey('row-style-film_strength')));
-      await t.tap(find.byKey(const ValueKey('row-style-film_strength')));
+      final strengthRow = find.byKey(ValueKey(docked ? 'chip-style-film_strength' : 'row-style-film_strength'));
+      await t.ensureVisible(strengthRow);
+      await t.tap(strengthRow);
       await t.pump(const Duration(milliseconds: 50));
-      await t.tap(find.byKey(const ValueKey('row-style-film_strength')));
+      await t.tap(strengthRow);
       await settle(t, 3);
       expect(app.editOf(id).value('film_strength'), 100);
     });

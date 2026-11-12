@@ -7,7 +7,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
@@ -15,7 +17,9 @@
 #include "dapple/camera.h"
 #include "dapple/dapple_c.h"
 #include "dapple/encode.h"
+#include "dapple/film.h"
 #include "dapple/edit_params.h"
+#include "dapple/lut.h"
 #include "dapple/renderer.h"
 #include "engine/exec/gpu_executor.h"
 #include "gpu_rig.h"
@@ -87,7 +91,10 @@ struct Stage {
   const char* name;
   std::function<void(EditParams&)> set;
   std::function<void(FastOptions&)> opt = nullptr;
+  bool lut = false;  // the renderer carries the synthetic look LUT (testLut)
 };
+
+const Lut3D& testLut() { return syntheticLut(); }  // the look LUT of the film display-stage rows (gpu_rig.h)
 
 EditParams baseParams() {
   EditParams p;
@@ -137,6 +144,21 @@ const std::vector<Stage>& stages() {
        [](FastOptions& o) { o.spatial = SpatialQuality::Interactive; o.noise = false; }},
       {"film interactive, grain drag", [](EditParams& p) { p.filmStock = "kodak_portra_400"; },
        [](FastOptions& o) { o.spatial = SpatialQuality::Interactive; o.noise = false; o.keepGrain = true; o.fullLongEdge = 3000; }},
+      // film coverage (no CPU fallback): strength < 100 blends the film with the normal render, display curves + look LUT follow the film
+      {"film strength 60 (blend)", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmStrength = 60; }},
+      {"film strength 0 (normal render only)", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmStrength = 0; }},
+      {"film strength 30 + geometry + vignette + NR/sharpen", [](EditParams& p) {
+         p.filmStock = "kodak_ektar_100"; p.filmStrength = 30; p.straighten = 2.f; p.crop = "4:5"; p.vignette = 25; p.nrLuma = 25; p.sharpen = 40; }},
+      {"film + point curves (master, red)", [](EditParams& p) {
+         p.filmStock = "kodak_portra_400"; p.toneCurve = {{0.f, 0.f}, {76.f, 56.f}, {178.f, 209.f}, {255.f, 255.f}}; p.toneCurveRed = {{0.f, 13.f}, {255.f, 242.f}}; }},
+      {"film + parametric curves (master, blue)", [](EditParams& p) {
+         p.filmStock = "fujifilm_velvia_100"; p.parametricShadows = 30; p.parametricHighlights = -25; p.channelParametric[2] = {0.f, 20.f, -10.f, 0.f}; }},
+      {"film + look LUT 70%", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.lutAmount = 70; }, nullptr, true},
+      {"film strength 70 + curves + LUT + grain", [](EditParams& p) {
+         p.filmStock = "kodak_portra_400"; p.filmStrength = 70; p.toneCurve = {{0.f, 0.f}, {128.f, 107.f}, {255.f, 255.f}}; p.lutAmount = 55; p.filmGrain = 80; },
+       nullptr, true},
+      {"film strength 40 interactive + LUT", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmStrength = 40; p.lutAmount = 100; },
+       [](FastOptions& o) { o.spatial = SpatialQuality::Interactive; o.noise = false; }, true},
   };
   return s;
 }
@@ -151,7 +173,7 @@ bool runStage(Env& env, Rig& rig, const SourceImage& src, const Stage& st, Row& 
   EditParams p = baseParams();
   st.set(p);
   const CameraProfile& cam = env.cams.resolve("", "");
-  Renderer r(p, cam, nullptr);
+  Renderer r(p, cam, st.lut ? &testLut() : nullptr);
   FastOptions fo;
   fo.spatial = SpatialQuality::Full;
   if (st.opt) st.opt(fo);
@@ -170,7 +192,7 @@ bool runStage(Env& env, Rig& rig, const SourceImage& src, const Stage& st, Row& 
   }
   std::uint8_t* cpu = r.renderBakedRgba(*refSrc, *lut, fo, w, h);
   std::string err;
-  std::uint8_t* gpu = rig.render(p, r, src, fo, 41, gw, gh, nullptr, err);
+  std::uint8_t* gpu = rig.render(p, r, src, fo, 41, gw, gh, nullptr, err, 0, 0.f, st.lut ? &testLut() : nullptr);
   if (!cpu || !gpu || w != gw || h != gh) {
     std::printf("  %-38s %s: render failed: %s (cpu %dx%d gpu %dx%d)\n", st.name, tag, err.c_str(), w, h, gw, gh);
     std::free(cpu);
@@ -216,6 +238,7 @@ void testStages(Env& env) {
         continue;
       }
       CHECK(row.s.mean <= 0.5, "stage '%s' mean dE %.3f", st.name, row.s.mean);
+      if (std::string(st.name).rfind("film", 0) == 0) CHECK(row.s.mean <= 0.1 && row.s.p99 <= 1.0, "film stage '%s': mean %.3f p99 %.3f", st.name, row.s.mean, row.s.p99);
       CHECK(row.s.max <= 30.0, "stage '%s' max dE %.2f", st.name, row.s.max);
     }
   }
@@ -334,6 +357,445 @@ void testTiling(Env& env, bool stream, int pw = 1500, int ph = 1000, std::vector
       CHECK(maxd <= 1, "seam: max channel difference %d (tile %d, %s)", maxd, tile, c.name);
     }
     std::free(whole);
+  }
+}
+
+// Tiled export of film frames against the whole-frame GPU render of the same job: exposure, mixtures and the DIR field run once over the
+// frame, the develop / grain / print / scan chain per tile with the film halo, grain hashed on absolute coordinates, display stages
+// and the blend with the normal branch per pixel. The tiles must reproduce the whole frame to the last bit of the 8-bit output.
+void testFilmTiling(Env& env, int pw = 1500, int ph = 1000, std::vector<int> tiles = {128, 256, 400, 1024}) {
+  std::printf("== tiled film export seams, %dx%d picture: 0 differing pixels vs the whole frame ==\n", pw, ph);
+  const SourceImage src = makeTestImage(pw, ph);
+  struct Case {
+    const char* name;
+    std::function<void(EditParams&)> set;
+    int longEdge;
+    bool lut;
+  };
+  const std::vector<Case> cases = {
+      {"film portra, all effects", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }, 0, false},
+      {"film ektar + NR, sharpen, grain, vignette", [](EditParams& p) {
+         p.filmStock = "kodak_ektar_100"; p.nrLuma = 30; p.nrColor = 30; p.sharpen = 50; p.grain = 20; p.vignette = -25; }, 0, false},
+      {"film strength 55 + curves + LUT + straighten/crop", [](EditParams& p) {
+         p.filmStock = "kodak_portra_400"; p.filmStrength = 55; p.toneCurve = {{0.f, 0.f}, {96.f, 80.f}, {255.f, 255.f}}; p.toneCurveBlue = {{0.f, 10.f}, {255.f, 245.f}};
+         p.lutAmount = 60; p.straighten = 3.f; p.crop = "4:5"; p.sharpen = 30; }, 0, true},
+      {"film velvia + dehaze, clarity (global solves)", [](EditParams& p) {
+         p.filmStock = "fujifilm_velvia_100"; p.dehaze = 30; p.clarity = 30; p.sharpen = 40; }, 0, false},
+      {"film strength 80 + rot90 + downscale 900", [](EditParams& p) {
+         p.filmStock = "kodak_portra_400"; p.filmStrength = 80; p.rotate = 90; p.dehaze = 25; p.sharpen = 40; }, 900, false},
+  };
+  const CameraProfile& cam = env.cams.resolve("", "");
+  for (const Case& c : cases) {
+    EditParams p = baseParams();
+    c.set(p);
+    const Lut3D* lut = c.lut ? &testLut() : nullptr;
+    Renderer r(p, cam, lut);
+    FastOptions fo;
+    Rig rig(env.be, src, cam);
+    std::string err;
+    const float rsharp = c.longEdge ? 0.2f : 0.f;
+    int w = 0, h = 0;
+    std::uint8_t* whole = rig.render(p, r, src, fo, 41, w, h, nullptr, err, c.longEdge, rsharp, lut);
+    CHECK(whole != nullptr, "%s: %s", c.name, err.c_str());
+    if (!whole) continue;
+    for (int tile : tiles) {
+      std::vector<std::uint8_t> img(std::size_t(w) * h * 4, 0);
+      std::size_t covered = 0;
+      auto sink = [&](int x, int y, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
+        for (int j = 0; j < th; ++j) std::memcpy(img.data() + (std::size_t(y + j) * w + x) * 4, rgba + std::size_t(j) * stride, std::size_t(tw) * 4);
+        covered += std::size_t(tw) * th;
+        return true;
+      };
+      engine::GpuStats st;
+      const bool ok = rig.exportTiled(p, r, src, c.longEdge, 41, tile, false, rsharp, nullptr, sink, &st, err, lut);
+      CHECK(ok, "%s tile %d: export: %s", c.name, tile, err.c_str());
+      if (!ok) continue;
+      CHECK(covered == std::size_t(w) * h, "covered %zu of %zu", covered, std::size_t(w) * h);
+      int maxd = 0;
+      std::size_t nd = 0;
+      for (std::size_t i = 0; i < std::size_t(w) * h; ++i) {
+        int d = 0;
+        for (int k = 0; k < 3; ++k) d = std::max(d, std::abs(int(img[4 * i + k]) - int(whole[4 * i + k])));
+        maxd = std::max(maxd, d);
+        nd += d > 0;
+      }
+      std::printf("  %-48s tile %4d: %3d tiles  max channel diff %d/255, %zu differing px  (%d passes, %.0f ms)\n", c.name, tile, st.tiles, maxd, nd,
+                  st.passes, st.wallMs);
+      CHECK(nd == 0, "film seam: %zu differing pixels (tile %d, %s)", nd, tile, c.name);
+    }
+    std::free(whole);
+  }
+}
+
+// EngineSession::renderExact (the exact variant: ToneColourExact) on the GPU executor against the CPU reference renderer. The device evaluates the
+// exact colour stage through a 65^3 lattice baked with the exact analysis: the budget is the lattice's, not bit identity.
+void testExact(Env& env) {
+  std::printf("== renderExact on the GPU (ToneColourExact via the dense lattice) vs Renderer::render ==\n");
+  const SourceImage src = makeTestImage(900, 600);
+  struct Case {
+    const char* name;
+    std::function<void(EditParams&)> set;
+    bool tiled;
+    bool lut;
+  };
+  const std::vector<Case> cases = {
+      {"tone + colour", [](EditParams& p) { p.contrast = 20; p.saturation = 15; p.vibrance = 20; p.highlights = -30; p.shadows = 25; }, false, false},
+      {"HSL + grading + curves", [](EditParams& p) {
+         p.hsl[kRed].hue = 20; p.hsl[kBlue].saturation = -30; p.gradeShadows.hue = 220; p.gradeShadows.saturation = 25;
+         p.toneCurve = {{0.f, 0.f}, {96.f, 80.f}, {255.f, 255.f}}; }, false, false},
+      {"look LUT + spatial", [](EditParams& p) { p.lutAmount = 80; p.sharpen = 40; p.nrLuma = 20; p.dehaze = 20; p.vignette = -20; }, false, true},
+      {"film portra", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }, false, false},
+      {"film strength 60 + curves", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmStrength = 60; p.toneCurve = {{0.f, 0.f}, {128.f, 107.f}, {255.f, 255.f}}; },
+       false, false},
+      {"tiled: tone + colour + spatial", [](EditParams& p) { p.contrast = 20; p.saturation = 15; p.sharpen = 40; p.clarity = 25; p.dehaze = 20; }, true, false},
+      {"tiled: film strength 70 + LUT", [](EditParams& p) { p.filmStock = "kodak_ektar_100"; p.filmStrength = 70; p.lutAmount = 60; p.sharpen = 30; }, true, true},
+  };
+  const CameraProfile& cam = env.cams.resolve("", "");
+  for (const Case& c : cases) {
+    EditParams p = baseParams();
+    c.set(p);
+    const Lut3D* lut = c.lut ? &testLut() : nullptr;
+    Renderer r(p, cam, lut);
+    Rig rig(env.be, src, cam);
+    Image8 gpu;
+    std::string err;
+    engine::EngineSession::ExactOptions o;
+    o.mode = c.tiled ? engine::ExecMode::TiledExport : engine::ExecMode::Whole;
+    o.tile = c.tiled ? 256 : 0;
+    const bool ok = rig.es.renderExact(p, r, src, o, gpu, &err);
+    const Image8 cpu = r.render(src);
+    CHECK(ok, "%s: %s", c.name, err.c_str());
+    CHECK(rig.es.stats().gpuFrames == 1, "%s: not rendered by the GPU executor (gpuFrames %llu)", c.name, (unsigned long long)rig.es.stats().gpuFrames);
+    if (!ok || gpu.data.size() != cpu.data.size()) {
+      CHECK(false, "%s: size %zu vs %zu", c.name, gpu.data.size(), cpu.data.size());
+      continue;
+    }
+    std::vector<std::uint8_t> a(std::size_t(gpu.width) * gpu.height * 4), b(a.size());
+    for (std::size_t i = 0, n = std::size_t(gpu.width) * gpu.height; i < n; ++i)
+      for (int k = 0; k < 3; ++k) {
+        a[4 * i + k] = gpu.data[3 * i + k];
+        b[4 * i + k] = cpu.data[3 * i + k];
+        a[4 * i + 3] = b[4 * i + 3] = 255;
+      }
+    const DeStats d = compareRgba8(a.data(), b.data(), std::size_t(gpu.width) * gpu.height);
+    std::printf("  %-34s %dx%d  mean %.4f  p99 %.3f  max %.2f\n", c.name, gpu.width, gpu.height, d.mean, d.p99, d.max);
+    CHECK(d.mean <= 0.1 && d.p99 <= 1.0, "exact %s: mean %.3f p99 %.3f", c.name, d.mean, d.p99);
+  }
+}
+
+// Coverage: no edit the app can produce on a film frame may come back Unsupported from the GPU executor (the rig forces the executor, so an
+// unsupported plan is an error). Film strength 0..100 x look LUT x display curves x tiled export x exact variant, every stock of the library
+// at both quality tiers, with geometry / vignette / the window nodes on top.
+void testNoFallback(Env& env) {
+  std::printf("== no film edit falls back to the CPU: strength x LUT x curves x tiled x exact, every stock x quality ==\n");
+  const SourceImage src = makeTestImage(320, 224);
+  const CameraProfile& cam = env.cams.resolve("", "");
+  int total = 0, onGpu = 0;
+  auto note = [&](const char* what, bool ok, bool gpu, const std::string& err) {
+    ++total;
+    onGpu += gpu ? 1 : 0;
+    if (!(ok && gpu)) {
+      CHECK(false, "%s: %s", what, ok ? "rendered by the CPU" : err.c_str());
+    }
+  };
+  {
+    Rig rig(env.be, src, cam);
+    const float strengths[] = {0.f, 1.f, 25.f, 50.f, 75.f, 99.f, 100.f};
+    for (float st : strengths)
+      for (int lutOn = 0; lutOn < 2; ++lutOn)
+        for (int curvesOn = 0; curvesOn < 2; ++curvesOn)
+          for (int tiled = 0; tiled < 2; ++tiled)
+            for (int exact = 0; exact < 2; ++exact) {
+              EditParams p = baseParams();
+              p.filmStock = "kodak_portra_400";
+              p.filmStrength = st;
+              p.sharpen = 20;
+              p.vignette = -10;
+              if (lutOn) p.lutAmount = 65;
+              if (curvesOn) {
+                p.toneCurve = {{0.f, 0.f}, {100.f, 84.f}, {255.f, 255.f}};
+                p.toneCurveGreen = {{0.f, 8.f}, {255.f, 250.f}};
+              }
+              const Lut3D* lut = lutOn ? &testLut() : nullptr;
+              Renderer r(p, cam, lut);
+              char name[160];
+              std::snprintf(name, sizeof name, "strength %.0f lut %d curves %d tiled %d exact %d", st, lutOn, curvesOn, tiled, exact);
+              std::string err;
+              const std::uint64_t before = rig.es.stats().gpuFrames;
+              bool ok = false;
+              if (exact) {
+                Image8 out;
+                engine::EngineSession::ExactOptions o;
+                o.mode = tiled ? engine::ExecMode::TiledExport : engine::ExecMode::Whole;
+                o.tile = tiled ? 128 : 0;
+                ok = rig.es.renderExact(p, r, src, o, out, &err) && !out.data.empty();
+              } else if (tiled) {
+                std::size_t covered = 0;
+                int w = 0, h = 0;
+                ok = rig.exportTiled(p, r, src, 0, 41, 128, false, 0.f, [&](int ow, int oh) { w = ow; h = oh; },
+                                     [&](int, int, int tw, int th, const std::uint8_t*, std::size_t) { covered += std::size_t(tw) * th; return true; }, nullptr, err, lut);
+                ok = ok && covered == std::size_t(w) * h;
+              } else {
+                FastOptions fo;
+                fo.spatial = SpatialQuality::Full;
+                int w = 0, h = 0;
+                std::uint8_t* px = rig.render(p, r, src, fo, 41, w, h, nullptr, err, 0, 0.f, lut);
+                ok = px != nullptr;
+                std::free(px);
+              }
+              note(name, ok, rig.es.stats().gpuFrames == before + 1, err);
+            }
+  }
+  {
+    Rig rig(env.be, src, cam);
+    const auto lib = film::defaultLibrary();
+    int stocks = 0;
+    for (const std::string& id : lib->names()) {
+      const film::FilmStock* st = lib->find(id);
+      if (!st || st->isPrintMedium()) continue;
+      ++stocks;
+      for (int tier = 0; tier < 2; ++tier)
+        for (float strength : {100.f, 45.f}) {
+          EditParams p = baseParams();
+          p.filmStock = id;
+          p.filmStrength = strength;
+          p.straighten = 1.5f;
+          Renderer r(p, cam, nullptr);
+          FastOptions fo;
+          fo.spatial = tier ? SpatialQuality::Full : SpatialQuality::Interactive;
+          fo.noise = tier != 0;
+          char name[160];
+          std::snprintf(name, sizeof name, "stock %s %s strength %.0f", id.c_str(), tier ? "final" : "interactive", strength);
+          std::string err;
+          int w = 0, h = 0;
+          const std::uint64_t before = rig.es.stats().gpuFrames;
+          std::uint8_t* px = rig.render(p, r, src, fo, 41, w, h, nullptr, err);
+          note(name, px != nullptr, rig.es.stats().gpuFrames == before + 1, err);
+          std::free(px);
+        }
+    }
+    std::printf("  %d film stocks checked\n", stocks);
+  }
+  std::printf("  %d cases, %d rendered by the GPU executor\n", total, onGpu);
+  CHECK(total == onGpu, "%d of %d cases did not run on the GPU", total - onGpu, total);
+}
+
+// Timings of the film frames that used to fall back to the CPU: "before" = the CPU engine (what the app did), "after" = the GPU executor.
+// 1600 px frames (steady state, wall time incl. readback) and a 24 MP export (tiled GPU export vs the CPU film export, which ran whole).
+// Interactive film frames through the session path (what the app does while a slider moves): per-frame wall time split into the executor's
+// phases (upload = film tables / plan / display on the device, record, submit, wait = GPU + fence, readback copy) for a still frame and
+// for strength / exposure / grain / halation drags. `--film-interactive [long edge]`.
+void testFilmInteractive(Env& env, int longEdge) {
+  using Clk = std::chrono::steady_clock;
+  auto ms = [](Clk::time_point t0) { return std::chrono::duration<double, std::milli>(Clk::now() - t0).count(); };
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.empty() ? 0.0 : v[v.size() / 2];
+  };
+  const CameraProfile& cam = env.cams.resolve("", "");
+  const int sw = 2000, sh = 1500;
+  const SourceImage src = makeTestImage(sw, sh);
+  struct Case {
+    const char* name;
+    std::function<void(EditParams&, int)> set;  // frame index i -> parameter value
+    bool keepGrain;
+  };
+  const std::vector<Case> cases = {
+      {"still frame", [](EditParams&, int) {}, false},
+      {"film strength drag", [](EditParams& p, int i) { p.filmStrength = 100.f - 3.f * float(i % 10); }, false},
+      {"film exposure drag", [](EditParams& p, int i) { p.filmExposure = 0.05f * float(i % 10); }, false},
+      {"exposure drag (normal slider)", [](EditParams& p, int i) { p.exposure = 0.3f + 0.05f * float(i % 10); }, false},
+      {"grain drag (keepGrain)", [](EditParams& p, int i) { p.filmGrain = 100.f - 4.f * float(i % 10); }, true},
+      {"halation drag", [](EditParams& p, int i) { p.filmHalation = 100.f - 4.f * float(i % 10); }, false},
+      {"film warmth drag", [](EditParams& p, int i) { p.filmWarmth = 4.f * float(i % 10); }, false},
+  };
+  std::printf("== film interactive frames through the session, long edge %d (source %dx%d): ms, medians of 12 ==\n", longEdge, sw, sh);
+  std::printf("  %-32s %7s %6s %7s %7s %7s %7s %7s %6s %s\n", "case", "wall", "gpu", "upload", "record", "submit", "wait", "copy", "passes", "(rebuild Renderer)");
+  Rig rig(env.be, src, cam);
+  for (const Case& c : cases) {
+    std::vector<double> wall, gpu, up, rec, sub, wt, cp, rb;
+    int passes = 0;
+    for (int i = 0; i < 14; ++i) {
+      EditParams p = baseParams();
+      p.filmStock = "kodak_portra_400";
+      c.set(p, i);
+      auto t0 = Clk::now();
+      Renderer r(p, cam, nullptr);
+      const double rbMs = ms(t0);
+      FastOptions fo;
+      fo.spatial = SpatialQuality::Interactive;
+      fo.noise = false;
+      fo.keepGrain = c.keepGrain;
+      fo.fullLongEdge = c.keepGrain ? sw : 0;
+      engine::GpuStats st;
+      std::string err;
+      int w = 0, h = 0;
+      t0 = Clk::now();
+      std::uint8_t* px = rig.render(p, r, src, fo, 41, w, h, &st, err, longEdge, 0.f, nullptr);
+      const double wl = ms(t0);
+      CHECK(px != nullptr, "%s: %s", c.name, err.c_str());
+      if (!px) break;
+      std::free(px);
+      if (i == 0 && c.keepGrain == false && std::string(c.name) == "still frame")
+        std::printf("  first film frame of the session: wall %.1f ms (upload %.1f = tables + plan + display, record %.1f incl. pipeline creation, wait %.1f)\n", wl, st.uploadMs, st.recordMs, st.waitMs);
+      if (i >= 2) {
+        wall.push_back(wl), gpu.push_back(st.gpuMs), up.push_back(st.uploadMs), rec.push_back(st.recordMs), sub.push_back(st.submitMs);
+        wt.push_back(st.waitMs), cp.push_back(st.readbackMs), rb.push_back(rbMs);
+        passes = st.passes;
+      }
+    }
+    std::printf("  %-32s %7.2f %6.2f %7.2f %7.2f %7.2f %7.2f %7.2f %6d (%.2f)\n", c.name, median(wall), median(gpu), median(up), median(rec), median(sub),
+                median(wt), median(cp), passes, median(rb));
+  }
+}
+
+void testFilmTiming(Env& env, bool with24mp) {
+  using Clk = std::chrono::steady_clock;
+  auto ms = [](Clk::time_point t0) { return std::chrono::duration<double, std::milli>(Clk::now() - t0).count(); };
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.empty() ? 0.0 : v[v.size() / 2];
+  };
+  const CameraProfile& cam = env.cams.resolve("", "");
+  struct Case {
+    const char* name;
+    std::function<void(EditParams&)> set;
+    bool lut;
+  };
+  const std::vector<Case> cases = {
+      {"film strength 100 (reference, was GPU)", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }, false},
+      {"film strength 60 (Blend)", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmStrength = 60; }, false},
+      {"film + curves + look LUT", [](EditParams& p) {
+         p.filmStock = "kodak_portra_400"; p.toneCurve = {{0.f, 0.f}, {96.f, 80.f}, {255.f, 255.f}}; p.lutAmount = 70; }, true},
+      {"film strength 60 + curves + LUT", [](EditParams& p) {
+         p.filmStock = "kodak_portra_400"; p.filmStrength = 60; p.toneCurve = {{0.f, 0.f}, {96.f, 80.f}, {255.f, 255.f}}; p.lutAmount = 70; }, true},
+  };
+  std::printf("== film timings, 1600 px frame (final tier): CPU engine vs GPU executor ==\n");
+  {
+    const SourceImage src = makeTestImage(1600, 1067);
+    for (const Case& c : cases) {
+      EditParams p = baseParams();
+      c.set(p);
+      const Lut3D* lut = c.lut ? &testLut() : nullptr;
+      Renderer r(p, cam, lut);
+      FastOptions fo;
+      fo.spatial = SpatialQuality::Full;
+      Rig rig(env.be, src, cam);
+      engine::EngineSession cpuEs;  // no executor override and no provider in this binary: the CPU executor
+      std::vector<double> tg, tc;
+      std::string err;
+      for (int i = 0; i < 6; ++i) {
+        int w = 0, h = 0;
+        auto t0 = Clk::now();
+        std::uint8_t* px = rig.render(p, r, src, fo, 41, w, h, nullptr, err, 0, 0.f, lut);
+        const double g = ms(t0);
+        std::free(px);
+        if (i >= 1) tg.push_back(g);
+        if (i < 3) {
+          engine::FrameJob job{p, r, src, nullptr, cam, lut, {}, {}, {}};
+          job.request.bakeSize = 41;
+          job.fastOptions = fo;
+          engine::FrameResult res;
+          t0 = Clk::now();
+          cpuEs.renderFrame(job, res);
+          if (i >= 1) tc.push_back(ms(t0));
+          std::free(res.rgba);
+        }
+      }
+      std::printf("  %-40s CPU %8.1f ms   GPU %7.1f ms   (x%.1f)\n", c.name, median(tc), median(tg), median(tc) / std::max(1e-3, median(tg)));
+    }
+  }
+  if (!with24mp) return;
+  std::printf("== film timings, 24 MP (6000x4000) export: CPU film export vs tiled GPU export ==\n");
+  const SourceImage big = makeTestImage(6000, 4000);
+  for (const Case& c : cases) {
+    EditParams p = baseParams();
+    c.set(p);
+    const Lut3D* lut = c.lut ? &testLut() : nullptr;
+    Renderer r(p, cam, lut);
+    Rig rig(env.be, big, cam);
+    std::string err;
+    int w = 0, h = 0;
+    double gpuMs[2] = {0, 0};
+    for (int rep = 0; rep < 2; ++rep) {  // the second run has the device source and film tables warm
+      auto t0 = Clk::now();
+      std::vector<std::uint8_t> sink8;
+      const bool ok = rig.exportTiled(p, r, big, 0, 65, 2048, false, 0.f, [&](int ow, int oh) { w = ow; h = oh; sink8.assign(std::size_t(ow) * oh * 4, 0); },
+                                      [&](int x, int y, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
+                                        for (int j = 0; j < th; ++j) std::memcpy(sink8.data() + (std::size_t(y + j) * w + x) * 4, rgba + std::size_t(j) * stride, std::size_t(tw) * 4);
+                                        return true;
+                                      },
+                                      nullptr, err, lut);
+      gpuMs[rep] = ms(t0);
+      CHECK(ok, "%s: GPU export: %s", c.name, err.c_str());
+      if (!ok) break;
+    }
+    engine::EngineSession cpuEs;
+    Image8 out;
+    engine::EngineSession::ExactOptions o;
+    auto t0 = Clk::now();
+    const bool okc = cpuEs.renderExact(p, r, big, o, out, &err);
+    const double cpuMs = ms(t0);
+    CHECK(okc, "%s: CPU export: %s", c.name, err.c_str());
+    std::printf("  %-40s CPU %9.0f ms   GPU %8.0f ms (first %8.0f ms)   (x%.1f)\n", c.name, cpuMs, gpuMs[1], gpuMs[0], cpuMs / std::max(1e-3, gpuMs[1]));
+    std::printf("      transient pool kept after the export: %.0f MB (%.0f bytes per pixel)\n", double(env.be->pooledBytes()) / 1048576.0,
+                double(env.be->pooledBytes()) / (6000.0 * 4000.0));
+  }
+}
+
+// The device keeps the frame-global solves: a frame that only changes parameters downstream of the dehaze (sharpen) is planned without the
+// accumulation sweep and the solve, and renders the same pixels as a session that has to solve.
+void testSolveCache(Env& env) {
+  std::printf("== device solve cache: dehaze solve kept between frames ==\n");
+  const SourceImage src = makeTestImage(900, 600);
+  const CameraProfile& cam = env.cams.resolve("", "");
+  FastOptions fo;
+  fo.spatial = SpatialQuality::Full;
+  auto render = [&](Rig& rig, int sharpen, engine::GpuStats* st) {
+    EditParams p = baseParams();
+    p.dehaze = 35;
+    p.sharpen = float(sharpen);
+    Renderer r(p, cam, nullptr);
+    int w = 0, h = 0;
+    std::string err;
+    std::uint8_t* px = rig.render(p, r, src, fo, 41, w, h, st, err);
+    CHECK(px != nullptr, "render: %s", err.c_str());
+    return std::make_pair(px, std::size_t(w) * h * 4);
+  };
+  Rig warm(env.be, src, cam), cold(env.be, src, cam);
+  engine::GpuStats s1, s2, s3;
+  auto a = render(warm, 20, &s1);   // solves (miss), stores the grid
+  auto b = render(warm, 45, &s2);   // sharpen changed: the dehaze solve is a hit
+  auto c = render(cold, 45, &s3);   // fresh session: solves
+  std::printf("  passes: first %d, solve kept %d, fresh session %d\n", s1.passes, s2.passes, s3.passes);
+  CHECK(s2.passes < s3.passes, "the kept solve must save passes (%d vs %d)", s2.passes, s3.passes);
+  if (b.first && c.first) {
+    const DeStats d = compareRgba8(b.first, c.first, b.second / 4);
+    std::printf("  kept solve vs fresh solve: mean %.5f max %.3f\n", d.mean, d.max);
+    CHECK(std::memcmp(b.first, c.first, b.second) == 0, "a kept solve must give the same pixels as solving again");
+  }
+  std::free(a.first);
+  std::free(b.first);
+  std::free(c.first);
+  // the guided filter coefficients (clarity) are kept too: the same frame again needs neither accumulation sweep nor solve
+  {
+    Rig rig(env.be, src, cam);
+    engine::GpuStats f1, f2;
+    EditParams p = baseParams();
+    p.dehaze = 25;
+    p.clarity = 35;
+    p.sharpen = 30;
+    Renderer r(p, cam, nullptr);
+    int w = 0, h = 0;
+    std::string err;
+    std::uint8_t* x1 = rig.render(p, r, src, fo, 41, w, h, &f1, err);
+    std::uint8_t* x2 = rig.render(p, r, src, fo, 41, w, h, &f2, err);
+    CHECK(x1 && x2, "render: %s", err.c_str());
+    std::printf("  dehaze + clarity, same frame twice: passes %d -> %d\n", f1.passes, f2.passes);
+    CHECK(f2.passes < f1.passes, "both solves kept: %d vs %d passes", f2.passes, f1.passes);
+    if (x1 && x2) CHECK(std::memcmp(x1, x2, std::size_t(w) * h * 4) == 0, "kept solves must reproduce the frame");
+    std::free(x1);
+    std::free(x2);
   }
 }
 
@@ -477,6 +939,20 @@ void testBlocklist() {
 
 int main(int argc, char** argv) {
   bool quick = argc > 1 && std::string(argv[1]) == "--quick";
+  {  // the film library: without it a film stock of an edit is ignored and the film rows would render the normal pipeline
+    std::string ferr;
+    namespace fs = std::filesystem;
+    const char* envData = std::getenv("DAPPLE_FILM_DATA");  // on a phone: the pushed folder holding dapple.dfp
+    const fs::path data = envData ? fs::path(envData) : fs::path(DAPPLE_SOURCE_DIR) / "core" / "data" / "film";
+    std::shared_ptr<film::FilmLibrary> lib;
+    if (fs::exists(data / "dapple.dfp")) lib = film::FilmLibrary::loadPack(data / "dapple.dfp", &ferr);
+    if (!lib) lib = film::FilmLibrary::loadJsonDir(data / "profiles", &ferr);
+    if (!lib) {
+      std::printf("film library not found (%s)\n", ferr.c_str());
+      return 1;
+    }
+    film::setLibrary(lib);
+  }
   Env env;
   eg::ContextOptions o;
   o.device.allowSoftware = std::getenv("DAPPLE_GPU_SOFTWARE") && std::getenv("DAPPLE_GPU_SOFTWARE")[0] == '1';
@@ -489,12 +965,45 @@ int main(int argc, char** argv) {
     return err.find("no Vulkan") != std::string::npos || err.find("no usable Vulkan device") != std::string::npos ? 77 : 1;
   }
   std::printf("%s\nself-test: %s\n\n", env.be->deviceText().c_str(), env.be->selfTestReport().c_str());
+  if (argc > 1 && std::string(argv[1]) == "--exact") {
+    testExact(env);
+    testNoFallback(env);
+    testSolveCache(env);
+    std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
+    return g_fail ? 1 : 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--film-interactive") {
+    testFilmInteractive(env, argc > 2 ? std::atoi(argv[2]) : 1080);
+    return g_fail ? 1 : 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--film-timing") {
+    testFilmTiming(env, argc > 2 && std::string(argv[2]) == "24mp");
+    return g_fail ? 1 : 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--solve-cache") {
+    testSolveCache(env);
+    return g_fail ? 1 : 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--coverage") {
+    testNoFallback(env);
+    std::printf("%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
+    return g_fail ? 1 : 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--film-tiling") {  // only the film seam test (with a 4000 px picture too on a real GPU)
+    testFilmTiling(env);
+    testExact(env);
+    // the 4000 px picture needs a whole-frame film reference (288 bytes per pixel on the device): only where that fits
+    if (!env.be->caps().software && std::uint64_t(4000) * 2667 * 288 * 20 / 9 <= env.be->caps().deviceLocalBytes) testFilmTiling(env, 4000, 2667, {512, 1000, 2048});
+    std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED", g_fail, g_fail == 1 ? "" : "s");
+    return g_fail ? 1 : 0;
+  }
   testStages(env);
   if (!quick) {
     testHalfBudget(env);
     testDownscale(env);
     testTiling(env, false);
     testTiling(env, true);
+    testFilmTiling(env);
     if (!env.be->caps().software) testTiling(env, true, 4000, 2667, {512, 1000, 2048});  // radii ~2x: larger halos
     testSteadyState(env);
     testCApiHook(env);

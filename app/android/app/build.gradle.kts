@@ -16,6 +16,10 @@ android {
 
     defaultConfig {
         applicationId = "com.dapple.dapple"
+        // Side-by-side dev install: -Pdapple.idSuffix=.dev -> com.dapple.dapple.dev, label "Dapple Dev". Default: unchanged.
+        val idSuffix = (project.findProperty("dapple.idSuffix") as String?) ?: ""
+        if (idSuffix.isNotEmpty()) applicationIdSuffix = idSuffix
+        manifestPlaceholders["appLabel"] = if (idSuffix.isNotEmpty()) "Dapple Dev" else "Dapple"
         minSdk = maxOf(29, flutter.minSdkVersion)
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
@@ -34,9 +38,16 @@ android {
                     "-DANDROID_STL=c++_shared",
                     "-DFETCHCONTENT_SOURCE_DIR_LIBRAW=F:/projects/sony-render/tools/_dl/libraw/LibRaw-0.22.2",
                 )
-                // GPU compute backend (core/gpu, docs/engine/gpu-backend.md): off unless built with -Pdapple.gpu=true.
-                // Even then it only runs when the runtime flag is set (dapple_gpu_set_enabled / debug.dapple.gpu).
-                if (project.hasProperty("dapple.gpu")) arguments("-DDAPPLE_GPU=ON")
+                // GPU executor (core/engine, docs/engine/pipeline-architecture.md 24): Vulkan + GLES 3.1 are compiled in by default and used when the
+                // start-up self-test of the device passed (no user switch; developer kill switch: setprop debug.dapple.gpu 0).
+                // -Pdapple.gpu=false builds a CPU-only app. The GLES shaders are translated by the host tool dapple_shaderc (tools/shaderc).
+                if (project.findProperty("dapple.gpu") != "false") {
+                    arguments(
+                        "-DDAPPLE_GPU=ON",
+                        "-DDAPPLE_GLES=ON",
+                        "-DDAPPLE_SHADERC_EXE=F:/projects/sony-render/build/shaderc/dapple_shaderc.exe",
+                    )
+                }
                 targets("dapple", "dapple_video")
             }
         }

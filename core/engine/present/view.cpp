@@ -1,6 +1,7 @@
 // dapple_view_* (core/include/dapple/dapple_view.h): the composition of RenderLoop + Presenter + the C API session.
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,7 @@ struct DappleView {
   std::string analysis;
   bool hasAnalysis = false;
   std::string lastErr;          // newest failure text (anMu)
+  std::string lastActive;       // active_param of the newest rendered snapshot (anMu; info json, tests)
   void setErr(const std::string& e) { std::lock_guard<std::mutex> l(anMu); lastErr = e; }
 
   // stats (loop thread writes, info reads)
@@ -90,6 +92,11 @@ struct DappleView {
         rq.long_edge = s.longEdge;
         rq.flags = s.flags;
         rq.bake_size = s.bakeSize;
+        if (!s.activeParam.empty()) rq.active_param = s.activeParam.c_str();  // grain stays on while a grain slider is dragged
+        {
+          std::lock_guard<std::mutex> al(anMu);
+          lastActive = s.activeParam;
+        }
         DappleImage img{};
         char* an = nullptr;
         // zero readback: ask the presenter for an image on the engine's device when the size of the frame can be estimated
@@ -289,6 +296,9 @@ int64_t dapple_view_submit(DappleView* v, const char* params, const char* lut, c
     s.longEdge = rq->long_edge;
     s.flags = rq->flags;
     s.bakeSize = rq->bake_size;
+    // active_param is additive: honoured only when the caller's struct covers it (size-versioned like dapple_session_render_frame)
+    const std::size_t covers = offsetof(DappleFrameRequest, active_param) + sizeof(rq->active_param);
+    if (rq->size > 0 && std::size_t(rq->size) >= covers && rq->active_param) s.activeParam = rq->active_param;
   }
   return std::int64_t(v->loop->submit(std::move(s)));
 }
@@ -344,13 +354,21 @@ char* dapple_view_info_json(DappleView* v) {
   }
   for (char& c : errCopy)
     if (c == '"' || c == '\\' || c < 32) c = ' ';
-  char buf[1400];
+  std::string activeCopy;
+  {
+    std::lock_guard<std::mutex> l(v->anMu);
+    activeCopy = v->lastActive;
+  }
+  for (char& c : activeCopy)
+    if (c == '"' || c == '\\' || c < 32) c = ' ';
+  if (activeCopy.size() > 40) activeCopy.resize(40);
+  char buf[1500];
   std::snprintf(buf, sizeof buf,
                 "{\"presenter\":%s,\"loop\":{\"submits\":%llu,\"renders\":%llu,\"dropped\":%llu,\"wakeups\":%llu,\"vsyncs\":%llu,"
                 "\"skippedByCap\":%llu},\"shown\":%llu,\"renderFailed\":%llu,\"presentFailed\":%llu,\"noTarget\":%llu,"
                 "\"renderMs\":%.2f,\"presentMs\":%.2f,\"latencyMs\":%.2f,\"emaRenderMs\":%.2f,\"emaPresentMs\":%.2f,"
                 "\"headroom\":%.3f,\"divisor\":%d,\"adpf\":%s,\"zeroReadback\":{\"externalFrames\":%llu,\"hostFrames\":%llu,"
-                "\"hostBytes\":%llu,\"tooSmall\":%llu,\"refused\":%llu,\"emaFenceMs\":%.2f},\"lastError\":\"%s\"}",
+                "\"hostBytes\":%llu,\"tooSmall\":%llu,\"refused\":%llu,\"emaFenceMs\":%.2f},\"lastError\":\"%s\",\"activeParam\":\"%s\"}",
                 pi.c_str(), (unsigned long long)st.submits, (unsigned long long)st.renders, (unsigned long long)st.dropped,
                 (unsigned long long)st.wakeups, (unsigned long long)st.vsyncs, (unsigned long long)st.skippedByCap,
                 (unsigned long long)v->shown.load(), (unsigned long long)v->failedRender.load(),
@@ -358,9 +376,17 @@ char* dapple_view_info_json(DappleView* v) {
                 v->lastPresentMs.load(), v->lastLatencyMs.load(), v->emaRenderMs.load(), v->emaPresentMs.load(), double(v->headroom.load()),
                 v->userDivisor, dapple::sys::adpf().hintAvailable() ? "true" : "false", (unsigned long long)v->extFrames.load(),
                 (unsigned long long)v->hostFrames.load(), (unsigned long long)v->hostBytes.load(), (unsigned long long)v->extTooSmall.load(),
-                (unsigned long long)v->extRefused.load(), v->emaFenceMs.load(), errCopy.c_str());
-  char* out = static_cast<char*>(std::malloc(std::strlen(buf) + 1));
-  if (out) std::memcpy(out, buf, std::strlen(buf) + 1);
+                (unsigned long long)v->extRefused.load(), v->emaFenceMs.load(), errCopy.c_str(), activeCopy.c_str());
+  std::string js(buf);
+  if (char* es = dapple_engine_stats_json()) {  // which executor rendered the frames (GPU / CPU, reasons), process-wide
+    if (!js.empty() && js.back() == '}') js.pop_back();
+    js += ",\"engine\":";
+    js += es;
+    js += "}";
+    dapple_free_string(es);
+  }
+  char* out = static_cast<char*>(std::malloc(js.size() + 1));
+  if (out) std::memcpy(out, js.c_str(), js.size() + 1);
   return out;
 }
 

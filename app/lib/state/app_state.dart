@@ -270,7 +270,11 @@ class AppState extends ChangeNotifier {
     return a.first.progress;
   }
 
+  /// The production app without the photo permission: not a lost link, just nothing to read yet.
+  bool get needsMediaPermission => !isDemo && !mediaPermitted;
+
   String get connTitle {
+    if (needsMediaPermission) return '还不能读取手机里的照片';
     switch (connState) {
       case ConnState.disconnected:
         return '${cameraName.isEmpty ? '手机相册' : cameraName} · 已断开';
@@ -283,6 +287,7 @@ class AppState extends ChangeNotifier {
   }
 
   String get connLine {
+    if (needsMediaPermission) return '允许后，手机相册里的照片会出现在这里';
     switch (connState) {
       case ConnState.disconnected:
         return '最后收到第 ${_photos.length} 张';
@@ -306,6 +311,7 @@ class AppState extends ChangeNotifier {
 
   /// Label of the card's action button or null.
   String? get connAction {
+    if (needsMediaPermission) return '允许访问';
     switch (connState) {
       case ConnState.interrupted:
         return '重试';
@@ -333,8 +339,12 @@ class AppState extends ChangeNotifier {
           notifyListeners();
         } else {
           // No camera transport yet: only the gallery permission can be (re)granted here.
-          if (!mediaPermitted) await requestPermission();
-          showToast(mediaPermitted ? '相机无线接收暂未开放，目前从手机相册导入' : '需要允许访问照片');
+          if (!mediaPermitted) {
+            await requestPermission();
+            if (!mediaPermitted) showToast('需要允许访问照片');
+          } else {
+            showToast('相机无线接收暂未开放，目前从手机相册导入');
+          }
         }
         break;
       case ConnState.connected:

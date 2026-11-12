@@ -158,6 +158,10 @@ class Renderer {
   // stages (noise reduction, dehaze, clarity, texture, sharpening, grain), used by the tone analysis.
   ImageF renderFloat(const SourceImage& source, bool spatial = true) const;
 
+  // Per-channel linear gain the pipeline applies to the source before tone mapping / the film (white balance x develop
+  // exposure x the camera's baseline exposure), for scene statistics.
+  void sceneGain(const SourceImage& source, float gain[3]) const;
+
  private:
   struct Curve1D {
     std::vector<float> table;  // samples over [0,1]

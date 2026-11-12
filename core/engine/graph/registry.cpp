@@ -85,7 +85,7 @@ NodeRegistry::NodeRegistry() {
   }
   {
     ParamMask m = COLOUR;
-    m.add(P.mask({"ctx.camera", "ctx.source", "ctx.lutIdentity", "ctx.filmActive"}));
+    m.add(P.mask({"ctx.camera", "ctx.source", "ctx.lutIdentity", "ctx.filmOnly"}));
     NodeDesc& d = def(NodeType::LatticeOverflow, "LatticeOverflow", Domain::Table, Footprint::Global, 0, 1, m);
     d.inputDomain[0] = Domain::Table;
     d.cache = CacheHint::Keep;
@@ -116,8 +116,7 @@ NodeRegistry::NodeRegistry() {
   }
   {
     ParamMask m = ANALYSIS;
-    NodeDesc& d = def(NodeType::ToneColourExact, "ToneColourExact", Domain::Image, Footprint::Point, 1, 1, m);
-    d.gpuImpl = false;
+    def(NodeType::ToneColourExact, "ToneColourExact", Domain::Image, Footprint::Point, 1, 1, m);
   }
   {
     ParamMask m = FRAME;
@@ -148,7 +147,7 @@ NodeRegistry::NodeRegistry() {
   {
     ParamMask m = FRAME;
     m.add(WB).add(P.mask({"exposure", "filmStock", "filmPaper", "film_exp", "film_warmth", "film_tint", "film_grain",
-                          "film_halation", "ctx.filmKeyEv", "ctx.camera", "ctx.source", "ctx.filmLib", "ctx.quality", "ctx.filmActive"}));
+                          "film_halation", "ctx.filmKeyEv", "ctx.filmPrintEv", "film_black", "ctx.camera", "ctx.source", "ctx.filmLib", "ctx.quality", "ctx.filmActive"}));
     NodeDesc& d = def(NodeType::FilmSim, "FilmSim", Domain::Image, Footprint::Super, 1, 1, m);
     d.usesGeometry = true;
     d.haloNote = "spectral film simulator incl. halation / DIR / grain / scan";
@@ -172,7 +171,7 @@ NodeRegistry::NodeRegistry() {
   {
     // dragging print warmth / tint re-bakes only this table
     NodeDesc& d = def(NodeType::FilmTablePrintScan, "FilmTablePrintScan", Domain::Table, Footprint::Global, 0, 0,
-                      P.mask({"filmStock", "filmPaper", "film_warmth", "film_tint", "ctx.filmLib"}));
+                      P.mask({"filmStock", "filmPaper", "film_warmth", "film_tint", "ctx.filmPrintEv", "film_black", "ctx.filmLib"}));
     d.cache = CacheHint::Keep;
     d.haloNote = "33^3 film density -> display sRGB LUT, glare white, sRGB decode";
   }
@@ -218,10 +217,24 @@ NodeRegistry::NodeRegistry() {
     d.haloNote = "stateless hash noise + dye-cloud / grain blur (a few px)";
   }
   {
+    // identity unless the film has an enlarger diffusion filter (FilmResolved::fx, not an edit parameter)
+    NodeDesc& d = def(NodeType::FilmPrintExposure, "FilmPrintExposure", Domain::Image, Footprint::Point, 2, 2, FILMPITCH);
+    d.inputDomain[0] = Domain::Image;
+    d.inputDomain[1] = Domain::Table;  // FilmTablePrintScan (split tables)
+    d.usesGeometry = true;
+    d.haloNote = "point: tetrahedral 3-D LUT density -> log paper exposure, then 10^x (enlarger diffusion path only)";
+  }
+  {
+    NodeDesc& d = def(NodeType::FilmEnlargerBlur, "FilmEnlargerBlur", Domain::Image, Footprint::Composite, 1, 1, FILMPITCH);
+    d.usesGeometry = true;
+    d.cache = CacheHint::KeepIfCheap;
+    d.haloNote = "enlarger diffusion filter: Gaussian mixtures of the linear paper exposure (enlarger diffusion path only)";
+  }
+  {
     NodeDesc& d = def(NodeType::FilmPrintScan, "FilmPrintScan", Domain::Image, Footprint::Point, 2, 2, ParamMask{});
     d.inputDomain[0] = Domain::Image;
     d.inputDomain[1] = Domain::Table;  // FilmTablePrintScan
-    d.haloNote = "point: tetrahedral 3-D LUT";
+    d.haloNote = "point: tetrahedral 3-D LUT (enlarger diffusion path: log10 + paper curve + scan LUT of the blurred paper exposure)";
   }
   {
     ParamMask m = FILMPITCH;

@@ -25,7 +25,7 @@ double msSince(Clock::time_point t) { return std::chrono::duration<double, std::
 // to the edit preview) run side by side; a frame takes the first free one.
 struct FrameWs {
   std::mutex m;
-  fd::AVec set[2];
+  fd::AVec set[3];
   fd::Arena arena;
 };
 constexpr int kFrameWs = 3;
@@ -74,7 +74,7 @@ bool runFilmFrame(const FilmResolved& r, const FilmTablesHandle& tb, const float
                   std::size_t outStride, int tileW, int tileH, FilmTimingsNodes* tm) {
   const auto tStart = Clock::now();
   const auto pd = planOf(r);
-  if (!pd->error.empty() || pd->split || pd->plan.boost || !tb.raw || !tb.curves || !tb.print) return false;
+  if (!pd->error.empty() || !tb.raw || !tb.curves || !tb.print) return false;
   const fd::SpatialPlan& pl = pd->plan;
   const int W = r.w, H = r.h;
   const fd::KernelSet& ks = fd::selectKernels();
@@ -97,8 +97,8 @@ bool runFilmFrame(const FilmResolved& r, const FilmTablesHandle& tb, const float
   ArenaScope arenaScope(&fw.arena);
   const std::size_t stride = (std::size_t(W) + 15) & ~std::size_t(15);
   const std::size_t planeStride = stride * H;
-  for (auto& s : fw.set)
-    if (s.size() < planeStride * 3) s = fd::AVec(planeStride * 3);
+  for (int i = 0; i < (pd->split ? 3 : 2); ++i)
+    if (fw.set[i].size() < planeStride * 3) fw.set[i] = fd::AVec(planeStride * 3);
   float* const S0 = fw.set[0].data();
   float* const S1 = fw.set[1].data();
   const Rect frame{0, 0, W, H};
@@ -126,7 +126,7 @@ bool runFilmFrame(const FilmResolved& r, const FilmTablesHandle& tb, const float
 
   // ---- FilmBlurExposure ------------------------------------------------------------------------------------------------------------
   t0 = Clock::now();
-  const bool blurActive = pl.preMix || pl.haloMix;
+  const bool blurActive = pl.preMix || pl.haloMix || pl.boost;  // boost: FilmBlurExposure (global maximum, then the curve)
   float* E2d = S0;
   float* Qd = S1;
   if (blurActive) {
@@ -151,6 +151,14 @@ bool runFilmFrame(const FilmResolved& r, const FilmTablesHandle& tb, const float
   }
   T.dirMs = msSince(t0);
 
+  // ---- enlarger diffusion path (spec 03 s6.1): tile pass 1 (FilmDevelop -> FilmGrain -> FilmPrintExposure) writes the linear paper
+  // exposure into frame-sized planes, FilmEnlargerBlur filters them, tile pass 2 (FilmPrintScan -> [FilmGlare -> FilmScan]) reads them
+  // with the reflect boundary. E2 / q are dead after pass 1, their set takes the filtered exposure.
+  const bool split = pd->split;
+  float* const S2 = split ? fw.set[2].data() : nullptr;
+  const ImageView Epv = split ? planarView(S2, W, H, stride, planeStride, frame) : ImageView{};
+  const ImageView Ebv = split ? planarView(E2d, W, H, stride, planeStride, frame) : ImageView{};
+
   // ---- tile pass: FilmDevelop -> FilmGrain -> FilmPrintScan [-> FilmGlare -> FilmScan] -----------------------------------------------
   t0 = Clock::now();
   const int Hs = pd->Hs, Hg = pd->Hg, Hd = pd->Hd;
@@ -159,13 +167,12 @@ bool runFilmFrame(const FilmResolved& r, const FilmTablesHandle& tb, const float
   const bool scanStage = pd->scanStage;
   const bool grain = pl.grain.active;
   std::atomic<int> failed{0};
-  parallelFor(
-      ntx * nty,
-      [&](int ti) {
+  // pass: 0 whole chain; 1 split pass 1 (develop, grain, paper exposure); 2 split pass 2 (paper scan, glare, scan)
+  auto tilePass = [&](int ti, int pass) {
         const int tx = ti % ntx, ty = ti / ntx;
         const Rect tile{tx * TW, ty * TH, std::min(W, tx * TW + TW), std::min(H, ty * TH + TH)};
-        const Rect rS = grow(tile, Hs);                 // print/scan output, glare, scan input
-        const Rect rD = grow(rS, grain ? Hg + Hd : 0);  // develop output / grain input
+        const Rect rS = grow(tile, pass == 1 ? 0 : Hs);                 // print/scan output, glare, scan input
+        const Rect rD = grow(rS, grain && pass != 2 ? Hg + Hd : 0);  // develop output / grain input
         const int dw = rw(rD), dh = rh(rD);
         const std::ptrdiff_t dls = (dw + 15) & ~15;
         const std::size_t dps = std::size_t(dls) * dh;
@@ -178,19 +185,30 @@ bool runFilmFrame(const FilmResolved& r, const FilmTablesHandle& tb, const float
         float* disp = base + dps * 3;
         float* Lp = Dp;  // the density planes are dead once FilmPrintScan has read them: the linear-light planes reuse them
         CpuCtx c = ctx;
-        {
-          const void* tabs[1] = {tCur};
+        ImageView Dout;
+        if (pass != 2) {
+          {
+            const void* tabs[1] = {tCur};
+            c.tables = tabs;
+            const ImageView D = planarView(Dp, dw, dh, std::size_t(dls), dps, rD);
+            const ImageView ins[2] = {E2v, Qv};
+            if (runDevelop(c, &r, {ins, dirActive ? std::size_t(2) : std::size_t(1)}, {&D, 1}) != Status::Ok) failed = 1;
+          }
+          const ImageView Dfull = planarView(Dp, dw, dh, std::size_t(dls), dps, rD);
+          float* Dsub = Dp + std::size_t(rS.y0 - rD.y0) * dls + (rS.x0 - rD.x0);
+          Dout = planarView(Dsub, sw, sh, std::size_t(dls), dps, rS);
+          if (grain) {
+            if (runGrain(c, &r, {&Dfull, 1}, {&Dout, 1}) != Status::Ok) failed = 1;
+          }
+        }
+        if (pass == 1) {  // FilmPrintExposure into the frame-sized planes (rS == tile)
+          const void* tabs[1] = {tPrint};
           c.tables = tabs;
-          const ImageView D = planarView(Dp, dw, dh, std::size_t(dls), dps, rD);
-          const ImageView ins[2] = {E2v, Qv};
-          if (runDevelop(c, &r, {ins, dirActive ? std::size_t(2) : std::size_t(1)}, {&D, 1}) != Status::Ok) failed = 1;
+          const ImageView ep = planarView(S2 + std::size_t(tile.y0) * stride + std::size_t(tile.x0), rw(tile), rh(tile), stride, planeStride, tile);
+          if (runPrintExposure(c, &r, {&Dout, 1}, {&ep, 1}) != Status::Ok) failed = 1;
+          return;
         }
-        const ImageView Dfull = planarView(Dp, dw, dh, std::size_t(dls), dps, rD);
-        float* Dsub = Dp + std::size_t(rS.y0 - rD.y0) * dls + (rS.x0 - rD.x0);
-        const ImageView Dout = planarView(Dsub, sw, sh, std::size_t(dls), dps, rS);
-        if (grain) {
-          if (runGrain(c, &r, {&Dfull, 1}, {&Dout, 1}) != Status::Ok) failed = 1;
-        }
+        if (pass == 2) Dout = Ebv;  // FilmPrintScan reads the filtered exposure of the whole frame
         float* outTile = out + std::size_t(tile.y0) * outStride + std::size_t(3) * tile.x0;
         const void* tabs[1] = {tPrint};
         c.tables = tabs;
@@ -205,8 +223,14 @@ bool runFilmFrame(const FilmResolved& r, const FilmTablesHandle& tb, const float
         if (runGlare(c, &r, {&o, 1}, {&Lv, 1}) != Status::Ok) failed = 1;
         const ImageView fin = packedView(outTile, rw(tile), rh(tile), outStride, tile);
         if (runScan(c, &r, {&Lv, 1}, {&fin, 1}) != Status::Ok) failed = 1;
-      },
-      1);
+  };
+  if (!split) {
+    parallelFor(ntx * nty, [&](int ti) { tilePass(ti, 0); }, 1);
+  } else {
+    parallelFor(ntx * nty, [&](int ti) { tilePass(ti, 1); }, 1);
+    if (failed.load() == 0 && runEnlargerBlur(ctx, &r, {&Epv, 1}, {&Ebv, 1}) != Status::Ok) failed = 1;
+    if (failed.load() == 0) parallelFor(ntx * nty, [&](int ti) { tilePass(ti, 2); }, 1);
+  }
   T.tileMs = msSince(t0);
   T.totalMs = msSince(tStart);
   return failed.load() == 0;
@@ -236,11 +260,14 @@ bool filmFrameResolved(const FilmFrameArgs& a, FilmResolved& r) {
   for (int c = 0; c < 3; ++c) r.gain[c] = a.gain[c] * evGain;
   r.warmth = a.warmth;
   r.tint = a.tint;
+  r.printEv = a.printEv;
+  r.black = a.black;
   r.grainPct = a.grainPct;
   r.halationPct = a.halationPct;
   r.formatScale = a.formatScale;
   r.w = a.w;
   r.h = a.h;
+  r.fx = a.fx;
   r.quality = std::uint8_t(a.quality);
   r.keepGrain = a.keepGrain ? 1 : 0;
   r.fullLongEdge = a.fullLongEdge;

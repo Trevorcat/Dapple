@@ -27,7 +27,7 @@ struct NodeDesc {
   ParamKey orderKey = kNoKey;      // a context key that selects among interchangeable results (lattice size): part of
                                    // the node key but not of its family (see ResultCache)
   bool usesGeometry = false;       // output depends on frame geometry (spatial outputs)
-  bool cpuImpl = true, gpuImpl = false;
+  bool cpuImpl = true;             // (the GPU implementations are asked of gpuImplFor(NodeType), nodes/gpu_nodes.h)
   CacheHint cache = CacheHint::Never;
   const char* haloNote = "";       // human readable: the neighbourhood this node reads (declared, executed whole-frame in a6)
 };

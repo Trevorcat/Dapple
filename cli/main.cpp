@@ -31,6 +31,7 @@
 #include "dapple/ingest.h"
 #include "dapple/lut.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 #include "dapple/xmp_preset.h"
 #include "eval.h"
 #include "film_cmds.h"
@@ -379,8 +380,12 @@ int cmdBench(const Options& o) {
   int w = 0, h = 0;
   for (int i = 0; i < std::max(1, o.repeat) + 1; ++i) {
     const auto t0 = std::chrono::steady_clock::now();
-    Renderer r(look.params, cam, look.lut ? &*look.lut : nullptr);
-    const Image8 img = r.render(*src);
+    Image8 img;
+    std::string err;
+    if (!engine::renderImage8(look.params, cam, look.lut ? &*look.lut : nullptr, *src, img, &err)) {
+      std::fprintf(stderr, "bench: %s\n", err.c_str());
+      return 1;
+    }
     w = img.width;
     h = img.height;
     if (i > 0) ms.push_back(msSince(t0));  // first run warms caches and the thread pool

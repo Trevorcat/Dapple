@@ -41,6 +41,39 @@ void main() {
   });
 
 
+  testWidgets('diagnostics lists the GPU probe state, the executor frame counts and the CPU reasons', (tester) async {
+    const gpu = '{"mode":"auto","state":"ready","enabled":true,"available":true,"api":"vulkan","device":"Adreno 620","selfTest":"point+geometry: ok",'
+        '"skipped":"","executors":{"gpuFrames":120,"cpuFrames":7,"deviceLost":0,"demotions":0,"api":"vulkan","lastReason":"",'
+        '"unsupported":{"GPU self-test running":5,"unsupported on the GPU: film frame":2}}}';
+    await tester.pumpWidget(MaterialApp(
+      theme: buildTheme(Brightness.light),
+      home: CodecDiagnosticsPage(loader: ({bool run = false, bool force = false}) async => _report, gpuLoader: () => gpu),
+    ));
+    await tester.pumpAndSettle();
+    final text = tester.widget<SelectableText>(find.byKey(const ValueKey('codec-report'))).data!;
+    expect(text, contains('mode auto · probe ready · in use'));
+    expect(text, contains('vulkan · Adreno 620'));
+    expect(text, contains('frames: GPU 120 · CPU 7 · last executor vulkan'));
+    expect(text, contains('5  GPU self-test running'));
+    expect(text, contains('2  unsupported on the GPU: film frame'));
+  });
+
+  testWidgets('diagnostics says so when the GPU probe failed or the build has no GPU', (tester) async {
+    Future<String> rep({bool run = false, bool force = false}) async => _report;
+    await tester.pumpWidget(MaterialApp(
+      theme: buildTheme(Brightness.light),
+      home: CodecDiagnosticsPage(loader: rep, gpuLoader: () => '{"mode":"auto","state":"failed","enabled":false,"available":false,"reason":"GPU unavailable: vulkan: self-test failed"}'),
+    ));
+    await tester.pumpAndSettle();
+    expect(tester.widget<SelectableText>(find.byKey(const ValueKey('codec-report'))).data!, contains('GPU unavailable: vulkan: self-test failed'));
+    await tester.pumpWidget(MaterialApp(
+      theme: buildTheme(Brightness.light),
+      home: CodecDiagnosticsPage(key: const ValueKey('b'), loader: rep, gpuLoader: () => '{"compiled":false,"enabled":false,"available":false}'),
+    ));
+    await tester.pumpAndSettle();
+    expect(tester.widget<SelectableText>(find.byKey(const ValueKey('codec-report'))).data!, contains('every frame is a CPU frame'));
+  });
+
   testWidgets('long-pressing the version on 关于 opens the diagnostics; a plain tap does nothing', (t) async {
     t.view.physicalSize = const Size(1080, 2400);
     t.view.devicePixelRatio = 3;

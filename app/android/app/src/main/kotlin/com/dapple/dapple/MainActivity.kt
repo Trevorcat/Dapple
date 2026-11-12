@@ -48,6 +48,9 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         val messenger = flutterEngine.dartExecutor.binaryMessenger
 
+        // GPU executor: self-test on a background thread, on by default when it passes (GpuProbe.kt); frames are CPU frames until then
+        GpuProbe.start(applicationContext)
+
         // Zero-copy display (stage d): SurfaceProducer textures drawn by the native view (DappleViewPlugin.kt)
         viewPlugin = DappleViewPlugin(applicationContext, messenger, flutterEngine.renderer)
 

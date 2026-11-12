@@ -12,7 +12,7 @@ import 'gesture_arbiter.dart' show ActiveKind;
 
 enum RowKind { oneD, discrete, twoD, action }
 
-enum TwoD { palette, tone, curve, wheel }
+enum TwoD { palette, tone, curve, wheel, offset }
 
 /// UI-only selections inside categories (not part of the photo's edit record).
 class PanelSel {
@@ -64,6 +64,9 @@ class ParamRow {
     this.reset,
     this.act,
     this.hint,
+    this.padX,
+    this.padY,
+    this.padLabels = const [],
   });
 
   final String id, label;
@@ -97,6 +100,11 @@ class ParamRow {
 
   // 2D
   final TwoD? twoD;
+
+  /// [TwoD.offset] pads: the params-map keys of the X and Y offsets (each in [-1, +1], 0 = automatic) and the four
+  /// edge labels: left, right, bottom, top.
+  final String? padX, padY;
+  final List<String> padLabels;
 
   /// Resets this row to its auto position.
   final EditState Function(EditState, RowContext)? reset;
@@ -150,6 +158,8 @@ class ParamRow {
           case TwoD.wheel:
             final z = c.sel.gradeZone;
             return e.values.containsKey(grKey(z, 'h')) || e.values.containsKey(grKey(z, 's'));
+          case TwoD.offset:
+            return e.values.containsKey(padX) || e.values.containsKey(padY);
         }
       case RowKind.action:
         return false;
@@ -178,6 +188,8 @@ class ParamRow {
             final z = c.sel.gradeZone;
             final s = e.value(grKey(z, 's'));
             return s == 0 ? '无' : '${fmtValue(Fmt.hue, e.value(grKey(z, 'h')))} · ${s.round()}';
+          case TwoD.offset:
+            return offsetPadText(e.value(padX!), e.value(padY!));
         }
       case RowKind.action:
         return fmt?.call(value(c)) ?? '';
@@ -243,6 +255,18 @@ class ParamRow {
   }
 }
 
+/// Latitude ruler scale: the stored offset -1 / 0 / +1 means an in-range guarantee of 55 / 80 / 98 % (piecewise linear).
+double latitudePercent(double v) => v <= 0 ? 80 + v * 25 : 80 + v * 18;
+
+/// Inverse of [latitudePercent].
+double latitudeFromPercent(double p) => p <= 80 ? (p - 80) / 25 : (p - 80) / 18;
+
+/// Offset pad readout: both offsets as signed hundredths, "自动" at the centre.
+String offsetPadText(double x, double y) {
+  String f(double v) => v == 0 ? '0' : '${v > 0 ? '+' : '−'}${(v.abs() * 100).round()}';
+  return x == 0 && y == 0 ? '自动' : '${f(x)} ${f(y)}';
+}
+
 /// "偏暖 12，偏浓 8" (requirements 4.7 aria text).
 String paletteText(Offset p) {
   final n = ((p.dy - 0.5).abs() * 200).round();
@@ -278,6 +302,9 @@ ParamRow _custom({
   EditState Function(EditState, RowContext)? reset,
   EditState Function(EditState)? act,
   String? hint,
+  String? padX,
+  String? padY,
+  List<String> padLabels = const [],
 }) =>
     ParamRow._(
       id: id,
@@ -300,6 +327,9 @@ ParamRow _custom({
       autoIndex: autoIndex,
       reset: reset,
       act: act,
+      padX: padX,
+      padY: padY,
+      padLabels: padLabels,
     );
 
 /// Rows of category [g] for the current selections (requirements 4.15.5, top to bottom).
@@ -516,16 +546,64 @@ List<ParamRow> _filmRows(RowContext c) {
   }
   rows.addAll([
     ParamRow.spec('film_strength', hint: '胶片效果与原图的混合比例'),
+    _offsetPad(
+      id: 'film_expo',
+      label: '曝光',
+      x: 'film_shoot',
+      y: 'film_print',
+      labels: const ['欠曝', '过曝', '深', '浅'],
+      hint: '横向：拍摄时欠曝或过曝；纵向：冲印的深浅。中心为自动',
+    ),
+    _custom(
+      id: 'film_latitude',
+      label: '宽容度',
+      kind: RowKind.oneD,
+      group: g,
+      min: 55,
+      max: 98,
+      auto: 80,
+      hint: '保证不溢出的亮度范围，80% 为自动',
+      read: (e) => latitudePercent(e.values['film_latitude'] ?? 0),
+      write: (e, v) => e.withValue('film_latitude', latitudeFromPercent(v)),
+      fmt: (v) => '${v.round()}%',
+    ),
+    _custom(
+      id: 'film_black',
+      label: '黑位',
+      kind: RowKind.oneD,
+      group: g,
+      min: -100,
+      max: 100,
+      auto: 0,
+      hint: '0 为纸的真黑；负值抬黑（哑光），正值压黑',
+      read: (e) => (e.values['film_black'] ?? 0) * 100,
+      write: (e, v) => e.withValue('film_black', v / 100),
+      fmt: (v) => fmtValue(Fmt.signed, v),
+    ),
     ParamRow.spec('film_grain', hint: '颗粒量，100 为该胶片的标准颗粒'),
     ParamRow.spec('film_halation', hint: '高光向周围的红色渗光'),
     if (stock.printed && !scanned) ...[
       ParamRow.spec('film_warmth', hint: '冲印时的黄色滤光，正值偏暖'),
       ParamRow.spec('film_tint', hint: '冲印时的品红滤光，正值偏品红'),
     ],
-    ParamRow.spec('film_exp', hint: '拍摄时的曝光偏移'),
   ]);
   return rows;
 }
+
+/// A film offset pad: two params-map keys, both normalised offsets in [-1, +1], 0 = automatic (the pad's centre).
+ParamRow _offsetPad({required String id, required String label, required String x, required String y, required List<String> labels, String? hint}) =>
+    _custom(
+      id: id,
+      label: label,
+      kind: RowKind.twoD,
+      group: EGroup.style,
+      twoD: TwoD.offset,
+      padX: x,
+      padY: y,
+      padLabels: labels,
+      hint: hint,
+      reset: (e, c) => e.withValue(x, 0).withValue(y, 0),
+    );
 
 /// Film off: the stock, the paper and every film knob go back to their defaults.
 EditState clearFilm(EditState e) {

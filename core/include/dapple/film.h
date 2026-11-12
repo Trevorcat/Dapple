@@ -178,6 +178,12 @@ struct ScannerParams {
   // Black / white print-luminance correction (spec 02 s3.10); implemented for the print path only.
   bool whiteCorrection = false, blackCorrection = false;
   double whiteLevel = 0.98, blackLevel = 0.01;
+  // true: the white / black references are the paper's own Dmin / Dmax (a slide: the clear / densest film) instead of the print
+  // of the film's extreme densities at the standard exposure (spec). Used by the develop pipeline's paper-to-screen mapping.
+  bool paperReference = false;
+  // With paperReference: where the paper's black goes, -1..1. 0 = its true luminance relative to the paper white (white scaling only),
+  // +1 = pinned to display black (scanner.blackLevel), -1 = lifted to a matte black (relative luminance 0.02, about L* 16).
+  double blackMix = 0;
   std::array<double, 2> unsharpMask{0.7, 0.7};  // (sigma px, amount)
 };
 struct KneeParams {

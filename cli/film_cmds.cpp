@@ -285,6 +285,24 @@ int cmdFilm(const std::vector<std::string>& args) {
     std::fprintf(stderr, "film: %s\n", err.c_str());
     return 1;
   }
+  // --neutral-from <film>: decision material, the print filter pack solved on that stock is used unchanged for this one (a single
+  // shared pack per paper instead of a neutral solve per stock)
+  if (a.has("--neutral-from")) {
+    FilmSimulator refSim(lib);
+    FilmParams rp = p;
+    rp.film = a.get("--neutral-from");
+    std::string re;
+    if (!refSim.setParams(rp, &re)) {
+      std::fprintf(stderr, "film: --neutral-from: %s\n", re.c_str());
+      return 2;
+    }
+    p.settings.neutralPrintFilters = false;
+    p.enlarger.cFilterNeutral = refSim.effectiveParams().enlarger.cFilterNeutral;
+    p.enlarger.mFilterNeutral = refSim.effectiveParams().enlarger.mFilterNeutral;
+    p.enlarger.yFilterNeutral = refSim.effectiveParams().enlarger.yFilterNeutral;
+  }
+  // the develop pipeline's paper-to-screen mapping (white / black correction) goes with the automatic exposure
+  if (a.get("--auto-exposure", "match") == "match") applyFilmPaperMapping(p, std::strtof(a.get("--black", "0").c_str(), nullptr));
   FilmSimulator sim(lib);
   FilmTimings bt;
   if (!sim.setParams(p, &err, &bt)) {
@@ -305,7 +323,7 @@ int cmdFilm(const std::vector<std::string>& args) {
   }
   const double loadMs = msSince(tl);
   const std::string aeMode = a.get("--auto-exposure", "match");
-  float matchEv = 0.f;
+  float matchEv = 0.f, matchPrintEv = 0.f;
   float matchGain[3] = {1.f, 1.f, 1.f};
   FilmMatchInfo mi;
   if (aeMode == "match") {
@@ -341,7 +359,79 @@ int cmdFilm(const std::vector<std::string>& args) {
       if (!probe.render(proxy.linear, po, nullptr, gain3)) return 0.f;
       return medianLightness(po);
     };
-    matchEv = solveFilmKeyEv(filmL, target, &mi);
+    const FilmMatchOptions mopt = FilmMatchOptions::fromEnv();
+    const float unity[3] = {1.f, 1.f, 1.f};  // the film sees the source as it is (gain 1)
+    const SceneStats stats = sceneLumaStats(proxy.linear, unity);
+    if (mopt.mode == FilmMatchMode::Pull || mopt.mode == FilmMatchMode::Full) {  // v2 / v3: one EV on the film
+      solveFilmKeyEv(filmL, target, &mi);
+      matchEv = resolveFilmKeyEv(lib->find(p.film), stats, mi.ev, mopt, &mi);
+    } else if (mopt.mode == FilmMatchMode::Window) {
+      // v4. A: film exposure from the stock's latitude; B: print exposure to the scene's key, limited by the paper
+      matchEv = chooseFilmEv(lib->find(p.film), stats, mopt, &mi);
+      mi.targetL = target;
+      const float gA = std::exp2(matchEv);
+      const float gainA[3] = {gA, gA, gA};
+      auto printL = [&](float pev) {
+        FilmParams qq = q;
+        qq.enlarger.printExposure = std::exp2(-double(pev));
+        std::string e3;
+        if (!probe.setParams(qq, &e3) || !probe.render(proxy.linear, po, nullptr, gainA)) return 0.f;
+        return medianLightness(po);
+      };
+      const FilmPrintRange prange = filmPrintRange(lib, p.film, p.paper);
+      matchPrintEv = solvePrintEv(printL, target, prange, &mi);
+      if (std::getenv("DAPPLE_MATCH_TRACE"))
+        std::fprintf(stderr, "paper range: white L* %.1f black L* %.1f usable %.1f..%.1f maxPrintEv %.2f\n", prange.lWhite, prange.lBlack, prange.loL, prange.hiL, prange.maxPrintEv);
+      FilmParams pf = p;
+      pf.enlarger.printExposure = std::exp2(-double(matchPrintEv));
+      if (!sim.setParams(pf, &err)) {
+        std::fprintf(stderr, "film: %s\n", err.c_str());
+        return 2;
+      }
+    } else {
+      // v5: one exposure decision per image, shared by all stocks, per-stock usability rescue, print constant (film_match.h)
+      EditParams ep0 = ep;
+      ep0.exposure = 0.f;
+      Renderer ref0(ep0, cam, nullptr);
+      ref0.setToneProxy(&proxy);
+      MeterInputs mi_in;
+      mi_in.lib = lib;
+      mi_in.film = p.film;
+      mi_in.paper = p.paper;
+      mi_in.st0 = mi_in.stFull = stats;
+      mi_in.keyL0 = medianLightness(ref0.renderFloat(proxy, false));
+      mi_in.shoot = std::atof(a.get("--shoot", "0").c_str());
+      mi_in.print = std::atof(a.get("--print", "0").c_str());
+      mi_in.latitude = std::atof(a.get("--latitude", "0").c_str());
+      mi_in.negativeBiasEv = mopt.negativeBiasEv;
+      mi_in.medianL = [&](float fev, float pev) {
+        FilmParams qq = q;
+        qq.enlarger.printExposure = std::exp2(-double(pev));
+        const float g = std::exp2(fev);
+        const float gain3[3] = {g, g, g};
+        std::string e3;
+        if (!probe.setParams(qq, &e3) || !probe.render(proxy.linear, po, nullptr, gain3)) return 0.f;
+        return medianLightness(po);
+      };
+      const FilmExposure fe = solveMeter(mi_in, &mi);
+      matchEv = fe.filmEv;
+      matchPrintEv = fe.printEv;
+      mi.targetL = target;
+      if (a.has("--pad-json")) {
+        const FilmPadInfo pad = filmPadInfo(mi_in);
+        std::ofstream f(P(a.get("--pad-json")));
+        f << "{\"shoot_ev\":[" << pad.shootEv[0] << "," << pad.shootEv[1] << "," << pad.shootEv[2] << "],\"print_l\":[" << pad.printL[0] << ","
+          << pad.printL[1] << "," << pad.printL[2] << "],\"black_l\":[" << pad.blackL[0] << "," << pad.blackL[1] << "," << pad.blackL[2]
+          << "],\"latitude\":[" << pad.latitude[0] << "," << pad.latitude[1] << "," << pad.latitude[2] << "],\"shared_ev\":" << pad.sharedEv
+          << ",\"final_ev\":" << pad.finalEv << "}\n";
+      }
+      FilmParams pf = p;
+      pf.enlarger.printExposure = std::exp2(-double(matchPrintEv));
+      if (!sim.setParams(pf, &err)) {
+        std::fprintf(stderr, "film: %s\n", err.c_str());
+        return 2;
+      }
+    }
     matchGain[0] = matchGain[1] = matchGain[2] = std::exp2(matchEv);
   }
   FilmTimings rt;
@@ -363,9 +453,23 @@ int cmdFilm(const std::vector<std::string>& args) {
   std::printf("%s -> %s (%dx%d)  %s + %s  neutral C/M/Y %.2f/%.2f/%.2f  auto-EV %+.2f  kernel %s\n", a.get("--in").c_str(),
               a.get("--out").c_str(), in.width, in.height, p.film.c_str(), p.paper.c_str(), e.enlarger.cFilterNeutral,
               e.enlarger.mFilterNeutral, e.enlarger.yFilterNeutral, rt.autoExposureEv, sim.kernelName());
-  if (aeMode == "match")
-    std::printf("match: key EV %+.2f  median L* develop %.1f  film at 0 EV %.1f -> matched %.1f  (%d evals)\n", matchEv, mi.targetL,
-                mi.filmL0, mi.filmL, mi.evals);
+  if (aeMode == "match") {
+    const auto bnd = [](FilmBound b) { return b == FilmBound::Toe ? "toe" : b == FilmBound::Shoulder ? "shoulder" : b == FilmBound::Fallback ? "fallback" : "-"; };
+    const auto pbnd = [](PrintBound b) { return b == PrintBound::PaperWhite ? "paper white" : b == PrintBound::PaperBlack ? "paper black" : b == PrintBound::SolverLimit ? "solver limit" : "-"; };
+    const FilmMatchMode rmode = FilmMatchOptions::fromEnv().mode;
+    if (rmode == FilmMatchMode::Meter)
+      std::printf("match: EV_scene %+.2f (key L* %.1f, meter %.4f -> %+.2f)  film EV shared %+.2f final %+.2f  in-range %.0f%% -> %.0f%% (below toe %.0f%%, above shoulder %.0f%%; %.2f / %.2f st)  print %+.2f (const %+.2f)  scene Y p2/p50/hi %.4f/%.3f/%.3f clipped %.1f%%\n",
+                  mi.evScene, mi.keyL0, double(mi.meterY), mi.evMeter, mi.sharedEv, matchEv, 100.0 * mi.fracShared, 100.0 * mi.fracFinal,
+                  100.0 * mi.fracBelowToe, 100.0 * mi.fracAboveShoulder, mi.stopsBelowToe, mi.stopsAboveShoulder, matchPrintEv, mi.printConst,
+                  double(mi.p2), double(mi.p50), double(mi.p995), 100.0 * double(mi.clipFrac));
+    else if (rmode == FilmMatchMode::Window)
+      std::printf("match: film EV %+.2f (window [%+.2f, %+.2f], bound %s)  print EV %+.2f (key L* %.1f -> %.1f, paper range %.1f..%.1f, bound %s)  scene Y p2/p50/hi %.4f/%.3f/%.3f clipped %.1f%%  develop median L* %.1f  (%d print evals)\n",
+                  matchEv, mi.evLo, mi.evHi, bnd(mi.bound), matchPrintEv, mi.targetL, mi.printL, mi.paperLoL, mi.paperHiL, pbnd(mi.printBound),
+                  double(mi.p2), double(mi.p50), double(mi.p995), 100.0 * double(mi.clipFrac), mi.targetL, mi.printEvals);
+    else
+      std::printf("match: key EV %+.2f  (full match %+.2f, pulled %+.2f, window %s[%+.2f, %+.2f] bound %s)  develop median L* %.1f  film at 0 EV %.1f  (%d evals)\n",
+                  matchEv, mi.evMatch, mi.evKey, mi.latitudeOk ? "" : "none ", mi.evLo, mi.evHi, bnd(mi.bound), mi.targetL, mi.filmL0, mi.evals);
+  }
   if (a.has("--timings"))
     std::printf("timings ms: bake %.1f (raw %.1f curves %.1f neutral %.1f lut %.1f)  auto-exp %.1f  run %.1f  load %.0f  write %.0f\n",
                 bt.bakeMs, bt.rawLutMs, bt.curvesMs, bt.neutralMs, bt.lutMs, rt.autoExposureMs, rt.runMs, loadMs, writeMs);

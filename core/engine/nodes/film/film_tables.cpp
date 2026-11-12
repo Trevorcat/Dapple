@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 
+#include "dapple/film_match.h"
 #include "engine/nodes/film/film_node_internal.h"
 
 namespace dapple::engine::filmnode {
@@ -33,6 +34,7 @@ dapple::film::FilmParams makeParams(const FilmResolved& r, int quality) {
   fp.film = r.stock->stock;
   fp.paper = r.scan ? std::string("none") : r.paper->stock;
   fp.camera.autoExposure = false;
+  dapple::applyFilmPaperMapping(fp, r.black);  // as renderer.cpp
   fp.camera.filmFormatMm *= r.formatScale;
   fp.enlarger.yFilterShift = -r.warmth / 100.f * kWarmthFilterUnits;
   fp.enlarger.mFilterShift = -r.tint / 100.f * kWarmthFilterUnits;
@@ -45,6 +47,23 @@ dapple::film::FilmParams makeParams(const FilmResolved& r, int quality) {
   const double h = std::clamp(r.halationPct / 100.f, 0.f, 1.f);
   fp.filmRender.halation.halationAmount = h;
   fp.filmRender.halation.scatterAmount = h;
+  fp.filmRender.halation.boostEv = r.fx.boostEv;
+  fp.filmRender.halation.boostRange = r.fx.boostRange;
+  fp.filmRender.halation.protectEv = r.fx.protectEv;
+  if (r.fx.enlargerFilter >= 1 && r.fx.enlargerFilter <= 4) {
+    DiffusionFilterParams& d = fp.enlarger.diffusionFilter;
+    d.active = true;
+    d.filterFamily = kDiffusionFamilies[r.fx.enlargerFilter - 1];
+    d.strength = r.fx.enlStrength;
+    d.spatialScale = r.fx.enlScale;
+    d.haloWarmth = r.fx.enlHaloWarmth;
+    d.coreIntensity = r.fx.enlCoreIntensity;
+    d.coreSize = r.fx.enlCoreSize;
+    d.haloIntensity = r.fx.enlHaloIntensity;
+    d.haloSize = r.fx.enlHaloSize;
+    d.bloomIntensity = r.fx.enlBloomIntensity;
+    d.bloomSize = r.fx.enlBloomSize;
+  }
   if (quality == 0) fp.disableSpatialAndStochastic();
   else if (quality == 1) fp.settings.previewMode = true;
   return fp;
@@ -56,6 +75,8 @@ struct ModelEntry {
   const void* stock = nullptr;
   const void* paper = nullptr;  // null = scan model
   bool off = false;             // spatial + stochastic effects off (the print LUT then has no mean glare baked in)
+  bool split = false;           // enlarger diffusion filter active: the print tables carry the split-path tables
+  bool bw = false;              // paper-to-screen white / black mapping (filmPaperMappingEnabled at creation)
   std::unique_ptr<fd::FilmModel> model;
   std::mutex m;
   std::string error;
@@ -118,11 +139,13 @@ std::shared_ptr<fd::RawLut> rawLutFor(const dapple::film::FilmLibrary& lib, cons
 std::shared_ptr<ModelEntry> modelFor(const FilmResolved& r, bool withPaper, std::string* err) {
   Caches& C = caches();
   const void* paperKey = withPaper && !r.scan ? static_cast<const void*>(r.paper) : nullptr;
+  const bool wantSplit = paperKey && r.fx.enlargerFilter != 0 && r.quality != 0;
   std::shared_ptr<ModelEntry> e;
   {
     std::lock_guard<std::mutex> lock(C.m);
     for (auto it = C.models.begin(); it != C.models.end(); ++it)
-      if ((*it)->lib == r.lib && (*it)->stock == r.stock && (*it)->paper == paperKey && (*it)->off == (r.quality == 0)) {
+      if ((*it)->lib == r.lib && (*it)->stock == r.stock && (*it)->paper == paperKey && (*it)->off == (r.quality == 0) &&
+          (*it)->split == wantSplit && (*it)->bw == dapple::filmPaperMappingEnabled()) {
         e = *it;
         C.models.splice(C.models.begin(), C.models, it);
         break;
@@ -134,6 +157,8 @@ std::shared_ptr<ModelEntry> modelFor(const FilmResolved& r, bool withPaper, std:
   ne->stock = r.stock;
   ne->paper = paperKey;
   ne->off = r.quality == 0;
+  ne->split = wantSplit;
+  ne->bw = dapple::filmPaperMappingEnabled();
   dapple::film::FilmParams eff = makeParams(r, r.quality == 0 ? 0 : 2);
   eff.enlarger.yFilterShift = eff.enlarger.mFilterShift = 0;
   const bool scan = !paperKey;
@@ -184,6 +209,8 @@ void resolveFilm(const ParamSet& ps, const FrameGeom& geom, FilmResolved& out) {
   if (ctx.gainFn) ctx.gainFn(ctx.gainUser, e, g);
   const float evGain = std::exp2(e.filmExposure + e.filmKeyEv);
   for (int c = 0; c < 3; ++c) out.gain[c] = g[c] * evGain;
+  out.printEv = e.filmPrintEv;
+  out.black = e.filmBlack;
   out.warmth = e.filmWarmth;
   out.tint = e.filmTint;
   out.grainPct = e.filmGrain;
@@ -247,7 +274,9 @@ Status bakePrintScan(const void* resolved, std::span<const void* const>, void** 
   {
     const dapple::film::FilmParams fp = makeParams(r, r.quality == 0 ? 0 : 2);
     std::lock_guard<std::mutex> lock(m->m);
+    m->model->setBlackMix(fp.scanner.blackMix);
     m->model->rebalance(fp.enlarger.mFilterShift, fp.enlarger.yFilterShift);
+    m->model->setPrintExposure(std::exp2(-double(std::clamp(r.printEv, -9.f, 9.f))));
     m->model->bakePrintScan(t->t);
   }
   *payloadOut = static_cast<PayloadBase*>(t.release());
@@ -321,6 +350,10 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
   hp.i32(r.quality == 0);
   hp.f32(r.warmth);
   hp.f32(r.tint);
+  hp.f32(r.printEv);
+  hp.f32(r.black);
+  hp.i32(dapple::filmPaperMappingEnabled());
+  hp.i32(r.fx.enlargerFilter != 0 && r.quality != 0 && !r.scan);  // split-path tables
   out.raw = cachedTable(raws, ks, bakeRaw, r);
   out.curves = cachedTable(curves, ks, bakeCurves, r);
   out.print = cachedTable(prints, hp.finish(), bakePrintScan, r);
@@ -388,6 +421,13 @@ Hash128 planKey(const FilmResolved& r) {
   h.i32(r.quality);
   h.i32(r.keepGrain);
   h.i32(r.scan);
+  h.f32(r.fx.boostEv);
+  h.f32(r.fx.boostRange);
+  h.f32(r.fx.protectEv);
+  h.i32(r.fx.enlargerFilter);
+  for (float v : {r.fx.enlStrength, r.fx.enlScale, r.fx.enlHaloWarmth, r.fx.enlCoreIntensity, r.fx.enlCoreSize, r.fx.enlHaloIntensity,
+                  r.fx.enlHaloSize, r.fx.enlBloomIntensity, r.fx.enlBloomSize})
+    h.f32(v);
   return h.finish();
 }
 struct PlanCache {

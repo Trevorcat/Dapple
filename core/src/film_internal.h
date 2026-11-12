@@ -237,6 +237,14 @@ class FilmModel {
   void bakePrintScan(FilmTables& t) const;
   // Changes the enlarger filtration shifts (warmth / tint) without re-running the neutral solve.
   void rebalance(double mShift, double yShift);
+  // Print exposure multiplier (paper exposure; for a scanned / projected film: 1 / pe is the lamp gain). Takes effect on the
+  // next bake*(); the match solver (film_match.h) drives it as 2^-printEv.
+  void setPrintExposure(double pe) { pe_ = pe; }
+  // Paper black mix (scanner.blackMix) for the next bake*(); rebuilds the paper-to-screen mapping.
+  void setBlackMix(double mix) {
+    p_.scanner.blackMix = mix;
+    buildBlackWhite();
+  }
 
  private:
   void init();
@@ -281,9 +289,12 @@ class FilmModel {
   double g_ = 1, pe_ = 1;
   // scanner black / white correction (print path, spec 02 s3.10)
   bool bwOn_ = false;
+  bool postOn_ = false;  // paper-to-screen mapping after the gamut compression (scanner.paperReference)
+  double postM_ = 1, postQ_ = 0;
   double bwM_ = 1, bwQ_ = 0, bwExposure_ = 1;
   std::vector<double> paperTab_[3];
   void buildBlackWhite();
+  void buildPostMap();
   Vec3 rawPre_{};
   std::vector<double> paperAxis_, paperCurve_[3];
   Vec3 dMidDir_{};

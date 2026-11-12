@@ -20,9 +20,12 @@ import 'editor_widgets.dart';
 
 /// 72x72 palette map: the look's own point as a white ring, the cursor as a white dot. No labels.
 class PaletteMini extends StatelessWidget {
-  const PaletteMini({super.key, required this.pos, required this.def, this.size = 72});
+  const PaletteMini({super.key, required this.pos, required this.def, this.size = 72, this.height});
   final Offset pos, def;
+
+  /// Width (and height unless [height] is given).
   final double size;
+  final double? height;
 
   @override
   Widget build(BuildContext context) {
@@ -34,7 +37,7 @@ class PaletteMini extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
         child: SizedBox(
           width: size,
-          height: size,
+          height: height ?? size,
           child: Stack(children: [
             Positioned.fill(
                 child: CustomPaint(
@@ -42,7 +45,7 @@ class PaletteMini extends StatelessWidget {
                         c.dark ? const Color(0x66888888) : const Color(0x55A0A0A0)))),
             Positioned(
               left: def.dx * size - 5,
-              top: def.dy * size - 5,
+              top: def.dy * (height ?? size) - 5,
               child: Container(
                   width: 10,
                   height: 10,
@@ -50,7 +53,7 @@ class PaletteMini extends StatelessWidget {
             ),
             Positioned(
               left: pos.dx * size - 7,
-              top: pos.dy * size - 7,
+              top: pos.dy * (height ?? size) - 7,
               child: Container(
                 width: 14,
                 height: 14,
@@ -73,7 +76,7 @@ class PaletteMini extends StatelessWidget {
 
 /// 3x3 tone target cells with a preview of this photo under each target. Tap selects a cell.
 class ToneMini extends StatelessWidget {
-  const ToneMini({super.key, required this.photo, required this.engine, required this.app, required this.edit, required this.nearest, required this.onSelect});
+  const ToneMini({super.key, required this.photo, required this.engine, required this.app, required this.edit, required this.nearest, required this.onSelect, this.cell = 20, this.gap = 2});
   final Photo photo;
   final EditorEngine engine;
   final AppState app;
@@ -81,13 +84,15 @@ class ToneMini extends StatelessWidget {
   final String nearest;
   final ValueChanged<String> onSelect;
 
+  /// Cell edge and gap (20 / 2 in the floating window, large in the docked panel).
+  final double cell, gap;
+
   @override
   Widget build(BuildContext context) {
     final c = context.c;
     final selected = edit.toneTarget ?? nearest;
     final de = DemoEdit.of(app, photo);
     final ts = math.max(60.0, de.edit.toneStrength ?? de.defaultTone);
-    const cell = 20.0, gap = 2.0;
     return Semantics(
       container: true,
       label: '明暗目标',
@@ -165,14 +170,15 @@ class ToneMini extends StatelessWidget {
 
 /// 160x120 curve map: histogram backdrop, 3x3 grid, diagonal, the channel curve and its four points.
 class CurveMini extends StatelessWidget {
-  const CurveMini({super.key, required this.analysis, required this.edit, required this.channel, required this.selected, required this.onSelect});
+  const CurveMini({super.key, required this.analysis, required this.edit, required this.channel, required this.selected, this.onSelect, this.width = 160, this.height = 120});
   final Analysis analysis;
   final EditState edit;
   final int channel;
 
   /// 0..3 = highlights, lights, darks, shadows.
   final int selected;
-  final ValueChanged<int> onSelect;
+  final ValueChanged<int>? onSelect;
+  final double width, height;
 
   @override
   Widget build(BuildContext context) {
@@ -185,20 +191,22 @@ class CurveMini extends StatelessWidget {
       label: '曲线',
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTapDown: (d) {
+        onTapDown: onSelect == null
+            ? null
+            : (d) {
           // nearest point by x (v1: points sit at fixed x)
-          final x = d.localPosition.dx / 160;
+          final x = d.localPosition.dx / width;
           var best = 0;
           for (var i = 1; i < 4; i++) {
             if ((xs[i] - x).abs() < (xs[best] - x).abs()) best = i;
           }
-          onSelect(best);
+          onSelect!(best);
         },
         child: ClipRRect(
           borderRadius: BorderRadius.circular(12),
           child: Container(
-            width: 160,
-            height: 120,
+            width: width,
+            height: height,
             color: c.bg,
             child: CustomPaint(
               painter: CurvePainter(analysis, v('H'), v('L'), v('D'), v('S'), channel == 0 ? c.text : colors[channel], c.histFill, c.sep,
@@ -324,8 +332,9 @@ class LookStrip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.c;
+    final ts = MediaQuery.textScalerOf(context).scale(11) / 11;
     return SizedBox(
-      height: 72,
+      height: 72 + math.max(0.0, ts - 1) * 16,
       child: ListView.builder(
         scrollDirection: Axis.horizontal,
         itemCount: dLooks.length,
@@ -375,7 +384,7 @@ class LookStrip extends StatelessWidget {
 
 /// Wrap of text chips (curve channel, grading zone, crop ratio).
 class ChipPicker extends StatelessWidget {
-  const ChipPicker({super.key, required this.labels, required this.index, required this.onSelect, this.dots, required this.keyPrefix, this.label});
+  const ChipPicker({super.key, required this.labels, required this.index, required this.onSelect, this.dots, required this.keyPrefix, this.label, this.scroll = false});
   final List<String> labels;
   final int index;
   final ValueChanged<int> onSelect;
@@ -383,13 +392,13 @@ class ChipPicker extends StatelessWidget {
   final String keyPrefix;
   final String? label;
 
+  /// One horizontally scrolling line (docked panel) instead of a wrapping block.
+  final bool scroll;
+
   @override
   Widget build(BuildContext context) {
     final c = context.c;
-    return Semantics(
-      container: true,
-      label: label,
-      child: Wrap(spacing: 6, runSpacing: 6, children: [
+    final chips = <Widget>[
         for (var i = 0; i < labels.length; i++)
           Semantics(
             checked: i == index,
@@ -418,7 +427,17 @@ class ChipPicker extends StatelessWidget {
               ),
             ),
           ),
-      ]),
+    ];
+    return Semantics(
+      container: true,
+      label: label,
+      child: scroll
+          ? SingleChildScrollView(
+              key: ValueKey('$keyPrefix-scroll'),
+              scrollDirection: Axis.horizontal,
+              child: Row(children: [for (var i = 0; i < chips.length; i++) Padding(padding: EdgeInsets.only(right: i == chips.length - 1 ? 0 : 6), child: chips[i])]),
+            )
+          : Wrap(spacing: 6, runSpacing: 6, children: chips),
     );
   }
 }
@@ -635,4 +654,106 @@ class FilmPaperStrip extends StatelessWidget {
       ),
     );
   }
+}
+
+// ------------------------------------------------------------------ film offset pad
+
+/// A film offset pad (曝光, 质感): X and Y are offsets in [-1, +1], 0 = automatic at the centre, marked with a
+/// ring and 自动. Edge labels name the four directions (left, right, bottom, top). Display only; the
+/// [ControlPad] around it owns the drag.
+class OffsetPadView extends StatelessWidget {
+  const OffsetPadView({super.key, required this.x, required this.y, required this.labels, required this.width, required this.height});
+  final double x, y;
+  final List<String> labels;
+  final double width, height;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    return Semantics(
+      image: true,
+      label: '胶片偏移垫板，${offsetPadText(x, y)}',
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: SizedBox(
+          width: width,
+          height: height,
+          child: CustomPaint(
+            key: const ValueKey('offset-pad-paint'),
+            painter: _OffsetPadPainter(x, y, labels, c.chip, c.sep, c.text2, c.accentBtn, DefaultTextStyle.of(context).style),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _OffsetPadPainter extends CustomPainter {
+  _OffsetPadPainter(this.x, this.y, this.labels, this.bg, this.grid, this.text, this.accent, this.base);
+  final double x, y;
+  final List<String> labels;
+  final Color bg, grid, text, accent;
+  final TextStyle base;
+
+  static final Map<String, TextPainter> _tp = {};
+
+  static TextPainter _label(String t, Color color, TextStyle base, double size) {
+    if (_tp.length > 200) _tp.clear();
+    return _tp.putIfAbsent(
+      '$t|${color.toARGB32()}|$size',
+      () => TextPainter(text: TextSpan(text: t, style: base.copyWith(color: color, fontSize: size, height: 1, fontWeight: FontWeight.w500)), textDirection: TextDirection.ltr)..layout(),
+    );
+  }
+
+  @override
+  void paint(Canvas canvas, Size s) {
+    canvas.drawRect(Offset.zero & s, Paint()..color = bg);
+    final g = Paint()
+      ..color = grid
+      ..strokeWidth = 1;
+    for (var i = 1; i < 4; i++) {
+      if (i == 2) continue;
+      canvas.drawLine(Offset(s.width * i / 4, 0), Offset(s.width * i / 4, s.height), g);
+      canvas.drawLine(Offset(0, s.height * i / 4), Offset(s.width, s.height * i / 4), g);
+    }
+    final axis = Paint()
+      ..color = text.withValues(alpha: 0.35)
+      ..strokeWidth = 1.2;
+    final c = s.center(Offset.zero);
+    canvas.drawLine(Offset(c.dx, 0), Offset(c.dx, s.height), axis);
+    canvas.drawLine(Offset(0, c.dy), Offset(s.width, c.dy), axis);
+    // the automatic position: a ring with its label
+    canvas.drawCircle(
+        c,
+        8,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.6
+          ..color = text.withValues(alpha: 0.8));
+    final auto = _label('自动', text, base, 10);
+    auto.paint(canvas, Offset(c.dx - auto.width / 2, c.dy + 12));
+    if (labels.length == 4) {
+      const m = 8.0;
+      final l = _label(labels[0], text, base, 11), r = _label(labels[1], text, base, 11);
+      final b = _label(labels[2], text, base, 11), t = _label(labels[3], text, base, 11);
+      l.paint(canvas, Offset(m, c.dy - l.height - 6));
+      r.paint(canvas, Offset(s.width - m - r.width, c.dy - r.height - 6));
+      t.paint(canvas, Offset(c.dx + 8, m));
+      b.paint(canvas, Offset(c.dx + 8, s.height - m - b.height));
+    }
+    // cursor: screen y grows down, +1 is at the top
+    final p = Offset((x + 1) / 2 * s.width, (1 - y) / 2 * s.height);
+    canvas.drawCircle(p, 10, Paint()..color = const Color(0x33000000));
+    canvas.drawCircle(p, 8.5, Paint()..color = Colors.white);
+    canvas.drawCircle(
+        p,
+        8.5,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.5
+          ..color = accent);
+  }
+
+  @override
+  bool shouldRepaint(_OffsetPadPainter o) => o.x != x || o.y != y || o.bg != bg || o.text != text || o.labels != labels;
 }

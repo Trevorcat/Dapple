@@ -27,6 +27,8 @@
 
 namespace dapple::engine {
 
+class ResultCache;
+
 // What a failed run means for the selection (5.9).
 //   Unsupported  this plan cannot run on the GPU (a node without GpuImpl, a film frame, limits): CPU for this frame, GPU stays
 //   Transient    OOM / timeout / failed submission: CPU for this frame, pools released, GPU stays
@@ -89,6 +91,9 @@ class IGpuExecutor {
   virtual void injectFailure(GpuFailure f, int count) = 0;
   // Releases the device copies (resident source, lattices) of this session.
   virtual void release() = 0;
+  // The frame-global solves (Dehaze / Detail node keys) this executor keeps on the device: pass it to Planner::plan so that a frame whose solve is
+  // still there is planned without the accumulation sweep and the solve. Null: the executor keeps none.
+  virtual const ResultCache* solveCache() const { return nullptr; }
 };
 
 // Process-wide device selection (Vulkan -> GLES 3.1 -> CPU), created by the GPU library.
@@ -121,6 +126,8 @@ class GpuProvider {
     std::uint64_t generation = 0;
   };
   virtual bool lease(DeviceLease* out) { (void)out; return false; }
+  // Why enabled() is false (diagnostics, FrameResult::why): "GPU disabled (debug.dapple.gpu=0)", "GPU self-test running", "GPU self-test failed: ...".
+  virtual std::string inactiveReason() { return "GPU disabled"; }
 };
 
 void installGpuProvider(GpuProvider* p);

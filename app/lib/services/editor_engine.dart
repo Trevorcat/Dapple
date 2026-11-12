@@ -605,7 +605,8 @@ class EditorEngine extends ChangeNotifier {
     final seq = g.submit(params,
         longEdge: interactive ? rung.longEdge : finalLongEdge,
         flags: (interactive ? dappleFrameInteractive : 0) | dappleFrameAnalysis,
-        bakeSize: interactive ? rung.bake : 0);
+        bakeSize: interactive ? rung.bake : 0,
+        activeParam: interactive ? _activeParam : null);
     if (seq <= 0) {
       _disableGpu('submit failed');
       return;

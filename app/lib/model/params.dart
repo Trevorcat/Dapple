@@ -82,7 +82,15 @@ List<SliderSpec> _buildSpecs() {
     const SliderSpec('film_halation', '光晕', 0, 100, 100, Fmt.pct, EGroup.style),
     const SliderSpec('film_warmth', '冲印冷暖', -100, 100, 0, Fmt.signed, EGroup.style),
     const SliderSpec('film_tint', '冲印色调', -100, 100, 0, Fmt.signed, EGroup.style),
+    // Old edits only: the 胶片曝光 slider left the UI (replaced by the 曝光 pad: film_shoot / film_print); the field stays.
     const SliderSpec('film_exp', '胶片曝光', -60, 60, 0, Fmt.ev, EGroup.style),
+    // Film exposure pad and the black-point / latitude rulers (docs/design/editor-panel.md §5): normalised offsets in [-1, +1], 0 = automatic.
+    // NATIVE BINDING: the engine reads these four keys from the edit JSON as plain floats, missing = 0 (they travel in
+    // EditState.toWire like the other film_* keys; nothing else on the Dart side is needed). The engine has no film_grade.
+    const SliderSpec('film_shoot', '拍摄曝光', -1, 1, 0, Fmt.signed, EGroup.style), // X of 曝光: 欠曝 -1 .. 过曝 +1
+    const SliderSpec('film_print', '冲印深浅', -1, 1, 0, Fmt.signed, EGroup.style), // Y of 曝光: 深 -1 .. 浅 +1
+    const SliderSpec('film_black', '黑位', -1, 1, 0, Fmt.signed, EGroup.style), // ruler 黑位: -1 抬黑 (matte), 0 paper black, +1 压黑 (shown x100)
+    const SliderSpec('film_latitude', '宽容度', -1, 1, 0, Fmt.signed, EGroup.style), // ruler 宽容度: -1..+1 = 55..98 % (0 = 80 %)
   ];
   for (var b = 0; b < 8; b++) {
     out.add(SliderSpec(hslKey(b, 'h'), '${hslBandNames[b]} · 色相', -100, 100, 0, Fmt.signed, EGroup.color,
@@ -159,7 +167,10 @@ String tonePro(String id) {
 // ---------------------------------------------------------------- sync categories
 
 /// Keys of the film simulation (numeric ones; the stock and the paper are [EditState.film] / [EditState.filmPaper]).
-const filmValueKeys = ['film_strength', 'film_grain', 'film_halation', 'film_warmth', 'film_tint', 'film_exp'];
+const filmValueKeys = [
+  'film_strength', 'film_grain', 'film_halation', 'film_warmth', 'film_tint', 'film_exp', //
+  'film_shoot', 'film_print', 'film_black', 'film_latitude',
+];
 
 enum SyncCat { style, tone, light, color, detail, crop }
 

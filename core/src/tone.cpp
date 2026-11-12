@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 #include "color.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 
 namespace dapple {
 
@@ -13,6 +15,16 @@ using namespace color;
 namespace {
 constexpr int kFine = 512;  // fine histogram for percentiles
 constexpr int kProxyEdge = 256;
+
+// The develop render of a proxy without neighbourhood stages, as float. Through the engine (graph + planner + CpuExecutor, the
+// exact variant); DAPPLE_ENGINE=off keeps the old Renderer here so the golden oracle stays independent of the engine.
+ImageF renderProxy(const EditParams& p, const CameraProfile& camera, const SourceImage& proxy) {
+  if (engine::mode() == engine::Mode::Off) return Renderer(p, camera, nullptr).renderFloat(proxy, false);
+  ImageF f;
+  std::string err;
+  if (!engine::renderImageF(p, camera, nullptr, proxy, false, f, &err)) throw std::runtime_error("tone analysis: " + err);
+  return f;
+}
 }  // namespace
 
 const std::array<ToneClassInfo, 9>& toneClasses() {
@@ -105,7 +117,7 @@ ToneAnalysis analyzeTone(const SourceImage& source, const CameraProfile& camera,
   p.toneStrength = 0.f;
   p.toneTarget.clear();
   p.filmStock.clear();  // the tonal class belongs to the develop render: it must not move with the film look
-  return analyzeToneImage(Renderer(p, camera, nullptr).renderFloat(proxy, false));
+  return analyzeToneImage(renderProxy(p, camera, proxy));
 }
 
 void applyFrameHistogram(ToneAnalysis& a, const std::uint8_t* rgba, int w, int h) {
@@ -133,7 +145,7 @@ void applyFilmHistogram(ToneAnalysis& a, const SourceImage& source, const Camera
   SourceImage proxy;
   proxy.sceneReferred = source.sceneReferred;
   proxy.linear = resizeToLongEdge(source.linear, kProxyEdge);
-  const ToneAnalysis f = analyzeToneImage(r.renderFloat(proxy, false));
+  const ToneAnalysis f = analyzeToneImage(renderProxy(p, camera, proxy));
   a.histogram = f.histogram;
   a.p5 = f.p5, a.p50 = f.p50, a.p95 = f.p95;
 }

@@ -15,4 +15,6 @@ internal object DappleViewNative {
     @JvmStatic external fun detach(view: Long)
     @JvmStatic external fun trim(view: Long, level: Int)
     @JvmStatic external fun lastError(): String
+    /** Starts the GPU probe (self-test) on the calling thread's behalf and returns at once: see dapple_gpu_configure / dapple_gpu_warmup. */
+    @JvmStatic external fun startGpu(dir: String, appVersion: String, fingerprint: String)
 }

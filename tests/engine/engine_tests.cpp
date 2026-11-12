@@ -812,25 +812,23 @@ SeqResult runSequence(int mode, const std::vector<SeqFrame>& seq) {
 
 void testReuse() {
   const auto seq = benchSequence();
-  const SeqResult off = runSequence(0, seq), legacy = runSequence(1, seq), tables = runSequence(2, seq);
+  const SeqResult off = runSequence(0, seq), tables = runSequence(1, seq);  // 0 = the old Renderer path (oracle), 1 = the engine
   auto count = [](const std::string& k, char c) { return int(std::count(k.begin(), k.end(), c)); };
   std::printf("  edit-bench drag sequences (%zu frames, two scenarios): old bakes[3]: bake %d, lattice-reuse %d, full-hit %d | engine: bake %d, reuse %d, hit %d\n",
               seq.size(), count(off.kinds, 'B'), count(off.kinds, 'R'), count(off.kinds, 'H'), count(tables.kinds, 'B'),
               count(tables.kinds, 'R'), count(tables.kinds, 'H'));
   CHECK(off.kinds.size() == tables.kinds.size());
-  CHECK(off.kinds == legacy.kinds);
   CHECK(off.kinds == tables.kinds);  // identical reuse decisions frame by frame
-  CHECK(off.hashes == legacy.hashes);
   CHECK(off.hashes == tables.hashes);  // and identical pixels + analysis
   {  // per frame-type medians (ms), 1600x1067 synthetic source; informational, the gate-P numbers come from edit-bench on a RAW
-    std::map<std::string, std::vector<double>> g[3];
-    const SeqResult* rs[3] = {&off, &legacy, &tables};
-    for (int m = 0; m < 3; ++m)
+    std::map<std::string, std::vector<double>> g[2];
+    const SeqResult* rs[2] = {&off, &tables};
+    for (int m = 0; m < 2; ++m)
       for (std::size_t i = 0; i < seq.size(); ++i)
         if (i % 9 != 0) g[m][seq[i].label.substr(0, seq[i].label.find('/'))].push_back(rs[m]->ms[i]);  // skip each list's warm-up frame
     auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
     for (const auto& [name, v] : g[0])
-      std::printf("    %-22s off %7.2f  legacy %7.2f  tables %7.2f ms\n", name.c_str(), med(v), med(g[1][name]), med(g[2][name]));
+      std::printf("    %-22s off %7.2f  engine %7.2f ms\n", name.c_str(), med(v), med(g[1][name]));
   }
   if (off.kinds != tables.kinds) {
     std::printf("  old   %s\n  new   %s\n", off.kinds.c_str(), tables.kinds.c_str());

@@ -1,6 +1,8 @@
 #include "engine/exec/gpu_scheduler.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -185,7 +187,17 @@ struct Acc {
 };
 }  // namespace
 
+namespace {
+std::vector<PassLog> g_passLog;
+bool passLogOn() {
+  static const bool on = [] { const char* e = std::getenv("DAPPLE_GPU_PASSLOG"); return e && e[0] == '1'; }();
+  return on;
+}
+}  // namespace
+const std::vector<PassLog>& lastPassLog() { return g_passLog; }
+
 Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err) {
+  if (passLogOn()) g_passLog.clear();
   const auto& nodes = g.nodes_;
   auto& res = g.res_;
   hal::Device& dev = g.dev_;
@@ -331,6 +343,25 @@ Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err) {
       if (a.rd && !hasRead(id)) readSince.push_back(id);
     }
 
+    if (passLogOn()) {  // DAPPLE_GPU_PASSLOG=1: per pass image traffic (nominal: every texel of each bound image once; 'S' = sampled / read, 'W' = written)
+      PassLog pl;
+      pl.name = n.name;
+      char buf[96];
+      for (const auto& u : n.uses) {
+        const auto& r = res[std::size_t(u.res)];
+        if (!r.hasImg) {
+          pl.desc += " buf";
+          continue;
+        }
+        const double mb = double(r.img.w) * r.img.h * hal::bytesPerTexel(r.img.fmt) / 1048576.0;
+        std::snprintf(buf, sizeof buf, " %c%ux%ux%u", u.write ? (u.read ? 'M' : 'W') : 'R', r.img.w, r.img.h, hal::bytesPerTexel(r.img.fmt));
+        pl.desc += buf;
+        (u.write ? pl.wrMB : pl.rdMB) += mb;
+        if (u.write && u.read) pl.rdMB += mb;
+      }
+      pl.groups = double(n.gx) * n.gy * n.gz;
+      g_passLog.push_back(pl);
+    }
     switch (n.kind) {
       case GpuGraph::Node::Dispatch: {
         cl.bindPipeline(n.pl);
@@ -341,6 +372,16 @@ Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err) {
         }
         Status s = cl.setParams(n.params.data(), n.params.size());
         if (s == Status::Ok) s = cl.dispatch(n.gx, n.gy, n.gz);
+        if (prof) {
+          // DAPPLE_GPU_PROF_REPEAT=N (profiling only, the image content is garbage afterwards): run every pass N times back to back, so the
+          // timestamp interval is N x the pass and a skewed timestamp (Adreno attributes work to neighbouring intervals) is amortised.
+          static const int reps = [] { const char* e = std::getenv("DAPPLE_GPU_PROF_REPEAT"); return e ? std::max(1, std::atoi(e)) : 1; }();
+          for (int rep = 1; rep < reps && s == Status::Ok; ++rep) {
+            cl.barrier(hal::kAll);
+            s = cl.setParams(n.params.data(), n.params.size());
+            if (s == Status::Ok) s = cl.dispatch(n.gx, n.gy, n.gz);
+          }
+        }
         if (s != Status::Ok) return err = dev.lastError().empty() ? std::string("dispatch of ") + n.name + " failed" : dev.lastError(), s;
         workSince += double(n.gx) * n.gy * n.gz * n.weight;
         break;
@@ -355,7 +396,13 @@ Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err) {
         break;
       }
     }
-    if (prof) cl.timestamp(n.name.c_str());
+    if (prof) {
+      // DAPPLE_GPU_PROF_SERIAL=1: drain the pipeline before each timestamp, so a pass is not hidden behind its neighbours
+      // (mobile GPUs overlap independent dispatches; without this the per-pass split is unreliable, find-n5.md).
+      static const bool serial = [] { const char* e = std::getenv("DAPPLE_GPU_PROF_SERIAL"); return e && e[0] == '1'; }();
+      if (serial) cl.barrier(hal::kAll);
+      cl.timestamp(n.name.c_str());
+    }
     // Long frames are cut into several submissions (Adreno kgsl hang detection, pixel-architecture.md 16 rule 1).
     if (workSince >= split && ni + 1 < nodes.size()) {
       const Status s = cl.flushPart();

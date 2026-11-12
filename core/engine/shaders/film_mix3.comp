@@ -16,6 +16,7 @@ layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_
 layout(constant_id = 0) const int NJ = 4;          // components in this pass (1..4)
 layout(constant_id = 1) const bool BASE = true;    // MODE 2
 layout(constant_id = 2) const bool HAS_UP = false; // MODE 2 / 3: an upsampled lower level is added
+layout(constant_id = 3) const bool DIRECT = false; // MODE 2: taps read straight from the texture path (no shared-memory column tile)
 
 layout(std140, binding = 0) uniform P {
   ivec4 dim;     // w, h (of the output), r (largest radius of the pass), offset of the pass's tap table in `tv` (vec4 units)
@@ -112,6 +113,22 @@ void main() {
   const int r = u.dim.z, w = u.dim.x, h = u.dim.y;
   const int rows = LY + 2 * r;
   vec3 acc = vec3(0.0);
+  if (DIRECT) {
+    // The mobile path: no staging, no barriers. Lanes run along x, so the fetches of one tap row are contiguous.
+    if (p.x < w && p.y < h) {
+      for (int j = 0; j < NJ; ++j) {
+        const int tb = u.dim.w + j * 20;
+        vec3 a = tv[tb].rgb * fetchT(j, p).rgb;
+        for (int k = 1; k <= r; ++k) {
+          int ya = p.y - k, yb = p.y + k;
+          if (ya < 0 || ya >= h) ya = reflectIdx(ya, h);
+          if (yb < 0 || yb >= h) yb = reflectIdx(yb, h);
+          a += tv[tb + k].rgb * (fetchT(j, ivec2(p.x, ya)).rgb + fetchT(j, ivec2(p.x, yb)).rgb);
+        }
+        acc += a;
+      }
+    }
+  } else
   for (int j = 0; j < NJ; ++j) {
     barrier();
     for (int i = lid.y * LX + lid.x; i < rows * LX; i += LX * LY) {

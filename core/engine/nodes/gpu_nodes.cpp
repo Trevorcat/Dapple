@@ -34,10 +34,11 @@ const GpuImpl kEpilogueImpl = {nullptr, {}, nullptr, "epilogue", true};
 
 const GpuImpl* gpuImplFor(NodeType t) {
   switch (t) {
-    // the point recipe: one pass for Geometry + Gain + ToneColour (+ Exact variant is CPU only) + Vignette
+    // the point recipe: one pass for Geometry + Gain + ToneColour (+ the Exact variant) + Vignette
     case NodeType::Geometry:
     case NodeType::Gain:
     case NodeType::ToneColour:
+    case NodeType::ToneColourExact:  // the exact variant runs on the same lattice kernel (a denser bake), see docs/engine/pipeline-architecture.md 21
     case NodeType::Vignette: return &kPointImpl;
     case NodeType::NRLuma: return &kNrLImpl;
     case NodeType::NRChroma: return &kNrCImpl;

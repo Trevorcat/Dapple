@@ -16,6 +16,7 @@
 #include "engine/exec/big_core.h"
 #include "engine/exec/result_cache.h"
 #include "dapple/film.h"
+#include "dapple/lut.h"
 #include "engine/nodes/film/film_gpu.h"
 #include "engine/nodes/film/film_node_internal.h"
 #include "engine/nodes/gpu_common.h"
@@ -237,9 +238,58 @@ struct DeviceFilm {
   }
 };
 
+// The device copy of the DisplayStages after a film: the four 1024-sample curves ([4][n], a buffer) and the look LUT (RGBA32F n^3, red fastest).
+// The identity (plain frames) is a 16 byte buffer and a 1^3 image, bound for the pipeline's sake only.
+struct DeviceDisplay {
+  std::shared_ptr<Context> ctx;
+  std::uint64_t epoch = 0;
+  hal::BufferH curves;
+  hal::ImageH lut;
+  int lutN = 0;          // 0: no look LUT
+  unsigned curveMask = 0;
+  int curveSamples = 0;
+  float lutMix = 0.f;
+  float domMin[3] = {0, 0, 0}, domMax[3] = {1, 1, 1};
+  Hash128 key;
+  ~DeviceDisplay() {
+    if (!ctx || epoch != ctx->epoch()) return;
+    hal::Device& d = ctx->core().dev();
+    d.waitIdle();
+    d.destroy(curves);
+    d.destroy(lut);
+  }
+};
+
+NodeType typeOfNode(const GpuRun& in, NodeId id) { return id < in.graph.nodes().size() ? in.graph.nodes()[id].type : NodeType::Source; }
+
+// The plan blends a film with the normal branch (film strength < 1).
+bool planHasBlend(const GpuRun& in) {
+  for (const Stage& st : in.plan.stages)
+    for (const Group& g : st.groups)
+      for (NodeId id : g.nodes)
+        if (id < in.graph.nodes().size() && in.graph.nodes()[id].type == NodeType::Blend) return true;
+  return false;
+}
+
+// A frame-global solve kept on the device (the dehaze dark channel / airlight grid, the guided filter coefficients of the clarity base), keyed by the
+// node key of the planner (the frame it was made for); a frame whose solve is a hit skips the accumulation sweep and the solve.
+struct DeviceSolve {
+  std::shared_ptr<Context> ctx;
+  std::uint64_t epoch = 0;
+  hal::ImageH img;
+  int w = 0, h = 0;
+  ~DeviceSolve() {
+    if (!ctx || epoch != ctx->epoch()) return;
+    hal::Device& d = ctx->core().dev();
+    d.waitIdle();
+    d.destroy(img);
+  }
+};
+
 // Node types a GPU plan may contain (everything else makes the plan Unsupported, 5.9).
 bool headNodeOk(NodeType t) {
-  return t == NodeType::Resize || t == NodeType::Geometry || t == NodeType::Gain || t == NodeType::ToneColour || t == NodeType::Vignette;
+  return t == NodeType::Resize || t == NodeType::Geometry || t == NodeType::Gain || t == NodeType::ToneColour || t == NodeType::ToneColourExact ||
+         t == NodeType::Vignette;
 }
 bool windowNodeOk(NodeType t) {
   return t == NodeType::NRLuma || t == NodeType::NRChroma || t == NodeType::Dehaze || t == NodeType::Detail || t == NodeType::Grain;
@@ -262,6 +312,8 @@ class Executor final : public IGpuExecutor {
   explicit Executor(std::shared_ptr<Context> c) : ctx_(std::move(c)) {
     epoch_ = ctx_->epoch();
     tables_.setLimit(NodeType::ColourLattice, 2);  // the two lattices of an interactive and a final frame
+    solves_.setLimit(NodeType::Dehaze, 2);  // the 1/4 grids of the last frames (a slider that does not touch the solve keeps hitting)
+    solves_.setLimit(NodeType::Detail, 2);
   }
   ~Executor() override {
     std::lock_guard<std::mutex> lk(ctx_->mutex());
@@ -270,6 +322,7 @@ class Executor final : public IGpuExecutor {
   hal::Api api() const override { return ctx_->api(); }
   const hal::DeviceCaps& caps() const override { return ctx_->caps(); }
   Status run(const GpuRun& in, GpuOut& out) override;
+  const ResultCache* solveCache() const override { return &solves_; }
   void injectFailure(GpuFailure f, int count) override {
     injected_ = f;
     injectCount_ = count;
@@ -290,7 +343,9 @@ class Executor final : public IGpuExecutor {
     rs_.reset();
     store_ = nullptr;
     film_.reset();
+    display_.clear();
     tables_.clear();  // payload deleters destroy the tables, or only forget them after a device rebuild
+    solves_.clear();
   }
   // A rebuilt device invalidates every handle: forget them (the lost device is kept alive by the Context).
   void checkEpoch() {
@@ -298,6 +353,8 @@ class Executor final : public IGpuExecutor {
     if (e == epoch_) return;
     tables_.clear();
     film_.reset();
+    display_.clear();
+    solves_.clear();
     rs_.reset();
     store_ = nullptr;
     epoch_ = e;
@@ -338,6 +395,8 @@ class Executor final : public IGpuExecutor {
   // Film frames (section 20): arguments of the film nodes from the FramePlan, device tables of their bake
   bool filmResolve(const GpuRun& in, filmnode::FilmResolved& r);
   std::shared_ptr<DeviceFilm> ensureFilm(const filmnode::FilmResolved& r);
+  // DisplayStages after a film: curves + look LUT on the device (the identity for plain frames); a small LRU of the last displays
+  std::shared_ptr<DeviceDisplay> ensureDisplay(const FramePlan& P);
 
   Status runWhole(const GpuRun& in, GpuOut& out);
   Status runTiled(const GpuRun& in, GpuOut& out);
@@ -355,7 +414,9 @@ class Executor final : public IGpuExecutor {
 
   // device tables on a ResultCache (ColourLattice slot: lattice + overflow lattice + tone table of one bake key)
   ResultCache tables_;
+  ResultCache solves_;  // DeviceSolve payloads by Dehaze / Detail node key (whole-frame runs)
   std::shared_ptr<DeviceFilm> film_;  // device copy of the film tables of the last film frame
+  std::vector<std::shared_ptr<DeviceDisplay>> display_;  // most recently used first (3)
 
   GpuFailure failure_ = GpuFailure::None;
   std::string err_;
@@ -438,7 +499,7 @@ std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
   Hasher hk;
   hk.str(lut.key);
   const Hash128 key = hk.finish();
-  if (ResultCache::Entry* e = tables_.find(NodeType::ColourLattice, key)) return std::static_pointer_cast<DeviceTables>(e->payload);
+  if (ResultCache::Entry* e = tables_.findLru(NodeType::ColourLattice, key)) return std::static_pointer_cast<DeviceTables>(e->payload);  // LRU: the two latest lattices stay (frame + final)
 
   if (lut.n < 2 || lut.rgb.size() != std::size_t(lut.n) * lut.n * lut.n * 3) return fail(GpuFailure::Unsupported, "lattice not usable (film only bake?)"), nullptr;
   if (lut.tone.size() != kToneN) return fail(GpuFailure::Unsupported, "tone table size differs from the GPU backend's"), nullptr;
@@ -534,6 +595,8 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
   a.paper = f.paper.c_str();
   for (int c = 0; c < 3; ++c) a.gain[c] = in.frame.gain[c];
   a.filmExposure = f.filmEv;
+  a.printEv = f.printEv;
+  a.black = f.black;
   a.warmth = f.warmth;
   a.tint = f.tint;
   a.grainPct = f.grainPct;
@@ -555,7 +618,10 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
 std::shared_ptr<DeviceFilm> Executor::ensureFilm(const filmnode::FilmResolved& r) {
   filmnode::FilmTablesHandle tb;
   std::string err;
-  if (!filmnode::bakeFilmTables(r, tb, &err)) return fail(GpuFailure::Unsupported, "film tables: " + err), nullptr;
+  // The process-wide table cache (raw + curves per stock, print + scan per stock / paper / warmth / tint / print EV): a strength, exposure,
+  // grain or halation drag hits it, so nothing is baked and, because the cached payloads are the same objects, nothing is re-uploaded below.
+  // (The uncached bakeFilmTables ran here on every frame: about 12 ms on the desktop, and a fresh upload each time.)
+  if (!filmnode::tablesFor(r, tb)) return fail(GpuFailure::Unsupported, "film tables: bake failed"), nullptr;
   const auto pd = filmnode::planOf(r);
   if (!film_ || film_->epoch != epoch_ || film_->tb.raw != tb.raw || film_->tb.curves != tb.curves || film_->tb.print != tb.print) {
     film_.reset();
@@ -577,6 +643,82 @@ std::shared_ptr<DeviceFilm> Executor::ensureFilm(const filmnode::FilmResolved& r
   return film_;
 }
 
+std::shared_ptr<DeviceDisplay> Executor::ensureDisplay(const FramePlan& P) {
+  const FramePlan::Display& d = P.display;
+  const bool hasLut = d.lut && d.lutMix > 0.f && d.lut->size() >= 2 && d.lut->table().size() == std::size_t(d.lut->size()) * d.lut->size() * d.lut->size() * 3;
+  const bool curves = d.curveMask != 0 && d.curveSamples >= 2 && d.curves.size() == std::size_t(4) * d.curveSamples;
+  const bool plain = P.film.displayPlain || (!curves && !hasLut);
+  Hasher hk;
+  hk.i32(plain ? 0 : 1);
+  if (!plain) {
+    hk.i32(curves ? int(d.curveMask) : 0);
+    hk.i32(curves ? d.curveSamples : 0);
+    if (curves)
+      for (float v : d.curves) hk.f32(v);
+    hk.u64(hasLut ? d.lutId : 0);
+    hk.i32(hasLut ? d.lut->size() : 0);
+    hk.f32(hasLut ? d.lutMix : 0.f);
+  }
+  const Hash128 key = hk.finish();
+  for (std::size_t i = 0; i < display_.size(); ++i)
+    if (display_[i]->key == key) {
+      std::rotate(display_.begin(), display_.begin() + std::ptrdiff_t(i), display_.begin() + std::ptrdiff_t(i) + 1);
+      return display_.front();
+    }
+  const int n = hasLut ? d.lut->size() : 1;
+  if (std::uint32_t(n) > dev().caps().maxImage3D) return fail(GpuFailure::Unsupported, "look LUT larger than the device's 3D image limit"), nullptr;
+  auto t = std::make_shared<DeviceDisplay>();
+  t->ctx = ctx_;
+  t->epoch = epoch_;
+  t->key = key;
+  t->lutN = hasLut ? n : 0;
+  t->curveMask = curves && !plain ? d.curveMask : 0;
+  t->curveSamples = curves && !plain ? d.curveSamples : 0;
+  t->lutMix = hasLut ? d.lutMix : 0.f;
+  if (hasLut)
+    for (int c = 0; c < 3; ++c) {
+      t->domMin[c] = d.lut->domainMin()[c];
+      t->domMax[c] = d.lut->domainMax()[c];
+    }
+  const std::size_t curveBytes = curves ? (d.curves.size() * 4 + 255) / 256 * 256 : 256;
+  const std::size_t lutBytes = std::size_t(n) * n * n * 16;
+  hal::Status s = dev().createBuffer({curveBytes, hal::MemKind::DeviceLocal, true}, &t->curves);
+  if (s == hal::Status::Ok) s = dev().createImage({hal::Format::RGBA32F, std::uint32_t(n), std::uint32_t(n), std::uint32_t(n)}, &t->lut);
+  if (s != hal::Status::Ok) return failStatus(s, ""), nullptr;
+  auto cl = dev().begin();
+  if (!cl) return failStatus(hal::Status::Timeout, ""), nullptr;
+  std::string err;
+  if (!core().ensureStaging(cl->slot(), curveBytes + lutBytes, err)) return fail(GpuFailure::Transient, err), nullptr;
+  auto& sr = core().slot(cl->slot());
+  auto* base = static_cast<std::uint8_t*>(sr.staging.mapped);
+  std::memset(base, 0, curveBytes);
+  if (curves) std::memcpy(base, d.curves.data(), d.curves.size() * 4);
+  auto* texels = reinterpret_cast<float*>(base + curveBytes);
+  if (hasLut) {
+    const std::vector<float>& tb = d.lut->table();
+    const std::size_t cnt = tb.size() / 3;
+    for (std::size_t i = 0; i < cnt; ++i) {
+      texels[4 * i] = tb[3 * i];
+      texels[4 * i + 1] = tb[3 * i + 1];
+      texels[4 * i + 2] = tb[3 * i + 2];
+      texels[4 * i + 3] = 1.f;
+    }
+  } else {
+    texels[0] = texels[1] = texels[2] = 0.f;
+    texels[3] = 1.f;
+  }
+  GpuGraph g(dev(), core().pool());
+  g.copyBufferToBuffer(sr.staging, g.externalBuf(t->curves), curveBytes, 0);
+  g.copyBufferToImage(sr.staging, g.external(t->lut), std::uint32_t(n), std::uint32_t(n), std::uint32_t(n), curveBytes);
+  hal::FenceH f;
+  s = runGraph(dev(), g, *cl, &f, err);
+  if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
+  if (s != hal::Status::Ok) return failStatus(s, err), nullptr;
+  display_.insert(display_.begin(), t);
+  if (display_.size() > 3) display_.pop_back();
+  return t;
+}
+
 bool Executor::validate(const GpuRun& in) {
   const Plan& pl = in.plan;
   if (pl.unsupported) return fail(GpuFailure::Unsupported, std::string("plan unsupported: ") + pl.why);
@@ -584,10 +726,10 @@ bool Executor::validate(const GpuRun& in) {
   const bool film = pl.hasFilm;
   if (film) {  // a whole film frame (section 20): film chain -> DisplayStages (identity) + Vignette -> window nodes
     if (!in.frame.film.active) return fail(GpuFailure::Unsupported, "film frame without film arguments");
-    if (!in.frame.film.displayPlain) return fail(GpuFailure::Unsupported, "film frame with display curves / look LUT");
-    if (pl.mode == ExecMode::TiledExport || in.target.sink) return fail(GpuFailure::Unsupported, "film frames run whole (no tiled export yet)");
     filmnode::FilmResolved fr;
     if (!filmResolve(in, fr)) return false;
+    if (pl.mode == ExecMode::TiledExport && !filmnode::filmWindowable(fr))
+      return fail(GpuFailure::Unsupported, "the enlarger diffusion filter blurs the whole frame: no tiled export");
   }
   bool sweep = false;
   for (const Stage& st : pl.stages) {
@@ -602,7 +744,8 @@ bool Executor::validate(const GpuRun& in) {
         if (id >= in.graph.nodes().size()) return fail(GpuFailure::Unsupported, "plan refers to an unknown node");
         const NodeType t = in.graph.nodes()[id].type;
         if (film && g.kind == GroupKind::PointChain) {
-          if (t == NodeType::DisplayStages || t == NodeType::Vignette) continue;
+          // DisplayStages / Blend / Vignette finish the film; Gain + ToneColour(Exact) are the normal branch of a blend (film strength < 1)
+          if (t == NodeType::DisplayStages || t == NodeType::Vignette || t == NodeType::Blend || headNodeOk(t)) continue;
           return fail(GpuFailure::Unsupported, std::string("node ") + NodeRegistry::instance().desc(t).name + " after a film frame");
         }
         const bool ok = g.kind == GroupKind::PointChain ? headNodeOk(t) : g.kind == GroupKind::Window ? windowNodeOk(t) : false;
@@ -637,6 +780,12 @@ struct Executor::Walk {
   const filmnode::FilmResolved* fres = nullptr;
   const filmnode::GpuFilmTables* ftab = nullptr;
   const filmnode::GpuFilmPlanRes* fplan = nullptr;
+  // DisplayStages after the film, the blend with the normal branch (strength < 1), the window of the film plane (tiled export)
+  const DeviceDisplay* disp = nullptr;
+  float strength = 1.f;
+  FramePlan mainPlan;  // P without the vignette: the normal branch of a blend (the vignette follows the blend)
+  int filmOx = 0, filmOy = 0;  // frame coordinates of pixel (0, 0) of filmH
+  filmnode::FilmPre pre;
 
   Walk(GpuRecorder& rec, const GpuRun& run, float resizeSharpen, bool wholeFrame)
       : r(rec), in(run), P(run.frame), R(spatialRadii(run.frame, resizeSharpen)), whole(wholeFrame) {
@@ -665,7 +814,8 @@ struct Executor::Walk {
 
   // FilmFrame stage: the film input (geometry gather of the resident source when the frame is a resampling of it), then the film
   // chain (recordFilmFrame) -> the display image (RGBA32F, sRGB encoded, unclamped) that the following sweep finishes
-  bool filmStage() {
+  // the film input: the resident source, or its geometry gather (rotate / straighten / crop) at the frame size; -1 on error
+  H filmInput() {
     H in = src.img;
     if (P.useGeo) {
       struct U {
@@ -690,19 +840,62 @@ struct Executor::Walk {
       u.c[0] = P.rot;
       u.c[1] = P.flip ? 1 : 0;
       const hal::PipelineH p = r.pl("film_src", {{0, P.exact ? 1 : 2}});
-      if (!p) return false;
+      if (!p) return -1;
       const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.outW), std::uint32_t(P.outH));
       r.g.dispatch("film_src", p, {GpuGraph::R(src.img), GpuGraph::W(g)}, r.gx(P.outW), r.gy(P.outH), &u, sizeof u);
       in = g;
     }
+    return in;
+  }
+  bool filmStage() {
+    const H in = filmInput();
+    if (in < 0) return false;
     filmH = filmnode::recordFilmFrame(r, *fres, *ftab, *fplan, in, P.outW, P.outH);
+    filmOx = filmOy = 0;
     return filmH >= 0;
   }
-  // the film plane -> vignette -> clamp -> D (or the grain epilogue + RGBA8 when it is the last pass)
-  bool filmFinish(const Epilogue& e, H Dst, int W, int Hh, int ox, int oy) {
+  // tiled export: the whole-frame part of the film (exposure, mixtures, DIR field) once, into `pre`
+  bool filmPrePass(filmnode::FilmPre& out) {
+    const H in = filmInput();
+    if (in < 0) return false;
+    return filmnode::recordFilmPre(r, *fres, *ftab, in, P.outW, P.outH, out);
+  }
+  // tiled export: the develop / grain / print / scan chain over the work rectangle grown by the film halo (clipped to the frame)
+  bool filmWindowStage() {
+    const int halo = filmnode::filmWindowHalo(*fres);
+    filmnode::FilmWin win;
+    win.x0 = std::max(0, work.x0 - halo);
+    win.y0 = std::max(0, work.y0 - halo);
+    win.w = std::min(P.outW, work.x1 + halo) - win.x0;
+    win.h = std::min(P.outH, work.y1 + halo) - win.y0;
+    const filmnode::FilmImg fi = filmnode::recordFilmWindow(r, *fres, *ftab, *fplan, pre, P.outW, P.outH, win);
+    if (fi.img < 0) return false;
+    filmH = fi.img;
+    filmOx = fi.ox;
+    filmOy = fi.oy;
+    return true;
+  }
+  // the normal branch of a film frame at strength < 1 (Gain + ToneColour(Exact) through the lattice, no vignette): RGBA16F working image
+  H mainBranch(int W, int Hh, int ox, int oy) {
+    if (lut.n < 2) return r.err = "film blend without a colour lattice", -1;
+    mainPlan = P;
+    mainPlan.vignette = 0.f;
+    PointNode pn{&mainPlan, src, lut, W, Hh, ox, oy, Epilogue{}};
+    GpuPorts ports;
+    const H M = r.tr(kF16, W, Hh);
+    ports.out[0] = M;
+    const GpuImpl* impl = gpuImplFor(NodeType::ToneColour);
+    if (!impl || !impl->recordPorts(r, &pn, ports)) return -1;
+    return M;
+  }
+  // the film plane -> display stages (curves, look LUT) -> blend with `main` (>= 0) -> vignette -> clamp -> D (or the grain epilogue + RGBA8
+  // when it is the last pass)
+  bool filmFinish(const Epilogue& e, H Dst, int W, int Hh, int ox, int oy, H main) {
     struct U {
       std::int32_t a[4];
       float geoB[4], geoC[4], e[4];
+      std::int32_t f[4];
+      float g[4], dmin[4], dmax[4];
     } u{};
     u.a[0] = W;
     u.a[1] = Hh;
@@ -717,9 +910,25 @@ struct Executor::Walk {
     u.geoC[2] = P.vignette;
     u.e[0] = e.amp;
     u.e[1] = e.period;
-    const hal::PipelineH p = r.pl("film_fin", {{10, e.last ? 1 : 0}, {11, e.last && e.grain ? 1 : 0}});
+    const bool blend = main >= 0;
+    const bool dispOn = disp && (disp->curveMask != 0 || disp->lutN > 0);
+    u.f[0] = filmOx;
+    u.f[1] = filmOy;
+    u.f[2] = dispOn ? int(disp->curveMask) : 0;
+    u.f[3] = dispOn ? disp->lutN : 0;
+    u.g[0] = strength;
+    u.g[1] = dispOn ? disp->lutMix : 0.f;
+    u.g[2] = dispOn ? float(disp->curveSamples) : 0.f;
+    for (int c = 0; c < 3; ++c) {
+      u.dmin[c] = disp ? disp->domMin[c] : 0.f;
+      u.dmax[c] = disp ? disp->domMax[c] : 1.f;
+    }
+    if (!disp) return r.err = "film display resources missing", false;
+    const hal::PipelineH p = r.pl("film_fin", {{10, e.last ? 1 : 0}, {11, e.last && e.grain ? 1 : 0}, {12, blend ? 1 : 0}, {13, dispOn ? 1 : 0}});
     if (!p) return false;
-    r.g.dispatch("film_fin", p, {GpuGraph::R(filmH), GpuGraph::W(Dst), e.last ? GpuGraph::W(e.out8) : GpuGraph::R(r.dummy(kU8))},
+    r.g.dispatch("film_fin", p,
+                 {GpuGraph::R(filmH), GpuGraph::W(Dst), e.last ? GpuGraph::W(e.out8) : GpuGraph::R(r.dummy(kU8)),
+                  GpuGraph::R(blend ? main : r.dummy(kF16)), GpuGraph::R(r.g.externalBuf(disp->curves)), GpuGraph::R(r.g.external(disp->lut))},
                  r.gx(W), r.gy(Hh), &u, sizeof u);
     return true;
   }
@@ -749,8 +958,15 @@ struct Executor::Walk {
       const GpuImpl* impl = gpuImplFor(t0);
       GpuPorts ports;
       const void* res = nullptr;
-      if (filmH >= 0 && g.kind == GroupKind::PointChain) {  // DisplayStages (identity) + Vignette of a film frame
-        if (!filmFinish(e, D, W, Hh, ox, oy)) return false;
+      if (filmH >= 0 && g.kind == GroupKind::PointChain) {  // [Gain + ToneColour] + DisplayStages [+ Blend] + Vignette of a film frame
+        bool blend = false;
+        for (NodeId id : g.nodes) blend |= typeOf(id) == NodeType::Blend;
+        H M = -1;
+        if (blend) {
+          M = mainBranch(W, Hh, ox, oy);
+          if (M < 0) return false;
+        }
+        if (!filmFinish(e, D, W, Hh, ox, oy, M)) return false;
         continue;
       }
       switch (t0) {
@@ -868,6 +1084,7 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   const bool filmFrame = in.plan.hasFilm;
   std::shared_ptr<DeviceTables> L;
   std::shared_ptr<DeviceFilm> DF;
+  std::shared_ptr<DeviceDisplay> DD;
   filmnode::FilmResolved fres;
   if (filmFrame) {  // the film replaces tone + colour: no colour lattice, the film tables instead
     // all intermediates of the film (E, E2, q, D, grain, linear light, ...) are RGBA32F frames: bounded by the device memory
@@ -876,6 +1093,12 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
     if (!filmResolve(in, fres)) return Status::Unsupported;
     DF = ensureFilm(fres);
     if (!DF) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
+    DD = ensureDisplay(P);
+    if (!DD) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
+    if (planHasBlend(in)) {  // film strength < 1: the normal branch (colour lattice) is rendered next to the film
+      L = ensureTables(in);
+      if (!L) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
+    }
   } else {
     L = ensureTables(in);
     if (!L) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
@@ -910,6 +1133,37 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
     w.fres = &fres;
     w.ftab = &DF->gt;
     w.fplan = &DF->pr;
+    w.disp = DD.get();
+    w.strength = P.film.strength;
+  }
+  // frame-global solves: a hit binds the kept grid (the plan pruned the sweep and the solve), a miss is copied into a kept image for the next frame
+  struct SolveStore {
+    NodeType type;
+    Hash128 key;
+    std::shared_ptr<DeviceSolve> keep;
+  };
+  std::vector<SolveStore> stores;
+  std::vector<std::shared_ptr<DeviceSolve>> hits;
+  for (const CacheOp& op : in.plan.cache) {
+    if (op.type != NodeType::Dehaze && op.type != NodeType::Detail) continue;
+    const bool dz = op.type == NodeType::Dehaze;
+    const int gw = cdiv(fw, 4), gh = cdiv(fh, 4);
+    if (op.kind == CacheOp::Lookup && op.hit) {
+      ResultCache::Entry* e = solves_.findLru(op.type, op.key);
+      auto sp = e ? std::static_pointer_cast<DeviceSolve>(e->payload) : nullptr;
+      if (!sp || sp->w != gw || sp->h != gh) return fail(GpuFailure::Transient, "kept solve missing"), Status::Internal;
+      hits.push_back(sp);
+      (dz ? w.dc : w.ab) = g.external(sp->img);
+    } else if (op.kind == CacheOp::Store) {
+      auto sp = std::make_shared<DeviceSolve>();
+      sp->ctx = ctx_;
+      sp->epoch = epoch_;
+      sp->w = gw;
+      sp->h = gh;
+      const hal::Status cs = d.createImage({dz ? hal::Format::R32F : hal::Format::RGBA32F, std::uint32_t(gw), std::uint32_t(gh), 1}, &sp->img);
+      if (cs != hal::Status::Ok) return failStatus(cs, ""), Status::Internal;
+      stores.push_back({op.type, op.key, sp});
+    }
   }
   for (const Stage& st : in.plan.stages) {
     if (st.kind == StageKind::FilmFrame) {
@@ -921,6 +1175,8 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
       if (!w.sweep(st) || !w.accumulate(st)) return fail(GpuFailure::Transient, err), Status::Internal;
     } else if (st.kind == StageKind::GlobalSolve) {
       if (!w.solve(st)) return fail(GpuFailure::Transient, err), Status::Internal;
+      for (const SolveStore& ss : stores)
+        if (ss.type == typeOfNode(in, st.solveNode)) g.copyImage(ss.type == NodeType::Dehaze ? w.dc : w.ab, g.external(ss.keep->img), std::uint32_t(ss.keep->w), std::uint32_t(ss.keep->h));
     }
   }
   if (w.o8 < 0) return fail(GpuFailure::Unsupported, "plan has no output sweep"), Status::Unsupported;
@@ -932,6 +1188,13 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   hal::Status s = runGraph(d, g, *cl, &fence, err);
   if (s != hal::Status::Ok) return failStatus(s, err), Status::Internal;
   const auto tWait = Clock::now();
+  for (SolveStore& ss : stores) {
+    ResultCache::Entry e;
+    e.key = e.family = ss.key;
+    e.payload = ss.keep;
+    e.bytes = std::size_t(ss.keep->w) * ss.keep->h * (ss.type == NodeType::Dehaze ? 4 : 16);
+    solves_.put(ss.type, std::move(e));
+  }
   Clock::time_point t1 = tWait;
   double copyMs = 0;
   if (!external) {
@@ -988,11 +1251,29 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   while (tile + 2 * R.halo > maxDim && tile > 64) tile = std::max(64, (tile / 2) / 4 * 4);
   if (tile + 2 * R.halo > maxDim) return fail(GpuFailure::Unsupported, "device image limit too small for the halo"), Status::Unsupported;
 
-  std::shared_ptr<DeviceTables> L = ensureTables(in);
-  if (!L) return bad(Status::Internal);
+  const bool filmFrame = in.plan.hasFilm;
+  std::shared_ptr<DeviceTables> L;
+  if (!filmFrame || planHasBlend(in)) {  // a film frame needs the colour lattice only for the blend with the normal branch
+    L = ensureTables(in);
+    if (!L) return bad(Status::Internal);
+  }
+  std::shared_ptr<DeviceFilm> DF;
+  std::shared_ptr<DeviceDisplay> DD;
+  filmnode::FilmResolved fres;
+  if (filmFrame) {  // the whole-frame part of the film (E2, q) is kept on the device while the tiles run
+    if (std::uint64_t(P.outW) * P.outH * 128 > std::uint64_t(double(d.caps().deviceLocalBytes) * 0.5))
+      return fail(GpuFailure::Unsupported, "film frame too large for the device memory"), Status::Unsupported;
+    if (!filmResolve(in, fres)) return Status::Unsupported;
+    DF = ensureFilm(fres);
+    if (!DF) return bad(Status::Internal);
+    DD = ensureDisplay(P);
+    if (!DD) return bad(Status::Internal);
+  }
 
-  // the source: resident (small enough) or streamed per tile
-  const bool resident = !in.forceStream && canResident(W_, H_) && canResident(rw, rh) && std::uint64_t(W_) * H_ <= 40000000ull;
+  // the source: resident (small enough) or streamed per tile; a film export keeps it resident (the whole-frame film part reads all of it)
+  const bool resident = filmFrame ? (canResident(W_, H_) && canResident(rw, rh))
+                                  : (!in.forceStream && canResident(W_, H_) && canResident(rw, rh) && std::uint64_t(W_) * H_ <= 40000000ull);
+  if (filmFrame && !resident) return fail(GpuFailure::Unsupported, "film export needs the source resident on the device"), Status::Unsupported;
   hal::ImageH* S = nullptr;
   if (resident) {
     if (!ensureResident()) return bad(Status::Internal);
@@ -1021,6 +1302,66 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   };
   if (wantDz && (!mk(gColor, hal::Format::RGBA32F) || !mk(gDc, hal::Format::R32F))) return Status::Internal;
   if (wantClar && (!mk(gYy, hal::Format::RGBA32F) || !mk(gAb, hal::Format::RGBA32F))) return Status::Internal;
+
+  // ---- film: exposure, mixtures and the DIR field over the whole frame, once; the tiles read them as persistent images ----
+  struct FilmKeep {
+    hal::Device& dev;
+    hal::ImageH e2, q, disp;
+    bool any = false;
+    ~FilmKeep() {
+      dev.waitIdle();
+      dev.destroy(e2);
+      dev.destroy(q);
+      dev.destroy(disp);
+    }
+  } keep{d, {}, {}, {}};
+  if (filmFrame) {
+    auto cl = d.begin();
+    if (!cl) return failStatus(hal::Status::Timeout, ""), Status::Internal;
+    const int slot = cl->slot();
+    std::string perr;
+    GpuGraph g(d, pool);
+    GpuRecorder rec(d, g, perr);
+    rec.weights = core().slot(slot).weights;
+    rec.taps = core().slot(slot).taps;
+    rec.boxScanMin = core().boxScanOk ? -1 : 0;
+    rec.gBuf = core().gBuf;
+    rec.partBuf = core().partBuf;
+    Walk wp(rec, in, rsharp, true);
+    wp.interior = wp.work = WRect{0, 0, P.outW, P.outH};
+    wp.src.img = g.external(*S);
+    wp.fres = &fres;
+    wp.ftab = &DF->gt;
+    wp.fplan = &DF->pr;
+    filmnode::FilmPre pre;
+    if (!wp.filmPrePass(pre)) {
+      const bool unsup = perr.rfind("film GPU:", 0) == 0;
+      return fail(unsup ? GpuFailure::Unsupported : GpuFailure::Transient, perr), unsup ? Status::Unsupported : Status::Internal;
+    }
+    keep.any = pre.any;
+    hal::Status ms = hal::Status::Ok;
+    auto mkImg = [&](hal::ImageH& im) {
+      if (ms == hal::Status::Ok) ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(P.outW), std::uint32_t(P.outH), 1}, &im);
+    };
+    if (pre.any) {
+      mkImg(keep.e2);
+      if (pre.q >= 0) mkImg(keep.q);
+    } else {
+      mkImg(keep.disp);
+    }
+    if (ms != hal::Status::Ok) return failStatus(ms, ""), Status::Internal;
+    if (pre.any) {
+      g.copyImage(pre.e2, g.external(keep.e2), std::uint32_t(P.outW), std::uint32_t(P.outH));
+      if (pre.q >= 0) g.copyImage(pre.q, g.external(keep.q), std::uint32_t(P.outW), std::uint32_t(P.outH));
+    } else {
+      g.copyImage(pre.disp, g.external(keep.disp), std::uint32_t(P.outW), std::uint32_t(P.outH));
+    }
+    hal::FenceH fence;
+    ms = runGraph(d, g, *cl, &fence, perr);
+    if (ms == hal::Status::Ok) ms = d.wait(fence, kWaitNs);
+    if (ms != hal::Status::Ok) return failStatus(ms, perr), Status::Internal;
+    if (in.cancel.cancelled()) return fail(GpuFailure::None, "cancelled"), Status::Cancelled;
+  }
 
   std::vector<WRect> tiles;
   for (int y = 0; y < P.outH; y += tile)
@@ -1099,7 +1440,21 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     Walk w(rec, in, rsharp, false);
     w.interior = interior;
     w.work = work;
-    w.lut = lutBind(g, *L);
+    if (L) w.lut = lutBind(g, *L);
+    if (filmFrame) {
+      w.fres = &fres;
+      w.ftab = &DF->gt;
+      w.fplan = &DF->pr;
+      w.disp = DD.get();
+      w.strength = P.film.strength;
+      w.pre.any = keep.any;
+      if (keep.any) {
+        w.pre.e2 = g.external(keep.e2);
+        if (keep.q) w.pre.q = g.external(keep.q);
+      } else {
+        w.pre.disp = g.external(keep.disp);
+      }
+    }
     GlobalRes gl;
     bindGlobals(g, gl);
     w.glob = &gl;
@@ -1120,6 +1475,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
         w.src.oy = win.y0;
       }
     }
+    if (ok && filmFrame) ok = w.filmWindowStage();
     if (ok) ok = w.sweep(st) && w.accumulate(st);
     if (ok && readback) {
       if (w.o8 < 0) ok = false;
@@ -1129,7 +1485,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     }
     if (!ok) {
       if (haveAcq) pool.release(acquired);
-      return fail(GpuFailure::Transient, err);
+      return fail(err.rfind("film GPU:", 0) == 0 ? GpuFailure::Unsupported : GpuFailure::Transient, err);
     }
     hal::FenceH fence;
     const hal::Status s = runGraph(d, g, *cl, &fence, err);

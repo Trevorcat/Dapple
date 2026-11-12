@@ -102,6 +102,14 @@ class EditorController extends ChangeNotifier implements GestureSink {
   /// Mini-map "fine" switch of 2D controls (kept for the session).
   final ValueNotifier<bool> fine2D = ValueNotifier(false);
 
+  /// Phone portrait: the category controls are a panel docked under the photo (set by the page), not
+  /// floating windows. Changes what back and a tap on the photo do to the open category.
+  bool docked = false;
+
+  /// The running adjust gesture started on a control inside a floating window (a pad): that window
+  /// must stay open under the finger instead of folding to its one-line readout.
+  bool dragFromWindow = false;
+
   final Map<EGroup, String> _activeId = {};
 
   /// A screen reader explores by touch: one-finger drags must not change values.
@@ -157,6 +165,27 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   void _bump() {
     edits.value++;
+  }
+
+  /// A control (docked ruler, pad) starts an adjust gesture on [row]: the same code path as a drag
+  /// on the photo, so both stay in sync. Makes [row] the active row of its category first.
+  void beginOn(ParamRow row, LockAxis axis, double x, double y, {bool fromWindow = false}) {
+    if (row.switchable) _activeId[row.group] = row.id;
+    wm.focus(row.group);
+    dragFromWindow = fromWindow;
+    adjustBegin(axis, x, y);
+  }
+
+  /// Chip tap in the docked panel: selects the row (or runs an action row) and opens a collapsed panel.
+  void selectRow(EGroup g, ParamRow r) {
+    if (r.kind == RowKind.action) {
+      performAction(r);
+      return;
+    }
+    _activeId[g] = r.id;
+    wm.focus(g);
+    if (wm.windowOf(g)?.collapsed ?? false) wm.setCollapsed(g, false);
+    _bump();
   }
 
   // ------------------------------------------------------------ GestureSink: context
@@ -235,6 +264,10 @@ class EditorController extends ChangeNotifier implements GestureSink {
         case TwoD.wheel:
           final z = c.sel.gradeZone;
           _wheel = WheelMapper()..begin(c.edit.value(grKey(z, 'h')), c.edit.value(grKey(z, 's')));
+        case TwoD.offset:
+          // pad coordinates: x right = +1; y up = +1; the mapper works on 0..1 screen coordinates (y down)
+          _pal = PaletteMapper(defX: 0.5, defY: 0.5, lo: 0, hi: 1)
+            ..begin((c.edit.value(row.padX!) + 1) / 2, (1 - c.edit.value(row.padY!)) / 2);
       }
     }
 
@@ -243,7 +276,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
     readout.dimmed = false;
     readout.cancelHide();
     wm.setInteracting(true);
-    engine.beginInteraction(activeParam: row.id);
+    engine.beginInteraction(activeParam: row.padX ?? row.id); // film pads: the X key names the pad to the engine
     _undragTimer?.cancel();
     dragging.value = true;
     _publish(row, c, PrecisionBand.standard);
@@ -379,6 +412,19 @@ class EditorController extends ChangeNotifier implements GestureSink {
           ..value = row.fmt!(q)
           ..endSide = m.endSide;
         if (m.landmark == Landmark.autoSnap) readout.flash++;
+      case TwoD.offset:
+        final p = _pal!;
+        p.update(dx, dy, speed, dtMs, fineScale: fine);
+        // NATIVE BINDING (film pads): the only place the two offsets are written. They land in the edit's params
+        // map under row.padX / row.padY (film_shoot / film_print), normalised to [-1, +1],
+        // 0 = automatic; EditState.toWire sends them like every other film_* key, so connecting the engine means
+        // the engine's film node reading those keys; nothing else changes here.
+        final ox = p.snapped ? 0.0 : (((p.x * 2 - 1) * 100).round() / 100);
+        final oy = p.snapped ? 0.0 : (((1 - p.y * 2) * 100).round() / 100);
+        _apply((e) => e.withValue(row.padX!, ox).withValue(row.padY!, oy));
+        haptics.landmark(p.landmark);
+        readout.value = offsetPadText(ox, oy);
+        if (p.landmark == Landmark.autoSnap) readout.flash++;
       case TwoD.wheel:
         final w = _wheel!;
         w.update(dx, dy, speed, dtMs, fineScale: fine);
@@ -434,7 +480,10 @@ class EditorController extends ChangeNotifier implements GestureSink {
     readout.notify();
     // The window springs back 150 ms after the finger lifts.
     _undragTimer?.cancel();
-    _undragTimer = Timer(const Duration(milliseconds: 150), () => dragging.value = false);
+    _undragTimer = Timer(const Duration(milliseconds: 150), () {
+      dragging.value = false;
+      dragFromWindow = false;
+    });
     _bump();
   }
 
@@ -651,6 +700,14 @@ class EditorController extends ChangeNotifier implements GestureSink {
     if (editingRow.value != null) {
       cancelNumeric();
       return true;
+    }
+    if (docked) {
+      // docked panel: first back folds it to its chip strip, the next closes it
+      final w = wm.focused;
+      if (w != null && !w.collapsed) {
+        wm.setCollapsed(w.group, true);
+        return true;
+      }
     }
     if (wm.closeLatest()) {
       _bump();

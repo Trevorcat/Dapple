@@ -7,8 +7,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "dapple/camera.h"
@@ -16,6 +20,7 @@
 #include "dapple/renderer.h"
 #include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
+#include "engine/exec/gpu_runtime.h"
 #include "engine/hal/select.h"
 #include "gpu_rig.h"
 #include "engine/nodes/gpu_common.h"
@@ -563,7 +568,143 @@ int benchBox() {
 
 }  // namespace
 
+// ---- the default-on probe (gpu_runtime.h): self-test off the frame thread, persisted verdicts, crash marker, kill switch ----------------------------
+// A child process (probe-child <dir>) is one app start: configure -> warm-up -> wait -> one frame -> status JSON on stdout. The parent runs several of them against
+// the same directory, because the provider is a process-wide singleton and the marker / verdict handling happens at its first selection.
+std::string slurp(const std::filesystem::path& p) {
+  std::ifstream in(p, std::ios::binary);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
+int probeChild(const std::string& dir) {
+  eg::configure(dir, "testapp+1", "testfp");
+  eg::setRuntimeEnabled(-1);  // environment decides (DAPPLE_GPU=auto / 0)
+  const auto t0 = std::chrono::steady_clock::now();
+  eg::startWarmup();
+  const double startMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  std::string st = eg::statusJson();
+  bool probing = st.find("\"state\":\"probing\"") != std::string::npos || st.find("\"state\":\"ready\"") != std::string::npos;
+  // frames during the probe are CPU frames and never wait for it
+  const SourceImage src = gpu::makeTestImage(160, 120);
+  const auto cams = CameraRegistry::withBuiltins();
+  EditParams p;
+  p.exposure = 0.3f;
+  engine::MemorySourceStore store(src);
+  engine::EngineSession es;
+  std::string firstExec, firstWhy;
+  {
+    Renderer r(p, cams.resolve("", ""), nullptr);
+    engine::FrameJob job{p, r, src, nullptr, cams.resolve("", ""), nullptr, {}, {}, {}};
+    job.request.bakeSize = 33;
+    job.store = &store;
+    engine::FrameResult res;
+    if (es.renderFrame(job, res)) {
+      firstExec = res.executor;
+      firstWhy = res.why;
+      std::free(res.rgba);
+    }
+  }
+  for (int i = 0; i < 1800; ++i) {  // up to 3 minutes
+    st = eg::statusJson();
+    if (st.find("\"state\":\"probing\"") == std::string::npos) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  std::string lastExec;
+  {
+    Renderer r(p, cams.resolve("", ""), nullptr);
+    engine::FrameJob job{p, r, src, nullptr, cams.resolve("", ""), nullptr, {}, {}, {}};
+    job.request.bakeSize = 33;
+    job.store = &store;
+    engine::FrameResult res;
+    if (es.renderFrame(job, res)) {
+      lastExec = res.executor;
+      std::free(res.rgba);
+    }
+  }
+  st = eg::statusJson();
+  std::printf("startWarmupMs=%.1f probing_or_ready_at_start=%d firstExec=%s firstWhy=[%s] lastExec=%s\nSTATUS %s\n", startMs, probing ? 1 : 0, firstExec.c_str(),
+              firstWhy.c_str(), lastExec.c_str(), st.c_str());
+  return 0;
+}
+
+int testDefaultProbe(const char* argv0) {
+  std::printf("== default-on GPU: background probe, persisted verdicts, crash marker, kill switch ==\n");
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / ("dapple_gpu_probe_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  fs::create_directories(dir);
+  const fs::path out = dir / "child.out";
+  auto child = [&](const char* gpuEnv, const char* api) -> std::string {
+    setEnv("DAPPLE_GPU", gpuEnv);
+    if (api) setEnv("DAPPLE_GPU_API", api);
+    else unsetEnv("DAPPLE_GPU_API");
+#if defined(_WIN32)
+    const char* wrap = "\"";  // cmd.exe /c strips the outer pair of quotes
+#else
+    const char* wrap = "";
+#endif
+    const std::string cmd = std::string(wrap) + "\"" + argv0 + "\" probe-child \"" + (dir / "state").string() + "\" > \"" + out.string() + "\" 2>&1" + wrap;
+    const int rc = std::system(cmd.c_str());
+    std::string s = slurp(out);
+    std::printf("  [%s%s%s] rc=%d: %s", gpuEnv, api ? " api=" : "", api ? api : "", rc, s.substr(0, s.find("STATUS")).c_str());
+    return rc == 0 ? s : std::string();
+  };
+  auto has = [](const std::string& s, const char* sub) { return s.find(sub) != std::string::npos; };
+  auto cleanup = [&] {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+  };
+  const fs::path verdicts = dir / "state" / "gpu_selftest.v1", marker = dir / "state" / "gpu_selftest.running";
+
+  std::string a = child("auto", nullptr);
+  CHECK(!a.empty(), "child 1 ran");
+  if (a.empty()) return cleanup(), 0;
+  if (!has(a, "\"state\":\"ready\"")) {
+    std::printf("  no GPU backend passed here (%s)\n", a.c_str());
+    return cleanup(), 77;
+  }
+  const bool vk = has(a, "\"api\":\"vulkan\"");
+  const std::string api = vk ? "vulkan" : "gles";
+  CHECK(!has(a, "lastExec=cpu") && !has(a, "lastExec=\n"), "after the probe frames run on the GPU: %s", a.substr(0, 300).c_str());
+  CHECK(has(a, "probing_or_ready_at_start=1"), "startWarmup returned with the probe running or done");
+  CHECK(fs::exists(verdicts) && has(slurp(verdicts), "\tpass\t"), "the verdict was persisted");
+  CHECK(!fs::exists(marker), "the in-progress marker is cleared after the test");
+  CHECK(!has(a, "cached pass"), "first start runs the self-test");
+
+  std::string b = child("auto", nullptr);
+  CHECK(has(b, "\"state\":\"ready\"") && has(b, "cached pass"), "second start takes the persisted verdict: %s", b.substr(b.find("STATUS"), 400).c_str());
+
+  // a start that died inside the self-test leaves the marker: that API is failed for this fingerprint + app version, not tried again
+  {
+    std::ofstream m(marker, std::ios::trunc);
+    m << "testfp\ttestapp+1\t" << api << "\n";
+  }
+  std::string c = child("auto", nullptr);
+  CHECK(!c.empty(), "child after a crash marker ran");
+  CHECK(!fs::exists(marker), "the marker is consumed");
+  CHECK(has(slurp(verdicts), (api + "\t*\tfail").c_str()), "the crash is recorded as a failed verdict for %s", api.c_str());
+  CHECK(has(c, "crashed or hung") || (has(c, "\"state\":\"ready\"") && !has(c, ("\"api\":\"" + std::string(vk ? "vulkan" : "gles31") + "\"").c_str())),
+        "that API is skipped (failed, or another API took over): %s", c.substr(c.find("STATUS"), 500).c_str());
+  // a marker of another OS build / app version is no verdict for this one
+  {
+    std::ofstream m(marker, std::ios::trunc);
+    m << "otherfp\ttestapp+1\t" << api << "\n";
+  }
+  fs::remove(verdicts);
+  std::string d = child("auto", nullptr);
+  CHECK(has(d, "\"state\":\"ready\""), "a marker of another fingerprint is ignored: %s", d.substr(d.find("STATUS"), 300).c_str());
+  // the developer switch
+  std::string e = child("0", nullptr);
+  CHECK(has(e, "\"mode\":\"off\"") && has(e, "\"enabled\":false") && has(e, "lastExec=cpu"), "DAPPLE_GPU=0: CPU frames, no probe: %s", e.substr(e.find("STATUS"), 300).c_str());
+  CHECK(has(e, "developer switch"), "the CPU frame says why");
+  unsetEnv("DAPPLE_GPU");
+  cleanup();
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 3 && std::strcmp(argv[1], "probe-child") == 0) return probeChild(argv[2]);
   std::vector<std::string> want(argv + 1, argv + argc);
   auto on = [&](const char* n) { return want.empty() ? std::strcmp(n, "bench-box") != 0 : std::find(want.begin(), want.end(), n) != want.end(); };
   int rc = 0;
@@ -578,6 +719,10 @@ int main(int argc, char** argv) {
   run("bench-box", benchBox);
   run("external", testExternal);
   run("select", testSelect);
+  if (on("probe")) {
+    const int r = testDefaultProbe(argv[0]);
+    if (r == 77) rc = rc ? rc : 77;
+  }
   if (g_fail) {
     std::printf("\nFAILED (%d failures)\n", g_fail);
     return 1;

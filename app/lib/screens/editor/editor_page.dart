@@ -4,6 +4,7 @@
 // pointer move: every moving part listens to its own small notifier.
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -12,6 +13,7 @@ import 'package:flutter/semantics.dart';
 import '../../editor/handedness.dart';
 import '../../editor/haptics.dart';
 import '../../editor/springs.dart';
+import '../../editor/param_rows.dart' show RowKind;
 import '../../editor/window_manager.dart';
 import '../../model/catalog.dart';
 import '../../model/params.dart';
@@ -22,6 +24,7 @@ import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
 import '../../widgets/photo_art.dart';
 import '../publish/publish_page.dart';
+import 'dock_panel.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart';
 import 'float_window.dart';
@@ -55,6 +58,12 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
   late final EditorController ctl;
   late final Haptics haptics = Haptics(enabled: app.settings.haptics);
   late final SpringValue _shift = SpringValue(this);
+
+  /// Visible height of the docked panel (phone portrait); 0 = no panel. The photo area follows it.
+  late final SpringValue _panel = SpringValue(this);
+  bool _docked = false;
+  _DockGeo? _geo;
+  double _lastAspect = 0;
   bool menuOpen = false;
   int lastRev = 0;
   Timer? _saveLayout;
@@ -86,6 +95,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     app.addListener(_onApp);
     app.editTick.addListener(_onApp);
     wm.addListener(_onWm);
+    ctl.edits.addListener(_onEdits);
     zoom.addListener(_onZoom);
     engine.attach(ph, neighbors: _neighborsOf(id));
     if (widget.resamplePointers) {
@@ -100,6 +110,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     app.removeListener(_onApp);
     app.editTick.removeListener(_onApp);
     wm.removeListener(_onWm);
+    ctl.edits.removeListener(_onEdits);
     zoom.removeListener(_onZoom);
     _saveLayout?.cancel();
     _persistLayout(deferred: true);
@@ -107,6 +118,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     if (p != null) Future.microtask(() => app.commitEdit(p));
     zoom.dispose();
     _shift.dispose();
+    _panel.dispose();
     ctl.dispose();
     wm.dispose();
     engine.dispose();
@@ -136,6 +148,11 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     }
   }
 
+  /// A new selection (or a changed crop) can change the controls the panel needs.
+  void _onEdits() {
+    if (_docked && mounted) WidgetsBinding.instance.addPostFrameCallback((_) => _updateDock());
+  }
+
   void _onWm() {
     _saveLayout?.cancel();
     _saveLayout = Timer(const Duration(seconds: 1), _persistLayout);
@@ -143,6 +160,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     if (styleNow && !_styleOpen) engine.refreshTiles();
     _styleOpen = styleNow;
     if (!wm.interacting) _syncShift();
+    if (_docked) WidgetsBinding.instance.addPostFrameCallback((_) => _updateDock());
   }
 
   void _onZoom() {
@@ -176,7 +194,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     if (lc == null || area == null) return;
     final frame = zoom.frame, vp = zoom.viewport;
     var target = 0.0;
-    if (lc.width == WidthClass.compact && !lc.railDock && !zoom.zoomed && frame.height > 0) {
+    if (lc.width == WidthClass.compact && !lc.railDock && !_docked && !zoom.zoomed && frame.height > 0) {
       final photoTop = (vp.height - frame.height) / 2, photoBottom = photoTop + frame.height;
       // One stable region for every window: the tallest card any category could have, so switching
       // between windows of different heights leaves the photo still.
@@ -187,6 +205,40 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
       target = -math.min(math.max(0.0, occ), gray);
     }
     if ((target - _shift.target).abs() > 0.5) _shift.animateTo(target, spring: SpringTier.large.displacement);
+  }
+
+  // ------------------------------------------------------------ docked panel (phone portrait)
+
+  /// Final height of the docked panel: what the photo's aspect leaves free, never less than the
+  /// controls need (then the photo area shrinks instead of the panel being covered), folded = handle + chips.
+  double _panelTarget() {
+    final g = _geo, w = wm.focused;
+    if (!_docked || g == null || w == null) return 0;
+    if (w.collapsed) return panelCollapsedH(g.textScale);
+    final regionH = g.regionBottom - g.regionTop;
+    final ratio = _frameRatio(ph, false);
+    final photoNat = math.min((g.size.width - g.photoPad.horizontal) / ratio, regionH);
+    return dockedPanelHeight(ctl, w.group, g.size.width, textScale: g.textScale, regionH: regionH, photoH: photoNat);
+  }
+
+  void _updateDock() {
+    if (!mounted) return;
+    final t = _panelTarget();
+    if ((t - _panel.target).abs() > 0.5) _panel.animateTo(t, spring: SpringTier.medium.opacity);
+  }
+
+  /// Extra space kept free around the photo by the docked panel: nothing without a panel; the top bar
+  /// above and the panel below with one. The photo view itself keeps its symmetric system insets (its
+  /// zoom maths centres the frame), so this is applied as padding around the whole view.
+  EdgeInsets _dockInset() {
+    final g = _geo;
+    final h = _panel.value;
+    if (g == null || !_docked || h < 0.5) return EdgeInsets.zero;
+    final base = g.photoPad;
+    final k = (h / 60).clamp(0.0, 1.0);
+    final top = ui.lerpDouble(base.top, g.regionTop, k)!;
+    final bottom = ui.lerpDouble(base.bottom, g.size.height - g.regionBottom + h + 8, k)!;
+    return EdgeInsets.only(top: math.max(0, top - base.top), bottom: math.max(0, bottom - base.bottom));
   }
 
   // ------------------------------------------------------------ navigation
@@ -352,6 +404,13 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     ctl.readoutArea = Rect.fromLTWH(size.width / 2 - 130, topBarBottom + 8, 260, 96);
     final photoPad = EdgeInsets.symmetric(vertical: math.max(pad.top, pad.bottom), horizontal: math.max(pad.left, pad.right));
     final c = context.c;
+    // Phone portrait: the controls are a docked panel under the photo; every other class keeps the
+    // floating windows (large screens: a side pane is the planned follow-up, see docs/design/editor-panel.md).
+    final docked = lc.width == WidthClass.compact && lc.aspect == AspectClass.portrait && !rail;
+    _docked = docked;
+    ctl.docked = docked;
+    _geo = _DockGeo(size, topBarBottom + 8, keyboard > 0 ? size.height - keyboard - 8 : dockTop - 8, photoPad, textScale);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _updateDock());
 
     return Stack(children: [
       // 0 photo + the single gesture surface
@@ -366,7 +425,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
                 const CustomSemanticsAction(label: '显示原片 / 恢复成片'): () => ctl.longPress(!ctl.compare.value),
                 const CustomSemanticsAction(label: '放大 / 适合'): () => ctl.doubleTap(size.width / 2, size.height / 2),
               },
-              child: _photoStage(photoPad),
+              child: _photoStage(),
             ),
           ),
         ),
@@ -375,21 +434,48 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
       if (lc.width != WidthClass.compact && !rail) _filmstrip(bottom: dockBottom + 56 + 12, left: marginL, right: marginR),
       // 1 histogram window (>= 600 dp)
       if (lc.histWindow) HistogramWindow(controller: ctl, area: area, reduceMotion: reduce),
-      // 2 category windows
-      Positioned.fill(
-        child: FloatingWindowsLayer(controller: ctl, layout: lc, area: area, reduceMotion: reduce, photo: ph, nearest: _analysis(ph, false).nearest),
-      ),
+      // 2 category controls: floating windows, or on a phone in portrait the docked panel
+      if (!docked)
+        Positioned.fill(
+          child: FloatingWindowsLayer(controller: ctl, layout: lc, area: area, reduceMotion: reduce, photo: ph, nearest: _analysis(ph, false).nearest),
+        )
+      else
+        ListenableBuilder(
+          listenable: Listenable.merge([wm, ctl.edits]),
+          builder: (context, _) {
+            final dockWin = wm.focused;
+            return DockedPanelHost(
+              controller: ctl,
+              height: _panel,
+              contentHeight: _panelTarget(),
+              group: dockWin?.group,
+              collapsed: dockWin?.collapsed ?? false,
+              bottom: size.height - (keyboard > 0 ? size.height - keyboard - 8 : dockTop - 8),
+              left: marginL,
+              right: marginR,
+            );
+          },
+        ),
       // 3 readout
       ListenableBuilder(
         listenable: ctl.readout,
         builder: (context, _) {
           final low = ctl.readout.low;
+          // the docked panel shows the value itself: only the original pill and counters appear over the photo
+          final show = !docked || ctl.readout.compare || ctl.readout.kind == RowKind.action;
           return Positioned(
             left: 0,
             right: 0,
             top: low ? null : topBarBottom + 8,
             bottom: low ? size.height - dockTop + 12 : null,
-            child: Center(child: ReadoutOverlay(controller: ctl, compactHist: !lc.histWindow)),
+            child: Center(
+              child: Visibility(
+                visible: show,
+                maintainState: true,
+                maintainAnimation: true,
+                child: ReadoutOverlay(controller: ctl, compactHist: !lc.histWindow),
+              ),
+            ),
           );
         },
       ),
@@ -446,9 +532,9 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
         child: Text('预览', key: const ValueKey('preview-pill'), style: T.small(Colors.white, w: FontWeight.w500)),
       );
 
-  Widget _photoStage(EdgeInsets padding) {
+  Widget _photoStage() {
     return ListenableBuilder(
-      listenable: Listenable.merge([engine, ctl.compare, ctl.edits, wm]),
+      listenable: Listenable.merge([engine, ctl.compare, ctl.edits, wm, _panel]),
       builder: (context, _) {
         final p = ph;
         PerfProbe.count('photoStage');
@@ -456,11 +542,18 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
         final focusGroup = wm.focused?.group;
         final showGrid = focusGroup == EGroup.crop && !original;
         final fine = showGrid && ctl.activeRow?.id == 'straighten';
-        return ZoomView(
+        final aspect = _frameRatio(p, original);
+        if (_docked && (aspect - _lastAspect).abs() > 1e-3) {
+          _lastAspect = aspect;
+          WidgetsBinding.instance.addPostFrameCallback((_) => _updateDock());
+        }
+        return Padding(
+          padding: _dockInset(),
+          child: ZoomView(
           key: const ValueKey('zoom-stage'),
           controller: zoom,
-          aspect: _frameRatio(p, original),
-          padding: padding,
+          aspect: aspect,
+          padding: _geo?.photoPad ?? const EdgeInsets.all(12),
           shiftY: _shift,
           onViewport: _onViewport,
           builder: (context, frame) {
@@ -479,6 +572,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
               if (showGrid) IgnorePointer(child: CustomPaint(painter: _ThirdsPainter(fine ? 6 : 3))),
             ]);
           },
+        ),
         );
       },
     );
@@ -669,6 +763,17 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
       ),
     );
   }
+}
+
+/// Inputs of the docked-panel layout, refreshed on every page build.
+class _DockGeo {
+  const _DockGeo(this.size, this.regionTop, this.regionBottom, this.photoPad, this.textScale);
+  final Size size;
+  final double textScale;
+
+  /// Free vertical region for photo + panel: below the top bar, above the dock (or the keyboard).
+  final double regionTop, regionBottom;
+  final EdgeInsets photoPad;
 }
 
 /// Thirds grid over the photo (6x6 while straightening, as a level reference) and a white frame.

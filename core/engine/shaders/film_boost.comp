@@ -1,0 +1,109 @@
+#version 450
+// Film highlight boost (spec 03 s4.1; core/src/film_spatial_render.cpp P1, film_spatial_kernels.inc boostRow; FilmBlurExposure on the CPU).
+// The boost needs the maximum X of the whole exposure frame, so it is three dependent passes (no host readback, no atomics):
+//   MODE 0  per-group maximum of the exposure planes (r, g, b)            -> part[group]
+//   MODE 1  one group: X = maximum of the partials, then boostConstants   -> g[8..12] = x0, X, a, k, apply (apply = 0: the identity)
+//   MODE 2  E -> E', v > x0: v + X k (exp(a d) - a d - 1), d = (v - x0) / X
+// u.s = (w, h, groups, 0); u.c = (boost EV, boost range A, protect EV P, 0). exp(t) - t - 1 is summed as a series below |t| = 0.25 (a float
+// subtraction loses its significant digits there; the CPU kernel does the subtraction in float, so the two agree to its rounding noise).
+#ifndef MODE
+#define MODE 0
+#endif
+#if MODE == 2
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+#else
+layout(local_size_x = 256, local_size_x_id = 18) in;  // spec constant 18: 256 where the device allows it, 128 / 64 on GLES 3.1 class devices (power of two)
+layout(constant_id = 19) const int WG = 256;           // the same number as spec constant 18 (see reduce.comp)
+const int PER_THREAD = 16;
+shared float sh[256];
+#endif
+
+layout(std140, binding = 0) uniform P {
+  ivec4 s;
+  vec4 c;
+} u;
+
+#if MODE == 0
+layout(binding = 1) uniform sampler2D uE;
+layout(binding = 2, std430) buffer Part { float part[]; };
+#elif MODE == 1
+layout(binding = 1, std430) buffer G { float g[]; };
+layout(binding = 2, std430) buffer Part { float part[]; };
+#else
+layout(binding = 1) uniform sampler2D uE;
+layout(binding = 2, std430) readonly buffer G { float g[]; };
+layout(binding = 3, rgba16f) uniform writeonly image2D uOut;
+// h16: round a float to the nearest half exactly, so the stored planes do not depend on the driver's rounding mode
+float h16(float x) {
+  uint ub = floatBitsToUint(x);
+  ub += 0xFFFu + ((ub >> 13) & 1u);
+  return uintBitsToFloat(ub & ~0x1FFFu);
+}
+vec4 h16v(vec4 v) { return vec4(h16(v.x), h16(v.y), h16(v.z), v.w); }
+#endif
+
+// exp(t) - t - 1
+vec3 expm1m(vec3 t) {
+  const vec3 ser = t * t * (0.5 + t * (1.0 / 6.0 + t * (1.0 / 24.0 + t * (1.0 / 120.0 + t * (1.0 / 720.0)))));
+  return mix(exp(t) - t - 1.0, ser, lessThan(abs(t), vec3(0.25)));
+}
+
+void main() {
+#if MODE == 2
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.s.x || p.y >= u.s.y) return;
+  vec3 v = texelFetch(uE, p, 0).rgb;
+  if (g[12] > 0.5) {
+    const float x0 = g[8], X = g[9], a = g[10], k = g[11];
+    const vec3 ad = a * ((v - x0) * (1.0 / X));
+    const vec3 b = v + (X * k) * expm1m(ad);
+    v = mix(v, b, greaterThan(v, vec3(x0)));
+  }
+  imageStore(uOut, p, h16v(vec4(v, 1.0)));
+#else
+  const uint t = gl_LocalInvocationID.x;
+  const int n = u.s.x * u.s.y;
+  float acc = 0.0;
+#if MODE == 0
+  const int base = int(gl_WorkGroupID.x) * int(WG) * PER_THREAD;
+  for (int k = 0; k < PER_THREAD; ++k) {
+    const int i = base + k * int(WG) + int(t);
+    if (i >= n) break;
+    const vec3 e = texelFetch(uE, ivec2(i % u.s.x, i / u.s.x), 0).rgb;
+    acc = max(acc, max(e.r, max(e.g, e.b)));
+  }
+#else
+  for (int i = int(t); i < u.s.z; i += int(WG)) acc = max(acc, part[i]);
+#endif
+  sh[t] = acc;
+  barrier();
+  for (uint st = uint(WG) / 2u; st > 0u; st >>= 1) {
+    if (t < st) sh[t] = max(sh[t], sh[t + st]);
+    barrier();
+  }
+  if (t == 0u) {
+#if MODE == 0
+    part[gl_WorkGroupID.x] = sh[0];
+#else
+    const float X = sh[0];
+    float x0 = 0.0, a = 0.0, k = 0.0, apply = 0.0;
+    if (X > 0.0) {
+      x0 = clamp(0.184 * exp2(u.c.z), 0.0, X);
+      a = pow(28.0, 1.0 - u.c.y);
+      const float tt = a * (1.0 - x0 / X);
+      const float den = tt < 0.25 ? tt * tt * (0.5 + tt * (1.0 / 6.0 + tt * (1.0 / 24.0 + tt * (1.0 / 120.0 + tt * (1.0 / 720.0)))))
+                                  : exp(tt) - tt - 1.0;
+      if (den > 0.0 && x0 < X) {
+        k = (exp2(u.c.x) - 1.0) / den;
+        apply = 1.0;
+      }
+    }
+    g[8] = x0;
+    g[9] = X;
+    g[10] = a;
+    g[11] = k;
+    g[12] = apply;
+#endif
+  }
+#endif
+}

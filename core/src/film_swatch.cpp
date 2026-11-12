@@ -16,6 +16,7 @@
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 
 namespace {
 std::string jsonEsc(const std::string& s) {
@@ -55,8 +56,8 @@ extern "C" DAPPLE_API char* dapple_film_swatch_bands_json(void) {
         EditParams p;
         p.filmStock = si.id;
         p.filmStrength = 100.f;
-        const ImageF out = Renderer(p, cam, nullptr).renderFloat(src, false);
-        if (out.width != 3 * kCell) continue;
+        ImageF out;
+        if (!engine::renderImageF(p, cam, nullptr, src, false, out) || out.width != 3 * kCell) continue;
         j += std::string(first ? "" : ",") + "\"" + jsonEsc(si.id) + "\":[";
         for (int k = 0; k < 3; ++k) {
           const float* px = out.row(kCell / 2) + 3 * (k * kCell + kCell / 2);

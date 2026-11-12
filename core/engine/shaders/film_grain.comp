@@ -17,14 +17,14 @@ vec4 h16v(vec4 v) { return vec4(h16(v.x), h16(v.y), h16(v.z), v.w); }
 layout(std140, binding = 0) uniform P {
   ivec4 dim;       // output (extended) w, h; frame w, h
   ivec4 org;       // absolute coordinates of output pixel (0, 0); layers; table size
-  uvec4 stream;    // per channel stream base
+  uvec4 stream;    // per channel stream base; w: layer mode = (layer + 1) | mask << 4: layer -1 = the value of the sum of the layers; l >= 0 = sub-layer l of the channels in the mask (the other channels give their sum on layer 0 and 0 on the others); mask = channels whose sub-layers are blurred separately
   vec4 pa[3];      // per channel: sub-layer dmin (xyz), inverse table scale
   vec4 pb[3];      // per channel: inverse dmax of the sub-layers (xyz), uniformity u
   vec4 pc[3];      // per channel: expected particle counts n of the sub-layers (xyz), merged-sampler switch
-  vec4 pd[3];      // per channel: sub-layer particle scale (xyz)
+  vec4 pd[3];      // per channel: sub-layer particle scale (xyz); pd[0].w = frame w | h << 16, pd[1].w = origin x | y << 16 of the density image in the frame (int bit patterns; the density reflects at the frame border)
 } u;
 
-layout(binding = 1) uniform sampler2D uD;  // developed density (frame size)
+layout(binding = 1) uniform sampler2D uD;  // developed density (the frame, or a window of it: dim.zw is its size)
 layout(binding = 2, std430) readonly buffer Tab { float tab[]; };  // per channel: inv ((N+2) x 4), merged ((N+2) x 4)
 layout(binding = 3, rgba16f) uniform writeonly image2D uOut;
 
@@ -103,12 +103,21 @@ void main() {
   const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
   if (p.x >= u.dim.x || p.y >= u.dim.y) return;
   const ivec2 a = p + u.org.xy;  // absolute coordinates
-  const vec3 dens = texelFetch(uD, ivec2(reflectIdx(a.x, u.dim.z), reflectIdx(a.y, u.dim.w)), 0).rgb;
+  const int layMode = int(u.stream.w & 15u) - 1, layMask = int((u.stream.w >> 4) & 7u);
+  const int pf = floatBitsToInt(u.pd[0].w), po = floatBitsToInt(u.pd[1].w);
+  const ivec2 frameSz = ivec2(pf & 0xFFFF, (pf >> 16) & 0xFFFF), winOrg = ivec2(po & 0xFFFF, (po >> 16) & 0xFFFF);
+  const ivec2 fi = ivec2(reflectIdx(a.x, frameSz.x), reflectIdx(a.y, frameSz.y)) - winOrg;
+  const vec3 dens = texelFetch(uD, clamp(fi, ivec2(0), u.dim.zw - 1), 0).rgb;
   const int N = u.org.w;
   const int layers = u.org.z;
   vec3 res = vec3(0.0);
   for (int ch = 0; ch < 3; ++ch) {
     const int tabInv = ch * 2 * (N + 2) * 4, tabMerged = tabInv + (N + 2) * 4;
+    const bool layerMode = layMode >= 0 && ((layMask >> ch) & 1) != 0;
+    if (layMode > 0 && !layerMode) {  // a channel whose layers are not blurred separately: its sum was written on layer 0
+      res[ch] = 0.0;
+      continue;
+    }
     float v = clamp(dens[ch] * u.pa[ch].w, 0.0, float(N));
     const int ii = int(v);
     const float ff = v - float(ii);
@@ -120,7 +129,7 @@ void main() {
     const float lam = tab[m0 + 3] + ff * (tab[m0 + 7] - tab[m0 + 3]);
     uint s0 = uint(a.x), s1 = uint(a.y), s2 = u.stream[ch] ^ 0x5851F42Du;
     pcg3d(s0, s1, s2);
-    if (lam >= u.pc[ch].w) {
+    if (!layerMode && lam >= u.pc[ch].w) {
       const float z = normalFrom(s0, s1);
       res[ch] = max(M + sV * (z + gam * (z * z - 1.0) * (1.0 / 6.0)), 0.0);
       continue;
@@ -139,6 +148,7 @@ void main() {
     pcg3d(h[3], h[4], h[5]);
     float sum = 0.0;
     for (int ly = 0; ly < layers; ++ly) {
+      if (layerMode && ly != layMode) continue;
       float pp = (D[ly] + u.pa[ch][ly]) * u.pb[ch][ly];
       pp = clamp(pp, 1e-6, 1.0 - 1e-6);
       const float s = 1.0 - pp * u.pb[ch].w * (1.0 - 1e-6);

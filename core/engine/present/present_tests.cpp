@@ -2,6 +2,7 @@
 // lifecycle (attach / detach / re-attach re-renders the newest snapshot, unbind, trim, destroy under load) on the
 // null presenter with a real session (a synthetic JPEG). The Vulkan swapchain is covered on the emulator.
 #include <algorithm>
+#include <cstddef>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -221,6 +222,30 @@ static void testView() {
   CHECK(dapple_view_attach_window(v, &fakeWindow, 800, 600) == DAPPLE_OK);
   CHECK(waitFor([&] { return count(ev, DAPPLE_VIEW_SHOWN) > sh; }, 3000));
   CHECK(ev.w == 200);
+
+  // active_param (the slider being dragged) reaches the frame request; a caller whose struct is too short to carry it is ignored
+  {
+    auto activeOf = [&](const char* expect) {
+      char* info = dapple_view_info_json(v);
+      const std::string j = info ? info : "";
+      dapple_free_string(info);
+      return j.find(std::string("\"activeParam\":\"") + expect + "\"") != std::string::npos;
+    };
+    DappleFrameRequest ar{};
+    ar.size = sizeof ar;
+    ar.long_edge = 200;
+    ar.flags = DAPPLE_FRAME_INTERACTIVE;
+    ar.active_param = "film_grain";
+    int sh3 = count(ev, DAPPLE_VIEW_SHOWN);
+    dapple_view_submit(v, "{}", nullptr, &ar);
+    CHECK(waitFor([&] { return count(ev, DAPPLE_VIEW_SHOWN) > sh3; }, 3000));
+    CHECK(activeOf("film_grain"));
+    ar.size = int32_t(offsetof(DappleFrameRequest, active_param));  // an older caller: the field is not part of its struct
+    sh3 = count(ev, DAPPLE_VIEW_SHOWN);
+    dapple_view_submit(v, "{}", nullptr, &ar);
+    CHECK(waitFor([&] { return count(ev, DAPPLE_VIEW_SHOWN) > sh3; }, 3000));
+    CHECK(activeOf(""));
+  }
 
   // trim keeps working afterwards
   dapple_view_trim(v, 0);

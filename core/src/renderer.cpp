@@ -12,6 +12,7 @@
 
 #include "color.h"
 #include "dapple/film.h"
+#include "dapple/film_match.h"
 #include "dapple/look.h"
 #include "dapple/tone.h"
 #include "look_internal.h"
@@ -739,6 +740,8 @@ film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, Spatial
   fp.film = p.filmStock;
   fp.paper = run.paper;
   fp.camera.autoExposure = false;  // the develop pipeline's own exposure slider is the exposure control
+  fp.enlarger.printExposure = std::exp2(-double(std::clamp(p.filmPrintEv, -9.f, 9.f)));  // print exposure (film_match.h)
+  applyFilmPaperMapping(fp, p.filmBlack);  // paper white / black -> display white / black (stage C)
   // (the exposure offset is folded into the input gain in runFilmStage: it then costs no re-bake while dragging)
   fp.camera.filmFormatMm *= formatScale;
   // print filtration: more yellow / magenta filtration = less of that dye = cooler / greener print
@@ -777,6 +780,8 @@ bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], 
     a.paper = run.paper.c_str();
     for (int c = 0; c < 3; ++c) a.gain[c] = gain[c];
     a.filmExposure = p.filmExposure + p.filmKeyEv;
+    a.printEv = p.filmPrintEv;
+    a.black = p.filmBlack;
     a.warmth = p.filmWarmth;
     a.tint = p.filmTint;
     a.grainPct = p.filmGrain;
@@ -833,6 +838,11 @@ void Renderer::displayStages(float e3[3]) const {
       for (int c = 0; c < 3; ++c) e3[c] += (l[c] - e3[c]) * mix;
     }
   }
+}
+
+void Renderer::sceneGain(const SourceImage& source, float gain[3]) const {
+  const float expo = std::exp2(p_.exposure + (source.sceneReferred ? camera_.baselineExposureEv : 0.f));
+  for (int c = 0; c < 3; ++c) gain[c] = wbGain_[c] * expo;
 }
 
 ImageF Renderer::renderFloat(const SourceImage& source, bool spatial) const {
@@ -1466,9 +1476,9 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
   fp.srcW = srcW;
   fp.srcH = srcH;
   const FilmRun filmRun = resolveFilm(p_);
-  if (filmRun.stock && !(filmRun.strength >= 1.f && engine::filmnode::enabled())) {
+  if (filmRun.stock && !engine::filmnode::enabled()) {
     fp.supported = false;
-    fp.why = "film simulation (blend with the normal branch)";
+    fp.why = "film simulation as nodes is switched off (DAPPLE_FILM_NODES=0)";
     return fp;
   }
   Geometry geo;
@@ -1518,9 +1528,29 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
     FramePlan::Film& f = fp.film;
     f.active = true;
     f.displayPlain = master_.identity && red_.identity && green_.identity && blue_.identity && !(lut_ && p_.lutAmount > 0);
+    f.strength = filmRun.strength;
+    if (!f.displayPlain) {  // the display stages after the film: the curve tables and the look LUT go to the backend as they are
+      FramePlan::Display& d = fp.display;
+      const Curve1D* cs[4] = {&master_, &red_, &green_, &blue_};
+      d.curveSamples = kCurveSamples;
+      for (int c = 0; c < 4; ++c)
+        if (!cs[c]->identity && int(cs[c]->table.size()) == kCurveSamples) d.curveMask |= 1u << c;
+      if (d.curveMask) {
+        d.curves.assign(std::size_t(4) * kCurveSamples, 0.f);
+        for (int c = 0; c < 4; ++c)
+          if ((d.curveMask >> c) & 1u) std::copy(cs[c]->table.begin(), cs[c]->table.end(), d.curves.begin() + std::ptrdiff_t(c) * kCurveSamples);
+      }
+      if (lut_ && p_.lutAmount > 0) {
+        d.lut = lut_;
+        d.lutMix = std::clamp(p_.lutAmount / 100.f, 0.f, 1.f);
+        d.lutId = lut_->contentId();
+      }
+    }
     f.stock = p_.filmStock;
     f.paper = filmRun.paper;
     f.filmEv = p_.filmExposure + p_.filmKeyEv;
+    f.printEv = p_.filmPrintEv;
+    f.black = p_.filmBlack;
     f.warmth = p_.filmWarmth;
     f.tint = p_.filmTint;
     f.grainPct = p_.filmGrain;
@@ -1536,7 +1566,7 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
 }
 
 std::vector<float> Renderer::bakeOverflow(const SourceImage& source, const BakedLut& base, int n, float maxV) const {
-  if (resolveFilm(p_).stock || base.rgb.size() < 4) return {};
+  if (latticeFilmOnly() || base.rgb.size() < 4) return {};
   n = std::clamp(n, 9, 65);
   const PointOp op = makePointOp(source, &base);
   std::vector<float> out(std::size_t(n) * n * n * 3);

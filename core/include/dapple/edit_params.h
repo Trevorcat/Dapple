@@ -128,6 +128,14 @@ struct EditParams {
   // Internal, not serialised and not a slider: EV the film is exposed on top of `exposure + filmExposure` so that its
   // mid-tone lightness equals the normal develop render's (matchFilmExposure, film_match.h). Set by the C layer / CLI.
   float filmKeyEv = 0.f;
+  // Internal, not serialised: print exposure in stops (positive = brighter print), the darkroom's brightness decision
+  // (film_match.h). Paper exposure 2^-EV; for a film with no print (slides) the scan / projection lamp gain 2^EV.
+  float filmPrintEv = 0.f;
+  // Automatic film exposure overrides (docs/engine/pipeline-architecture.md section 18), normalised -1..1, 0 = automatic:
+  // filmShoot moves the film EV between the under / over edge of the stock's usable range, filmPrint the print / scan exposure
+  // between a dark and a light median, filmBlack the paper black (-1 matte, 0 true Dmax, +1 display black), filmLatitude the
+  // in-range fraction the stock is rescued to (0.55 .. 0.80 .. 0.98).
+  float filmShoot = 0.f, filmPrint = 0.f, filmBlack = 0.f, filmLatitude = 0.f;
 
   // Optional creative look (3D LUT, .cube); applied in sRGB at the end.
   std::string lutPath;

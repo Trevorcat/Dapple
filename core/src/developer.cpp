@@ -5,6 +5,7 @@
 
 #include "dapple/film_match.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 
 namespace dapple {
 
@@ -47,11 +48,14 @@ Result<DevelopResult> Developer::develop(const DevelopRequest& req) const {
     SourceImage proxy;
     proxy.sceneReferred = source->sceneReferred;
     proxy.linear = resizeToLongEdge(source->linear, 256);
-    result.applied.filmKeyEv = matchFilmExposure(result.applied, *result.camera, req.lut, proxy);
+    const FilmExposure fe = matchFilmExposure(result.applied, *result.camera, req.lut, proxy);
+    result.applied.filmKeyEv = fe.filmEv;
+    result.applied.filmPrintEv = fe.printEv;
   }
   t0 = std::chrono::steady_clock::now();
-  Renderer renderer(result.applied, *result.camera, req.lut);
-  result.image = renderer.render(*source);
+  std::string renderErr;  // graph + planner + CpuExecutor (the old Renderer::render is the golden oracle only)
+  if (!engine::renderImage8(result.applied, *result.camera, req.lut, *source, result.image, &renderErr))
+    return fail("render failed: " + renderErr);
   result.timings.renderMs = msSince(t0);
   return result;
 }

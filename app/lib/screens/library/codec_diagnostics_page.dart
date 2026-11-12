@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../native/dapple_session.dart';
 import '../../services/live_bridge.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
@@ -13,10 +14,13 @@ import 'page_bar.dart';
 /// Hidden diagnostics (long-press the version on 关于): what the device's codecs declare, the ladders that follow from it and
 /// the one-time self-test results. Nothing here can be switched; the codec choice is automatic.
 class CodecDiagnosticsPage extends StatefulWidget {
-  const CodecDiagnosticsPage({super.key, this.loader});
+  const CodecDiagnosticsPage({super.key, this.loader, this.gpuLoader});
 
   /// Test hook: returns the report JSON (`run` = run missing self-tests, `force` = repeat all).
   final Future<String> Function({bool run, bool force})? loader;
+
+  /// Test hook: returns the GPU status JSON (`dapple_gpu_status_json`); default reads it from the engine.
+  final String? Function()? gpuLoader;
 
   @override
   State<CodecDiagnosticsPage> createState() => _CodecDiagnosticsPageState();
@@ -57,10 +61,57 @@ class _CodecDiagnosticsPageState extends State<CodecDiagnosticsPage> {
 
   List<String> _strs(Object? o) => [for (final x in (o as List? ?? const [])) '$x'];
 
+  /// The GPU executor block: probe state, device and self-test, and how many frames each executor rendered (and why the CPU did).
+  String _gpuText() {
+    final String? raw;
+    try {
+      raw = (widget.gpuLoader ?? DappleSession.gpuStatusJson)();
+    } catch (e) {
+      return 'GPU\n  unavailable: $e\n';
+    }
+    if (raw == null || raw.isEmpty) return 'GPU\n  no data\n';
+    final Map<String, dynamic> g;
+    try {
+      g = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      return 'GPU\n  unreadable status\n';
+    }
+    final b = StringBuffer('GPU\n');
+    if (g['compiled'] == false) {
+      b.writeln('  not compiled into this build -> every frame is a CPU frame');
+      return b.toString();
+    }
+    b.writeln('  mode ${g['mode']} · probe ${g['state']} · ${g['enabled'] == true ? 'in use' : 'not in use'}');
+    if (g['available'] == true) {
+      b.writeln('  ${g['api']} · ${g['device']}');
+      b.writeln('  self-test ${g['selfTest']}');
+    } else if (g['reason'] != null) {
+      b.writeln('  ${g['reason']}');
+    }
+    if ((g['skipped'] ?? '').toString().isNotEmpty) b.writeln('  skipped/failed first: ${g['skipped']}');
+    final ex = g['executors'];
+    if (ex is Map) {
+      b.writeln('  frames: GPU ${ex['gpuFrames']} · CPU ${ex['cpuFrames']} · last executor ${ex['api']}');
+      b.writeln('  device lost ${ex['deviceLost']} · demotions ${ex['demotions']}');
+      final un = ex['unsupported'];
+      if (un is Map && un.isNotEmpty) {
+        b.writeln('  CPU frames by reason');
+        final e = un.entries.toList()..sort((a, c) => (c.value as num).compareTo(a.value as num));
+        for (final x in e) {
+          b.writeln('    ${x.value}  ${x.key}');
+        }
+      }
+    }
+    return b.toString();
+  }
+
   String _text() {
     final r = _r;
-    if (r == null) return _error ?? '';
+    final gpu = _gpuText();
+    if (r == null) return '$gpu\n${_error ?? ''}';
     final b = StringBuffer();
+    b.write(gpu);
+    b.writeln();
     b.writeln('${r['fingerprint']}');
     b.writeln('Android API ${r['sdk']} · ${r['abi']}');
     b.writeln();

@@ -177,4 +177,34 @@ void main() {
     await _open(tester, size: foldSize, dark: true);
     await shot(tester, 'home_fold_dark');
   });
+
+  test('no photo permission: the card says so instead of a lost link (state strings)', () {
+    final app = AppState()
+      ..ready = true
+      ..mediaPermitted = false;
+    expect(app.needsMediaPermission, isTrue);
+    expect(app.connTitle, '还不能读取手机里的照片');
+    expect(app.connLine, '允许后，手机相册里的照片会出现在这里');
+    expect(app.connAction, '允许访问');
+    app.mediaPermitted = true; // granted: the ordinary card texts take over again
+    expect(app.needsMediaPermission, isFalse);
+    expect(app.connTitle, isNot('还不能读取手机里的照片'));
+    expect(app.connAction, isNot('允许访问'));
+    // the demo app (widget tests, screenshots) is never in that state
+    final demo = AppState.demo()..mediaPermitted = false;
+    expect(demo.needsMediaPermission, isFalse);
+  });
+
+  testWidgets('no photo permission: the connection card shows the permission wording and the allow action', (tester) async {
+    useWindow(tester, phoneSize);
+    final app = AppState()
+      ..ready = true
+      ..mediaPermitted = false;
+    await pumpDapple(tester, app);
+    expect(find.text('还不能读取手机里的照片'), findsOneWidget);
+    expect(find.text('允许后，手机相册里的照片会出现在这里'), findsOneWidget);
+    expect(find.descendant(of: find.byKey(const ValueKey('conn-action')), matching: find.text('允许访问')), findsOneWidget);
+    expect(find.textContaining('已断开'), findsNothing);
+    await shot(tester, 'home_phone_no_permission');
+  });
 }

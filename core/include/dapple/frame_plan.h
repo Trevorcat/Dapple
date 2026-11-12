@@ -2,9 +2,13 @@
 // Everything a GPU (or any other) backend needs to reproduce Renderer::renderBakedRgba() for one frame,
 // resolved by the CPU reference so the numbers cannot drift apart: geometry, gain, vignette and the
 // neighbourhood parameters. See Renderer::framePlan() and docs/engine/gpu-backend.md.
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace dapple {
+
+class Lut3D;
 
 struct FramePlan {
   bool supported = true;      // false: the CPU path must render this frame (reason in `why`)
@@ -35,8 +39,11 @@ struct FramePlan {
   struct Film {
     bool active = false;
     bool displayPlain = true;       // DisplayStages (master / RGB curves, look LUT) are the identity
+    float strength = 1.f;           // film strength 0..1 (the film frame is blended with the normal render when < 1)
     std::string stock, paper;
-    float filmEv = 0.f;             // film_exp + the key-preserving match EV
+    float filmEv = 0.f;             // film_exp + the film exposure of the automatic match
+    float printEv = 0.f;            // print exposure (EditParams::filmPrintEv)
+    float black = 0.f;              // paper black (EditParams::filmBlack)
     float warmth = 0.f, tint = 0.f, grainPct = 100.f, halationPct = 100.f;
     float formatScale = 1.f;
     int quality = 2;                // 0 off, 1 interactive, 2 full
@@ -44,6 +51,16 @@ struct FramePlan {
     int fullLongEdge = 0;
     unsigned frameIndex = 0;
   } film;
+  // DisplayStages after a film (Renderer::displayStages): master / red / green / blue curves and the look LUT. Filled only for a film frame
+  // with `film.displayPlain == false`; the curves are the 1024-sample tables of the renderer (identity curves are not stored).
+  struct Display {
+    unsigned curveMask = 0;      // bit c: curve c (0 master, 1 red, 2 green, 3 blue) is not the identity
+    int curveSamples = 0;
+    std::vector<float> curves;   // [4][curveSamples]
+    const Lut3D* lut = nullptr;  // look LUT (null = none); owned by the caller of Renderer, valid for the frame
+    float lutMix = 0.f;          // 0..1
+    std::uint64_t lutId = 0;     // Lut3D::contentId()
+  } display;
   bool anySpatial() const {
     return nrLuma > 0 || nrColor > 0 || dehaze != 0 || clarity != 0 || texture != 0 || sharpen > 0 || grain > 0;
   }

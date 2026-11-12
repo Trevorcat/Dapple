@@ -295,9 +295,11 @@ class DetentStepper {
 
 /// 2D relative mapper for the colour palette (0.04..0.96 on both axes, 300 dp = full range).
 class PaletteMapper {
-  PaletteMapper({required this.defX, required this.defY});
+  PaletteMapper({required this.defX, required this.defY, this.lo = 0.04, this.hi = 0.96});
   final double defX, defY;
-  static const double lo = 0.04, hi = 0.96;
+
+  /// Reachable range on both axes (0.04..0.96 for the colour palette, 0..1 for the film offset pads).
+  final double lo, hi;
 
   double x = 0.5, y = 0.5;
   bool snapped = false;

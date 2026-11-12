@@ -55,7 +55,9 @@ NodeId addFilm(Graph& g, NodeId cur, GraphDetail detail) {
   const NodeId fq = g.add(NodeType::FilmDirField, {Edge{fb}, Edge{tCur}});
   const NodeId fd = g.add(NodeType::FilmDevelop, {Edge{fb}, Edge{fq}, Edge{tCur}});
   const NodeId fg = g.add(NodeType::FilmGrain, {Edge{fd}});
-  const NodeId fp2 = g.add(NodeType::FilmPrintScan, {Edge{fg}, Edge{tPrint}});
+  const NodeId fpe = g.add(NodeType::FilmPrintExposure, {Edge{fg}, Edge{tPrint}});
+  const NodeId feb = g.add(NodeType::FilmEnlargerBlur, {Edge{fpe}});
+  const NodeId fp2 = g.add(NodeType::FilmPrintScan, {Edge{feb}, Edge{tPrint}});
   const NodeId fl = g.add(NodeType::FilmGlare, {Edge{fp2}, Edge{tPrint}});
   return g.add(NodeType::FilmScan, {Edge{fl}});
 }

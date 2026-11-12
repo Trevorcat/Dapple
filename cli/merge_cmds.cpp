@@ -17,6 +17,7 @@
 #include "dapple/merge.h"
 #include "dapple/motion_photo.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 
 namespace fs = std::filesystem;
 using namespace dapple;
@@ -87,8 +88,9 @@ Result<void> developTo(const SourceImage& src, const fs::path& out, int longEdge
   EditParams params;
   AutoOptions ao;
   params += computeAutoAdjust(s, cam, ao).correction;
-  Renderer renderer(params, cam, nullptr);
-  Image8 img = renderer.render(s);
+  Image8 img;
+  std::string err;
+  if (!engine::renderImage8(params, cam, nullptr, s, img, &err)) return fail("render failed: " + err);
   JpegOptions jo;
   jo.quality = quality;
   return writeJpeg(img, out, jo);

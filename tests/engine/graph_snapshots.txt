@@ -280,7 +280,9 @@ n6 ToneColour <- n5 n3 n2
 n7 FilmSim <- n1
 n8 DisplayStages <- n7
 n9 Blend <- n6 n8
-n10 Pack8 <- n9 [frame]
+n10 NRChroma <- n9
+n11 Detail <- n10
+n12 Pack8 <- n11 [frame]
 == film_strength_0 [legacy]
 n0 Source
 n1 ColourLattice
@@ -295,4 +297,6 @@ n3 ToneTable
 n4 Analysis [analysis]
 n5 Gain <- n1
 n6 ToneColour <- n5 n3 n2
-n7 Pack8 <- n6 [frame]
+n7 NRChroma <- n6
+n8 Detail <- n7
+n9 Pack8 <- n8 [frame]

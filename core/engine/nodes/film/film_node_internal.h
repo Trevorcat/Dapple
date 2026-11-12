@@ -48,7 +48,7 @@ struct FilmPlanData {
   std::uint32_t streamGrain[3] = {}, streamMicro[3] = {}, streamGlare = 0;
   bool scanStage = false;
   bool dirHalf = false;
-  bool split = false;       // enlarger diffusion path: not ported
+  bool split = false;       // enlarger diffusion path: FilmPrintExposure / FilmEnlargerBlur / split FilmPrintScan
   std::string error;
 };
 std::shared_ptr<const FilmPlanData> planOf(const FilmResolved& r);
@@ -107,6 +107,8 @@ Status runBlurExposure(const CpuCtx&, const void*, std::span<const ImageView>, s
 Status runDirField(const CpuCtx&, const void*, std::span<const ImageView>, std::span<const ImageView>);
 Status runDevelop(const CpuCtx&, const void*, std::span<const ImageView>, std::span<const ImageView>);
 Status runGrain(const CpuCtx&, const void*, std::span<const ImageView>, std::span<const ImageView>);
+Status runPrintExposure(const CpuCtx&, const void*, std::span<const ImageView>, std::span<const ImageView>);
+Status runEnlargerBlur(const CpuCtx&, const void*, std::span<const ImageView>, std::span<const ImageView>);
 Status runPrintScan(const CpuCtx&, const void*, std::span<const ImageView>, std::span<const ImageView>);
 Status runGlare(const CpuCtx&, const void*, std::span<const ImageView>, std::span<const ImageView>);
 Status runScan(const CpuCtx&, const void*, std::span<const ImageView>, std::span<const ImageView>);

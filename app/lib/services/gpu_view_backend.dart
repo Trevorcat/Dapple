@@ -130,19 +130,24 @@ class GpuViewBackend with WidgetsBindingObserver {
   }
 
   /// Latest wins. Returns the sequence number.
-  int submit(Map<String, dynamic> params, {required int longEdge, required int flags, int bakeSize = 0}) {
+  ///
+  /// [activeParam]: key of the slider being dragged (grain stays on in interactive frames while a grain-family slider moves).
+  int submit(Map<String, dynamic> params, {required int longEdge, required int flags, int bakeSize = 0, String? activeParam}) {
     if (_disposed || _view == ffi.nullptr) return 0;
     final pj = jsonEncode(params).toNativeUtf8();
     final rq = calloc<DappleFrameRequestStruct>();
+    final ap = (activeParam == null || activeParam.isEmpty) ? ffi.nullptr : activeParam.toNativeUtf8();
     try {
       rq.ref
         ..size = ffi.sizeOf<DappleFrameRequestStruct>()
         ..longEdge = longEdge
         ..flags = flags
-        ..bakeSize = bakeSize;
+        ..bakeSize = bakeSize
+        ..activeParam = ap;
       return _submit(_view, pj, ffi.nullptr, rq);
     } finally {
       malloc.free(pj);
+      if (ap != ffi.nullptr) malloc.free(ap);
       calloc.free(rq);
     }
   }

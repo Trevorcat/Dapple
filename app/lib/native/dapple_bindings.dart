@@ -251,6 +251,8 @@ class DappleBindings {
         filmSwatchBandsJson = lib.providesSymbol('dapple_film_swatch_bands_json')
             ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_swatch_bands_json')
             : null,
+        gpuStatusJson =
+            lib.providesSymbol('dapple_gpu_status_json') ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_gpu_status_json') : null,
         progressToCell = lib.providesSymbol('dapple_progress_to_cell')
             ? lib.lookup<ffi.NativeFunction<DappleProgressNative>>('dapple_progress_to_cell')
             : null;
@@ -294,10 +296,14 @@ class DappleBindings {
   final _CStrFnD? filmAttribution;
   final _CStrFnD? filmSwatchesJson;
   final _CStrFnD? filmSwatchBandsJson;
+  final _CStrFnD? gpuStatusJson; // GPU probe state, device, self-test, per-frame executor counters
   final ffi.Pointer<ffi.NativeFunction<DappleProgressNative>>? progressToCell;
 
   /// Opens the native library for the current platform. Throws if missing.
   static ffi.DynamicLibrary openLibrary() {
+    // Desktop tests / tools: DAPPLE_LIB points at a host build of the engine (build/<dir>/bin/libdapple.dll, libdapple.so ...).
+    final override = Platform.environment['DAPPLE_LIB'];
+    if (override != null && override.isNotEmpty && !Platform.isAndroid && !Platform.isIOS) return ffi.DynamicLibrary.open(override);
     if (Platform.isAndroid) return ffi.DynamicLibrary.open('libdapple.so');
     if (Platform.isIOS || Platform.isMacOS) return ffi.DynamicLibrary.process();
     if (Platform.isWindows) return ffi.DynamicLibrary.open('dapple.dll');

@@ -8,6 +8,10 @@
 //   MODE 3  src -> display sRGB, the three above fused (no spatial effect between them)
 //   MODE 4  E2 -> inhibitor field q, 2x2 box averaged to half resolution (smooth DIR diffusion path)
 //   MODE 5  E2 -> inhibitor field q at full resolution
+//   MODE 6  D -> linear paper exposure 10^(print LUT 'lut1' of D - dsub)         (enlarger diffusion path: FilmPrintExposure; uLut = lut1)
+//   MODE 8  E2 [, q field] -> display sRGB: MODE 1 and MODE 2 in one pass (no grain between develop and print; the dsub offset is applied to D)
+//   MODE 7  filtered paper exposure -> display sRGB: log10, paper curves, scan LUT (enlarger diffusion path: FilmPrintScan)
+//           uLut = lut3, tab = the paper curves, dmin / dscale = the paper-density grid, gam = (1, 1, 1, paper x0), misc.x = paper 1/dx, dim.w = paperN
 layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
 // h16: round a float to the nearest half exactly (common.glsl), so the stored planes do not depend on the driver's rounding mode
 float h16(float x) {
@@ -19,6 +23,7 @@ vec4 h16v(vec4 v) { return vec4(h16(v.x), h16(v.y), h16(v.z), v.w); }
 
 layout(constant_id = 0) const int MODE = 3;
 layout(constant_id = 1) const bool HAS_Q = false;  // MODE 1: the inhibitor field comes from FilmDirField instead of the pixel
+layout(constant_id = 2) const bool ENCODE = false;  // FUSED_POST: encode the linear light back to display sRGB (film_post MODE 5 without unsharp)
 
 layout(std140, binding = 0) uniform P {
   vec4 m0, m1, m2;     // input matrix columns (3x3 ProPhoto -> XYZ in the film white) already multiplied by the gain
@@ -30,6 +35,7 @@ layout(std140, binding = 0) uniform P {
   vec4 misc;           // curve invDx, exposure scale, 0, 0
   ivec4 src;           // MODE 4: size of the source image (the allocation is larger)
   vec4 dsub;           // MODE 2: subtracted from the density first (the grain's baked minimum density, per channel)
+  ivec4 org;           // MODE 0 / 1 / 3: origin of this window in the frame (the source and the inhibitor field are frame sized); 0 for a whole frame
 } u;
 
 layout(binding = 1) uniform sampler2D uSrc;
@@ -39,8 +45,8 @@ layout(binding = 4, std430) readonly buffer Curves { float tab[]; };  // dn then
 layout(binding = 5, rgba16f) uniform writeonly image2D uOut;
 #ifdef FUSED_POST
 // MODE 2 + FilmGlare's decode and glare add (film_post.comp MODE 0 / 2): the output is linear light, not display sRGB.
-// Parameters in the unused fields of the DIR matrix: dq0.xyz = linear display white, dq0.w = glare mean; src.xy = offset of the glare
-// field (its blur margin), src.z != 0: add the glare field.
+// Parameters in unused fields (the DIR matrix is needed by MODE 8): linear display white = (dmin.w, dscale.w, dsub.w), glare mean = misc.w;
+// src.xy = offset of the glare field (its blur margin), src.z != 0: add the glare field.
 layout(binding = 6) uniform sampler2D uField;
 layout(binding = 7, std430) readonly buffer Dec { float dec[]; };
 vec3 decodeLin(vec3 e) {
@@ -58,6 +64,11 @@ vec3 decodeLin(vec3 e) {
     }
   }
   return l;
+}
+float encodeS(float v) {  // film_post.comp encode()
+  if (v <= 0.0) return 12.92 * v;
+  if (v >= 1.0) return 1.0 + (v - 1.0) * 0.4396;
+  return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
 }
 #endif
 
@@ -174,19 +185,36 @@ void main() {
     imageStore(uOut, p, h16v(vec4(qOf(p), 1.0)));
     return;
   }
-  const vec3 s = texelFetch(uSrc, p + u.lutN.yz, 0).rgb;
+  const vec3 s = texelFetch(uSrc, p + u.lutN.yz + u.org.xy, 0).rgb;
   vec3 o;
   if (MODE == 0) {
     o = pxExposure(s);
   } else if (MODE == 1) {
     const vec3 x = pxLogE(s);
-    const vec3 q = HAS_Q ? texelFetch(uAux, p, 0).rgb : pxQ(pxCurves(0, x));
+    const vec3 q = HAS_Q ? texelFetch(uAux, p + u.org.xy, 0).rgb : pxQ(pxCurves(0, x));
     o = pxCurves(6 * u.dim.w, x - q);
   } else if (MODE == 2) {
     o = tetra(s - u.dsub.xyz);
 #ifdef FUSED_POST
     o = decodeLin(o);
-    if (u.src.z != 0) o += (texelFetch(uField, p + u.src.xy, 0).r * 0.01 - u.dq0.w) * u.dq0.xyz;
+    if (u.src.z != 0) o += (texelFetch(uField, p + u.src.xy, 0).r * 0.01 - u.misc.w) * vec3(u.dmin.w, u.dscale.w, u.dsub.w);
+#endif
+  } else if (MODE == 8) {
+    const vec3 x = pxLogE(s);
+    const vec3 q = HAS_Q ? texelFetch(uAux, p + u.org.xy, 0).rgb : pxQ(pxCurves(0, x));
+    o = tetra(pxCurves(6 * u.dim.w, x - q) - u.dsub.xyz);
+#ifdef FUSED_POST
+    o = decodeLin(o);
+    if (u.src.z != 0) o += (texelFetch(uField, p + u.src.xy, 0).r * 0.01 - u.misc.w) * vec3(u.dmin.w, u.dscale.w, u.dsub.w);
+    if (ENCODE) o = vec3(encodeS(o.r), encodeS(o.g), encodeS(o.b));
+#endif
+  } else if (MODE == 6) {
+    o = exp2(3.32192809 * tetra(s - u.dsub.xyz));  // 10^x (the CPU: exp2Scale(x, 3.32192809))
+  } else if (MODE == 7) {
+    o = tetra(pxCurves(0, pxLogE(s)));
+#ifdef FUSED_POST
+    o = decodeLin(o);
+    if (u.src.z != 0) o += (texelFetch(uField, p + u.src.xy, 0).r * 0.01 - u.misc.w) * vec3(u.dmin.w, u.dscale.w, u.dsub.w);
 #endif
   } else {
     const vec3 x = pxLogE(pxExposure(s));

@@ -197,6 +197,12 @@ struct Run {
     const int T = plan.grid.tile;
     gridW = gridH = 0;
 
+    if (nWin == 0 && st.output && env.outF) {  // float frame straight from the chain (Whole plans)
+      *env.outF = ImageF(W, H);
+      runHead(0, 0, W, H, env.outF);
+      if (stats) ++stats->tiles;
+      return cancelled() ? Status::Cancelled : Status::Ok;
+    }
     if (nWin == 0 && st.output) {  // no neighbourhood stage: the chain packs the 8-bit pixels itself
       for (int ty = 0; ty < H; ty += T)
         for (int tx = 0; tx < W; tx += T) {
@@ -222,6 +228,10 @@ struct Run {
       done = nWin;
       const Rect all{0, 0, W, H};
       if (st.accum != Accum::None) accumulate(st.accum, *img, all, 0, 0, true, scratch);
+      if (st.output && env.outF) {  // float output: the finished frame as it is (the 8-bit pack is a pure encode of it)
+        *env.outF = *img;
+        return cancelled() ? Status::Cancelled : Status::Ok;
+      }
       if (st.output) {
         CpuTile t;
         t.img = img;
@@ -337,7 +347,8 @@ struct Run {
 }  // namespace
 
 Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
-  if (plan.unsupported || !env.fk.valid() || !env.out) return Status::Unsupported;
+  if (plan.unsupported || !env.fk.valid() || (!env.out && !env.outF)) return Status::Unsupported;
+  if (env.outF && !(plan.grid.nx == 1 && plan.grid.ny == 1)) return Status::Unsupported;
   CancelScope scope(env.cancel.current, env.cancel.mine);
   Run r(plan, env, stats);
   r.single = plan.grid.nx == 1 && plan.grid.ny == 1;
@@ -352,7 +363,7 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
   // film: a whole-frame node before the sweeps (the streaming path finishes the frame by itself)
   for (const Stage& s : plan.stages) {
     if (s.kind != StageKind::FilmFrame) continue;
-    if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.fk.spatial().any()) {
+    if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF && !env.fk.spatial().any()) {
       if (env.fk.streamFilm(env.out)) {
         if (stats) stats->streamed = true;
         return Status::Ok;

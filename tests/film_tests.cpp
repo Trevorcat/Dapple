@@ -1266,27 +1266,436 @@ void testFilmMatch() {
   EditParams p3 = p;
   p3.contrast = 20.f;
   CHECK(filmMatchKey(p) != filmMatchKey(p3));
+  FilmMatchOptions full;  // v2: 100 % of the match on the film EV, no latitude window, no print exposure
+  full.mode = FilmMatchMode::Full;
+  full.pull = 1.f;
+  full.latitude = false;
+  FilmMatchOptions pull;  // v3: 70 % pull + latitude window
+  pull.mode = FilmMatchMode::Pull;
   for (const SourceImage* s : {&src, static_cast<const SourceImage*>(&bright)}) {
     FilmMatchInfo mi;
-    const float ev = matchFilmExposure(p, cam, nullptr, *s, &mi);
+    const FilmExposure fe = matchFilmExposure(p, cam, nullptr, *s, &mi, &full);
+    const float ev = fe.filmEv;
     const float normal = medianLightness(Renderer(plain, cam, nullptr).renderFloat(*s, false));
     EditParams m = p;
     m.filmKeyEv = ev;
     const float film = medianLightness(Renderer(m, cam, nullptr).renderFloat(*s, false));
     const float film0 = medianLightness(Renderer(p, cam, nullptr).renderFloat(*s, false));
-    std::printf("  film match: ev %+.2f  L* develop %.1f  film unmatched %.1f  matched %.1f  (%d evals)\n", ev, normal, film0, film, mi.evals);
+    std::printf("  film match (full, v2): ev %+.2f  L* develop %.1f  film unmatched %.1f  matched %.1f  (%d evals)\n", ev, normal, film0, film, mi.evals);
     CHECK(std::fabs(film - normal) < 2.0f);
     CHECK(std::fabs(film - normal) <= std::fabs(film0 - normal) + 0.01f);
-    CHECK(std::fabs(ev) <= 4.0f);
+    CHECK(std::fabs(ev) <= 4.0f && fe.printEv == 0.f);
+    CHECK(mi.ev == ev && mi.evMatch == ev && mi.bound == FilmBound::None);
+
+    FilmMatchInfo md;
+    const FilmExposure fd = matchFilmExposure(p, cam, nullptr, *s, &md, &pull);
+    CHECK(std::fabs(md.evMatch - ev) < 1e-5f && fd.printEv == 0.f);
+    CHECK_NEAR(md.evKey, kFilmKeyPull * md.evMatch, 1e-5);
+    CHECK(md.latitudeOk);
+    if (md.bound == FilmBound::None) CHECK(fd.filmEv == md.evKey);
+    CHECK(fd.filmEv >= std::min(md.evLo, md.evHi) - 1e-5f && fd.filmEv <= std::max(md.evLo, md.evHi) + 1e-5f);
+  }
+
+  // ---- split model (default): A film exposure from the latitude, B print exposure to the key, C paper to screen ----
+  FilmMatchOptions split;  // v4: A (latitude window) and B (print solved to the key) per image and stock
+  split.mode = FilmMatchMode::Window;
+  CHECK(filmPaperMappingEnabled());
+  {
+    // A does not look at the digital render's brightness: the same scene with a different develop tone gives the same film EV
+    EditParams q = p;
+    q.contrast = 45.f;
+    FilmMatchInfo m0, m1;
+    const FilmExposure e0 = matchFilmExposure(p, cam, nullptr, src, &m0, &split);
+    const FilmExposure e1 = matchFilmExposure(q, cam, nullptr, src, &m1, &split);
+    std::printf("  split A: film EV %+.3f / %+.3f (develop L* %.1f / %.1f)  print EV %+.2f / %+.2f\n", e0.filmEv, e1.filmEv, m0.targetL, m1.targetL, e0.printEv, e1.printEv);
+    CHECK(std::fabs(m0.targetL - m1.targetL) > 1.0f);  // the digital key does differ
+    CHECK(e0.filmEv == e1.filmEv);
+    // it follows the shadows: the dim scene is exposed more, within the stock's window
+    FilmMatchInfo md;
+    const FilmExposure ed = matchFilmExposure(p, cam, nullptr, bright, &md, &split);
+    CHECK(ed.filmEv > e0.filmEv + 0.5f);
+    CHECK(md.latitudeOk && ed.filmEv >= md.evLo - 1e-5f);
+    CHECK_NEAR(ed.filmEv, md.evLo + kFilmNegativeBiasEv, 1e-4);
+    // B hits the scene's key within the tolerance when it is inside the paper's range, and the render shows it
+    for (const auto& pr : {std::make_pair(&m0, 0), std::make_pair(&md, 1)}) {
+      const FilmMatchInfo& mi = *pr.first;
+      CHECK(mi.printBound == PrintBound::None);
+      CHECK(mi.targetL >= mi.paperLoL && mi.targetL <= mi.paperHiL);
+      CHECK(std::fabs(mi.printL - mi.keyL) < 1.0f);
+    }
+    {
+      EditParams m = p;
+      m.filmKeyEv = ed.filmEv;
+      m.filmPrintEv = ed.printEv;
+      const float L = medianLightness(Renderer(m, cam, nullptr).renderFloat(bright, false));
+      std::printf("  dim scene, portra 400: film EV %+.2f print EV %+.2f -> median L* %.1f (develop %.1f)\n", ed.filmEv, ed.printEv, L, md.targetL);
+      CHECK(std::fabs(L - md.targetL) < 1.5f);
+      EditParams u = p;  // brighter than the unexposed film
+      CHECK(L > medianLightness(Renderer(u, cam, nullptr).renderFloat(bright, false)) + 1.f);
+    }
+  }
+  // B on a synthetic print response: inside the range it hits the target, outside it clamps at the paper bounds
+  {
+    FilmPrintRange rg;
+    rg.ok = true;
+    rg.loL = 10.f;
+    rg.hiL = 90.f;
+    auto resp = [](float ev) { return 50.f + 40.f * std::tanh(0.6f * ev); };  // a toe / shoulder like paper response
+    FilmMatchInfo mi;
+    float ev = solvePrintEv(resp, 70.f, rg, &mi);
+    CHECK(std::fabs(resp(ev) - 70.f) < 0.5f && mi.printBound == PrintBound::None && mi.keyL == 70.f);
+    ev = solvePrintEv(resp, 120.f, rg, &mi);  // brighter than the paper white: the key is lowered to the white limit
+    CHECK(mi.printBound == PrintBound::PaperWhite && mi.keyL == 90.f && std::fabs(resp(ev) - 90.f) < 1.0f);
+    ev = solvePrintEv(resp, -5.f, rg, &mi);
+    CHECK(mi.printBound == PrintBound::PaperBlack && mi.keyL == 10.f && std::fabs(resp(ev) - 10.f) < 1.0f);
+    rg.maxPrintEv = 0.3f;  // no print: the lamp may not lift the clear film above display white
+    ev = solvePrintEv(resp, 80.f, rg, &mi);
+    CHECK(ev <= 0.3f + 1e-4f && mi.printBound == PrintBound::PaperWhite);
+  }
+  // reversal film: the film EV puts the unclipped highlight at the shoulder margin
+  for (const char* id : {"kodak_kodachrome_64", "fujifilm_velvia_100"}) {
+    const film::FilmStock* st = lib->find(id);
+    CHECK(st != nullptr);
+    if (!st) continue;
+    const FilmLatitude lat = filmLatitude(*st);
+    CHECK(lat.ok && lat.reversal);
+    EditParams rp;
+    rp.filmStock = id;
+    FilmMatchInfo mi;
+    const FilmExposure fe = matchFilmExposure(rp, cam, nullptr, src, &mi, &split);
+    const float logH = std::log10(mi.p995 / 0.184f) + fe.filmEv * 0.30103f;
+    std::printf("  %s: film EV %+.2f print EV %+.2f  window [%+.2f, %+.2f]  p99.5 logH %+.3f  shoulder %+.3f  key L* %.1f -> %.1f\n", id, fe.filmEv, fe.printEv, mi.evLo, mi.evHi, logH, lat.shoulder, mi.keyL, mi.printL);
+    CHECK(logH <= lat.shoulder + 1e-3f);
+    CHECK_NEAR(logH, lat.shoulder - kFilmShoulderMarginReversalLogH, 1e-3);
+    CHECK(fe.filmEv == mi.evHi);
+    CHECK(fe.printEv <= 0.3f);  // the lamp does not lift the clear film above display white
+  }
+  // C: paper to screen. White and black of every print paper and of a slide, as displayed.
+  {
+    std::printf("  paper | white L* | black L* | white Y | black Y | contrast | usable L* | sRGB range covered\n");
+    for (const std::string& name : lib->names()) {
+      const film::FilmStock* pp = lib->find(name);
+      if (!pp || !pp->isPrintMedium() || pp->isPaper() == false) continue;
+      const FilmPrintRange r = filmPrintRange(lib, "kodak_portra_400", name);
+      CHECK(r.ok);
+      std::printf("  %-34s %6.1f %6.1f %7.4f %8.5f %8.0f:1 %5.1f..%5.1f %5.1f %%\n", name.c_str(), r.lWhite, r.lBlack, r.yWhite, r.yBlack,
+                  r.yBlack > 0 ? r.yWhite / r.yBlack : 0.f, r.loL, r.hiL, r.lWhite - r.lBlack);
+      CHECK(r.lWhite > 96.f && r.lBlack < 8.f && r.loL < r.hiL);  // white maps to display white, the black keeps its true luminance
+    }
+    for (const char* id : {"kodak_kodachrome_64", "fujifilm_velvia_100"}) {
+      const FilmPrintRange r = filmPrintRange(lib, id, "none");
+      CHECK(r.ok && r.lWhite > 96.f && r.lBlack < 8.f);
+      CHECK(r.maxPrintEv > -0.5f && r.maxPrintEv < 0.5f);
+    }
+    // the mapping is the old stage when switched off
+    const FilmPrintRange on = filmPrintRange(lib, "kodak_portra_400", "kodak_portra_endura");
+#ifdef _WIN32
+    _putenv_s("DAPPLE_FILM_PAPER_MAP_OFF", "1");
+#else
+    setenv("DAPPLE_FILM_PAPER_MAP_OFF", "1", 1);
+#endif
+    CHECK(!filmPaperMappingEnabled());
+    const FilmPrintRange off = filmPrintRange(lib, "kodak_portra_400", "kodak_portra_endura");
+    std::printf("  portra endura, mapping off: white L* %.1f black L* %.1f\n", off.lWhite, off.lBlack);
+    CHECK(off.lWhite < on.lWhite - 4.f && off.lWhite > 80.f);
+#ifdef _WIN32
+    _putenv_s("DAPPLE_FILM_PAPER_MAP_OFF", "");
+#else
+    unsetenv("DAPPLE_FILM_PAPER_MAP_OFF");
+#endif
+    CHECK(filmPaperMappingEnabled());
+  }
+  // ---- v5 (default): one exposure decision per image shared by all stocks, a per stock + paper print constant, the paper mapping ----
+  {
+    struct Stat {
+      float median = 0, black = 0, white = 0;
+    };
+    auto srgbToLinear = [](float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); };
+    auto lstats = [&](const EditParams& e, const SourceImage& s) {
+      const ImageF img = Renderer(e, cam, nullptr).renderFloat(s, false);
+      std::vector<float> ls;
+      ls.reserve(std::size_t(img.width) * img.height);
+      std::size_t nb = 0, nw = 0;
+      for (int y = 0; y < img.height; ++y)
+        for (int x = 0; x < img.width; ++x) {
+          const float* r = img.row(y) + 3 * x;
+          const float Y = std::clamp(0.2126f * srgbToLinear(r[0]) + 0.7152f * srgbToLinear(r[1]) + 0.0722f * srgbToLinear(r[2]), 0.f, 1.f);
+          const float L = Y > 0.008856f ? 116.f * std::cbrt(Y) - 16.f : 903.3f * Y;
+          ls.push_back(L);
+          nb += L < 3.f;
+          nw += L > 97.f;
+        }
+      std::nth_element(ls.begin(), ls.begin() + ls.size() / 2, ls.end());
+      Stat st;
+      st.median = ls[ls.size() / 2];
+      st.black = float(nb) / float(ls.size());
+      st.white = float(nw) / float(ls.size());
+      return st;
+    };
+    auto withExposure = [&](EditParams e, const FilmExposure& fe) {
+      e.filmKeyEv = fe.filmEv;
+      e.filmPrintEv = fe.printEv;
+      return e;
+    };
+    // stage 1 and the convention are identical for all stocks of one image; the print constant does not depend on the image
+    FilmMatchInfo mn1, mn2, mr1, mr2, dim1;
+    EditParams pn = p, pr = p;
+    pr.filmStock = "kodak_kodachrome_64";
+    const FilmExposure en1 = matchFilmExposure(pn, cam, nullptr, src, &mn1);
+    pn.filmStock = "kodak_ektar_100";
+    const FilmExposure en2 = matchFilmExposure(pn, cam, nullptr, src, &mn2);
+    const FilmExposure er1 = matchFilmExposure(pr, cam, nullptr, src, &mr1);
+    pr.filmStock = "fujifilm_velvia_100";
+    const FilmExposure er2 = matchFilmExposure(pr, cam, nullptr, src, &mr2);
+    std::printf("  v5 scene EV %+.3f  meter %+.3f  film EV shared: N400C %+.2f N100 %+.2f R64 %+.2f R100B %+.2f\n", mn1.evScene, mn1.evMeter, mn1.sharedEv, mn2.sharedEv, mr1.sharedEv, mr2.sharedEv);
+    CHECK(mn1.evScene == mn2.evScene && mn1.evScene == mr1.evScene && mn1.evScene == mr2.evScene);
+    CHECK(mn1.evMeter == mr1.evMeter && mn1.evMeter == mr2.evMeter);
+    CHECK(mn1.sharedEv == mn2.sharedEv);  // same type convention
+    CHECK_NEAR(mn1.sharedEv - mr1.sharedEv, kFilmNegativeBiasEv - kFilmReversalBiasEv, 1e-5);
+    const FilmExposure ed1 = matchFilmExposure(p, cam, nullptr, bright, &dim1);
+    FilmMatchInfo srcP;
+    const FilmExposure es = matchFilmExposure(p, cam, nullptr, src, &srcP);
+    std::printf("  v5 portra 400 print const: bright scene %+.3f (delta %+.2f), dim scene %+.3f (delta %+.2f)\n", srcP.printConst, srcP.printDelta, dim1.printConst, dim1.printDelta);
+    if (srcP.printDelta == 0.f && dim1.printDelta == 0.f) CHECK(srcP.printConst == dim1.printConst);
+    CHECK(srcP.printConst == filmPrintConstantAt(lib, "kodak_portra_400", film::defaultPaperFor(*lib, "kodak_portra_400"), srcP.printDelta));
+    CHECK(dim1.evScene < srcP.evScene - 0.3f);  // the dim scene gets less compensation than the bright one
+    (void)en1; (void)en2; (void)er1; (void)er2; (void)ed1; (void)es;
+    // EV_scene formula: 50 -> 0, clamps
+    CHECK_NEAR(sceneKeyEv(50.f), 0.0, 0.02);
+    CHECK(sceneKeyEv(2.f) == kFilmSceneEvMin && sceneKeyEv(100.f) <= kFilmSceneEvMax);
+    CHECK(sceneKeyEv(70.f) > sceneKeyEv(60.f));
+    // the print constant puts the grey card (box speed + convention) at L* 50 relative to the paper white
+    for (const char* id : {"kodak_portra_400", "kodak_vision3_250d"}) {
+      const std::string paper = film::defaultPaperFor(*lib, id);
+      const float pc = filmPrintConstant(lib, id, paper);
+      FilmParams fpp;
+      fpp.film = id;
+      fpp.paper = paper;
+      fpp.camera.autoExposure = false;
+      applyFilmPaperMapping(fpp);
+      fpp.disableSpatialAndStochastic();
+      fpp.enlarger.printExposure = std::exp2(-double(pc));
+      FilmSimulator sim(lib);
+      CHECK(sim.setParams(fpp));
+      ImageF in(8, 8), out;
+      for (float& x : in.data) x = 0.184f;
+      const float g = std::exp2(lib->find(id)->positive() ? kFilmReversalBiasEv : kFilmNegativeBiasEv);
+      const float g3[3] = {g, g, g};
+      CHECK(sim.render(in, out, nullptr, g3));
+      const FilmPrintRange rg = filmPrintRange(lib, id, paper);
+      const float want = 116.f * std::cbrt(0.184f * rg.yWhite) - 16.f;
+      std::printf("  grey card on %s: print constant %+.3f, L* %.2f (wanted %.2f)\n", id, pc, medianLightness(out), want);
+      CHECK_NEAR(medianLightness(out), want, 0.6);
+    }
+    // per-stock rescue: a range that fits keeps the shared exposure, a narrow stock is moved just enough
+    {
+      FilmMatchInfo mw;
+      EditParams rw = p;
+      rw.filmStock = "kodak_kodachrome_64";
+      SourceImage wide = src;  // 14 stops
+      for (int y = 0; y < wide.linear.height; ++y)
+        for (int x = 0; x < wide.linear.width; ++x) {
+          float* q = wide.linear.row(y) + 3 * x;
+          q[0] = q[1] = q[2] = 0.184f * std::exp2(-7.f + 14.f * float(x) / float(wide.linear.width - 1));
+        }
+      const FilmExposure ew = matchFilmExposure(rw, cam, nullptr, wide, &mw);
+      std::printf("  R64 on a 14 stop ramp: shared EV %+.2f final %+.2f  in-range %.0f%% -> %.0f%% (below %.0f%% above %.0f%%)\n", mw.sharedEv, ew.filmEv, 100 * mw.fracShared, 100 * mw.fracFinal, 100 * mw.fracBelowToe, 100 * mw.fracAboveShoulder);
+      CHECK(mw.fracFinal >= mw.fracShared - 1e-6f);
+      CHECK(mw.fracFinal < kFilmRangeFraction);  // a slide cannot hold 14 stops: it loses both ends
+      CHECK(mw.fracBelowToe + mw.fracAboveShoulder > 0.3f);
+      CHECK(ew.printEv == mw.printConst);  // reversal: no print compensation
+      FilmMatchInfo mf;
+      EditParams rn = p;
+      const FilmExposure efit = matchFilmExposure(rn, cam, nullptr, src, &mf);
+      CHECK(mf.fracShared >= kFilmRangeFraction ? efit.filmEv == mf.sharedEv : mf.fracFinal > mf.fracShared);
+      // the same ramp: the slide loses shadows and highlights on screen, the negative keeps (almost all of) them
+      EditParams nw = p;
+      FilmMatchInfo mnw;
+      const FilmExposure enw = matchFilmExposure(nw, cam, nullptr, wide, &mnw);
+      const Stat sr = lstats(withExposure(rw, ew), wide), sn = lstats(withExposure(nw, enw), wide);
+      std::printf("  14 stop ramp on screen: R64 black %.1f%% white %.1f%% (median %.1f)   N400C black %.1f%% white %.1f%% (median %.1f)\n", 100 * sr.black, 100 * sr.white, sr.median, 100 * sn.black, 100 * sn.white, sn.median);
+      CHECK(sr.black > 0.03f && sr.white > 0.03f);
+      CHECK(sn.black < sr.black && sn.black + sn.white < sr.black + sr.white);
+    }
+    // overrides: film_shoot, film_print, film_black, film_latitude
+    {
+      auto at = [&](const char* id, float shoot, float print, float black, float lat, const SourceImage& sc, FilmMatchInfo* inf = nullptr) {
+        EditParams e = p;
+        e.filmStock = id;
+        e.filmShoot = shoot;
+        e.filmPrint = print;
+        e.filmBlack = black;
+        e.filmLatitude = lat;
+        const FilmExposure fe = matchFilmExposure(e, cam, nullptr, sc, inf);
+        return std::make_pair(e, fe);
+      };
+      for (const char* id : {"kodak_portra_400", "kodak_kodachrome_64"}) {
+        FilmMatchInfo m0, ml, mh;
+        const auto a0 = at(id, 0, 0, 0, 0, src, &m0), alo = at(id, -1, 0, 0, 0, src, &ml), ahi = at(id, 1, 0, 0, 0, src, &mh);
+        std::printf("  %s film_shoot -1/0/+1: EV %+.2f %+.2f %+.2f (in-range %.0f%% %.0f%% %.0f%%)  print %+.2f %+.2f %+.2f\n", id, alo.second.filmEv, a0.second.filmEv, ahi.second.filmEv, 100 * ml.fracFinal, 100 * m0.fracFinal, 100 * mh.fracFinal, alo.second.printEv, a0.second.printEv, ahi.second.printEv);
+        CHECK(alo.second.filmEv < a0.second.filmEv && a0.second.filmEv < ahi.second.filmEv);
+        CHECK(alo.second.filmEv >= a0.second.filmEv - kFilmShootMaxEv - 1e-4f && ahi.second.filmEv <= a0.second.filmEv + kFilmShootMaxEv + 1e-4f);
+        if (std::string(id).rfind("kodak_kodachrome", 0) != 0) {  // a negative is printed down / up by the shift: brightness stays near
+          const float la = lstats(withExposure(a0.first, a0.second), src).median, lh = lstats(withExposure(ahi.first, ahi.second), src).median;
+          std::printf("    negative median L*: auto %.1f, shoot +1 %.1f\n", la, lh);
+          CHECK(std::fabs(la - lh) < 12.f);
+        }
+        // film_print: -1 darker, +1 lighter, within the paper's range
+        const auto plo = at(id, 0, -1, 0, 0, src), phi = at(id, 0, 1, 0, 0, src);
+        const float lm = lstats(withExposure(a0.first, a0.second), src).median, ll = lstats(withExposure(plo.first, plo.second), src).median,
+                    lhh = lstats(withExposure(phi.first, phi.second), src).median;
+        std::printf("  %s film_print -1/0/+1: median L* %.1f %.1f %.1f (print EV %+.2f %+.2f %+.2f)\n", id, ll, lm, lhh, plo.second.printEv, a0.second.printEv, phi.second.printEv);
+        CHECK(ll < lm - 2.f || lm < 40.f);
+        CHECK(lhh > lm + 2.f || lm > 75.f);
+        // film_latitude: the rescue target follows
+        FilmMatchInfo mlt, mht;
+        at(id, 0, 0, 0, -1, src, &mlt);
+        at(id, 0, 0, 0, 1, src, &mht);
+        CHECK(mht.fracFinal + 1e-4f >= mlt.fracFinal);
+      }
+      CHECK_NEAR(rangeFractionFor(-1.f), kFilmRangeFractionMin, 1e-6);
+      CHECK_NEAR(rangeFractionFor(0.f), kFilmRangeFraction, 1e-6);
+      CHECK_NEAR(rangeFractionFor(1.f), kFilmRangeFractionMax, 1e-6);
+      // film_black: matte > true > display black on a deep shadow patch
+      SourceImage dark = src;
+      for (float& v : dark.linear.data) v = 1e-5f;
+      float bl[3];
+      for (int k = 0; k < 3; ++k) {
+        EditParams e = p;
+        e.filmBlack = float(k - 1);
+        const FilmExposure fe = matchFilmExposure(e, cam, nullptr, src);
+        bl[k] = lstats(withExposure(e, fe), dark).median;
+      }
+      std::printf("  film_black -1/0/+1: black L* %.2f %.2f %.2f\n", bl[0], bl[1], bl[2]);
+      CHECK(bl[0] > bl[1] + 5.f && bl[1] > bl[2] + 0.3f);
+      // the corners and edge midpoints of the (film_shoot, film_print) pad are never broken
+      const SourceImage* scenes[2] = {&src, &bright};
+      int bad = 0, total = 0;
+      for (const char* id : {"kodak_portra_400", "kodak_vision3_250d", "fujifilm_velvia_100", "kodak_kodachrome_64"})
+        for (const SourceImage* sc : scenes)
+          for (int i = 0; i < 9; ++i) {
+            const float sh = float(i % 3 - 1), pr2 = float(i / 3 - 1);
+            const auto r = at(id, sh, pr2, 0, 0, *sc);
+            const Stat st = lstats(withExposure(r.first, r.second), *sc);
+            const bool ok = st.median >= 25.f && st.median <= 90.f && st.black < 0.35f && st.white < 0.35f;
+            ++total;
+            if (!ok) {
+              ++bad;
+              std::printf("    pad %s scene %d shoot %+.0f print %+.0f: median %.1f black %.1f%% white %.1f%%\n", id, sc == &src ? 0 : 1, sh, pr2, st.median, 100 * st.black, 100 * st.white);
+            }
+          }
+      std::printf("  pad corner / edge check: %d of %d positions broken\n", bad, total);
+      CHECK(bad == 0);
+    }
+  }
+  // latitude of every shipped camera film is sane; slides are narrower than negatives
+  for (const std::string& name : lib->names()) {
+    const film::FilmStock* st = lib->find(name);
+    if (!st || st->isPrintMedium()) continue;
+    const FilmLatitude lat = filmLatitude(*st);
+    CHECK(lat.ok);
+    CHECK(lat.toe < 0.f && lat.shoulder > 0.f && lat.midGamma > 0.1f);
+    CHECK(st->positive() ? lat.stops() < 11.f : lat.stops() > 10.f);
+  }
+  // the window is ordered for a moderate scene and a fixed width: hi - lo = latitude - margins - scene range (stops)
+  {
+    const SceneStats mid{0.03f, 0.18f, 0.5f};
+    const SceneStats wide{0.002f, 0.2f, 4.f};
+    for (const char* id : {"kodak_portra_400", "kodak_kodachrome_64", "fujifilm_velvia_100", "kodak_vision3_250d"}) {
+      const film::FilmStock* st = lib->find(id);
+      if (!st) { CHECK(false); continue; }
+      const FilmLatitude lat = filmLatitude(*st);
+      float lo = 0.f, hi = 0.f;
+      CHECK(filmExposureWindow(lat, mid, lo, hi));
+      CHECK(lo < hi);
+      const float range = std::log10(mid.p995 / std::max(mid.p2, 0.002f));
+      const float shMargin = lat.reversal ? kFilmShoulderMarginReversalLogH : kFilmShoulderMarginLogH;
+      CHECK_NEAR(hi - lo, (lat.shoulder - lat.toe - shMargin - kFilmToeMarginLogH - range) / 0.30103, 1e-4);
+      // the pull is applied: a match inside the window is scaled by kFilmKeyPull
+      FilmMatchInfo mi;
+      const float a = resolveFilmKeyEv(st, mid, 0.4f, FilmMatchOptions{}, &mi);
+      if (mi.bound == FilmBound::None) CHECK_NEAR(a, 0.7f * 0.4f, 1e-6);
+      CHECK_NEAR(mi.evKey, kFilmKeyPull * 0.4f, 1e-6);
+      FilmMatchOptions fo;
+      fo.pull = 1.f;
+      fo.latitude = false;
+      CHECK(resolveFilmKeyEv(st, mid, 0.4f, fo) == 0.4f);
+      // a scene wider than the latitude: slides protect the highlights, negatives keep the shadows
+      FilmMatchInfo mw;
+      const float w = resolveFilmKeyEv(st, wide, 0.f, FilmMatchOptions{}, &mw);
+      CHECK(mw.conflict == (mw.evLo > mw.evHi));
+      if (mw.conflict) {
+        CHECK(w == std::clamp(lat.reversal ? mw.evHi : mw.evLo, -4.f, 4.f));
+        CHECK(mw.bound == (lat.reversal ? FilmBound::Shoulder : FilmBound::Toe));
+      }
+      if (lat.reversal) CHECK(mw.conflict);
+    }
+  }
+  // clipped pixels do not set the highlight statistic; a mostly clipped frame falls back to p90 of everything
+  {
+    const float g1[3] = {1.f, 1.f, 1.f};
+    ImageF im(100, 100);
+    for (int y = 0; y < 100; ++y)
+      for (int x = 0; x < 100; ++x) {
+        float* q = im.row(y) + 3 * x;
+        const float v = x < 10 ? 1.0f : 0.1f + 0.4f * float(x) / 100.f;  // 10 % clipped, the rest 0.14 .. 0.5
+        q[0] = q[1] = q[2] = v;
+      }
+    const SceneStats st = sceneLumaStats(im, g1);
+    CHECK_NEAR(st.clipFrac, 0.10, 1e-4);
+    CHECK(st.p995 < 0.55f && st.p995 > 0.45f);  // not 1.0
+    for (int y = 0; y < 100; ++y)
+      for (int x = 0; x < 100; ++x) {
+        float* q = im.row(y) + 3 * x;
+        q[0] = q[1] = q[2] = x < 40 ? 1.0f : 0.3f;  // 40 % clipped: p90 of all pixels
+      }
+    const SceneStats s2 = sceneLumaStats(im, g1);
+    CHECK_NEAR(s2.clipFrac, 0.40, 1e-4);
+    CHECK_NEAR(s2.p995, 1.0, 1e-3);
+  }
+  // a stock without usable curves: plain +-2 EV limit
+  {
+    film::FilmStock bad = *lib->find("kodak_portra_400");
+    bad.densityCurves.clear();
+    FilmMatchInfo mi;
+    CHECK(resolveFilmKeyEv(&bad, SceneStats{0.03f, 0.18f, 0.5f}, 4.f, FilmMatchOptions{}, &mi) == kFilmFallbackMaxEv);
+    CHECK(mi.bound == FilmBound::Fallback && !mi.latitudeOk);
+    CHECK(resolveFilmKeyEv(nullptr, SceneStats{0.03f, 0.18f, 0.5f}, -4.f, FilmMatchOptions{}) == -kFilmFallbackMaxEv);
+    CHECK(chooseFilmEv(&bad, SceneStats{0.03f, 0.18f, 0.5f}, FilmMatchOptions{}, &mi) == 0.f && mi.bound == FilmBound::Fallback);
+  }
+  // DAPPLE_FILM_MATCH_FULL=1 restores the old behaviour (film EV only, no print exposure, no paper mapping)
+  {
+#ifdef _WIN32
+    _putenv_s("DAPPLE_FILM_MATCH_FULL", "1");
+#else
+    setenv("DAPPLE_FILM_MATCH_FULL", "1", 1);
+#endif
+    const FilmMatchOptions o = FilmMatchOptions::fromEnv();
+    CHECK(o.mode == FilmMatchMode::Full && o.pull == 1.f && !o.latitude);
+    CHECK(!filmPaperMappingEnabled());
+    FilmMatchInfo a, b;
+    const FilmExposure evFull = matchFilmExposure(p, cam, nullptr, src, &a);
+    CHECK(evFull.filmEv == a.evMatch && evFull.printEv == 0.f && a.bound == FilmBound::None);
+#ifdef _WIN32
+    _putenv_s("DAPPLE_FILM_MATCH_FULL", "");
+#else
+    unsetenv("DAPPLE_FILM_MATCH_FULL");
+#endif
+    CHECK(FilmMatchOptions::fromEnv().mode == FilmMatchMode::Meter && filmPaperMappingEnabled());
+    const FilmExposure sp = matchFilmExposure(p, cam, nullptr, src, &b);
+    CHECK(sp.printEv != 0.f && b.printConst == sp.printEv);
   }
   // no film: nothing to match
-  CHECK(matchFilmExposure(plain, cam, nullptr, src) == 0.f);
-  // the user's film exposure stays an offset on top of the matched exposure
+  CHECK(matchFilmExposure(plain, cam, nullptr, src).filmEv == 0.f);
+  // the user's film exposure stays an offset on the film exposure, the print exposure is separate
   EditParams a = p, b = p;
   a.filmKeyEv = 1.f;
   b.filmKeyEv = 0.f;
   b.filmExposure = 1.f;
   CHECK(meanAbsDiff(Renderer(a, cam, nullptr).renderFloat(src, false), Renderer(b, cam, nullptr).renderFloat(src, false)) < 1e-6);
+  EditParams c = p;
+  c.filmPrintEv = 0.5f;
+  CHECK(meanAbsDiff(Renderer(c, cam, nullptr).renderFloat(src, false), Renderer(p, cam, nullptr).renderFloat(src, false)) > 1e-3);
 }
 
 void testDevelopFilmIntegration() {
@@ -1502,7 +1911,9 @@ void testDevelopFilmIntegration() {
     EditParams vg = fp;
     vg.vignette = -80.f;
     const ImageF v = Renderer(vg, cam, nullptr).renderFloat(src);
-    CHECK(v.data[0] < f1.data[0] * 0.9f);  // corner darkened
+    double sv = 0, sf = 0;
+    for (int i = 0; i < 48; ++i) sv += v.data[i], sf += f1.data[i];
+    CHECK(sv < sf * 0.9 + 1e-6);  // corner darkened (a black corner stays black)
   }
 
   // ---- grain amount: flat grey, std dev grows with the knob, 0 = none ----
@@ -1582,6 +1993,7 @@ void testDevelopFilmIntegration() {
     fpar.film = p.filmStock;
     fpar.paper = film::defaultPaperFor(*lib, p.filmStock);
     fpar.camera.autoExposure = false;
+    applyFilmPaperMapping(fpar);  // the develop pipeline's paper-to-screen mapping
     fpar.disableSpatialAndStochastic();
     CHECK(oracle.setParams(fpar));
     const float gain = std::exp2(cam.baselineExposureEv);

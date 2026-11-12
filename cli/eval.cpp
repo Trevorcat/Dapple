@@ -23,6 +23,7 @@
 #include "dapple/developer.h"
 #include "dapple/encode.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 #include "dapple/tone.h"
 #include "eval_common.h"
 
@@ -236,8 +237,12 @@ int cmdEval(const std::vector<std::string>& args) {
     for (const auto& n : ar.notes) row.notes += (row.notes.empty() ? "" : "; ") + n;
     row.tone = ar.tone;
 
-    const ImageF oursF = Renderer(EditParams{}, cam, nullptr).renderFloat(c.src);
-    const ImageF autoF = Renderer(ar.correction, cam, nullptr).renderFloat(c.src);
+    ImageF oursF, autoF;
+    if (!engine::renderImageF(EditParams{}, cam, nullptr, c.src, true, oursF) ||
+        !engine::renderImageF(ar.correction, cam, nullptr, c.src, true, autoF)) {
+      std::fprintf(stderr, "eval: render failed\n");
+      std::exit(1);
+    }
 
     row.align = c.align;
 

@@ -9,6 +9,8 @@
 //   graph        FullFilm graph validates, film nodes are wired as 8.1
 //   grain_scale  scale-aware grain (Q8): variance + spectrum of the preview vs the box-downscaled full-resolution grain
 //   grain_frame  frameIndex: a repeat is bit-identical, consecutive frames are decorrelated, frame 0 equals the still
+//   fx           highlight boost + enlarger diffusion filter as nodes: byte-identical with FilmSimulator::render, rendered by the
+//                node chain (no simulator fallback), golden frame hashes (tests/engine/golden/film_fx.txt)
 //   bench        film-render-bench style timings: FilmSimulator::render vs the node chain (DAPPLE_PERF=1 adds 26 MP)
 #include <algorithm>
 #include <chrono>
@@ -19,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <random>
 #include <set>
@@ -27,6 +30,7 @@
 #include <vector>
 
 #include "dapple/film.h"
+#include "dapple/film_match.h"
 #include "edit_params_fields.h"
 #include "engine/graph/graph.h"
 #include "engine/nodes/film/film_node_internal.h"
@@ -164,6 +168,8 @@ film::FilmParams refParams(const ef::FilmResolved& r, int quality) {
   fp.film = r.stock->stock;
   fp.paper = r.scan ? std::string("none") : r.paper->stock;
   fp.camera.autoExposure = false;
+  fp.enlarger.printExposure = std::exp2(-double(std::clamp(r.printEv, -9.f, 9.f)));
+  applyFilmPaperMapping(fp, r.black);
   fp.camera.filmFormatMm *= r.formatScale;
   fp.enlarger.yFilterShift = -r.warmth / 100.f * 12.f;
   fp.enlarger.mFilterShift = -r.tint / 100.f * 12.f;
@@ -173,6 +179,23 @@ film::FilmParams refParams(const ef::FilmResolved& r, int quality) {
   const double h = std::clamp(r.halationPct / 100.f, 0.f, 1.f);
   fp.filmRender.halation.halationAmount = h;
   fp.filmRender.halation.scatterAmount = h;
+  fp.filmRender.halation.boostEv = r.fx.boostEv;
+  fp.filmRender.halation.boostRange = r.fx.boostRange;
+  fp.filmRender.halation.protectEv = r.fx.protectEv;
+  if (r.fx.enlargerFilter) {
+    auto& d = fp.enlarger.diffusionFilter;
+    d.active = true;
+    d.filterFamily = ef::kDiffusionFamilies[r.fx.enlargerFilter - 1];
+    d.strength = r.fx.enlStrength;
+    d.spatialScale = r.fx.enlScale;
+    d.haloWarmth = r.fx.enlHaloWarmth;
+    d.coreIntensity = r.fx.enlCoreIntensity;
+    d.coreSize = r.fx.enlCoreSize;
+    d.haloIntensity = r.fx.enlHaloIntensity;
+    d.haloSize = r.fx.enlHaloSize;
+    d.bloomIntensity = r.fx.enlBloomIntensity;
+    d.bloomSize = r.fx.enlBloomSize;
+  }
   if (quality == 0) fp.disableSpatialAndStochastic();
   else if (quality == 1) fp.settings.previewMode = true;
   return fp;
@@ -607,7 +630,8 @@ void testGraph() {
   const NodeRegistry& N = NodeRegistry::instance();
   for (NodeType t : {NodeType::FilmTableRaw, NodeType::FilmTableCurves, NodeType::FilmTablePrintScan, NodeType::FilmExposure,
                      NodeType::FilmBlurExposure, NodeType::FilmDirField, NodeType::FilmDevelop, NodeType::FilmGrain,
-                     NodeType::FilmPrintScan, NodeType::FilmGlare, NodeType::FilmScan}) {
+                     NodeType::FilmPrintExposure, NodeType::FilmEnlargerBlur, NodeType::FilmPrintScan, NodeType::FilmGlare,
+                     NodeType::FilmScan}) {
     CHECK(g.find(t) != nullptr);
     CHECK(N.desc(t).cpuImpl);
     CHECK(ef::isFilmNode(t));
@@ -654,6 +678,166 @@ void testGraph() {
     if (n.key != g4.nodes()[n.id].key) moved += std::string(NodeRegistry::name(n.type)) + " ";
   std::printf("  film_halation moves: %s\n", moved.c_str());
   CHECK(moved.find("FilmExposure") == std::string::npos && moved.find("FilmBlurExposure") != std::string::npos);
+}
+
+// ---- fx: highlight boost + enlarger diffusion ------------------------------------------------------------------------------------
+std::uint64_t fnvImage(const ImageF& im) { return fnv(im.data.data(), im.data.size()); }
+
+std::string fxPlatformTag() { return std::string("kernels=") + dapple::film::detail::selectKernels().name; }
+
+struct FxCase {
+  const char* name;
+  const char* stock;
+  int w, h;
+  int quality;
+  ef::FilmFx fx;
+  float grain = 100.f, halation = 100.f;
+};
+
+ef::FilmFx boostFx(float ev, float range = 0.3f, float protect = 1.0f) {
+  ef::FilmFx f;
+  f.boostEv = ev;
+  f.boostRange = range;
+  f.protectEv = protect;
+  return f;
+}
+ef::FilmFx enlFx(int family, float strength = 0.5f, float scale = 1.f) {
+  ef::FilmFx f;
+  f.enlargerFilter = std::uint8_t(family);
+  f.enlStrength = strength;
+  f.enlScale = scale;
+  return f;
+}
+
+void testFx() {
+  ef::FilmFx both = enlFx(2, 1.0f, 2.f);
+  both.boostEv = 1.2f;
+  both.protectEv = 1.0f;
+  both.enlHaloWarmth = 0.3f;
+  both.enlBloomIntensity = 1.5f;
+  const FxCase cases[] = {
+      {"boost 1.5 EV (portra)", "kodak_portra_400", 400, 267, 2, boostFx(1.5f)},
+      {"boost, halation off", "kodak_portra_400", 331, 197, 2, boostFx(1.0f, 0.5f, 0.5f), 100.f, 0.f},
+      {"boost, grain off", "kodak_ektar_100", 320, 213, 2, boostFx(2.0f, 0.2f), 0.f},
+      {"boost interactive", "kodak_portra_400", 400, 267, 1, boostFx(1.5f)},
+      {"boost scan (slide)", "fujifilm_velvia_100", 320, 213, 2, boostFx(1.0f)},
+      {"boost + spatial off (quality 0)", "kodak_portra_400", 320, 213, 0, boostFx(1.5f)},
+      {"boost tiny 33x17", "kodak_portra_400", 33, 17, 2, boostFx(1.0f)},
+      {"boost never reached (x0 >= max)", "kodak_portra_400", 320, 213, 2, boostFx(1.0f, 0.3f, 14.f)},
+      {"enlarger glimmerglass", "kodak_portra_400", 400, 267, 2, enlFx(1)},
+      {"enlarger black_pro_mist", "kodak_portra_400", 400, 267, 2, enlFx(2)},
+      {"enlarger pro_mist strong x2", "kodak_ektar_100", 360, 240, 2, enlFx(3, 1.0f, 2.f)},
+      {"enlarger cinebloom", "fujifilm_pro_400h", 331, 197, 2, enlFx(4, 0.8f)},
+      {"enlarger interactive", "kodak_portra_400", 400, 267, 1, enlFx(2)},
+      {"enlarger, no grain, no halation", "kodak_portra_400", 320, 213, 2, enlFx(2), 0.f, 0.f},
+      {"enlarger cine + 2383", "kodak_vision3_500t", 360, 240, 2, enlFx(4)},
+      {"enlarger on scan film (no print)", "fujifilm_velvia_100", 320, 213, 2, enlFx(2)},
+      {"enlarger + spatial off (quality 0)", "kodak_portra_400", 320, 213, 0, enlFx(2)},
+      {"enlarger tiny 33x17", "kodak_portra_400", 33, 17, 2, enlFx(2)},
+      {"boost + enlarger", "kodak_portra_400", 400, 267, 2, both},
+  };
+  const std::string tag = fxPlatformTag();
+  const fs::path golden = fs::path(DAPPLE_SOURCE_DIR) / "tests" / "engine" / "golden" / "film_fx.txt";
+  const bool record = std::getenv("DAPPLE_FX_RECORD") != nullptr;
+  std::map<std::string, std::uint64_t> want;
+  std::string goldenTag;
+  if (!record && fs::exists(golden)) {
+    std::ifstream f(golden);
+    std::string line;
+    while (std::getline(f, line)) {
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+      if (line.rfind("# platform ", 0) == 0) goldenTag = line.substr(11);
+      if (line.empty() || line[0] == '#') continue;
+      const std::size_t sp = line.rfind(' ');
+      if (sp != std::string::npos) want[line.substr(0, sp)] = std::strtoull(line.c_str() + sp + 1, nullptr, 16);
+    }
+  }
+  const bool useGolden = !record && !want.empty() && goldenTag == tag;
+  if (!record && !want.empty() && !useGolden)
+    std::printf("  golden hashes recorded on '%s', this run is '%s': hash check skipped (the simulator comparison still gates)\n",
+                goldenTag.c_str(), tag.c_str());
+  std::vector<std::pair<std::string, std::uint64_t>> got;
+  for (const FxCase& c : cases) {
+    EditParams e;
+    e.filmStock = c.stock;
+    e.filmGrain = c.grain;
+    e.filmHalation = c.halation;
+    ef::FilmResolved r = resolvedFor(e, c.w, c.h, c.quality);
+    r.quality = std::uint8_t(c.quality);
+    if (!r.stock) {
+      std::printf("  %-36s stock unavailable\n", c.name);
+      ++g_failures;
+      continue;
+    }
+    r.fx = c.fx;
+    const ImageF in = scene(c.w, c.h);
+    ImageF sim, nodes, nodesApi, base;
+    double msSim = 0, msNode = 0;
+    const bool simOk = simRender(r, c.quality, in, sim, &msSim);
+    const bool nodeOk = nodeRender(r, in, nodes, &msNode);
+    // the Renderer-facing entry (what FrameKernels::runFilm / runFilmStage call): true = rendered by the node chain, no simulator
+    ef::FilmFrameArgs a;
+    a.lib = library().get();
+    a.stock = r.stock->stock.c_str();
+    a.paper = r.scan ? "none" : r.paper->stock.c_str();
+    for (int i = 0; i < 3; ++i) a.gain[i] = r.gain[i];
+    a.warmth = r.warmth;
+    a.tint = r.tint;
+    a.grainPct = r.grainPct;
+    a.halationPct = r.halationPct;
+    a.formatScale = r.formatScale;
+    a.w = c.w;
+    a.h = c.h;
+    a.quality = c.quality;
+    a.fx = c.fx;
+    nodesApi = ImageF(c.w, c.h);
+    const bool apiOk = ef::renderFilmFrame(a, in.data.data(), std::size_t(c.w) * 3, nodesApi.data.data(), std::size_t(c.w) * 3);
+    ef::FilmResolved r0 = r;
+    r0.fx = ef::FilmFx{};
+    const bool baseOk = nodeRender(r0, in, base);
+    if (!simOk || !nodeOk || !apiOk || !baseOk) {
+      std::printf("  %-36s FAILED: simulator %d nodes %d renderFilmFrame %d base %d\n", c.name, simOk, nodeOk, apiOk, baseOk);
+      ++g_failures;
+      continue;
+    }
+    double mx = 0, mxBase = 0;
+    const std::size_t d = diffCount(sim, nodes, &mx), dApi = diffCount(sim, nodesApi), dBase = diffCount(base, nodes, &mxBase);
+    const std::uint64_t hsh = fnvImage(nodes);
+    got.emplace_back(c.name, hsh);
+    const ef::FilmHalos hl = ef::halosOf(r);
+    std::printf("  %-36s %4dx%-4d differing floats vs simulator %zu (max %.3g), via renderFilmFrame %zu; effect vs fx off: %zu floats (max %.3g)  "
+                "sim %.1f ms nodes %.1f ms  hash %016llx\n",
+                c.name, c.w, c.h, d, mx, dApi, dBase, mxBase, msSim, msNode, static_cast<unsigned long long>(hsh));
+    CHECK(d == 0);
+    CHECK(dApi == 0);
+    // the effect must be visible, except where the model drops it on purpose (spatial off drops the diffusion filter, a scan has no
+    // print, a boost whose knee is above the maximum is the identity)
+    const bool expectEffect = !(c.quality == 0 && !c.fx.boostEv) && !(r.scan && !c.fx.boostEv) && std::string(c.name).find("never reached") == std::string::npos;
+    CHECK(expectEffect ? dBase > 0 : dBase == 0);
+    CHECK(hl.boost == (c.fx.boostEv > 0.f));
+    CHECK(hl.enlargerSplit == (c.fx.enlargerFilter != 0 && !r.scan && c.quality != 0));
+    if (useGolden) {
+      auto it = want.find(c.name);
+      if (it == want.end()) {
+        std::printf("    no golden hash for this case\n");
+        ++g_failures;
+      } else {
+        CHECK(it->second == hsh);
+      }
+    }
+  }
+  if (record) {
+    std::ofstream f(golden, std::ios::binary);
+    f << "# film effects not in the edit schema: highlight boost and the enlarger diffusion filter. FNV-1a of the node chain's float output\n"
+         "# (tests/engine/film_nodes_tests.cpp fx; identical to FilmSimulator::render). Re-record: DAPPLE_FX_RECORD=1 dapple_film_nodes_tests fx\n";
+    f << "# platform " << tag << "\n";
+    for (auto& g : got) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%016llx", static_cast<unsigned long long>(g.second));
+      f << g.first << " " << buf << "\n";
+    }
+    std::printf("  recorded %zu hashes to %s\n", got.size(), golden.string().c_str());
+  }
 }
 
 // ---- grain statistics ---------------------------------------------------------------------------------------------------------
@@ -958,7 +1142,7 @@ struct Test {
   void (*fn)();
 };
 const Test kTests[] = {{"equiv", testEquiv},       {"rebake", testRebake},   {"keys", testKeys},         {"graph", testGraph},
-                       {"concurrent", testConcurrent}, {"grain_scale", testGrainScale}, {"grain_frame", testGrainFrame}, {"bench", testBench}};
+                       {"concurrent", testConcurrent}, {"grain_scale", testGrainScale}, {"grain_frame", testGrainFrame}, {"fx", testFx}, {"bench", testBench}};
 
 }  // namespace
 

@@ -6,9 +6,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"
@@ -21,7 +24,9 @@
 #include "engine/hal/gles/gles_device.h"
 #endif
 #if defined(__ANDROID__)
+#include <sys/resource.h>
 #include <sys/system_properties.h>
+#include <unistd.h>
 #endif
 
 namespace dapple::engine::gpu {
@@ -176,11 +181,17 @@ bool pipelineSelfTest(const std::shared_ptr<Context>& ctx, std::string& report) 
     EditParams p;
     c.set(p);
     Renderer r(p, cam, nullptr);
-    const auto lut = r.bake(src, 33);
     FastOptions fo;
     fo.spatial = SpatialQuality::Full;
-    int w = 0, h = 0;
-    std::uint8_t* cpu = r.renderBakedRgba(src, *lut, fo, w, h);
+    // the reference is the CpuExecutor on the same plan (a session without a source store never uses the GPU)
+    EngineSession cpuSession;
+    FrameJob cpuJob{p, r, src, nullptr, cam, nullptr, {}, {}, {}};
+    cpuJob.request.bakeSize = 33;
+    cpuJob.fastOptions = fo;
+    FrameResult cpuRes;
+    const bool cpuOk = cpuSession.renderFrame(cpuJob, cpuRes);
+    std::uint8_t* cpu = cpuOk ? cpuRes.rgba : nullptr;
+    const int w = cpuRes.w, h = cpuRes.h;
     FrameJob job{p, r, src, nullptr, cam, nullptr, {}, {}, {}};
     job.request.bakeSize = 33;
     job.fastOptions = fo;
@@ -217,11 +228,26 @@ std::shared_ptr<Context> Context::create(const ContextOptions& opt, std::string&
   SelfTestOut st;
   hal::SelfTestFn test;
   if (opt.selfTest) {
-    test = [&st](hal::Device& dev, std::string& why) -> bool {
+    test = [&st, &opt](hal::Device& dev, std::string& why) -> bool {
+      const std::string devKey = dev.caps().key();
+      if (opt.cacheLookup) {
+        bool boxOk = true;
+        std::string detail;
+        const int c = opt.cacheLookup(devKey, &boxOk, &detail);
+        if (c > 0) {  // this device + driver + OS build + app version passed before: skip the (expensive) self-test
+          st.boxOk = boxOk;
+          st.report = "cached pass (" + detail + ")";
+          return true;
+        }
+        if (c < 0) return why = "cached failure (" + detail + ")", false;
+      }
 #if defined(DAPPLE_HAL_GLES)
       if (dev.caps().api == hal::Api::Gles31) {
         const hal::gles::SelfTestReport r = hal::gles::selfTest(dev);
-        if (!r.ok) return why = r.text, false;
+        if (!r.ok) {
+          if (opt.cacheStore) opt.cacheStore(devKey, false, true, r.text);
+          return why = r.text, false;
+        }
       }
 #endif
       std::string e;
@@ -238,6 +264,7 @@ std::shared_ptr<Context> Context::create(const ContextOptions& opt, std::string&
       st.report = report + "; " + boxReport;
       if (!ok) why = report;
       view->d_->core.reset();
+      if (opt.cacheStore) opt.cacheStore(devKey, ok, st.boxOk, ok ? st.report : report);
       return ok;
     };
   }
@@ -291,13 +318,24 @@ namespace {
 std::atomic<int> g_override{-1};
 std::atomic<int> g_presentExt{-1};
 
-bool envEnabled() {
-  if (const char* v = std::getenv("DAPPLE_GPU")) return v[0] == '1';
+// Off: no GPU. On: explicit (setRuntimeEnabled(1), DAPPLE_GPU=1, debug.dapple.gpu=1): the device is created and self-tested lazily on the first GPU
+// frame, on that thread. Auto (Android default): the app starts a background probe at start-up (startWarmup); frames are CPU frames until it passed.
+enum class Mode { Off, On, Auto };
+
+Mode envMode() {
+  if (const char* v = std::getenv("DAPPLE_GPU")) return v[0] == 'a' ? Mode::Auto : v[0] == '1' ? Mode::On : Mode::Off;
 #if defined(__ANDROID__)
   char buf[PROP_VALUE_MAX] = {0};
-  if (__system_property_get("debug.dapple.gpu", buf) > 0) return buf[0] == '1';
+  if (__system_property_get("debug.dapple.gpu", buf) > 0 && buf[0]) return buf[0] == '0' ? Mode::Off : buf[0] == '1' ? Mode::On : Mode::Auto;
+  return Mode::Auto;  // the default: on after the self-test passed (docs/engine/pipeline-architecture.md 24)
+#else
+  return Mode::Off;
 #endif
-  return false;
+}
+
+Mode mode() {
+  const int o = g_override.load();
+  return o >= 0 ? (o != 0 ? Mode::On : Mode::Off) : envMode();
 }
 
 std::string envApi() {
@@ -309,9 +347,151 @@ std::string envApi() {
   return {};
 }
 
+// ---- persisted self-test verdicts + the crash / hang marker ------------------------------------------------------------------------------------
+// gpu_selftest.v1 (one record per line): header "v1<TAB>fingerprint<TAB>appVersion", then "api<TAB>deviceKey<TAB>pass|fail<TAB>boxOk<TAB>detail". The key of a verdict is
+// Build.FINGERPRINT + app version (the header) + api + DeviceCaps::key() (vendor:device:driverVersion), so an OS update, a driver update or a new
+// build re-runs the test. gpu_selftest.running is written before an API is created and tested and removed after: a process that died or hung
+// inside leaves it, and the next start records that API as failed for this fingerprint + app version (deviceKey "*") without trying it again.
+struct Config {
+  std::mutex mu;
+  std::string dir, app, fingerprint;
+};
+Config& config() {
+  static Config* c = new Config;
+  return *c;
+}
+
+std::string clean(std::string s) {
+  for (char& c : s)
+    if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+  if (s.size() > 300) s.resize(300);
+  return s;
+}
+
+class SelfTestStore {
+ public:
+  SelfTestStore(std::string dir, std::string app, std::string fp) : dir_(std::move(dir)), app_(clean(std::move(app))), fp_(clean(std::move(fp))) {
+    if (!dir_.empty()) {
+      std::error_code ec;
+      std::filesystem::create_directories(dir_, ec);
+    }
+  }
+  bool persistent() const { return !dir_.empty(); }
+
+  // A marker left by a run that did not finish: that API failed for this fingerprint + app version.
+  void recoverMarker() {
+    if (!persistent()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    std::ifstream in(markerPath());
+    if (!in) return;
+    std::string line;
+    std::getline(in, line);
+    in.close();
+    std::error_code ec;
+    std::filesystem::remove(markerPath(), ec);
+    const std::string want = fp_ + "\t" + app_ + "\t";
+    if (line.compare(0, want.size(), want) != 0) return;  // another build / OS: not a verdict for this one
+    const std::string api = line.substr(want.size());
+    std::vector<Rec> recs = load();
+    recs.erase(std::remove_if(recs.begin(), recs.end(), [&](const Rec& r) { return r.api == api && r.devKey == "*"; }), recs.end());
+    recs.push_back({api, "*", false, true, "the self-test crashed or hung in an earlier run"});
+    save(recs);
+  }
+  void arm(const std::string& api) {
+    if (!persistent()) return;
+    std::ofstream out(markerPath(), std::ios::trunc);
+    out << fp_ << "\t" << app_ << "\t" << api << "\n";
+  }
+  void disarm() {
+    if (!persistent()) return;
+    std::error_code ec;
+    std::filesystem::remove(markerPath(), ec);
+  }
+  bool crashed(const std::string& api) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const Rec& r : load())
+      if (r.api == api && r.devKey == "*" && !r.pass) return true;
+    return false;
+  }
+  int lookup(const std::string& api, const std::string& devKey, bool* boxOk, std::string* detail) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const Rec& r : load())
+      if (r.api == api && r.devKey == devKey) {
+        if (boxOk) *boxOk = r.boxOk;
+        if (detail) *detail = r.detail;
+        return r.pass ? 1 : -1;
+      }
+    return 0;
+  }
+  void store(const std::string& api, const std::string& devKey, bool ok, bool boxOk, const std::string& detail) {
+    if (!persistent()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<Rec> recs = load();
+    recs.erase(std::remove_if(recs.begin(), recs.end(), [&](const Rec& r) { return r.api == api && r.devKey == devKey; }), recs.end());
+    recs.push_back({api, devKey, ok, boxOk, clean(detail)});
+    if (recs.size() > 16) recs.erase(recs.begin(), recs.end() - 16);
+    save(recs);
+  }
+
+ private:
+  struct Rec {
+    std::string api, devKey;
+    bool pass = false, boxOk = true;
+    std::string detail;
+  };
+  std::string path() const { return dir_ + "/gpu_selftest.v1"; }
+  std::string markerPath() const { return dir_ + "/gpu_selftest.running"; }
+  std::vector<Rec> load() const {
+    std::vector<Rec> v;
+    if (!persistent()) return v;
+    std::ifstream in(path());
+    std::string line;
+    if (!std::getline(in, line) || line != "v1\t" + fp_ + "\t" + app_) return v;  // other OS build / app version: nothing is known
+    while (std::getline(in, line)) {
+      std::vector<std::string> f;
+      std::size_t p = 0;
+      for (int i = 0; i < 4; ++i) {
+        const std::size_t q = line.find('\t', p);
+        if (q == std::string::npos) break;
+        f.push_back(line.substr(p, q - p));
+        p = q + 1;
+      }
+      if (f.size() != 4) continue;
+      v.push_back({f[0], f[1], f[2] == "pass", f[3] != "0", line.substr(p)});
+    }
+    return v;
+  }
+  void save(const std::vector<Rec>& recs) const {
+    const std::string tmp = path() + ".tmp";
+    {
+      std::ofstream out(tmp, std::ios::trunc);
+      out << "v1\t" << fp_ << "\t" << app_ << "\n";
+      for (const Rec& r : recs) out << r.api << "\t" << r.devKey << "\t" << (r.pass ? "pass" : "fail") << "\t" << (r.boxOk ? "1" : "0") << "\t" << r.detail << "\n";
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path(), ec);
+  }
+  std::string dir_, app_, fp_;
+  std::mutex mu_;
+};
+
+std::string systemFingerprint() {
+#if defined(__ANDROID__)
+  char buf[PROP_VALUE_MAX] = {0};
+  if (__system_property_get("ro.build.fingerprint", buf) > 0) return buf;  // what android.os.Build.FINGERPRINT reads
+#endif
+  return "unknown";
+}
+
 class ProviderImpl final : public GpuProvider {
  public:
-  bool enabled() const override { return runtimeEnabled() && !broken_.load(); }
+  enum class State { Idle, Probing, Ready, Failed };
+
+  bool enabled() const override {
+    const Mode m = mode();
+    if (m == Mode::Off || broken_.load()) return false;
+    return m == Mode::On || state_.load() == State::Ready;
+  }
   std::uint64_t generation() override {
     std::lock_guard<std::mutex> lk(mtx_);
     return gen_;
@@ -337,30 +517,54 @@ class ProviderImpl final : public GpuProvider {
     excluded_.insert(c->api());
     ctx_.reset();
     ++gen_;
-    started_ = false;
+    state_.store(State::Idle);
     std::string w2;
-    std::shared_ptr<Context> n = make(&w2);
+    std::shared_ptr<Context> n = make(&w2, excluded_, nullptr);
     if (!n) {
       broken_.store(true);
+      state_.store(State::Failed);
       why += (why.empty() ? "" : "; ") + w2;
       return false;
     }
     ctx_ = n;
-    started_ = true;
+    state_.store(State::Ready);
     return false;  // the failed API did not recover; the caller counts a demotion and goes on with a new executor
   }
+  std::string inactiveReason() override {
+    const Mode m = mode();
+    if (m == Mode::Off) return "GPU disabled (developer switch)";
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (broken_.load()) return "GPU given up after device loss" + (lastWhy_.empty() ? std::string() : ": " + lastWhy_);
+    switch (state_.load()) {
+      case State::Idle: return "GPU self-test not started";
+      case State::Probing: return "GPU self-test running";
+      case State::Failed: return "GPU unavailable: " + (lastWhy_.empty() ? std::string("no usable backend") : lastWhy_);
+      case State::Ready: break;
+    }
+    return "GPU ready";
+  }
   std::string statusJson() override {
-    const bool en = runtimeEnabled();
+    const Mode m = mode();
+    const bool en = enabled();
     std::string why;
-    std::shared_ptr<Context> c = en && !broken_.load() ? context(&why) : nullptr;
+    std::shared_ptr<Context> c = m != Mode::Off && !broken_.load() ? context(&why) : nullptr;
     const GpuCounters cnt = gpuCounters();
-    std::string j = std::string("{\"enabled\":") + (en ? "true" : "false") + ",\"available\":" + (c ? "true" : "false");
+    const char* st[] = {"idle", "probing", "ready", "failed"};
+    std::string tried;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      tried = tried_;
+    }
+    std::string j = std::string("{\"mode\":\"") + (m == Mode::Off ? "off" : m == Mode::On ? "on" : "auto") + "\",\"state\":\"" + st[int(state_.load())] +
+                    "\",\"enabled\":" + (en ? "true" : "false") + ",\"available\":" + (c ? "true" : "false");
     if (c)
       j += ",\"api\":\"" + std::string(c->api() == hal::Api::Gles31 ? "gles31" : "vulkan") + "\",\"device\":\"" + jsonEsc(c->caps().name) + "\",\"deviceKey\":\"" +
            c->caps().key() + "\",\"selfTest\":\"" + jsonEsc(c->selfTestReport()) + "\",\"selection\":" + c->selectionJson();
-    else if (en) j += ",\"reason\":\"" + jsonEsc(broken_.load() ? std::string("device lost") : why) + "\"";
+    else if (m != Mode::Off) j += ",\"reason\":\"" + jsonEsc(inactiveReason()) + "\"";
+    if (!tried.empty()) j += ",\"skipped\":\"" + jsonEsc(tried) + "\"";
     j += ",\"frames\":" + std::to_string(cnt.frames) + ",\"fallbacks\":" + std::to_string(cnt.fallbacks) + ",\"transients\":" + std::to_string(cnt.transients) +
-         ",\"deviceLost\":" + std::to_string(cnt.lost) + ",\"demotions\":" + std::to_string(cnt.demotions) + ",\"rebuilds\":" + std::to_string(c ? c->rebuilds() : 0);
+         ",\"deviceLost\":" + std::to_string(cnt.lost) + ",\"demotions\":" + std::to_string(cnt.demotions) + ",\"rebuilds\":" + std::to_string(c ? c->rebuilds() : 0) +
+         ",\"executors\":" + executorStatsJson();
     return j + "}";
   }
   std::size_t pooledBytes() override {
@@ -382,8 +586,20 @@ class ProviderImpl final : public GpuProvider {
     return true;
   }
 
+  // Auto mode: start the device creation + self-test on a background thread (once). Frames render on the CPU until it is done; nothing waits for it.
+  void startWarmup() {
+    if (mode() != Mode::Auto) return;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      if (state_.load() != State::Idle || broken_.load()) return;
+      state_.store(State::Probing);
+    }
+    std::thread([this] { probe(); }).detach();
+  }
+
   std::shared_ptr<Context> context(std::string* why) {
-    if (!runtimeEnabled()) {
+    const Mode m = mode();
+    if (m == Mode::Off) {
       if (why) *why = "GPU backend disabled";
       return nullptr;
     }
@@ -392,18 +608,44 @@ class ProviderImpl final : public GpuProvider {
       if (why) *why = lastWhy_.empty() ? "GPU unavailable for the rest of the process" : lastWhy_;
       return nullptr;
     }
-    if (!started_) {
-      started_ = true;
-      ctx_ = make(&lastWhy_);
+    if (m == Mode::On && state_.load() == State::Idle) {  // explicit switch: create + self-test here, on the calling thread
+      state_.store(State::Probing);
+      ctx_ = make(&lastWhy_, excluded_, &tried_);
       ++gen_;
+      state_.store(ctx_ ? State::Ready : State::Failed);
     }
-    if (!ctx_ && why) *why = lastWhy_;
+    if (!ctx_ && why) *why = state_.load() == State::Probing ? "GPU self-test running" : lastWhy_.empty() ? "GPU self-test not started" : lastWhy_;
     return ctx_;
   }
 
  private:
-  // mtx_ held
-  std::shared_ptr<Context> make(std::string* why) {
+  void probe() {
+    std::string why, tried;
+    std::shared_ptr<Context> c;
+    try {
+#if defined(__ANDROID__)
+      setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 10);  // never compete with the first paint
+#endif
+      std::set<hal::Api> ex;
+      {
+        std::lock_guard<std::mutex> lk(mtx_);
+        ex = excluded_;
+      }
+      c = make(&why, ex, &tried);
+    } catch (...) {
+      why = "exception during the GPU self-test";
+    }
+    std::lock_guard<std::mutex> lk(mtx_);
+    ctx_ = c;
+    lastWhy_ = why;
+    tried_ = tried;
+    ++gen_;
+    state_.store(c ? State::Ready : State::Failed);
+  }
+
+  // Tries the candidates in order (Vulkan -> GLES 3.1, or the one API forced by DAPPLE_GPU_API / debug.dapple.gpu_api), each wrapped in the
+  // in-progress marker and consulting the persisted verdicts. `tried` = the candidates that failed before the one that was taken.
+  std::shared_ptr<Context> make(std::string* why, const std::set<hal::Api>& excluded, std::string* tried) {
     ContextOptions o;
     if (const char* v = std::getenv("DAPPLE_GPU_SOFTWARE")) o.device.allowSoftware = v[0] == '1';
     if (const char* v = std::getenv("DAPPLE_GPU_PIPELINE_CACHE")) o.device.pipelineCachePath = v;  // persisted VkPipelineCache
@@ -418,23 +660,43 @@ class ProviderImpl final : public GpuProvider {
     for (auto& ch : api) ch = char(std::tolower(static_cast<unsigned char>(ch)));
     if (api == "vk") api = "vulkan";
     if (api == "auto") api.clear();
-    if (excluded_.empty()) {  // first selection: Vulkan -> GLES 3.1 (or the one DAPPLE_GPU_API names), reasons of every attempt kept
-      o.api = api;
+    const bool forced = !api.empty();
+
+    std::string dir, app, fp;
+    {
+      std::lock_guard<std::mutex> lk(config().mu);
+      dir = config().dir;
+      app = config().app;
+      fp = config().fingerprint.empty() ? systemFingerprint() : config().fingerprint;
+    }
+    auto store = std::make_shared<SelfTestStore>(dir, app, fp);
+    store->recoverMarker();
+
+    std::vector<std::string> cands;
+    if (forced) cands = {api};
+    else cands = {"vulkan", "gles"};
+    std::string reasons;
+    for (const std::string& cand : cands) {
+      const hal::Api a = cand == "vulkan" ? hal::Api::Vulkan : cand == "gles" ? hal::Api::Gles31 : hal::Api::Null;
+      if (excluded.count(a)) continue;
+      if (!forced && store->crashed(cand)) {  // earlier run died or hung in this API's self-test: not again for this OS build + app version
+        reasons += (reasons.empty() ? "" : "; ") + cand + ": the self-test crashed or hung in an earlier run (cached)";
+        continue;
+      }
+      o.api = cand;
+      o.cacheLookup = [store, cand](const std::string& k, bool* boxOk, std::string* d) { return store->lookup(cand, k, boxOk, d); };
+      o.cacheStore = [store, cand](const std::string& k, bool ok, bool boxOk, const std::string& d) { store->store(cand, k, ok, boxOk, d); };
+      store->arm(cand);
       std::string err;
       std::shared_ptr<Context> c = Context::create(o, err);
-      if (!c && why) *why = err;
-      return c;
-    }
-    // after a demotion: the candidates that were not given up yet, in order
-    std::string reasons;
-    for (const char* cand : {"vulkan", "gles"}) {
-      const hal::Api a = std::string(cand) == "vulkan" ? hal::Api::Vulkan : hal::Api::Gles31;
-      if (excluded_.count(a) || (!api.empty() && api != cand)) continue;
-      o.api = cand;
-      std::string err;
-      if (std::shared_ptr<Context> c = Context::create(o, err)) return c;
+      store->disarm();
+      if (c) {
+        if (tried) *tried = reasons;
+        return c;
+      }
       reasons += (reasons.empty() ? "" : "; ") + err;
     }
+    if (tried) *tried = reasons;
     if (why) *why = reasons.empty() ? "no backend left" : reasons;
     return nullptr;
   }
@@ -442,10 +704,10 @@ class ProviderImpl final : public GpuProvider {
   std::mutex mtx_;
   std::shared_ptr<Context> ctx_;
   std::set<hal::Api> excluded_;
-  bool started_ = false;
+  std::atomic<State> state_{State::Idle};
   std::atomic<bool> broken_{false};
   std::uint64_t gen_ = 1;
-  std::string lastWhy_;
+  std::string lastWhy_, tried_;
 };
 
 ProviderImpl& provider() {
@@ -455,13 +717,20 @@ ProviderImpl& provider() {
 }
 }  // namespace
 
-bool runtimeEnabled() {
-  const int o = g_override.load();
-  return o >= 0 ? o != 0 : envEnabled();
-}
+bool runtimeEnabled() { return mode() != Mode::Off; }
 void setRuntimeEnabled(int enabled) { g_override.store(enabled); }
 void setPresentExtensions(int on) { g_presentExt.store(on); }
+void configure(const std::string& cacheDir, const std::string& appVersion, const std::string& fingerprint) {
+  std::lock_guard<std::mutex> lk(config().mu);
+  config().dir = cacheDir;
+  config().app = appVersion;
+  config().fingerprint = fingerprint;
+}
 void installProvider() { installGpuProvider(&provider()); }
+void startWarmup() {
+  installProvider();
+  provider().startWarmup();
+}
 std::shared_ptr<Context> sharedContext(std::string* why) { return provider().context(why); }
 std::string statusJson() { return provider().statusJson(); }
 

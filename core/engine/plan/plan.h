@@ -96,6 +96,7 @@ struct PlanRequest {
   float nrLuma = 0, nrColor = 0, dehaze = 0, clarity = 0, texture = 0, sharpen = 0, sharpRadius = 1, grain = 0, scale = 1;
   bool vignette = false, useGeo = false;
   int outChannels = 4;                  // 4 = RGBA8 (alpha 255), 3 = RGB8
+  bool filmTiles = false;               // a film frame may keep ExecMode::TiledExport (the GPU executor runs the film in windows with a halo); the CPU executor needs false
 };
 
 // What an executor did (tests, edit-bench, EngineStats).

@@ -1,8 +1,13 @@
 // Golden corpus + hash harness for the engine migration (docs/engine/pipeline-architecture.md 10.1, step a0).
 //
 //   dapple_golden record <corpus.txt>            records the corpus from the CURRENT code (DAPPLE_ENGINE ignored: off)
-//   dapple_golden verify <corpus.txt> [mode...]  mode = off | legacy | tables | full (default: all four); every frame
-//                                                must hash to the recorded value in every mode (gate B)
+//   dapple_golden verify <corpus.txt> [mode...]  mode = off | full (default: both); every frame must hash to the recorded
+//                                                value in every mode (gate B)
+//   dapple_golden selfcheck [film.dfp]           no corpus: the old Renderer path (off) against the engine (full) on THIS machine,
+//                                                bit for bit, plus the engine's one-shot renders against Renderer::render /
+//                                                renderFloat. Runs on any architecture (x86_64, arm64 NEON, the emulator): the
+//                                                recorded corpus is arch-specific, this is not. The film pack is optional
+//                                                (path argument; without it the film scenarios are skipped).
 //
 // Inputs are synthetic (deterministic integer-hash scenes, no private photos). Each scenario is a short sequence of
 // frames through dapple_session_render_frame on one session, so cache state (lattice reuse, tone tables, the
@@ -670,9 +675,117 @@ std::vector<GoldenHash> runAll(bool haveFilm) {
 
 }  // namespace
 
+// ---- selfcheck: off vs full on the same machine ---------------------------------------------------------------------------------------
+bool sameImageF(const ImageF& a, const ImageF& b) {
+  return a.width == b.width && a.height == b.height &&
+         std::memcmp(a.data.data(), b.data.data(), std::size_t(a.width) * a.height * 3 * sizeof(float)) == 0;
+}
+
+int selfcheckOneShot(bool haveFilm) {
+  int bad = 0;
+  static const CameraRegistry reg = CameraRegistry::withBuiltins();
+  const CameraProfile& cam = reg.resolve("SONY", "ILCE-7M4");
+  const SourceImage src = makeScene(480, 320, 21, true);
+  struct Case {
+    const char* name;
+    EditParams p;
+  };
+  std::vector<Case> cases;
+  cases.push_back({"default", EditParams{}});
+  cases.push_back({"base", base()});
+  {
+    EditParams p = base();
+    p.clarity = 40, p.texture = 30, p.nrLuma = 30, p.nrColor = 25, p.sharpen = 60, p.dehaze = 25, p.grain = 30;
+    cases.push_back({"spatial", p});
+  }
+  {
+    EditParams p = base();
+    p.rotate = 90, p.straighten = 3.f, p.vignette = -30.f, p.crop = "4:5";
+    cases.push_back({"geometry", p});
+  }
+  {
+    EditParams p = base();
+    p.toneStrength = 60.f;
+    p.hsl[1].saturation = 20.f;
+    cases.push_back({"tone-colour", p});
+  }
+  if (haveFilm) {
+    EditParams p = base();
+    p.filmStock = "kodak_portra_400";
+    p.filmStrength = 100.f;
+    cases.push_back({"film", p});
+    p.filmStrength = 50.f;
+    cases.push_back({"film-blend", p});
+  }
+  for (const Case& c : cases) {
+    const Renderer r(c.p, cam, nullptr);
+    const Image8 want = r.render(src);
+    Image8 got;
+    std::string err;
+    bool ok = engine::renderImage8(c.p, cam, nullptr, src, got, &err) && got.width == want.width && got.height == want.height &&
+              got.data == want.data;
+    std::printf("  one-shot Image8 %-12s %s %s\n", c.name, ok ? "identical" : "DIFFERENT", err.c_str());
+    if (!ok) ++bad;
+    for (const bool spatial : {false, true}) {
+      const ImageF wantF = r.renderFloat(src, spatial);
+      ImageF gotF;
+      ok = engine::renderImageF(c.p, cam, nullptr, src, spatial, gotF, &err) && sameImageF(gotF, wantF);
+      std::printf("  one-shot float  %-12s spatial=%d %s %s\n", c.name, spatial ? 1 : 0, ok ? "identical" : "DIFFERENT", err.c_str());
+      if (!ok) ++bad;
+    }
+  }
+  {  // the Resize node's output is the resampler's output; cached; a no-op at the source's own size
+    const SourceImage big = makeScene(640, 427, 3, true);
+    engine::EngineSession es;
+    const auto sc = es.resizedSource(big, 300);
+    const ImageF want = resizeToLongEdge(big.linear, 300);
+    const bool ok = sc && sameImageF(sc->linear, want) && es.resizedSource(big, 300) == sc && !es.resizedSource(big, 640);
+    std::printf("  Resize node 640 -> 300 (cached, no-op at own size) %s\n", ok ? "identical" : "DIFFERENT");
+    if (!ok) ++bad;
+  }
+  return bad;
+}
+
+int selfcheck(bool haveFilm) {
+  const auto runMode = [&](int m) {
+    dapple::engine::setModeOverride(m);
+    return runAll(haveFilm);
+  };
+  const auto off = runMode(0);
+  const auto full = runMode(1);
+  dapple::engine::setModeOverride(-1);
+  int bad = 0;
+  if (off.size() != full.size()) {
+    std::printf("frame count off %zu vs full %zu\n", off.size(), full.size());
+    ++bad;
+  }
+  for (std::size_t i = 0; i < std::min(off.size(), full.size()); ++i)
+    if (off[i].name != full[i].name || off[i].hash != full[i].hash) {
+      std::printf("MISMATCH %s: off %s full %s\n", off[i].name.c_str(), off[i].hash.c_str(), full[i].hash.c_str());
+      ++bad;
+    }
+  std::printf("selfcheck %s: %zu frames off vs full, %d mismatches\n", platformTag().c_str(), off.size(), bad);
+  const int oneshot = selfcheckOneShot(haveFilm);
+  std::printf("selfcheck one-shot: %d differences\n", oneshot);
+  bad += oneshot;
+  std::printf(bad ? "SELFCHECK FAILED (%d)\n" : "SELFCHECK OK (%d)\n", bad);
+  return bad ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::string(argv[1]) == "selfcheck") {
+    bool film = false;
+    if (argc >= 3) {
+      film = dapple_film_load_pack(argv[2]) == DAPPLE_OK;
+    } else {
+      const std::string ps = (fs::path(DAPPLE_SOURCE_DIR) / "core" / "data" / "film" / "dapple.dfp").string();
+      film = fs::exists(ps) && dapple_film_load_pack(ps.c_str()) == DAPPLE_OK;
+    }
+    if (!film) std::fputs("note: film pack not loaded, film scenarios skipped\n", stderr);
+    return selfcheck(film);
+  }
   if (argc < 3) {
-    std::fputs("usage: dapple_golden record|verify <corpus.txt> [off|legacy|tables|full ...]\n", stderr);
+    std::fputs("usage: dapple_golden record|verify <corpus.txt> [off|full ...]\n", stderr);
     return 2;
   }
   const std::string cmd = argv[1], file = argv[2];
@@ -726,10 +839,10 @@ int main(int argc, char** argv) {
     }
     std::vector<std::string> modes;
     for (int i = 3; i < argc; ++i) modes.push_back(argv[i]);
-    if (modes.empty()) modes = {"off", "legacy", "tables", "full"};
+    if (modes.empty()) modes = {"off", "full"};
     int failures = 0;
     for (const std::string& m : modes) {
-      dapple::engine::setModeOverride(m == "off" ? 0 : (m == "legacy" ? 1 : (m == "tables" ? 2 : 3)));
+      dapple::engine::setModeOverride(m == "off" ? 0 : 1);
       const auto r = runAll(haveFilm);
       int bad = 0;
       for (const GoldenHash& x : r) {

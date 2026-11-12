@@ -23,6 +23,7 @@
 #include "colour_metrics.h"
 #include "dapple/developer.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 #include "eval.h"
 #include "eval_common.h"
 
@@ -56,7 +57,8 @@ double meanDE(const std::vector<Case>& cases, const CameraProfile& prof, double*
   long n = 0;
   std::vector<long> hist(1201, 0);
   for (const Case& c : cases) {
-    const ImageF out = Renderer(EditParams{}, prof, nullptr).renderFloat(c.src);
+    ImageF out;
+    if (!engine::renderImageF(EditParams{}, prof, nullptr, c.src, true, out)) continue;
     const int m = c.align.margin;
     double s = 0;
     long k = 0;
@@ -88,7 +90,8 @@ double meanDE(const std::vector<Case>& cases, const CameraProfile& prof, double*
 
 void collectPairs(const std::vector<Case>& cases, const CameraProfile& bare, std::vector<Pair>& out, int stride) {
   for (const Case& c : cases) {
-    const ImageF pre = Renderer(EditParams{}, bare, nullptr).renderFloat(c.src);
+    ImageF pre;
+    if (!engine::renderImageF(EditParams{}, bare, nullptr, c.src, true, pre)) continue;
     const int m = c.align.margin;
     long cnt = 0;
     for (int y = m; y < pre.height - m; y += stride)

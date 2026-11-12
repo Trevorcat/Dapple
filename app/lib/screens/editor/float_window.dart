@@ -13,13 +13,13 @@ import 'package:flutter/services.dart';
 import '../../editor/param_rows.dart';
 import '../../editor/springs.dart';
 import '../../editor/window_manager.dart';
-import '../../model/catalog.dart';
 import '../../model/params.dart';
 import '../../models.dart';
 import '../../services/editor_engine.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/icons.dart';
 import 'editor_controller.dart';
+import 'control_pad.dart';
 import 'editor_widgets.dart';
 import 'mini_maps.dart';
 import '../../services/perf_probe.dart';
@@ -53,13 +53,15 @@ double extraHeight(ParamRow r) {
       return 56;
     case 'ratio':
       return 128;
-    case 'palette':
     case 'toneTarget':
       return 92;
+    case 'film_expo':
+    case 'palette':
+      return 148; // a pad of about 172 x 132 dp: big enough to steer with a thumb
     case 'wheel':
-      return 100;
+      return 160;
     default:
-      return r.twoD == TwoD.curve ? 132 : 0;
+      return r.twoD == TwoD.curve ? 148 : 0;
   }
 }
 
@@ -300,7 +302,7 @@ class _WindowHostState extends State<WindowHost> with TickerProviderStateMixin {
   }
 
   void _onDragging() {
-    _line.animateTo(ctl.dragging.value ? 1 : 0, spring: SpringTier.small.opacity);
+    _line.animateTo(ctl.dragging.value && !ctl.dragFromWindow ? 1 : 0, spring: SpringTier.small.opacity);
   }
 
   @override
@@ -831,7 +833,7 @@ class _RowTile extends StatelessWidget {
     final valueStyle = T.body(modified ? c.accent : c.text2, tabular: true);
     Widget valueWidget = Text(text, maxLines: 1, overflow: TextOverflow.ellipsis, style: valueStyle, textAlign: TextAlign.right);
     if (editing) {
-      valueWidget = _NumberEntry(
+      valueWidget = NumberEntry(
         key: ValueKey('entry-${row.id}'),
         initial: row.inputText(rc),
         style: valueStyle,
@@ -925,16 +927,16 @@ class _RowTile extends StatelessWidget {
 
 /// The typed-value field (requirements 4.15.10): numeric keyboard with minus, commit on done or
 /// when it loses focus (tap on the photo), empty = cancel.
-class _NumberEntry extends StatefulWidget {
-  const _NumberEntry({super.key, required this.initial, required this.style, required this.onSubmit});
+class NumberEntry extends StatefulWidget {
+  const NumberEntry({super.key, required this.initial, required this.style, required this.onSubmit});
   final String initial;
   final TextStyle style;
   final ValueChanged<String> onSubmit;
   @override
-  State<_NumberEntry> createState() => _NumberEntryState();
+  State<NumberEntry> createState() => NumberEntryState();
 }
 
-class _NumberEntryState extends State<_NumberEntry> {
+class NumberEntryState extends State<NumberEntry> {
   late final TextEditingController _tc = TextEditingController(text: widget.initial);
   final FocusNode _fn = FocusNode();
   bool _done = false;
@@ -1023,13 +1025,7 @@ class _Extra extends StatelessWidget {
       case 'ratio':
         child = ChipPicker(keyPrefix: 'crop', label: '裁切比例', labels: cropRatioNames, index: row.readIndex!(rc), onSelect: (i) => ctl.selectDiscrete(row, i));
       case 'palette':
-        final look = lookById(e.look ?? rc.defaultLookId);
-        final p = e.palette ?? Offset(look.px, look.py);
-        child = Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-          PaletteMini(pos: p, def: Offset(look.px, look.py)),
-          const Spacer(),
-          _FineSwitch(ctl: ctl),
-        ]);
+        child = SizedBox.expand(child: ControlPad(ctl: ctl, row: row, fromWindow: true));
       case 'toneTarget':
         child = Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
           ToneMini(photo: host.photo, engine: ctl.engine, app: ctl.app, edit: e, nearest: host.nearest, onSelect: ctl.selectTone),
@@ -1037,27 +1033,10 @@ class _Extra extends StatelessWidget {
           Expanded(child: Text(tonePlain(e.toneTarget ?? host.nearest), style: T.small(c.text2), maxLines: 2)),
         ]);
       case 'wheel':
-        final z = rc.sel.gradeZone;
-        child = Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
-          WheelMini(hue: e.value(grKey(z, 'h')), sat: e.value(grKey(z, 's'))),
-          const Spacer(),
-          _FineSwitch(ctl: ctl),
-        ]);
+        child = SizedBox.expand(child: ControlPad(ctl: ctl, row: row, fromWindow: true));
       default:
-        if (row.twoD == TwoD.curve) {
-          child = Stack(children: [
-            CurveMini(
-              analysis: ctl.analysis(),
-              edit: e,
-              channel: rc.sel.curveCh,
-              selected: ['H', 'L', 'D', 'S'].indexWhere((r) => cvKey(rc.sel.curveCh, r) == row.id),
-              onSelect: (i) {
-                final rows = ctl.rowsOf(EGroup.curve);
-                ctl.setActive(EGroup.curve, rows[i + 1]);
-              },
-            ),
-            Positioned(right: 4, bottom: 4, child: _FineSwitch(ctl: ctl, compact: true)),
-          ]);
+        if (row.twoD == TwoD.curve || row.twoD == TwoD.offset) {
+          child = SizedBox.expand(child: ControlPad(ctl: ctl, row: row, fromWindow: true));
         }
     }
     if (child == null) return const SizedBox.shrink();
@@ -1067,42 +1046,6 @@ class _Extra extends StatelessWidget {
       alignment: Alignment.topLeft,
       padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
       child: child,
-    );
-  }
-}
-
-class _FineSwitch extends StatelessWidget {
-  const _FineSwitch({required this.ctl, this.compact = false});
-  final EditorController ctl;
-  final bool compact;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = context.c;
-    return ValueListenableBuilder<bool>(
-      valueListenable: ctl.fine2D,
-      builder: (context, on, _) => Semantics(
-        toggled: on,
-        button: true,
-        label: '精细',
-        excludeSemantics: true,
-        child: GestureDetector(
-          key: const ValueKey('fine-switch'),
-          behavior: HitTestBehavior.opaque,
-          onTap: () => ctl.fine2D.value = !on,
-          child: Container(
-            height: compact ? 26 : 32,
-            padding: EdgeInsets.symmetric(horizontal: compact ? 8 : 10),
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: on ? c.accentSoft : c.chip,
-              borderRadius: BorderRadius.circular(16),
-              border: on ? Border.all(color: c.accent, width: 1.5) : null,
-            ),
-            child: Text('精细', style: T.cap(on ? c.accent : c.text2, w: FontWeight.w500)),
-          ),
-        ),
-      ),
     );
   }
 }

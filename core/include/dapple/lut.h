@@ -25,6 +25,12 @@ class Lut3D {
   // Tetrahedral interpolation; rgb in/out, values clamped to the domain.
   void apply(const float in[3], float out[3]) const;
 
+  // The table as stored (size^3 RGB triples, red fastest, then green, then blue) and its input domain: for a backend that
+  // evaluates the same tetrahedral interpolation on the device (film display stages on the GPU).
+  const std::vector<float>& table() const { return table_; }
+  const float* domainMin() const { return domainMin_; }
+  const float* domainMax() const { return domainMax_; }
+
  private:
   int size_ = 0;
   std::string title_;

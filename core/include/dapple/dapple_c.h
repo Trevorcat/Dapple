@@ -114,6 +114,15 @@ DAPPLE_API char* dapple_film_swatch_bands_json(void);
 
 /* ---- Previews for pickers ---- */
 
+/* Film control pad labels for the current photo and film (docs/engine/pipeline-architecture.md section 18): JSON
+ *   {"ok":true,"shared_ev":..,"final_ev":..,"fraction":..,"shoot_ev":[-1,0,+1],"print_l":[..],"black_l":[..],"latitude":[..],"white_l":..}
+ * with the actual film EV at film_shoot -1/0/+1, the print's median L* at film_print -1/0/+1, the paper black L* at film_black
+ * -1/0/+1 and the in-range fraction at film_latitude -1/0/+1. {"ok":false} without an active film or with a legacy
+ * DAPPLE_FILM_MATCH_* mode. To preview a pad position render the 256 px proxy with params_json carrying the offsets
+ * (film_shoot, film_print, film_black, film_latitude in -1..1): dapple_session_render with out_long_edge 256 (the match is cached
+ * per key, the print exposure of a moved film_print costs a few proxy renders). Free with dapple_free_string. */
+DAPPLE_API char* dapple_session_film_pad_json(DappleSession* session, const char* params_json);
+
 /* Renders the photo with each of the nine styles (order of dapple_looks_json, default colour pad,
  * strength 100) on top of `params_json` (its own look / palette / lookStrength are replaced).
  * Fills out[0..8]; release each with dapple_free_image. On failure none is allocated.
@@ -224,7 +233,7 @@ DAPPLE_API float dapple_thermal_headroom(int32_t forecast_seconds);
 /* {"cpus":N,"perf":N,"efficient":N,"pool":N,"adpf":bool,"thermal_status":N}; free with dapple_free_string. */
 DAPPLE_API char* dapple_perf_info_json(void);
 
-/* Frame engine diagnostics (DAPPLE_ENGINE: default full; off|legacy|tables for A/B): {"engine":"off|legacy|tables","frames":N,
+/* Frame engine diagnostics (DAPPLE_ENGINE: default full; off = the old Renderer path, golden oracle / A/B): {"engine":"off|full","frames":N,
  * "fullHits":N,"latticeReuse":N,"latticeBake":N,...}; free with dapple_free_string. Additive. */
 DAPPLE_API char* dapple_engine_info_json(void);
 
@@ -325,13 +334,27 @@ DAPPLE_API int32_t dapple_motion_photo_write(const char* jpeg_path, const char* 
 /* Checks a file against the spec: same JSON as info_json_out (without "clip"). NULL if the file cannot be read. */
 DAPPLE_API char* dapple_motion_photo_validate_json(const char* path);
 
-/* Optional GPU backend (Vulkan compute; only present in builds configured with DAPPLE_GPU, default off at run time).
+/* Optional GPU backend (Vulkan / GLES 3.1 compute; only present in builds configured with DAPPLE_GPU).
  * mode: 1 = use the GPU for render_frame / export when available (CPU fallback on any failure), 0 = never,
- * -1 = back to the default (env DAPPLE_GPU=1, Android property debug.dapple.gpu=1, else off).
+ * -1 = back to the default (env DAPPLE_GPU=0|1|auto, Android property debug.dapple.gpu=0|1; unset: auto on Android, off elsewhere).
  * Returns the effective state (0 in builds without the backend). */
 DAPPLE_API int32_t dapple_gpu_set_enabled(int32_t mode);
 /* {"enabled","available","device","deviceKey","selfTest","reason"} (or {"compiled":false,...}); dapple_free_string. */
 DAPPLE_API char* dapple_gpu_status_json(void);
+
+/* Default behaviour (Android): the GPU is used once a background probe created a device and it passed the self-test (Vulkan, else GLES 3.1), with no
+ * user switch; until then, and when nothing passes, frames render on the CPU. The developer kill switch is the property debug.dapple.gpu=0
+ * (debug.dapple.gpu_api=vulkan|gles|cpu forces an API).
+ * dapple_gpu_configure: app-private directory for the persisted self-test verdicts and the "self-test in progress" marker (a crash or hang
+ * inside the self-test marks that API as failed for this OS build + app version on the next start), the app version and Build.FINGERPRINT they are
+ * keyed by (null/empty fingerprint = ro.build.fingerprint). Call before dapple_gpu_warmup; without a directory nothing is persisted.
+ * dapple_gpu_warmup: starts the probe on a detached low-priority thread and returns at once (idempotent; no-op when the GPU is off or the build has none). */
+DAPPLE_API void dapple_gpu_configure(const char* cache_dir, const char* app_version, const char* fingerprint);
+DAPPLE_API void dapple_gpu_warmup(void);
+
+/* Which executor rendered the frames of this process: {"gpuFrames":n,"cpuFrames":n,"deviceLost":n,"demotions":n,"api":"vulkan|gles31|cpu|none",
+ * "lastReason":"...","unsupported":{"<reason the GPU did not render a frame>":count,...}}. Free with dapple_free_string. */
+DAPPLE_API char* dapple_engine_stats_json(void);
 
 #ifdef __cplusplus
 }

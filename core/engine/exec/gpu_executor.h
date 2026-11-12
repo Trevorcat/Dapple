@@ -66,6 +66,10 @@ struct ContextOptions {
   hal::DeviceOptions device;  // allowSoftware, deviceIndex, profile, blocklist, pipelineCachePath, poolBudgetBytes, presentExtensions
   bool selfTest = true;       // render a known pattern through the whole pipeline before the first use
   std::string api;            // "" (env DAPPLE_GPU_API, then Vulkan -> GLES), "vulkan", "gles"
+  // Persisted self-test verdicts (the provider keys them by Build.FINGERPRINT + app version; `devKey` = DeviceCaps::key(), i.e. includes the driver
+  // version). lookup: 1 = passed before (box scan verdict in *boxOk), -1 = failed before (*detail), 0 = unknown (run the self-test).
+  std::function<int(const std::string& devKey, bool* boxOk, std::string* detail)> cacheLookup;
+  std::function<void(const std::string& devKey, bool ok, bool boxOk, const std::string& detail)> cacheStore;
 };
 
 class Context : public std::enable_shared_from_this<Context> {

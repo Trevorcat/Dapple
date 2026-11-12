@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -22,10 +24,11 @@
 
 namespace dapple::engine {
 
-// DAPPLE_ENGINE: unset (default) = full; 0/off = the C layer's own path), "legacy" = routed through EngineSession with the old bakes[3]
-// inside it (step a2), "tables" = table nodes + ResultCache (step a3), anything else ("full") = the whole frame through
-// the Planner and the CpuExecutor (the fourth pipeline: every frame and export).
-enum class Mode : int { Off = 0, LegacyBakes = 1, Tables = 2, Full = 3 };
+// DAPPLE_ENGINE: unset (default) = full: every frame and export goes through the Planner and the CpuExecutor / GpuExecutor.
+// "0" / "off" = the C layer's own path with the old Renderer (bakes[3] + renderBakedRgba): kept only as the golden oracle and
+// the A/B switch until the device sign-off (docs/engine/pipeline-architecture.md 10.7). The intermediate "legacy" / "tables"
+// modes are gone (their behaviour is the Full engine's table stage).
+enum class Mode : int { Off = 0, Full = 1 };
 Mode mode();
 void setModeOverride(int m);  // tests: -1 = back to the environment
 
@@ -38,6 +41,24 @@ struct TableEnv {
   const Renderer& renderer;
   const SourceImage& src;
 };
+// The per-frame parameters of a table node's CpuImpl::bake (`resolved`). n = lattice size; fast / maxV as the node needs.
+struct TableBakeCtx {
+  const TableEnv* env = nullptr;
+  int n = 0;
+  bool fast = false;
+  float maxV = 0.f;
+};
+// The per-frame parameters of the Resize node's CpuImpl::bake: the source resampled to `longEdge`.
+struct ResizeBakeCtx {
+  const SourceImage* full = nullptr;
+  int longEdge = 0;
+};
+// Runs `type`'s CpuImpl::bake; null payload when the node has no bake or it failed. Payload types: ColourLattice and
+// LatticeOverflow std::vector<float>, ToneAnalysisPre Renderer::TonePre, ToneTable ToneTableOut, Analysis ToneAnalysis,
+// Resize SourceImage.
+std::shared_ptr<void> bakeNode(NodeType type, const void* resolved, std::span<const void* const> inputs = {});
+
+// Convenience wrappers over bakeNode (conformance tests, bench).
 std::shared_ptr<std::vector<float>> evalColourLattice(const TableEnv& env, int n);
 Renderer::TonePre evalToneAnalysisPre(const TableEnv& env, std::vector<float>* lattice, int n, bool fast);
 ToneTableOut evalToneTable(const TableEnv& env, const Renderer::TonePre* pre);
@@ -84,6 +105,7 @@ struct FrameResult {
   // what this frame did (tests, edit-bench)
   enum class Bake : std::uint8_t { FullHit, LatticeReuse, LatticeBake } bake = Bake::FullHit;
   std::string executor;  // "cpu", "vulkan" or "gles31": who produced the pixels (Full mode)
+  std::string why;       // when the CPU rendered although a GPU was asked for or could have been: the reason (Unsupported text, "GPU self-test running", ...)
   bool external = false; // the pixels are in FrameJob::gpuTarget, not in rgba
   GpuStats gpu;          // GPU runs only
 };
@@ -104,6 +126,11 @@ struct GpuCounters {
   std::uint64_t frames = 0, fallbacks = 0, transients = 0, lost = 0, demotions = 0;
 };
 GpuCounters gpuCounters();
+
+// Per-frame executor accounting (EngineSession::renderFrame, process-wide): which executor rendered each frame and, for CPU frames, why the GPU did
+// not. JSON: {"gpuFrames":n,"cpuFrames":n,"deviceLost":n,"api":"vulkan|gles31|cpu","unsupported":{"<reason>":n,..}}. Also logged (logcat tag
+// dapple_engine on Android, stderr when DAPPLE_ENGINE_LOG=1 elsewhere): once per 30 frames and on every change of executor or reason.
+std::string executorStatsJson();
 
 // True when frames go through the engine: DAPPLE_ENGINE is on, or the GPU runtime flag is on (the GPU executor consumes the
 // Planner's Plan, so a GPU session always runs the Full engine).
@@ -133,6 +160,8 @@ class EngineSession {
     bool sessionCache = false;
     // Test hook: runs after the cancel ticket was taken and before execution (a deterministic cancel point).
     std::function<void()> beforeExec;
+    // Non-null: the clamped, display-encoded float frame goes here instead of the 8-bit `out` (Whole plans; analysis, swatches).
+    ImageF* outFloat = nullptr;
   };
   bool renderExact(const EditParams& params, const Renderer& renderer, const SourceImage& src, const ExactOptions& opt,
                    Image8& out, std::string* err = nullptr, ExecStats* stats = nullptr);
@@ -172,6 +201,10 @@ class EngineSession {
   // One plan on the GPU with the selection of 5.9. 0 = out filled, 1 = CPU takes the frame, -1 = cancelled.
   int runOnGpu(const GpuRun& run, GpuOut& out);
   int renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out);
+  // renderExact on the GPU executor (the exact variant: ToneColourExact through a dense lattice bake): 0 = `out` holds the frame, 1 = the CPU takes it,
+  // -1 = failed / cancelled (err)
+  int renderExactGpu(const EditParams& params, const Renderer& renderer, const SourceImage& src, const ExactOptions& opt, Image8& out,
+                     std::string* err);
   const std::vector<float>* overflowFor(const ParamSet& ps, int n) const;
   hal::Api gpuLastApi_ = hal::Api::Null;
   IGpuExecutor* gpuExecutor();
@@ -180,10 +213,11 @@ class EngineSession {
   IGpuExecutor* gpuOverride_ = nullptr;
   bool gpuForce_ = false;
   std::string gpuWhy_;  // last reason for not using the GPU (diagnostics)
+  std::string frameWhy_;  // reason the GPU did not render the frame being rendered (reset by renderFrame; FrameResult::why)
 
-  std::shared_ptr<const BakedLut> bakeLegacy(FrameJob& job, int n, FrameResult& out);
-  std::shared_ptr<const BakedLut> bakeTables(FrameJob& job, const ParamSet& ps, int n, FrameResult& out,
-                                             Renderer::TonePre* preOut, bool* haveAnalysis);
+  // The HostTable stage: evaluates the table nodes of `graph_` through their CpuImpl::bake (cached in the ResultCache under the
+  // effective node keys) and assembles the frame's BakedLut.
+  std::shared_ptr<const BakedLut> runHostTables(FrameJob& job, const ParamSet& ps, int n, FrameResult& out);
 
   // 0 = out.rgba is the frame, 1 = not supported here (render with the legacy renderer), -1 = failed / cancelled (out.error)
   int renderFull(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out);
@@ -193,8 +227,26 @@ class EngineSession {
   ResultCache cache_;
   EngineStats stats_;
   Graph graph_;
-  std::vector<std::shared_ptr<const BakedLut>> bakes_;  // Mode::LegacyBakes only
+
+ public:
+  // The Resize node: the session source resampled to `longEdge` (CpuImpl::bake of Resize, cached; at most 4 copies / ~160 MB,
+  // least recently used first out). Null when the source is not larger than `longEdge` (the caller reads `full` itself).
+  // The returned image stays valid while the caller holds it, whatever the cache does.
+  // cacheLarge = false (exports, previews): a copy of more than 64 MB is returned but not kept.
+  std::shared_ptr<const SourceImage> resizedSource(const SourceImage& full, int longEdge, bool cacheLarge = true);
+
+ private:
+  std::mutex resizeMtx_;
 };
+
+// One-shot reference-quality renders for callers that have no DappleSession (CLI, developer, tone analysis, swatches): a private
+// EngineSession, the exact variant of the Full graph through the Planner and the CpuExecutor (frames above 16 MP in tiles). The old
+// Renderer is only the parameter resolver here. `spatial` = false skips the neighbourhood stages. False: failed (error in `err`).
+// With DAPPLE_ENGINE=off these still work (they are the engine's own entry points, not the oracle).
+bool renderImage8(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, Image8& out,
+                  std::string* err = nullptr, float toneReach = 1.f);
+bool renderImageF(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, bool spatial,
+                  ImageF& out, std::string* err = nullptr);
 
 // Process-wide summary for dapple_engine_info_json().
 std::string infoJson();

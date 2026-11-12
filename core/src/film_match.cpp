@@ -5,6 +5,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <set>
 #include <vector>
 
 #include "color.h"
@@ -35,6 +38,8 @@ std::string filmMatchKey(const EditParams& p) {
   EditParams k = p;
   k.filmExposure = 0.f;
   k.filmKeyEv = 0.f;
+  k.filmPrintEv = 0.f;
+  k.filmBlack = 0.f;
   k.filmStrength = 100.f;
   k.filmGrain = 0.f;
   k.filmHalation = 0.f;
@@ -42,6 +47,197 @@ std::string filmMatchKey(const EditParams& p) {
   k.sharpen = k.sharpRadius = k.nrLuma = k.nrColor = 0.f;
   k.vignette = 0.f;
   return toJson(k);
+}
+
+FilmMatchOptions FilmMatchOptions::fromEnv() {
+  FilmMatchOptions o;
+  const char* full = std::getenv("DAPPLE_FILM_MATCH_FULL");
+  if (const char* v = std::getenv("DAPPLE_FILM_MATCH_V4")) {
+    if (v[0] && v[0] != '0') o.mode = FilmMatchMode::Window;
+  }
+  if (const char* v = std::getenv("DAPPLE_FILM_MATCH_PULL")) o.mode = FilmMatchMode::Pull, o.pull = std::strtof(v, nullptr);
+  if (full && full[0] && full[0] != '0') o.mode = FilmMatchMode::Full, o.pull = 1.f, o.latitude = false;
+  if (const char* v = std::getenv("DAPPLE_FILM_MATCH_NEG_BIAS")) o.negativeBiasEv = std::strtof(v, nullptr);
+  if (const char* v = std::getenv("DAPPLE_FILM_MATCH_REV_MARGIN")) o.shoulderMarginReversal = std::strtof(v, nullptr);
+  return o;
+}
+
+bool filmPaperMapStretchesBlack() { return FilmMatchOptions::fromEnv().mode == FilmMatchMode::Window; }
+
+bool filmPaperMappingEnabled() {
+  if (std::getenv("DAPPLE_FILM_MATCH_OFF") || std::getenv("DAPPLE_FILM_PAPER_MAP_OFF")) return false;
+  const FilmMatchMode m = FilmMatchOptions::fromEnv().mode;
+  return m == FilmMatchMode::Meter || m == FilmMatchMode::Window;
+}
+
+FilmLatitude filmLatitude(const film::FilmStock& s) {
+  FilmLatitude r;
+  r.reversal = s.positive();
+  const std::size_t n = s.logExposure.size();
+  if (n < 16 || s.densityCurves.size() != n * 3) return r;
+  std::vector<double> x(n), d(n), sl(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    x[i] = s.logExposure[i];
+    d[i] = s.densityCurves[i * 3 + 1];  // green: the mid layer
+    if (!std::isfinite(x[i]) || !std::isfinite(d[i])) return r;
+    if (i && !(x[i] > x[i - 1])) return r;
+  }
+  if (x.front() > -0.3 || x.back() < 0.3) return r;
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::size_t a = i ? i - 1 : i, b = i + 1 < n ? i + 1 : i;
+    sl[i] = std::fabs((d[b] - d[a]) / (x[b] - x[a]));
+  }
+  double sum = 0;
+  int cnt = 0;
+  std::size_t i0 = 0;
+  double best = 1e9;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (std::fabs(x[i]) < best) best = std::fabs(x[i]), i0 = i;
+    if (x[i] >= -0.3 && x[i] <= 0.3) sum += sl[i], ++cnt;
+  }
+  if (!cnt) return r;
+  const double gm = sum / cnt;
+  if (!(gm > 0.05)) return r;
+  const double th = kFilmEdgeSlopeFrac * gm;
+  std::size_t k = i0;
+  while (k > 0 && sl[k] > th) --k;
+  const double toe = x[k];
+  k = i0;
+  while (k + 1 < n && sl[k] > th) ++k;
+  r.ok = true;
+  r.midGamma = float(gm);
+  r.toe = float(toe);
+  r.shoulder = float(x[k]);
+  return r;
+}
+
+SceneStats sceneLumaStats(const ImageF& lin, const float gain[3]) {
+  SceneStats st;
+  const std::size_t n = std::size_t(lin.width) * lin.height;
+  if (!n) return st;
+  std::vector<float> y(n), yc;
+  yc.reserve(n);
+  std::size_t k = 0;
+  std::size_t clipped = 0;
+  for (int j = 0; j < lin.height; ++j) {
+    const float* r = lin.row(j);
+    for (int i = 0; i < lin.width; ++i, ++k) {
+      const float v = 0.2880f * std::max(0.f, r[3 * i] * gain[0]) + 0.7119f * std::max(0.f, r[3 * i + 1] * gain[1]) +
+                      0.0001f * std::max(0.f, r[3 * i + 2] * gain[2]);
+      y[k] = std::isfinite(v) ? v : 0.f;
+      const float mx = std::max(r[3 * i], std::max(r[3 * i + 1], r[3 * i + 2]));
+      if (mx >= kFilmClipLevel) ++clipped;
+      else yc.push_back(y[k]);
+    }
+  }
+  st.clipFrac = float(double(clipped) / double(n));
+  {
+    const std::vector<float>& base = (yc.empty() || st.clipFrac > kFilmClipMaxFrac) ? y : yc;
+    double sl = 0;
+    for (float v : base) sl += std::log(std::max(v, kFilmShadowFloorY));
+    st.logMean = base.empty() ? 0.f : float(std::exp(sl / double(base.size())));
+    st.logH0.resize(base.size());
+    for (std::size_t i = 0; i < base.size(); ++i) st.logH0[i] = std::log10(std::max(base[i], kFilmShadowFloorY) / kFilmGreyCard);
+    std::sort(st.logH0.begin(), st.logH0.end());
+    // the meter reads the median of the counted pixels (the intended key is a median too: develop render L*)
+    if (!st.logH0.empty()) st.logMean = kFilmGreyCard * std::pow(10.f, st.logH0[st.logH0.size() / 2]);
+  }
+  if (std::getenv("DAPPLE_MATCH_TRACE")) {
+    static const float th[] = {0.5f, 0.7f, 0.8f, 0.9f, 0.95f, 0.98f, 1.0f, 1.2f};
+    for (float t : th) {
+      std::size_t c = 0, c2 = 0;
+      for (int j = 0; j < lin.height; ++j)
+        for (int i = 0; i < lin.width; ++i) {
+          const float* r = lin.row(j) + 3 * i;
+          c += std::max(r[0], std::max(r[1], r[2])) >= t;
+          c2 += r[1] >= t;
+        }
+      std::fprintf(stderr, "clip trace: max-channel >= %.2f : %.1f%%  (G >= : %.1f%%)\n", double(t), 100.0 * double(c) / double(n), 100.0 * double(c2) / double(n));
+    }
+  }
+  auto pct = [&](double q) {
+    const std::size_t i = std::min(n - 1, std::size_t(q * double(n - 1) + 0.5));
+    std::nth_element(y.begin(), y.begin() + i, y.end());
+    return y[i];
+  };
+  st.p2 = pct(0.02);
+  st.p50 = pct(0.50);
+  if (st.clipFrac > kFilmClipMaxFrac || yc.empty()) {
+    st.p995 = pct(0.90);
+  } else {
+    const std::size_t i = std::min(yc.size() - 1, std::size_t(0.995 * double(yc.size() - 1) + 0.5));
+    std::nth_element(yc.begin(), yc.begin() + i, yc.end());
+    st.p995 = yc[i];
+  }
+  return st;
+}
+
+namespace {
+constexpr float kLog2of10 = 0.30103f;  // log10(2): log10 H per stop
+constexpr float kShadowFloorY = 0.002f;  // sensor noise floor: crushed blacks do not demand an infinite push
+}  // namespace
+
+bool filmExposureWindow(const FilmLatitude& lat, const SceneStats& st, float& evLo, float& evHi,
+                        float shoulderMarginReversal) {
+  if (!lat.ok || !(st.p995 > 0.f) || !std::isfinite(st.p995) || !std::isfinite(st.p2)) return false;
+  const float lHi = std::log10(st.p995 / 0.184f);
+  const float lLo = std::log10(std::max(st.p2, kShadowFloorY) / 0.184f);
+  evHi = ((lat.shoulder - (lat.reversal ? shoulderMarginReversal : kFilmShoulderMarginLogH)) - lHi) / kLog2of10;
+  evLo = ((lat.toe + kFilmToeMarginLogH) - lLo) / kLog2of10;
+  return true;
+}
+
+float resolveFilmKeyEv(const film::FilmStock* stock, const SceneStats& st, float evMatch, const FilmMatchOptions& opt,
+                       FilmMatchInfo* info) {
+  constexpr float kMaxEv = 4.f;
+  FilmMatchInfo local;
+  FilmMatchInfo& m = info ? *info : local;
+  m.evMatch = evMatch;
+  m.p2 = st.p2;
+  m.p50 = st.p50;
+  m.p995 = st.p995;
+  m.clipFrac = st.clipFrac;
+  m.evKey = opt.pull * evMatch;
+  m.latitudeOk = false;
+  m.conflict = false;
+  m.bound = FilmBound::None;
+  float ev = m.evKey;
+  if (opt.latitude) {
+    FilmLatitude lat;
+    if (stock) lat = filmLatitude(*stock);
+    float lo = 0.f, hi = 0.f;
+    if (filmExposureWindow(lat, st, lo, hi, opt.shoulderMarginReversal)) {
+      m.latitudeOk = true;
+      m.evLo = lo;
+      m.evHi = hi;
+      if (lo > hi) {
+        m.conflict = true;
+        ev = lat.reversal ? hi : lo;  // slide: protect the highlights; negative: keep the shadows, highlights roll off
+        m.bound = lat.reversal ? FilmBound::Shoulder : FilmBound::Toe;
+      } else if (ev < lo) {
+        ev = lo;
+        m.bound = FilmBound::Toe;
+      } else if (ev > hi) {
+        ev = hi;
+        m.bound = FilmBound::Shoulder;
+      }
+    } else {
+      // no usable curve: a plain limit, logged once per stock
+      ev = std::clamp(ev, -kFilmFallbackMaxEv, kFilmFallbackMaxEv);
+      m.bound = FilmBound::Fallback;
+      static std::mutex mtx;
+      static std::set<std::string> seen;
+      const std::string id = stock ? stock->stock : std::string("(unknown)");
+      std::lock_guard<std::mutex> lock(mtx);
+      if (seen.insert(id).second)
+        std::fprintf(stderr, "film match: no usable density curve for '%s', key EV clamped to +-%.0f\n", id.c_str(),
+                     double(kFilmFallbackMaxEv));
+    }
+  }
+  if (!std::isfinite(ev)) ev = 0.f;
+  ev = std::clamp(ev, -kMaxEv, kMaxEv);
+  m.ev = ev;
+  return ev;
 }
 
 float solveFilmKeyEv(const std::function<float(float)>& filmL, float target, FilmMatchInfo* info) {
@@ -80,40 +276,593 @@ float solveFilmKeyEv(const std::function<float(float)>& filmL, float target, Fil
   return best;
 }
 
-float matchFilmExposure(const EditParams& p, const CameraProfile& camera, const Lut3D* lut, const SourceImage& proxy,
-                        FilmMatchInfo* info) try {
+static float lightnessOfY(double Y) {
+  Y = std::clamp(Y, 0.0, 1.0);
+  return float(Y > 0.008856 ? 116.0 * std::cbrt(Y) - 16.0 : 903.3 * Y);
+}
+static double yOfLightness(double L) {
+  const double f = (L + 16.0) / 116.0;
+  return L > 8.0 ? f * f * f : L / 903.3;
+}
+
+float chooseFilmEv(const film::FilmStock* stock, const SceneStats& st, const FilmMatchOptions& opt, FilmMatchInfo* info) {
+  FilmMatchInfo local;
+  FilmMatchInfo& m = info ? *info : local;
+  m.p2 = st.p2;
+  m.p50 = st.p50;
+  m.p995 = st.p995;
+  m.clipFrac = st.clipFrac;
+  m.latitudeOk = false;
+  m.conflict = false;
+  m.bound = FilmBound::None;
+  FilmLatitude lat;
+  if (stock) lat = filmLatitude(*stock);
+  float lo = 0.f, hi = 0.f, ev = 0.f;
+  if (filmExposureWindow(lat, st, lo, hi, opt.shoulderMarginReversal)) {
+    m.latitudeOk = true;
+    m.evLo = lo;
+    m.evHi = hi;
+    m.conflict = lo > hi;
+    if (lat.reversal) {  // slide: the (unclipped) highlight sits at the shoulder margin, the shadows block up if they must
+      ev = hi;
+      m.bound = FilmBound::Shoulder;
+    } else {  // negative: shadows above the toe with the overexposure bias, never past the shoulder window
+      ev = lo + opt.negativeBiasEv;
+      m.bound = FilmBound::Toe;
+      if (ev > hi) {
+        ev = std::max(hi, lo);  // scene wider than the latitude: keep the shadows, highlights roll off
+        m.bound = lo > hi ? FilmBound::Toe : FilmBound::Shoulder;
+      }
+    }
+  } else {
+    m.bound = FilmBound::Fallback;
+    static std::mutex mtx;
+    static std::set<std::string> seen;
+    const std::string id = stock ? stock->stock : std::string("(unknown)");
+    std::lock_guard<std::mutex> lock(mtx);
+    if (seen.insert(id).second)
+      std::fprintf(stderr, "film match: no usable density curve for '%s', film EV 0\n", id.c_str());
+  }
+  if (!std::isfinite(ev)) ev = 0.f;
+  ev = std::clamp(ev, -4.f, 4.f);
+  m.ev = ev;
+  return ev;
+}
+
+FilmPrintRange filmPrintRange(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId,
+                              const std::string& paperId) try {
+  static std::mutex mtx;
+  static std::map<std::string, FilmPrintRange> cache;
+  FilmPrintRange r;
+  if (!lib) return r;
+  const bool mapped = filmPaperMappingEnabled();
+  const std::string key = filmId + "|" + paperId + "|" + std::to_string(std::uintptr_t(lib.get())) + (mapped ? "|m" : "");
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+  }
+  const film::FilmStock* st = lib->find(filmId);
+  if (!st || st->isPrintMedium()) return r;
+  const bool scan = paperId == "none" || !lib->find(paperId);
+  film::FilmParams fp;
+  fp.film = filmId;
+  fp.paper = scan ? std::string("none") : paperId;
+  fp.camera.autoExposure = false;
+  applyFilmPaperMapping(fp);
+  fp.disableSpatialAndStochastic();
+  film::FilmSimulator sim(lib);
+  auto patch = [&](float sceneEv, float printEv) -> float {
+    fp.enlarger.printExposure = std::exp2(-double(printEv));
+    std::string err;
+    if (!sim.setParams(fp, &err)) return -1.f;
+    ImageF in(8, 8), out;
+    const float v = 0.184f * std::exp2(sceneEv);
+    for (float& x : in.data) x = v;
+    if (!sim.render(in, out)) return -1.f;
+    return medianLightness(out);
+  };
+  // bright scene + short exposure = paper base (Dmin); dark scene + long exposure = Dmax. A film with no print (scan /
+  // projection) has no paper exposure to vary: only the scene's extremes.
+  const float lw = patch(8.f, scan ? 0.f : 8.f), lb = patch(-8.f, scan ? 0.f : -8.f);
+  if (lw < 0.f || lb < 0.f) return r;
+  r.ok = true;
+  r.lWhite = lw;
+  r.lBlack = lb;
+  r.yWhite = float(yOfLightness(lw));
+  r.yBlack = float(yOfLightness(lb));
+  r.hiL = lightnessOfY(double(r.yWhite) * std::pow(10.0, -double(kPaperWhiteMarginD)));
+  r.loL = lightnessOfY(double(r.yBlack) * std::pow(10.0, double(kPaperBlackMarginD)));
+  if (scan && r.yWhite > 1e-4f)
+    r.maxPrintEv = std::clamp(float(std::log2(std::pow(10.0, -double(kPaperWhiteMarginD)) / double(r.yWhite))), -kFilmMaxPrintEv, kFilmMaxPrintEv);
+  std::lock_guard<std::mutex> lock(mtx);
+  cache[key] = r;
+  return r;
+} catch (...) {
+  return {};
+}
+
+float solvePrintEv(const std::function<float(float)>& printL, float target, const FilmPrintRange& range, FilmMatchInfo* info) {
+  FilmMatchInfo local;
+  FilmMatchInfo& m = info ? *info : local;
+  float t = target;
+  PrintBound bound = PrintBound::None;
+  if (range.ok) {
+    m.paperLoL = range.loL;
+    m.paperHiL = range.hiL;
+    if (t > range.hiL) t = range.hiL, bound = PrintBound::PaperWhite;
+    else if (t < range.loL) t = range.loL, bound = PrintBound::PaperBlack;
+  }
+  // L* rises monotonically with the print EV but not linearly (paper toe / shoulder): bracket, then Illinois regula falsi
+  const float tol = 0.35f;
+  int evals = 0;
+  auto f = [&](float e) {
+    ++evals;
+    return printL(e) - t;
+  };
+  const float limLo = -kFilmMaxPrintEv, limHi = range.ok ? std::min(range.maxPrintEv, kFilmMaxPrintEv) : kFilmMaxPrintEv;
+  float xa = std::clamp(0.f, limLo, limHi), fa = f(xa), xb = xa, fb = fa;
+  float ev = xa, fbest = fa;
+  if (std::fabs(fa) > tol) {
+    const float dir = fa < 0.f ? 1.f : -1.f;  // brighter print = higher L*
+    float step = 1.5f;
+    bool bracketed = false;
+    for (int i = 0; i < 6; ++i) {
+      const float xn = std::clamp(xb + dir * step, limLo, limHi);
+      if (xn == xb) break;
+      xa = xb, fa = fb;
+      xb = xn, fb = f(xb);
+      if (std::fabs(fb) < std::fabs(fbest)) ev = xb, fbest = fb;
+      if ((fa < 0.f) != (fb < 0.f)) {
+        bracketed = true;
+        break;
+      }
+      step *= 1.5f;
+    }
+    if (bracketed) {
+      float side = 0.f;
+      for (int i = 0; i < 8 && std::fabs(fbest) > tol; ++i) {
+        const float denom = fb - fa;
+        float xm = std::fabs(denom) > 1e-6f ? xb - fb * (xb - xa) / denom : 0.5f * (xa + xb);
+        xm = std::clamp(xm, std::min(xa, xb), std::max(xa, xb));
+        const float fm = f(xm);
+        if (std::fabs(fm) < std::fabs(fbest)) ev = xm, fbest = fm;
+        if ((fm < 0.f) == (fb < 0.f)) {
+          xb = xm, fb = fm;
+          if (side < 0.f) fa *= 0.5f;
+          side = -1.f;
+        } else {
+          xa = xm, fa = fm;
+          if (side > 0.f) fb *= 0.5f;
+          side = 1.f;
+        }
+      }
+    }
+  }
+  FilmMatchInfo tmp;
+  tmp.filmL = fbest + t;
+  tmp.evals = evals;
+  if (bound == PrintBound::None && std::fabs(fbest) > 1.0f) bound = PrintBound::SolverLimit;
+  float evc = std::clamp(ev, limLo, limHi);
+  float Lp = tmp.filmL;
+  if (range.ok && range.maxPrintEv < kFilmMaxPrintEv && fbest < -tol && evc >= limHi - 1e-4f)
+    bound = PrintBound::PaperWhite;  // no print: the lamp may not lift the clear film above display white
+  m.printEv = evc;
+  m.keyL = t;
+  m.printL = Lp;
+  m.printBound = bound;
+  m.printEvals = tmp.evals;
+  return m.printEv;
+}
+
+float meterEv(const SceneStats& st0) {
+  if (!(st0.logMean > 0.f)) return 0.f;
+  return std::log2(kFilmGreyCard / st0.logMean);
+}
+
+float sceneKeyEv(float keyL) {
+  const double Y = std::max(yOfLightness(double(keyL)), 1e-4);
+  float scale = 1.f;  // DAPPLE_FILM_SCENE_EV_SCALE: decision material (half the compensation = 0.5), default 1
+  if (const char* v = std::getenv("DAPPLE_FILM_SCENE_EV_SCALE")) scale = std::strtof(v, nullptr);
+  return std::clamp(scale * float(std::log2(Y / double(kFilmGreyCard))) / kFilmSystemGamma, kFilmSceneEvMin, kFilmSceneEvMax);
+}
+
+void scenePlacement(const FilmLatitude& lat, const SceneStats& st, float ev, float* belowToe, float* aboveShoulder) {
+  if (belowToe) *belowToe = 0.f;
+  if (aboveShoulder) *aboveShoulder = 0.f;
+  if (!lat.ok || !(st.p995 > 0.f)) return;
+  const float lHi = std::log10(st.p995 / 0.184f) + ev * 0.30103f;
+  const float lLo = std::log10(std::max(st.p2, kShadowFloorY) / 0.184f) + ev * 0.30103f;
+  if (belowToe) *belowToe = std::max(0.f, (lat.toe - lLo) / 0.30103f);
+  if (aboveShoulder) *aboveShoulder = std::max(0.f, (lHi - lat.shoulder) / 0.30103f);
+}
+
+float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId,
+                        float deltaEv) try {
+  static std::mutex mtx;
+  static std::map<std::string, float> cache;
+  if (!lib) return 0.f;
+  const film::FilmStock* st = lib->find(filmId);
+  if (!st || st->isPrintMedium()) return 0.f;
+  const bool scan = paperId == "none" || !lib->find(paperId);
+  const std::string key = filmId + "|" + (scan ? std::string("none") : paperId) + "|" + std::to_string(std::uintptr_t(lib.get())) +
+                          (filmPaperMappingEnabled() ? "|m" : "") + (filmPaperMapStretchesBlack() ? "b" : "") + "|d" + std::to_string(int(std::lround(deltaEv * 1000.f)));
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+  }
+  if (scan) {  // the clear film is display white (the paper mapping): a lamp constant would only dim it, the slide is what it is
+    std::lock_guard<std::mutex> lock(mtx);
+    cache[key] = 0.f;
+    return 0.f;
+  }
+  const FilmPrintRange range = filmPrintRange(lib, filmId, paperId);
+  if (!range.ok) return 0.f;
+  film::FilmParams fp;
+  fp.film = filmId;
+  fp.paper = scan ? std::string("none") : paperId;
+  fp.camera.autoExposure = false;
+  applyFilmPaperMapping(fp);
+  fp.disableSpatialAndStochastic();
+  film::FilmSimulator sim(lib);
+  const float conv = st->positive() ? kFilmReversalBiasEv : kFilmNegativeBiasEv;
+  const float g = std::exp2(conv + deltaEv);
+  const float gain3[3] = {g, g, g};
+  auto patch = [&](float printEv) -> float {
+    fp.enlarger.printExposure = std::exp2(-double(printEv));
+    std::string err;
+    if (!sim.setParams(fp, &err)) return 0.f;
+    ImageF in(8, 8), out;
+    for (float& x : in.data) x = kFilmGreyCard;
+    if (!sim.render(in, out, nullptr, gain3)) return 0.f;
+    return medianLightness(out);
+  };
+  // mid grey: L* 50 relative to the paper white as displayed (Y = 0.184 * white Y)
+  const float target = lightnessOfY(double(kFilmGreyCard) * double(range.yWhite));
+  FilmPrintRange open;  // no limits: this is a calibration, not a target
+  FilmMatchInfo mi;
+  const float ev = solvePrintEv(patch, target, open, &mi);
+  std::lock_guard<std::mutex> lock(mtx);
+  cache[key] = ev;
+  return ev;
+} catch (...) {
+  return 0.f;
+}
+
+float filmPrintConstantAt(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId,
+                          float deltaEv) {
+  if (std::fabs(deltaEv) < 1e-4f) return filmPrintConstant(lib, filmId, paperId, 0.f);
+  const float step = 0.5f;
+  const float lo = std::floor(deltaEv / step) * step;
+  const float t = (deltaEv - lo) / step;
+  const float a = filmPrintConstant(lib, filmId, paperId, lo);
+  if (t < 1e-4f) return a;
+  const float b = filmPrintConstant(lib, filmId, paperId, lo + step);
+  return a + (b - a) * t;
+}
+
+float inRangeFraction(const SceneStats& st, const FilmLatitude& lat, float ev) {
+  if (!lat.ok || st.logH0.empty()) return 1.f;
+  const float shift = ev * 0.30103f;  // logH = logH0 + shift in [toe, shoulder]
+  const auto lo = std::lower_bound(st.logH0.begin(), st.logH0.end(), lat.toe - shift);
+  const auto hi = std::upper_bound(st.logH0.begin(), st.logH0.end(), lat.shoulder - shift);
+  return float(std::max<std::ptrdiff_t>(0, hi - lo)) / float(st.logH0.size());
+}
+
+float rangeFractionFor(float l) {
+  l = std::clamp(l, -1.f, 1.f);
+  return l < 0.f ? kFilmRangeFraction + (kFilmRangeFractionMin - kFilmRangeFraction) * (-l)
+                 : kFilmRangeFraction + (kFilmRangeFractionMax - kFilmRangeFraction) * l;
+}
+
+namespace {
+// Rule A: keep the shared exposure when `target` of the scene is inside the range, else the nearest EV (smallest move) that reaches
+// it, else the EV that maximises the share (ties: nearest to the shared exposure).
+float placeEv(const SceneStats& st, const FilmLatitude& lat, float shared, float target) {
+  if (!lat.ok || st.logH0.empty()) return shared;
+  if (inRangeFraction(st, lat, shared) >= target) return shared;
+  float bestReach = shared, bestReachDist = 1e9f, bestAny = shared, bestFrac = -1.f, bestAnyDist = 1e9f;
+  for (int i = -120; i <= 120; ++i) {
+    const float ev = shared + 0.05f * float(i);
+    const float f = inRangeFraction(st, lat, ev), d = std::fabs(ev - shared);
+    if (f >= target && d < bestReachDist) bestReach = ev, bestReachDist = d;
+    if (f > bestFrac + 1e-6f || (std::fabs(f - bestFrac) <= 1e-6f && d < bestAnyDist)) bestAny = ev, bestFrac = f, bestAnyDist = d;
+  }
+  return bestReachDist < 1e8f ? bestReach : bestAny;
+}
+
+// film_shoot: between the EV where the share falls to kFilmShootEdgeFraction on the under side and on the over side
+float shootEv(const SceneStats& st, const FilmLatitude& lat, float autoEv, float s) {
+  s = std::clamp(s, -1.f, 1.f);
+  if (s == 0.f || !lat.ok) return autoEv;
+  const bool under = s < 0.f;
+  const float dir = under ? -1.f : 1.f;
+  float ev = autoEv;
+  if (inRangeFraction(st, lat, autoEv) >= kFilmShootEdgeFraction) {
+    while (std::fabs(ev + dir * 0.05f - autoEv) <= kFilmShootMaxEv && inRangeFraction(st, lat, ev + dir * 0.05f) >= kFilmShootEdgeFraction)
+      ev += dir * 0.05f;
+  } else {
+    ev = autoEv + dir * 1.f;  // the scene does not fit this stock at all: a fixed, safe travel
+  }
+  return autoEv + std::fabs(s) * (ev - autoEv);
+}
+
+float targetDisplayL(const FilmPrintRange& r, float relL) {
+  const float y = r.yWhite * float(yOfLightness(double(relL)));
+  return std::clamp(lightnessOfY(double(y)), r.loL, r.hiL);
+}
+}  // namespace
+
+FilmExposure solveMeter(const MeterInputs& in, FilmMatchInfo* info) try {
+  FilmMatchInfo local;
+  FilmMatchInfo& mi = info ? *info : local;
+  const film::FilmStock* stock = in.lib ? in.lib->find(in.film) : nullptr;
+  const bool reversal = stock && stock->positive();
+  FilmLatitude lat;
+  if (stock) lat = filmLatitude(*stock);
+  mi.meterY = in.st0.logMean;
+  mi.evMeter = meterEv(in.st0);
+  mi.evScene = sceneKeyEv(in.keyL0);
+  mi.keyL0 = in.keyL0;
+  mi.p2 = in.stFull.p2, mi.p50 = in.stFull.p50, mi.p995 = in.stFull.p995, mi.clipFrac = in.stFull.clipFrac;
+  const float conv = reversal ? kFilmReversalBiasEv : in.negativeBiasEv;
+  const float shared = std::clamp(mi.evMeter + mi.evScene + conv, -6.f, 6.f);
+  mi.sharedEv = shared;
+  const float target = rangeFractionFor(in.latitude);
+  float autoEv = placeEv(in.stFull, lat, shared, target);
+  {  // DAPPLE_FILM_SLIDE_PROTECT=1: decision material, the v4 slide rule (the unclipped highlight at the shoulder margin)
+    const char* pv = std::getenv("DAPPLE_FILM_SLIDE_PROTECT");
+    float lo = 0.f, hi = 0.f;
+    if (pv && pv[0] && pv[0] != '0' && reversal && filmExposureWindow(lat, in.stFull, lo, hi)) autoEv = hi;
+  }
+  float filmEv = std::clamp(shootEv(in.stFull, lat, autoEv, in.shoot), -9.f, 9.f);
+  if (reversal && in.shoot != 0.f && in.medianL) {
+    // a slide's brightness is its exposure: keep the override inside a usable median (L* 33 .. 86), bisecting towards the automatic EV
+    auto usable = [&](float e) {
+      const float m = in.medianL(e, filmPrintConstant(in.lib, in.film, in.paper, 0.f));
+      return m >= kFilmSafeMedianMin && m <= kFilmSafeMedianMax;
+    };
+    if (!usable(filmEv)) {
+      float good = autoEv, bad = filmEv;
+      for (int i = 0; i < 7; ++i) {
+        const float mid = 0.5f * (good + bad);
+        (usable(mid) ? good : bad) = mid;
+      }
+      filmEv = good;
+    }
+  }
+  mi.shootEv = filmEv;
+  mi.ev = filmEv;
+  mi.printDelta = filmEv - shared;
+  mi.fracShared = inRangeFraction(in.stFull, lat, shared);
+  mi.fracFinal = inRangeFraction(in.stFull, lat, filmEv);
+  if (lat.ok && !in.stFull.logH0.empty()) {
+    const float shift = filmEv * 0.30103f;
+    const auto& v = in.stFull.logH0;
+    mi.fracBelowToe = float(std::lower_bound(v.begin(), v.end(), lat.toe - shift) - v.begin()) / float(v.size());
+    mi.fracAboveShoulder = float(v.end() - std::upper_bound(v.begin(), v.end(), lat.shoulder - shift)) / float(v.size());
+    float lo = 0.f, hi = 0.f;
+    if (filmExposureWindow(lat, in.stFull, lo, hi)) mi.latitudeOk = true, mi.evLo = lo, mi.evHi = hi;
+    scenePlacement(lat, in.stFull, filmEv, &mi.stopsBelowToe, &mi.stopsAboveShoulder);
+  }
+  // print / scan exposure: the per stock + paper constant; a negative whose EV moved is printed down / up by the lab
+  float printEv = reversal ? filmPrintConstant(in.lib, in.film, in.paper, 0.f)
+                           : filmPrintConstantAt(in.lib, in.film, in.paper, mi.printDelta);
+  mi.printConst = printEv;
+  if (in.print != 0.f && in.medianL) {
+    const FilmPrintRange range = filmPrintRange(in.lib, in.film, in.paper);
+    if (range.ok) {
+      const float s = std::clamp(in.print, -1.f, 1.f);
+      const float lAuto = in.medianL(filmEv, printEv);
+      const float lEnd = targetDisplayL(range, s < 0.f ? kFilmPrintDarkL : kFilmPrintLightL);
+      // -1 never brightens and +1 never darkens (the automatic median may already lie beyond the end of the band)
+      const float lTo = s < 0.f ? std::min(lEnd, lAuto) : std::max(lEnd, lAuto);
+      const float tgt = lAuto + (lTo - lAuto) * std::fabs(s);
+      auto pl = [&](float e) { return in.medianL(filmEv, e); };
+      printEv = solvePrintEv(pl, tgt, range, &mi);
+    }
+  }
+  mi.printEv = printEv;
+  return {filmEv, printEv};
+} catch (...) {
+  return {};
+}
+
+FilmPadInfo filmPadInfo(const MeterInputs& in) try {
+  FilmPadInfo pad;
+  const film::FilmStock* stock = in.lib ? in.lib->find(in.film) : nullptr;
+  if (!stock) return pad;
+  FilmMatchInfo mi;
+  MeterInputs base = in;
+  base.shoot = base.print = 0.f;
+  const FilmExposure autoE = solveMeter(base, &mi);
+  pad.ok = true;
+  pad.sharedEv = mi.sharedEv;
+  pad.finalEv = autoE.filmEv;
+  pad.fractionAtFinal = mi.fracFinal;
+  const FilmLatitude lat = filmLatitude(*stock);
+  const float autoPlace = placeEv(in.stFull, lat, mi.sharedEv, rangeFractionFor(in.latitude));
+  for (int k = 0; k < 3; ++k) {
+    const float s = float(k - 1);
+    pad.shootEv[k] = std::clamp(shootEv(in.stFull, lat, autoPlace, s), -9.f, 9.f);
+    pad.latitude[k] = k == 0 ? kFilmRangeFractionMin : (k == 1 ? kFilmRangeFraction : kFilmRangeFractionMax);
+  }
+  const FilmPrintRange range = filmPrintRange(in.lib, in.film, in.paper);
+  if (range.ok) {
+    pad.whiteL = range.lWhite;
+    pad.blackL[0] = lightnessOfY(double(kFilmMatteBlackY));
+    pad.blackL[1] = range.lBlack;
+    pad.blackL[2] = lightnessOfY(double(0.00077));
+    pad.printL[0] = targetDisplayL(range, kFilmPrintDarkL);
+    pad.printL[2] = targetDisplayL(range, kFilmPrintLightL);
+    pad.printEv[1] = autoE.printEv;
+    if (in.medianL) pad.printL[1] = in.medianL(autoE.filmEv, autoE.printEv);
+  }
+  return pad;
+} catch (...) {
+  return {};
+}
+
+FilmPadInfo filmPadFor(const EditParams& p, const CameraProfile& camera, const Lut3D* lut, const SourceImage& proxy) try {
+  const FilmMatchOptions opt = FilmMatchOptions::fromEnv();
+  if (p.filmStock.empty() || opt.mode != FilmMatchMode::Meter || proxy.linear.width <= 0) return {};
+  std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
+  if (!lib) return {};
+  EditParams ref = p;
+  ref.filmStock.clear();
+  ref.filmKeyEv = ref.filmPrintEv = 0.f;
+  ref.clarity = ref.texture = ref.dehaze = ref.grain = 0.f;
+  ref.sharpen = ref.nrLuma = 0.f;
+  float gain[3], keyL0;
+  {
+    Renderer r(ref, camera, lut);
+    r.setToneProxy(&proxy);
+    r.sceneGain(proxy, gain);
+    EditParams ref0 = ref;
+    ref0.exposure = 0.f;
+    Renderer r0(ref0, camera, lut);
+    r0.setToneProxy(&proxy);
+    keyL0 = medianLightness(r0.renderFloat(proxy, false));
+  }
+  float g0[3];
+  for (int c = 0; c < 3; ++c) g0[c] = gain[c] / std::exp2(p.exposure);
+  std::string paper = p.filmPaper;
+  if (paper.empty() || (paper != "none" && !(lib->find(paper) && lib->find(paper)->isPrintMedium())))
+    paper = film::defaultPaperFor(*lib, p.filmStock);
+  auto fp = std::make_shared<EditParams>(p);
+  fp->filmStrength = 100.f;
+  fp->filmExposure = 0.f;
+  fp->vignette = 0.f;
+  MeterInputs in;
+  in.lib = lib;
+  in.film = p.filmStock;
+  in.paper = paper;
+  in.st0 = sceneLumaStats(proxy.linear, g0);
+  in.stFull = sceneLumaStats(proxy.linear, gain);
+  in.keyL0 = keyL0;
+  in.shoot = p.filmShoot;
+  in.print = p.filmPrint;
+  in.latitude = p.filmLatitude;
+  in.negativeBiasEv = opt.negativeBiasEv;
+  in.medianL = [fp, &camera, lut, &proxy](float fev, float pev) {
+    fp->filmKeyEv = fev;
+    fp->filmPrintEv = pev;
+    Renderer r(*fp, camera, lut);
+    r.setToneProxy(&proxy);
+    return medianLightness(r.renderFloat(proxy, false));
+  };
+  return filmPadInfo(in);
+} catch (...) {
+  return {};
+}
+
+FilmExposure matchFilmExposure(const EditParams& p, const CameraProfile& camera, const Lut3D* lut, const SourceImage& proxy,
+                               FilmMatchInfo* info, const FilmMatchOptions* optIn) try {
   if (info) *info = FilmMatchInfo{};
-  if (p.filmStock.empty() || proxy.linear.width <= 0 || proxy.linear.height <= 0) return 0.f;
+  if (p.filmStock.empty() || proxy.linear.width <= 0 || proxy.linear.height <= 0) return {};
 
   // the target: the normal develop render of this edit (film off), tonal analysis taken on this same proxy
   EditParams ref = p;
   ref.filmStock.clear();
   ref.filmKeyEv = 0.f;
+  ref.filmPrintEv = 0.f;
   ref.clarity = ref.texture = ref.dehaze = ref.grain = 0.f;
   ref.sharpen = ref.nrLuma = 0.f;
   float target;
+  float gain[3];
   {
     Renderer r(ref, camera, lut);
     r.setToneProxy(&proxy);
     target = medianLightness(r.renderFloat(proxy, false));
+    r.sceneGain(proxy, gain);
   }
 
-  // the film alone (strength 100), spatial stages off, at a trial exposure
+  // the film alone (strength 100), spatial stages off
   EditParams fp = p;
   fp.filmStrength = 100.f;
   fp.filmExposure = 0.f;
   fp.vignette = 0.f;
-  auto evalAt = [&](float ev) {
-    fp.filmKeyEv = ev;
-    Renderer r(fp, camera, lut);
+  fp.filmKeyEv = 0.f;
+  fp.filmPrintEv = 0.f;
+  auto render = [&](const EditParams& e) {
+    Renderer r(e, camera, lut);
     r.setToneProxy(&proxy);
     return medianLightness(r.renderFloat(proxy, false));
   };
 
-  const float best = solveFilmKeyEv(evalAt, target, info);
-  return best;
+  FilmMatchInfo local;
+  FilmMatchInfo& mi = info ? *info : local;
+  const FilmMatchOptions opt = optIn ? *optIn : FilmMatchOptions::fromEnv();
+  const SceneStats st = sceneLumaStats(proxy.linear, gain);
+  std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
+  const film::FilmStock* stock = lib ? lib->find(p.filmStock) : nullptr;
+
+  if (opt.mode == FilmMatchMode::Pull || opt.mode == FilmMatchMode::Full) {  // v2 / v3: one EV on the film, the digital median as target
+    auto evalAt = [&](float ev) {
+      fp.filmKeyEv = ev;
+      return render(fp);
+    };
+    const float evMatch = solveFilmKeyEv(evalAt, target, &mi);
+    return {resolveFilmKeyEv(stock, st, evMatch, opt, &mi), 0.f};
+  }
+
+  std::string paper = p.filmPaper;
+  if (lib && (paper.empty() || (paper != "none" && !(lib->find(paper) && lib->find(paper)->isPrintMedium()))))
+    paper = film::defaultPaperFor(*lib, p.filmStock);
+
+  if (opt.mode == FilmMatchMode::Window) {  // v4: A (latitude window) and B (print solved to the key) per image and stock
+    const float filmEv = chooseFilmEv(stock, st, opt, &mi);
+    mi.targetL = target;
+    const FilmPrintRange range = filmPrintRange(lib, p.filmStock, paper);
+    fp.filmKeyEv = filmEv;
+    mi.filmL0 = render(fp);
+    auto printL = [&](float ev) {
+      fp.filmPrintEv = ev;
+      return render(fp);
+    };
+    const float printEv = solvePrintEv(printL, target, range, &mi);
+    mi.filmL = mi.printL;
+    mi.ev = filmEv;
+    return {filmEv, printEv};
+  }
+
+  // v5: metering (stock independent) -> film exposure; print = per stock + paper constant (film_match.h, solveMeter)
+  EditParams ref0 = ref;
+  ref0.exposure = 0.f;
+  float keyL0;
+  {
+    Renderer r(ref0, camera, lut);
+    r.setToneProxy(&proxy);
+    keyL0 = medianLightness(r.renderFloat(proxy, false));
+  }
+  float g0[3];
+  const float expGain = std::exp2(p.exposure);
+  for (int c = 0; c < 3; ++c) g0[c] = gain[c] / expGain;  // the scene as the camera recorded it, before the develop exposure
+  MeterInputs mi_in;
+  mi_in.lib = lib;
+  mi_in.film = p.filmStock;
+  mi_in.paper = paper;
+  mi_in.st0 = sceneLumaStats(proxy.linear, g0);
+  mi_in.stFull = st;
+  mi_in.keyL0 = keyL0;
+  mi_in.shoot = p.filmShoot;
+  mi_in.print = p.filmPrint;
+  mi_in.latitude = p.filmLatitude;
+  mi_in.negativeBiasEv = opt.negativeBiasEv;
+  mi_in.medianL = [&](float fev, float pev) {
+    fp.filmKeyEv = fev;
+    fp.filmPrintEv = pev;
+    return render(fp);
+  };
+  const FilmExposure fe = solveMeter(mi_in, &mi);
+  mi.targetL = target;
+  fp.filmKeyEv = fe.filmEv;
+  fp.filmPrintEv = fe.printEv;
+  mi.printL = mi.filmL = render(fp);
+  return fe;
 } catch (...) {
-  return 0.f;
+  return {};
 }
 
 }  // namespace dapple

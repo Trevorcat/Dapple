@@ -23,6 +23,7 @@ struct Snapshot {
   std::uint64_t seq = 0;        // assigned by submit()
   std::string payload;          // params JSON (opaque to the loop)
   std::string lutPath;
+  std::string activeParam;      // key of the slider being dragged (DappleFrameRequest::active_param); empty = none
   std::int32_t longEdge = 0, flags = 0, bakeSize = 0;
   std::int64_t submitNs = 0;    // steady clock, for end-to-end latency
 };

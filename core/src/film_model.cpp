@@ -378,6 +378,8 @@ void FilmModel::init() {
     buildEnlarger(p_.enlarger.cFilterNeutral, p_.enlarger.mFilterNeutral + p_.enlarger.mFilterShift,
                   p_.enlarger.yFilterNeutral + p_.enlarger.yFilterShift);
     buildBlackWhite();
+  } else {
+    buildBlackWhite();  // a film with no print: only the paper-to-screen mapping (scanner.paperReference) applies
   }
 }
 
@@ -568,11 +570,15 @@ Vec3 FilmModel::printScanLinear(const Vec3& d, bool glare) const {
 Vec3 FilmModel::scanOut(const Vec3& dp) const {
   Vec3 rgb = scanLinear(dp, true);
   if (p_.io.outputGamutCompress) rgb = compressOutput(cam_, *cmax_, rgb);
+  if (postOn_)
+    for (double& v : rgb) v = v * postM_ + postQ_;
   return {srgbOetf(rgb[0]), srgbOetf(rgb[1]), srgbOetf(rgb[2])};
 }
 
 Vec3 FilmModel::scanLinear(const Vec3& dp, bool glare) const {
   Vec3 xyz = scanXyz(dp);
+  if (scanFilm_ && pe_ != 1.0)  // no print: the exposure multiplier is the scan / projection lamp (1 / pe)
+    for (double& v : xyz) v /= pe_;
   if (bwOn_) {
     const double Y = xyz[1];
     const double Yp = std::clamp(bwM_ * Y + bwQ_, 0.0, 1.0);
@@ -588,6 +594,8 @@ Vec3 FilmModel::printScan(const Vec3& d, Vec3* linRgb) const {
   Vec3 rgb = printScanLinear(d, true);
   if (linRgb) *linRgb = rgb;
   if (p_.io.outputGamutCompress) rgb = compressOutput(cam_, *cmax_, rgb);
+  if (postOn_)
+    for (double& v : rgb) v = v * postM_ + postQ_;
   return {srgbOetf(rgb[0]), srgbOetf(rgb[1]), srgbOetf(rgb[2])};
 }
 
@@ -640,16 +648,80 @@ void FilmModel::buildEnlarger(double cc, double mm, double yy) {
   }
 }
 
+// Paper-to-screen mapping after the output gamut compression (stage C, docs/engine/pipeline-architecture.md section 18): the
+// displayed paper white (unexposed paper, Dmin; for a film with no print the clear film) maps to scanner.whiteLevel and the
+// displayed black (Dmax) to scanner.blackLevel, a linear map of the display light that keeps the colour of every pixel
+// (relative colorimetric with black point compensation; the paper base tint survives as far as the gamut compression keeps it).
+void FilmModel::buildPostMap() {
+  const auto& sc = p_.scanner;
+  Vec3 dLo, dHi;
+  if (scanFilm_) {  // the reachable clear film (the lowest density of the curves) and the densest film
+    const int fn = int(film_.logExposure.size());
+    for (int c = 0; c < 3; ++c) {
+      double lo = 1e30, hi = -1e30;
+      for (int k = 0; k < fn; ++k) {
+        const double v = nan0(film_.densityCurves[k * 3 + c]);
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+      }
+      dLo[c] = lo;
+      dHi[c] = hi;
+    }
+    const double y0 = scanXyz(dLo)[1], y1 = scanXyz(dHi)[1];
+    if (y0 < y1) std::swap(dLo, dHi);  // lowest density = brightest
+  } else {
+    const int pn = int(paperAxis_.size());
+    for (int c = 0; c < 3; ++c) {
+      double lo = 1e30, hi = -1e30;
+      for (int k = 0; k < pn; ++k) {
+        const double v = nan0(paper_->densityCurves[k * 3 + c]);
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+      }
+      dLo[c] = lo;
+      dHi[c] = hi;
+    }
+  }
+  auto shown = [&](const Vec3& dp) {
+    Vec3 rgb = mul(xyzToRgb_, scanXyz(dp));
+    if (p_.io.outputGamutCompress) rgb = compressOutput(cam_, *cmax_, rgb);
+    return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+  };
+  const double Yw = shown(dLo), Yb = shown(dHi);
+  const double lw = sc.whiteCorrection ? srgbEotf(sc.whiteLevel) : Yw;
+  // black: 0 = the paper's true relative luminance (white scaling only), +1 = display black (v4), -1 = a matte lifted black
+  const double mix = std::clamp(sc.blackCorrection ? 1.0 : sc.blackMix, -1.0, 1.0);
+  postOn_ = Yw > Yb + 1e-6;
+  if (!postOn_) {
+    postM_ = Yw > 1e-6 ? lw / Yw : 1.0;
+    postQ_ = 0.0;
+    postOn_ = Yw > 1e-6;
+    return;
+  }
+  const double ybTrue = Yb * lw / Yw;
+  const double ybT = mix >= 0 ? ybTrue + (srgbEotf(sc.blackLevel) - ybTrue) * mix : ybTrue + (0.02 - ybTrue) * (-mix);
+  postM_ = (lw - ybT) / (Yw - Yb);
+  postQ_ = ybT - postM_ * Yb;
+}
+
 // Scanner black / white correction (spec 02 s3.10), print path only: a linear rescale of the print luminance so that
 // the print's black and white reference map to the requested levels, plus the matching paper exposure factor that
 // keeps mid-grey where it was.
 void FilmModel::buildBlackWhite() {
+  postOn_ = false;
+  postM_ = 1;
+  postQ_ = 0;
   bwOn_ = false;
   bwM_ = 1;
   bwQ_ = 0;
   bwExposure_ = 1;
   const auto& sc = p_.scanner;
-  if ((!sc.blackCorrection && !sc.whiteCorrection) || scanFilm_) return;
+  if (!sc.blackCorrection && !sc.whiteCorrection) return;
+  if (sc.paperReference) {
+    buildPostMap();
+    return;
+  }
+  if (scanFilm_) return;
   const int pn = int(paperAxis_.size());
   for (int c = 0; c < 3; ++c) {
     paperTab_[c].assign(pn, 0.0);

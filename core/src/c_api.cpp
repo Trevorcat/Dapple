@@ -43,15 +43,7 @@ struct DappleSession {
   const dapple::CameraProfile* camera = nullptr;
 
   // ---- interactive frame caches (see dapple_session_render_frame) ----
-  struct Scaled {
-    int longEdge = 0;
-    std::shared_ptr<dapple::SourceImage> img;
-    std::size_t bytes = 0;
-    unsigned stamp = 0;
-  };
   std::mutex mtx;
-  std::vector<Scaled> scaled;
-  unsigned stamp = 0;
   std::shared_ptr<dapple::SourceImage> proxy;                  // 256 px copy for the tonal analysis
   std::vector<std::shared_ptr<const dapple::BakedLut>> bakes;  // newest last (three slots)
   std::shared_ptr<const dapple::Lut3D> lutKeep;
@@ -63,7 +55,7 @@ struct DappleSession {
   // film exposure that keeps the photo's key (film_match.h): own 256 px proxy, results cached by filmMatchKey()
   std::mutex keyMtx;
   std::shared_ptr<dapple::SourceImage> keyProxy;
-  std::vector<std::pair<std::string, float>> filmKeys;
+  std::vector<std::pair<std::string, dapple::FilmExposure>> filmKeys;
   // Where the executors read the full-resolution source from (the GPU keeps a device copy per store identity)
   std::once_flag storeOnce;
   std::unique_ptr<dapple::engine::MemorySourceStore> store;
@@ -189,13 +181,15 @@ bool parseParams(const char* paramsJson, EditParams& params) {
 // render of the same edit has it (film_match.h). A few film evaluations of the 256 px proxy, cached by key.
 EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath = nullptr) {
   params.filmKeyEv = 0.f;
+  params.filmPrintEv = 0.f;
   if (params.filmStock.empty() || std::getenv("DAPPLE_FILM_MATCH_OFF")) return params;
   const std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
   const std::string key = filmMatchKey(params) + "|" + lutFile;
   std::lock_guard<std::mutex> lock(s->keyMtx);
   for (auto& e : s->filmKeys)
     if (e.first == key) {
-      params.filmKeyEv = e.second;
+      params.filmKeyEv = e.second.filmEv;
+      params.filmPrintEv = e.second.printEv;
       return params;
     }
   if (!s->keyProxy) {
@@ -205,10 +199,11 @@ EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath 
   }
   std::shared_ptr<const Lut3D> lut;
   if (!lutFile.empty()) lut = loadLut(lutFile);
-  const float ev = matchFilmExposure(params, *s->camera, lut.get(), *s->keyProxy);
+  const FilmExposure ev = matchFilmExposure(params, *s->camera, lut.get(), *s->keyProxy);
   if (s->filmKeys.size() >= 12) s->filmKeys.erase(s->filmKeys.begin());
   s->filmKeys.emplace_back(key, ev);
-  params.filmKeyEv = ev;
+  params.filmKeyEv = ev.filmEv;
+  params.filmPrintEv = ev.printEv;
   return params;
 }
 
@@ -321,11 +316,14 @@ bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const cha
   if (dapple::engine::gpu::runtimeEnabled() && toneReach == 1.f && (outLongEdge <= 0 || outLongEdge >= 1500) && gpuExport(s, params, renderer, lut.get(), outLongEdge, out)) return true;
 #endif
   if (outLongEdge > 0 && std::max(s->source.linear.width, s->source.linear.height) > outLongEdge) {
-    SourceImage scaled;
-    scaled.sceneReferred = s->source.sceneReferred;
-    scaled.linear = resizeToLongEdge(s->source.linear, outLongEdge);
-    if (dapple::engine::mode() == dapple::engine::Mode::Full) return engineRenderExact(s, params, renderer, scaled, out);
-    out = renderer.render(scaled);
+    // the Resize node of the engine (exports and previews do not keep large copies)
+    const std::shared_ptr<const SourceImage> scaled = s->exportEngine.resizedSource(s->source, outLongEdge, false);
+    if (!scaled) {
+      setError("resize failed");
+      return false;
+    }
+    if (dapple::engine::mode() == dapple::engine::Mode::Full) return engineRenderExact(s, params, renderer, *scaled, out);
+    out = renderer.render(*scaled);  // Mode::Off: the golden oracle
   } else {
     if (dapple::engine::mode() == dapple::engine::Mode::Full) return engineRenderExact(s, params, renderer, s->source, out);
     out = renderer.render(s->source);
@@ -444,6 +442,24 @@ int32_t dapple_gpu_set_enabled(int32_t mode) {
   return 0;
 #endif
 }
+
+void dapple_gpu_configure(const char* cache_dir, const char* app_version, const char* fingerprint) {
+#ifdef DAPPLE_HAVE_GPU
+  dapple::engine::gpu::configure(cache_dir ? cache_dir : "", app_version ? app_version : "", fingerprint ? fingerprint : "");
+#else
+  (void)cache_dir;
+  (void)app_version;
+  (void)fingerprint;
+#endif
+}
+
+void dapple_gpu_warmup(void) {
+#ifdef DAPPLE_HAVE_GPU
+  dapple::engine::gpu::startWarmup();
+#endif
+}
+
+char* dapple_engine_stats_json(void) { return dupString(dapple::engine::executorStatsJson()); }
 
 char* dapple_gpu_status_json(void) {
 #ifdef DAPPLE_HAVE_GPU
@@ -591,41 +607,6 @@ static std::string toneJson(const ToneAnalysis& a) {
 }
 
 
-// Source scaled to `longEdge` (cached, at most ~160 MB of scaled copies); null when the session
-// source itself is not larger.
-static std::shared_ptr<SourceImage> scaledSource(DappleSession* s, int longEdge) {
-  const int own = std::max(s->source.linear.width, s->source.linear.height);
-  if (longEdge <= 0 || longEdge >= own) return nullptr;
-  ++s->stamp;
-  for (auto& e : s->scaled)
-    if (e.longEdge == longEdge) {
-      e.stamp = s->stamp;
-      return e.img;
-    }
-  auto img = std::make_shared<SourceImage>();
-  img->sceneReferred = s->source.sceneReferred;
-  img->linear = resizeToLongEdge(s->source.linear, longEdge);
-  DappleSession::Scaled e;
-  e.longEdge = longEdge;
-  e.img = img;
-  e.bytes = img->linear.data.size() * sizeof(float);
-  e.stamp = s->stamp;
-  s->scaled.push_back(e);
-  auto total = [&] {
-    std::size_t t = 0;
-    for (auto& x : s->scaled) t += x.bytes;
-    return t;
-  };
-  while (s->scaled.size() > 1 && (total() > (160u << 20) || s->scaled.size() > 4)) {
-    auto oldest = s->scaled.end();
-    for (auto it = s->scaled.begin(); it != s->scaled.end(); ++it)
-      if (it->img != img && (oldest == s->scaled.end() || it->stamp < oldest->stamp)) oldest = it;
-    if (oldest == s->scaled.end()) break;
-    s->scaled.erase(oldest);
-  }
-  return img;
-}
-
 // Foreground frames run on ONE dedicated, long-lived render thread: a stable tid for the ADPF hint session, pinned
 // to the performance cores on big.LITTLE. The calling isolate thread just waits (no CPU) for the result.
 class RenderThread {
@@ -701,7 +682,7 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     const int need = int(std::ceil(float(region.outLongEdge) / std::max(frac, 1e-3f) * 1.15f));
     srcLong = std::min(own, (need + 31) / 32 * 32);
   }
-  std::shared_ptr<SourceImage> hold = scaledSource(s, srcLong);
+  const std::shared_ptr<const SourceImage> hold = s->engine.resizedSource(s->source, srcLong);  // the Resize node
   const SourceImage& src = hold ? *hold : s->source;
 
   if (!s->proxy) {
@@ -1044,8 +1025,8 @@ char* dapple_film_swatches_json(void) {
             EditParams p;
             p.filmStock = si.id;
             p.filmStrength = 100.f;
-            const ImageF out = Renderer(p, cam, nullptr).renderFloat(src, false);
-            if (out.width != 3 * kCell) continue;
+            ImageF out;
+            if (!dapple::engine::renderImageF(p, cam, nullptr, src, false, out) || out.width != 3 * kCell) continue;
             j += std::string(first ? "" : ",") + "\"" + esc(si.id) + "\":[";
             for (int k = 0; k < 3; ++k) {
               const float* px = out.row(kCell / 2) + 3 * (k * kCell + kCell / 2);
@@ -1068,6 +1049,42 @@ char* dapple_film_swatches_json(void) {
 char* dapple_looks_json(void) { return dupString(looksJson()); }
 
 char* dapple_params_schema_json(void) { return dupString(paramsSchemaJson()); }
+
+char* dapple_session_film_pad_json(DappleSession* session, const char* params_json) {
+  return guarded(
+      [&]() -> char* {
+        if (!session) {
+          setError("null session");
+          return nullptr;
+        }
+        EditParams params;
+        if (!parseParams(params_json, params)) return nullptr;
+        const std::string lutFile = params.lutPath;
+        FilmPadInfo pad;
+        {
+          std::lock_guard<std::mutex> lock(session->keyMtx);
+          if (!session->keyProxy) {
+            session->keyProxy = std::make_shared<SourceImage>();
+            session->keyProxy->sceneReferred = session->source.sceneReferred;
+            session->keyProxy->linear = resizeToLongEdge(session->source.linear, 256);
+          }
+          std::shared_ptr<const Lut3D> lut;
+          if (!lutFile.empty()) lut = loadLut(lutFile);
+          pad = filmPadFor(params, *session->camera, lut.get(), *session->keyProxy);
+        }
+        char buf[900];
+        if (!pad.ok) return dupString("{\"ok\":false}");
+        std::snprintf(buf, sizeof buf,
+                      "{\"ok\":true,\"shared_ev\":%.4f,\"final_ev\":%.4f,\"fraction\":%.4f,\"shoot_ev\":[%.4f,%.4f,%.4f],"
+                      "\"print_l\":[%.3f,%.3f,%.3f],\"black_l\":[%.3f,%.3f,%.3f],\"latitude\":[%.3f,%.3f,%.3f],\"white_l\":%.3f}",
+                      double(pad.sharedEv), double(pad.finalEv), double(pad.fractionAtFinal), double(pad.shootEv[0]), double(pad.shootEv[1]),
+                      double(pad.shootEv[2]), double(pad.printL[0]), double(pad.printL[1]), double(pad.printL[2]), double(pad.blackL[0]),
+                      double(pad.blackL[1]), double(pad.blackL[2]), double(pad.latitude[0]), double(pad.latitude[1]), double(pad.latitude[2]),
+                      double(pad.whiteL));
+        return dupString(buf);
+      },
+      static_cast<char*>(nullptr));
+}
 
 int32_t dapple_session_render_look_previews(DappleSession* session, const char* params_json, int32_t out_long_edge,
                                             DappleImage* out) {

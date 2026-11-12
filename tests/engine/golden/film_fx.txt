@@ -1,0 +1,22 @@
+# film effects not in the edit schema: highlight boost and the enlarger diffusion filter. FNV-1a of the node chain's float output
+# (tests/engine/film_nodes_tests.cpp fx; identical to FilmSimulator::render). Re-record: DAPPLE_FX_RECORD=1 dapple_film_nodes_tests fx
+# platform kernels=avx2
+boost 1.5 EV (portra) 59f8d528e09d4013
+boost, halation off 4a8eebc68765d61a
+boost, grain off 1124cfe30b970cfa
+boost interactive 1b4362346667895a
+boost scan (slide) 9387c0df4fc85d18
+boost + spatial off (quality 0) 64ca6ddde3550530
+boost tiny 33x17 3459a48f1232871d
+boost never reached (x0 >= max) cda7210f1122e63c
+enlarger glimmerglass 6795e08ffd2eaeab
+enlarger black_pro_mist 9409990ae3f80986
+enlarger pro_mist strong x2 966658ea55907424
+enlarger cinebloom 3b4388326c5e60bb
+enlarger interactive 25d7534d14b6ac7b
+enlarger, no grain, no halation 71719550081199f9
+enlarger cine + 2383 80f2d1771c5a53ae
+enlarger on scan film (no print) e899cb629331d260
+enlarger + spatial off (quality 0) 6f10bbc9299ea72d
+enlarger tiny 33x17 0e4ed5873e5701c6
+boost + enlarger 7b23f34d4bf1a03c

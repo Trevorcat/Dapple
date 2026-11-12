@@ -83,6 +83,8 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
       case NodeType::FilmDirField:
       case NodeType::FilmDevelop:
       case NodeType::FilmGrain:
+      case NodeType::FilmPrintExposure:
+      case NodeType::FilmEnlargerBlur:
       case NodeType::FilmPrintScan:
       case NodeType::FilmGlare:
       case NodeType::FilmScan:
@@ -189,7 +191,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
   p.grid.frameH = rq.frameH;
   p.grid.align = align;
   ExecMode mode = rq.mode;
-  if (mode == ExecMode::TiledExport && nFilm) {
+  if (mode == ExecMode::TiledExport && nFilm && !rq.filmTiles) {
     mode = ExecMode::Whole;  // the film plane is a whole float frame until the film nodes tile (film engineer)
     p.why = "film frame runs whole";
   }

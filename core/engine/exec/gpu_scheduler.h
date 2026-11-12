@@ -119,6 +119,13 @@ class GpuGraph {
 // Device::submit). On failure `err` is set and the status is the first error.
 hal::Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err);
 
+// DAPPLE_GPU_PASSLOG=1: one entry per recorded pass of the last submitGraph, in execution order (aligned with the timestamps).
+struct PassLog {
+  std::string name, desc;  // desc: the bound images as <R|W|M>WxHxBytesPerTexel
+  double rdMB = 0, wrMB = 0, groups = 0;
+};
+const std::vector<PassLog>& lastPassLog();
+
 // Convenience: record + submit + (optionally) wait.
 hal::Status runGraph(hal::Device& dev, GpuGraph& g, hal::CommandList& cl, hal::FenceH* fence, std::string& err);
 

@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <sys/system_properties.h>
@@ -35,8 +38,8 @@ double msSince(Clock::time_point t0) { return std::chrono::duration<double, std:
 
 Mode envMode() {
   static const Mode m = [] {
-    // Default: Full (the fourth pipeline). Override to the old paths for A/B: env DAPPLE_ENGINE=off|0|legacy|tables, or on
-    // Android the system property debug.dapple.engine (read when the env var is unset).
+    // Default: Full. Override to the old Renderer path (the golden oracle / A/B switch): env DAPPLE_ENGINE=off|0, or on Android
+    // the system property debug.dapple.engine (read when the env var is unset).
     const char* e = std::getenv("DAPPLE_ENGINE");
 #if defined(__ANDROID__)
     char propBuf[PROP_VALUE_MAX] = {0};
@@ -44,9 +47,7 @@ Mode envMode() {
 #endif
     if (!e || !*e) return Mode::Full;
     if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return Mode::Off;
-    if (std::strcmp(e, "legacy") == 0) return Mode::LegacyBakes;
-    if (std::strcmp(e, "tables") == 0) return Mode::Tables;
-    return Mode::Full;  // "full", "1", anything else
+    return Mode::Full;  // "full", "1", anything else (the retired "legacy" / "tables" modes included)
   }();
   return m;
 }
@@ -97,28 +98,47 @@ void setModeOverride(int m) { g_override.store(m, std::memory_order_relaxed); }
 
 // ---- table node evaluators: thin wrappers over the Renderer::bake pieces -------------------------------------------------
 
+std::shared_ptr<void> bakeNode(NodeType type, const void* resolved, std::span<const void* const> inputs) {
+  const CpuImpl* impl = cpuImpl(type);
+  if (!impl || !impl->bake) return nullptr;
+  void* p = nullptr;
+  if (impl->bake(resolved, inputs, &p) != Status::Ok || !p) return nullptr;
+  void (*fr)(void*) = impl->freePayload;
+  return std::shared_ptr<void>(p, [fr](void* q) {
+    if (fr) fr(q);
+  });
+}
+
 std::shared_ptr<std::vector<float>> evalColourLattice(const TableEnv& env, int n) {
-  return std::make_shared<std::vector<float>>(env.renderer.bakeColourLattice(env.src, n));
+  const TableBakeCtx c{&env, n, false, 0.f};
+  return as<std::vector<float>>(bakeNode(NodeType::ColourLattice, &c));
 }
 
 Renderer::TonePre evalToneAnalysisPre(const TableEnv& env, std::vector<float>* lattice, int n, bool fast) {
-  return env.renderer.bakeTonePre(env.src, lattice, n, fast);
+  const TableBakeCtx c{&env, n, fast, 0.f};
+  const void* in[1] = {lattice};
+  const auto p = as<Renderer::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &c, in));
+  return p ? *p : Renderer::TonePre{};
 }
 
 ToneTableOut evalToneTable(const TableEnv& env, const Renderer::TonePre* pre) {
-  BakedLut tmp;
-  env.renderer.bakeToneTable(env.src, pre ? *pre : Renderer::TonePre{}, tmp);
-  return {std::move(tmp.tone), std::move(tmp.toneMove)};
+  const TableBakeCtx c{&env, 0, false, 0.f};
+  const void* in[1] = {pre};
+  const auto p = as<ToneTableOut>(bakeNode(NodeType::ToneTable, &c, in));
+  return p ? *p : ToneTableOut{};
 }
 
 std::vector<float> evalLatticeOverflow(const TableEnv& env, int n, float maxV) {
-  BakedLut base;
-  base.rgb.resize(4);  // only its presence matters: the overflow lattice is a function of the colour stage alone
-  return env.renderer.bakeOverflow(env.src, base, n, maxV);
+  const TableBakeCtx c{&env, n, false, maxV};
+  const auto p = as<std::vector<float>>(bakeNode(NodeType::LatticeOverflow, &c));
+  return p ? *p : std::vector<float>{};
 }
 
 ToneAnalysis evalAnalysis(const TableEnv& env, const Renderer::TonePre* pre) {
-  return env.renderer.bakeAnalysis(env.src, pre ? *pre : Renderer::TonePre{});
+  const TableBakeCtx c{&env, 0, false, 0.f};
+  const void* in[1] = {pre};
+  const auto p = as<ToneAnalysis>(bakeNode(NodeType::Analysis, &c, in));
+  return p ? *p : ToneAnalysis{};
 }
 
 TableKeys effectiveTableKeys(const Graph& g, const ParamSet& ps, int nLattice) {
@@ -151,6 +171,7 @@ TableKeys effectiveTableKeys(const Graph& g, const ParamSet& ps, int nLattice) {
 EngineSession::EngineSession() : id_(g_nextId.fetch_add(1)) {
   cache_.setLimit(NodeType::Dehaze, 2);  // frame-global solves (1/4 grids: 15 MB each at 60 MP)
   cache_.setLimit(NodeType::Detail, 2);
+  cache_.setLimit(NodeType::Resize, 4);  // scaled copies of the source (resizedSource)
 }
 
 namespace {
@@ -188,8 +209,9 @@ void addStats(EngineStats& st, const ExecStats& es) {
 }
 
 // Plan request from a resolved frame (the GPU path has no FrameKernels: the executor reads the FramePlan).
-PlanRequest requestFromFrame(const FramePlan& fp, ExecMode mode, int tile, std::size_t budget) {
+PlanRequest requestFromFrame(const FramePlan& fp, ExecMode mode, int tile, std::size_t budget, bool filmTiles = false) {
   PlanRequest rq;
+  rq.filmTiles = filmTiles;
   rq.frameW = fp.outW;
   rq.frameH = fp.outH;
   rq.mode = mode;
@@ -218,6 +240,77 @@ void gpuLog(const char* what, const std::string& why) {
 #endif
 }
 
+// ---- per-frame executor accounting + throttled log (executorStatsJson, docs/engine/pipeline-architecture.md 24) --------------------------------
+struct ExecLog {
+  std::mutex mu;
+  std::map<std::string, std::uint64_t> reasons;  // CPU frames by the reason the GPU did not render them (at most kMaxReasons distinct texts)
+  std::uint64_t gpu = 0, cpu = 0, sinceLog = 0;
+  std::string lastExec, lastReason;
+};
+constexpr std::size_t kMaxReasons = 48;
+ExecLog& execLog() {
+  static ExecLog* l = new ExecLog;  // leaked: frames may still be counted while statics are destroyed
+  return *l;
+}
+
+bool engineLogOn() {
+#if defined(__ANDROID__)
+  return true;
+#else
+  const char* e = std::getenv("DAPPLE_ENGINE_LOG");
+  return e && e[0] == '1';
+#endif
+}
+
+std::string jsonStr(const std::string& s) {
+  std::string o;
+  for (char c : s) {
+    if (c == '"' || c == '\\') o.push_back('\\');
+    if (static_cast<unsigned char>(c) >= 32) o.push_back(c);
+  }
+  return o;
+}
+
+// One frame of the engine finished: count it and log "frame WxH tier film exec reason" once per 30 frames and whenever the executor or reason changes.
+void noteFrame(const FrameJob& job, const FrameResult& out) {
+  const std::string exec = out.executor.empty() ? "cpu" : out.executor;
+  const bool onGpu = exec == "vulkan" || exec == "gles31";
+  const std::string reason = onGpu ? std::string() : (out.why.empty() ? std::string("none given") : out.why);
+  ExecLog& L = execLog();
+  bool doLog = false;
+  std::uint64_t g = 0, cp = 0;
+  {
+    std::lock_guard<std::mutex> lk(L.mu);
+    if (onGpu) ++L.gpu;
+    else {
+      ++L.cpu;
+      auto it = L.reasons.find(reason);
+      if (it != L.reasons.end()) ++it->second;
+      else ++L.reasons[L.reasons.size() < kMaxReasons ? reason : std::string("(other)")];
+    }
+    const bool changed = exec != L.lastExec || reason != L.lastReason;
+    doLog = changed || ++L.sinceLog >= 30;
+    if (doLog) {
+      L.sinceLog = 0;
+      L.lastExec = exec;
+      L.lastReason = reason;
+    }
+    g = L.gpu;
+    cp = L.cpu;
+  }
+  if (!doLog || !engineLogOn()) return;
+  const SpatialQuality q = job.fastOptions.spatial;
+  const char* tier = q == SpatialQuality::Interactive ? "interactive" : q == SpatialQuality::Full ? "full" : "off";
+  char line[512];
+  std::snprintf(line, sizeof line, "frame %dx%d tier=%s film=%s exec=%s%s%s | gpu %llu cpu %llu", out.w, out.h, tier, job.renderer.filmActive() ? "on" : "off",
+                exec.c_str(), onGpu ? "" : " reason=", onGpu ? "" : reason.c_str(), (unsigned long long)g, (unsigned long long)cp);
+#if defined(__ANDROID__)
+  __android_log_print(ANDROID_LOG_INFO, "dapple_engine", "%s", line);
+#else
+  std::fprintf(stderr, "dapple_engine: %s\n", line);
+#endif
+}
+
 // SessionCtx::gainFn: white balance x exposure of the Gain node (what the film folds into its input matrix)
 struct GainCtx {
   const CameraProfile* camera;
@@ -230,13 +323,37 @@ void gainOf(const void* user, const EditParams& e, float out[3]) {
 
 }  // namespace
 
+std::string executorStatsJson() {
+  ExecLog& L = execLog();
+  std::string j;
+  std::string api;
+  {
+    std::lock_guard<std::mutex> lk(L.mu);
+    api = L.lastExec.empty() ? "none" : L.lastExec;
+    j = "{\"gpuFrames\":" + std::to_string(L.gpu) + ",\"cpuFrames\":" + std::to_string(L.cpu) + ",\"deviceLost\":" + std::to_string(totals().gpuLost.load()) +
+        ",\"demotions\":" + std::to_string(totals().gpuDemotions.load()) + ",\"api\":\"" + api + "\",\"lastReason\":\"" + jsonStr(L.lastReason) + "\",\"unsupported\":{";
+    bool first = true;
+    for (const auto& kv : L.reasons) {
+      j += std::string(first ? "" : ",") + "\"" + jsonStr(kv.first) + "\":" + std::to_string(kv.second);
+      first = false;
+    }
+  }
+  return j + "}}";
+}
+
 int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out) {
   if (gpuUsable(job)) {  // Vulkan -> GLES 3.1 -> CPU (5.9)
     const int g = renderGpu(job, ps, bake, out);
     if (g != 1) return g;
+  } else {
+    GpuProvider* pv = gpuProvider();
+    frameWhy_ = !pv ? "no GPU provider (build without the GPU executor)" : !pv->enabled() ? pv->inactiveReason() : "no source store (host frame)";
   }
   FrameKernels fk(job.renderer, job.src, &bake, job.fastOptions);
-  if (!fk.valid()) return 1;
+  if (!fk.valid()) {
+    frameWhy_ += std::string(frameWhy_.empty() ? "" : "; ") + "empty source";
+    return 1;
+  }
   const auto t0 = Clock::now();
   const FramePlan fp = fk.framePlan();
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);
@@ -254,7 +371,10 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
   }
   ++stats_.planned;
   totals().planned.fetch_add(1, std::memory_order_relaxed);
-  if (plan.unsupported) return 1;
+  if (plan.unsupported) {
+    frameWhy_ += std::string(frameWhy_.empty() ? "" : "; ") + "cpu plan unsupported: " + std::string(plan.why ? plan.why : "?");
+    return 1;
+  }
   const int w = fk.width(), h = fk.height();
   auto* rgba = static_cast<std::uint8_t*>(std::malloc(std::size_t(w) * h * 4));
   if (!rgba) {
@@ -297,8 +417,93 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
   return 1;  // Unsupported (film stage failed ...): the legacy renderer takes the frame
 }
 
+int EngineSession::renderExactGpu(const EditParams& params, const Renderer& renderer, const SourceImage& src, const ExactOptions& opt, Image8& out,
+                                  std::string* err) {
+  GpuProvider* pv = gpuProvider();
+  if (!gpuOverride_ && !(pv && pv->enabled())) return 1;
+  IGpuExecutor* x = gpuExecutor();
+  if (!x) return 1;
+  const int W = src.linear.width, H = src.linear.height;
+  if (W < 1 || H < 1) return 1;
+  FastOptions fo;
+  fo.spatial = SpatialQuality::Full;
+  FramePlan fp = renderer.framePlan(W, H, src.sceneReferred, fo);
+  if (!fp.supported) return 1;
+  ParamInputs in;
+  in.edit = params;
+  in.frame.exact = true;
+  in.ctx.sourceId = id_;
+  in.ctx.sceneReferred = src.sceneReferred;
+  in.ctx.hasProxy = opt.hasProxy;
+  const std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
+  in.ctx.filmLib = lib.get();
+  in.ctx.srcW = W;
+  in.ctx.srcH = H;
+  const ParamSet ps = ParamSet::make(std::move(in));
+  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);  // the exact variant: ToneColourExact, no table nodes
+  if (const ValidationResult v = g.validate(); !v.ok) {
+    if (err) *err = "engine graph: " + v.error;
+    return -1;
+  }
+  g.computeKeys(ps);
+  // The GPU evaluates the exact colour stage through the finest lattice (65^3 + the overflow lattice) baked with the exact analysis; the CPU
+  // executor remains the per-pixel reference (docs/engine/pipeline-architecture.md 21).
+  const std::shared_ptr<const BakedLut> bake = renderer.bake(src, 65, nullptr, false);
+  if (!bake) return 1;
+  const bool tiled = opt.mode == ExecMode::TiledExport;
+  const int tile = opt.tile > 0 ? opt.tile : (x->caps().unifiedMemory ? 1024 : 2048);
+  const Plan plan = Planner::plan(g, requestFromFrame(fp, tiled ? ExecMode::TiledExport : ExecMode::Whole, tiled ? tile : 0, std::size_t(1) << 30, true), nullptr);
+  MemorySourceStore store(src);
+  GpuRun run{plan, g, fp, store, *bake, nullptr, &renderer, 0.f, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
+  out.width = fp.outW;
+  out.height = fp.outH;
+  out.data.assign(std::size_t(out.width) * out.height * 3, 0);
+  if (tiled) {
+    run.target.sink = [&](int x0, int y0, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
+      for (int j = 0; j < th; ++j) {
+        const std::uint8_t* s = rgba + std::size_t(j) * stride;
+        std::uint8_t* d = out.data.data() + (std::size_t(y0 + j) * std::size_t(out.width) + std::size_t(x0)) * 3;
+        for (int i = 0; i < tw; ++i) {
+          d[3 * i] = s[4 * i];
+          d[3 * i + 1] = s[4 * i + 1];
+          d[3 * i + 2] = s[4 * i + 2];
+        }
+      }
+      return true;
+    };
+  }
+  GpuOut go;
+  const int r = runOnGpu(run, go);
+  if (r == 0) {
+    if (!tiled) {
+      if (!go.rgba || go.w != out.width || go.h != out.height) {
+        std::free(go.rgba);
+        return 1;
+      }
+      for (std::size_t i = 0, n = std::size_t(out.width) * out.height; i < n; ++i) {
+        out.data[3 * i] = go.rgba[4 * i];
+        out.data[3 * i + 1] = go.rgba[4 * i + 1];
+        out.data[3 * i + 2] = go.rgba[4 * i + 2];
+      }
+      std::free(go.rgba);
+    }
+    return 0;
+  }
+  if (r == -2) {
+    if (err) *err = "cancelled";
+    return -1;
+  }
+  if (r < 0 && err) *err = go.error;
+  return r;
+}
+
 bool EngineSession::renderExact(const EditParams& params, const Renderer& renderer, const SourceImage& src,
                                 const ExactOptions& opt, Image8& out, std::string* err, ExecStats* statsOut) {
+  if (!opt.outFloat && opt.spatial && !opt.sessionCache) {  // export / reference frames: the GPU executor first (exact variant on the dense lattice)
+    const int gr = renderExactGpu(params, renderer, src, opt, out, err);
+    if (gr == 0) return true;
+    if (gr < 0) return false;
+  }
   FastOptions fo;
   fo.spatial = opt.spatial ? SpatialQuality::Full : SpatialQuality::Off;
   FrameKernels fk(renderer, src, nullptr, fo);
@@ -331,19 +536,28 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   const Plan plan = Planner::plan(g, makeRequest(fk, opt.mode, opt.tile, opt.memBudget, 3), &cache);
   stats_.planMs += msSince(t0);
   ++stats_.planned;
-  out.width = fk.width();
-  out.height = fk.height();
-  out.data.resize(std::size_t(out.width) * out.height * 3);
-  ExecEnv env{fk, g, cache, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, out.data.data(), 3};
+  ExecEnv env{fk, g, cache, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, nullptr, 3};
+  if (opt.outFloat) {
+    env.outF = opt.outFloat;
+  } else {
+    out.width = fk.width();
+    out.height = fk.height();
+    out.data.resize(std::size_t(out.width) * out.height * 3);
+    env.out = out.data.data();
+  }
   ExecStats es;
   if (opt.beforeExec) opt.beforeExec();
   Status s = plan.unsupported ? Status::Unsupported : CpuExecutor::run(plan, env, &es);
   addStats(stats_, es);
   if (statsOut) *statsOut = es;
-  if (s == Status::Unsupported) {  // e.g. the film stage failed: the reference renderer takes the frame
+  if (s == Status::Unsupported) {
     ++stats_.fallbacks;
-    out = renderer.render(src);
-    return true;
+    // No second renderer behind the engine: a film whose stock / paper is not in the library or whose table bake failed is an explicit error
+    // like any other unsupported plan.
+    if (err)
+      *err = "engine: plan not supported by the CPU executor" + (std::string(plan.why ? plan.why : "").empty() ? std::string() : " (" + std::string(plan.why) + ")") +
+             (renderer.filmActive() ? " [film: unknown stock / paper or failed table bake]" : "");
+    return false;
   }
   if (s != Status::Ok) {
     if (err) *err = s == Status::Cancelled ? "cancelled" : "out of memory";
@@ -353,37 +567,7 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   return true;
 }
 
-std::shared_ptr<const BakedLut> EngineSession::bakeLegacy(FrameJob& job, int n, FrameResult& out) {
-  // Step a2: the lookup the C layer used to do, unchanged, inside the engine.
-  const std::string pk = job.renderer.pointKey() + (job.request.fastAnalysis ? "#f" : "#x");  // fast / exact analysis = different bakes
-  std::shared_ptr<const BakedLut> bake;
-  for (auto& b : bakes_)
-    if (b->n >= std::clamp(n, 17, 65) && b->key.size() > pk.size() && b->key.compare(0, pk.size(), pk) == 0 &&
-        (!bake || b->n > bake->n))
-      bake = b;
-  if (bake) {  // the finest lattice of this colour stage wins (as in the table path): a finer one is rebuilt from, not skipped
-    const std::string ck0 = job.renderer.colourKey();
-    for (auto& b : bakes_)
-      if (b->colourKey == ck0 && b->n >= std::clamp(n, 17, 65) && b->n > bake->n) bake = nullptr;
-  }
-  if (bake) {
-    out.bake = FrameResult::Bake::FullHit;
-    return bake;
-  }
-  const std::string ck = job.renderer.colourKey();
-  const BakedLut* from = nullptr;
-  for (auto& b : bakes_)
-    if (b->colourKey == ck && b->n >= std::clamp(n, 17, 65) && (!from || b->n > from->n)) from = b.get();
-  out.bake = from ? FrameResult::Bake::LatticeReuse : FrameResult::Bake::LatticeBake;
-  bake = job.renderer.bake(job.src, n, from, job.request.fastAnalysis);
-  bakes_.push_back(bake);
-  if (bakes_.size() > 3) bakes_.erase(bakes_.begin());
-  return bake;
-}
-
-std::shared_ptr<const BakedLut> EngineSession::bakeTables(FrameJob& job, const ParamSet& ps, int n, FrameResult& out,
-                                                         Renderer::TonePre* preOut, bool* haveAnalysis) {
-  (void)ps;
+std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, const ParamSet& ps, int n, FrameResult& out) {
   const Graph& g = graph_;
   const NodeInstance* latN = g.find(NodeType::ColourLattice);
   const NodeInstance* preN = g.find(NodeType::ToneAnalysisPre);
@@ -414,7 +598,10 @@ std::shared_ptr<const BakedLut> EngineSession::bakeTables(FrameJob& job, const P
     if (ResultCache::Entry* e = cache_.find(NodeType::ToneAnalysisPre, tk.pre)) {
       pre = *as<Renderer::TonePre>(e->payload);
     } else {
-      pre = evalToneAnalysisPre(env, lattice.get(), latticeN, job.request.fastAnalysis);
+      const TableBakeCtx bc{&env, latticeN, job.request.fastAnalysis, 0.f};
+      const void* in[1] = {lattice.get()};
+      const auto made = as<Renderer::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &bc, in));
+      pre = made ? *made : Renderer::TonePre{};
       ResultCache::Entry ne;
       ne.key = ne.family = tk.pre;
       ne.payload = std::make_shared<Renderer::TonePre>(pre);
@@ -440,7 +627,12 @@ std::shared_ptr<const BakedLut> EngineSession::bakeTables(FrameJob& job, const P
     } else {
       out.bake = FrameResult::Bake::LatticeBake;
       bakeCounters().latticeEvaluated.fetch_add(1, std::memory_order_relaxed);
-      lattice = evalColourLattice(env, nReq);
+      const TableBakeCtx bc{&env, nReq, false, 0.f};
+      lattice = as<std::vector<float>>(bakeNode(NodeType::ColourLattice, &bc));
+      if (!lattice) {
+        out.error = "colour lattice";
+        return nullptr;
+      }
       latticeN = nReq;
       latticeKey = withOrder(latN->family, nReq);
       ResultCache::Entry ne;
@@ -457,7 +649,10 @@ std::shared_ptr<const BakedLut> EngineSession::bakeTables(FrameJob& job, const P
       tt = *as<ToneTableOut>(e->payload);
     } else {
       const Renderer::TonePre* p = (move && preN) ? &ensurePre() : nullptr;
-      tt = evalToneTable(env, p);
+      const TableBakeCtx bc{&env, latticeN, false, 0.f};
+      const void* in[1] = {p};
+      const auto made = as<ToneTableOut>(bakeNode(NodeType::ToneTable, &bc, in));
+      tt = made ? *made : ToneTableOut{};
       ResultCache::Entry ne;
       ne.key = ne.family = tk.tone;
       ne.payload = std::make_shared<ToneTableOut>(tt);
@@ -495,7 +690,9 @@ std::shared_ptr<const BakedLut> EngineSession::bakeTables(FrameJob& job, const P
     if (!cache_.find(NodeType::LatticeOverflow, tk.overflow)) {
       ResultCache::Entry ne;
       ne.key = ne.family = tk.overflow;
-      auto v = std::make_shared<std::vector<float>>(evalLatticeOverflow(env, 33, 8.f));
+      const TableBakeCtx bc{&env, 33, false, 8.f};
+      auto v = as<std::vector<float>>(bakeNode(NodeType::LatticeOverflow, &bc));
+      if (!v) v = std::make_shared<std::vector<float>>();
       ne.bytes = v->size() * 4;
       ne.payload = v;
       cache_.put(NodeType::LatticeOverflow, std::move(ne));
@@ -507,7 +704,10 @@ std::shared_ptr<const BakedLut> EngineSession::bakeTables(FrameJob& job, const P
       out.analysis = *as<ToneAnalysis>(e->payload);
     } else {
       const Renderer::TonePre* p = preN ? &ensurePre() : nullptr;
-      out.analysis = evalAnalysis(env, p);
+      const TableBakeCtx bc{&env, latticeN, false, 0.f};
+      const void* in[1] = {p};
+      const auto made = as<ToneAnalysis>(bakeNode(NodeType::Analysis, &bc, in));
+      out.analysis = made ? *made : ToneAnalysis{};
       ResultCache::Entry ne;
       ne.key = ne.family = tk.analysis;
       ne.payload = std::make_shared<ToneAnalysis>(out.analysis);
@@ -516,14 +716,13 @@ std::shared_ptr<const BakedLut> EngineSession::bakeTables(FrameJob& job, const P
       ++stats_.analysisBuilds;
     }
     out.hasAnalysis = true;
-    if (haveAnalysis) *haveAnalysis = true;
   }
-  (void)preOut;
   return bl;
 }
 
 bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   const auto t0 = Clock::now();
+  frameWhy_.clear();
   ParamInputs in;
   in.edit = job.params;
   in.frame = job.request;
@@ -559,25 +758,28 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   stats_.graphMs += msSince(t0);
 
   const int n = job.request.bakeSize;
-  bool haveAnalysis = false;
-  std::shared_ptr<const BakedLut> bake;
-  const Mode fm = gpuFrame && mode() != Mode::Full ? Mode::Full : mode();  // a GPU session always runs the Full engine
-  if (fm == Mode::LegacyBakes) bake = bakeLegacy(job, n, out);
-  else bake = bakeTables(job, ps, n, out, nullptr, &haveAnalysis);
+  const std::shared_ptr<const BakedLut> bake = runHostTables(job, ps, n, out);
+  if (!bake) {
+    if (out.error.empty()) out.error = "tables";
+    return false;
+  }
 
-  // ---- LegacyRender: the existing renderer ------------------------------------------------------------------------------
+  // ---- the frame: GPU executor where it supports the plan, else the CpuExecutor on the same plan ---------------------------
   int w = 0, h = 0;
   std::uint8_t* rgba = nullptr;
-  if (fm == Mode::Full) {
-    const int r = renderFull(job, ps, *bake, out);
-    if (r < 0) return false;
-    if (r == 0) {
-      rgba = out.rgba;
-      w = out.w;
-      h = out.h;
-    }
+  const int r = renderFull(job, ps, *bake, out);
+  if (r < 0) return false;
+  if (r == 0) {
+    rgba = out.rgba;
+    w = out.w;
+    h = out.h;
+  } else {
+    // r == 1: neither executor took the plan. There is no second renderer behind it: that is an explicit error (also for a film whose stock /
+    // paper is not in the library or whose table bake failed; highlight boost and the enlarger diffusion filter are film nodes).
+    out.error = "engine: plan not supported by any executor" + (frameWhy_.empty() ? std::string() : " (" + frameWhy_ + ")") +
+                (job.renderer.filmActive() ? " [film: unknown stock / paper or failed table bake]" : "");
+    return false;
   }
-  if (!rgba && !out.external) rgba = job.renderer.renderBakedRgba(job.src, *bake, job.fastOptions, w, h);
   if (!rgba && !out.external) {
     out.error = "out of memory";
     return false;
@@ -586,10 +788,8 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   out.w = w;
   out.h = h;
   if (out.executor.empty()) out.executor = "cpu";
-  if (fm == Mode::LegacyBakes && job.request.wantAnalysis) {
-    out.analysis = bake->analysis;
-    out.hasAnalysis = true;
-  }
+  out.why = frameWhy_;
+  noteFrame(job, out);
 
   ++stats_.frames;
   totals().frames.fetch_add(1, std::memory_order_relaxed);
@@ -649,7 +849,10 @@ int EngineSession::runOnGpu(const GpuRun& run, GpuOut& go) {
   GpuProvider* pv = gpuProvider();
   for (int attempt = 0; attempt < 2; ++attempt) {
     IGpuExecutor* x = gpuExecutor();
-    if (!x) return 1;
+    if (!x) {
+      frameWhy_ = gpuWhy_.empty() ? "no GPU executor" : gpuWhy_;
+      return 1;
+    }
     go = GpuOut{};
     const Status s = x->run(run, go);
     if (s == Status::Ok) {
@@ -671,12 +874,14 @@ int EngineSession::runOnGpu(const GpuRun& run, GpuOut& go) {
         totals().gpuTransients.fetch_add(1, std::memory_order_relaxed);
         gpuLog("frame failed", go.error);
         x->release();  // drop the device copies (pools, resident source): they are rebuilt from the SourceStore
+        frameWhy_ = "transient GPU failure: " + go.error;
         if (attempt == 0) continue;
         return 1;
       case GpuFailure::DeviceLost: {
         ++stats_.gpuLost;
         totals().gpuLost.fetch_add(1, std::memory_order_relaxed);
         gpuLog("device lost", go.error);
+        frameWhy_ = "device lost: " + go.error;
         if (pv && !gpuOverride_) {
           std::string why;
           if (pv->recover(why)) {
@@ -692,6 +897,7 @@ int EngineSession::runOnGpu(const GpuRun& run, GpuOut& go) {
       default:
         ++stats_.gpuUnsupported;
         totals().gpuFallbacks.fetch_add(1, std::memory_order_relaxed);
+        frameWhy_ = go.error.empty() ? "unsupported (no reason given)" : go.error;
         return 1;
     }
   }
@@ -717,7 +923,8 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
   if (!fp.supported) {
     ++stats_.gpuUnsupported;
     totals().gpuFallbacks.fetch_add(1, std::memory_order_relaxed);
-    if (gpuForce_) return out.error = "unsupported on the GPU: " + fp.why, -1;
+    frameWhy_ = "unsupported on the GPU: " + fp.why;
+    if (gpuForce_) return out.error = frameWhy_, -1;
     return 1;
   }
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);
@@ -727,8 +934,10 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
     return -1;
   }
   g.computeKeys(ps);
-  // the GPU plan is made without the session cache: the cached solves are CPU payloads, the device solves live in the sweep
-  const Plan plan = Planner::plan(g, requestFromFrame(fp, ExecMode::Whole, 0, 0), nullptr);
+  // the GPU plan is made against the executor's own cache of device solves (the session cache holds CPU payloads): a frame whose dehaze / clarity
+  // solve is still on the device skips the accumulation sweep and the solve
+  IGpuExecutor* gx = gpuExecutor();
+  const Plan plan = Planner::plan(g, requestFromFrame(fp, ExecMode::Whole, 0, 0), gx ? gx->solveCache() : nullptr);
   {
     const double ms = msSince(t0);
     stats_.planMs += ms;
@@ -764,7 +973,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
   return r;
 }
 
-// LatticeOverflow payload of the frame (cached by bakeTables when the request asked for it), or null.
+// LatticeOverflow payload of the frame (cached by runHostTables when the request asked for it), or null.
 const std::vector<float>* EngineSession::overflowFor(const ParamSet& ps, int n) const {
   const TableKeys tk = effectiveTableKeys(graph_, ps, n);
   if (!tk.hasOverflow) return nullptr;
@@ -806,7 +1015,7 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
   if (const ValidationResult v = graph_.validate(); !v.ok) return bail(-1, "engine graph: " + v.error);
   graph_.computeKeys(ps);
   FrameResult fr;
-  const std::shared_ptr<const BakedLut> bake = bakeTables(fj, ps, e.latticeN, fr, nullptr, nullptr);
+  const std::shared_ptr<const BakedLut> bake = runHostTables(fj, ps, e.latticeN, fr);
   if (!bake) return bail(-1, "tables");
 
   int rw = W, rh = H;  // image.cpp resizeToLongEdge
@@ -819,14 +1028,13 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
   }
   FramePlan fp = e.renderer.framePlan(rw, rh, e.image.sceneReferred, fj.fastOptions);
   if (!fp.supported) return bail(1, "unsupported on the GPU: " + fp.why);
-  if (fp.film.active) return bail(1, "film export stays on the CPU (film frames run whole on the GPU)");
   fp.resizeSharpen = down ? e.resizeSharpen : 0.f;
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);
   if (const ValidationResult v = g.validate(); !v.ok) return bail(-1, "engine graph: " + v.error);
   g.computeKeys(ps);
   // mobile / unified memory: tile 1024 keeps the export pool near 320 MB (pixel-architecture.md 16 rule 8)
   const int tile = e.tile > 0 ? e.tile : (x->caps().unifiedMemory ? 1024 : 2048);
-  const Plan plan = Planner::plan(g, requestFromFrame(fp, ExecMode::TiledExport, tile, std::size_t(1) << 30), nullptr);
+  const Plan plan = Planner::plan(g, requestFromFrame(fp, ExecMode::TiledExport, tile, std::size_t(1) << 30, true), nullptr);
   if (e.onSize) e.onSize(fp.outW, fp.outH);
   GpuRun run{plan, g, fp, e.store, *bake, overflowFor(ps, bake->n), &e.renderer, fp.resizeSharpen,
              GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, e.target, e.forceStream};
@@ -840,12 +1048,74 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
   return bail(r, go.error);
 }
 
+// ---- the Resize node (CpuImpl::bake): the session source at a smaller long edge, cached ------------------------------------------------
+
+std::shared_ptr<const SourceImage> EngineSession::resizedSource(const SourceImage& full, int longEdge, bool cacheLarge) {
+  const int own = std::max(full.linear.width, full.linear.height);
+  if (longEdge <= 0 || longEdge >= own) return nullptr;
+  Hasher h;
+  h.u64(id_);
+  h.i32(longEdge);
+  h.i32(full.linear.width);
+  h.i32(full.linear.height);
+  const Hash128 key = h.finish();
+  std::lock_guard<std::mutex> lock(resizeMtx_);
+  if (const ResultCache::Entry* e = cache_.peek(NodeType::Resize, key)) {  // LRU: a hit moves the entry to the back
+    ResultCache::Entry moved = *e;
+    std::shared_ptr<const SourceImage> hit = as<const SourceImage>(moved.payload);
+    cache_.eraseIf(NodeType::Resize, [&](const ResultCache::Entry& x) { return x.key == key; });
+    cache_.put(NodeType::Resize, std::move(moved));
+    return hit;
+  }
+  const ResizeBakeCtx ctx{&full, longEdge};
+  std::shared_ptr<void> made = bakeNode(NodeType::Resize, &ctx);
+  if (!made) return nullptr;
+  auto img = as<const SourceImage>(made);
+  if (!cacheLarge && img->linear.data.size() * sizeof(float) > (64u << 20)) return img;
+  ResultCache::Entry ne;
+  ne.key = ne.family = key;
+  ne.order = longEdge;
+  ne.payload = made;
+  ne.bytes = img->linear.data.size() * sizeof(float);
+  cache_.put(NodeType::Resize, std::move(ne));
+  // at most ~160 MB of scaled copies (the newest always stays), as the C layer's scaledSource did
+  std::size_t total = 0;
+  for (const auto& e : cache_.entries(NodeType::Resize)) total += e.bytes;
+  while (cache_.entries(NodeType::Resize).size() > 1 && total > (160u << 20)) {
+    const Hash128 oldest = cache_.entries(NodeType::Resize).front().key;
+    total -= cache_.entries(NodeType::Resize).front().bytes;
+    cache_.eraseIf(NodeType::Resize, [&](const ResultCache::Entry& x) { return x.key == oldest; });
+  }
+  return img;
+}
+
+bool renderImage8(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, Image8& out,
+                  std::string* err, float toneReach) {
+  Renderer renderer(params, camera, lut);
+  renderer.setToneReach(toneReach);
+  EngineSession session;
+  EngineSession::ExactOptions o;
+  if (std::size_t(src.linear.width) * src.linear.height > 16000000u) o.mode = ExecMode::TiledExport;  // as the C layer's exports
+  return session.renderExact(params, renderer, src, o, out, err);
+}
+
+bool renderImageF(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, bool spatial,
+                  ImageF& out, std::string* err) {
+  Renderer renderer(params, camera, lut);
+  EngineSession session;
+  EngineSession::ExactOptions o;
+  o.spatial = spatial;
+  o.outFloat = &out;
+  Image8 unused;
+  return session.renderExact(params, renderer, src, o, unused, err);
+}
+
 std::string infoJson() {
   const Totals& t = totals();
   const BakeCounters& c = bakeCounters();
   const Mode m = mode();
   std::string j = "{\"engine\":\"";
-  j += m == Mode::Off ? "off" : (m == Mode::LegacyBakes ? "legacy" : (m == Mode::Tables ? "tables" : "full"));
+  j += m == Mode::Off ? "off" : "full";
   j += "\",\"frames\":" + std::to_string(t.frames.load());
   j += ",\"fullHits\":" + std::to_string(t.fullHits.load());
   j += ",\"latticeReuse\":" + std::to_string(t.latticeReuse.load());

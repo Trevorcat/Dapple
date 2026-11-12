@@ -176,7 +176,8 @@ Key bakeKey(const FilmParams& p) {
                    m.gammaFactorGreen, m.gammaFactorBlue})
     keyNum(k, v);
   keyNum(k, p.io.scanFilm);
-  for (double v : {double(p.scanner.blackCorrection), double(p.scanner.whiteCorrection), p.scanner.blackLevel, p.scanner.whiteLevel})
+  for (double v : {double(p.scanner.blackCorrection), double(p.scanner.whiteCorrection), p.scanner.blackLevel, p.scanner.whiteLevel,
+                   double(p.scanner.paperReference), p.scanner.blackMix})
     keyNum(k, v);
   keyNum(k, p.io.inputGamutCompress);
   keyNum(k, p.io.outputGamutCompress);

@@ -66,6 +66,9 @@ struct ExecEnv {
   CancelToken cancel;
   std::uint8_t* out = nullptr;    // w * h * outChannels, caller-allocated
   int outChannels = 4;
+  // Float output (analysis, swatches, reference renders): the clamped, display-encoded frame instead of 8-bit pixels. The executor
+  // sizes it; Whole plans only (a tiled plan returns Unsupported). `out` is then null.
+  ImageF* outF = nullptr;
 };
 
 class CpuExecutor {

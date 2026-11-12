@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import 'dapple_bindings.dart';
 import '../services/perf_probe.dart';
@@ -184,6 +185,11 @@ List<Object?> _frameNative(int id, List msg) {
 /// are serialised (the C API forbids concurrent use of a single session).
 class DappleSession {
   DappleSession._(this._address);
+  /// A session handle that is not backed by a render (binding tests: [cancel] on an address, a closed handle ...).
+  @visibleForTesting
+  DappleSession.forTest(this._address, {bool closed = false}) {
+    _closed = closed;
+  }
   final int _address;
 
   /// Native session pointer (for the zero-copy view, which renders on its own thread; see GpuViewBackend).
@@ -216,6 +222,20 @@ class DappleSession {
     final p = f();
     try {
       return _decodeObj(p.toDartString());
+    } finally {
+      b.freeString(p);
+    }
+  }
+
+  /// GPU executor status (`dapple_gpu_status_json`): mode, probe state, api, device, self-test, and `executors`: frames rendered by the GPU / CPU and the reasons
+  /// the GPU did not render a frame. Null when the library is missing.
+  static String? gpuStatusJson() {
+    final b = DappleBindings.instanceOrNull;
+    final f = b?.gpuStatusJson;
+    if (b == null || f == null) return null;
+    final p = f();
+    try {
+      return p.toDartString();
     } finally {
       b.freeString(p);
     }

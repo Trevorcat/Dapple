@@ -469,6 +469,7 @@ class _ReadoutOverlayState extends State<ReadoutOverlay>
             size: 72,
           );
         case TwoD.curve:
+        case TwoD.offset:
           break;
       }
     }

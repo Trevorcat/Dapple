@@ -134,7 +134,7 @@ Status runExposure(const CpuCtx& c, const void* res, std::span<const ImageView> 
   if (in.empty() || out.empty() || c.tables.empty()) return Status::Internal;
   const FilmResolved& r = R(res);
   const auto pd = planOf(r);
-  if (!pd->error.empty() || pd->plan.boost) return Status::Unsupported;  // highlight boost needs a global maximum: not ported
+  if (!pd->error.empty()) return Status::Unsupported;  // (highlight boost needs the global maximum: it runs in FilmBlurExposure)
   const RawTable* raw = payloadAs<RawTable>(c.tables[0]);
   float mi[12];
   const fd::KView view = viewOf(raw, nullptr, nullptr, r.gain, mi);
@@ -169,6 +169,42 @@ Status runBlurExposure(const CpuCtx&, const void* res, std::span<const ImageView
   const int W = out[0].width, H = out[0].height;
   ArenaLease lease = leaseArena();
   fd::Arena& arena = *lease.arena;
+  // highlight boost (spec 03 s4.1): v > x0 -> v + X k (exp(a d) - a d - 1), X = the maximum of the whole exposure frame. The boosted
+  // copy replaces the input of the mixtures (the input planes stay untouched).
+  if (pl.boost) {
+    std::vector<float> rowMax(std::size_t(H), 0.f);
+    parallelFor(
+        H,
+        [&](int y) {
+          float m = 0.f;
+          for (int c = 0; c < 3; ++c) {
+            const float* r = src[c].row(y);
+            for (int x = 0; x < W; ++x) m = std::max(m, r[x]);
+          }
+          rowMax[std::size_t(y)] = m;
+        },
+        4);
+    double X = 0;
+    for (float v : rowMax) X = std::max(X, double(v));
+    double x0, aa, k;
+    if (fd::boostConstants(pl.boostM, pl.boostA, pl.boostP, X, x0, aa, k) && x0 < X) {
+      const float fx0 = float(x0), fX = float(X), fa = float(aa), fk = float(k);
+      const bool mixes = pl.preMix || pl.haloMix;
+      fd::Plane bs[3];
+      for (int c = 0; c < 3; ++c) bs[c] = mixes ? arena.plane(W, H) : dst[c];
+      parallelFor(
+          H,
+          [&](int y) {
+            for (int c = 0; c < 3; ++c) {
+              std::memcpy(bs[c].row(y), src[c].row(y), sizeof(float) * W);
+              K.boostRow(bs[c].row(y), W, fx0, fX, fa, fk);
+            }
+          },
+          4);
+      for (int c = 0; c < 3; ++c) src[c] = bs[c];
+      if (!mixes) return Status::Ok;
+    }
+  }
   if (pl.preMix && pl.haloMix) {
     fd::Plane mid[3] = {arena.plane(W, H), arena.plane(W, H), arena.plane(W, H)};
     for (int c = 0; c < 3; ++c) fd::applyMixture(K, arena, src[c], mid[c], pl.pre[c]);
@@ -379,13 +415,73 @@ Status runGrain(const CpuCtx&, const void* res, std::span<const ImageView> in, s
   return Status::Ok;
 }
 
+// ---- FilmPrintExposure (enlarger diffusion path) ----------------------------------------------------------------------------------------------
+// in[0] = density planes (covers out rect), out[0] = linear paper exposure planes (a window of the frame-sized planes).
+Status runPrintExposure(const CpuCtx& c, const void* res, std::span<const ImageView> in, std::span<const ImageView> out) {
+  if (in.empty() || out.empty() || c.tables.empty()) return Status::Internal;
+  const FilmResolved& r = R(res);
+  const auto pd = planOf(r);
+  if (!pd->error.empty()) return Status::Unsupported;
+  if (!pd->split) {  // identity (normally elided): copy
+    const Rect o = rectOf(out[0]);
+    for (int ch = 0; ch < 3; ++ch)
+      for (int y = o.y0; y < o.y1; ++y)
+        if (planeRow(out[0], ch, y, o.x0) != planeRow(in[0], ch, y, o.x0))
+          std::memcpy(planeRow(out[0], ch, y, o.x0), planeRow(in[0], ch, y, o.x0), sizeof(float) * rw(o));
+    return Status::Ok;
+  }
+  const PrintTable* pt = payloadAs<PrintTable>(c.tables[0]);
+  if (!pt->t.split) return Status::Internal;
+  float mi[12];
+  const fd::KView view = viewOf(nullptr, nullptr, pt, nullptr, mi);
+  const fd::KernelSet& ks = fd::selectKernels();
+  const fd::SpatialKernels& K = fd::selectSpatialKernels();
+  const Rect o = rectOf(out[0]);
+  const int n = rw(o);
+  if (n <= 0) return Status::Ok;
+  thread_local std::vector<float> rowD, rowO;
+  if (int(rowD.size()) < 3 * std::size_t(n)) rowD.resize(std::size_t(3) * n), rowO.resize(std::size_t(3) * n);
+  for (int y = o.y0; y < o.y1; ++y) {
+    interleave(planeRow(in[0], 0, y, o.x0), planeRow(in[0], 1, y, o.x0), planeRow(in[0], 2, y, o.x0), rowD.data(), n);
+    ks.printRaw(view, rowD.data(), rowO.data(), n);
+    K.exp2Scale(rowO.data(), n * 3, 3.32192809f);  // 10^x
+    deinterleave(rowO.data(), planeRow(out[0], 0, y, o.x0), planeRow(out[0], 1, y, o.x0), planeRow(out[0], 2, y, o.x0), n);
+  }
+  return Status::Ok;
+}
+
+// ---- FilmEnlargerBlur (enlarger diffusion path) -------------------------------------------------------------------------------------------------
+// Whole-frame node: in[0] and out[0] are frame-sized planar paper exposure; out[0] = the exposure through the filter mixtures.
+Status runEnlargerBlur(const CpuCtx&, const void* res, std::span<const ImageView> in, std::span<const ImageView> out) {
+  if (in.empty() || out.empty()) return Status::Internal;
+  const FilmResolved& r = R(res);
+  const auto pd = planOf(r);
+  if (!pd->error.empty()) return Status::Unsupported;
+  const fd::SpatialKernels& K = fd::selectSpatialKernels();
+  const int W = out[0].width, H = out[0].height;
+  if (!pd->split) {
+    for (int c = 0; c < 3; ++c)
+      for (int y = 0; y < H; ++y) {
+        float* d = planeRow(out[0], c, y + out[0].origin.y0, out[0].origin.x0);
+        const float* s = planeRow(in[0], c, y + in[0].origin.y0, in[0].origin.x0);
+        if (d != s) std::memcpy(d, s, sizeof(float) * W);
+      }
+    return Status::Ok;
+  }
+  ArenaLease lease = leaseArena();
+  for (int c = 0; c < 3; ++c) fd::applyMixture(K, *lease.arena, planeOf(in[0], c), planeOf(out[0], c), pd->plan.enl[c]);
+  return Status::Ok;
+}
+
 // ---- FilmPrintScan --------------------------------------------------------------------------------------------------------------------------
 // in[0] = density planes (covers out rect), out[0] = interleaved display sRGB (encoded, unclamped).
+// Enlarger diffusion path: in[0] = the filtered linear paper exposure of the whole frame (read with the reflect boundary against
+// CpuCtx::frame); the node applies log10, the paper curves and the scan LUT instead of the density LUT.
 Status runPrintScan(const CpuCtx& c, const void* res, std::span<const ImageView> in, std::span<const ImageView> out) {
   if (in.empty() || out.empty() || c.tables.empty()) return Status::Internal;
   const FilmResolved& r = R(res);
   const auto pd = planOf(r);
-  if (!pd->error.empty() || pd->split) return Status::Unsupported;  // enlarger diffusion (split print path): not ported
+  if (!pd->error.empty()) return Status::Unsupported;
   const PrintTable* pt = payloadAs<PrintTable>(c.tables[0]);
   float mi[12];
   const fd::KView view = viewOf(nullptr, nullptr, pt, nullptr, mi);
@@ -393,6 +489,20 @@ Status runPrintScan(const CpuCtx& c, const void* res, std::span<const ImageView>
   const Rect o = rectOf(out[0]);
   const int n = rw(o);
   if (n <= 0) return Status::Ok;
+  if (pd->split) {
+    if (!pt->t.split) return Status::Internal;
+    const Rect frame = c.frame;
+    const int H = frame.y1 - frame.y0;
+    thread_local std::vector<float> rowE, rowX;
+    if (rowE.size() < std::size_t(3) * n) rowE.resize(std::size_t(3) * n), rowX.resize(std::size_t(3) * n);
+    for (int y = o.y0; y < o.y1; ++y) {
+      const int gy = frame.y0 + reflectIdx(y - frame.y0, H);
+      gatherView(in[0], frame, gy, o.x0, n, rowE.data());
+      ks.logE(view, rowE.data(), rowX.data(), n);
+      ks.paperScan(view, rowX.data(), packedRow(out[0], y, o.x0), n);
+    }
+    return Status::Ok;
+  }
   thread_local std::vector<float> rowD;
   if (int(rowD.size()) < 3 * n) rowD.resize(std::size_t(3) * n);
   for (int y = o.y0; y < o.y1; ++y) {
@@ -540,7 +650,9 @@ bool identityOf(NodeType t, const void* res) {
   if (!pd->error.empty()) return false;
   const fd::SpatialPlan& p = pd->plan;
   switch (t) {
-    case NodeType::FilmBlurExposure: return !(p.preMix || p.haloMix);
+    case NodeType::FilmBlurExposure: return !(p.preMix || p.haloMix || p.boost);
+    case NodeType::FilmPrintExposure:
+    case NodeType::FilmEnlargerBlur: return !pd->split;
     case NodeType::FilmDirField: return !p.dirDiffuse;
     case NodeType::FilmGrain: return !p.grain.active;
     case NodeType::FilmGlare:
@@ -569,6 +681,8 @@ NodeBehaviour behaviourFor(NodeType t) {
   b.resolve = resolveAny;
   switch (t) {
     case NodeType::FilmBlurExposure: b.isIdentity = identityFn<NodeType::FilmBlurExposure>; break;
+    case NodeType::FilmPrintExposure: b.isIdentity = identityFn<NodeType::FilmPrintExposure>; break;
+    case NodeType::FilmEnlargerBlur: b.isIdentity = identityFn<NodeType::FilmEnlargerBlur>; break;
     case NodeType::FilmDirField: b.isIdentity = identityFn<NodeType::FilmDirField>; break;
     case NodeType::FilmGrain: b.isIdentity = identityFn<NodeType::FilmGrain>; b.halo = haloFn<NodeType::FilmGrain>; break;
     case NodeType::FilmGlare: b.isIdentity = identityFn<NodeType::FilmGlare>; break;
@@ -580,7 +694,9 @@ NodeBehaviour behaviourFor(NodeType t) {
 
 }  // namespace
 
-bool isFilmNode(NodeType t) { return t >= NodeType::FilmTableRaw && t <= NodeType::FilmScan; }
+bool isFilmNode(NodeType t) {
+  return (t >= NodeType::FilmTableRaw && t <= NodeType::FilmScan) || t == NodeType::FilmPrintExposure || t == NodeType::FilmEnlargerBlur;
+}
 
 const CpuImpl& cpuImpl(NodeType t) {
   static const CpuImpl none{};
@@ -596,7 +712,8 @@ const CpuImpl& cpuImpl(NodeType t) {
     return i;
   };
   static const CpuImpl exposure = img(runExposure), blur = img(runBlurExposure), dir = img(runDirField), develop = img(runDevelop),
-                       grain = img(runGrain), print = img(runPrintScan), glare = img(runGlare), scan = img(runScan);
+                       grain = img(runGrain), print = img(runPrintScan), glare = img(runGlare), scan = img(runScan),
+                       printExp = img(runPrintExposure), enlBlur = img(runEnlargerBlur);
   static const CpuImpl raw = tab(bakeRaw), curves = tab(bakeCurves), printTab = tab(bakePrintScan);
   switch (t) {
     case NodeType::FilmTableRaw: return raw;
@@ -610,6 +727,8 @@ const CpuImpl& cpuImpl(NodeType t) {
     case NodeType::FilmPrintScan: return print;
     case NodeType::FilmGlare: return glare;
     case NodeType::FilmScan: return scan;
+    case NodeType::FilmPrintExposure: return printExp;
+    case NodeType::FilmEnlargerBlur: return enlBlur;
     default: return none;
   }
 }
@@ -619,9 +738,12 @@ const NodeBehaviour& behaviour(NodeType t) {
       behaviourFor(NodeType::FilmTableRaw),     behaviourFor(NodeType::FilmTableCurves), behaviourFor(NodeType::FilmTablePrintScan),
       behaviourFor(NodeType::FilmExposure),     behaviourFor(NodeType::FilmBlurExposure), behaviourFor(NodeType::FilmDirField),
       behaviourFor(NodeType::FilmDevelop),      behaviourFor(NodeType::FilmGrain),        behaviourFor(NodeType::FilmPrintScan),
-      behaviourFor(NodeType::FilmGlare),        behaviourFor(NodeType::FilmScan)};
+      behaviourFor(NodeType::FilmGlare),        behaviourFor(NodeType::FilmScan),         behaviourFor(NodeType::FilmPrintExposure),
+      behaviourFor(NodeType::FilmEnlargerBlur)};
   static const NodeBehaviour empty{};
   if (!isFilmNode(t)) return empty;
+  if (t == NodeType::FilmPrintExposure) return table[11];
+  if (t == NodeType::FilmEnlargerBlur) return table[12];
   return table[int(t) - int(NodeType::FilmTableRaw)];
 }
 

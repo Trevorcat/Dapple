@@ -133,6 +133,8 @@ enum class NodeType : std::uint16_t {
   FilmPrintScan,
   FilmGlare,
   FilmScan,
+  FilmPrintExposure,   // enlarger diffusion path: film density -> linear paper exposure (frame-sized planes)
+  FilmEnlargerBlur,    // enlarger diffusion path: Gaussian mixtures of the paper exposure
   Count
 };
 constexpr int kNodeTypeCount = int(NodeType::Count);

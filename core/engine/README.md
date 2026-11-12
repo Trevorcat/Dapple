@@ -18,7 +18,9 @@ Adding a node:
 4. Update snapshots: `DAPPLE_UPDATE_SNAPSHOTS=1 dapple_engine_tests snapshots`, review the diff of tests/engine/graph_snapshots.txt.
 5. Run `dapple_engine_tests keys` (undeclared-influence check on every node/key) and, for table nodes, `conformance`
    (equal key => bit-identical output; has negative controls). A node with a wrong mask fails these.
-6. Golden corpus: `dapple_golden verify tests/engine/golden/corpus.txt off legacy tables` must stay byte-identical.
+6. Golden corpus: `dapple_golden verify tests/engine/golden/corpus.txt off full` must stay byte-identical, and `dapple_golden selfcheck`
+   (old Renderer vs engine on this machine, any architecture) must report 0 differences.
+   A table node's evaluation is its `CpuImpl::bake` (`nodes/main/cpu_nodes.cpp`; `engine::bakeNode`); `EngineSession::runHostTables` caches it.
 Edge `keyed=false` = scheduling edge only (producer key does not enter the consumer key).
 
 ## Planner / executor (CPU engineer, docs/engine/pipeline-architecture.md section 17)
@@ -38,5 +40,7 @@ Edge `keyed=false` = scheduling edge only (producer key does not enter the consu
 ## Film nodes (core/engine/nodes/film)
 Three table nodes (`FilmTableRaw`, `FilmTableCurves`, `FilmTablePrintScan`) and eight image nodes (`FilmExposure` ... `FilmScan`), each with
 its own minimal mask; `GraphDetail::FullFilm` builds them. CPU impls: `filmnode::cpuImpl(type)` / `behaviour(type)` (`film_nodes.h`); the
-whole-frame composition `runFilmFrame` is what a Film group executes (byte-identical with `FilmSimulator::render`). GPU: `film_gpu.h`.
-Gates: `film_nodes.*` (CPU) and `film_gpu.parity` (`-DDAPPLE_GPU=ON`). `DAPPLE_FILM_NODES=0` makes `renderer.cpp` use the simulator again.
+whole-frame composition `runFilmFrame` is what a Film group executes (byte-identical with `FilmSimulator::render`). GPU: `film_gpu.h`. Every film frame runs on the GPU executor (no CPU fallback): strength < 100 (Blend), display curves / look LUT, tiled export (`recordFilmPre` once for the frame, `recordFilmWindow` per tile with `filmWindowHalo`, tiles bit-identical with the whole frame), the exact variant, dye-cloud blur and micro-structure (docs/engine/pipeline-architecture.md 23). A new film pass takes the window origin and hashes noise on absolute coordinates; gate: `gpu_tests --film-tiling` (0 differing pixels), `--coverage` (no film edit may fall back).
+Two more image nodes carry the enlarger diffusion filter (`FilmPrintExposure`, `FilmEnlargerBlur`, identity without the filter) and the highlight boost
+is part of `FilmBlurExposure`; both are driven by `FilmResolved::fx` (docs section 22, `film_boost.comp`, `film_point.comp` MODE 6 / 7).
+Gates: `film_nodes.*` (CPU, `film_nodes.fx` for the two effects) and `film_gpu.parity` (`-DDAPPLE_GPU=ON`, `DAPPLE_GPU_API=gles` for GLES). `DAPPLE_FILM_NODES=0` makes `renderer.cpp` use the simulator again.
