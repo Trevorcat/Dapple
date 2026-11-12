@@ -242,6 +242,9 @@ class DappleBindings {
             lib.providesSymbol('dapple_film_attribution') ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_attribution') : null,
         filmSwatchesJson =
             lib.providesSymbol('dapple_film_swatches_json') ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_swatches_json') : null,
+        filmSwatchBandsJson = lib.providesSymbol('dapple_film_swatch_bands_json')
+            ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_swatch_bands_json')
+            : null,
         progressToCell = lib.providesSymbol('dapple_progress_to_cell')
             ? lib.lookup<ffi.NativeFunction<DappleProgressNative>>('dapple_progress_to_cell')
             : null;
@@ -283,6 +286,7 @@ class DappleBindings {
   final _CStrFnD? filmListJson;
   final _CStrFnD? filmAttribution;
   final _CStrFnD? filmSwatchesJson;
+  final _CStrFnD? filmSwatchBandsJson;
   final ffi.Pointer<ffi.NativeFunction<DappleProgressNative>>? progressToCell;
 
   /// Opens the native library for the current platform. Throws if missing.

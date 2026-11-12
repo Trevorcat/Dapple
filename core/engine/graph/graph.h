@@ -92,6 +92,7 @@ class Graph {
 // How much of the pipeline the builder spells out.
 enum class GraphDetail : std::uint8_t {
   Full,    // every current stage as its own node (snapshot tests, validation, later steps)
+  FullFilm,  // Full, with the film simulation decomposed into its nodes (8.1) instead of the FilmSim super-node
   Legacy,  // the stages stage (a) executes: tables as nodes, everything after them inside LegacyRender
 };
 

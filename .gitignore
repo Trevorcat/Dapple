@@ -17,3 +17,6 @@ compile_commands.json
 
 # generated prototype screenshots
 /design/prototype/shots/
+
+# local Claude Code settings
+/.claude/settings.local.json

@@ -86,8 +86,26 @@ bool buildDiffusionMixture(const DiffusionFilterParams& f, double pixelUm, Mixtu
 
 // Builds everything that depends on the image size (pixel size) and the spatial parameters. `film` supplies the
 // density curves for the grain model. `printPath`: true when a print is made (glare applies).
+//
+// Scale-aware grain (docs/engine/pipeline-architecture.md 14.1 Q8). `full` describes the full-resolution render this frame is
+// a preview of: its pixel pitch (`pixelUm`, > 0) and the scanner stage it applies to the grain (lens blur, unsharp mask: the
+// preview skips them, but they shape the grain the final shows). When this frame's pitch is coarser (k = pitch / pixelUm > 1)
+// the grain is planned so that it is statistically what an area-average (box) downscale by k of the full-resolution grain
+// would be: the pixel-unit grain blur is divided by k and the particle count is divided by the variance factor of
+// box-averaging the full-resolution grain after its blur and scanner stage (grainBoxFactor). nullptr or k <= 1: the plan is
+// exactly the one of the frame itself.
+struct GrainFullRes {
+  double pixelUm = 0;
+  double scanBlur = 0, unsharpSigma = 0, unsharpAmount = 0;
+  double glareBlur = 0;  // the stochastic print glare is averaged the same way
+};
 SpatialPlan makeSpatialPlan(const FilmStock& film, const FilmParams& digested, int W, int H, bool printPath,
-                            const FilmTables& tables, std::string* err);
+                            const FilmTables& tables, std::string* err, const GrainFullRes* full = nullptr);
+
+// Variance of the area-average (box of k full-resolution pixels per axis, phase 0) of white noise passed through
+// grain blur sigma, scanner lens blur and unsharp mask (sigma, amount), relative to the same box average of the
+// unblurred noise (1 for no filtering). 2-D: square of the 1-D factor. Discrete taps as the renderer uses them.
+double grainBoxFactor(double k, double grainBlur, double scanBlur, double unsharpSigma, double unsharpAmount);
 
 // ---- kernels (compiled per instruction set, film_spatial_kernels.inc) ----------------------------------------
 

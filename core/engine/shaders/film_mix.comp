@@ -1,0 +1,106 @@
+#version 450
+// Gaussian-mixture engine of the film nodes (FilmBlurExposure, FilmDirField, glare / scanner blur): single-channel R32F passes
+// mirroring core/src/film_spatial.cpp (mixImpl, levelCombine, downPlane) and the kernels of film_spatial_kernels.inc.
+//   MODE 0  split   RGBA32F channel -> R32F
+//   MODE 1  merge   three R32F -> RGBA32F (alpha 1)
+//   MODE 2  down    2x2 box average, last column / row replicated for odd sizes (down2Row)
+//   MODE 3  base    dst = w0 * src + [Catmull-Rom 2x upsample of up; dim.zw = its size, 0 = none] (levelCombine's accumulator initialisation)
+//   MODE 4  firh    tmp = horizontal FIR with scipy 'reflect' boundary (half taps, unit sum)
+//   MODE 5  firv    dst += vertical FIR of tmp, taps premultiplied by the component weight (read-modify-write)
+layout(local_size_x = 16, local_size_y = 16) in;
+#ifndef MODE
+#define MODE 0
+#endif
+
+layout(std140, binding = 0) uniform P {
+  ivec4 dim;    // w, h (of the output), r, channel / hasUp
+  vec4 s;       // w0 or component weight, 0, 0, 0
+  vec4 taps[5]; // half taps w[0..r] (unit sum), r <= 19
+} u;
+
+#if MODE == 0
+layout(binding = 1) uniform sampler2D uA;
+layout(binding = 2, r32f) uniform writeonly image2D uOut;
+#elif MODE == 1
+layout(binding = 1) uniform sampler2D uA;
+layout(binding = 2) uniform sampler2D uB;
+layout(binding = 3) uniform sampler2D uC;
+layout(binding = 4, rgba32f) uniform writeonly image2D uOut;
+#elif MODE == 2
+layout(binding = 1) uniform sampler2D uA;
+layout(binding = 2, r32f) uniform writeonly image2D uOut;
+#elif MODE == 3
+layout(binding = 1) uniform sampler2D uA;   // src
+layout(binding = 2) uniform sampler2D uB;   // low-resolution accumulator (when hasUp)
+layout(binding = 3, r32f) uniform writeonly image2D uOut;
+#elif MODE == 4
+layout(binding = 1) uniform sampler2D uA;
+layout(binding = 2, r32f) uniform writeonly image2D uOut;
+#else
+layout(binding = 1) uniform sampler2D uA;   // tmp
+layout(binding = 2, r32f) uniform image2D uOut;
+#endif
+
+int reflectIdx(int i, int n) {
+  if (n == 1) return 0;
+  const int period = 2 * n;
+  // floor modulo without the GLSL '%' on negative operands (undefined in the specification)
+  const int q = i >= 0 ? i / period : -((-i + period - 1) / period);
+  i -= q * period;
+  return i < n ? i : period - 1 - i;
+}
+float tap(int k) { return u.taps[k >> 2][k & 3]; }
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.dim.x || p.y >= u.dim.y) return;
+#if MODE == 0
+  imageStore(uOut, p, vec4(texelFetch(uA, p, 0)[u.dim.w], 0.0, 0.0, 0.0));
+#elif MODE == 1
+  imageStore(uOut, p, vec4(texelFetch(uA, p, 0).r, texelFetch(uB, p, 0).r, texelFetch(uC, p, 0).r, 1.0));
+#elif MODE == 2
+  // source size is carried in u.dim.zw
+  const int sw = u.dim.z, sh = u.dim.w;
+  const int ya = min(2 * p.y, sh - 1), yb = min(2 * p.y + 1, sh - 1);
+  float v;
+  if (2 * p.x + 1 < sw)
+    v = 0.25 * (texelFetch(uA, ivec2(2 * p.x, ya), 0).r + texelFetch(uA, ivec2(2 * p.x + 1, ya), 0).r +
+                texelFetch(uA, ivec2(2 * p.x, yb), 0).r + texelFetch(uA, ivec2(2 * p.x + 1, yb), 0).r);
+  else
+    v = 0.5 * (texelFetch(uA, ivec2(2 * p.x, ya), 0).r + texelFetch(uA, ivec2(2 * p.x, yb), 0).r);
+  imageStore(uOut, p, vec4(v, 0.0, 0.0, 0.0));
+#elif MODE == 3
+  float v = u.s.x != 0.0 ? u.s.x * texelFetch(uA, p, 0).r : 0.0;
+  if (u.dim.w > 0) {
+    // levelCombine up path: even / odd output column and row use the two Catmull-Rom phases (t = 0.75 / 0.25)
+    const ivec2 lsz = u.dim.zw;  // size of the low-resolution plane (the allocation is larger)
+    const float wE[4] = float[4](-0.0234375, 0.2265625, 0.8671875, -0.0703125);
+    const float wO[4] = float[4](-0.0703125, 0.8671875, 0.2265625, -0.0234375);
+    const int jy = p.y >> 1, ix = p.x >> 1;
+    const int byy = (p.y & 1) != 0 ? jy - 1 : jy - 2;
+    const int bxx = (p.x & 1) != 0 ? ix - 1 : ix - 2;
+    float acc = 0.0;
+    for (int t = 0; t < 4; ++t) {
+      const int row = reflectIdx(byy + t, lsz.y);
+      float rowAcc = 0.0;
+      for (int k = 0; k < 4; ++k)
+        rowAcc += ((p.x & 1) != 0 ? wO[k] : wE[k]) * texelFetch(uB, ivec2(reflectIdx(bxx + k, lsz.x), row), 0).r;
+      acc += ((p.y & 1) != 0 ? wO[t] : wE[t]) * rowAcc;
+    }
+    v += acc;
+  }
+  imageStore(uOut, p, vec4(v, 0.0, 0.0, 0.0));
+#elif MODE == 4
+  const int r = u.dim.z, w = u.dim.x;
+  float acc = tap(0) * texelFetch(uA, p, 0).r;
+  for (int k = 1; k <= r; ++k)
+    acc += tap(k) * (texelFetch(uA, ivec2(reflectIdx(p.x - k, w), p.y), 0).r + texelFetch(uA, ivec2(reflectIdx(p.x + k, w), p.y), 0).r);
+  imageStore(uOut, p, vec4(acc, 0.0, 0.0, 0.0));
+#else
+  const int r = u.dim.z, h = u.dim.y;
+  float acc = tap(0) * texelFetch(uA, p, 0).r;
+  for (int k = 1; k <= r; ++k)
+    acc += tap(k) * (texelFetch(uA, ivec2(p.x, reflectIdx(p.y - k, h)), 0).r + texelFetch(uA, ivec2(p.x, reflectIdx(p.y + k, h)), 0).r);
+  imageStore(uOut, p, vec4(imageLoad(uOut, p).r + u.s.x * acc, 0.0, 0.0, 0.0));
+#endif
+}

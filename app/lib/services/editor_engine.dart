@@ -10,9 +10,11 @@ import '../model/catalog.dart';
 import '../model/params.dart';
 import '../models.dart';
 import '../state/app_state.dart';
+import '../native/dapple_bindings.dart' show dappleFrameAnalysis, dappleFrameInteractive;
 import '../native/dapple_session.dart';
 import 'adaptive_quality.dart';
 import 'edit_interaction.dart';
+import 'gpu_view_backend.dart';
 import 'perf_probe.dart';
 import 'session_cache.dart';
 
@@ -296,11 +298,13 @@ class EditorEngine extends ChangeNotifier {
       // ADPF target = the drag frame budget; threads: all performance cores (the engine picks them on big.LITTLE)
       DappleSession.configurePerf(targetFrameMs: quality.budgetMs.round());
       PerfProbe.log('perfinfo', DappleSession.perfInfo() ?? const {});
+      PerfProbe.textBench();
     }
     _pollThermal();
     if (photo?.id != p.id) app.sessions.closeDetail(); // the high-resolution session belongs to one photo
     photo = p;
     _neighbors = neighbors;
+    _gpuDetachSession();
     _disposeImages();
     analysis = null;
     originalAnalysis = null;
@@ -409,6 +413,10 @@ class EditorEngine extends ChangeNotifier {
         final params = app.wireParams(ph);
         final rung = quality.rung;
         final editUs = _editUs; // newest edit this frame contains
+        if (_gpuActive) {
+          _submitGpu(s, params, interactive, rung); // zero-copy: the native loop renders and presents (latest wins)
+          continue;
+        }
         final t0 = _clock.elapsedMicroseconds;
         final frame = await s.renderFrame(params,
             longEdge: interactive ? rung.longEdge : finalLongEdge,
@@ -452,7 +460,7 @@ class EditorEngine extends ChangeNotifier {
       _originalTimer?.cancel();
       final g = _gen, ph = photo;
       _originalTimer = Timer(const Duration(milliseconds: 600), () {
-        if (g == _gen && ph != null && original == null && !_busy && !_dirty && !_interactiveNow) unawaited(_loadOriginal(ph, g));
+        if (g == _gen && ph != null && original == null && !_busy && !_dirty && !_interactiveNow && !_gpuInFlight) unawaited(_loadOriginal(ph, g));
       });
     }
   }
@@ -476,6 +484,7 @@ class EditorEngine extends ChangeNotifier {
         placeholder?.dispose();
         placeholder = null;
         _schedulePrefetch();
+        _maybeStartGpu(img);
       }
       final an = frame.analysis;
       if (an != null) {
@@ -521,6 +530,173 @@ class EditorEngine extends ChangeNotifier {
   }
   bool _skipRecord = false;
 
+
+  // ---- zero-copy display (stage d) -----------------------------------------------------------------------
+  // After the first frame of a photo has been shown through the readback path, drag and final frames go to the native
+  // render loop (GpuViewBackend), which draws them straight onto a Flutter texture: no decodeImageFromPixels, no pixels
+  // across isolates. The readback path above stays the permanent fallback (any failure ends in _disableGpu).
+  GpuViewBackend? _gpu;
+  bool _gpuStarting = false, _gpuDisabled = false, _gpuLive = false, _closed = false;
+  int _gpuW = 0, _gpuH = 0, _gpuFails = 0, _gpuSubmitted = 0, _gpuDone = 0, _gpuSubmitMs = 0;
+  final Map<int, ({bool interactive, int editUs})> _gpuMeta = {};
+
+  /// Texture showing the current photo's frames, or null while the readback image is what is on screen.
+  int? get gpuTextureId => _gpuLive ? _gpu?.textureId : null;
+
+  /// Aspect (w / h) of the picture the texture shows, null when the texture is not live.
+  double? get gpuAspect => _gpuLive && _gpuH > 0 ? _gpuW / _gpuH : null;
+
+  /// Width of the newest frame in pixels (0 when not live).
+  int get gpuFrameWidth => _gpuLive ? _gpuW : 0;
+
+  bool get _gpuActive => _gpu != null && _gpu!.ready && !_gpuDisabled && image != null;
+  bool get _gpuInFlight => _gpuSubmitted > _gpuDone;
+
+  void _maybeStartGpu(ui.Image first) {
+    if (_gpu != null || _gpuStarting || _gpuDisabled || !GpuViewBackend.supported) return;
+    _gpuStarting = true;
+    GpuViewBackend.start(first.width, first.height, onFrame: _onGpuFrame).then((b) {
+      _gpuStarting = false;
+      if (b == null) {
+        _gpuDisabled = true;
+        PerfProbe.log('gpu_view', {'enabled': false});
+        return;
+      }
+      if (_closed) {
+        b.dispose();
+        return;
+      }
+      _gpu = b;
+      PerfProbe.log('gpu_view', {'enabled': true, ...?b.info()});
+    });
+  }
+
+  void _submitGpu(DappleSession s, Map<String, dynamic> params, bool interactive, QualityRung rung) {
+    final g = _gpu!;
+    if (_gpuInFlight && _clock.elapsedMilliseconds - _gpuSubmitMs > 3000) {
+      _disableGpu('no frame for 3 s'); // the loop stalled: take the readback path again
+      return;
+    }
+    if (g.boundSession != s.address) g.bindSession(s.address);
+    final seq = g.submit(params,
+        longEdge: interactive ? rung.longEdge : finalLongEdge,
+        flags: (interactive ? dappleFrameInteractive : 0) | dappleFrameAnalysis,
+        bakeSize: interactive ? rung.bake : 0);
+    if (seq <= 0) {
+      _disableGpu('submit failed');
+      return;
+    }
+    if (!_gpuInFlight) _gpuSubmitMs = _clock.elapsedMilliseconds;
+    _gpuSubmitted = seq;
+    _gpuMeta[seq] = (interactive: interactive, editUs: _editUs);
+  }
+
+  void _onGpuFrame(GpuFrameEvent e) {
+    final g = _gpu;
+    if (g == null || _closed) return;
+    if (e.seq > _gpuDone) _gpuDone = e.seq;
+    final meta = _gpuMeta.remove(e.seq);
+    _gpuMeta.removeWhere((k, _) => k < e.seq);
+    if (_gpuSubmitMs != 0 && _gpuInFlight) _gpuSubmitMs = _clock.elapsedMilliseconds;
+    switch (e.status) {
+      case 0: // shown
+        _gpuFails = 0;
+        final firstLive = !_gpuLive;
+        _gpuLive = true;
+        _gpuW = e.width;
+        _gpuH = e.height;
+        final interactive = meta?.interactive ?? false;
+        final an = g.takeAnalysis();
+        if (an != null) {
+          analysis = Analysis.fromJson(an);
+          photo?.nearest ??= analysis!.nearest;
+        }
+        // the texture follows the picture: crop changes alter the aspect, a new screen size alters the final frame size
+        final aspectOff = ((e.width / e.height) / (g.texW / g.texH) - 1).abs() > 0.015;
+        final sizeOff = !interactive && (e.width - g.texW).abs() > g.texW * 0.1;
+        if (aspectOff || sizeOff) {
+          if (aspectOff && interactive) {
+            final k = math.max(g.texW, g.texH) / math.max(e.width, e.height);
+            unawaited(g.resize((e.width * k).round(), (e.height * k).round()));
+          } else {
+            unawaited(g.resize(e.width, e.height));
+          }
+        }
+        if (interactive) {
+          final ms = math.max(e.renderMs, e.presentMs);
+          if (_skipRecord) {
+            _skipRecord = false;
+          } else if (quality.record(ms)) {
+            _skipRecord = true;
+            PerfProbe.log('rung', {'to': quality.rung.toString(), 'ema': quality.emaMs});
+          }
+        }
+        if (kPerfProbe) {
+          final editUs = meta?.editUs ?? -1;
+          PerfProbe.log('frame', {
+            'k': interactive ? 'g' : 'gf', // zero-copy frame
+            'e2p': editUs > 0 ? (_clock.elapsedMicroseconds - editUs) / 1000.0 : -1,
+            'native': e.renderMs,
+            'present': e.presentMs,
+            'lat': e.latencyMs,
+            'w': e.width,
+            'first': firstLive,
+          });
+        }
+        if (an != null || firstLive || !interactive) notifyListeners();
+        if (!interactive && !_gpuInFlight && !_dirty) _gpuIdleTail();
+        break;
+      case 1: // render failed
+        if (++_gpuFails >= 3) _disableGpu('render failed ${e.status}');
+        break;
+      case 2: // present failed: surface / device problems
+        if (++_gpuFails >= 2) _disableGpu('present failed');
+        break;
+      default: // no window / session right now (background): nothing to do, the loop re-renders on attach
+        break;
+    }
+  }
+
+  /// What `_kick` does once things are idle (zoom detail, before/after picture), for frames that finish natively.
+  void _gpuIdleTail() {
+    if (_interactiveNow || _busy) return;
+    if (_zoom > detailMinZoom) _scheduleDetail();
+    if (original == null) {
+      _originalTimer?.cancel();
+      final g = _gen, ph = photo;
+      _originalTimer = Timer(const Duration(milliseconds: 600), () {
+        if (g == _gen && ph != null && original == null && !_busy && !_dirty && !_interactiveNow && !_gpuInFlight) unawaited(_loadOriginal(ph, g));
+      });
+    }
+  }
+
+  /// Back to the readback path for the rest of the process (diagnostics in the perf log).
+  void _disableGpu(String why) {
+    if (_gpuDisabled && _gpu == null) return;
+    debugPrint('gpu view disabled: $why');
+    PerfProbe.log('gpu_view', {'enabled': false, 'why': why, ...?_gpu?.info()});
+    _gpuDisabled = true;
+    _gpuLive = false;
+    final g = _gpu;
+    _gpu = null;
+    g?.dispose();
+    _gpuMeta.clear();
+    _gpuSubmitted = _gpuDone = 0;
+    // the readback image is stale: render the current state through the old path
+    if (!_closed && live) {
+      _dirty = true;
+      unawaited(_kick());
+    }
+    notifyListeners();
+  }
+
+  void _gpuDetachSession() {
+    _gpuLive = false;
+    _gpuMeta.clear();
+    _gpuSubmitted = _gpuDone = 0;
+    final g = _gpu;
+    if (g != null && g.boundSession != 0) g.bindSession(0); // before the session can be closed
+  }
   // ---- neighbour prefetch ----------------------------------------------------------------------------
   // Decoding the next / previous RAW takes ~10 s of CPU and ~350 MB transient memory on a Snapdragon 680 class
   // phone. Started right after the first frame it ran under the user's first drags (no drag frame for 3 s, the
@@ -581,7 +757,7 @@ class EditorEngine extends ChangeNotifier {
     final ph = photo;
     final img = image;
     if (ph == null || img == null || !live || _zoom <= detailMinZoom || _fullWidthPx <= 0) return;
-    if (_busy || _dirty || _interactiveNow) {
+    if (_busy || _dirty || _interactiveNow || _gpuInFlight) {
       _scheduleDetail(); // edits in flight: try again once the view is still
       return;
     }
@@ -713,6 +889,11 @@ class EditorEngine extends ChangeNotifier {
 
   @override
   void dispose() {
+    _closed = true;
+    _gpuLive = false;
+    _gpu?.bindSession(0); // before the sessions are closed
+    _gpu?.dispose();
+    _gpu = null;
     _gen++;
     _tileGen++;
     _detailGen++;

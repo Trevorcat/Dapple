@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "engine/exec/cpu_executor.h"
+#include "engine/plan/plan.h"
+
 namespace dapple::engine {
 
 namespace {
@@ -14,6 +17,7 @@ std::atomic<std::uint64_t> g_nextId{1};
 
 struct Totals {
   std::atomic<std::uint64_t> frames{0}, fullHits{0}, latticeReuse{0}, latticeBake{0};
+  std::atomic<std::uint64_t> planned{0}, planUs{0}, execUs{0}, sweeps{0}, tiles{0}, solveHits{0}, cancelled{0}, fallbacks{0};
 };
 Totals& totals() {
   static Totals t;
@@ -28,7 +32,8 @@ Mode envMode() {
     const char* e = std::getenv("DAPPLE_ENGINE");
     if (!e || !*e || std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return Mode::Off;
     if (std::strcmp(e, "legacy") == 0) return Mode::LegacyBakes;
-    return Mode::Tables;
+    if (std::strcmp(e, "tables") == 0) return Mode::Tables;
+    return Mode::Full;  // "full", "1", anything else
   }();
   return m;
 }
@@ -113,7 +118,163 @@ TableKeys effectiveTableKeys(const Graph& g, const ParamSet& ps, int nLattice) {
 
 // ---- session ------------------------------------------------------------------------------------------------------------
 
-EngineSession::EngineSession() : id_(g_nextId.fetch_add(1)) {}
+EngineSession::EngineSession() : id_(g_nextId.fetch_add(1)) {
+  cache_.setLimit(NodeType::Dehaze, 2);  // frame-global solves (1/4 grids: 15 MB each at 60 MP)
+  cache_.setLimit(NodeType::Detail, 2);
+}
+
+namespace {
+
+// What the planner needs besides the graph: frame size, neighbourhood amounts after quality / region / film.
+PlanRequest makeRequest(const FrameKernels& fk, ExecMode mode, int tile, std::size_t budget, int channels) {
+  PlanRequest rq;
+  rq.frameW = fk.width();
+  rq.frameH = fk.height();
+  rq.mode = mode;
+  rq.tile = tile;
+  rq.memBudget = budget;
+  const SpatialParams& sp = fk.spatial();
+  rq.nrLuma = sp.nrLuma;
+  rq.nrColor = sp.nrColor;
+  rq.dehaze = sp.dehaze;
+  rq.clarity = sp.clarity;
+  rq.texture = sp.texture;
+  rq.sharpen = sp.sharpen;
+  rq.sharpRadius = sp.sharpRadius;
+  rq.grain = sp.grain;
+  rq.scale = fk.spatialScale();
+  rq.vignette = fk.vignetteActive();
+  rq.useGeo = fk.useGeo();
+  rq.outChannels = channels;
+  return rq;
+}
+
+void addStats(EngineStats& st, const ExecStats& es) {
+  st.sweeps += std::uint64_t(es.sweeps);
+  st.tiles += std::uint64_t(es.tiles);
+  st.solveHits += std::uint64_t(es.solveHits);
+  st.solveBuilds += std::uint64_t(es.solveBuilds);
+  st.streamed += es.streamed ? 1 : 0;
+}
+
+}  // namespace
+
+int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out) {
+  FrameKernels fk(job.renderer, job.src, &bake, job.fastOptions);
+  if (!fk.valid()) return 1;
+  const auto t0 = Clock::now();
+  const FramePlan fp = fk.framePlan();
+  Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp);
+  const ValidationResult v = g.validate();
+  if (!v.ok) {
+    out.error = "engine graph: " + v.error;
+    return -1;
+  }
+  g.computeKeys(ps);
+  const Plan plan = Planner::plan(g, makeRequest(fk, ExecMode::Whole, 0, 0, 4), &cache_);
+  {
+    const double ms = msSince(t0);
+    stats_.planMs += ms;
+    totals().planUs.fetch_add(std::uint64_t(ms * 1000.0), std::memory_order_relaxed);
+  }
+  ++stats_.planned;
+  totals().planned.fetch_add(1, std::memory_order_relaxed);
+  if (plan.unsupported) return 1;
+  const int w = fk.width(), h = fk.height();
+  auto* rgba = static_cast<std::uint8_t*>(std::malloc(std::size_t(w) * h * 4));
+  if (!rgba) {
+    out.error = "out of memory";
+    return -1;
+  }
+  ExecEnv env{fk, g, cache_, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, rgba, 4};
+  ExecStats es;
+  const auto t1 = Clock::now();
+  const Status s = CpuExecutor::run(plan, env, &es);
+  {
+    const double ms = msSince(t1);
+    stats_.execMs += ms;
+    totals().execUs.fetch_add(std::uint64_t(ms * 1000.0), std::memory_order_relaxed);
+  }
+  addStats(stats_, es);
+  totals().sweeps.fetch_add(std::uint64_t(es.sweeps), std::memory_order_relaxed);
+  totals().tiles.fetch_add(std::uint64_t(es.tiles), std::memory_order_relaxed);
+  totals().solveHits.fetch_add(std::uint64_t(es.solveHits), std::memory_order_relaxed);
+  if (s == Status::Ok) {
+    out.rgba = rgba;
+    out.w = w;
+    out.h = h;
+    return 0;
+  }
+  std::free(rgba);
+  if (s == Status::Cancelled) {
+    ++stats_.cancelled;
+    totals().cancelled.fetch_add(1, std::memory_order_relaxed);
+    out.error = "cancelled";
+    return -1;
+  }
+  ++stats_.fallbacks;
+  totals().fallbacks.fetch_add(1, std::memory_order_relaxed);
+  if (s == Status::OutOfMemory) {
+    out.error = "out of memory";
+    return -1;
+  }
+  return 1;  // Unsupported (film stage failed ...): the legacy renderer takes the frame
+}
+
+bool EngineSession::renderExact(const EditParams& params, const Renderer& renderer, const SourceImage& src,
+                                const ExactOptions& opt, Image8& out, std::string* err, ExecStats* statsOut) {
+  FastOptions fo;
+  fo.spatial = opt.spatial ? SpatialQuality::Full : SpatialQuality::Off;
+  FrameKernels fk(renderer, src, nullptr, fo);
+  if (!fk.valid()) {
+    if (err) *err = "empty source";
+    return false;
+  }
+  ParamInputs in;
+  in.edit = params;
+  in.frame.exact = true;
+  in.ctx.sourceId = id_;
+  in.ctx.sceneReferred = src.sceneReferred;
+  in.ctx.hasProxy = opt.hasProxy;
+  const std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
+  in.ctx.filmLib = lib.get();
+  in.ctx.srcW = src.linear.width;
+  in.ctx.srcH = src.linear.height;
+  const ParamSet ps = ParamSet::make(std::move(in));
+  const FramePlan fp = fk.framePlan();
+  Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp);
+  const ValidationResult v = g.validate();
+  if (!v.ok) {
+    if (err) *err = "engine graph: " + v.error;
+    return false;
+  }
+  g.computeKeys(ps);
+  const auto t0 = Clock::now();
+  ResultCache local;
+  ResultCache& cache = opt.sessionCache ? cache_ : local;
+  const Plan plan = Planner::plan(g, makeRequest(fk, opt.mode, opt.tile, opt.memBudget, 3), &cache);
+  stats_.planMs += msSince(t0);
+  ++stats_.planned;
+  out.width = fk.width();
+  out.height = fk.height();
+  out.data.resize(std::size_t(out.width) * out.height * 3);
+  ExecEnv env{fk, g, cache, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, out.data.data(), 3};
+  ExecStats es;
+  Status s = plan.unsupported ? Status::Unsupported : CpuExecutor::run(plan, env, &es);
+  addStats(stats_, es);
+  if (statsOut) *statsOut = es;
+  if (s == Status::Unsupported) {  // e.g. the film stage failed: the reference renderer takes the frame
+    ++stats_.fallbacks;
+    out = renderer.render(src);
+    return true;
+  }
+  if (s != Status::Ok) {
+    if (err) *err = s == Status::Cancelled ? "cancelled" : "out of memory";
+    if (s == Status::Cancelled) ++stats_.cancelled;
+    return false;
+  }
+  return true;
+}
 
 std::shared_ptr<const BakedLut> EngineSession::bakeLegacy(FrameJob& job, int n, FrameResult& out) {
   // Step a2: the lookup the C layer used to do, unchanged, inside the engine.
@@ -284,6 +445,11 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   ParamInputs in;
   in.edit = job.params;
   in.frame = job.request;
+  if (job.fastOptions.region.active()) {  // the region is part of what a frame (and its cached solves) depends on
+    const RenderRegion& R = job.fastOptions.region;
+    in.frame.region[0] = R.x0, in.frame.region[1] = R.y0, in.frame.region[2] = R.x1, in.frame.region[3] = R.y1;
+    in.frame.regionLongEdge = R.outLongEdge;
+  }
   in.ctx.sourceId = id_;
   in.ctx.sceneReferred = job.src.sceneReferred;
   in.ctx.hasProxy = job.proxy != nullptr;
@@ -313,6 +479,15 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   int w = 0, h = 0;
   std::uint8_t* rgba = nullptr;
   if (job.gpuHook) rgba = job.gpuHook(*bake, w, h);
+  if (!rgba && mode() == Mode::Full) {
+    const int r = renderFull(job, ps, *bake, out);
+    if (r < 0) return false;
+    if (r == 0) {
+      rgba = out.rgba;
+      w = out.w;
+      h = out.h;
+    }
+  }
   if (!rgba) rgba = job.renderer.renderBakedRgba(job.src, *bake, job.fastOptions, w, h);
   if (!rgba) {
     out.error = "out of memory";
@@ -341,11 +516,20 @@ std::string infoJson() {
   const BakeCounters& c = bakeCounters();
   const Mode m = mode();
   std::string j = "{\"engine\":\"";
-  j += m == Mode::Off ? "off" : (m == Mode::LegacyBakes ? "legacy" : "tables");
+  j += m == Mode::Off ? "off" : (m == Mode::LegacyBakes ? "legacy" : (m == Mode::Tables ? "tables" : "full"));
   j += "\",\"frames\":" + std::to_string(t.frames.load());
   j += ",\"fullHits\":" + std::to_string(t.fullHits.load());
   j += ",\"latticeReuse\":" + std::to_string(t.latticeReuse.load());
   j += ",\"latticeBake\":" + std::to_string(t.latticeBake.load());
+  if (m == Mode::Full) {
+    const std::uint64_t n = t.planned.load();
+    j += ",\"planned\":" + std::to_string(n);
+    j += ",\"planUsPerFrame\":" + std::to_string(n ? t.planUs.load() / n : 0);
+    j += ",\"execUsPerFrame\":" + std::to_string(n ? t.execUs.load() / n : 0);
+    j += ",\"sweeps\":" + std::to_string(t.sweeps.load()) + ",\"tiles\":" + std::to_string(t.tiles.load());
+    j += ",\"solveHits\":" + std::to_string(t.solveHits.load()) + ",\"cancelled\":" + std::to_string(t.cancelled.load());
+    j += ",\"fallbacks\":" + std::to_string(t.fallbacks.load());
+  }
   j += ",\"bakeLatticeEvaluated\":" + std::to_string(c.latticeEvaluated.load());
   j += ",\"bakeLatticeReused\":" + std::to_string(c.latticeReused.load());
   j += ",\"bakeToneTables\":" + std::to_string(c.toneTables.load());

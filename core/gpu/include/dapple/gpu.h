@@ -83,6 +83,11 @@ class Backend : public std::enable_shared_from_this<Backend> {
   std::unique_ptr<Session> createSession();
   // Device memory currently held by pooled working images (bytes).
   std::size_t pooledBytes() const;
+  // Device loss (docs/engine/pipeline-architecture.md 5.9): rebuilds the device once; resident data of sessions is dropped and
+  // re-created lazily (it is reconstructible from the CPU source). False when the rebuild or its self-test failed.
+  bool rebuild(std::string& err);
+  int rebuilds() const;      // device rebuilds so far
+  bool deviceLost() const;   // the current device reported a loss
 
   struct Impl;
 
@@ -113,6 +118,14 @@ class Session {
 
   // Full-picture export in tiles (interior + halo; large-scale operators are analysed once for the whole picture), so
   // 60 MP fits mobile memory and the maximum image size. The source is streamed per tile when it is not resident.
+  // Classification of the last failed call (render / exportTiled), for the engine selection: Unsupported = this plan cannot
+  // run on the GPU (CPU renders it, the GPU stays in use); Transient = this frame goes to the CPU, the session stays on the
+  // GPU; DeviceLost = rebuild once, then sticky CPU.
+  enum class Failure { None, Unsupported, Transient, DeviceLost };
+  Failure lastFailure() const;
+  // Test seam: the next `count` render / exportTiled calls fail with this classification before touching the device.
+  void injectFailure(Failure f, int count = 1);
+
   bool exportTiled(const Renderer& r, const SourceImage& src, const BakedLut& lut, const FastOptions& opt,
                    const ExportOptions& eo, FrameStats* stats, std::string& err);
 

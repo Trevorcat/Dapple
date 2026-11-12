@@ -5,6 +5,7 @@ hardware decoding first (FFmpeg's `h264_mediacodec` / `hevc_mediacodec`), FFmpeg
 what no phone decoder handles correctly (Sony XAVC S / S-I / HS: H.264 High 4:2:2 Intra and 10-bit, HEVC 10-bit 4:2:2),
 and the PCM audio decoders for Sony's LPCM soundtrack. It is a small separate build, not the FFmpeg that ships with any
 other product. Dapple does not encode with FFmpeg: the clip is encoded with the platform MediaCodec encoders.
+For 10-bit 4:2:0 streams on devices whose hardware decoder passed the one-time self-test (docs/engine/codec-capability.md), the core drives the platform decoder directly through the NDK `AMediaCodec` API (output `COLOR_FormatYUVP010`; FFmpeg's MediaCodec wrapper only returns 8-bit) and uses FFmpeg's libswscale for the conversion; that is Dapple code (`core/video/dapple_video.cpp`) calling the platform's `libmediandk`, no FFmpeg code is involved in the decoding itself.
 
 ## What is used
 

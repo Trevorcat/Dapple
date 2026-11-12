@@ -33,6 +33,7 @@ endif()
 
 # name | source | defines (comma separated) | descriptor bindings after the uniform block (I storage image,
 # S sampled image + sampler, B storage buffer). The binding string is checked against the shader by the self-test.
+set(_SH "${PROJECT_SOURCE_DIR}/core/engine/shaders")
 set(DAPPLE_GPU_SHADERS
   "point|point.comp||SBSSII"
   "sep_d2y|sepconv.comp|IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
@@ -54,7 +55,14 @@ set(DAPPLE_GPU_SHADERS
   "gf_ab|gf_ab.comp||SI"
   "detail|detail.comp||ISSSI"
   "resize|resize.comp||SI"
-  "convert|convert.comp||BI")
+  "convert|convert.comp||BI"
+  "bx_d2y|boxscan.comp|IN_MODE=1|SI"
+  "bx_y|boxscan.comp|IN_MODE=0|SI"
+  "bx_y_v|boxscan.comp|VERT=1,IN_MODE=0|SI")
+
+# film nodes (engineer: film): shader variants + sources
+include("${PROJECT_SOURCE_DIR}/core/engine/nodes/film/film_gpu.cmake")
+list(APPEND DAPPLE_GPU_SHADERS ${DAPPLE_FILM_GPU_SHADERS})
 
 set(_gen "${CMAKE_CURRENT_BINARY_DIR}/gen")
 file(MAKE_DIRECTORY "${_gen}")
@@ -78,12 +86,12 @@ foreach(_entry ${DAPPLE_GPU_SHADERS})
   set(_h "${_gen}/${_name}_spv.h")
   add_custom_command(OUTPUT "${_h}"
     COMMAND "${DAPPLE_GLSLC}" -O --target-env=vulkan1.0 -fshader-stage=compute ${_dargs}
-            -I "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
-            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_src}" -o "${_spv}"
+            -I "${_SH}"
+            "${_SH}/${_src}" -o "${_spv}"
     COMMAND ${CMAKE_COMMAND} -DSPV=${_spv} -DOUT=${_h} -DNAME=g_${_name}_spv
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${_src}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.glsl"
-            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+            -P "${_SH}/cmake/embed_spv.cmake"
+    DEPENDS "${_SH}/${_src}" "${_SH}/common.glsl"
+            "${_SH}/cmake/embed_spv.cmake"
     COMMENT "glslc ${_name} (${_src})")
   list(APPEND _spv_headers "${_h}")
   string(APPEND _inc_headers "#include \"${_name}_spv.h\"\n")
@@ -93,11 +101,16 @@ endforeach()
 file(GENERATE OUTPUT "${_gen}/shader_table.inc"
   CONTENT "${_inc_headers}\nconst ShaderBin kShaders[] = {\n${_inc_table}};\nconst std::size_t kShaderCount = sizeof(kShaders) / sizeof(kShaders[0]);\n")
 
+set(_E "${PROJECT_SOURCE_DIR}/core/engine")
 add_library(dapple_gpu STATIC
-  src/vk_core.cpp src/frame.cpp src/session.cpp src/hook.cpp src/parity.cpp src/gpu_bench.cpp ${_spv_headers})
+  ${_E}/hal/hal.cpp ${_E}/hal/vk/vk_device.cpp ${_E}/exec/gpu_scheduler.cpp ${_E}/exec/gpu_executor.cpp ${_E}/exec/gpu_frame.cpp
+  ${_E}/nodes/gpu_common.cpp ${_E}/nodes/point/gpu.cpp ${_E}/nodes/nr/gpu.cpp ${_E}/nodes/dehaze/gpu.cpp ${_E}/nodes/detail/gpu.cpp
+  ${_E}/nodes/resize/gpu.cpp ${_E}/nodes/gpu_nodes.cpp ${DAPPLE_FILM_GPU_SOURCES}
+  src/hook.cpp src/parity.cpp src/gpu_bench.cpp ${_spv_headers})
 target_include_directories(dapple_gpu
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  PRIVATE "${_hdr}/include" "${_volk}" "${_gen}" "${PROJECT_SOURCE_DIR}/cli")
+  PRIVATE "${_hdr}/include" "${_volk}" "${_gen}" "${PROJECT_SOURCE_DIR}/cli" "${PROJECT_SOURCE_DIR}/core" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(dapple_gpu PRIVATE "${PROJECT_SOURCE_DIR}/core/src")  # film nodes read the film tables
 target_compile_definitions(dapple_gpu PUBLIC DAPPLE_HAVE_GPU=1 PRIVATE VK_NO_PROTOTYPES)
 target_sources(dapple_gpu PRIVATE "${_volk}/volk.c")
 set_source_files_properties("${_volk}/volk.c" PROPERTIES LANGUAGE C)

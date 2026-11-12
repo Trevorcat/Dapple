@@ -730,6 +730,30 @@ Grain caveat to carry into product decisions (FA 5b): grain depends on absolute 
 
 `E`, `E2`, `q`, `d` are `F32` (declared through `requiredPrecision`) in v1: the spec's dynamic range is large and the CPU path is float. `F16Ok` is a later per-node experiment only after parity data (it halves the 36 B/px figure on devices with limited memory).
 
+### 8.7 As built (film engineer, 2026-11-12)
+
+Code: `core/engine/nodes/film/` (`film_nodes.h` API, `film_tables.cpp`, `film_cpu.cpp`, `film_frame.cpp`, `film_gpu.{h,cpp}`, `film_gpu.cmake`), shaders `core/engine/shaders/film_{point,mix,grain,post}.comp`, tests `tests/engine/film_nodes_tests.cpp` (CPU, ctest `film_nodes.*`) and `tests/engine/film_gpu_tests.cpp` (`film_gpu.parity`, only with `-DDAPPLE_GPU=ON`).
+
+| Node (`NodeType`) | Foot. | Own mask (inherited keys come through keyed edges) | Out |
+|---|---|---|---|
+| `FilmTableRaw` | T | `filmStock`, `ctx.filmLib` | mIn + padded raw LUT |
+| `FilmTableCurves` | T | `filmStock`, `ctx.filmLib` (the curves do not depend on the paper) | density / pre-coupler curves, DIR matrix |
+| `FilmTablePrintScan` | T | `filmStock`, `filmPaper`, `film_warmth`, `film_tint`, `ctx.filmLib` | 33^3 print + scan LUT, glare white, sRGB decode |
+| `FilmExposure` | P | `temp`, `tint`, `exposure`, `film_exp`, `ctx.camera`, `ctx.source`, `ctx.filmLib` (gain folded into the input matrix: byte-identical) | `E`, planar F32 |
+| `FilmBlurExposure` | W+G | frame-size keys, `film_halation`, `filmStock`, `ctx.filmLib` | `E2` |
+| `FilmDirField` | W+G | frame-size keys, `ctx.quality`, `filmStock` | `q` (half-resolution path when all widths >= 3.2 px) |
+| `FilmDevelop` | P | none (tables + inputs) | density `d` |
+| `FilmGrain` | W | frame-size keys, `film_grain`, `ctx.quality`, `ctx.keepGrain`, `ctx.frameIndex`, `ctx.fullLongEdge` | `d` |
+| `FilmPrintScan` | P | none | display RGB |
+| `FilmGlare` | W | frame-size keys, `filmPaper`, `ctx.quality`, `ctx.frameIndex` | linear light + glare |
+| `FilmScan` | W | frame-size keys, `filmPaper`, `ctx.quality` | display RGB (scanner blur, unsharp, encode) |
+
+- Graph: `GraphDetail::FullFilm` builds the film branch from these nodes (`Full` still uses the `FilmSim` super-node; flipping `Full` is the CPU engineer's call). Identity nodes are elided at plan time (`NodeBehaviour::isIdentity`); a warmth drag moves `FilmTablePrintScan` and what follows, a grain drag `FilmGrain` and what follows, halation `FilmBlurExposure` and what follows (test `film_nodes.graph`).
+- CPU: each `run()` is a piece of `renderSpatial()` on a window (planar F32 intermediates, `ImageView::planeStrideFloats`), the same SIMD kernels in the same order; the composition (`runFilmFrame`, tile 256 x 64, halo accumulated backwards) is byte-identical with `FilmSimulator::render` on every case of `film_nodes.equiv`. `renderer.cpp runFilmStage` calls it (`DAPPLE_FILM_NODES=0` returns to the simulator); the golden corpus is byte-identical in all four modes with the nodes on.
+- Not ported (the frame falls back to the simulator): highlight boost (`boostEv`, never set by the app) and the enlarger diffusion split print path (never set by the app), grain micro-structure (inactive below ~0.6 um pixels).
+- Scale-aware grain (14.1 Q8): `ctx.fullLongEdge` names the full-resolution render a smaller frame previews. `makeSpatialPlan(..., GrainFullRes*)` divides the grain blur by the pitch ratio k and the particle count by the variance factor of box-averaging the full-resolution grain after its blur and scanner unsharp mask (`grainBoxFactor`); print glare noise gets the same treatment. Interactive frames keep grain while a grain-family slider is dragged (`ctx.keepGrain`). Video: `ctx.frameIndex` enters the grain / glare hash streams (frame 0 keeps the still's seed).
+- GPU: `recordFilmFrame` appends the passes to a `GpuGraph`; the tables are the CPU bake uploaded as is. Mixtures run per channel on R32F planes through a port of `mixImpl` (pyramid down / Catmull-Rom up / FIR); grain, glare noise and the scan stage are ports of the CPU hash kernels. Porting rules found on the way: never use GLSL `%` on negative operands (NVIDIA returned a result that broke every reflect boundary), and never take `textureSize` of a pooled transient (its allocation is larger than the frame).
+
 ---
 
 ## 9. Display path and frame loop (stage d, interface only)
@@ -764,19 +788,27 @@ class RenderLoop {                      // one per editor view; owns the render 
 
 ### 10.2 Stage (a): CPU renderer to nodes, bit-identical
 
-| Step | Change | Gate |
-|---|---|---|
-| a0 | Golden corpus + hash harness (`tests/engine/golden`), recorded from current `Renderer`; `edit-bench` baseline numbers on the throttle profiles | corpus passes on current code; baseline file committed |
-| a1 | `core/engine/graph`: types, `ParamSet` + registry (from `paramFields()` + extra keys), hashing, `NodeDesc`, validation, `GraphBuilder` that builds the graph **without executing it**; descriptors for all current stages | graph snapshot tests per scenario; declaration-conformance harness exists (nodes still empty) |
-| a2 | `EngineSession` with one super-node `LegacyRender` that calls `Renderer::renderBakedImpl`; `dapple_session_render_frame` routes through it behind `DAPPLE_ENGINE` (default off) | **B** (trivially), **P** |
-| a3 | Table nodes: `ColourLattice`, `LatticeOverflow`, `ToneAnalysisPre`, `ToneTable`, `Analysis` using the existing `Renderer::bake` pieces; `ResultCache` replaces `bakes[3]` and `pointKey()/colourKey()` | **B**; reuse decisions equal the old ones on the edit-bench drag scenarios (same lattice-reuse counts); conformance test passes for all table nodes |
-| a4 | `Resize` node replaces `scaledSource` | **B** |
-| a5 | Pixel group: `Geometry+Gain+ToneColour+Vignette+Pack8` as CPU block fragments in the same float order as `renderBakedImpl`'s per-pixel loop (same `-ffp-contract`, same `LutSampler`) | **B** (RGBA8 and float), **P** |
-| a6 | Spatial nodes one by one wrapping `spatial.cpp` functions on whole-frame planes: `NRLuma`, `NRChroma`, `Dehaze`, `Detail`, `Grain` (declared halos, executed whole-frame) | **B** after each; halo and declaration conformance pass |
-| a7 | Film: `FilmSim` super-node wrapping `acquireSimulator/setParams/render/renderRows` (including the streaming 8-bit sink path), `DisplayStages`, `Blend` | **B** on the film corpus; `film.*` tests unchanged |
-| a8 | Delete `LegacyRender`; `Renderer` stays as a thin facade (tests/CLI) built on the exact variant; `DAPPLE_ENGINE` default on | **B** everywhere; all existing ctest suites green |
-| a9 | CPU `TiledExport`: tiles + halos + sweeps for the spatial nodes; `SourceStore` interface with the in-memory implementation | **S** (tiled vs whole: dE mean < 0.01, max 1 code, 5.5); 60 MP synthetic export under the memory budget (measured with the harness in `build/arch-scratch`-style scratch builds) |
-| a10 | Cancellation tokens through executor and `ThreadPool` chunk loop; additive `dapple_session_cancel` | cancel latency test (< 1 chunk); no change in outputs (**B**) |
+| Step | Change | Gate | Status |
+|---|---|---|---|
+| a0 | Golden corpus + hash harness (`tests/engine/golden`), recorded from current `Renderer`; `edit-bench` baseline numbers on the throttle profiles | corpus passes on current code; baseline file committed | **done** (148-hash corpus, `dapple_golden`; edit-bench baseline recorded 2026-11-12) |
+| a1 | `core/engine/graph`: types, `ParamSet` + registry (from `paramFields()` + extra keys), hashing, `NodeDesc`, validation, `GraphBuilder` that builds the graph **without executing it**; descriptors for all current stages | graph snapshot tests per scenario; declaration-conformance harness exists (nodes still empty) | **done** (IR headers stable 2026-11-12T11:51+08:00; 36 snapshots; keys + conformance + negative controls) |
+| a2 | `EngineSession` with one super-node `LegacyRender` that calls `Renderer::renderBakedImpl`; `dapple_session_render_frame` routes through it behind `DAPPLE_ENGINE` (default off) | **B** (trivially), **P** | **superseded** (owner: no LegacyRender path; the thin router exists behind `DAPPLE_ENGINE`, B + P hold) |
+| a3 | Table nodes: `ColourLattice`, `LatticeOverflow`, `ToneAnalysisPre`, `ToneTable`, `Analysis` using the existing `Renderer::bake` pieces; `ResultCache` replaces `bakes[3]` and `pointKey()/colourKey()` | **B**; reuse decisions equal the old ones on the edit-bench drag scenarios (same lattice-reuse counts); conformance test passes for all table nodes | **done as table nodes** (B hold in off/legacy/tables; reuse counts identical: bake 24 / reuse 52 / hit 50) |
+| a4 | `Resize` node replaces `scaledSource` | **B** | **partial** (Resize node exists; CPU path is a pass-through of the caller's scaled source; `scaledSource` still lives in the session) |
+| a5 | Pixel group: `Geometry+Gain+ToneColour+Vignette+Pack8` as CPU block fragments in the same float order as `renderBakedImpl`'s per-pixel loop (same `-ffp-contract`, same `LutSampler`) | **B** (RGBA8 and float), **P** | **done** (fused PointChain block fragments, golden_full byte-identical) |
+| a6 | Spatial nodes one by one wrapping `spatial.cpp` functions on whole-frame planes: `NRLuma`, `NRChroma`, `Dehaze`, `Detail`, `Grain` (declared halos, executed whole-frame) | **B** after each; halo and declaration conformance pass | **done** (tile functions with halos; tiled vs whole dE mean <= 0.00013) |
+| a7 | Film: `FilmSim` super-node wrapping `acquireSimulator/setParams/render/renderRows` (including the streaming 8-bit sink path), `DisplayStages`, `Blend` | **B** on the film corpus; `film.*` tests unchanged | **partial** (FilmSim super-node on CPU; film node chain runs inside `renderer.cpp` `runFilmStage`, 0 differing floats vs simulator; `GraphDetail::FullFilm` not yet the planner's graph) |
+| a8 | Delete `LegacyRender`; `Renderer` stays as a thin facade (tests/CLI) built on the exact variant; `DAPPLE_ENGINE` default on | **B** everywhere; all existing ctest suites green | **not done** (`Renderer` still owns the old render path; `DAPPLE_ENGINE` default still off) |
+| a9 | CPU `TiledExport`: tiles + halos + sweeps for the spatial nodes; `SourceStore` interface with the in-memory implementation | **S** (tiled vs whole: dE mean < 0.01, max 1 code, 5.5); 60 MP synthetic export under the memory budget (measured with the harness in `build/arch-scratch`-style scratch builds) | **done** (TiledExport; 60 MP export 4.5 s, 442 MB added) |
+| a10 | Cancellation tokens through executor and `ThreadPool` chunk loop; additive `dapple_session_cancel` | cancel latency test (< 1 chunk); no change in outputs (**B**) | **done** (cancel 4 ms after 150 ms request; C++ side only, no Dart binding) |
+**Status of a0-a3 (2026-11-12; desktop i7-14700KF, build `build/engine-a`, all 42 ctest entries green).**
+
+1. *a0.* `tests/engine/golden/golden_tests.cpp` (exe `dapple_golden`, ctest `engine.golden_off|legacy|tables`) renders 148 frames through `dapple_session_render_frame` (plus core-API renders: RGBA8 direct, float baked and direct, bake tables) on synthetic scenes (no private photos) and hashes pixels and analysis JSON: direct/exact, baked final and interactive, bake sizes, region, geometry (crops, rotations, straighten), curves, grading and HSL, grain, tonal class (fast vs exact analysis), all 9 looks, each detail stage and all together, a LUT, film (full, 50 % blend, 0 %, off, spatial, geometry, region, exact), and drag sequences (exposure, saturation, clarity, contrast + tonal class, NR, JPEG source, revisits A B A C A D, bake-size flows) so that cache state is part of what is hashed. Corpus: `tests/engine/golden/corpus.txt`, tagged `arch=x86_64 avx2=1 film=1`; a run on another platform exits 77 (skipped) because the film kernels pick AVX2 at run time. Baseline numbers: `docs/engine/baselines/edit-bench-desktop.txt` (default threads and `DAPPLE_THREADS=8`; the throttle profiles were not run).
+2. *a2.* `DAPPLE_ENGINE` unset or `0` = old path, untouched; `legacy` = `EngineSession` with `LegacyRender` and the old `bakes[3]` lookup inside it; `1` = a3. Gate P (edit-bench on a 24 MP ARW, `--quick --repeat 20`, interleaved off / legacy / tables, 3 rounds, medians): sum of the 14 "new path" rows 402.4 / 400.7 / 400.3 ms with all threads (tables/off 0.995) and 582.1 / 583.5 / 584.5 ms with `DAPPLE_THREADS=8` (1.004). Single rows move between -9 % and +9 % in both directions, and the same row varies up to 1.5x between runs of the same mode (shared machine), so the evidence is "no slowdown beyond noise", not a speed-up. The graph and key work costs 3.5 us per frame (note 5), less than the 34.7 us the old `pointKey()` + `colourKey()` JSON strings cost.
+3. *a3.* The table nodes (`ColourLattice`, `LatticeOverflow`, `ToneAnalysisPre`, `ToneTable`, `Analysis`) are thin wrappers over new `Renderer::bakeColourLattice / bakeTonePre / bakeToneTable / bakeAnalysis`, which copy the steps of `Renderer::bake` (itself unchanged, so the old path stays the oracle). `ResultCache` replaces `bakes[3]`: FIFO, 3 assembled bakes, a lattice lives while a retained bake refers to it, lookup by lattice family with "finest at least as fine as asked", which reproduces the old reuse rule. Lattice-reuse counts: bake / lattice-reuse / full-hit = 24 / 52 / 50 of 126 frames for old and new on the synthetic edit-bench sequences (identical frame by frame, identical pixels and analysis), and 24 evaluated / 52 reused lattices on the real-RAW `edit-bench --quick` for old, `legacy` and new alike. Differences that are improvements: the tonal analysis is lazy (computed only when the frame asks for it; the old bake always ran the exact analysis on final frames), a tone table is not rebuilt when the lattice changes but the tone parameters do not (toneStrength = 0), and the colour lattice key depends on `ctx.filmOnly` instead of the whole film parameter block, so a film change that does not alter the normal render reuses the lattice (golden frames `film/strength0` and `film/off` are full hits in the engine and bakes in the old path; pixels identical). `LatticeOverflow` exists, is cached and tested, but only a GPU executor demands it (`FrameRequest.wantOverflow`); the CPU renderer still builds it lazily inside `renderBakedImpl`.
+4. *Declaration conformance.* Key level (`engine.keys`): 55 842 (node, key, variant) checks, no undeclared influence. Output level (`engine.conformance`: 7 baselines including a LUT, tone move fast and exact, film-only and film blend; 1 541 node evaluations): 2 243 equal-key checks with bit-identical output, plus negative controls (removing `contrast` from `ToneTable` or `saturation` from `ColourLattice` is caught). Two deviations are documented and enforced by name (a new one fails the test). (a) `crop`, `straighten` and `vignette` change the output of `ToneAnalysisPre`, of `ToneTable` (when the tonal-class move is on) and of `Analysis`, because `Renderer::bake` analyses the proxy with geometry and vignette while the old `pointKey()` masks them: **the old cache returns a stale tonal analysis / tone-class move after a crop or vignette change** (worked example 3 in 5.7 assumes the uncropped analysis, which is what the keys say and the code does not do). The engine reproduces the old behaviour because gate B is byte identity; fixing it (analyse the uncropped proxy) changes pixels and needs its own re-baselined step. (b) `ctx.fastAnalysis` changes the analysis output but is not in the key: an interactive frame analyses through the lattice, a final frame exactly, and both belong to the same bake (old semantics; edit-bench shows the same dE within 1e-4 on its drag scenarios). One more difference to the old code: an analysis requested for a bake that was made without one is computed when asked, in the requesting frame's mode, whereas the old bake always carried one made in its own mode.
+5. *Overhead micro-benchmark* (`engine.overhead`; host, best of 7 x 4000 frames; interactive frame with tone move, analysis, curves and 3 cache lookups): `ParamSet::make` 0.92 us (116 keys), graph build 0.28 us, validate 1.03 us, key computation 1.05 us; total **3.5 us** per frame with the legacy graph and 3.8 us with the full 22-node graph. Budget: 0.2 ms on the low-end profile x 0.14 (risk 8) = **28 us on the host**; margin 7x. Not measured: the same code on a phone (arm64 or the throttled emulator). There is no plan cache yet (no planner exists before a5); the graph is rebuilt every frame, by design (4.6).
+6. *C API.* Unchanged except the additive `dapple_engine_info_json()` (engine mode and counters; `edit-bench` prints it). The builder implements the Q8 rule (grain kept in interactive frames while a grain-family slider is dragged; snapshot `grain_dragged_interactive`), but `DappleFrameRequest` has no `activeParam` field yet, so the Dart side cannot send it until that additive field is added.
 
 Out-of-scope for (a) (and therefore separate, flagged): changing CPU `Resize` to Lanczos (Q2), `SourceStore` file-backed implementations (Q3).
 
@@ -792,6 +824,8 @@ Out-of-scope for (a) (and therefore separate, flagged): changing CPU `Resize` to
 | b5 | (optional, Q4) `ColourLattice` GPU bake node; CPU stays the oracle | parity of lattice values (max abs error on encoded 0..1), end-to-end dE; **only if Q1 measurements show the CPU bake dominates on low-end** |
 | b6 | `SourceStore` implementations `InMemoryHalf` and `MappedHalf` (Q3) | memory gate for 60 MP export (<= 500 MB added), **S** |
 
+**Status of stage (b) (2026-11-12, integrator).** b0 done (`hal/vk`, Pixel 5 fixes kept; tests `engine.gpu_hal`). b1 done (`gpu_scheduler`; `engine.gpu_sched`). b2 partly: record functions and parity table pass (mean <= 0.073, p99 <= 0.87 vs budget 0.1/1.0; seams 0 pixels), but the GPU frame is still the fixed-order `gpu_frame.cpp`, **not driven by the Planner's stage list**. b3 partly: per-frame fallback and rebuild-once selection live in `core/gpu/src/hook.cpp` behind `EngineSession::gpuHook`; `GpuExecutor` consuming `Plan` does not exist. b4: CPU film nodes done (byte identical, in the renderer); GPU film passes parity (`film_gpu.parity`) but `recordFilmFrame` is not called from `gpu_frame.cpp`, and the GPU film is slower than the 28-thread CPU at 1600 px. b5, b6 not started.
+
 What happens to phase-1 code:
 
 | Phase-1 item | Decision |
@@ -805,6 +839,9 @@ What happens to phase-1 code:
 | `parity.cpp`, `gpu_tests.cpp`, `gpu_bench.cpp` | **Keep as the gate**, port to the engine API; bench becomes `dapple engine-bench` |
 
 ### 10.4 Stage (c): GLES 3.1 backend
+
+Status: `hal/gles/**` and `shader_list.cmake` were started by another engineer; not built or run by the integrator. c2-c4 not started.
+
 
 | Step | Change | Gate |
 |---|---|---|
@@ -823,6 +860,8 @@ What happens to phase-1 code:
 | d3 | ADPF GPU/CPU hints, `AThermal` ladder wired to GPU knobs, low-battery policy, background release (`trim`), `DeviceLost` rebuild | 20-minute continuous edit thermal run (GB phase 4 criterion) |
 | d4 | Find N5 measurement (Q1): frame times, power, 120 Hz behaviour; low-end device pass | targets of 1.3 |
 
+**Status of stage (d).** d1 done on the x86_64 emulator (SwiftShader): Vulkan swapchain on the SurfaceProducer Surface. d2 done: `RenderLoop`, `dapple_view_*`, `GpuViewBackend`; frames still come from the host-RGBA render, so no zero-readback yet (needs the GPU executor to render into the presenter's VkImage). d3, d4 not started; nothing measured on a phone.
+
 ### 10.6 C API stability
 
 - All existing exported functions keep signature and semantics. `DappleFrameRequest` is size-versioned (`size` field): new fields are appended; flags get new bits only.
@@ -832,6 +871,16 @@ What happens to phase-1 code:
 - New, additive: `dapple_session_cancel`, `dapple_engine_info_json` (executor, API, device key, budgets), the `dapple_view_*` family in stage (d).
 
 ---
+
+### 10.7 What remains before the old paths can be deleted (integrator, 2026-11-12)
+
+**`core/src/renderer.cpp` render path (`renderBakedImpl`, `renderFloat`, `Renderer::render`).** Still the kernels: `FrameKernels` wraps their per-pixel loops, and `Renderer::render` is the byte-identity oracle and the fallback when a CPU node has no impl or film `setParams` fails. Needed first: (1) `DAPPLE_ENGINE=full` default on (golden_full is green, but app and edit-bench A/B on a phone not run); (2) look previews, tone previews, HDR and pano paths moved onto the engine; (3) `scaledSource` moved into the Resize node (a4); (4) table nodes baked through `CpuImpl::bake` instead of `EngineSession::bakeTables`; (5) kernels physically moved out of `renderer.cpp` and the oracle role taken by the golden corpus; (6) `FullFilm` graph adopted by the planner.
+
+**`core/gpu` (`gpu_frame.cpp`, `session.cpp`, `hook.cpp`, `parity.cpp`).** Needed: (1) a `GpuExecutor` that consumes `Plan` stages and calls `gpuImplFor(...).recordPorts` (recipe selection, epilogue); (2) the lattice cache and resident source on `ResultCache`/`SourceStore`; (3) selection logic in `EngineSession` replacing `gpuHook`; (4) `dapple_gpu_tests` and `gpu_bench` ported to the engine API; (5) on-device pass on the Pixel 5 (box-scan threshold, vertical scan on Adreno, 24 MP submission splitting, export tile 1024).
+
+**Film scheduler (`FilmSimulator::render`, `film_spatial` plans).** Needed: (1) planner uses the node chain (`FullFilm`) and tiles it (film frames are Whole only, 36 B/px at 26 MP); (2) GPU film wired into the executor and made faster than the CPU (dispatch-count bound: batch mixture components, fuse channels); (3) `SessionCtx::gainFn`, `FastOptions::{keepGrain,fullLongEdge,frameIndex}` set by the C layer so previews are scale-aware; (4) highlight boost and enlarger diffusion paths ported or dropped.
+
+**Display.** Zero-readback requires the HAL to enable `VK_KHR_swapchain`/`VK_KHR_android_surface` or hand device handles to the presenter, and the executor to render into the presenter's image.
 
 ## 11. Rejected alternatives
 
@@ -951,3 +1000,65 @@ Mobile GPU rules (apply to every kernel and to the HAL):
 7. **Readback**: the host-visible buffer types are limited by `memoryTypeBits` (Adreno: only cached+coherent, read at ~1 GB/s). Pin the thread that waits and copies to the big cores (done in `Session::render`; copy-out 12-49 ms -> 10-14 ms). For a cached mapping use `AHardwareBuffer` (`CPU_READ_OFTEN`) or avoid readback.
 8. **Memory**: default pool budget (1 GB cap) is too high for 7.6 GB phones; use export tile 1024 on mid-range devices (pool ~320 MB).
 9. Persist the device key (`vendor:device:driverVersion`) with the self-test result; query `memoryTypeBits` per buffer, never assume a memory type.
+
+## 17. CPU planner and executor (steps a4b - a10, CPU engineer, 2026-11-12)
+
+Status: **landed behind `DAPPLE_ENGINE=full`** (`off`, `legacy`, `tables` still work). Numbers are measured on the desktop (i7-14700KF, `build/v4-cpu`, llvm-mingw clang -O3, other builds running: edit-bench rows vary +-8 % between runs).
+
+### 17.1 What landed
+
+| Piece | Where |
+|---|---|
+| `Plan`, `Planner` (fusion, tile + halo propagation, sweep structure, cache decisions, memory estimate) | `core/engine/plan/plan.h`, `planner.cpp` |
+| `CpuExecutor` (block-fragment head chain, window nodes on tiles, frame-global solves, latest-wins cancellation) | `core/engine/exec/cpu_executor.{h,cpp}` |
+| `CpuImpl` of every main-pipeline node: `Source, Resize, Geometry, Gain, ToneColour(Exact), Vignette, DisplayStages, Blend` (block fragments), `NRLuma, NRChroma, Dehaze, Detail, Grain, FilmSim, Pack8` (tile fns). Tables stay in `EngineSession` (HostTable stage) | `core/engine/nodes/main/cpu_nodes.cpp` |
+| Kernel facade: the per-pixel loop of `renderBakedImpl` / `renderFloat` as block operations (`FrameKernels`), a recycled float frame (`ScratchFrame`) | `core/src/frame_kernels.h`, tail of `core/src/renderer.cpp` |
+| Spatial stages one by one with the frame-global solves split out (`stageNRLuma ... stageGrain`, `dehazeLowGrid/Solve/Apply`, `lumaGrid/guidedSolveGrid`); `applySpatial` now calls them | `core/src/spatial.{h,cpp}` |
+| `Mode::Full`, `EngineSession::renderFull / renderExact / cancel`; export and the exact frames go through the executor | `engine_session.*`, `c_api.cpp` (`engineRenderExact`) |
+| Cancellation through the pool chunk loop (`CancelScope`), additive `dapple_session_cancel` | `core/src/parallel.h`, `dapple_c.h` |
+| Tests: `dapple_exec_tests` (`whole tiles plan cancel analysis`, manual `bench export60`), `engine.golden_full` | `tests/engine/exec_tests.cpp` |
+
+### 17.2 Gates
+
+| Gate | Result |
+|---|---|
+| **B** golden corpus, 148 frames, modes off / legacy / tables / full | 0 mismatches in all four (after the re-baseline of 17.3). The pixel hashes of all 148 entries are unchanged by the re-baseline. |
+| **B** `Plan(Whole)` exact variant vs `Renderer::render` (10 parameter sets: each stage alone, and all) | byte-identical |
+| **S** tiled vs whole (tiles 64 / 128 / 192 on a 701x523 frame, 512 on 2301x1499; every stage alone and all together; frame-global solves accumulated tile by tile) | dE2000 mean <= 0.00013 (limit 0.01), max 1 code, 0.00-0.03 % of the pixels differ. Dehaze, clarity, sharpen, grain, veil, geometry + vignette: bit-identical. NR luma / chroma and texture differ by 1 code in <= 0.022 % of the pixels (running-sum box blur rounding, 5.5) |
+| halo conformance | `Planner::windowHalo()` per node is exercised by the tile test (a halo that is too small shows as a seam); the frame-global parts are not halos but 1/4-grid solves |
+| declaration conformance | `engine.keys`, `engine.conformance` (with negative controls) pass; the legacy-deviation pairs for crop / straighten / vignette are removed from the known list (17.3) |
+| edit-bench (`DAPPLE_ENGINE=off` vs `full`, 5 interleaved rounds x 12 repeats, median of rounds, scenarios of the a0 baseline, 24 MP ARW at 2048 px) | 16 rows, ratio full/off 0.85 .. 1.09, median 1.01. Pixel pipeline in isolation (`exec_tests bench`, 1600x1067, executor incl. graph + plan vs `renderBakedRgba`): point only 1.05-1.11, default spatial 1.01-1.06, all stages 0.88, geometry + vignette 1.04-1.15 |
+| graph + plan per frame | 17-29 us (FrameKernels + Full graph + keys + plan); 21-91 us per frame measured in the C API (`planUsPerFrame` in `dapple_engine_info_json`) |
+| cancel | 3000x2000 all-stage tiled export cancelled 150 ms in: returns "cancelled" 4 ms later; the session renders correctly afterwards (bit-identical to a never-cancelled render) |
+| 60 MP synthetic export (9504x6336, all stages, TiledExport, budget 500 MB) | 4.5 s, 60 tiles, 3 sweeps; working set +442 MB at peak with the 722 MB source resident and the 172 MB RGB8 output included (tile working set ~270 MB) |
+| ctest | 55 / 55 green |
+
+### 17.3 Intentional differences (documented, re-baselined)
+
+1. **The tonal analysis follows crop, straighten, rotate, flip and vignette (a4b).** The analysis (histogram, tonal class, the tone-class move built from it) is taken from the cropped / vignetted render of the 256 px proxy, but the legacy `pointKey()` zeroed those parameters, so a crop change returned the previous crop's analysis (found by the conformance harness). Fix: the `Analysis` / `ToneAnalysisPre` nodes declare `crop straighten rotate flip vignette` (`registry.cpp`), `Renderer::pointKey()` keeps them, `colourKey()` still masks them (the lattice is reused across crops as before). The off / legacy / tables modes get the same fix, so all four modes agree.
+   Re-baselined golden entries (analysis hash only, pixel hash unchanged): `geometry/crop_4:5 crop_3:4 crop_16:9 crop_9:16 crop_orig rot90 rot180 rot270 straighten-650 straighten325 straighten1700`, `detail/all`, `film/full_spatial_final`, `film/full_geometry`, `film/full_region` (15 of 148). `geometry/crop_1:1` is the first frame of its scenario and keeps its value.
+   Cost: a crop change now rebuilds the tone table + analysis (proxy render, ~1-5 ms) instead of hitting the stale bake; the lattice is still reused.
+2. **The exact graph has a `Gain` node** (`Gain -> ToneColourExact`, and the film branch like the baked graph): one graph snapshot changed (`exact`).
+3. **Tiled export differs from whole by <= 1 code** in a small fraction of pixels (5.5, accepted). Exports above 16 MP use `TiledExport`; `DAPPLE_ENGINE_TILE=N` forces tile size N, `=0` never tiles.
+4. `ResultCache` limit for the new frame-global solve entries (`Dehaze`, `Detail`): 2 each.
+
+### 17.4 API for the GPU and film engineers
+
+```cpp
+Graph g = GraphBuilder::build(ps, GraphDetail::Full, &framePlan);  g.validate();  g.computeKeys(ps);
+Plan plan = Planner::plan(g, PlanRequest, &resultCache);            // plan/plan.h, backend independent
+ExecEnv env{fk, g, cache, CancelToken, out, channels};  Status s = CpuExecutor::run(plan, env, &stats);
+```
+
+* **Plan** (`plan/plan.h`): `stages = [HostTable?, FilmFrame?, (TileSweep, GlobalSolve)*, TileSweep(output)]`. `HostTable` lists the table nodes + advisory `CacheOp`s (the session evaluates them: `EngineSession::bakeTables`, unchanged). A `TileSweep` has `groups[0]` = the PointChain (point nodes fused, in node order `[Resize|Geometry] Gain ToneColour|ToneColourExact [DisplayStages] [Blend] [Vignette]` plus an implicit clamp) and `groups[1..]` = one Window group per spatial node, **cumulative** (a sweep lists every window group it covers). `Stage::halo` = summed window halos (multiple of `grid.align = 4`), `Stage::accum` = the 1/4 grid the sweep leaves for the `GlobalSolve` after it (`DehazeGrid`, `LumaGrid`), `Stage::output` = last sweep, `packInChain` = no window node: the chain writes the 8-bit pixels. `TileGrid{tile, align, nx, ny}`; `Plan::mode` Whole (one tile) or TiledExport; `peakCpuBytes`, `allocs` (lifetimes in stage indices). A solve that is in the `ResultCache` (`Dehaze` / `Detail` entries under the node key) is not planned, and the sweep that would have produced its grid disappears. Film frames are planned Whole (`Plan::why`).
+* **Executor selection per frame** (`EngineSession::renderFrame`, Full mode): tables -> `job.gpuHook` (the GPU engineer replaces this by a `GpuExecutor` that consumes the same `Plan`; return null / `Unsupported` to fall through) -> `CpuExecutor`. The CPU executor returns `Unsupported` when a node has no impl or the film stage fails; the session then renders the frame with `renderBakedRgba`. A node's CPU table is `cpuImpl(NodeType)` (`nodes/main/cpu_nodes.cpp`): `CpuImpl::block` (point fragments: `px` is **3-float interleaved RGB, n <= 256**, absolute `PixelPos`), `CpuImpl::tile` (additive field in `node.h`: window nodes on an `ImageF` tile `CpuTile{img, scratch, ox, oy, frameW, frameH, dehaze, guided, interior, out8}`), `bindResolved()` builds the per-frame resolved block (`Resolved`, 128 B). `ExecStats` reports sweeps / tiles / solve hits. `cpuFusedHead()` is the CPU fusion recipe `[Resize|Geometry] + Gain + ToneColour` in one pass.
+* **Film engineer**: `FilmSim` is a whole-frame node (`tileFilmSim` -> `FrameKernels::runFilm`, plus the streaming path `streamFilm` for a full-strength film to 8 bit with no neighbourhood stage); `DisplayStages` / `Blend` are block fragments that read the film plane (`FrameEnv::film`). Replace `tileFilmSim` and `FrameKernels::runFilm/streamFilm` with your nodes; keep the `FilmFrame` stage contract (a float plane of the frame, display-encoded, unclamped) or extend the planner to tile it (it forces `Whole` while a `FilmSim` node exists).
+* **GPU engineer**: the graph, `Plan` and `FrameRequest`/`ParamSet` are the contract. `PlanRequest` carries the resolved neighbourhood amounts, so `Planner::windowHalo` can be the halo source for `spatialRadii`. The frame-global parts are solved on the 1/4 grid (`dehazeSolve`, `guidedSolve` in `spatial.cpp`) and looked up at absolute coordinates: a GPU sweep can use the same structure (accumulate grid, solve, apply per tile).
+* **Cancellation**: `EngineSession::cancel()` / `dapple_session_cancel()` bumps the ticket; `CancelToken{&latest, mine}` is polled between tiles, between groups and in the `ThreadPool` chunk loop (`CancelScope`). A cancelled run returns `Status::Cancelled`, stores nothing partial, `dapple_last_error() == "cancelled"`.
+
+### 17.5 Not done / not verified
+
+* Table nodes have no `CpuImpl::bake` registration (they remain `EngineSession::bakeTables`, which the `HostTable` plan stage stands for). `Resize` is a pass-through of the caller's scaled source (a4, the `scaledSource` replacement, was not part of this task). There is no `PlanCache` (planning is 20-90 us).
+* Film frames: Whole only, FilmSim is the existing super-node; an exact frame whose film `setParams` fails falls back to `Renderer::render`.
+* Not run: Android / NEON builds of the new files, the throttle profiles, the Pixel 5, the app (the Dart binding of `dapple_session_cancel` is not added). Look previews, tone previews and the HDR / pano paths still call the renderer directly.
+* The cached `Detail` / `Dehaze` solves are keyed by node key; for baked frames the key includes the LUT pointer identity like the lattice cache does (same pre-existing limitation). Exports use a private per-call cache.

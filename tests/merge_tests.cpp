@@ -1632,6 +1632,7 @@ void testPerformance() {
 #endif
 
 // ===========================================================================
+#ifdef DAPPLE_HAVE_OPENCV
 void testDegenerateMergeRejected() {
   bool real = false;
   ImageF base = loadScene(400, real);
@@ -1661,6 +1662,7 @@ void testDegenerateMergeRejected() {
   ImageF zero(8, 8);
   CHECK(!writeLinearTiff16(zero, outDir() / "bad_zero.tif").has_value());
 }
+#endif  // DAPPLE_HAVE_OPENCV
 
 int main() {
   struct T {

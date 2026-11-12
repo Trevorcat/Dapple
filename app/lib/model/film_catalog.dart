@@ -28,14 +28,20 @@ class FilmPaper {
 class FilmCatalog {
   const FilmCatalog._(this.stocks, this.papers, this.attribution, [this.swatches = const {}]);
 
-  /// The same catalog with engine-rendered swatches (see [parseFilmSwatches]).
-  FilmCatalog withSwatches(Map<String, List<Color>> s) => FilmCatalog._(stocks, papers, attribution, s);
+  /// The same catalog with engine-rendered swatches ([s] = the raw table of [parseFilmSwatches]; the stock's character is
+  /// brought out here, see [characterSwatches]).
+  FilmCatalog withSwatches(Map<String, List<Color>> s) => FilmCatalog._(stocks, papers, attribution, characterSwatches(s));
 
-  /// Swatch colours per stock id, derived from the engine (test patches through the stock); empty until computed.
+  /// Three-band swatch colours (skin, sky, shadow) per stock id, derived from the engine (test patches through the stock);
+  /// empty until computed.
   final Map<String, List<Color>> swatches;
 
-  /// Colours of [id]'s swatch, [kFilmSwatchFallback] while the engine's are not there.
-  List<Color> swatch(String id) => swatches[id] ?? kFilmSwatchFallback;
+  /// Colour stops of [id]'s swatch (each of the three bands twice, for a banded gradient), [kFilmSwatchFallback] while the
+  /// engine's are not there.
+  List<Color> swatch(String id) {
+    final b = swatches[id];
+    return b == null ? kFilmSwatchFallback : swatchBands(b);
+  }
 
   /// No pack loaded: the film rows are not offered.
   static const empty = FilmCatalog._([], [], '');

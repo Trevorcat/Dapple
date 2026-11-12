@@ -35,6 +35,12 @@ add_library(dapple_core STATIC
   engine/graph/registry.cpp
   engine/graph/builder.cpp
   engine/exec/engine_session.cpp
+  engine/nodes/film/film_tables.cpp
+  engine/nodes/film/film_cpu.cpp
+  engine/nodes/film/film_frame.cpp
+  engine/exec/cpu_executor.cpp
+  engine/plan/planner.cpp
+  engine/nodes/main/cpu_nodes.cpp
 )
 add_library(Dapple::core ALIAS dapple_core)
 
@@ -66,7 +72,9 @@ endif()
 # dapple_c.h; the C++ core is linked in statically. On Android this is
 # libdapple.so.
 # ---------------------------------------------------------------------------
-add_library(dapple SHARED src/c_api.cpp)
+# film_swatch.cpp (a C API function of its own) is compiled into the shared library itself: as a member of the static core nothing
+# references it, so the linker would drop it from libdapple.
+add_library(dapple SHARED src/c_api.cpp src/film_swatch.cpp)
 target_include_directories(dapple PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dapple PRIVATE dapple_core)
 target_compile_definitions(dapple PRIVATE DAPPLE_VERSION_STRING="${PROJECT_VERSION}")
@@ -87,3 +95,6 @@ if(ANDROID)
   # 16 KB page size support for Android 15+ devices
   target_link_options(dapple PRIVATE -Wl,-z,max-page-size=16384)
 endif()
+
+# Stage (d): zero-copy display layer (view API, render loop, presenters) compiled into libdapple.
+include(engine/present/present.cmake)

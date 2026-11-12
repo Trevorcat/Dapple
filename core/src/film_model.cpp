@@ -747,6 +747,21 @@ FilmTables FilmModel::bake(BakeTimings* tm) const {
   auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
   const auto t0 = Clock::now();
   FilmTables t;
+  bakeInput(t);
+  bakeCurves(t);
+  const auto t1 = Clock::now();
+  bakePrintScan(t);
+  const auto t2 = Clock::now();
+  if (tm) {
+    tm->curvesMs = ms(t0, t1);
+    tm->lutMs = ms(t1, t2);
+    tm->totalMs = ms(t0, t2);
+  }
+  return t;
+}
+
+// Input stage tables: the 3x3 into the film's balance white and the reflect-padded raw-exposure LUT.
+void FilmModel::bakeInput(FilmTables& t) const {
   for (int c = 0; c < 3; ++c) {
     t.mIn[c * 4 + 0] = float(mIn_[0 * 3 + c]);
     t.mIn[c * 4 + 1] = float(mIn_[1 * 3 + c]);
@@ -762,6 +777,10 @@ FilmTables FilmModel::bake(BakeTimings* tm) const {
     for (int i = -1; i <= n; ++i)
       std::memcpy(&t.raw[(std::size_t(j + 1) * pn + (i + 1)) * 4], &raw_->node[(std::size_t(refl(j)) * n + refl(i)) * 4],
                   16);
+}
+
+// Density curves, pre-coupler curves and the DIR inhibitor matrix (depend on the film and the DIR parameters only).
+void FilmModel::bakeCurves(FilmTables& t) const {
   t.curveN = nCurve_;
   t.curveX0 = float(lex0_);
   t.curveInvDx = float(1.0 / dlex_);
@@ -781,8 +800,10 @@ FilmTables FilmModel::bake(BakeTimings* tm) const {
     t.dirQ[k * 4 + 3] = 0.f;
   }
   for (int m = 0; m < 3; ++m) t.dirQ0[m] = float(dirQ0_[m]);
-  const auto t1 = Clock::now();
+}
 
+// film density -> display sRGB, whole print + scan chain (needs the paper; changes with the enlarger filtration)
+void FilmModel::bakePrintScan(FilmTables& t) const {
   // film density -> display sRGB, whole print + scan chain
   const int N = p_.settings.lutResolution;
   t.lutN = N;
@@ -866,13 +887,17 @@ FilmTables FilmModel::bake(BakeTimings* tm) const {
   }
   t.srgbDecode.resize(4097);
   for (int i = 0; i <= 4096; ++i) t.srgbDecode[i] = float(srgbEotf(double(i) / 4096.0));
-  const auto t2 = Clock::now();
-  if (tm) {
-    tm->curvesMs = ms(t0, t1);
-    tm->lutMs = ms(t1, t2);
-    tm->totalMs = ms(t0, t2);
-  }
-  return t;
+}
+
+// Re-balances the print for new enlarger filtration shifts without rebuilding the film side. The neutral filtration
+// solved at construction does not depend on the shifts, so the result equals a model constructed with these shifts.
+void FilmModel::rebalance(double mShift, double yShift) {
+  if (scanFilm_) return;
+  p_.enlarger.mFilterShift = mShift;
+  p_.enlarger.yFilterShift = yShift;
+  buildEnlarger(p_.enlarger.cFilterNeutral, p_.enlarger.mFilterNeutral + p_.enlarger.mFilterShift,
+                p_.enlarger.yFilterNeutral + p_.enlarger.yFilterShift);
+  buildBlackWhite();
 }
 
 }  // namespace dapple::film::detail

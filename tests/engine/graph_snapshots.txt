@@ -109,11 +109,12 @@ n2 Analysis [analysis]
 == exact [full]
 n0 Source
 n1 Resize <- n0
-n2 ToneColourExact <- n1
-n3 Analysis [analysis]
-n4 NRChroma <- n2
-n5 Detail <- n4
-n6 Pack8 <- n5 [frame]
+n2 Gain <- n1
+n3 ToneColourExact <- n2
+n4 Analysis [analysis]
+n5 NRChroma <- n3
+n6 Detail <- n5
+n7 Pack8 <- n6 [frame]
 == overflow_gpu [legacy]
 n0 Source
 n1 ColourLattice

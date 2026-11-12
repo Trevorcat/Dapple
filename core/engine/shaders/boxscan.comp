@@ -1,0 +1,117 @@
+#version 450
+// O(1)-per-pixel box filter of single-channel data along one axis (replicated edges), for radii where the direct sum of
+// sepconv.comp (2R+1 shared reads per output) dominates: 24-60 MP exports (docs/engine/pipeline-architecture.md 16, rule 6).
+//
+// Method: every group stages ALONG + 2R + 1 samples of its line segment in shared memory as FIXED-POINT integers
+// (value * 65536, clamped to +-16), forms the inclusive prefix sum of the segment in place with a three step scan (per-thread
+// segment sums, an exclusive scan of the TA segment sums, per-thread in-place prefix), and then every output is
+// P[j + 2R] - P[j - 1]. Integer addition is exact and wraps modulo 2^32, so
+//   - the result does not depend on where a segment starts: bit-identical for any tile decomposition (the tiled export seam
+//     test needs 0 differing pixels) and for any group size,
+//   - there is no fp32 prefix-sum cancellation (a float prefix over 9504 samples loses ~1e-3 absolute, which is visible after
+//     the division by a small window),
+//   - quantisation is 1.5e-5 per sample (250x finer than 1/255), random and averaged by the window.
+// Window sums stay below 2^31 for (2R+1) * 16 * 65536 with R <= 64.
+//
+// Memory access: the load and the store are cooperative (consecutive lanes = consecutive samples along the axis), the scan
+// reads the shared tile with an odd per-thread stride S (no bank conflicts). Work per output is independent of R.
+#ifdef VERT
+#define TA 32       // threads along the axis
+#define PERP 4      // lines (columns) per group
+#define ALONG 512   // outputs along the axis per group
+#define SEG 21      // samples per thread in the scan: TA * SEG >= ALONG + 2 * RCAP + 1, odd
+#else
+#define TA 64
+#define PERP 2
+#define ALONG 1024
+#define SEG 19
+#endif
+layout(local_size_x = TA, local_size_y = PERP) in;
+
+const int RCAP = 64;
+const int LEN = ALONG + 2 * RCAP + 1;   // samples staged per line
+const int ROW = TA * SEG + (((TA * SEG) & 1) == 0 ? 1 : 0);  // odd row pitch
+
+#ifndef IN_MODE
+#define IN_MODE 0
+#endif
+layout(binding = 1) uniform sampler2D uIn;  // texture path: imageLoad is several times slower on Adreno
+layout(binding = 2, r32f) uniform writeonly image2D uOut;
+layout(std140, binding = 0) uniform P {
+  ivec4 size;  // width, height, radius, 0
+} pc;
+
+shared uint sh[PERP * ROW];
+shared uint tot[PERP * TA];
+
+uint quant(float v) { return uint(int(floor(clamp(v, -16.0, 16.0) * 65536.0 + 0.5))); }
+
+float fetch(ivec2 c) {
+  const vec4 v = texelFetch(uIn, c, 0);
+#if IN_MODE == 1
+  return dot(v.rgb, vec3(0.2126729, 0.7151522, 0.0721750));
+#else
+  return v.x;
+#endif
+}
+
+void main() {
+  const int a = int(gl_LocalInvocationID.x);
+  const int q = int(gl_LocalInvocationID.y);
+  const int R = min(pc.size.z, RCAP);
+#ifdef VERT
+  const int baseAlong = int(gl_WorkGroupID.y) * ALONG;
+  const int line = int(gl_WorkGroupID.x) * PERP + q;
+  const int len = pc.size.y, lines = pc.size.x;
+#else
+  const int baseAlong = int(gl_WorkGroupID.x) * ALONG;
+  const int line = int(gl_WorkGroupID.y) * PERP + q;
+  const int len = pc.size.x, lines = pc.size.y;
+#endif
+  const int lc = min(line, lines - 1);
+  const int row = q * ROW;
+  const int nLoad = ALONG + 2 * R + 1;
+
+  for (int j = a; j < ROW; j += TA) {
+    uint v = 0u;
+    if (j < nLoad) {
+      const int c = clamp(baseAlong - R + j, 0, len - 1);
+#ifdef VERT
+      v = quant(fetch(ivec2(lc, c)));
+#else
+      v = quant(fetch(ivec2(c, lc)));
+#endif
+    }
+    sh[row + j] = v;
+  }
+  barrier();
+  // 1. segment sums
+  const int base = row + a * SEG;
+  uint t = 0u;
+  for (int k = 0; k < SEG; ++k) t += sh[base + k];
+  tot[q * TA + a] = t;
+  barrier();
+  // 2. exclusive scan of the segment sums (TA values per line; every thread sums its predecessors)
+  uint run = 0u;
+  for (int i = 0; i < a; ++i) run += tot[q * TA + i];
+  // 3. in-place inclusive prefix
+  for (int k = 0; k < SEG; ++k) {
+    run += sh[base + k];
+    sh[base + k] = run;
+  }
+  barrier();
+  if (line >= lines) return;
+  const float norm = 1.0 / (65536.0 * float(2 * R + 1));
+  for (int j = a; j < ALONG; j += TA) {
+    const int pos = baseAlong + j;
+    if (pos >= len) break;
+    const uint hi = sh[row + j + 2 * R];
+    const uint lo = j > 0 ? sh[row + j - 1] : 0u;
+    const float v = float(int(hi - lo)) * norm;
+#ifdef VERT
+    imageStore(uOut, ivec2(line, pos), vec4(v, 0.0, 0.0, 0.0));
+#else
+    imageStore(uOut, ivec2(pos, line), vec4(v, 0.0, 0.0, 0.0));
+#endif
+  }
+}

@@ -650,16 +650,13 @@ void testConformance() {
   const ConformanceStats st = runConformance(baselines, N, lut.get());
   // Known deviations (docs/engine/pipeline-architecture.md 10.2, a3 notes). The harness is exact about them: the set of
   // (key, node) pairs must be inside this list, so a new undeclared dependency fails.
-  //  - crop / straighten / vignette: the tonal analysis (Renderer::bake -> analyzeTone) renders the proxy WITH geometry and
-  //    vignette, but the old pointKey()/colourKey() mask them, so the old cache returns a stale analysis / tone-class move
-  //    after a crop change. Step a3 stays byte-identical to that behaviour (gate B); the fix (analyse the uncropped proxy,
-  //    as the document's worked example 3 assumes) is a behaviour change that needs its own re-baselined step.
+  //  - (fixed in a4b) crop / straighten / vignette: the tonal analysis (Renderer::bake -> analyzeTone) renders the proxy WITH
+  //    geometry and vignette, and the old pointKey()/colourKey() masked them, so a crop change returned a stale analysis /
+  //    tone-class move. The Analysis / ToneAnalysisPre nodes now declare crop, straighten, rotate, flip and vignette and
+  //    pointKey() keeps them (colourKey() still masks them: the lattice does not care). They are no longer allowed here.
   //  - ctx.fastAnalysis: interactive frames analyse through the lattice, final frames exactly; both belong to the same
   //    bake (old semantics: same bake => same analysis), edit-bench measures them within the same dE. Not part of the key.
   const std::set<std::pair<std::string, std::string>> known = {
-      {"crop", "ToneAnalysisPre"},       {"crop", "ToneTable"},       {"crop", "Analysis"},
-      {"straighten", "ToneAnalysisPre"}, {"straighten", "ToneTable"}, {"straighten", "Analysis"},
-      {"vignette", "ToneAnalysisPre"},   {"vignette", "ToneTable"},   {"vignette", "Analysis"},
       {"ctx.fastAnalysis", "ToneAnalysisPre"}, {"ctx.fastAnalysis", "ToneTable"}, {"ctx.fastAnalysis", "Analysis"}};
   std::set<std::pair<std::string, std::string>> seenKnown;
   int knownCount = 0;

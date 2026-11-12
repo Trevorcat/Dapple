@@ -152,6 +152,12 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
   }
 
   void _onViewport(Rect visible, double scale, Size frame) {
+    final t0 = PerfProbe.begin();
+    _onViewport2(visible, scale, frame);
+    PerfProbe.end('viewport', t0);
+  }
+
+  void _onViewport2(Rect visible, double scale, Size frame) {
     final img = engine.image;
     if (img == null || !engine.live) return;
     final dpr = MediaQuery.devicePixelRatioOf(context);
@@ -235,6 +241,8 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
 
   double _frameRatio(Photo p, bool original) {
     if (engine.live) {
+      final ga = original ? null : engine.gpuAspect;
+      if (ga != null) return ga;
       final img = original ? (engine.original ?? engine.image) : engine.image;
       if (img != null) return img.width / img.height;
       final pl = engine.placeholder;
@@ -253,6 +261,8 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
 
   Widget _art(Photo p, bool original) {
     if (engine.live) {
+      final tex = original ? null : engine.gpuTextureId; // zero-copy texture (stage d) while it is live
+      if (tex != null) return Texture(textureId: tex, filterQuality: FilterQuality.medium);
       final img = original ? (engine.original ?? engine.image) : engine.image;
       if (img != null) return RawImage(image: img, fit: BoxFit.cover);
       final pl = engine.placeholder;

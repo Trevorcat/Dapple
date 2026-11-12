@@ -121,6 +121,18 @@ enum class NodeType : std::uint16_t {
   DisplayStages,
   Blend,
   LegacyRender,
+  // film decomposition (docs/engine/pipeline-architecture.md 8.1): three tables, then the image nodes
+  FilmTableRaw,
+  FilmTableCurves,
+  FilmTablePrintScan,
+  FilmExposure,
+  FilmBlurExposure,
+  FilmDirField,
+  FilmDevelop,
+  FilmGrain,
+  FilmPrintScan,
+  FilmGlare,
+  FilmScan,
   Count
 };
 constexpr int kNodeTypeCount = int(NodeType::Count);

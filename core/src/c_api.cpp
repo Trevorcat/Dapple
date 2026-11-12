@@ -57,6 +57,8 @@ struct DappleSession {
   dapple::EditParams lastParams;
   bool haveLast = false;
   dapple::engine::EngineSession engine;  // used only when DAPPLE_ENGINE is set (docs/engine/pipeline-architecture.md)
+  dapple::engine::EngineSession exportEngine;  // DAPPLE_ENGINE=full: export / reference renders (serialised by exportMtx)
+  std::mutex exportMtx;
 #ifdef DAPPLE_HAVE_GPU
   dapple::gpu::SessionSlot gpu;  // resident GPU copy of the source (created on first GPU frame)
 #endif
@@ -201,6 +203,31 @@ bool fillImage(const Image8& img, DappleImage* out) {
   return true;
 }
 
+// DAPPLE_ENGINE=full: the exact (reference / export) variant through the Planner and the CpuExecutor. Frames of more than
+// 16 MP are split into tiles (TiledExport, halo + frame-global sweeps) so the float frame never exists; DAPPLE_ENGINE_TILE=N
+// forces tile size N for every size, =0 never tiles.
+bool engineRenderExact(DappleSession* s, const EditParams& params, const Renderer& renderer, const SourceImage& src,
+                       Image8& out) {
+  dapple::engine::EngineSession::ExactOptions o;
+  o.hasProxy = s->proxy != nullptr;
+  int forced = -1;
+  if (const char* e = std::getenv("DAPPLE_ENGINE_TILE")) forced = std::atoi(e);
+  const std::size_t px = std::size_t(src.linear.width) * src.linear.height;
+  if (forced > 0) {
+    o.mode = dapple::engine::ExecMode::TiledExport;
+    o.tile = forced;
+  } else if (forced < 0 && px > 16000000u) {
+    o.mode = dapple::engine::ExecMode::TiledExport;
+  }
+  std::lock_guard<std::mutex> lock(s->exportMtx);
+  std::string err;
+  if (!s->exportEngine.renderExact(params, renderer, src, o, out, &err)) {
+    setError(err.empty() ? "engine failure" : err);
+    return false;
+  }
+  return true;
+}
+
 // Renders the session into 8-bit RGB. Returns false (with last error set) on failure.
 bool renderSession(DappleSession* s, const char* paramsJson, const char* lutPath, int32_t outLongEdge, Image8& out) {
   if (!s) {
@@ -229,8 +256,10 @@ bool renderSessionParams(DappleSession* s, const EditParams& params, const char*
     SourceImage scaled;
     scaled.sceneReferred = s->source.sceneReferred;
     scaled.linear = resizeToLongEdge(s->source.linear, outLongEdge);
+    if (dapple::engine::mode() == dapple::engine::Mode::Full) return engineRenderExact(s, params, renderer, scaled, out);
     out = renderer.render(scaled);
   } else {
+    if (dapple::engine::mode() == dapple::engine::Mode::Full) return engineRenderExact(s, params, renderer, s->source, out);
     out = renderer.render(s->source);
   }
   return true;
@@ -614,7 +643,12 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
 
   if (rq.flags & DAPPLE_FRAME_EXACT) {
     // reference pipeline (no region)
-    const Image8 img = renderer.render(src);
+    Image8 img;
+    if (dapple::engine::mode() == dapple::engine::Mode::Full) {
+      if (!engineRenderExact(s, params, renderer, src, img)) return false;
+    } else {
+      img = renderer.render(src);
+    }
     if (!fillImage(img, out)) return false;
     if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS))
     {
@@ -803,6 +837,13 @@ int32_t dapple_session_render_frame(DappleSession* session, const char* params_j
 }
 
 char* dapple_engine_info_json(void) { return dupString(dapple::engine::infoJson()); }
+
+int32_t dapple_session_cancel(DappleSession* session) {
+  if (!session) return DAPPLE_ERROR;
+  session->engine.cancel();  // lock-free: the render in flight (any thread) polls the ticket
+  session->exportEngine.cancel();
+  return DAPPLE_OK;
+}
 
 void dapple_thread_background(int32_t on) { sys::setBackground(on != 0); }
 

@@ -1,0 +1,238 @@
+# edit-bench desktop baseline (step a0 of docs/engine/pipeline-architecture.md 10.2)
+
+Recorded from the current renderer (DAPPLE_ENGINE unset = off) with:
+    dapple edit-bench <24 MP Sony ARW, decoded at preview quality, resized to 2048 long edge> --repeat 8
+Machine: Intel Core i7-14700KF (20 cores / 28 threads), Windows 10, Release build (build/engine-a, llvm-mingw clang -O3).
+Timings are medians of 8 runs after one warm-up. Run-to-run spread on this shared machine is 5-50 % per row (other
+builds were running), so use these as order-of-magnitude references and compare A/B only with interleaved runs.
+The photo is private and stays on this PC; its path is replaced below.
+Throttle profiles (tools/throttle) were NOT run for this baseline (optional per the task).
+
+## default threads (28)
+
+<raw file>
+session source 1365x2048 (decode 1512 ms + resize 57 ms)
+
+================ default auto edit ================
+
+per-stage, core API, 1600 long edge (legacy)
+  1 resizeToLongEdge 2048 -> 1600                   12.82 ms
+  2 pointwise (tone/colour/curves), incl. toneMove analysis    48.68 ms
+    2a toneMove analysis only (resize 256 + proxy render)     4.74 ms
+    (copy of float image, for reference)            12.23 ms
+  3a spatial: sharpen                               17.12 ms
+  3b spatial: chroma NR                             24.95 ms
+  3c spatial: luma NR                               20.19 ms
+  3d spatial: clarity                               21.92 ms
+  3e spatial: texture                               17.47 ms
+  3f spatial: dehaze                                13.55 ms
+  3g spatial: grain                                 10.24 ms
+  4 Renderer::render total (point+spatial+u8)       65.92 ms
+
+C API end to end (legacy)
+  legacy: dapple_session_render(1600)               76.51 ms
+  legacy: dapple_session_analyze_params_json         5.65 ms
+  legacy frame = render + analyze                   82.16 ms
+
+new path: dapple_session_render_frame (image + analysis in one call)
+  interactive 1080, exposure drag (re-bake 41^3)    10.59 ms
+  interactive 1080, saturation drag (bake 41^3)     12.19 ms
+  interactive 1080, clarity drag (lattice cached)     7.80 ms
+  interactive 1600, exposure drag                   16.83 ms
+  final 1600, params unchanged (lattice cached)     21.80 ms
+  final 1600 after point-wise change (bake 65^3)    27.88 ms
+  reference (exact) 1600 + analysis                 69.55 ms
+
+new path stages (core API)
+  bake 41^3 (incl. analysis)                         6.06 ms
+  bake 49^3                                          7.22 ms
+  bake 65^3                                          8.69 ms
+  lattice pass 1067x1600 -> RGBA8 (no spatial)       3.46 ms
+  lattice pass + all spatial, 1600                  21.72 ms
+  lattice pass + interactive spatial, 1080           4.07 ms
+  lattice pass only, 1080                            1.54 ms
+  baked 17^3 vs direct: mean dE2000 0.7841  p99 3.054  p99.9 4.438  max 8.77
+  baked 25^3 vs direct: mean dE2000 0.4617  p99 2.149  p99.9 4.190  max 7.85
+  baked 29^3 vs direct: mean dE2000 0.3780  p99 2.368  p99.9 3.469  max 5.43
+  baked 33^3 vs direct: mean dE2000 0.2620  p99 1.341  p99.9 2.220  max 4.99
+  baked 37^3 vs direct: mean dE2000 0.2542  p99 1.337  p99.9 2.539  max 4.86
+  baked 41^3 vs direct: mean dE2000 0.2365  p99 1.431  p99.9 1.995  max 4.57
+  baked 49^3 vs direct: mean dE2000 0.1362  p99 0.928  p99.9 1.953  max 4.47
+  baked 65^3 vs direct: mean dE2000 0.0943  p99 0.686  p99.9 1.230  max 3.50
+
+================ clarity/texture/NR/sharpen/dehaze ================
+
+per-stage, core API, 1600 long edge (legacy)
+  1 resizeToLongEdge 2048 -> 1600                   12.04 ms
+  2 pointwise (tone/colour/curves), incl. toneMove analysis    48.01 ms
+    2a toneMove analysis only (resize 256 + proxy render)     4.43 ms
+    (copy of float image, for reference)            11.01 ms
+  3a spatial: sharpen                               19.75 ms
+  3b spatial: chroma NR                             25.37 ms
+  3c spatial: luma NR                               20.30 ms
+  3d spatial: clarity                               19.26 ms
+  3e spatial: texture                               18.58 ms
+  3f spatial: dehaze                                16.33 ms
+  3g spatial: grain                                 10.38 ms
+  4 Renderer::render total (point+spatial+u8)       91.86 ms
+
+C API end to end (legacy)
+  legacy: dapple_session_render(1600)              109.08 ms
+  legacy: dapple_session_analyze_params_json         6.37 ms
+  legacy frame = render + analyze                  115.45 ms
+
+new path: dapple_session_render_frame (image + analysis in one call)
+  interactive 1080, exposure drag (re-bake 41^3)    16.98 ms
+  interactive 1080, saturation drag (bake 41^3)     19.35 ms
+  interactive 1080, clarity drag (lattice cached)    10.98 ms
+  interactive 1600, exposure drag                   29.37 ms
+  final 1600, params unchanged (lattice cached)     41.34 ms
+  final 1600 after point-wise change (bake 65^3)    50.74 ms
+  reference (exact) 1600 + analysis                102.73 ms
+
+new path stages (core API)
+  bake 41^3 (incl. analysis)                         7.71 ms
+  bake 49^3                                          8.43 ms
+  bake 65^3                                         11.43 ms
+  lattice pass 1067x1600 -> RGBA8 (no spatial)       4.39 ms
+  lattice pass + all spatial, 1600                  59.90 ms
+  lattice pass + interactive spatial, 1080          15.38 ms
+  lattice pass only, 1080                            2.08 ms
+  baked 17^3 vs direct: mean dE2000 0.9577  p99 4.337  p99.9 5.881  max 9.94
+  baked 25^3 vs direct: mean dE2000 0.7405  p99 3.015  p99.9 4.964  max 8.32
+  baked 29^3 vs direct: mean dE2000 0.4629  p99 2.070  p99.9 3.596  max 5.48
+  baked 33^3 vs direct: mean dE2000 0.3436  p99 2.310  p99.9 3.563  max 5.72
+  baked 37^3 vs direct: mean dE2000 0.3983  p99 2.543  p99.9 3.371  max 7.16
+  baked 41^3 vs direct: mean dE2000 0.4184  p99 2.606  p99.9 3.357  max 5.69
+  baked 49^3 vs direct: mean dE2000 0.2048  p99 1.503  p99.9 2.553  max 5.57
+  baked 65^3 vs direct: mean dE2000 0.1632  p99 1.353  p99.9 1.949  max 5.29
+
+drag frames vs exact (point-wise, 1600, float, mean dE2000)
+  default auto edit                  exposure +0.35 EV, reused 65^3: fast analysis 0.1073  exact analysis 0.1073
+  default auto edit                  exposure -0.60 EV, reused 65^3: fast analysis 0.0719  exact analysis 0.0719
+  default auto edit                  saturation +12, bake 41^3: 0.2565
+  default auto edit                  saturation +12, bake 49^3: 0.1459
+  default auto edit                  saturation +12, bake 57^3: 0.1594
+  default auto edit                  saturation +12, bake 65^3: 0.1049
+  clarity/texture/NR/sharpen/dehaze  exposure +0.35 EV, reused 65^3: fast analysis 0.1277  exact analysis 0.1277
+  clarity/texture/NR/sharpen/dehaze  exposure -0.60 EV, reused 65^3: fast analysis 0.1438  exact analysis 0.1438
+  clarity/texture/NR/sharpen/dehaze  saturation +12, bake 41^3: 0.4355
+  clarity/texture/NR/sharpen/dehaze  saturation +12, bake 49^3: 0.2174
+  clarity/texture/NR/sharpen/dehaze  saturation +12, bake 57^3: 0.2739
+  clarity/texture/NR/sharpen/dehaze  saturation +12, bake 65^3: 0.1694
+
+
+## DAPPLE_THREADS=8 (phone-like core count)
+
+<raw file>
+session source 1365x2048 (decode 1223 ms + resize 51 ms)
+
+================ default auto edit ================
+
+per-stage, core API, 1600 long edge (legacy)
+  1 resizeToLongEdge 2048 -> 1600                   12.00 ms
+  2 pointwise (tone/colour/curves), incl. toneMove analysis    94.91 ms
+    2a toneMove analysis only (resize 256 + proxy render)     5.09 ms
+    (copy of float image, for reference)             9.14 ms
+  3a spatial: sharpen                               15.42 ms
+  3b spatial: chroma NR                             22.28 ms
+  3c spatial: luma NR                               19.00 ms
+  3d spatial: clarity                               17.85 ms
+  3e spatial: texture                               19.31 ms
+  3f spatial: dehaze                                12.37 ms
+  3g spatial: grain                                 10.43 ms
+  4 Renderer::render total (point+spatial+u8)      111.63 ms
+
+C API end to end (legacy)
+  legacy: dapple_session_render(1600)              130.64 ms
+  legacy: dapple_session_analyze_params_json         5.97 ms
+  legacy frame = render + analyze                  136.61 ms
+
+new path: dapple_session_render_frame (image + analysis in one call)
+  interactive 1080, exposure drag (re-bake 41^3)    11.03 ms
+  interactive 1080, saturation drag (bake 41^3)     16.14 ms
+  interactive 1080, clarity drag (lattice cached)     8.33 ms
+  interactive 1600, exposure drag                   20.44 ms
+  final 1600, params unchanged (lattice cached)     22.15 ms
+  final 1600 after point-wise change (bake 65^3)    32.61 ms
+  reference (exact) 1600 + analysis                135.57 ms
+
+new path stages (core API)
+  bake 41^3 (incl. analysis)                         7.65 ms
+  bake 49^3                                          9.98 ms
+  bake 65^3                                         14.14 ms
+  lattice pass 1067x1600 -> RGBA8 (no spatial)       6.99 ms
+  lattice pass + all spatial, 1600                  23.15 ms
+  lattice pass + interactive spatial, 1080           6.30 ms
+  lattice pass only, 1080                            3.52 ms
+  baked 17^3 vs direct: mean dE2000 0.7841  p99 3.054  p99.9 4.438  max 8.77
+  baked 25^3 vs direct: mean dE2000 0.4617  p99 2.149  p99.9 4.190  max 7.85
+  baked 29^3 vs direct: mean dE2000 0.3780  p99 2.368  p99.9 3.469  max 5.43
+  baked 33^3 vs direct: mean dE2000 0.2620  p99 1.341  p99.9 2.220  max 4.99
+  baked 37^3 vs direct: mean dE2000 0.2542  p99 1.337  p99.9 2.539  max 4.86
+  baked 41^3 vs direct: mean dE2000 0.2365  p99 1.431  p99.9 1.995  max 4.57
+  baked 49^3 vs direct: mean dE2000 0.1362  p99 0.928  p99.9 1.953  max 4.47
+  baked 65^3 vs direct: mean dE2000 0.0943  p99 0.686  p99.9 1.230  max 3.50
+
+================ clarity/texture/NR/sharpen/dehaze ================
+
+per-stage, core API, 1600 long edge (legacy)
+  1 resizeToLongEdge 2048 -> 1600                   10.16 ms
+  2 pointwise (tone/colour/curves), incl. toneMove analysis   104.50 ms
+    2a toneMove analysis only (resize 256 + proxy render)     5.33 ms
+    (copy of float image, for reference)            11.58 ms
+  3a spatial: sharpen                               16.55 ms
+  3b spatial: chroma NR                             26.54 ms
+  3c spatial: luma NR                               19.12 ms
+  3d spatial: clarity                               18.29 ms
+  3e spatial: texture                               18.14 ms
+  3f spatial: dehaze                                11.33 ms
+  3g spatial: grain                                 10.66 ms
+  4 Renderer::render total (point+spatial+u8)      140.60 ms
+
+C API end to end (legacy)
+  legacy: dapple_session_render(1600)              157.48 ms
+  legacy: dapple_session_analyze_params_json         6.04 ms
+  legacy frame = render + analyze                  163.51 ms
+
+new path: dapple_session_render_frame (image + analysis in one call)
+  interactive 1080, exposure drag (re-bake 41^3)    15.37 ms
+  interactive 1080, saturation drag (bake 41^3)     21.00 ms
+  interactive 1080, clarity drag (lattice cached)    10.06 ms
+  interactive 1600, exposure drag                   27.97 ms
+  final 1600, params unchanged (lattice cached)     41.25 ms
+  final 1600 after point-wise change (bake 65^3)    47.44 ms
+  reference (exact) 1600 + analysis                148.36 ms
+
+new path stages (core API)
+  bake 41^3 (incl. analysis)                         8.50 ms
+  bake 49^3                                         11.20 ms
+  bake 65^3                                         16.52 ms
+  lattice pass 1067x1600 -> RGBA8 (no spatial)       7.30 ms
+  lattice pass + all spatial, 1600                  43.40 ms
+  lattice pass + interactive spatial, 1080          10.84 ms
+  lattice pass only, 1080                            3.39 ms
+  baked 17^3 vs direct: mean dE2000 0.9577  p99 4.337  p99.9 5.881  max 9.94
+  baked 25^3 vs direct: mean dE2000 0.7405  p99 3.015  p99.9 4.964  max 8.32
+  baked 29^3 vs direct: mean dE2000 0.4629  p99 2.070  p99.9 3.596  max 5.48
+  baked 33^3 vs direct: mean dE2000 0.3436  p99 2.310  p99.9 3.563  max 5.72
+  baked 37^3 vs direct: mean dE2000 0.3983  p99 2.543  p99.9 3.371  max 7.16
+  baked 41^3 vs direct: mean dE2000 0.4184  p99 2.606  p99.9 3.357  max 5.69
+  baked 49^3 vs direct: mean dE2000 0.2048  p99 1.503  p99.9 2.553  max 5.57
+  baked 65^3 vs direct: mean dE2000 0.1632  p99 1.353  p99.9 1.949  max 5.29
+
+drag frames vs exact (point-wise, 1600, float, mean dE2000)
+  default auto edit                  exposure +0.35 EV, reused 65^3: fast analysis 0.1073  exact analysis 0.1073
+  default auto edit                  exposure -0.60 EV, reused 65^3: fast analysis 0.0719  exact analysis 0.0719
+  default auto edit                  saturation +12, bake 41^3: 0.2565
+  default auto edit                  saturation +12, bake 49^3: 0.1459
+  default auto edit                  saturation +12, bake 57^3: 0.1594
+  default auto edit                  saturation +12, bake 65^3: 0.1049
+  clarity/texture/NR/sharpen/dehaze  exposure +0.35 EV, reused 65^3: fast analysis 0.1277  exact analysis 0.1277
+  clarity/texture/NR/sharpen/dehaze  exposure -0.60 EV, reused 65^3: fast analysis 0.1438  exact analysis 0.1438
+  clarity/texture/NR/sharpen/dehaze  saturation +12, bake 41^3: 0.4355
+  clarity/texture/NR/sharpen/dehaze  saturation +12, bake 49^3: 0.2174
+  clarity/texture/NR/sharpen/dehaze  saturation +12, bake 57^3: 0.2739
+  clarity/texture/NR/sharpen/dehaze  saturation +12, bake 65^3: 0.1694
+
+engine info: {"engine":"off","frames":0,"fullHits":0,"latticeReuse":0,"latticeBake":0,"bakeLatticeEvaluated":24,"bakeLatticeReused":52,"bakeToneTables":76}

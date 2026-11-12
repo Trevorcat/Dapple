@@ -179,6 +179,9 @@ List<Object?> _frameNative(int id, List msg) {
 class DappleSession {
   DappleSession._(this._address);
   final int _address;
+
+  /// Native session pointer (for the zero-copy view, which renders on its own thread; see GpuViewBackend).
+  int get address => _address;
   Future<void> _tail = Future.value();
   bool _closed = false;
 
@@ -383,11 +386,27 @@ class DappleSession {
     return f == null ? null : _takeString(_b(), f());
   }
 
-  /// `{"<stock id>":["rrggbb" x3]}` the engine's rendering of test patches per stock (a pure function of the pack; null
-  /// without native support). Takes a few seconds: call from a background isolate ([filmSwatchesJsonIsolate]).
+  /// `{"<stock id>":["rrggbb" x3]}` the engine's rendering of three test patches per stock, in the order skin, sky, shadow (a
+  /// pure function of the pack; null without native support). Takes a few seconds: call from a background isolate
+  /// ([filmSwatchesJsonIsolate]). An engine without the band function gives its older grey / skin / sky table, reordered.
   static String? filmSwatchesJson() {
-    final f = DappleBindings.instanceOrNull?.filmSwatchesJson;
-    return f == null ? null : _takeString(_b(), f());
+    final b = DappleBindings.instanceOrNull;
+    final bands = b?.filmSwatchBandsJson;
+    if (bands != null) {
+      final s = _takeString(_b(), bands());
+      if (s != null && s.length > 2) return s;
+    }
+    final f = b?.filmSwatchesJson;
+    final old = f == null ? null : _takeString(_b(), f());
+    if (old == null) return null;
+    try {
+      final m = jsonDecode(old) as Map<String, dynamic>;
+      return jsonEncode({
+        for (final e in m.entries) e.key: [(e.value as List)[1], (e.value as List)[2], (e.value as List)[0]]
+      });
+    } catch (_) {
+      return null;
+    }
   }
 
   /// [filmSwatchesJson] without blocking the UI isolate (the film pack is process-wide, the worker sees it).

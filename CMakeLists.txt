@@ -59,3 +59,9 @@ if(DAPPLE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+# GLES 3.1 compute backend (docs/engine/pipeline-architecture.md 6.3): dapple_gles_check, ctest gles_* (skip when ANGLE is absent).
+option(DAPPLE_GLES "Build the GLES 3.1 HAL backend, its check tool and GLES ctest entries" OFF)
+if(DAPPLE_GLES)
+  include(core/engine/hal/gles/gles_gpu.cmake)
+endif()

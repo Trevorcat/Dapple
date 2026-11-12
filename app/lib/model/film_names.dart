@@ -4,6 +4,7 @@
 // (dapple_film_swatches_json, FilmCatalog.swatch). Ids are the profile ids of
 // the engine (core/data/film/profiles/*.json); an id missing here shows [kFilmUnnamed].
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:ui' show Color;
 
 /// stock id -> display name: a neutral code, never a trademark. The scheme (the group header says 负片 / 反转片 /
@@ -69,8 +70,9 @@ const String kPaperNone = 'none';
 /// Colours of a stock whose swatch the engine has not produced (yet): neutral grey tones.
 const List<Color> kFilmSwatchFallback = [Color(0xFFCFC8BC), Color(0xFF9A948A), Color(0xFF7C7469)];
 
-/// Parses the engine's `{"id":["rrggbb",...],...}` swatch table (dapple_film_swatches_json); malformed entries are dropped.
-/// Each swatch lists the stock's rendering of a skin, a neutral and a sky patch, in that order.
+/// Parses the engine's `{"id":["rrggbb",...],...}` swatch table (dapple_film_swatch_bands_json); malformed entries are dropped.
+/// Each entry lists the stock's rendering of a skin, a sky and a deep-shadow patch, in that order. These are the raw
+/// renderings: real stocks differ by only a few levels, see [characterSwatches].
 Map<String, List<Color>> parseFilmSwatches(String? json) {
   final out = <String, List<Color>>{};
   if (json == null || json.isEmpty) return out;
@@ -85,9 +87,78 @@ Map<String, List<Color>> parseFilmSwatches(String? json) {
         if (n == null) return;
         cs.add(Color(0xFF000000 | n));
       }
-      // engine order: neutral, skin, sky -> swatch order: skin, neutral, sky
-      out[id] = [cs[1], cs[0], cs[2]];
+      out[id] = cs;
     });
   } catch (_) {}
   return out;
 }
+
+// ---- swatch character ------------------------------------------------------------------------------------------------
+// Stocks are calibrated to render a given scene alike (grey at the same level, skin within a few levels), so raw swatches of
+// N200A and N400A are nearly the same colour. A swatch has to say "this stock" at a glance, so each patch shows how its stock
+// deviates from the average stock, amplified: the warm or cool skin, the greener or bluer sky, the lifted, crushed or tinted
+// shadow. It is an icon of the stock's character, not a preview of a photo.
+
+double _lin(double v) => v <= 0.04045 ? v / 12.92 : math.pow((v + 0.055) / 1.055, 2.4).toDouble();
+double _gam(double v) => v <= 0.0031308 ? v * 12.92 : 1.055 * math.pow(v, 1 / 2.4).toDouble() - 0.055;
+double _labF(double t) => t > 0.008856 ? math.pow(t, 1 / 3).toDouble() : 7.787 * t + 16 / 116;
+double _labFi(double t) => t * t * t > 0.008856 ? t * t * t : (t - 16 / 116) / 7.787;
+
+/// sRGB colour -> CIE L*a*b* (D65).
+List<double> colorToLab(Color c) {
+  final r = _lin(c.r), g = _lin(c.g), b = _lin(c.b);
+  final x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.9505;
+  final y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  final z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.089;
+  final fx = _labF(x), fy = _labF(y), fz = _labF(z);
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+
+/// CIE L*a*b* (D65) -> sRGB colour, clamped into the gamut.
+Color labToColor(List<double> lab) {
+  final fy = (lab[0] + 16) / 116, fx = fy + lab[1] / 500, fz = fy - lab[2] / 200;
+  final x = _labFi(fx) * 0.9505, y = _labFi(fy), z = _labFi(fz) * 1.089;
+  final r = 3.2406 * x - 1.5372 * y - 0.4986 * z;
+  final g = -0.9689 * x + 1.8758 * y + 0.0415 * z;
+  final b = 0.0557 * x - 0.2040 * y + 1.0570 * z;
+  int ch(double v) => (_gam(v.clamp(0.0, 1.0)) * 255).round().clamp(0, 255);
+  return Color(0xFF000000 | (ch(r) << 16) | (ch(g) << 8) | ch(b));
+}
+
+/// Mean distance (CIE76 delta E over the bands) between two swatches of equal length.
+double swatchDistance(List<Color> a, List<Color> b) {
+  var sum = 0.0;
+  for (var i = 0; i < a.length; i++) {
+    final x = colorToLab(a[i]), y = colorToLab(b[i]);
+    sum += math.sqrt(math.pow(x[0] - y[0], 2) + math.pow(x[1] - y[1], 2) + math.pow(x[2] - y[2], 2));
+  }
+  return sum / a.length;
+}
+
+/// Raw swatches (see [parseFilmSwatches]) -> swatches that show each stock's character: per band, the stock's deviation from
+/// the mean of all stocks, in L*a*b*, is multiplied by [lightGain] (L*) and [chromaGain] (a*, b*) around that mean.
+Map<String, List<Color>> characterSwatches(Map<String, List<Color>> raw, {double lightGain = 2.5, double chromaGain = 4}) {
+  if (raw.length < 2) return Map.of(raw);
+  final n = raw.values.map((v) => v.length).reduce(math.min);
+  final labs = {
+    for (final e in raw.entries) e.key: [for (var i = 0; i < n; i++) colorToLab(e.value[i])]
+  };
+  final mean = [
+    for (var i = 0; i < n; i++)
+      [for (var k = 0; k < 3; k++) labs.values.map((l) => l[i][k]).reduce((a, b) => a + b) / labs.length]
+  ];
+  return {
+    for (final e in labs.entries)
+      e.key: [
+        for (var i = 0; i < n; i++)
+          labToColor([
+            mean[i][0] + lightGain * (e.value[i][0] - mean[i][0]),
+            mean[i][1] + chromaGain * (e.value[i][1] - mean[i][1]),
+            mean[i][2] + chromaGain * (e.value[i][2] - mean[i][2]),
+          ])
+      ]
+  };
+}
+
+/// The colour stops for a 36 px swatch: each band twice, so a diagonal gradient shows three (nearly) flat bands.
+List<Color> swatchBands(List<Color> bands) => [for (final c in bands) ...[c, c]];

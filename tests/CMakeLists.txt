@@ -27,7 +27,7 @@ set_tests_properties(merge_tests PROPERTIES TIMEOUT 900)
 # Spectral film engine tests (profiles, film pack, grey neutrality, baked-vs-direct dE2000, hooks).
 # The C API under test is compiled into the executable (not the dapple DLL): the registry and the thread pool are
 # process singletons, so linking both libdapple_core.a and the DLL would test two separate copies.
-add_executable(dapple_film_tests film_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp)
+add_executable(dapple_film_tests film_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
 target_link_libraries(dapple_film_tests PRIVATE dapple_core)
 target_include_directories(dapple_film_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
 target_include_directories(dapple_film_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/cli)
@@ -71,6 +71,25 @@ if(TARGET dapple_gpu)
     set_tests_properties(gpu_parity_swiftshader PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77
       ENVIRONMENT "VK_DRIVER_FILES=${_ss_icd};VK_ICD_FILENAMES=${_ss_icd};DAPPLE_GPU_SOFTWARE=1")
   endif()
+
+  # GPU engine tests (core/engine/hal, exec/gpu_*, nodes/*/gpu.cpp): HAL, scheduler, O(1) box, splitting, selection.
+  add_executable(dapple_gpu_engine_tests ${PROJECT_SOURCE_DIR}/tests/engine/gpu/gpu_engine_tests.cpp)
+  target_link_libraries(dapple_gpu_engine_tests PRIVATE dapple_gpu dapple_core dapple)
+  target_include_directories(dapple_gpu_engine_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src ${PROJECT_SOURCE_DIR}/cli)
+  if(NOT MSVC)
+    target_compile_options(dapple_gpu_engine_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+  foreach(_t hal box sched select)
+    add_test(NAME engine.gpu_${_t} COMMAND dapple_gpu_engine_tests ${_t})
+    set_tests_properties(engine.gpu_${_t} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+  endforeach()
+  if(EXISTS "${DAPPLE_SWIFTSHADER_LIB}")
+    foreach(_t hal box sched select)
+      add_test(NAME engine.gpu_${_t}_swiftshader COMMAND dapple_gpu_engine_tests ${_t})
+      set_tests_properties(engine.gpu_${_t}_swiftshader PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77
+        ENVIRONMENT "VK_DRIVER_FILES=${_ss_icd};VK_ICD_FILENAMES=${_ss_icd};DAPPLE_GPU_SOFTWARE=1")
+    endforeach()
+  endif()
 endif()
 
 # ---- engine migration (docs/engine/pipeline-architecture.md section 10, stage a) ---------------------------------------
@@ -85,7 +104,7 @@ if(MSVC)
 else()
   target_compile_options(dapple_golden PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-foreach(mode off legacy tables)
+foreach(mode off legacy tables full)
   add_test(NAME engine.golden_${mode}
            COMMAND dapple_golden verify ${PROJECT_SOURCE_DIR}/tests/engine/golden/corpus.txt ${mode}
            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -107,3 +126,48 @@ foreach(id IN LISTS DAPPLE_ENGINE_TEST_IDS)
   add_test(NAME engine.${id} COMMAND dapple_engine_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(engine.${id} PROPERTIES TIMEOUT 900)
 endforeach()
+
+# Film nodes (step b4): byte-identity with FilmSimulator::render, table re-bake granularity, declaration conformance of the
+# film nodes, scale-aware grain statistics, frame-index grain, timings. One ctest entry per id (`--list` prints them).
+add_executable(dapple_film_nodes_tests engine/film_nodes_tests.cpp)
+target_link_libraries(dapple_film_nodes_tests PRIVATE dapple_core)
+target_include_directories(dapple_film_nodes_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core)
+target_compile_definitions(dapple_film_nodes_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+if(MSVC)
+  target_compile_options(dapple_film_nodes_tests PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(dapple_film_nodes_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+foreach(id equiv rebake keys graph concurrent grain_scale grain_frame)
+  add_test(NAME film_nodes.${id} COMMAND dapple_film_nodes_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(film_nodes.${id} PROPERTIES TIMEOUT 900)
+endforeach()
+
+# CPU planner / executor tests (steps a5 - a10): byte identity of the Whole plan, tile invariance of TiledExport, plan structure,
+# cancellation, the tonal-analysis key fix. One ctest entry per id.
+add_executable(dapple_exec_tests engine/exec_tests.cpp)
+target_link_libraries(dapple_exec_tests PRIVATE dapple_core)
+target_include_directories(dapple_exec_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/cli)
+if(MSVC)
+  target_compile_options(dapple_exec_tests PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(dapple_exec_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+foreach(id whole tiles plan cancel analysis)
+  add_test(NAME engine.exec_${id} COMMAND dapple_exec_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(engine.exec_${id} PROPERTIES TIMEOUT 900)
+endforeach()
+
+# Film nodes on the GPU executor (step b4 (2)): per-node parity with the CPU nodes. Only with -DDAPPLE_GPU=ON; exit 77 = no Vulkan.
+if(TARGET dapple_gpu)
+  add_executable(dapple_film_gpu_tests engine/film_gpu_tests.cpp)
+  target_link_libraries(dapple_film_gpu_tests PRIVATE dapple_gpu dapple_core)
+  target_include_directories(dapple_film_gpu_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include
+                             ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/cli)
+  target_compile_definitions(dapple_film_gpu_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  if(NOT MSVC)
+    target_compile_options(dapple_film_gpu_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+  add_test(NAME film_gpu.parity COMMAND dapple_film_gpu_tests WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(film_gpu.parity PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+endif()

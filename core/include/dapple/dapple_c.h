@@ -108,6 +108,9 @@ DAPPLE_API char* dapple_film_attribution(void);
  * fixed test patches (18 % grey, skin, sky) with its default paper. Deterministic for a pack; cache it. Free with
  * dapple_free_string. "{}" without a pack. */
 DAPPLE_API char* dapple_film_swatches_json(void);
+/* Same shape, but the three patches are skin, sky and a deep shadow (the grey of dapple_film_swatches_json hardly differs between
+ * stocks; the shadow shows each stock's toe, cast and black level). Preferred by the UI. NULL on failure. */
+DAPPLE_API char* dapple_film_swatch_bands_json(void);
 
 /* ---- Previews for pickers ---- */
 
@@ -185,6 +188,10 @@ typedef struct DappleFrameRequest {
 DAPPLE_API int32_t dapple_session_render_frame(DappleSession* session, const char* params_json, const char* lut_path,
                                                const DappleFrameRequest* request, DappleImage* out,
                                                char** analysis_json);
+
+/* Latest-wins cancellation (DAPPLE_ENGINE=full): makes a render / export in flight on this session return early with
+ * DAPPLE_ERROR and dapple_last_error() == "cancelled". Lock-free, callable from any thread; a no-op when nothing runs. */
+DAPPLE_API int32_t dapple_session_cancel(DappleSession* session);
 
 /* ---- Scheduling / power (all optional, safe no-ops where the platform lacks the feature) ------------------
  * Foreground frames run on one dedicated render thread, pinned to the performance cores on big.LITTLE, and are

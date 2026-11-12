@@ -43,6 +43,13 @@ struct SessionCtx {
   const film::FilmLibrary* filmLib = nullptr;
   float toneReach = 1.f;
   int srcW = 0, srcH = 0;       // size of the (scaled) source this frame reads
+  // ---- additive (film nodes) ----
+  int fullLongEdge = 0;         // long edge of the full-resolution render this frame is a preview of (0 = none): scale-aware grain
+  std::uint32_t frameIndex = 0; // video: enters the grain / glare noise seed (0 = a still; the seed is then unchanged)
+  // White balance x exposure gain of the frame (what the Gain node multiplies): the film folds it into its input matrix.
+  // Set by the C layer (Renderer); null = unit gain.
+  void (*gainFn)(const void* user, const EditParams&, float out[3]) = nullptr;
+  const void* gainUser = nullptr;
 };
 
 // All inputs a ParamSet is made of. The registry's hash and perturb functions work on this struct.
@@ -52,6 +59,7 @@ struct ParamInputs {
   SessionCtx ctx;
   // derived (filled by ParamSet::make / derive())
   bool filmActive = false, filmOnly = false;
+  bool keepGrain = false;       // interactive frame while a grain-family slider is dragged (14 Q8): grain stays on
   int quality = 2;              // 0 Off, 1 Interactive, 2 Full
   void derive();
 };

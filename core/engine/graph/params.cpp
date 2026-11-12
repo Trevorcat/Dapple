@@ -24,6 +24,7 @@ void ParamInputs::derive() {
     filmOnly = filmActive && edit.filmStrength / 100.f >= 1.f;
   }
   quality = frame.exact ? 2 : (frame.interactive ? 1 : 2);
+  keepGrain = frame.interactive && (frame.activeParam == "grain" || frame.activeParam == "film_grain");
 }
 
 namespace {
@@ -214,6 +215,17 @@ ParamRegistry::ParamRegistry() {
         in.frame.wantOverflow = !in.frame.wantOverflow;
         return true;
       });
+  add("ctx.frameIndex", C, [](const ParamInputs& in, Hasher& h) { h.u64(in.ctx.frameIndex); },
+      [](ParamInputs& in, int v) {
+        in.ctx.frameIndex = v ? 7u : 3u;
+        return true;
+      });
+  add("ctx.fullLongEdge", C, [](const ParamInputs& in, Hasher& h) { h.i32(in.ctx.fullLongEdge); },
+      [](ParamInputs& in, int v) {
+        in.ctx.fullLongEdge = v ? 6000 : 4000;
+        return true;
+      });
+  add("ctx.keepGrain", D, [](const ParamInputs& in, Hasher& h) { h.boolean(in.keepGrain); }, nullptr);
   add("ctx.activeParam", C, [](const ParamInputs& in, Hasher& h) { h.str(in.frame.activeParam); },
       [](ParamInputs& in, int v) { return perturbString(in.frame.activeParam, v, {"", "grain", "exposure"}); });
   if (keys_.size() > kMaxKeys) throw std::logic_error("too many ParamKeys");

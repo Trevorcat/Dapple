@@ -374,6 +374,11 @@ class _WindowHostState extends State<WindowHost> with TickerProviderStateMixin {
   @override
   Widget build(BuildContext context) {
     final w = widget;
+    // Built once per widget update, not per animation tick: the card (all its rows and their text) is the
+    // expensive part of the fade-out / fade-in at the start and end of every drag, and only its opacity,
+    // scale and offset change while the springs run. Its own layer makes those changes compositing-only.
+    final card = RepaintBoundary(child: _Card(host: w, scroll: _scroll, onDragStart: _dragStart, onDragUpdate: _dragUpdate, onDragEnd: _dragEnd));
+    final pill = _Pill(host: w, onDragStart: _dragStart, onDragUpdate: _dragUpdate, onDragEnd: _dragEnd);
     return AnimatedBuilder(
       animation: Listenable.merge([_dx, _dy, _mode, _line, _appear]),
       builder: (context, _) {
@@ -396,7 +401,7 @@ class _WindowHostState extends State<WindowHost> with TickerProviderStateMixin {
                   alignment: w.win.anchor.edge == DockEdge.right ? Alignment.bottomRight : Alignment.bottomLeft,
                   child: IgnorePointer(
                     ignoring: line > 0.5 || k > 0.5,
-                    child: _Card(host: w, scroll: _scroll, onDragStart: _dragStart, onDragUpdate: _dragUpdate, onDragEnd: _dragEnd),
+                    child: card,
                   ),
                 ),
               ),
@@ -408,7 +413,7 @@ class _WindowHostState extends State<WindowHost> with TickerProviderStateMixin {
                 opacity: pillOpacity.clamp(0.0, 1.0),
                 child: IgnorePointer(
                   ignoring: !w.win.collapsed || k < 0.5,
-                  child: _Pill(host: w, onDragStart: _dragStart, onDragUpdate: _dragUpdate, onDragEnd: _dragEnd),
+                  child: pill,
                 ),
               ),
             ),
@@ -446,7 +451,8 @@ class _Pill extends StatelessWidget {
         PerfProbe.count('winLine');
         final name = dragging && ctl.readout.name.isNotEmpty ? ctl.readout.name : host.active.label;
         final value = dragging ? ctl.readout.value : host.active.text(ctl.ctx());
-        return Semantics(
+        // its own layer: the line's text changes with every pointer move and must not repaint the page
+        return RepaintBoundary(child: Semantics(
           container: true,
           button: true,
           label: '${groupLabels[g]}，$name，$value，展开',
@@ -489,7 +495,7 @@ class _Pill extends StatelessWidget {
               ]),
             ),
           ),
-        );
+        ));
       },
     );
   }

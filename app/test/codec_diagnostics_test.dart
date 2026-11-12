@@ -1,0 +1,73 @@
+import 'package:dapple/screens/library/codec_diagnostics_page.dart';
+import 'package:dapple/screens/library/settings_page.dart';
+import 'package:dapple/state/app_state.dart';
+import 'package:dapple/services/live_bridge.dart';
+import 'package:dapple/theme/tokens.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const _report = '''
+{"fingerprint":"google/redfin/redfin:14/UP1A.231105.001.B2","sdk":34,"abi":"arm64-v8a",
+ "codecs":[{"name":"c2.qti.hevc.encoder","mime":"video/hevc","type":"encoder","hardware":true,"softwareOnly":false,
+   "profiles":["Main"],"colorFormats":["Flexible","P010"],"maxSize":"4096x2304","maxFps1080":120,"performancePoints":3,"hdrEditing":false}],
+ "selfTests":[{"kind":"enc10","codec":"c2.qti.hevc.encoder","pass":false,"detail":"no output: 8 frames accepted, none returned within 3 s","ms":3120,"at":1}],
+ "encodeLadder1080p30":["HEVC Main 8-bit · c2.qti.hevc.encoder","H.264 High 8-bit · c2.qti.avc.encoder"],
+ "decodeLadderHevc10":["hardware 10-bit (P010) · c2.qti.hevc.decoder","software"],
+ "jobs":["clip HEVC Main 8-bit · c2.qti.hevc.encoder (hardware) | decode hevc (software), 4210 ms"]}
+''';
+
+void main() {
+  testWidgets('hidden codec diagnostics shows the report and can re-run the self-tests', (tester) async {
+    final calls = <String>[];
+    await tester.pumpWidget(MaterialApp(
+      theme: buildTheme(Brightness.light),
+      home: CodecDiagnosticsPage(loader: ({bool run = false, bool force = false}) async {
+        calls.add('run=$run force=$force');
+        return _report;
+      }),
+    ));
+    await tester.pumpAndSettle();
+    final text = tester.widget<SelectableText>(find.byKey(const ValueKey('codec-report'))).data!;
+    expect(text, contains('FAIL  enc10  c2.qti.hevc.encoder  3120 ms'));
+    expect(text, contains('no output: 8 frames accepted'));
+    expect(text, contains('1. HEVC Main 8-bit · c2.qti.hevc.encoder'));
+    expect(text, contains('hardware 10-bit (P010)'));
+    expect(text, contains('Main'));
+    await tester.tap(find.text('运行自检'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('全部重测'));
+    await tester.pumpAndSettle();
+    expect(calls, ['run=false force=false', 'run=true force=false', 'run=false force=true']);
+  });
+
+
+  testWidgets('long-pressing the version on 关于 opens the diagnostics; a plain tap does nothing', (t) async {
+    t.view.physicalSize = const Size(1080, 2400);
+    t.view.devicePixelRatio = 3;
+    addTearDown(t.view.reset);
+    final app = AppState.demo();
+    await t.pumpWidget(MaterialApp(
+      theme: buildTheme(Brightness.light),
+      home: Scaffold(body: SettingsPage(app: app, wide: false)),
+    ));
+    await t.pump(const Duration(milliseconds: 300));
+    await t.scrollUntilVisible(find.byKey(const ValueKey('about-version')), 300, scrollable: find.byType(Scrollable).first);
+    expect(find.text(kAppVersion), findsOneWidget);
+    await t.tap(find.byKey(const ValueKey('about-version')));
+    await t.pump(const Duration(milliseconds: 400));
+    expect(find.byType(CodecDiagnosticsPage), findsNothing);
+    await t.longPress(find.byKey(const ValueKey('about-version')));
+    await t.pump(const Duration(milliseconds: 600));
+    expect(find.byType(CodecDiagnosticsPage), findsOneWidget);
+  });
+
+  test('clip summary carries the codec path and demotions', () {
+    final i = ClipInfo({
+      'videoCodec': 'hevc', 'videoProfile': 'Main', 'bitDepth': 8, 'decoder': 'hevc', 'hardwareDecode': false, 'audioHow': 'none',
+      'codecSummary': 'HEVC Main 8-bit · c2.qti.hevc.encoder (hardware) | decode hevc (software) | demoted: HEVC Main10 c2.qti.hevc.encoder: self-test failed',
+    });
+    expect(i.summary, contains('demoted: HEVC Main10'));
+    expect(ClipInfo({'videoCodec': 'h264', 'videoProfile': 'High', 'bitDepth': 8, 'decoder': 'h264'}).codecPath, '');
+    expect(kAppVersion, isNotEmpty);
+  });
+}

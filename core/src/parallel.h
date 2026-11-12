@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <condition_variable>
 #include <cstdlib>
 #include <exception>
@@ -21,6 +22,17 @@ namespace dapple {
 // from inside a job runs inline on the calling thread.
 class ThreadPool {
  public:
+  // Latest-wins cancellation (docs/engine/pipeline-architecture.md 5.8): while a CancelScope is alive on the submitting
+  // thread, a job it submits stops handing out chunks as soon as *cur != mine. The caller must treat the output of such a
+  // job as invalid (it checks the same token afterwards).
+  struct CancelRef {
+    const std::atomic<std::uint64_t>* cur = nullptr;
+    std::uint64_t mine = 0;
+  };
+  static CancelRef& tlCancel() {
+    static thread_local CancelRef c;
+    return c;
+  }
   static ThreadPool& instance() {
     static ThreadPool* pool = new ThreadPool;
     return *pool;
@@ -38,6 +50,8 @@ class ThreadPool {
       return;
     }
     std::lock_guard<std::mutex> submit(submit_);
+    cancelCur_.store(tlCancel().cur, std::memory_order_relaxed);
+    cancelMine_.store(tlCancel().mine, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lock(mtx_);
       job_ = &fn;
@@ -91,6 +105,12 @@ class ThreadPool {
     for (;;) {
       const int start = next_.fetch_add(chunk_);
       if (start >= total_) break;
+      if (const auto* cc = cancelCur_.load(std::memory_order_relaxed)) {
+        if (cc->load(std::memory_order_relaxed) != cancelMine_.load(std::memory_order_relaxed)) {
+          next_.store(total_);  // cancelled: abandon the remaining chunks
+          break;
+        }
+      }
       try {
         (*job_)(start, std::min(total_, start + chunk_));
       } catch (...) {
@@ -144,6 +164,8 @@ class ThreadPool {
   const std::function<void(int, int)>* job_ = nullptr;
   std::exception_ptr err_;  // first exception of the running job (guarded by mtx_)
   std::atomic<int> next_{0};
+  std::atomic<const std::atomic<std::uint64_t>*> cancelCur_{nullptr};
+  std::atomic<std::uint64_t> cancelMine_{0};
   int total_ = 0, chunk_ = 1, pending_ = 0, threads_ = 0;
   unsigned generation_ = 0;
   std::atomic<unsigned> gen_{0};      // mirror of generation_ for the lock-free spin
@@ -161,6 +183,20 @@ class ThreadPool {
     std::lock_guard<std::mutex> lock(mtx_);
     return tids_;
   }
+};
+
+// Scopes the cancellation token of the jobs this thread submits (see ThreadPool::CancelRef).
+class CancelScope {
+ public:
+  CancelScope(const std::atomic<std::uint64_t>* cur, std::uint64_t mine) : prev_(ThreadPool::tlCancel()) {
+    ThreadPool::tlCancel() = {cur, mine};
+  }
+  ~CancelScope() { ThreadPool::tlCancel() = prev_; }
+  CancelScope(const CancelScope&) = delete;
+  CancelScope& operator=(const CancelScope&) = delete;
+
+ private:
+  ThreadPool::CancelRef prev_;
 };
 
 // Runs fn(i) for every i in [0, n) across all hardware threads.

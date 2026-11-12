@@ -69,9 +69,17 @@ struct FastOptions {
   SpatialQuality spatial = SpatialQuality::Full;
   bool noise = true;  // Interactive only: also run noise reduction
   RenderRegion region;
+  // Film (engine nodes): the interactive tier keeps the film grain while a grain-family slider is dragged (14 Q8); the
+  // grain of a frame that previews a larger render is scale-aware against `fullLongEdge`; `frameIndex` seeds video grain.
+  bool keepGrain = false;
+  int fullLongEdge = 0;
+  std::uint32_t frameIndex = 0;
 };
 
+class FrameKernels;  // engine block fragments of the per-pixel pipeline (src/frame_kernels.h)
+
 class Renderer {
+  friend class FrameKernels;
  public:
   // `lut` may be null. It must outlive the renderer.
   Renderer(const EditParams& params, const CameraProfile& camera, const Lut3D* lut);

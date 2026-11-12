@@ -1611,6 +1611,33 @@ void testFilmCApi() {
       return q == std::string::npos ? std::string() : w.substr(q, 40);
     };
     CHECK(first("kodak_portra_400").substr(18) != first("fujifilm_velvia_100").substr(21));
+    // band swatches (skin, sky, deep shadow): one entry per camera stock, deterministic, and the bands look like what they are
+    char* sb = dapple_film_swatch_bands_json();
+    const std::string bw = sb ? sb : "";
+    dapple_free_string(sb);
+    int bentries = 0;
+    for (std::size_t p = bw.find("\":[\""); p != std::string::npos; p = bw.find("\":[\"", p + 1)) ++bentries;
+    CHECK(bentries == stocks);
+    char* sb2 = dapple_film_swatch_bands_json();
+    CHECK(sb2 && bw == sb2);
+    dapple_free_string(sb2);
+    {
+      const std::size_t q = bw.find("\"kodak_portra_400\":[\"");
+      CHECK(q != std::string::npos);
+      if (q != std::string::npos) {
+        int v[3][3] = {{0}};
+        const std::size_t s0 = bw.find('[', q);
+        for (int k = 0; k < 3; ++k) {
+          const std::string h = bw.substr(s0 + 2 + k * 9, 6);
+          for (int c = 0; c < 3; ++c) v[k][c] = std::stoi(h.substr(c * 2, 2), nullptr, 16);
+        }
+        std::printf("  portra_400 bands: skin %d,%d,%d sky %d,%d,%d shadow %d,%d,%d\n", v[0][0], v[0][1], v[0][2], v[1][0], v[1][1], v[1][2],
+                    v[2][0], v[2][1], v[2][2]);
+        CHECK(v[0][0] > v[0][2] + 20);            // skin is warm
+        CHECK(v[1][2] > v[1][0] + 20);            // sky is blue
+        CHECK(v[2][0] < 70 && v[2][1] < 70 && v[2][2] < 70);  // shadow is dark
+      }
+    }
   }
   char* attr = dapple_film_attribution();
   CHECK(attr && std::string(attr).find("Volpato") != std::string::npos && std::string(attr).find("CC BY-SA 4.0") != std::string::npos);

@@ -1,0 +1,49 @@
+#version 450
+// Chroma noise reduction, apply step (spatial.cpp denoiseChroma): the blurred (R-Y, B-Y, Y) low-resolution grid
+// is sampled bilinearly and blended in where the pixel's luminance agrees with the smoothed one. The grid is local
+// to the working image; its origin is a multiple of the factor, so tiles see the same grid as the whole picture.
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+
+layout(std140, binding = 0) uniform P {
+  ivec4 dims;  // w, h, picture origin x, y
+  ivec4 low;   // lw, lh, f, 0
+  vec4 nr;     // blend, 1 / 0.05^2, grain amp, grain period
+} u;
+#ifdef ES_PINGPONG  // GLES 3.1: rgba16f images cannot be read-write -> read a sampled copy, write a different (write-only) image
+layout(binding = 1, rgba16f) uniform writeonly image2D uD;
+layout(binding = 4) uniform sampler2D uDin;
+#define LOAD_D(p) texelFetch(uDin, (p), 0)
+#else
+layout(binding = 1, rgba16f) uniform image2D uD;
+#define LOAD_D(p) imageLoad(uD, (p))
+#endif
+layout(binding = 2) uniform sampler2D uLow;
+layout(binding = 3, rgba8) uniform writeonly image2D uOut8;
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.dims.x || p.y >= u.dims.y) return;
+  int x0, x1, y0, y1;
+  float tx, ty;
+  lowAxis(p.x, u.low.z, u.low.x, x0, x1, tx);
+  lowAxis(p.y, u.low.z, u.low.y, y0, y1, ty);
+  const vec4 a = mix(texelFetch(uLow, ivec2(x0, y0), 0), texelFetch(uLow, ivec2(x1, y0), 0), tx);
+  const vec4 b = mix(texelFetch(uLow, ivec2(x0, y1), 0), texelFetch(uLow, ivec2(x1, y1), 0), tx);
+  const vec4 lo = mix(a, b, ty);  // u, v, yb
+  const vec3 c0 = LOAD_D(p).rgb;
+  const float Yv = lumaOf(c0);
+  const float e = Yv - lo.z;
+  const float k = u.nr.x / (1.0 + e * e * u.nr.y);
+  const float un = (c0.r - Yv) + (lo.x - (c0.r - Yv)) * k;
+  const float vn = (c0.b - Yv) + (lo.y - (c0.b - Yv)) * k;
+  const float R = Yv + un, B = Yv + vn;
+  vec3 c;
+  c.r = clamp(R, 0.0, 1.0);
+  c.b = clamp(B, 0.0, 1.0);
+  c.g = clamp((Yv - kLuma.r * R - kLuma.b * B) / kLuma.g, 0.0, 1.0);
+  if (GRAIN) c = grainApply(c, p + u.dims.zw, u.nr.z, u.nr.w);
+  if (LAST) imageStore(uOut8, p, pack8(c));
+  else imageStore(uD, p, h16v(vec4(c, 1.0)));
+}

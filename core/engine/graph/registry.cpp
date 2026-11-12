@@ -40,7 +40,9 @@ NodeRegistry::NodeRegistry() {
 
   ParamMask ANALYSIS = P.mask({"exposure", "toneTarget", "toneStrength", "ctx.camera", "ctx.source", "ctx.proxy",
                                "ctx.toneReach", "ctx.lutIdentity"});
-  ANALYSIS.add(WB).add(TONE).add(COLOUR).add(FILMCTX);
+  // The tonal analysis is the histogram of the cropped / straightened / vignetted proxy render: it depends on the frame
+  // geometry and the vignette (the legacy keys masked them, so a crop change returned a stale analysis; fixed in a4b).
+  ANALYSIS.add(WB).add(TONE).add(COLOUR).add(FILMCTX).add(P.mask({"crop", "straighten", "rotate", "flip", "vignette"}));
 
   ParamMask ALL;
   for (std::size_t k = 0; k < P.size(); ++k) ALL.add(ParamKey(k));
@@ -150,6 +152,92 @@ NodeRegistry::NodeRegistry() {
     NodeDesc& d = def(NodeType::FilmSim, "FilmSim", Domain::Image, Footprint::Super, 1, 1, m);
     d.usesGeometry = true;
     d.haloNote = "spectral film simulator incl. halation / DIR / grain / scan";
+  }
+  // ---- film decomposition (8.1, 8.3): each node declares the smallest set it reads itself ------------------------------------
+  // Pixel pitch of the film frame (spatial effects are defined in micrometres) follows the frame size keys.
+  const ParamMask FILMPITCH = P.mask({"ctx.srcSize", "ctx.outLongEdge", "ctx.region", "ctx.filmLib", "filmStock"});
+  {
+    NodeDesc& d = def(NodeType::FilmTableRaw, "FilmTableRaw", Domain::Table, Footprint::Global, 0, 0,
+                      P.mask({"filmStock", "ctx.filmLib"}));
+    d.cache = CacheHint::Keep;
+    d.haloNote = "raw-exposure LUT 192^2 (reflect-padded)";
+  }
+  {
+    // the film side only: the curves do not depend on the print paper
+    NodeDesc& d = def(NodeType::FilmTableCurves, "FilmTableCurves", Domain::Table, Footprint::Global, 0, 0,
+                      P.mask({"filmStock", "ctx.filmLib"}));
+    d.cache = CacheHint::Keep;
+    d.haloNote = "density + pre-coupler curves, DIR matrix";
+  }
+  {
+    // dragging print warmth / tint re-bakes only this table
+    NodeDesc& d = def(NodeType::FilmTablePrintScan, "FilmTablePrintScan", Domain::Table, Footprint::Global, 0, 0,
+                      P.mask({"filmStock", "filmPaper", "film_warmth", "film_tint", "ctx.filmLib"}));
+    d.cache = CacheHint::Keep;
+    d.haloNote = "33^3 film density -> display sRGB LUT, glare white, sRGB decode";
+  }
+  {
+    // gain (white balance x exposure x film exposure) is folded into the input matrix
+    ParamMask m = WB;
+    m.add(P.mask({"exposure", "film_exp", "ctx.camera", "ctx.source", "ctx.filmLib"}));
+    NodeDesc& d = def(NodeType::FilmExposure, "FilmExposure", Domain::Image, Footprint::Point, 2, 2, m);
+    d.inputDomain[0] = Domain::Image;
+    d.inputDomain[1] = Domain::Table;  // FilmTableRaw
+    d.haloNote = "point: matrix + chromaticity + bicubic raw LUT; output is 3 planar F32 planes";
+  }
+  {
+    ParamMask m = FILMPITCH;
+    m.add(P.mask({"film_halation"}));
+    NodeDesc& d = def(NodeType::FilmBlurExposure, "FilmBlurExposure", Domain::Image, Footprint::Composite, 1, 1, m);
+    d.usesGeometry = true;
+    d.cache = CacheHint::KeepIfCheap;
+    d.haloNote = "camera diffusion / lens blur + scatter + halation: Gaussian mixtures, half-resolution pyramid above 3 px";
+  }
+  {
+    ParamMask m = FILMPITCH;
+    m.add(P.mask({"ctx.quality"}));  // preview mode drops the DIR diffusion
+    NodeDesc& d = def(NodeType::FilmDirField, "FilmDirField", Domain::Image, Footprint::Composite, 2, 2, m);
+    d.inputDomain[0] = Domain::Image;
+    d.inputDomain[1] = Domain::Table;  // FilmTableCurves
+    d.usesGeometry = true;
+    d.cache = CacheHint::KeepIfCheap;
+    d.haloNote = "inhibitor field q from E2, diffused (sigma >= 3.2 px: half-resolution)";
+  }
+  {
+    NodeDesc& d = def(NodeType::FilmDevelop, "FilmDevelop", Domain::Image, Footprint::Point, 3, 3, ParamMask{});
+    d.inputDomain[0] = Domain::Image;  // E2
+    d.inputDomain[1] = Domain::Image;  // q field (FilmDirField), or elided
+    d.inputDomain[2] = Domain::Table;  // FilmTableCurves
+    d.haloNote = "point: log10, curves, DIR correction -> density";
+  }
+  {
+    ParamMask m = FILMPITCH;
+    m.add(P.mask({"film_grain", "ctx.quality", "ctx.keepGrain", "ctx.frameIndex", "ctx.fullLongEdge"}));
+    NodeDesc& d = def(NodeType::FilmGrain, "FilmGrain", Domain::Image, Footprint::Window, 1, 1, m);
+    d.usesGeometry = true;
+    d.haloNote = "stateless hash noise + dye-cloud / grain blur (a few px)";
+  }
+  {
+    NodeDesc& d = def(NodeType::FilmPrintScan, "FilmPrintScan", Domain::Image, Footprint::Point, 2, 2, ParamMask{});
+    d.inputDomain[0] = Domain::Image;
+    d.inputDomain[1] = Domain::Table;  // FilmTablePrintScan
+    d.haloNote = "point: tetrahedral 3-D LUT";
+  }
+  {
+    ParamMask m = FILMPITCH;
+    m.add(P.mask({"filmPaper", "ctx.quality", "ctx.frameIndex"}));
+    NodeDesc& d = def(NodeType::FilmGlare, "FilmGlare", Domain::Image, Footprint::Window, 2, 2, m);
+    d.inputDomain[0] = Domain::Image;
+    d.inputDomain[1] = Domain::Table;  // FilmTablePrintScan (sRGB decode, glare white)
+    d.usesGeometry = true;
+    d.haloNote = "decode to linear + blurred log-normal hash field (reads no neighbours of the image)";
+  }
+  {
+    ParamMask m = FILMPITCH;
+    m.add(P.mask({"filmPaper", "ctx.quality"}));
+    NodeDesc& d = def(NodeType::FilmScan, "FilmScan", Domain::Image, Footprint::Window, 1, 1, m);
+    d.usesGeometry = true;
+    d.haloNote = "scanner blur + unsharp mask in linear light, sRGB encode";
   }
   {
     ParamMask m = P.mask({"curve_rgb", "curve_r", "curve_g", "curve_b", "lutAmount", "ctx.lutIdentity"});

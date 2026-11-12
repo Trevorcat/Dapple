@@ -46,6 +46,13 @@ class ResultCache {
     return nullptr;
   }
 
+  // Lookup without touching the statistics (the planner decides on cache state before the executor uses it).
+  const Entry* peek(NodeType t, const Hash128& key) const {
+    for (const Entry& e : entries_[std::size_t(t)])
+      if (e.key == key) return &e;
+    return nullptr;
+  }
+
   // The entry of `family` with the largest order >= minOrder (earliest inserted among equals).
   Entry* findBest(NodeType t, const Hash128& family, int minOrder) {
     Entry* best = nullptr;

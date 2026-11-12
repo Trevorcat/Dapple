@@ -16,6 +16,8 @@
 #include "dapple/tone.h"
 #include "look_internal.h"
 #include "parallel.h"
+#include "engine/nodes/film/film_nodes.h"
+#include "frame_kernels.h"
 #include "spatial.h"
 
 namespace dapple {
@@ -749,11 +751,44 @@ film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, Spatial
 // `pitch` = size of an output pixel in source pixels (spatial effects are defined in film-frame micrometres).
 template <class Fetch>
 bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], const ImageF& src, bool resample, int w,
-                  int h, float pitch, SpatialQuality q, Fetch&& fetch, ImageF& out) {
+                  int h, float pitch, SpatialQuality q, Fetch&& fetch, ImageF& out, const FastOptions* fo = nullptr) {
   if (!run.stock) return false;
   const float formatScale = pitch * float(std::max(w, h)) / float(std::max(src.width, src.height));
   const float evGain = std::exp2(p.filmExposure);
   const float gainEv[3] = {gain[0] * evGain, gain[1] * evGain, gain[2] * evGain};
+  if (engine::filmnode::enabled()) {
+    // the film as engine nodes (core/engine/nodes/film): byte-identical with the FilmSimulator below
+    engine::filmnode::FilmFrameArgs a;
+    a.lib = run.lib.get();
+    a.stock = p.filmStock.c_str();
+    a.paper = run.paper.c_str();
+    for (int c = 0; c < 3; ++c) a.gain[c] = gain[c];
+    a.filmExposure = p.filmExposure;
+    a.warmth = p.filmWarmth;
+    a.tint = p.filmTint;
+    a.grainPct = p.filmGrain;
+    a.halationPct = p.filmHalation;
+    a.formatScale = formatScale;
+    a.w = w;
+    a.h = h;
+    a.quality = q == SpatialQuality::Off ? 0 : (q == SpatialQuality::Interactive ? 1 : 2);
+    if (fo) {
+      a.keepGrain = fo->keepGrain;
+      a.fullLongEdge = fo->fullLongEdge;
+      a.frameIndex = fo->frameIndex;
+    }
+    ScratchImage nodeScratch;
+    const ImageF* nin = &src;
+    if (resample) {
+      ImageF& lin = nodeScratch.get(w, h);
+      parallelRows(h, [&](int y) { fetch(y, lin.row(y)); });
+      nin = &lin;
+    }
+    if (out.width != nin->width || out.height != nin->height) out = ImageF(nin->width, nin->height);
+    if (nin->width == w && nin->height == h &&
+        engine::filmnode::renderFilmFrame(a, nin->data.data(), std::size_t(nin->width) * 3, out.data.data(), std::size_t(out.width) * 3))
+      return true;
+  }
   film::SimulatorLease lease = film::acquireSimulator(run.lib, p.filmStock, run.paper);
   std::string err;
   if (!lease->setParams(makeFilmParams(p, run, q, formatScale), &err)) return false;
@@ -1000,16 +1035,15 @@ FastDims fastDims(const Geometry& geo, const RenderRegion& R) {
 std::string Renderer::pointKey() const {
   EditParams k = p_;
   // everything that is not point-wise
-  k.clarity = k.texture = k.dehaze = k.vignette = k.grain = 0.f;
+  k.clarity = k.texture = k.dehaze = k.grain = 0.f;
   k.sharpen = k.sharpRadius = k.nrLuma = k.nrColor = 0.f;
   k.filmGrain = k.filmHalation = 100.f;  // spatial film parameters do not touch the lattice
   // Nor do the film's own continuous controls: the film branch applies them inside the film simulator, the lattice is
   // only the blend partner of the normal render, and the tonal class analysis ignores the film look.
   k.filmExposure = k.filmWarmth = k.filmTint = 0.f;
-  k.crop = "orig";
-  k.straighten = 0.f;
-  k.rotate = 0;
-  k.flip = false;
+  // crop, straighten, rotate, flip and vignette stay in the key: the tonal analysis (histogram, tonal class, the move built
+  // from it) is taken from the cropped / vignetted render of the proxy, so a bake made for another framing is stale
+  // (the old key masked them: a crop change returned the previous crop's analysis; documented in docs/engine, a4b).
   char buf[96];
   std::snprintf(buf, sizeof buf, "|%p|%s|%.3f|%d", static_cast<const void*>(lut_), camera_.id.c_str(), toneReach_,
                 toneProxy_ ? 1 : 0);
@@ -1022,6 +1056,12 @@ std::string Renderer::colourKey() const {
   r.p_.temperature = r.p_.tint = 0.f;
   r.p_.toneTarget.clear();
   r.p_.toneStrength = 0.f;
+  // the lattice is a function of the colour stage alone: neither the framing nor the vignette reaches it
+  r.p_.vignette = 0.f;
+  r.p_.crop = "orig";
+  r.p_.straighten = 0.f;
+  r.p_.rotate = 0;
+  r.p_.flip = false;
   return r.pointKey();
 }
 
@@ -1308,7 +1348,7 @@ std::uint8_t* Renderer::renderBakedImpl(const SourceImage& source, const BakedLu
         [&](int y, float* row) {
           for (int x = 0; x < w; ++x) fetchPixel(x, y, row + 3 * x);
         },
-        *F);
+        *F, &opt);
   }
   const bool needNormal = !filmOk || fr.strength < 1.f;
 
@@ -1481,5 +1521,303 @@ std::vector<float> Renderer::bakeOverflow(const SourceImage& source, const Baked
   });
   return out;
 }
+
+// ================================================================================================
+// FrameKernels: the per-pixel loop of renderBakedImpl / renderFloat as block fragments (core/engine, src/frame_kernels.h)
+// ================================================================================================
+struct FrameKernels::Impl {
+  const Renderer& r;
+  const SourceImage& source;
+  const ImageF& in;
+  const BakedLut* lutp;
+  const bool exact;
+  FastOptions opt;
+  Geometry geo;
+  FastDims d;
+  bool region = false, useGeo = false, exactMap = false;
+  FilmRun fr;
+  SpatialParams sp;
+  float gain[3] = {1.f, 1.f, 1.f};
+  float vig = 0.f;
+  std::optional<LutSampler> sample;
+  mutable std::once_flag opOnce;
+  mutable std::optional<Renderer::PointOp> overflowOp;
+  std::optional<Renderer::PointOp> exactOp;
+  bool filmRan = false, filmOkV = false, valid = false;
+  float pitch = 1.f;
+
+  Impl(const Renderer& rr, const SourceImage& src, const BakedLut* lut, const FastOptions& o)
+      : r(rr), source(src), in(src.linear), lutp(lut), exact(lut == nullptr), opt(o) {
+    if (in.empty() || (lut && lut->n < 2)) return;
+    geo.setup(r.p_, in.width, in.height);
+    fr = resolveFilm(r.p_);
+    if (!exact) {
+      const RenderRegion& R = opt.region;
+      region = R.active();
+      d = fastDims(geo, R);
+      EditParams pStyle = r.p_;
+      if (fr.stock && fr.strength >= 1.f) pStyle.look = "std";  // a film at full strength brings its own grain
+      const StyleMix style = makeStyle(pStyle);
+      sp = makeSpatial(r.p_, source.sceneReferred, style);
+      if (opt.spatial == SpatialQuality::Off) {
+        sp = SpatialParams{};
+      } else if (opt.spatial == SpatialQuality::Interactive) {
+        sp.grain = 0.f;
+        if (!opt.noise) sp.nrLuma = sp.nrColor = 0.f;
+      }
+      if (region) sp.scale = std::max(float(d.w) / (d.fx1 - d.fx0), float(d.h) / (d.fy1 - d.fy0)) / 2048.f;
+      const float expo = std::exp2(r.p_.exposure + (source.sceneReferred ? r.camera_.baselineExposureEv : 0.f));
+      for (int c = 0; c < 3; ++c) gain[c] = r.wbGain_[c] * expo;
+      sample.emplace(*lut);
+      pitch = region ? std::max(d.stepX, d.stepY) : 1.f;
+    } else {
+      d = fastDims(geo, RenderRegion{});
+      exactOp.emplace(r.makePointOp(source, nullptr));
+      sp = opt.spatial == SpatialQuality::Off ? SpatialParams{} : makeSpatial(r.p_, source.sceneReferred, exactOp->style);
+    }
+    vig = r.p_.vignette / 100.f;
+    useGeo = geo.active || region;
+    exactMap = geo.exact && !region;
+    valid = true;
+  }
+
+  void fetchPixel(int x, int y, float v[3]) const {
+    const float fx = d.ox0 + (float(x) + 0.5f) * d.stepX, fy = d.oy0 + (float(y) + 0.5f) * d.stepY;
+    float sx, sy;
+    geo.mapF(fx, fy, sx, sy);
+    if (exactMap) {
+      const float* px = in.row(std::clamp(int(std::floor(sy)), 0, in.height - 1)) +
+                        3 * std::clamp(int(std::floor(sx)), 0, in.width - 1);
+      v[0] = px[0], v[1] = px[1], v[2] = px[2];
+    } else {
+      sampleCubic(in, sx, sy, v);
+    }
+  }
+};
+
+FrameKernels::FrameKernels(const Renderer& r, const SourceImage& src, const BakedLut* lut, const FastOptions& opt)
+    : impl_(std::make_unique<Impl>(r, src, lut, opt)) {}
+FrameKernels::~FrameKernels() = default;
+
+bool FrameKernels::valid() const { return impl_->valid; }
+int FrameKernels::width() const { return impl_->d.w; }
+int FrameKernels::height() const { return impl_->d.h; }
+bool FrameKernels::exactVariant() const { return impl_->exact; }
+bool FrameKernels::useGeo() const { return impl_->useGeo; }
+bool FrameKernels::filmSelected() const { return impl_->fr.stock != nullptr; }
+float FrameKernels::filmStrength() const { return impl_->fr.strength; }
+bool FrameKernels::vignetteActive() const { return impl_->vig != 0.f; }
+const SpatialParams& FrameKernels::spatial() const { return impl_->sp; }
+float FrameKernels::spatialScale() const {
+  return impl_->sp.scale > 0.f ? impl_->sp.scale : float(std::max(impl_->d.w, impl_->d.h)) / 2048.f;
+}
+bool FrameKernels::filmOk() const { return impl_->filmOkV; }
+bool FrameKernels::needNormal() const { return !impl_->filmOkV || impl_->fr.strength < 1.f; }
+
+FramePlan FrameKernels::framePlan() const {
+  const Impl& m = *impl_;
+  FramePlan fp;
+  fp.srcW = m.in.width;
+  fp.srcH = m.in.height;
+  fp.outW = m.d.w;
+  fp.outH = m.d.h;
+  fp.useGeo = m.useGeo;
+  fp.exact = m.exactMap;
+  fp.rot = m.geo.rot;
+  fp.flip = m.geo.flip;
+  fp.cs = m.geo.cs;
+  fp.sn = m.geo.sn;
+  fp.fw = m.geo.fw;
+  fp.fh = m.geo.fh;
+  fp.ox0 = m.d.ox0;
+  fp.oy0 = m.d.oy0;
+  fp.stepX = m.d.stepX;
+  fp.stepY = m.d.stepY;
+  fp.fullW = m.d.fullW;
+  fp.fullH = m.d.fullH;
+  for (int c = 0; c < 3; ++c) fp.gain[c] = m.gain[c];
+  fp.vignette = m.vig;
+  fp.nrLuma = m.sp.nrLuma;
+  fp.nrColor = m.sp.nrColor;
+  fp.dehaze = m.sp.dehaze;
+  fp.clarity = m.sp.clarity;
+  fp.texture = m.sp.texture;
+  fp.sharpen = m.sp.sharpen;
+  fp.sharpRadius = m.sp.sharpRadius;
+  fp.grain = m.sp.grain;
+  fp.spatialScale = spatialScale();
+  return fp;
+}
+
+void FrameKernels::copyRow(float* px, int n, int x0, int y) const {
+  std::memcpy(px, impl_->in.row(y) + 3 * std::size_t(x0), std::size_t(n) * 3 * sizeof(float));
+}
+
+void FrameKernels::fetchRow(float* px, int n, int x0, int y) const {
+  for (int i = 0; i < n; ++i) impl_->fetchPixel(x0 + i, y, px + 3 * i);
+}
+
+void FrameKernels::gain(float* px, int n) const {
+  const Impl& m = *impl_;
+  if (m.exact) {  // renderFloat: (v * wb) * exposure
+    const Renderer::PointOp& op = *m.exactOp;
+    for (int i = 0; i < n; ++i)
+      for (int c = 0; c < 3; ++c) px[3 * i + c] = std::max(0.f, px[3 * i + c] * op.wb[c] * op.exposureGain);
+    return;
+  }
+  for (int i = 0; i < n; ++i)
+    for (int c = 0; c < 3; ++c) px[3 * i + c] = std::max(0.f, px[3 * i + c] * m.gain[c]);
+}
+
+void FrameKernels::toneColour(float* px, int n) const {
+  const Impl& m = *impl_;
+  if (m.exact) {
+    for (int i = 0; i < n; ++i) {
+      const float v[3] = {px[3 * i], px[3 * i + 1], px[3 * i + 2]};
+      m.exactOp->apply(v, px + 3 * i);
+    }
+    return;
+  }
+  const LutSampler sample = *m.sample;
+  for (int i = 0; i < n; ++i) {
+    float* p = px + 3 * i;
+    const float v[3] = {p[0], p[1], p[2]};
+    float e3[3], tm[3];
+    if (!sample(v, e3, tm)) {
+      std::call_once(m.opOnce, [&] { m.overflowOp.emplace(m.r.makePointOp(m.source, m.lutp)); });
+      m.overflowOp->colour(tm, e3);
+    }
+    p[0] = e3[0], p[1] = e3[1], p[2] = e3[2];
+  }
+}
+
+bool FrameKernels::canFuseHead() const { return !impl_->exact; }
+
+void FrameKernels::headGainTone(float* px, int n, int x0, int y) const {
+  const Impl& m = *impl_;
+  // local copies: the compiler cannot keep fields of an object it may alias with the float stores below in registers
+  const LutSampler sample = *m.sample;
+  const float gain[3] = {m.gain[0], m.gain[1], m.gain[2]};
+  const float* srcRow = m.useGeo ? nullptr : m.in.row(y) + 3 * std::size_t(x0);
+  for (int i = 0; i < n; ++i) {
+    float v[3];
+    if (srcRow) {
+      v[0] = srcRow[3 * i], v[1] = srcRow[3 * i + 1], v[2] = srcRow[3 * i + 2];
+    } else {
+      m.fetchPixel(x0 + i, y, v);
+    }
+    for (int c = 0; c < 3; ++c) v[c] = std::max(0.f, v[c] * gain[c]);
+    float e3[3], tm[3];
+    if (!sample(v, e3, tm)) {
+      std::call_once(m.opOnce, [&] { m.overflowOp.emplace(m.r.makePointOp(m.source, m.lutp)); });
+      m.overflowOp->colour(tm, e3);
+    }
+    float* p = px + 3 * i;
+    p[0] = e3[0], p[1] = e3[1], p[2] = e3[2];
+  }
+}
+
+void FrameKernels::displayStages(float* px, int n) const {
+  for (int i = 0; i < n; ++i) impl_->r.displayStages(px + 3 * i);
+}
+
+void FrameKernels::blend(float* main, const float* film, int n) const {
+  const float s = impl_->fr.strength;
+  for (int i = 0; i < n; ++i)
+    for (int c = 0; c < 3; ++c) main[3 * i + c] = main[3 * i + c] + s * (film[3 * i + c] - main[3 * i + c]);
+}
+
+void FrameKernels::vignette(float* px, int n, int x0, int y) const {
+  const Impl& m = *impl_;
+  const float cx = m.d.fullW * 0.5f, cy = m.d.fullH * 0.5f;
+  const float py = m.d.oy0 + (float(y) + 0.5f) * m.d.stepY - 0.5f;
+  for (int i = 0; i < n; ++i) {
+    const float pxx = m.d.ox0 + (float(x0 + i) + 0.5f) * m.d.stepX - 0.5f;
+    applyVignette(px + 3 * i, (pxx - cx) / cx, (py - cy) / cy, m.vig);
+  }
+}
+
+bool FrameKernels::streamFilm(std::uint8_t* rgba) {
+  Impl& m = *impl_;
+  if (m.exact || !(m.fr.stock && m.fr.strength >= 1.f) || !rgba || m.sp.any()) return false;
+  const Renderer& rr = m.r;
+  const int w = m.d.w, h = m.d.h;
+  film::SimulatorLease lease = film::acquireSimulator(m.fr.lib, rr.p_.filmStock, m.fr.paper);
+  std::string err;
+  const float evGain = std::exp2(rr.p_.filmExposure);
+  const float gainEv[3] = {m.gain[0] * evGain, m.gain[1] * evGain, m.gain[2] * evGain};
+  if (!(lease && lease->setParams(makeFilmParams(rr.p_, m.fr, m.opt.spatial, m.pitch), &err))) return false;
+  const bool plain = rr.master_.identity && rr.red_.identity && rr.green_.identity && rr.blue_.identity &&
+                     !(rr.lut_ && rr.p_.lutAmount > 0);
+  auto sink = [&](int y, float* t, int W) {
+    std::uint8_t* o = rgba + std::size_t(y) * W * 4;
+    if (!plain || m.vig != 0) {
+      for (int x = 0; x < W; ++x) {
+        float e3[3] = {t[3 * x], t[3 * x + 1], t[3 * x + 2]};
+        if (!plain) rr.displayStages(e3);
+        if (m.vig != 0) {
+          const float cx = m.d.fullW * 0.5f, cy = m.d.fullH * 0.5f;
+          const float px = m.d.ox0 + (float(x) + 0.5f) * m.d.stepX - 0.5f,
+                      py = m.d.oy0 + (float(y) + 0.5f) * m.d.stepY - 0.5f;
+          applyVignette(e3, (px - cx) / cx, (py - cy) / cy, m.vig);
+        }
+        t[3 * x] = e3[0], t[3 * x + 1] = e3[1], t[3 * x + 2] = e3[2];
+      }
+    }
+    for (int i = 0; i < W; ++i) {  // clamp + encode (vectorises: fixed trip count, no branches)
+      const float rr_ = std::min(std::max(t[3 * i], 0.f), 1.f), g = std::min(std::max(t[3 * i + 1], 0.f), 1.f),
+                  b = std::min(std::max(t[3 * i + 2], 0.f), 1.f);
+      o[4 * i] = std::uint8_t(rr_ * 255.f + 0.5f);
+      o[4 * i + 1] = std::uint8_t(g * 255.f + 0.5f);
+      o[4 * i + 2] = std::uint8_t(b * 255.f + 0.5f);
+      o[4 * i + 3] = 255;
+    }
+  };
+  auto tramp = [](void* u, int y, float* t, int W) { (*static_cast<decltype(sink)*>(u))(y, t, W); };
+  auto fetchRowFn = [&](int y, float* row) {
+    for (int x = 0; x < w; ++x) m.fetchPixel(x, y, row + 3 * x);
+  };
+  auto fetchTramp = [](void* u, int y, float* row) { (*static_cast<decltype(fetchRowFn)*>(u))(y, row); };
+  const bool resampled = m.geo.active || m.region;
+  return lease->renderRows(m.in, w, h, gainEv, resampled ? fetchTramp : nullptr, &fetchRowFn, tramp, &sink);
+}
+
+bool FrameKernels::runFilm(ImageF& F) {
+  Impl& m = *impl_;
+  m.filmRan = true;
+  if (!m.fr.stock) return false;
+  const int w = m.d.w, h = m.d.h;
+  float g[3];
+  if (m.exact) {
+    for (int c = 0; c < 3; ++c) g[c] = m.exactOp->wb[c] * m.exactOp->exposureGain;
+  } else {
+    for (int c = 0; c < 3; ++c) g[c] = m.gain[c];
+  }
+  const SpatialQuality q = m.exact ? (m.opt.spatial == SpatialQuality::Off ? SpatialQuality::Off : SpatialQuality::Full)
+                                   : m.opt.spatial;
+  m.filmOkV = runFilmStage(
+      m.r.p_, m.fr, g, m.in, m.useGeo, w, h, m.pitch, q,
+      [&](int y, float* row) {
+        for (int x = 0; x < w; ++x) m.fetchPixel(x, y, row + 3 * x);
+      },
+      F, &m.opt);
+  return m.filmOkV;
+}
+
+void FrameKernels::finalizeSpatial() {
+  Impl& m = *impl_;
+  if (!m.exact || m.opt.spatial == SpatialQuality::Off) return;
+  // renderFloat: a film at full strength brings its own grain, the look's grain would double it
+  EditParams pe = m.r.p_;
+  if (m.filmOkV && m.fr.strength >= 1.f) pe.look = "std";
+  m.sp = makeSpatial(m.r.p_, m.source.sceneReferred, m.filmOkV && m.fr.strength >= 1.f ? makeStyle(pe) : m.exactOp->style);
+}
+
+struct ScratchFrame::Impl {
+  ScratchImage s;
+};
+ScratchFrame::ScratchFrame() : impl_(std::make_unique<Impl>()) {}
+ScratchFrame::~ScratchFrame() = default;
+ImageF& ScratchFrame::get(int w, int h) { return impl_->s.get(w, h); }
 
 }  // namespace dapple

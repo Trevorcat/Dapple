@@ -1,0 +1,145 @@
+#version 450
+// FilmGlare + FilmScan (mirror of the second half of the tile pass in core/src/film_spatial_render.cpp):
+//   MODE 0  decode      display sRGB (encoded) -> linear light (4097-entry table, linear extension outside [0,1])
+//   MODE 1  glare noise log-normal hash field exp(mu + sigma z) over the frame grown by the glare blur radius (hash on absolute coordinates)
+//   MODE 2  glare add   lin += (field * 0.01 - mean) * white   (per channel)
+//   MODE 3  fir4 h      horizontal FIR of a 3-channel image, 'reflect' boundary (scanner lens blur / unsharp mask / glare field)
+//   MODE 4  fir4 v      vertical FIR
+//   MODE 5  encode      linear (+ unsharp: lin + amount * (lin - blurred)) -> display sRGB, unclamped
+layout(local_size_x = 16, local_size_y = 16) in;
+#ifndef MODE
+#define MODE 0
+#endif
+
+layout(std140, binding = 0) uniform P {
+  ivec4 dim;    // output w, h, r (fir radius), flag (glare field margin / unsharp on)
+  ivec4 org;    // absolute coordinates of output pixel (0, 0), glare margin
+  vec4 glare;   // mu, sigma, mean (glareRgb[3]), amount (unsharp)
+  vec4 white;   // linear display white of the viewing illuminant (glareRgb xyz)
+  uvec4 stream; // glare stream
+  vec4 taps[5]; // half taps
+} u;
+
+#if MODE == 0
+layout(binding = 1) uniform sampler2D uA;
+layout(binding = 2, std430) readonly buffer Dec { float dec[]; };
+layout(binding = 3, rgba32f) uniform writeonly image2D uOut;
+#elif MODE == 1
+layout(binding = 1, r32f) uniform writeonly image2D uOut;
+#elif MODE == 2
+layout(binding = 1) uniform sampler2D uA;   // lin
+layout(binding = 2) uniform sampler2D uB;   // field (with margin)
+layout(binding = 3, rgba32f) uniform writeonly image2D uOut;
+#elif MODE == 3 || MODE == 4
+layout(binding = 1) uniform sampler2D uA;
+layout(binding = 2, rgba32f) uniform writeonly image2D uOut;
+#else
+layout(binding = 1) uniform sampler2D uA;   // lin
+layout(binding = 2) uniform sampler2D uB;   // blurred lin (unsharp) or lin again
+layout(binding = 3, rgba32f) uniform writeonly image2D uOut;
+#endif
+
+int reflectIdx(int i, int n) {
+  if (n == 1) return 0;
+  const int period = 2 * n;
+  // floor modulo without the GLSL '%' on negative operands (undefined in the specification)
+  const int q = i >= 0 ? i / period : -((-i + period - 1) / period);
+  i -= q * period;
+  return i < n ? i : period - 1 - i;
+}
+float tap(int k) { return u.taps[k >> 2][k & 3]; }
+
+void pcg3d(inout uint x, inout uint y, inout uint z) {
+  x = x * 1664525u + 1013904223u;
+  y = y * 1664525u + 1013904223u;
+  z = z * 1664525u + 1013904223u;
+  x += y * z;
+  y += z * x;
+  z += x * y;
+  x ^= x >> 16;
+  y ^= y >> 16;
+  z ^= z >> 16;
+  x += y * z;
+  y += z * x;
+  z += x * y;
+}
+float exp2f_(float x) {
+  x = clamp(x, -125.0, 125.0);
+  const float r = roundEven(x);
+  const float f = x - r;
+  const float p = 1.0 + f * (0.69314718 + f * (0.24022651 + f * (0.05550411 + f * (0.00961813 + f * 0.00133336))));
+  return p * uintBitsToFloat(uint(int(r) + 127) << 23);
+}
+float logf_(float x) {
+  const uint b = floatBitsToUint(x);
+  int e = int(b >> 23) - 127;
+  float m = uintBitsToFloat((b & 0x7FFFFFu) | 0x3F800000u);
+  const bool hi = m > 1.41421356;
+  m = hi ? m * 0.5 : m;
+  e += hi ? 1 : 0;
+  const float t = (m - 1.0) / (m + 1.0), t2 = t * t;
+  const float pp = 1.0 + t2 * (1.0 / 3.0 + t2 * (1.0 / 5.0 + t2 * (1.0 / 7.0 + t2 * (1.0 / 9.0))));
+  return float(e) * 0.69314718 + 2.0 * t * pp;
+}
+float cos2pi(float t) {
+  const float a = t - 0.5;
+  const float aa = abs(a);
+  const bool fold = aa > 0.25;
+  const float b = fold ? 0.5 - aa : aa;
+  const float x = 6.28318531 * b, x2 = x * x;
+  const float c = 1.0 + x2 * (-0.5 + x2 * (4.16666667e-2 + x2 * (-1.38888889e-3 + x2 * (2.48015873e-5 + x2 * -2.75573192e-7))));
+  return fold ? c : -c;
+}
+float u01(uint w) { return (float(w >> 8) + 0.5) * (1.0 / 16777216.0); }
+float normalFrom(uint a, uint b) { return sqrt(-2.0 * logf_(u01(a))) * cos2pi(u01(b)); }
+
+float encode(float v) {
+  if (v <= 0.0) return 12.92 * v;
+  if (v >= 1.0) return 1.0 + (v - 1.0) * 0.4396;
+  return v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
+}
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.dim.x || p.y >= u.dim.y) return;
+#if MODE == 0
+  vec3 e = texelFetch(uA, p, 0).rgb, l;
+  for (int c = 0; c < 3; ++c) {
+    if (e[c] <= 0.0) {
+      l[c] = e[c] * (1.0 / 12.92);
+    } else if (e[c] >= 1.0) {
+      l[c] = 1.0 + (e[c] - 1.0) * 2.2749;
+    } else {
+      const float xx = e[c] * 4096.0;
+      const int idx = min(int(xx), 4095);
+      const float f = xx - float(idx);
+      l[c] = dec[idx] + f * (dec[idx + 1] - dec[idx]);
+    }
+  }
+  imageStore(uOut, p, vec4(l, 1.0));
+#elif MODE == 1
+  uint w0 = uint(p.x + u.org.x), w1 = uint(p.y + u.org.y), w2 = u.stream.x;
+  pcg3d(w0, w1, w2);
+  imageStore(uOut, p, vec4(exp2f_((u.glare.x + u.glare.y * normalFrom(w0, w1)) * 1.44269504), 0.0, 0.0, 0.0));
+#elif MODE == 2
+  const float g = texelFetch(uB, p + ivec2(u.org.zw), 0).r;
+  const vec3 l = texelFetch(uA, p, 0).rgb;
+  imageStore(uOut, p, vec4(l + (g * 0.01 - u.glare.z) * u.white.xyz, 1.0));
+#elif MODE == 3
+  const int r = u.dim.z, w = u.dim.x;
+  vec3 acc = tap(0) * texelFetch(uA, p, 0).rgb;
+  for (int k = 1; k <= r; ++k)
+    acc += tap(k) * (texelFetch(uA, ivec2(reflectIdx(p.x - k, w), p.y), 0).rgb + texelFetch(uA, ivec2(reflectIdx(p.x + k, w), p.y), 0).rgb);
+  imageStore(uOut, p, vec4(acc, 1.0));
+#elif MODE == 4
+  const int r = u.dim.z, h = u.dim.y;
+  vec3 acc = tap(0) * texelFetch(uA, p, 0).rgb;
+  for (int k = 1; k <= r; ++k)
+    acc += tap(k) * (texelFetch(uA, ivec2(p.x, reflectIdx(p.y - k, h)), 0).rgb + texelFetch(uA, ivec2(p.x, reflectIdx(p.y + k, h)), 0).rgb);
+  imageStore(uOut, p, vec4(acc, 1.0));
+#else
+  vec3 l = texelFetch(uA, p, 0).rgb;
+  if (u.dim.w != 0) l += u.glare.w * (l - texelFetch(uB, p, 0).rgb);
+  imageStore(uOut, p, vec4(encode(l.r), encode(l.g), encode(l.b), 1.0));
+#endif
+}

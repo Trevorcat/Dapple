@@ -29,6 +29,7 @@ class MainActivity : FlutterActivity() {
     private var observer: ContentObserver? = null
     private val liveIo = Executors.newFixedThreadPool(2)
     private val live by lazy { LiveBridge(applicationContext) }
+    private var viewPlugin: DappleViewPlugin? = null
 
     private val extensions = listOf("arw", "raf", "dng", "jpg", "jpeg")
 
@@ -38,6 +39,9 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val messenger = flutterEngine.dartExecutor.binaryMessenger
+
+        // Zero-copy display (stage d): SurfaceProducer textures drawn by the native view (DappleViewPlugin.kt)
+        viewPlugin = DappleViewPlugin(applicationContext, messenger, flutterEngine.renderer)
 
         // Editor landmark haptics (requirements 4.15.9): View.performHapticFeedback with the
         // finest constant the OS offers. Numeric values so this compiles against any compileSdk.

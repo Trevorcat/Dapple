@@ -1,0 +1,143 @@
+#version 450
+// FilmGrain: stateless-hash particle grain, one value per pixel and channel (mirror of grainRow with sumOnly = 1 in
+// core/src/film_spatial_kernels.inc: pcg3d counter hash of (x, y, stream), Box-Muller normal, Poisson inversion below an expected
+// particle count of 4, Cornish-Fisher above, merged-layer sampler when the three sub-layers together are large).
+// The hash coordinates are the ABSOLUTE frame coordinates (u.org + pixel, possibly negative: the halo of the grain blur), so tiles,
+// previews and the video frame index (folded into the stream words) agree. The density is fetched with scipy 'reflect'.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std140, binding = 0) uniform P {
+  ivec4 dim;       // output (extended) w, h; frame w, h
+  ivec4 org;       // absolute coordinates of output pixel (0, 0); layers; table size
+  uvec4 stream;    // per channel stream base
+  vec4 pa[3];      // per channel: sub-layer dmin (xyz), inverse table scale
+  vec4 pb[3];      // per channel: inverse dmax of the sub-layers (xyz), uniformity u
+  vec4 pc[3];      // per channel: expected particle counts n of the sub-layers (xyz), merged-sampler switch
+  vec4 pd[3];      // per channel: sub-layer particle scale (xyz)
+} u;
+
+layout(binding = 1) uniform sampler2D uD;  // developed density (frame size)
+layout(binding = 2, std430) readonly buffer Tab { float tab[]; };  // per channel: inv ((N+2) x 4), merged ((N+2) x 4)
+layout(binding = 3, rgba32f) uniform writeonly image2D uOut;
+
+void pcg3d(inout uint x, inout uint y, inout uint z) {
+  x = x * 1664525u + 1013904223u;
+  y = y * 1664525u + 1013904223u;
+  z = z * 1664525u + 1013904223u;
+  x += y * z;
+  y += z * x;
+  z += x * y;
+  x ^= x >> 16;
+  y ^= y >> 16;
+  z ^= z >> 16;
+  x += y * z;
+  y += z * x;
+  z += x * y;
+}
+float exp2f_(float x) {
+  x = clamp(x, -125.0, 125.0);
+  const float r = roundEven(x);
+  const float f = x - r;
+  const float p = 1.0 + f * (0.69314718 + f * (0.24022651 + f * (0.05550411 + f * (0.00961813 + f * 0.00133336))));
+  return p * uintBitsToFloat(uint(int(r) + 127) << 23);
+}
+float expf_(float x) { return exp2f_(x * 1.44269504); }
+float logf_(float x) {  // ln(u), u in (0, 1]
+  const uint b = floatBitsToUint(x);
+  int e = int(b >> 23) - 127;
+  float m = uintBitsToFloat((b & 0x7FFFFFu) | 0x3F800000u);
+  const bool hi = m > 1.41421356;
+  m = hi ? m * 0.5 : m;
+  e += hi ? 1 : 0;
+  const float t = (m - 1.0) / (m + 1.0), t2 = t * t;
+  const float pp = 1.0 + t2 * (1.0 / 3.0 + t2 * (1.0 / 5.0 + t2 * (1.0 / 7.0 + t2 * (1.0 / 9.0))));
+  return float(e) * 0.69314718 + 2.0 * t * pp;
+}
+float cos2pi(float t) {
+  const float a = t - 0.5;
+  const float aa = abs(a);
+  const bool fold = aa > 0.25;
+  const float b = fold ? 0.5 - aa : aa;
+  const float x = 6.28318531 * b, x2 = x * x;
+  const float c = 1.0 + x2 * (-0.5 + x2 * (4.16666667e-2 + x2 * (-1.38888889e-3 + x2 * (2.48015873e-5 + x2 * -2.75573192e-7))));
+  return fold ? c : -c;
+}
+float u01(uint w) { return (float(w >> 8) + 0.5) * (1.0 / 16777216.0); }
+float normalFrom(uint a, uint b) { return sqrt(-2.0 * logf_(u01(a))) * cos2pi(u01(b)); }
+
+float poisson(float lam, uint wa, uint wb) {
+  if (lam >= 4.0) {
+    const float z = normalFrom(wa, wb);
+    const float k = lam + sqrt(lam) * z + (z * z - 1.0) * (1.0 / 6.0);
+    return k > 0.0 ? k : 0.0;
+  }
+  const float uu = u01(wa);
+  float p = expf_(-lam), cdf = p, k = 0.0;
+  for (int i = 1; i < 24; ++i) {
+    if (!(uu > cdf)) break;
+    k += 1.0;
+    p *= lam * (1.0 / float(i));
+    cdf += p;
+  }
+  return k;
+}
+
+int reflectIdx(int i, int n) {
+  if (n == 1) return 0;
+  const int period = 2 * n;
+  // floor modulo without the GLSL '%' on negative operands (undefined in the specification)
+  const int q = i >= 0 ? i / period : -((-i + period - 1) / period);
+  i -= q * period;
+  return i < n ? i : period - 1 - i;
+}
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.dim.x || p.y >= u.dim.y) return;
+  const ivec2 a = p + u.org.xy;  // absolute coordinates
+  const vec3 dens = texelFetch(uD, ivec2(reflectIdx(a.x, u.dim.z), reflectIdx(a.y, u.dim.w)), 0).rgb;
+  const int N = u.org.w;
+  const int layers = u.org.z;
+  vec3 res = vec3(0.0);
+  for (int ch = 0; ch < 3; ++ch) {
+    const int tabInv = ch * 2 * (N + 2) * 4, tabMerged = tabInv + (N + 2) * 4;
+    float v = clamp(dens[ch] * u.pa[ch].w, 0.0, float(N));
+    const int ii = int(v);
+    const float ff = v - float(ii);
+    // merged sampler
+    const int m0 = tabMerged + ii * 4;
+    const float M = tab[m0] + ff * (tab[m0 + 4] - tab[m0]);
+    const float sV = tab[m0 + 1] + ff * (tab[m0 + 5] - tab[m0 + 1]);
+    const float gam = tab[m0 + 2] + ff * (tab[m0 + 6] - tab[m0 + 2]);
+    const float lam = tab[m0 + 3] + ff * (tab[m0 + 7] - tab[m0 + 3]);
+    uint s0 = uint(a.x), s1 = uint(a.y), s2 = u.stream[ch] ^ 0x5851F42Du;
+    pcg3d(s0, s1, s2);
+    if (lam >= u.pc[ch].w) {
+      const float z = normalFrom(s0, s1);
+      res[ch] = max(M + sV * (z + gam * (z * z - 1.0) * (1.0 / 6.0)), 0.0);
+      continue;
+    }
+    const int i0 = tabInv + ii * 4;
+    float D[3];
+    for (int l = 0; l < 3; ++l) D[l] = tab[i0 + l] + ff * (tab[i0 + 4 + l] - tab[i0 + l]);
+    uint h[6];
+    h[0] = uint(a.x);
+    h[1] = uint(a.y);
+    h[2] = u.stream[ch];
+    pcg3d(h[0], h[1], h[2]);
+    h[3] = uint(a.x);
+    h[4] = uint(a.y);
+    h[5] = u.stream[ch] + 0x9E3779B9u;
+    pcg3d(h[3], h[4], h[5]);
+    float sum = 0.0;
+    for (int ly = 0; ly < layers; ++ly) {
+      float pp = (D[ly] + u.pa[ch][ly]) * u.pb[ch][ly];
+      pp = clamp(pp, 1e-6, 1.0 - 1e-6);
+      const float s = 1.0 - pp * u.pb[ch].w * (1.0 - 1e-6);
+      const float l2 = u.pc[ch][ly] * pp / s;
+      sum += poisson(l2, h[2 * ly], h[2 * ly + 1]) * u.pd[ch][ly] * s;
+    }
+    res[ch] = sum;
+  }
+  imageStore(uOut, p, vec4(res, 1.0));
+}

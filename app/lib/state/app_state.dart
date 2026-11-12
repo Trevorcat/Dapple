@@ -121,7 +121,7 @@ class AppState extends ChangeNotifier {
   }
 
   /// Bump when the engine's swatch patches change (invalidates the cached swatches).
-  static const _swatchVersion = 1;
+  static const _swatchVersion = 2;
 
   /// Swatches of the stocks, rendered by the engine from fixed test patches (a few seconds, once per pack): read from
   /// the cache file when its key (version, pack size, stock ids) matches, else computed in a background isolate and cached.

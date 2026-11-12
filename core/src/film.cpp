@@ -236,6 +236,10 @@ Key spatialKey(const FilmParams& p, const Key& bake, bool printPath) {
 
 }  // namespace
 
+namespace detail {
+void digestParams(FilmParams& p, const FilmStock& film) { digest(p, film); }
+}  // namespace detail
+
 struct FilmSimulator::Impl {
   std::shared_ptr<const FilmLibrary> lib;
   FilmParams params, digested, effective;

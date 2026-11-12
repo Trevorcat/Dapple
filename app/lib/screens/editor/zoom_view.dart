@@ -338,6 +338,13 @@ class _ZoomViewState extends State<ZoomView> with TickerProviderStateMixin {
     cb(n, math.max(1.0, s), _frame);
   }
 
+  Widget _timed(BuildContext context, Size frame) {
+    final t0 = PerfProbe.begin();
+    final w = widget.builder(context, frame);
+    PerfProbe.end('zv_inner', t0);
+    return w;
+  }
+
   // ------------------------------------------------------------ build
 
   @override
@@ -380,7 +387,7 @@ class _ZoomViewState extends State<ZoomView> with TickerProviderStateMixin {
                   child: SizedBox(
                     width: frame.width,
                     height: frame.height,
-                    child: RepaintBoundary(child: widget.builder(context, frame)),
+                    child: RepaintBoundary(child: _timed(context, frame)),
                   ),
                 ),
               );

@@ -18,6 +18,8 @@ object CodecCatalog {
         val infos = try { MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos } catch (e: Exception) { Log.w(TAG, "codec list: $e"); return out }
         for (ci in infos) {
             if (Build.VERSION.SDK_INT >= 29 && ci.isAlias) continue
+            // secure (DRM) decoders only work with a protected pipeline: never a candidate for ordinary video
+            if (ci.name.endsWith(".secure")) continue
             for (t in ci.supportedTypes) {
                 val mime = MIMES.firstOrNull { it.equals(t, true) } ?: continue
                 try {

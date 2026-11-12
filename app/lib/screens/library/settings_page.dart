@@ -286,15 +286,15 @@ class _SettingsPageState extends State<SettingsPage> {
         ];
       case 5:
         return [
+          _row(context, '开源许可',
+              key: 'licenses',
+              onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => LicensesPage(app: app))),
+              trailing: DIcon(DI.forward, size: 16, color: c.text2)),
           // long-press: hidden codec diagnostics (no user-facing switches)
           _row(context, '版本',
               key: 'about-version',
               onLongPress: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const CodecDiagnosticsPage())),
               trailing: Text(kAppVersion, key: const ValueKey('about-version-value'), style: T.body17(c.text2, w: FontWeight.w400))),
-          _row(context, '开源许可',
-              key: 'licenses',
-              onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => LicensesPage(app: app))),
-              trailing: DIcon(DI.forward, size: 16, color: c.text2)),
         ];
       default:
         return [

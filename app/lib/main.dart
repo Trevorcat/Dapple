@@ -2,10 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'app.dart';
+import 'services/perf_probe.dart';
 import 'state/app_state.dart';
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
+  PerfBinding.ensureInitialized();
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   runApp(const _Root());
 }

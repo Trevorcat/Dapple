@@ -131,6 +131,9 @@ struct AlignedAlloc {
 };
 using AVec = std::vector<float, AlignedAlloc<float>>;
 
+// Parameter digest of FilmSimulator::setParams (stock specifics, preview mode, debug switches), exposed for the engine.
+void digestParams(FilmParams& p, const FilmStock& film);
+
 // Generation counter bumped by film::trimMemory(): per-thread scratch buffers notice it on their next use.
 inline std::atomic<unsigned>& scratchGeneration() {
   static std::atomic<unsigned> g{0};
@@ -226,6 +229,14 @@ class FilmModel {
   Vec3 paperDensityOf(const Vec3& logE) const { return paperDensity(logE); }
 
   FilmTables bake(BakeTimings* t = nullptr) const;
+  // The three parts of bake() (engine film table nodes bake and cache them separately). bakeInput: mIn + padded raw LUT;
+  // bakeCurves: density / pre-coupler curves + DIR matrix (identical for a model built without paper); bakePrintScan:
+  // 33^3 print + scan LUT, glare white, sRGB decode (and the split-path tables).
+  void bakeInput(FilmTables& t) const;
+  void bakeCurves(FilmTables& t) const;
+  void bakePrintScan(FilmTables& t) const;
+  // Changes the enlarger filtration shifts (warmth / tint) without re-running the neutral solve.
+  void rebalance(double mShift, double yShift);
 
  private:
   void init();

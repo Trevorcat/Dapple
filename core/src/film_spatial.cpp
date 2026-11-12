@@ -484,8 +484,53 @@ void applyMixtureHalf(const SpatialKernels& K, Arena& arena, const Plane& half, 
 
 // ---- plan ----------------------------------------------------------------------------------------------------------------
 
+namespace {
+// Full-tap (symmetric) kernel from the half-kernel of gaussTaps; r == 0 gives the unit impulse.
+std::vector<double> fullTaps(double sigma) {
+  std::vector<float> w;
+  int r = 0;
+  if (sigma > 0) gaussTaps(sigma, w, r);
+  std::vector<double> k(std::size_t(2 * r + 1), 0.0);
+  if (r == 0) {
+    k[0] = 1.0;
+    return k;
+  }
+  for (int i = -r; i <= r; ++i) k[std::size_t(i + r)] = w[std::size_t(std::abs(i))];
+  return k;
+}
+std::vector<double> convolve(const std::vector<double>& a, const std::vector<double>& b) {
+  std::vector<double> o(a.size() + b.size() - 1, 0.0);
+  for (std::size_t i = 0; i < a.size(); ++i)
+    for (std::size_t j = 0; j < b.size(); ++j) o[i + j] += a[i] * b[j];
+  return o;
+}
+}  // namespace
+
+double grainBoxFactor(double k, double grainBlur, double scanBlur, double unsharpSigma, double unsharpAmount) {
+  if (!(k > 1.0)) return 1.0;
+  // total 1-D kernel on the pixel grid: (impulse * (1 + a) - a * G_unsharp) * G_grain * G_scan
+  std::vector<double> kern = convolve(fullTaps(grainBlur), fullTaps(scanBlur));
+  if (unsharpSigma > 0 && unsharpAmount > 0) {
+    std::vector<double> us = fullTaps(unsharpSigma);
+    for (double& v : us) v *= -unsharpAmount;
+    us[us.size() / 2] += 1.0 + unsharpAmount;
+    kern = convolve(kern, us);
+  }
+  // box coverage of k pixels (fractional last pixel), phase 0
+  const int nb = int(std::ceil(k));
+  std::vector<double> box(std::size_t(nb), 1.0 / k);
+  box.back() = (k - std::floor(k) > 1e-9 ? k - std::floor(k) : 1.0) / k;
+  double s0 = 0;
+  for (double v : box) s0 += v * v;
+  const std::vector<double> h = convolve(box, kern);
+  double s1 = 0;
+  for (double v : h) s1 += v * v;
+  const double r1 = s1 / s0;
+  return std::clamp(r1 * r1, 0.02, 4.0);
+}
+
 SpatialPlan makeSpatialPlan(const FilmStock& film, const FilmParams& p, int W, int H, bool printPath, const FilmTables& tables,
-                            std::string* err) {
+                            std::string* err, const GrainFullRes* full) {
   (void)tables;
   SpatialPlan s;
   s.W = W;
@@ -580,6 +625,19 @@ SpatialPlan makeSpatialPlan(const FilmStock& film, const FilmParams& p, int W, i
       const double A = pix * pix;
       const bool layers = g.sublayersActive && film.densityCurvesLayers.size() == std::size_t(nc) * 9;
       gp.blurSigma = layers ? (g.blur > 0 ? g.blur : 0) : (g.blur > 0.4 ? g.blur : 0);
+      // scale-aware grain: this frame previews a finer render (see the declaration)
+      const double kScale = full && full->pixelUm > 0 ? pix / full->pixelUm : 1.0;
+      double nDiv = 1.0;  // particle count divisor (variance factor of the box average of the blurred full-resolution grain)
+      if (kScale > 1.05) {
+        // the scanner stage the full-resolution render applies is part of its grain; a frame that applies its own (final tier)
+        // must not count it twice
+        const bool ownUs = p.scanner.unsharpMask[0] > 0 && p.scanner.unsharpMask[1] > 0;
+        const bool ownScan = p.scanner.lensBlur > 0;
+        nDiv = grainBoxFactor(kScale, gp.blurSigma, ownScan ? 0.0 : full->scanBlur, ownUs ? 0.0 : full->unsharpSigma,
+                              ownUs ? 0.0 : full->unsharpAmount);
+        gp.blurSigma = gp.blurSigma / kScale;
+        if (gp.blurSigma < 0.17) gp.blurSigma = 0;  // gaussTaps: radius 0 below this, i.e. identity
+      }
       const bool pos = film.positive();
       for (int ch = 0; ch < 3; ++ch) {
         GrainChannelPlan& gc = gp.ch[ch];
@@ -644,7 +702,7 @@ SpatialPlan makeSpatialPlan(const FilmStock& film, const FilmParams& p, int W, i
             const double dminL = f * g.densityMin[ch];
             const double dmaxP = dmaxL[l] + dminL;
             const double ap = g.particleAreaUm2 * g.particleScale[ch] * layerScale[l];
-            const double n = A * f / ap;
+            const double n = A * f / ap / nDiv;
             gc.dminL[l] = float(dminL);
             gc.invDmaxL[l] = float(1.0 / dmaxP);
             gc.nL[l] = float(n);
@@ -654,7 +712,7 @@ SpatialPlan makeSpatialPlan(const FilmStock& film, const FilmParams& p, int W, i
         } else {
           for (int i = 0; i <= gc.tableN + 1; ++i) gc.inv[std::size_t(i) * 4] = float(double(std::min(i, gc.tableN)) / gc.invScale);
           const double dmaxP = mx + g.densityMin[ch];
-          const double n = A / (g.particleAreaUm2 * g.particleScale[ch]);
+          const double n = A / (g.particleAreaUm2 * g.particleScale[ch]) / nDiv;
           gc.dminL[0] = float(g.densityMin[ch]);
           gc.invDmaxL[0] = float(1.0 / dmaxP);
           gc.nL[0] = float(n);
@@ -713,6 +771,15 @@ SpatialPlan makeSpatialPlan(const FilmStock& film, const FilmParams& p, int W, i
       s.glareSigma = r > 1e-6 ? std::sqrt(sig2) : 0.0;
       s.glareMu = std::log(gl.percent) - (r > 1e-6 ? sig2 / 2 : 0.0);
       s.glareBlur = gl.blur;
+      // scale-aware (see GrainFullRes): the preview's per-pixel glare field gets the variance of the box-averaged full-resolution field
+      const double kS = full && full->pixelUm > 0 ? pix / full->pixelUm : 1.0;
+      if (kS > 1.05 && r > 1e-6 && gl.blur <= 0) {
+        const double f = grainBoxFactor(kS, full->glareBlur, full->scanBlur, full->unsharpSigma, full->unsharpAmount);
+        const double sig2n = std::log(1.0 + (std::exp(sig2) - 1.0) * f / (kS * kS));
+        s.glareSigma = std::sqrt(sig2n);
+        s.glareMu = std::log(gl.percent) - sig2n / 2;
+        s.glareBlur = gl.blur / kS;
+      }
       s.glareMean = gl.percent / 100.0;
     }
   }

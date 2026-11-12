@@ -421,6 +421,26 @@ static void nativeDecoderTest(const std::string& dir) {
       dv_close(g);
     }
   }
+  // the same asset through the NDK decoder with P010 output: on a device with a Main10 hardware decoder this is the real 10-bit
+  // hardware path (decoder name "mc:..."), elsewhere it falls back to software; either way the picture must keep > 256 levels
+  {
+    DvOpenOptions N2{2, DV_SRC_AUTO, nullptr};
+    DvInfo gi{};
+    DvVideo* g = openF(dir, "gradient_hevc_main10.mp4", N2, &gi);
+    CHECK(g != nullptr, "open gradient with the native decoder");
+    if (g) {
+      std::vector<uint8_t> px;
+      int n = countFrames(g, px, DV_P010);
+      char name[32];
+      int hw = dv_decoder(g, name, sizeof name);
+      std::set<int> lv;
+      const uint16_t* y = (const uint16_t*)px.data();
+      for (int x = 0; x < 640; x++) lv.insert(y[(size_t)176 * 640 + x] >> 6);
+      std::printf("  gradient_hevc_main10.mp4 via hwPref 2: decoder '%s' hardware=%d, %d frames, %zu distinct luma levels\n", name, hw, n, lv.size());
+      CHECK(n == 3 && lv.size() > 256, "native P010 gradient: %d frames, %zu levels (decoder %s)", n, lv.size(), name);
+      dv_close(g);
+    }
+  }
   // report round trip
   dv_set_codec_report("{\"x\":1}");
   char rep[32] = {0};

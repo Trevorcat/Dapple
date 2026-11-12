@@ -42,6 +42,24 @@ Tables buildTables(Graph& g, const ParamSet& ps) {
   return t;
 }
 
+// The film branch. FullFilm (8.1): three table nodes (each with its own minimal mask), then the film image nodes. Spatial
+// nodes whose resolved parameters make them identities are elided at plan time (NodeBehaviour::isIdentity), so the
+// structure hash does not depend on parameter values. Full: the FilmSim super-node.
+NodeId addFilm(Graph& g, NodeId cur, GraphDetail detail) {
+  if (detail != GraphDetail::FullFilm) return g.add(NodeType::FilmSim, {Edge{cur}});
+  const NodeId tRaw = g.add(NodeType::FilmTableRaw);
+  const NodeId tCur = g.add(NodeType::FilmTableCurves);
+  const NodeId tPrint = g.add(NodeType::FilmTablePrintScan);
+  const NodeId fe = g.add(NodeType::FilmExposure, {Edge{cur}, Edge{tRaw}});
+  const NodeId fb = g.add(NodeType::FilmBlurExposure, {Edge{fe}});
+  const NodeId fq = g.add(NodeType::FilmDirField, {Edge{fb}, Edge{tCur}});
+  const NodeId fd = g.add(NodeType::FilmDevelop, {Edge{fb}, Edge{fq}, Edge{tCur}});
+  const NodeId fg = g.add(NodeType::FilmGrain, {Edge{fd}});
+  const NodeId fp2 = g.add(NodeType::FilmPrintScan, {Edge{fg}, Edge{tPrint}});
+  const NodeId fl = g.add(NodeType::FilmGlare, {Edge{fp2}, Edge{tPrint}});
+  return g.add(NodeType::FilmScan, {Edge{fl}});
+}
+
 }  // namespace
 
 Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePlan* plan) {
@@ -74,7 +92,22 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
   if (fp.useGeo) cur = g.add(NodeType::Geometry, {Edge{cur}});
 
   if (f.exact) {
-    cur = g.add(NodeType::ToneColourExact, {Edge{cur}});
+    // the reference variant: per-pixel PointOp::apply instead of the lattice; the film branch is the same as below
+    const float strength = e.filmStrength / 100.f;
+    const bool useFilm = in.filmActive && strength > 0.f;
+    const bool needMain = !useFilm || strength < 1.f;
+    NodeId mainOut = 0;
+    if (needMain) {
+      const NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
+      mainOut = g.add(NodeType::ToneColourExact, {Edge{gain}});
+    }
+    if (useFilm) {
+      const NodeId film = addFilm(g, cur, detail);
+      const NodeId disp = g.add(NodeType::DisplayStages, {Edge{film}});
+      cur = needMain ? g.add(NodeType::Blend, {Edge{mainOut}, Edge{disp}}) : disp;
+    } else {
+      cur = mainOut;
+    }
     if (f.wantAnalysis) g.markOutput(g.add(NodeType::Analysis), OutputRole::Analysis);
   } else {
     const Tables t = buildTables(g, ps);
@@ -88,7 +121,7 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
       else mainOut = g.add(NodeType::ToneColour, {Edge{gain}, Edge{t.tone}, Edge{t.lattice}});
     }
     if (useFilm) {
-      const NodeId film = g.add(NodeType::FilmSim, {Edge{cur}});
+      const NodeId film = addFilm(g, cur, detail);
       const NodeId disp = g.add(NodeType::DisplayStages, {Edge{film}});
       cur = needMain ? g.add(NodeType::Blend, {Edge{mainOut}, Edge{disp}}) : disp;
     } else {

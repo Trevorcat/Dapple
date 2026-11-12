@@ -418,7 +418,7 @@ class _ReadoutOverlayState extends State<ReadoutOverlay>
           final o = _fade.value.clamp(0.0, 1.0);
           if (o < 0.01) return const SizedBox.shrink();
           final t0 = PerfProbe.begin();
-          final w = Opacity(opacity: o, child: _content(context));
+          final w = RepaintBoundary(child: Opacity(opacity: o, child: _content(context)));
           PerfProbe.end('readout', t0);
           return w;
         },
@@ -557,6 +557,27 @@ class RulerPainter extends CustomPainter {
   final Color accent;
   final TextStyle baseStyle;
 
+  /// The three fixed labels are laid out once (a text layout per frame is expensive on a slow phone).
+  static final Map<String, TextPainter> _labels = {};
+  static TextStyle? _labelStyle;
+
+  TextPainter _label(String t) {
+    if (_labelStyle != baseStyle) {
+      _labels.clear();
+      _labelStyle = baseStyle;
+    }
+    return _labels.putIfAbsent(
+      t,
+      () => TextPainter(
+        text: TextSpan(
+          text: t,
+          style: baseStyle.copyWith(color: Colors.white, fontSize: 9, height: 1, fontWeight: FontWeight.w500),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout(),
+    );
+  }
+
   static double spanFor(double range, double step, PrecisionBand b) =>
       math.max(range * 0.4 * bandMultiplier(b), step * 5);
 
@@ -594,18 +615,7 @@ class RulerPainter extends CustomPainter {
       ..color = Colors.white.withValues(alpha: snapped ? 1.0 : 0.85)
       ..strokeWidth = snapped ? 3 : 2;
     void label(String t, double x, TextAlign al) {
-      final tp = TextPainter(
-        text: TextSpan(
-          text: t,
-          style: baseStyle.copyWith(
-            color: Colors.white,
-            fontSize: 9,
-            height: 1,
-            fontWeight: FontWeight.w500,
-          ),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout();
+      final tp = _label(t);
       final dx = al == TextAlign.left
           ? x
           : (al == TextAlign.right ? x - tp.width : x - tp.width / 2);

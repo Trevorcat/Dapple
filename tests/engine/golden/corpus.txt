@@ -1,4 +1,4 @@
-# dapple golden corpus (docs/engine/pipeline-architecture.md 10.1). Recorded from the unchanged renderer.
+# dapple golden corpus (docs/engine/pipeline-architecture.md 10.1). Recorded from the unchanged renderer; 15 analysis hashes re-baselined by step a4b (docs/engine, section 17.3).
 # platform arch=x86_64 avx2=1 film=1
 direct_default/f0 ac22c1103a795183:a083a7cae2d7dd4e
 direct_base/f0 072c568e576f93e3:676d2bc7e42ea9a6
@@ -12,17 +12,17 @@ region/r0 3446127d21ce8361:48f63a6f6cb0e6c3
 region/r1 05ae2f2a9bf592d2:48f63a6f6cb0e6c3
 region/r2 f55b1d4238cf5546:48f63a6f6cb0e6c3
 geometry/crop_1:1 ef6bb9565c1828e3:fdbbaeaa3a4239d4
-geometry/crop_4:5 01dbbf75c350b044:fdbbaeaa3a4239d4
-geometry/crop_3:4 096db38d5d167650:fdbbaeaa3a4239d4
-geometry/crop_16:9 3ced0e8c3ba1758b:fdbbaeaa3a4239d4
-geometry/crop_9:16 1b29b7762eb18069:fdbbaeaa3a4239d4
-geometry/crop_orig c7bf50dd3e9904c7:fdbbaeaa3a4239d4
-geometry/rot90 e0b9ca695a108b56:fdbbaeaa3a4239d4
-geometry/rot180 d43df463925988f6:fdbbaeaa3a4239d4
-geometry/rot270 1f92d7656f85acb8:fdbbaeaa3a4239d4
-geometry/straighten-650 5fad07dc63ba81c7:fdbbaeaa3a4239d4
-geometry/straighten325 f36620cade473740:fdbbaeaa3a4239d4
-geometry/straighten1700 48e3d7d82565ffb1:fdbbaeaa3a4239d4
+geometry/crop_4:5 01dbbf75c350b044:0c4b7746c656bd51
+geometry/crop_3:4 096db38d5d167650:0825cdde279986e7
+geometry/crop_16:9 3ced0e8c3ba1758b:f9dd0b04ad474f13
+geometry/crop_9:16 1b29b7762eb18069:14526915986a5621
+geometry/crop_orig c7bf50dd3e9904c7:bc5e48054fb8f6a1
+geometry/rot90 e0b9ca695a108b56:8aad48082e09df4c
+geometry/rot180 d43df463925988f6:8aad48082e09df4c
+geometry/rot270 1f92d7656f85acb8:8aad48082e09df4c
+geometry/straighten-650 5fad07dc63ba81c7:c915b4d90c134d46
+geometry/straighten325 f36620cade473740:41dca544f11d821f
+geometry/straighten1700 48e3d7d82565ffb1:4f5e0f1d2eb9ca21
 geometry/exact_geo ada147e3459f618c:c3212000e72a99b2
 curves/master b959a46f8ceb8ae7:0047f24906f15cc9
 curves/channels 553876b95bc5ba58:2621e161edb70b97
@@ -61,7 +61,7 @@ detail/clarity 87b9434a31017fdc:3daad2c7f6ddf003
 detail/texture 226573fe38cef7d5:3daad2c7f6ddf003
 detail/dehaze 150ac349359fe4dd:3daad2c7f6ddf003
 detail/dehaze_neg f4880efae27664dc:3daad2c7f6ddf003
-detail/all 70757fbc16a1e8c3:3daad2c7f6ddf003
+detail/all 70757fbc16a1e8c3:0788b13f81b9c78b
 detail/all_interactive da7d576f705cf92a:3daad2c7f6ddf003
 detail/all_exact 141ccdcbc22aff48
 lut/final c2276254de61d093:955841a9bd93c2b9
@@ -72,9 +72,9 @@ film/full_interactive fee5ef53c307de7c:2b3c013207e68096
 film/full_warm_interactive e661a0ea37acb60d:ca599a1a84b74160
 film/blend50_interactive e8006fe55846af64:34c8a32c533899a0
 film/blend50_final a3cc8f207fa730cd:9c92ef80755b70b9
-film/full_spatial_final fbd1e1bdf98871d7:6a1a0984cbd1d516
-film/full_geometry 66784d08181fd875:b0f2b48c8ad3cfad
-film/full_region b554fbba638aa123:c556358827a2337e
+film/full_spatial_final fbd1e1bdf98871d7:6571b21ad30f9100
+film/full_geometry 66784d08181fd875:6d004075f74b281c
+film/full_region b554fbba638aa123:0ef20ac2281e11d8
 film/strength0 ee8e57a50ce2d2ca:05563bfa9936664e
 film/off ee8e57a50ce2d2ca:a4a8bbefc228282b
 film/exact_blend 22f890a997b8e2e3:5ae57153774a9c82

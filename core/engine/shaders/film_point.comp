@@ -1,0 +1,163 @@
+#version 450
+// Film point nodes (docs/engine/pipeline-architecture.md 8.1): FilmExposure, FilmDevelop, FilmPrintScan and their fused chain.
+// Mirrors the CPU kernels of core/src/film_kernels_impl.inc (pxExposure, pxLogE, pxCurves, pxQ, tetra); the tables are the CPU
+// bake uploaded as they are (raw LUT padded by one node, curves as (value, slope) pairs, 33^3 print LUT).
+//   MODE 0  src (linear ProPhoto, ungained) -> E (linear exposure, gain folded into the input matrix)
+//   MODE 1  E2 [, q field] -> density D
+//   MODE 2  D -> display sRGB (encoded, unclamped)
+//   MODE 3  src -> display sRGB, the three above fused (no spatial effect between them)
+//   MODE 4  E2 -> inhibitor field q, 2x2 box averaged to half resolution (smooth DIR diffusion path)
+//   MODE 5  E2 -> inhibitor field q at full resolution
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(constant_id = 0) const int MODE = 3;
+layout(constant_id = 1) const bool HAS_Q = false;  // MODE 1: the inhibitor field comes from FilmDirField instead of the pixel
+
+layout(std140, binding = 0) uniform P {
+  vec4 m0, m1, m2;     // input matrix columns (3x3 ProPhoto -> XYZ in the film white) already multiplied by the gain
+  vec4 gam;            // gamma xyz, curve x0
+  vec4 dq0, dq1, dq2, dq3;  // DIR inhibitor matrix columns, offset
+  vec4 dmin, dscale;   // print LUT grid
+  ivec4 dim;           // w, h, rawN, curveN
+  ivec4 lutN;          // N, fetch offset x, y (MODE 2: the grain blur halo), 0
+  vec4 misc;           // curve invDx, exposure scale, 0, 0
+  ivec4 src;           // MODE 4: size of the source image (the allocation is larger)
+  vec4 dsub;           // MODE 2: subtracted from the density first (the grain's baked minimum density, per channel)
+} u;
+
+layout(binding = 1) uniform sampler2D uSrc;
+layout(binding = 2) uniform sampler2D uAux;   // MODE 0/3: raw LUT; MODE 1: q field
+layout(binding = 3) uniform sampler3D uLut;   // print LUT
+layout(binding = 4, std430) readonly buffer Curves { float tab[]; };  // dn then d0, each [3][curveN] (value, slope)
+layout(binding = 5, rgba32f) uniform writeonly image2D uOut;
+
+float mitK0(float t) { return ((7.0 * t - 12.0) * t * t + 16.0 / 3.0) * (1.0 / 6.0); }
+float mitK1(float t) { return (((-7.0 / 3.0 * t + 12.0) * t - 20.0) * t + 32.0 / 3.0) * (1.0 / 6.0); }
+
+vec3 pxExposure(vec3 rgb) {
+  const vec4 xyz = u.m0 * rgb.x + u.m1 * rgb.y + u.m2 * rgb.z;
+  const float b = xyz.x + xyz.y + xyz.z;
+  const float bb = max(b, 1e-10), yz = max(xyz.y + xyz.z, 1e-10);
+  const float r = 1.0 / (bb * yz);
+  const float dd = yz * (yz * r);
+  const float tc0 = clamp(dd * dd, 0.0, 1.0);
+  const float tc1 = clamp(xyz.y * (bb * r), 0.0, 1.0);
+  const int rawN = u.dim.z;
+  const float top = float(rawN - 1);
+  const float a = tc0 * top, c = tc1 * top;
+  int ia = int(a), ic = int(c);
+  ia = min(ia, rawN - 2);
+  ic = min(ic, rawN - 2);
+  const float fa = a - float(ia), fc = c - float(ic);
+  const float wa[4] = float[4](mitK1(fa + 1.0), mitK0(fa), mitK0(1.0 - fa), mitK1(2.0 - fa));
+  const float wc[4] = float[4](mitK1(fc + 1.0), mitK0(fc), mitK0(1.0 - fc), mitK1(2.0 - fc));
+  vec3 acc = vec3(0.0);
+  for (int dj = 0; dj < 4; ++dj) {
+    vec3 row = vec3(0.0);
+    for (int di = 0; di < 4; ++di) row += wa[di] * texelFetch(uAux, ivec2(ia + di, ic + dj), 0).rgb;
+    acc += wc[dj] * row;
+  }
+  return acc * (b * u.misc.y);
+}
+
+// log10(max(e,0) + 1e-10): exponent extraction + odd series, as pxLogE
+vec3 pxLogE(vec3 e) {
+  const vec3 z = max(e, vec3(0.0)) + 1e-10;
+  const ivec3 bits = floatBitsToInt(z);
+  ivec3 ex = (bits >> 23) - 127;
+  vec3 m = intBitsToFloat((bits & 0x7FFFFF) | 0x3F800000);
+  const bvec3 hi = greaterThan(m, vec3(1.41421356));
+  m = mix(m, m * 0.5, hi);
+  ex += ivec3(hi);
+  const vec3 t = (m - 1.0) / (m + 1.0);
+  const vec3 t2 = t * t;
+  const vec3 p = 1.0 + t2 * (1.0 / 3.0 + t2 * (1.0 / 5.0 + t2 * (1.0 / 7.0 + t2 * (1.0 / 9.0))));
+  return (vec3(ex) + 2.88539008 * t * p) * 0.30102999566;
+}
+
+float curveAt(int off, float idx) {
+  const int n = u.dim.w;
+  idx = clamp(idx, 0.0, float(n - 1));
+  const int i = int(idx);
+  const float f = idx - float(i);
+  return tab[off + 2 * i] + f * tab[off + 2 * i + 1];
+}
+vec3 pxCurves(int tabOff, vec3 x) {
+  const int n = u.dim.w;
+  const vec3 idx = (u.gam.xyz * x - u.gam.w) * u.misc.x;
+  return vec3(curveAt(tabOff, idx.x), curveAt(tabOff + 2 * n, idx.y), curveAt(tabOff + 4 * n, idx.z));
+}
+vec3 pxQ(vec3 d) { return u.dq0.xyz * d.x + u.dq1.xyz * d.y + u.dq2.xyz * d.z + u.dq3.xyz; }
+
+vec3 tetra(vec3 d) {
+  const int N = u.lutN.x;
+  const float top = float(N - 1);
+  ivec3 i0;
+  vec3 fr;
+  const vec3 v0 = (d - u.dmin.xyz) * u.dscale.xyz * top;
+  for (int c = 0; c < 3; ++c) {
+    const float v = clamp(v0[c], 0.0, top);
+    const int i = min(int(v), N - 2);
+    i0[c] = i;
+    fr[c] = v - float(i);
+  }
+  const float fx = fr.x, fy = fr.y, fz = fr.z;
+  const int rx = int(fy > fx) + int(fz > fx);
+  const int ry = int(fx >= fy) + int(fz > fy);
+  const int rz = int(fx >= fz) + int(fy >= fz);
+  float fs[3];
+  ivec3 e1 = ivec3(0), e2 = ivec3(0);
+  fs[rx] = fx;
+  fs[ry] = fy;
+  fs[rz] = fz;
+  // offsets along the rank order: the axis with rank 0 first
+  ivec3 ax[3];
+  ax[rx] = ivec3(1, 0, 0);
+  ax[ry] = ivec3(0, 1, 0);
+  ax[rz] = ivec3(0, 0, 1);
+  e1 = ax[0];
+  e2 = ax[0] + ax[1];
+  const vec3 p0 = texelFetch(uLut, i0, 0).rgb;
+  const vec3 p1 = texelFetch(uLut, i0 + e1, 0).rgb;
+  const vec3 p2 = texelFetch(uLut, i0 + e2, 0).rgb;
+  const vec3 p3 = texelFetch(uLut, i0 + ivec3(1), 0).rgb;
+  return p0 * (1.0 - fs[0]) + p1 * (fs[0] - fs[1]) + p2 * (fs[1] - fs[2]) + p3 * fs[2];
+}
+
+vec3 qOf(ivec2 p) { return pxQ(pxCurves(0, pxLogE(texelFetch(uSrc, p, 0).rgb))); }
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.dim.x || p.y >= u.dim.y) return;
+  if (MODE == 4) {
+    const ivec2 sz = u.src.xy;
+    const int ya = min(2 * p.y, sz.y - 1), yb = min(2 * p.y + 1, sz.y - 1);
+    vec3 q;
+    if (2 * p.x + 1 < sz.x)
+      q = 0.25 * (qOf(ivec2(2 * p.x, ya)) + qOf(ivec2(2 * p.x + 1, ya)) + qOf(ivec2(2 * p.x, yb)) + qOf(ivec2(2 * p.x + 1, yb)));
+    else
+      q = 0.5 * (qOf(ivec2(2 * p.x, ya)) + qOf(ivec2(2 * p.x, yb)));
+    imageStore(uOut, p, vec4(q, 1.0));
+    return;
+  }
+  if (MODE == 5) {
+    imageStore(uOut, p, vec4(qOf(p), 1.0));
+    return;
+  }
+  const vec3 s = texelFetch(uSrc, p + u.lutN.yz, 0).rgb;
+  vec3 o;
+  if (MODE == 0) {
+    o = pxExposure(s);
+  } else if (MODE == 1) {
+    const vec3 x = pxLogE(s);
+    const vec3 q = HAS_Q ? texelFetch(uAux, p, 0).rgb : pxQ(pxCurves(0, x));
+    o = pxCurves(6 * u.dim.w, x - q);
+  } else if (MODE == 2) {
+    o = tetra(s - u.dsub.xyz);
+  } else {
+    const vec3 x = pxLogE(pxExposure(s));
+    const vec3 d1 = pxCurves(0, x);
+    const vec3 q = pxQ(d1);
+    o = tetra(pxCurves(6 * u.dim.w, x - q));
+  }
+  imageStore(uOut, p, vec4(o, 1.0));
+}

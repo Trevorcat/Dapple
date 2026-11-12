@@ -106,12 +106,13 @@ void main() {
     });
 
     test('swatches come from the engine table; without it the neutral fallback; bad entries are dropped', () {
-      final sw = parseFilmSwatches('{"kodak_portra_400":["737373","c49770","5997ca"],"bad":["zz","1","2"],"short":["000000"]}');
+      final sw = parseFilmSwatches('{"kodak_portra_400":["c49770","5997ca","151717"],"bad":["zz","1","2"],"short":["000000"]}');
       expect(sw.keys, ['kodak_portra_400']);
-      // engine order neutral, skin, sky -> swatch order skin, neutral, sky
-      expect(sw['kodak_portra_400'], const [Color(0xFFC49770), Color(0xFF737373), Color(0xFF5997CA)]);
+      // engine order: skin, sky, shadow
+      expect(sw['kodak_portra_400'], const [Color(0xFFC49770), Color(0xFF5997CA), Color(0xFF151717)]);
       final c = testFilmCatalog.withSwatches(sw);
-      expect(c.swatch('kodak_portra_400'), sw['kodak_portra_400']);
+      // one stock only: nothing to deviate from, the bands are shown as rendered (each twice, banded)
+      expect(c.swatch('kodak_portra_400'), [for (final x in sw['kodak_portra_400']!) ...[x, x]]);
       expect(c.swatch('kodak_gold_200'), kFilmSwatchFallback);
       expect(testFilmCatalog.swatch('kodak_portra_400'), kFilmSwatchFallback);
       expect(parseFilmSwatches(null), isEmpty);

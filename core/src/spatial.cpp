@@ -267,23 +267,9 @@ void denoiseChroma(ImageF& img, const Plane& Y, float amount, float scale) {
 
 // --------------------------------------------------------------------------- dehaze ---
 
-void dehazeImage(ImageF& img, float amount, float scale) {
-  const int w = img.width, h = img.height;
-  if (amount < 0.f) {  // add haze: veil of light grey
-    const float k = 0.5f * -amount, air = 0.88f;
-    parallelFor(
-        h,
-        [&](int y) {
-          float* p = img.row(y);
-          for (int i = 0; i < 3 * w; ++i) p[i] = p[i] * (1.f - k) + air * k;
-        },
-        8);
-    return;
-  }
-  constexpr int f = 4;
-  std::vector<float> low;
-  int lw = 0, lh = 0;
-  downscale(img.data.data(), 3, w, h, f, low, lw, lh);
+// Frame-global part of the dehaze (dark channel on the 1/4 grid, airlight, transmission). The 1/4 grid of the picture is
+// the only thing the solve reads, so a tiled run accumulates it tile by tile and solves once.
+void dehazeSolve(const std::vector<float>& low, int lw, int lh, float amount, float scale, DehazeSolve& sv) {
   const std::size_t LN = std::size_t(lw) * lh;
   // dark channel: per-pixel min over RGB, min filter, smoothing
   Plane dc(LN), tmp(LN);
@@ -312,34 +298,50 @@ void dehazeImage(ImageF& img, float amount, float scale) {
       for (int c = 0; c < 3; ++c) air[c] += low[3 * i + c];
       ++cnt;
     }
-  float A[3];
-  for (int c = 0; c < 3; ++c) A[c] = std::clamp(cnt ? float(air[c] / cnt) : 1.f, 0.7f, 1.f);
-  const float Amin = std::min({A[0], A[1], A[2]});
+  for (int c = 0; c < 3; ++c) sv.A[c] = std::clamp(cnt ? float(air[c] / cnt) : 1.f, 0.7f, 1.f);
+  const float Amin = std::min({sv.A[0], sv.A[1], sv.A[2]});
   const float omega = 0.7f * amount;
-  Plane t(LN);
-  for (std::size_t i = 0; i < LN; ++i) t[i] = std::clamp(1.f - omega * dc[i] / Amin, 0.25f, 1.f);
-  const Axis ax = makeAxis(w, lw, f), ay = makeAxis(h, lh, f);
+  sv.t.resize(LN);
+  for (std::size_t i = 0; i < LN; ++i) sv.t[i] = std::clamp(1.f - omega * dc[i] / Amin, 0.25f, 1.f);
+  sv.lw = lw;
+  sv.lh = lh;
+  sv.valid = true;
+}
+
+// `img` is a window at (ox, oy) of a frame of fw x fh pixels; the solve was made on the whole frame.
+void dehazeApply(ImageF& img, int ox, int oy, int fw, int fh, const DehazeSolve& sv) {
+  const int w = img.width, h = img.height;
+  const Axis ax = makeAxis(fw, sv.lw, 4), ay = makeAxis(fh, sv.lh, 4);
   parallelFor(
       h,
       [&](int y) {
         float* p = img.row(y);
         for (int x = 0; x < w; ++x) {
-          const float inv = 1.f / sampleLow(t.data(), lw, ax, ay, x, y);
-          for (int c = 0; c < 3; ++c) p[3 * x + c] = clamp01((p[3 * x + c] - A[c]) * inv + A[c]);
+          const float inv = 1.f / sampleLow(sv.t.data(), sv.lw, ax, ay, ox + x, oy + y);
+          for (int c = 0; c < 3; ++c) p[3 * x + c] = clamp01((p[3 * x + c] - sv.A[c]) * inv + sv.A[c]);
         }
+      },
+      8);
+}
+
+void dehazeVeil(ImageF& img, float amount) {  // amount < 0: add haze (veil of light grey)
+  const int w = img.width, h = img.height;
+  const float k = 0.5f * -amount, air = 0.88f;
+  parallelFor(
+      h,
+      [&](int y) {
+        float* p = img.row(y);
+        for (int i = 0; i < 3 * w; ++i) p[i] = p[i] * (1.f - k) + air * k;
       },
       8);
 }
 
 // ------------------------------------------------------- clarity / texture / sharpening ---
 
-// Edge-aware base layer of the luminance: fast guided filter (He & Sun) run on a 1/4 size copy,
-// its linear coefficients upsampled bilinearly and applied at full resolution.
-void guidedBase(const Plane& Y, int w, int h, float scale, Plane& base) {
+// Frame-global part of the guided filter: the linear coefficients a, b on the 1/4 grid, solved from the 1/4 grid of the
+// luminance (`low`, lw x lh). A tiled run accumulates `low` tile by tile and solves once.
+void guidedSolve(const std::vector<float>& low, int lw, int lh, float scale, GuidedSolve& gs) {
   constexpr int f = 4;
-  std::vector<float> low;
-  int lw = 0, lh = 0;
-  downscale(Y.data(), 1, w, h, f, low, lw, lh);
   const std::size_t LN = std::size_t(lw) * lh;
   const int r = std::max(2, int(std::lround(0.02f * 2048.f * scale / f)));
   const float eps = 0.045f * 0.045f;
@@ -347,7 +349,10 @@ void guidedBase(const Plane& Y, int w, int h, float scale, Plane& base) {
   for (std::size_t i = 0; i < LN; ++i) mII[i] = low[i] * low[i];
   boxBlur(mI, tmp, lw, lh, r, 1);
   boxBlur(mII, tmp, lw, lh, r, 1);
-  Plane a(LN), b(LN);
+  Plane& a = gs.a;
+  Plane& b = gs.b;
+  a.resize(LN);
+  b.resize(LN);
   for (std::size_t i = 0; i < LN; ++i) {
     const float var = std::max(0.f, mII[i] - mI[i] * mI[i]);
     a[i] = var / (var + eps);
@@ -355,19 +360,29 @@ void guidedBase(const Plane& Y, int w, int h, float scale, Plane& base) {
   }
   boxBlur(a, tmp, lw, lh, r, 1);
   boxBlur(b, tmp, lw, lh, r, 1);
-  const Axis ax = makeAxis(w, lw, f), ay = makeAxis(h, lh, f);
+  gs.lw = lw;
+  gs.lh = lh;
+  gs.valid = true;
+}
+
+// Edge-aware base layer of the luminance of a window (Y: w x h) at (ox, oy) of a fw x fh frame.
+void guidedApply(const Plane& Y, int w, int h, int ox, int oy, int fw, int fh, const GuidedSolve& gs, Plane& base) {
+  constexpr int f = 4;
+  const Axis ax = makeAxis(fw, gs.lw, f), ay = makeAxis(fh, gs.lh, f);
   base.resize(Y.size());
   parallelFor(
       h,
       [&](int y) {
         const std::size_t o = std::size_t(y) * w;
         for (int x = 0; x < w; ++x)
-          base[o + x] = sampleLow(a.data(), lw, ax, ay, x, y) * Y[o + x] + sampleLow(b.data(), lw, ax, ay, x, y);
+          base[o + x] = sampleLow(gs.a.data(), gs.lw, ax, ay, ox + x, oy + y) * Y[o + x] +
+                        sampleLow(gs.b.data(), gs.lw, ax, ay, ox + x, oy + y);
       },
       8);
 }
 
-void detailPass(ImageF& img, const Plane& Y, const SpatialParams& p, float scale) {
+void detailPass(ImageF& img, const Plane& Y, const SpatialParams& p, float scale, const GuidedSolve* gsIn, int ox, int oy,
+                int fw, int fh) {
   const int w = img.width, h = img.height;
   const std::size_t N = std::size_t(w) * h;
   Plane& dY = arena(2);
@@ -377,7 +392,16 @@ void detailPass(ImageF& img, const Plane& Y, const SpatialParams& p, float scale
   Plane& work2 = arena(4);
 
   if (p.clarity != 0.f) {
-    guidedBase(Y, w, h, scale, work);
+    GuidedSolve own;
+    const GuidedSolve* gs = gsIn;
+    if (!gs) {  // whole picture: solve from its own 1/4 grid
+      std::vector<float> low;
+      int lw = 0, lh = 0;
+      downscale(Y.data(), 1, w, h, 4, low, lw, lh);
+      guidedSolve(low, lw, lh, scale, own);
+      gs = &own;
+    }
+    guidedApply(Y, w, h, gsIn ? ox : 0, gsIn ? oy : 0, gsIn ? fw : w, gsIn ? fh : h, *gs, work);
     const float g = p.clarity > 0.f ? p.clarity * 1.1f : p.clarity * 0.85f;
     parallelFor(
         h,
@@ -456,7 +480,7 @@ inline float lattice(int ix, int iy) {
   return float((a & 0xFFFF) + (b & 0xFFFF)) * (1.f / 65535.f) - 1.f;
 }
 
-void addGrain(ImageF& img, float amount, float scale) {
+void addGrain(ImageF& img, float amount, float scale, int ox, int oy) {
   const int w = img.width, h = img.height;
   const float period = std::max(1.f, 1.6f * scale);
   const float inv = 1.f / period;
@@ -465,16 +489,16 @@ void addGrain(ImageF& img, float amount, float scale) {
       h,
       [&](int y) {
         float* p = img.row(y);
-        const float fy = float(y) * inv;
+        const float fy = float(y + oy) * inv;
         const int iy = int(fy);
         const float ty0 = fy - float(iy);
         const float ty = ty0 * ty0 * (3.f - 2.f * ty0);
         for (int x = 0; x < w; ++x) {
           float n;
           if (period <= 1.01f) {
-            n = lattice(x, y);
+            n = lattice(x + ox, y + oy);
           } else {
-            const float fx = float(x) * inv;
+            const float fx = float(x + ox) * inv;
             const int ix = int(fx);
             const float tx0 = fx - float(ix);
             const float tx = tx0 * tx0 * (3.f - 2.f * tx0);
@@ -495,21 +519,89 @@ void addGrain(ImageF& img, float amount, float scale) {
 
 }  // namespace
 
+// ---- stage API (the engine's CPU spatial nodes, core/engine/nodes/main) ------------------------------------------------
+// Each stage is the corresponding block of applySpatial(); applySpatial() itself calls them in the same order, so the
+// whole-picture result is unchanged.
+
+void stageNRLuma(ImageF& img, SpatialScratch& sc, float amount, float scale) {
+  if (!sc.yValid) {
+    lumaOf(img, sc.Y);
+    sc.yValid = true;
+  }
+  denoiseLuma(img, sc.Y, sc.tmp, amount, scale);
+}
+
+void stageNRChroma(ImageF& img, SpatialScratch& sc, float amount, float scale) {
+  if (!sc.yValid) {
+    lumaOf(img, sc.Y);
+    sc.yValid = true;
+  }
+  denoiseChroma(img, sc.Y, amount, scale);
+}
+
+void dehazeLowGrid(const ImageF& img, std::vector<float>& low, int& lw, int& lh) {
+  downscale(img.data.data(), 3, img.width, img.height, 4, low, lw, lh);
+}
+void dehazeSolveGrid(const std::vector<float>& low, int lw, int lh, float amount, float scale, DehazeSolve& sv) {
+  dehazeSolve(low, lw, lh, amount, scale, sv);
+}
+void stageDehazeApply(ImageF& img, SpatialScratch& sc, float amount, int ox, int oy, int fw, int fh, const DehazeSolve* sv) {
+  if (amount < 0.f) dehazeVeil(img, amount);
+  else dehazeApply(img, ox, oy, fw, fh, *sv);
+  sc.yValid = false;  // the luminance is taken again for the detail stage
+}
+
+void lumaGrid(const ImageF& img, SpatialScratch& sc, int x0, int y0, int x1, int y1, std::vector<float>& low, int& lw,
+              int& lh) {
+  if (!sc.yValid) {  // else the luminance the earlier stages kept (applySpatial hands the detail stage that very plane)
+    lumaOf(img, sc.Y);
+    sc.yValid = true;
+  }
+  const int w = img.width, iw = x1 - x0, ih = y1 - y0;
+  if (x0 == 0 && y0 == 0 && iw == w && ih == img.height) {
+    downscale(sc.Y.data(), 1, w, img.height, 4, low, lw, lh);
+    return;
+  }
+  Plane crop(std::size_t(iw) * ih);
+  for (int y = 0; y < ih; ++y)
+    std::copy_n(sc.Y.data() + std::size_t(y0 + y) * w + x0, iw, crop.data() + std::size_t(y) * iw);
+  downscale(crop.data(), 1, iw, ih, 4, low, lw, lh);
+}
+void guidedSolveGrid(const std::vector<float>& low, int lw, int lh, float scale, GuidedSolve& gs) {
+  guidedSolve(low, lw, lh, scale, gs);
+}
+
+void stageDetail(ImageF& img, SpatialScratch& sc, const SpatialParams& p, float scale, const GuidedSolve* gs, int ox, int oy,
+                 int fw, int fh) {
+  if (!sc.yValid) {
+    lumaOf(img, sc.Y);
+    sc.yValid = true;
+  }
+  detailPass(img, sc.Y, p, scale, gs, ox, oy, fw, fh);
+}
+
+void stageGrain(ImageF& img, float amount, float scale, int ox, int oy) { addGrain(img, amount, scale, ox, oy); }
+
 void applySpatial(ImageF& img, const SpatialParams& p) {
   if (img.empty() || !p.any()) return;
   const int w = img.width, h = img.height;
   const float scale = p.scale > 0.f ? p.scale : float(std::max(w, h)) / 2048.f;
-  Plane Y, tmp;
-  const bool needY = p.nrLuma > 0 || p.nrColor > 0 || p.clarity != 0 || p.texture != 0 || p.sharpen > 0;
-  if (needY) lumaOf(img, Y);
-  if (p.nrLuma > 0) denoiseLuma(img, Y, tmp, p.nrLuma, scale);
-  if (p.nrColor > 0) denoiseChroma(img, Y, p.nrColor, scale);
+  const bool detail = p.clarity != 0 || p.texture != 0 || p.sharpen > 0;
+  SpatialScratch sc;
+  if (p.nrLuma > 0) stageNRLuma(img, sc, p.nrLuma, scale);
+  if (p.nrColor > 0) stageNRChroma(img, sc, p.nrColor, scale);
   if (p.dehaze != 0) {
-    dehazeImage(img, p.dehaze, scale);
-    if (p.clarity != 0 || p.texture != 0 || p.sharpen > 0) lumaOf(img, Y);
+    DehazeSolve sv;
+    if (p.dehaze > 0.f) {
+      std::vector<float> low;
+      int lw = 0, lh = 0;
+      dehazeLowGrid(img, low, lw, lh);
+      dehazeSolveGrid(low, lw, lh, p.dehaze, scale, sv);
+    }
+    stageDehazeApply(img, sc, p.dehaze, 0, 0, w, h, &sv);
   }
-  if (p.clarity != 0 || p.texture != 0 || p.sharpen > 0) detailPass(img, Y, p, scale);
-  if (p.grain > 0) addGrain(img, p.grain, scale);
+  if (detail) stageDetail(img, sc, p, scale, nullptr, 0, 0, w, h);
+  if (p.grain > 0) stageGrain(img, p.grain, scale, 0, 0);
 }
 
 }  // namespace dapple

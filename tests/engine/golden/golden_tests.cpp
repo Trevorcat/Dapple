@@ -1,7 +1,7 @@
 // Golden corpus + hash harness for the engine migration (docs/engine/pipeline-architecture.md 10.1, step a0).
 //
 //   dapple_golden record <corpus.txt>            records the corpus from the CURRENT code (DAPPLE_ENGINE ignored: off)
-//   dapple_golden verify <corpus.txt> [mode...]  mode = off | legacy | tables (default: off legacy tables); every frame
+//   dapple_golden verify <corpus.txt> [mode...]  mode = off | legacy | tables | full (default: all four); every frame
 //                                                must hash to the recorded value in every mode (gate B)
 //
 // Inputs are synthetic (deterministic integer-hash scenes, no private photos). Each scenario is a short sequence of
@@ -672,7 +672,7 @@ std::vector<GoldenHash> runAll(bool haveFilm) {
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::fputs("usage: dapple_golden record|verify <corpus.txt> [off|legacy|tables ...]\n", stderr);
+    std::fputs("usage: dapple_golden record|verify <corpus.txt> [off|legacy|tables|full ...]\n", stderr);
     return 2;
   }
   const std::string cmd = argv[1], file = argv[2];
@@ -726,10 +726,10 @@ int main(int argc, char** argv) {
     }
     std::vector<std::string> modes;
     for (int i = 3; i < argc; ++i) modes.push_back(argv[i]);
-    if (modes.empty()) modes = {"off", "legacy", "tables"};
+    if (modes.empty()) modes = {"off", "legacy", "tables", "full"};
     int failures = 0;
     for (const std::string& m : modes) {
-      dapple::engine::setModeOverride(m == "off" ? 0 : (m == "legacy" ? 1 : 2));
+      dapple::engine::setModeOverride(m == "off" ? 0 : (m == "legacy" ? 1 : (m == "tables" ? 2 : 3)));
       const auto r = runAll(haveFilm);
       int bad = 0;
       for (const GoldenHash& x : r) {
