@@ -10,6 +10,7 @@
 #ifndef DAPPLE_C_H
 #define DAPPLE_C_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -85,6 +86,29 @@ DAPPLE_API char* dapple_looks_json(void);
  * (docs/design/requirements.md 6.3); "exposure" is in UI units (EV * 20). */
 DAPPLE_API char* dapple_params_schema_json(void);
 
+/* ---- Film simulation (docs/film/README.md) ------------------------------------------------------------------
+ * The film profiles ship as one binary pack (core/data/film/dapple.dfp, an Android asset). Load it once at start
+ * (or let the CLI / tests find it); the edit keys "film", "film_paper", "film_strength", ... then work. Without a
+ * pack a "film" key is ignored and the normal pipeline renders. The profile data is by Andrea Volpato
+ * (spektrafilm), CC BY-SA 4.0: the app's About screen must show it (dapple_film_attribution). */
+
+/* Loads the pack from a .dfp file (or a directory of profile JSON files, slow) and installs it process-wide. */
+DAPPLE_API int32_t dapple_film_load_pack(const char* path);
+/* Same from memory (an asset read into a buffer); the data is copied. */
+DAPPLE_API int32_t dapple_film_load_pack_memory(const void* data, size_t size);
+/* Records the path only; the pack is loaded on first use (keeps app start fast). */
+DAPPLE_API void dapple_film_set_pack_path(const char* path);
+/* {"loaded":bool,"stocks":[{"id","name","type":"negative"|"slide"|"paper"},...]}. "negative" and "slide" are camera
+ * films ("film" key); "paper" are print papers / print films ("film_paper" key, or "none" to scan the film).
+ * Free with dapple_free_string. */
+DAPPLE_API char* dapple_film_list_json(void);
+/* The licence line for the About screen ("" when no pack is loaded). Free with dapple_free_string. */
+DAPPLE_API char* dapple_film_attribution(void);
+/* {"<stock id>":["rrggbb","rrggbb","rrggbb"],...} for every camera film (not papers): the stock's rendering of three
+ * fixed test patches (18 % grey, skin, sky) with its default paper. Deterministic for a pack; cache it. Free with
+ * dapple_free_string. "{}" without a pack. */
+DAPPLE_API char* dapple_film_swatches_json(void);
+
 /* ---- Previews for pickers ---- */
 
 /* Renders the photo with each of the nine styles (order of dapple_looks_json, default colour pad,
@@ -134,6 +158,51 @@ DAPPLE_API char* dapple_session_analyze_params_json(DappleSession* session, cons
  * Fills *out; release with dapple_free_image. */
 DAPPLE_API int32_t dapple_session_render(DappleSession* session, const char* params_json, const char* lut_path,
                                          int32_t out_long_edge, DappleImage* out);
+
+/* ---- Interactive frames (slider dragging, zoom) ----------------------------------------------
+ * One call = one frame: the image and the tonal analysis of the same render. Point-wise stages run
+ * through a lattice that is baked once per parameter change and cached in the session; scaled copies
+ * of the source are cached too, so a frame costs one pass over the pixels plus the neighbourhood
+ * stages. A session must still be used by one thread at a time. */
+enum {
+  DAPPLE_FRAME_INTERACTIVE = 1, /* drag quality: no grain; noise reduction only when its sliders moved */
+  DAPPLE_FRAME_ANALYSIS = 2,    /* also return the tonal analysis JSON (same schema as analyze_json) */
+  DAPPLE_FRAME_EXACT = 4,       /* reference pipeline (no lattice), for tests and export parity */
+  DAPPLE_FRAME_BACKGROUND = 8,  /* low priority: calling thread on efficiency cores, nice 10, never uses the pool */
+};
+
+typedef struct DappleFrameRequest {
+  int32_t size;             /* sizeof(DappleFrameRequest) (versioning) */
+  int32_t long_edge;        /* long edge of the whole picture, 0 = session source size */
+  int32_t flags;            /* DAPPLE_FRAME_* */
+  int32_t bake_size;        /* lattice size 17..65; 0 = 57 interactive / 65 otherwise (a cached finer lattice of the same colour stage is reused) */
+  float region[4];          /* x0,y0,x1,y1 normalised in the output picture; all 0 = whole picture */
+  int32_t region_long_edge; /* long edge of the region image (only with a region) */
+} DappleFrameRequest;
+
+/* Fills *out (release with dapple_free_image). *analysis_json (may be NULL) receives a string to
+ * release with dapple_free_string when DAPPLE_FRAME_ANALYSIS is set, else NULL. */
+DAPPLE_API int32_t dapple_session_render_frame(DappleSession* session, const char* params_json, const char* lut_path,
+                                               const DappleFrameRequest* request, DappleImage* out,
+                                               char** analysis_json);
+
+/* ---- Scheduling / power (all optional, safe no-ops where the platform lacks the feature) ------------------
+ * Foreground frames run on one dedicated render thread, pinned to the performance cores on big.LITTLE, and are
+ * reported to Android's ADPF (APerformanceHint) when available. Idle workers block (no spinning). */
+/* thread_limit: max threads (caller included) per job, 0 = all; target_frame_ms: ADPF target work duration of an
+ * interactive frame, 0 = off. */
+DAPPLE_API void dapple_perf_configure(int32_t thread_limit, int32_t target_frame_ms);
+/* Marks the CALLING thread as background (nice 10, efficiency cores, pool bypassed) until called with 0. Use it
+ * around open/preview calls that must not compete with interactive frames (prefetch, thumbnails). */
+DAPPLE_API void dapple_thread_background(int32_t on);
+/* AThermal headroom forecast (0 = cool, 1 = throttling threshold), < 0 when unavailable. */
+DAPPLE_API float dapple_thermal_headroom(int32_t forecast_seconds);
+/* {"cpus":N,"perf":N,"efficient":N,"pool":N,"adpf":bool,"thermal_status":N}; free with dapple_free_string. */
+DAPPLE_API char* dapple_perf_info_json(void);
+
+/* Frame engine diagnostics (DAPPLE_ENGINE=1|legacy, default off): {"engine":"off|legacy|tables","frames":N,
+ * "fullHits":N,"latticeReuse":N,"latticeBake":N,...}; free with dapple_free_string. Additive. */
+DAPPLE_API char* dapple_engine_info_json(void);
 
 /* Same as render, but encodes a JPEG to out_path. */
 DAPPLE_API int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_json, const char* lut_path,
@@ -231,6 +300,14 @@ DAPPLE_API int32_t dapple_motion_photo_write(const char* jpeg_path, const char* 
                                              double cover_time_sec, char** info_json_out);
 /* Checks a file against the spec: same JSON as info_json_out (without "clip"). NULL if the file cannot be read. */
 DAPPLE_API char* dapple_motion_photo_validate_json(const char* path);
+
+/* Optional GPU backend (Vulkan compute; only present in builds configured with DAPPLE_GPU, default off at run time).
+ * mode: 1 = use the GPU for render_frame / export when available (CPU fallback on any failure), 0 = never,
+ * -1 = back to the default (env DAPPLE_GPU=1, Android property debug.dapple.gpu=1, else off).
+ * Returns the effective state (0 in builds without the backend). */
+DAPPLE_API int32_t dapple_gpu_set_enabled(int32_t mode);
+/* {"enabled","available","device","deviceKey","selfTest","reason"} (or {"compiled":false,...}); dapple_free_string. */
+DAPPLE_API char* dapple_gpu_status_json(void);
 
 #ifdef __cplusplus
 }

@@ -13,6 +13,9 @@
 #include <string>
 
 #include "color.h"
+#include "colour_metrics.h"
+#include "parallel.h"
+#include "sysperf.h"
 #include "dapple/camera.h"
 #include "dapple/dapple_c.h"
 #include "dapple/decoder.h"
@@ -628,6 +631,35 @@ void testCApi() {
   CHECK(dapple_session_render(s, "{not json", nullptr, 0, &img) == DAPPLE_ERROR);
   CHECK(std::string(dapple_last_error()).find("params") != std::string::npos);
 
+  // interactive frame API: image + analysis in one call, region render
+  {
+    DappleFrameRequest rq{};
+    rq.size = sizeof rq;
+    rq.long_edge = 512;
+    rq.flags = DAPPLE_FRAME_INTERACTIVE | DAPPLE_FRAME_ANALYSIS;
+    DappleImage fr{};
+    char* an = nullptr;
+    CHECK(dapple_session_render_frame(s, "{\"exposure\": 10, \"clarity\": 30}", nullptr, &rq, &fr, &an) == DAPPLE_OK);
+    CHECK(fr.rgba && std::max(fr.width, fr.height) == 512 && fr.rgba[3] == 255);
+    CHECK(an && std::string(an).find("\"histogram\":[") != std::string::npos);
+    dapple_free_image(&fr);
+    dapple_free_string(an);
+    rq.flags = 0;  // final quality, region at the lower right quarter
+    rq.region[0] = 0.5f; rq.region[1] = 0.5f; rq.region[2] = 1.f; rq.region[3] = 1.f;
+    rq.region_long_edge = 300;
+    CHECK(dapple_session_render_frame(s, "{\"exposure\": 10}", nullptr, &rq, &fr, nullptr) == DAPPLE_OK);
+    CHECK(fr.rgba && std::max(fr.width, fr.height) == 300);
+    dapple_free_image(&fr);
+    rq = DappleFrameRequest{};
+    rq.size = sizeof rq;
+    rq.flags = DAPPLE_FRAME_EXACT | DAPPLE_FRAME_ANALYSIS;
+    rq.long_edge = 256;
+    CHECK(dapple_session_render_frame(s, "", nullptr, &rq, &fr, &an) == DAPPLE_OK && fr.rgba && an);
+    dapple_free_image(&fr);
+    dapple_free_string(an);
+    CHECK(dapple_session_render_frame(s, "{bad", nullptr, &rq, &fr, nullptr) == DAPPLE_ERROR);
+  }
+
   const fs::path jpg = tmp / "out.jpg";
   CHECK(dapple_session_export_jpeg(s, "", nullptr, 512, 90, u8(jpg).c_str()) == DAPPLE_OK);
   CHECK(fs::exists(jpg, ec) && fs::file_size(jpg, ec) > 1000);
@@ -687,7 +719,7 @@ double jsonNumber(const std::string& json, const std::string& key) {
 
 void testAllKeys() {
   const auto entries = schemaEntries();
-  CHECK(entries.size() == 77);  // 74 contract keys + lookStrength, toneStrength, lutAmount
+  CHECK(entries.size() == 83);  // 74 contract keys + lookStrength, toneStrength, lutAmount + 6 film keys
   for (const std::string& k : contractKeys()) {
     const bool found = std::any_of(entries.begin(), entries.end(), [&](const SchemaEntry& e) { return e.key == k; });
     CHECK(found);
@@ -1225,6 +1257,208 @@ void testCApiPreviews(DappleSession* s) {
   dapple_free_image(&img);
 }
 
+
+// -------------------------------------------------- baked (lattice) path vs direct path ---
+
+// Scene-referred test image covering many stops and saturated colours (deterministic).
+SourceImage bakeScene(int w, int h) {
+  SourceImage s;
+  s.sceneReferred = true;
+  s.linear = ImageF(w, h);
+  std::mt19937 rng(12345);
+  std::uniform_real_distribution<float> U(0.f, 1.f);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      float* p = s.linear.row(y) + 3 * x;
+      const float level = std::exp2(-9.f + 9.5f * (0.5f * U(rng) + 0.5f * float(x) / float(w)));  // 2^-9 .. 2^0.5
+      float c[3] = {U(rng), U(rng), U(rng)};
+      if (U(rng) < 0.25f) c[int(U(rng) * 3) % 3] = 0.f;  // fully saturated colours
+      const float luma = 0.288f * c[0] + 0.712f * c[1] + 0.0001f;
+      for (int k = 0; k < 3; ++k) p[k] = std::min(1.2f, level * c[k] / luma * 0.6f);
+    }
+  return s;
+}
+
+struct DeStats {
+  double mean = 0, p99 = 0, max = 0;
+};
+
+DeStats deltaE(const ImageF& a, const ImageF& b) {
+  std::vector<double> de;
+  for (std::size_t i = 0; i + 2 < a.data.size(); i += 3) {
+    const auto la = metrics::srgbToLab(&a.data[i]);
+    const auto lb = metrics::srgbToLab(&b.data[i]);
+    de.push_back(metrics::deltaE2000(la, lb));
+  }
+  std::sort(de.begin(), de.end());
+  DeStats r;
+  for (double d : de) r.mean += d;
+  r.mean /= double(de.size());
+  r.p99 = de[std::size_t(double(de.size()) * 0.99)];
+  r.max = de.back();
+  return r;
+}
+
+void testBakedPath() {
+  const CameraRegistry cams = CameraRegistry::withBuiltins();
+  const CameraProfile& cam = cams.resolve("Sony", "ILCE-7RM5");
+  const SourceImage scene = bakeScene(320, 240);
+  const SourceImage disp = colourScene(160, 120);
+
+  std::vector<std::pair<const char*, EditParams>> cases;
+  cases.push_back({"defaults", EditParams{}});
+  {
+    EditParams p;
+    p.exposure = 0.5f;
+    p.contrast = 20;
+    p.shadows = 35;
+    p.highlights = -40;
+    p.toneStrength = 60;
+    cases.push_back({"auto-like", p});
+  }
+  {
+    EditParams p;
+    p.temperature = 30;
+    p.tint = -10;
+    p.vibrance = 40;
+    p.saturation = 20;
+    p.hsl[kOrange].saturation = 30;
+    p.hsl[kBlue].hue = -30;
+    p.hsl[kGreen].luminance = 25;
+    p.gradeShadows = {220, 40, -5};
+    p.gradeHighlights = {40, 30, 5};
+    p.gradeGlobal = {10, 10, 0};
+    p.look = "teal";
+    p.hasPalette = true;
+    p.paletteX = 0.8f;
+    p.paletteY = 0.3f;
+    p.toneCurve = {{0, 0}, {64, 50}, {192, 210}, {255, 255}};
+    p.toneCurveBlue = {{0, 10}, {255, 245}};
+    p.parametricLights = 30;
+    cases.push_back({"heavy colour", p});
+  }
+  {
+    EditParams p;
+    p.look = "film";
+    p.exposure = -1.f;
+    p.whites = 30;
+    p.blacks = -30;
+    cases.push_back({"film look", p});
+  }
+  {
+    EditParams p;
+    p.look = "bw";
+    p.vignette = -40;
+    cases.push_back({"bw + vignette", p});
+  }
+
+  for (const SourceImage* src : {&scene, &disp})
+    for (const auto& [name, p] : cases) {
+      Renderer r(p, cam, nullptr);
+      const ImageF ref = r.renderFloat(*src, false);
+      for (int n : {41, 65}) {
+        const auto lut = r.bake(*src, n);
+        FastOptions fo;
+        fo.spatial = SpatialQuality::Off;
+        const ImageF got = r.renderBakedFloat(*src, *lut, fo);
+        CHECK(got.width == ref.width && got.height == ref.height);
+        const DeStats d = deltaE(ref, got);
+        if (d.mean >= 0.5 || (n == 65 && d.mean >= 0.3))
+          std::fprintf(stderr, "  %s n=%d (%s): mean dE %.3f p99 %.2f max %.2f\n", name, n, src == &scene ? "scene" : "display", d.mean, d.p99, d.max);
+        CHECK(d.mean < 0.5);
+        if (n == 65) CHECK(d.mean < 0.3);
+      }
+    }
+
+  // geometry + vignette + cropping through the baked path match the direct path
+  {
+    EditParams p;
+    p.crop = "1:1";
+    p.straighten = 4.f;
+    p.vignette = -50.f;
+    p.look = "warm";
+    Renderer r(p, cam, nullptr);
+    const ImageF ref = r.renderFloat(scene, false);
+    const auto lut = r.bake(scene, 65);
+    FastOptions fo;
+    fo.spatial = SpatialQuality::Off;
+    const ImageF got = r.renderBakedFloat(scene, *lut, fo);
+    CHECK(got.width == ref.width && got.height == ref.height);
+    CHECK(deltaE(ref, got).mean < 0.5);
+  }
+
+  // region render: the full region at natural scale equals the plain render; half the width halves the size
+  {
+    EditParams p;
+    p.look = "warm";
+    Renderer r(p, cam, nullptr);
+    const auto lut = r.bake(scene, 33);
+    FastOptions fo;
+    fo.spatial = SpatialQuality::Off;
+    const ImageF whole = r.renderBakedFloat(scene, *lut, fo);
+    fo.region.outLongEdge = std::max(whole.width, whole.height);
+    fo.region.x1 = 1.f;
+    fo.region.y1 = 1.f;
+    fo.region.x0 = 1e-3f;  // forces the region path
+    const ImageF reg = r.renderBakedFloat(scene, *lut, fo);
+    CHECK(std::abs(reg.width - whole.width) <= 1 && std::abs(reg.height - whole.height) <= 1);
+    FastOptions half;
+    half.spatial = SpatialQuality::Off;
+    half.region = {0.f, 0.f, 0.5f, 1.f, 0};
+    int w = 0, h = 0;
+    r.fastSize(scene, half.region, w, h);
+    CHECK(w == whole.width / 2 && h == whole.height);
+    const ImageF left = r.renderBakedFloat(scene, *lut, half);
+    CHECK(left.width == w && left.height == h);
+    // pixels of the left half agree with the plain render (cubic sampling at 1:1 vs exact copy)
+    double md = 0;
+    for (int y = 4; y < h - 4; ++y)
+      for (int x = 4; x < w - 4; ++x)
+        for (int c = 0; c < 3; ++c) md += std::fabs(left.row(y)[3 * x + c] - whole.row(y)[3 * x + c]);
+    md /= double((h - 8) * (w - 8) * 3);
+    CHECK(md < 0.02);
+  }
+
+  // C API frame
+  {
+    CHECK(dapple_session_render_frame(nullptr, "", nullptr, nullptr, nullptr, nullptr) == DAPPLE_ERROR);
+    DappleImage none{};
+    CHECK(dapple_session_render_frame(nullptr, "", nullptr, nullptr, &none, nullptr) == DAPPLE_ERROR);
+  }
+}
+
+// big.LITTLE classification and the interactive pool's cpu set; the pool itself (spin-then-block) must give
+// the same result as a serial loop for many back-to-back small jobs.
+void testSchedulingPolicy() {
+  using dapple::sys::classify;
+  using dapple::sys::poolCpus;
+  // Snapdragon 680: 4x A73 (cap 1024) + 4x A53 (~400) -> pool on the 4 big cores
+  auto sd680 = classify({400, 400, 400, 400, 1024, 1024, 1024, 1024});
+  CHECK(sd680.hetero() && sd680.perf.size() == 4 && sd680.efficient.size() == 4);
+  CHECK(poolCpus(sd680) == std::vector<int>({4, 5, 6, 7}));
+  // Helio G85: 2x A75 + 6x A55 -> too few big cores: every cpu takes part
+  auto g85 = classify({430, 430, 430, 430, 430, 430, 1024, 1024});
+  CHECK(g85.hetero() && g85.perf.size() == 2);
+  CHECK(poolCpus(g85).size() == 8);
+  // 8 Elite (2 prime + 6 performance, all >= 60% of the prime): homogeneous for our purpose, no pinning
+  auto elite = classify({870, 870, 870, 870, 870, 870, 1024, 1024});
+  CHECK(!elite.hetero() && poolCpus(elite).size() == 8);
+  // unknown capacities (emulator, desktop): no split
+  auto unk = classify({-1, -1, -1, -1});
+  CHECK(!unk.hetero() && poolCpus(unk).size() == 4);
+  CHECK(classify({}).total == 0);
+  // many tiny jobs back to back (exercises the spin / wake hand-off)
+  std::vector<int> v(997, 0);
+  long long want = 0;
+  for (int rep = 0; rep < 300; ++rep) {
+    dapple::parallelFor(int(v.size()), [&](int i) { v[std::size_t(i)] += i % 7; }, 3);
+    for (std::size_t i = 0; i < v.size(); ++i) want += int(i) % 7;
+  }
+  long long got = 0;
+  for (int x : v) got += x;
+  CHECK(got == want);
+}
+
 }  // namespace
 
 int main() {
@@ -1239,7 +1473,8 @@ int main() {
                      {"ingest", testIngest},            {"c api", testCApi},
                      {"all keys", testAllKeys},         {"identity at defaults", testIdentityAtDefaults},
                      {"slider monotonicity", testSliderMonotonicity}, {"local operations", testLocalOperations},
-                     {"geometry", testGeometry},        {"styles", testStyles}};
+                     {"geometry", testGeometry},        {"styles", testStyles},
+                     {"baked path", testBakedPath},  {"scheduling policy", testSchedulingPolicy}};
   for (const T& t : tests) {
     const int before = g_failures;
     t.fn();

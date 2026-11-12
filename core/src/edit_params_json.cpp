@@ -286,6 +286,8 @@ Result<EditParams> fromJson(const std::string& json) {
     else if (v->kind == JValue::Number) p.flip = v->number != 0;
   }
   if (const JValue* v = root.get("look"); v && v->kind == JValue::String) p.look = v->str;
+  if (const JValue* v = root.get("film"); v && v->kind == JValue::String) p.filmStock = v->str;
+  if (const JValue* v = root.get("film_paper"); v && v->kind == JValue::String) p.filmPaper = v->str;
   if (const JValue* pal = root.get("palette"); pal && pal->kind == JValue::Object) {
     float x = p.paletteX, y = p.paletteY;
     const JValue* jx = pal->get("x");

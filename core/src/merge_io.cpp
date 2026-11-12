@@ -82,6 +82,14 @@ float autoHeadroom(const ImageF& im) {
 Result<void> writeTiffLike(const ImageF& image, const std::filesystem::path& path, float headroom, bool dng,
                            const std::string& make, const std::string& model) {
   if (image.empty()) return fail("Empty image");
+  {
+    float mx = 0.f;
+    for (float v : image.data) {
+      if (!std::isfinite(v)) return fail("Image has non-finite pixels; refusing to write");
+      mx = std::max(mx, v);
+    }
+    if (mx <= 0.f) return fail("Image is entirely black; refusing to write");
+  }
   if (headroom <= 0.f) headroom = autoHeadroom(image);
   const std::uint64_t pixelBytes = std::uint64_t(image.width) * image.height * 6;
   if (pixelBytes > 0xF0000000ull) return fail("Image too large for a classic TIFF/DNG (4 GB limit)");

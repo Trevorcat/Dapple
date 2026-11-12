@@ -104,7 +104,38 @@ ToneAnalysis analyzeTone(const SourceImage& source, const CameraProfile& camera,
   EditParams p = look;
   p.toneStrength = 0.f;
   p.toneTarget.clear();
+  p.filmStock.clear();  // the tonal class belongs to the develop render: it must not move with the film look
   return analyzeToneImage(Renderer(p, camera, nullptr).renderFloat(proxy, false));
+}
+
+void applyFrameHistogram(ToneAnalysis& a, const std::uint8_t* rgba, int w, int h) {
+  if (!rgba || w < 1 || h < 1) return;
+  const int step = std::max(1, std::max(w, h) / 128);  // ~11k samples: 64 bins and the percentiles are stable
+  ImageF im((w + step - 1) / step, (h + step - 1) / step);
+  for (int y = 0; y < im.height; ++y) {
+    const std::uint8_t* src = rgba + std::size_t(y) * step * w * 4;
+    float* dst = im.row(y);
+    for (int x = 0; x < im.width; ++x)
+      for (int c = 0; c < 3; ++c) dst[3 * x + c] = float(src[std::size_t(x) * step * 4 + c]) * (1.f / 255.f);
+  }
+  const ToneAnalysis f = analyzeToneImage(im);
+  a.histogram = f.histogram;
+  a.p5 = f.p5, a.p50 = f.p50, a.p95 = f.p95;
+}
+
+void applyFilmHistogram(ToneAnalysis& a, const SourceImage& source, const CameraProfile& camera,
+                        const EditParams& look) {
+  EditParams p = look;
+  p.toneStrength = 0.f;
+  p.toneTarget.clear();
+  const Renderer r(p, camera, nullptr);
+  if (!r.filmActive()) return;
+  SourceImage proxy;
+  proxy.sceneReferred = source.sceneReferred;
+  proxy.linear = resizeToLongEdge(source.linear, kProxyEdge);
+  const ToneAnalysis f = analyzeToneImage(r.renderFloat(proxy, false));
+  a.histogram = f.histogram;
+  a.p5 = f.p5, a.p50 = f.p50, a.p95 = f.p95;
 }
 
 std::vector<std::pair<float, float>> toneTargetCurve(const ToneAnalysis& a, const std::string& target,

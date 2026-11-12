@@ -40,6 +40,17 @@ endif()
 
 add_subdirectory(core)
 
+# Software video decoding for Motion Photos (FFmpeg, LGPL, dynamically linked; docs/legal/ffmpeg-lgpl.md). Android only.
+if(ANDROID)
+  add_subdirectory(core/video)
+endif()
+
+# GPU compute backend spike (docs/engine/gpu-backend.md). Off by default; adds the `dapple gpu-bench` command.
+option(DAPPLE_GPU "Build the Vulkan compute backend spike (core/gpu)" OFF)
+if(DAPPLE_GPU)
+  add_subdirectory(core/gpu)
+endif()
+
 if(DAPPLE_BUILD_CLI)
   add_subdirectory(cli)
 endif()

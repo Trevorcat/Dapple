@@ -17,6 +17,7 @@ struct SpatialParams {
   float sharpen = 0.f;   // 0..1.5
   float sharpRadius = 1.f;  // pixels at 2048 px (0.5..3.0)
   float grain = 0.f;     // 0..1
+  float scale = 0.f;     // radii scale (full-picture long edge / 2048); 0 = this image's own long edge / 2048
 
   bool any() const {
     return nrLuma > 0 || nrColor > 0 || dehaze != 0 || clarity != 0 || texture != 0 || sharpen > 0 || grain > 0;

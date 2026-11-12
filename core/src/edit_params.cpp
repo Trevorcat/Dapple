@@ -107,6 +107,12 @@ const std::vector<ParamField>& paramFields() {
     add("lookStrength", d.lookStrength, 0.f, 100.f, "look", 1.f, false);
     add("toneStrength", d.toneStrength, 0.f, 100.f, "tone");
     add("lutAmount", d.lutAmount, 0.f, 100.f, "lut", 1.f, false);
+    add("film_strength", d.filmStrength, 0.f, 100.f, "film", 1.f, false);
+    add("film_exp", d.filmExposure, -3.f, 3.f, "film", 20.f);
+    add("film_warmth", d.filmWarmth, -100.f, 100.f, "film");
+    add("film_tint", d.filmTint, -100.f, 100.f, "film");
+    add("film_grain", d.filmGrain, 0.f, 100.f, "film", 1.f, false);
+    add("film_halation", d.filmHalation, 0.f, 100.f, "film", 1.f, false);
     return t;
   }();
   return table;
@@ -129,6 +135,8 @@ void EditParams::clamp() {
   fix(paletteY, 0.04f, 0.96f, 0.5f);
   if (!validCrop(crop)) crop = "orig";
   if (lookIndex(look) < 0) look = "std";
+  if (filmStock.size() > 64 || filmStock == "none") filmStock.clear();
+  if (filmPaper.size() > 64) filmPaper.clear();
   rotate = ((rotate % 360) + 360) % 360;
   rotate = (rotate + 45) / 90 * 90 % 360;
 }
@@ -157,6 +165,8 @@ EditParams& EditParams::operator+=(const EditParams& d) {
   rotate = (rotate + d.rotate) % 360;
   flip = flip != d.flip;
   if (d.look != def.look) look = d.look;
+  if (!d.filmStock.empty()) filmStock = d.filmStock;
+  if (!d.filmPaper.empty()) filmPaper = d.filmPaper;
   if (d.hasPalette) {
     hasPalette = true;
     paletteX = d.paletteX;
@@ -191,6 +201,8 @@ std::string writeJson(const EditParams& p, bool diffOnly) {
   if (!diffOnly || p.rotate != def.rotate) { sep(); o << "\"rot\": " << p.rotate; }
   if (!diffOnly || p.flip != def.flip) { sep(); o << "\"flip\": " << (p.flip ? "true" : "false"); }
   if (!diffOnly || p.look != def.look) { sep(); o << "\"look\": \"" << escape(p.look) << "\""; }
+  if (!diffOnly || !p.filmStock.empty()) { sep(); o << "\"film\": \"" << escape(p.filmStock) << "\""; }
+  if (!diffOnly || !p.filmPaper.empty()) { sep(); o << "\"film_paper\": \"" << escape(p.filmPaper) << "\""; }
   if (p.hasPalette) { sep(); o << "\"palette\": {\"x\": " << num(p.paletteX) << ", \"y\": " << num(p.paletteY) << "}"; }
   if (!diffOnly || !p.toneTarget.empty()) { sep(); o << "\"toneTarget\": \"" << escape(p.toneTarget) << "\""; }
   if (!diffOnly || !p.lutPath.empty()) { sep(); o << "\"lut\": \"" << escape(p.lutPath) << "\""; }
@@ -238,7 +250,8 @@ std::string paramsSchemaJson() {
   }
   o << "],\"crop\":{\"values\":[\"orig\",\"1:1\",\"4:5\",\"3:4\",\"16:9\",\"9:16\"],\"default\":\"orig\"},"
        "\"rot\":{\"values\":[0,90,180,270],\"default\":0},\"flip\":{\"default\":false},"
-       "\"palette\":{\"min\":0.04,\"max\":0.96},\"look\":{\"default\":\"std\"}}";
+       "\"palette\":{\"min\":0.04,\"max\":0.96},\"look\":{\"default\":\"std\"},"
+       "\"film\":{\"default\":\"\"},\"film_paper\":{\"default\":\"\"}}";
   return o.str();
 }
 

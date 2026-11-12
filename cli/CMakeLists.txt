@@ -1,9 +1,15 @@
-add_executable(dapple_cli main.cpp eval.cpp eval_common.cpp fit_profile.cpp merge_cmds.cpp)
+add_executable(dapple_cli main.cpp film_cmds.cpp film_bench.cpp edit_bench.cpp eval.cpp eval_common.cpp fit_profile.cpp merge_cmds.cpp)
 set_target_properties(dapple_cli PROPERTIES OUTPUT_NAME dapple)
-target_link_libraries(dapple_cli PRIVATE dapple_core)
+target_link_libraries(dapple_cli PRIVATE dapple_core dapple)
 target_include_directories(dapple_cli PRIVATE ${PROJECT_SOURCE_DIR}/core/src)
 if(MSVC)
   target_compile_options(dapple_cli PRIVATE /W4 /utf-8)
 else()
   target_compile_options(dapple_cli PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
+# `dapple gpu-bench` (core/gpu spike), only when configured with -DDAPPLE_GPU=ON
+if(TARGET dapple_gpu)
+  target_link_libraries(dapple_cli PRIVATE dapple_gpu)
+  target_compile_definitions(dapple_cli PRIVATE DAPPLE_HAVE_GPU=1)
 endif()

@@ -33,7 +33,13 @@
 #include "dapple/renderer.h"
 #include "dapple/xmp_preset.h"
 #include "eval.h"
+#include "film_cmds.h"
 #include "merge_cmds.h"
+
+namespace dapple::benchtool { int editBench(const std::vector<std::string>& args); }
+#ifdef DAPPLE_HAVE_GPU
+namespace dapple::gpu { int gpuBench(const std::vector<std::string>& args); }
+#endif
 
 namespace fs = std::filesystem;
 using namespace dapple;
@@ -63,6 +69,11 @@ void usage() {
       "  dapple detect <files|dirs...> [-r]                                              find bracket / pano sets\n"
       "  dapple eval --dir <ARW folder> [--step 10] [--out build/eval]   compare with the camera JPEG\n"
       "  dapple fit-profile --dir <ARW folder> --out profile.inc          fit a camera matching profile\n"
+      "  dapple film --in x.pfm|x.ARW --out y.png --film NAME --paper NAME|none [...]   spectral film simulation\n"
+      "  dapple film-pack <profiles_dir> <out.dfp>                        build the binary film pack\n"
+      "  dapple film-upsm-gen [--n 192] [--out t.bin] [--verify pack.dfp]  regenerate / verify the spectral upsampling table\n"
+      "  dapple film-render-bench                                         develop pipeline with film on: timings\n"
+      "  dapple film-bench | film-compare a.pfm b.pfm | film-info         film benchmark / dE2000 / stock list\n"
       "\n"
       "develop options:\n"
       "  --xmp preset.xmp     Lightroom/Camera Raw preset\n"
@@ -468,6 +479,46 @@ int cmdDumpLinear(const Options& o) {
   return f ? 0 : 1;
 }
 
+// Reference-comparison exporter: decodes a RAW (as-shot WB, camera profile ->
+// linear ProPhoto, no tone/colour/look), optionally box-downsizes, writes a
+// little-endian float32 PFM (3ch, rows bottom-to-top).
+//   dapple linear <in> <out.pfm> [--max-edge N]
+int cmdLinear(const std::vector<std::string>& a) {
+  std::vector<std::string> pos;
+  int maxEdge = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (a[i] == "--max-edge" && i + 1 < a.size()) maxEdge = std::atoi(a[++i].c_str());
+    else pos.push_back(a[i]);
+  }
+  if (pos.size() != 2) {
+    std::fputs("linear: usage: dapple linear <in.ARW> <out.pfm> [--max-edge N]\n", stderr);
+    return 2;
+  }
+  const Developer dev;
+  const fs::path in = pathFromUtf8(pos[0]);
+  const ImageDecoder* decoder = dev.decoders().find(in);
+  if (!decoder) {
+    std::fputs("linear: unsupported file\n", stderr);
+    return 1;
+  }
+  auto src = decoder->decode(in, DecodeOptions{DecodeQuality::Full});
+  if (!src) {
+    std::fprintf(stderr, "linear: %s\n", src.error().message.c_str());
+    return 1;
+  }
+  const ImageF img = resizeToLongEdge(src->linear, maxEdge);
+  std::ofstream f(pathFromUtf8(pos[1]), std::ios::binary);
+  if (!f) {
+    std::fputs("linear: cannot open output\n", stderr);
+    return 1;
+  }
+  f << "PF\n" << img.width << " " << img.height << "\n-1.0\n";
+  for (int y = img.height - 1; y >= 0; --y)
+    f.write(reinterpret_cast<const char*>(img.row(y)), std::streamsize(std::size_t(img.width) * 3 * sizeof(float)));
+  std::printf("%s -> %s (%dx%d)\n", pos[0].c_str(), pos[1].c_str(), img.width, img.height);
+  return f ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -494,9 +545,16 @@ int main(int argc, char** argv) {
     return args.empty() ? 2 : 0;
   }
   const std::string cmd = args[0];
+  filmtool::installDefaultLibrary();
   if (mergetool::handles(cmd)) return mergetool::run(cmd, {args.begin() + 1, args.end()});
+  if (filmtool::handles(cmd)) return filmtool::run(cmd, {args.begin() + 1, args.end()});
   if (cmd == "eval") return evaltool::cmdEval({args.begin() + 1, args.end()});
   if (cmd == "fit-profile") return evaltool::cmdFitProfile({args.begin() + 1, args.end()});
+  if (cmd == "edit-bench") return dapple::benchtool::editBench({args.begin() + 1, args.end()});
+#ifdef DAPPLE_HAVE_GPU
+  if (cmd == "gpu-bench") return dapple::gpu::gpuBench({args.begin() + 1, args.end()});
+#endif
+  if (cmd == "linear") return cmdLinear({args.begin() + 1, args.end()});
   Options o;
   std::string err;
   if (!parseArgs({args.begin() + 1, args.end()}, o, err)) {

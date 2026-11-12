@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,8 +47,18 @@ struct ToneAnalysis {
 // From a display-referred, sRGB-encoded image (values 0..1).
 ToneAnalysis analyzeToneImage(const ImageF& srgbEncoded);
 
-// Renders `source` with `look` (toneStrength is ignored) at a small proxy size and classifies it.
+// Renders `source` with `look` (toneStrength and any film look are ignored) at a small proxy size and classifies it.
 ToneAnalysis analyzeTone(const SourceImage& source, const CameraProfile& camera, const EditParams& look = {});
+
+// With a film look active, replaces the histogram and percentiles of `a` (the develop render's analysis) by those of
+// the film render of the same proxy, so the displayed histogram follows the film (incl. film exposure). The class
+// fields (key / range / nearest / distance / margin) stay those of the develop render. No-op without film.
+void applyFilmHistogram(ToneAnalysis& a, const SourceImage& source, const CameraProfile& camera,
+                        const EditParams& look);
+
+// Same replacement from a finished 8-bit RGBA frame (sub-sampled to ~256 px): the histogram of the picture that is on
+// screen, which costs next to nothing, unlike a second film render of the proxy. Used for interactive film frames.
+void applyFrameHistogram(ToneAnalysis& a, const std::uint8_t* rgba, int w, int h);
 
 // Control points (0..255 both axes, like EditParams::toneCurve) of the tone curve that moves an
 // image with analysis `a` towards class `target` ("" = its own nearest class) by `strength`

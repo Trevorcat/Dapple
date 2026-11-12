@@ -1,0 +1,295 @@
+== default_final [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 LegacyRender <- n0 n2 n1 [frame]
+== default_final [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Gain <- n1
+n5 ToneColour <- n4 n3 n2
+n6 NRChroma <- n5
+n7 Detail <- n6
+n8 Pack8 <- n7 [frame]
+== final_analysis [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 Analysis [analysis]
+n4 LegacyRender <- n0 n2 n1 [frame]
+== final_analysis [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Analysis [analysis]
+n5 Gain <- n1
+n6 ToneColour <- n5 n3 n2
+n7 NRChroma <- n6
+n8 Detail <- n7
+n9 Pack8 <- n8 [frame]
+== interactive [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 LegacyRender <- n0 n2 n1 [frame]
+== interactive [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Gain <- n1
+n5 ToneColour <- n4 n3 n2
+n6 NRChroma <- n5
+n7 Detail <- n6
+n8 Pack8 <- n7 [frame]
+== interactive_analysis_fast [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneAnalysisPre <- n1~
+n3 ToneTable
+n4 Analysis <- n2~ [analysis]
+n5 LegacyRender <- n0 n3 n1 [frame]
+== interactive_analysis_fast [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneAnalysisPre <- n2~
+n4 ToneTable
+n5 Analysis <- n3~ [analysis]
+n6 Gain <- n1
+n7 ToneColour <- n6 n4 n2
+n8 NRChroma <- n7
+n9 Detail <- n8
+n10 Pack8 <- n9 [frame]
+== tone_move_interactive [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneAnalysisPre <- n1~
+n3 ToneTable <- n2
+n4 Analysis <- n2~ [analysis]
+n5 LegacyRender <- n0 n3 n1 [frame]
+== tone_move_interactive [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneAnalysisPre <- n2~
+n4 ToneTable <- n3
+n5 Analysis <- n3~ [analysis]
+n6 Gain <- n1
+n7 ToneColour <- n6 n4 n2
+n8 NRChroma <- n7
+n9 Detail <- n8
+n10 Pack8 <- n9 [frame]
+== tone_move_final [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneAnalysisPre <- n1~
+n3 ToneTable <- n2
+n4 Analysis <- n2~ [analysis]
+n5 LegacyRender <- n0 n3 n1 [frame]
+== tone_move_final [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneAnalysisPre <- n2~
+n4 ToneTable <- n3
+n5 Analysis <- n3~ [analysis]
+n6 Gain <- n1
+n7 ToneColour <- n6 n4 n2
+n8 NRChroma <- n7
+n9 Detail <- n8
+n10 Pack8 <- n9 [frame]
+== exact [legacy]
+n0 Source
+n1 LegacyRender <- n0 [frame]
+n2 Analysis [analysis]
+== exact [full]
+n0 Source
+n1 Resize <- n0
+n2 ToneColourExact <- n1
+n3 Analysis [analysis]
+n4 NRChroma <- n2
+n5 Detail <- n4
+n6 Pack8 <- n5 [frame]
+== overflow_gpu [legacy]
+n0 Source
+n1 ColourLattice
+n2 LatticeOverflow <- n1~
+n3 ToneTable
+n4 LegacyRender <- n0 n3 n1 n2 [frame]
+== overflow_gpu [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 LatticeOverflow <- n2~
+n4 ToneTable
+n5 Gain <- n1
+n6 ToneColour <- n5 n4 n2 n3
+n7 NRChroma <- n6
+n8 Detail <- n7
+n9 Pack8 <- n8 [frame]
+== geometry_vignette [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 LegacyRender <- n0 n2 n1 [frame]
+== geometry_vignette [full]
+n0 Source
+n1 Resize <- n0
+n2 Geometry <- n1
+n3 ColourLattice
+n4 ToneTable
+n5 Gain <- n2
+n6 ToneColour <- n5 n4 n3
+n7 Vignette <- n6
+n8 NRChroma <- n7
+n9 Detail <- n8
+n10 Pack8 <- n9 [frame]
+== region [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 LegacyRender <- n0 n2 n1 [frame]
+== region [full]
+n0 Source
+n1 Resize <- n0
+n2 Geometry <- n1
+n3 ColourLattice
+n4 ToneTable
+n5 Gain <- n2
+n6 ToneColour <- n5 n4 n3
+n7 NRChroma <- n6
+n8 Detail <- n7
+n9 Pack8 <- n8 [frame]
+== detail_all_final [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 LegacyRender <- n0 n2 n1 [frame]
+== detail_all_final [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Gain <- n1
+n5 ToneColour <- n4 n3 n2
+n6 NRLuma <- n5
+n7 NRChroma <- n6
+n8 Dehaze <- n7
+n9 Detail <- n8
+n10 Grain <- n9
+n11 Pack8 <- n10 [frame]
+== detail_all_interactive [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 LegacyRender <- n0 n2 n1 [frame]
+== detail_all_interactive [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Gain <- n1
+n5 ToneColour <- n4 n3 n2
+n6 NRLuma <- n5
+n7 NRChroma <- n6
+n8 Dehaze <- n7
+n9 Detail <- n8
+n10 Pack8 <- n9 [frame]
+== detail_interactive_no_noise [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 LegacyRender <- n0 n2 n1 [frame]
+== detail_interactive_no_noise [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Gain <- n1
+n5 ToneColour <- n4 n3 n2
+n6 Dehaze <- n5
+n7 Detail <- n6
+n8 Pack8 <- n7 [frame]
+== grain_dragged_interactive [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 LegacyRender <- n0 n2 n1 [frame]
+== grain_dragged_interactive [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Gain <- n1
+n5 ToneColour <- n4 n3 n2
+n6 NRLuma <- n5
+n7 NRChroma <- n6
+n8 Dehaze <- n7
+n9 Detail <- n8
+n10 Grain <- n9
+n11 Pack8 <- n10 [frame]
+== jpeg_source [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 LegacyRender <- n0 n2 n1 [frame]
+== jpeg_source [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Gain <- n1
+n5 ToneColour <- n4 n3 n2
+n6 Pack8 <- n5 [frame]
+== film_strength_100 [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 Analysis [analysis]
+n4 LegacyRender <- n0 n2 n1 [frame]
+== film_strength_100 [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice [table]
+n3 ToneTable [table]
+n4 Analysis [analysis]
+n5 FilmSim <- n1
+n6 DisplayStages <- n5
+n7 Pack8 <- n6 [frame]
+== film_strength_50 [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 Analysis [analysis]
+n4 LegacyRender <- n0 n2 n1 [frame]
+== film_strength_50 [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Analysis [analysis]
+n5 Gain <- n1
+n6 ToneColour <- n5 n3 n2
+n7 FilmSim <- n1
+n8 DisplayStages <- n7
+n9 Blend <- n6 n8
+n10 Pack8 <- n9 [frame]
+== film_strength_0 [legacy]
+n0 Source
+n1 ColourLattice
+n2 ToneTable
+n3 Analysis [analysis]
+n4 LegacyRender <- n0 n2 n1 [frame]
+== film_strength_0 [full]
+n0 Source
+n1 Resize <- n0
+n2 ColourLattice
+n3 ToneTable
+n4 Analysis [analysis]
+n5 Gain <- n1
+n6 ToneColour <- n5 n3 n2
+n7 Pack8 <- n6 [frame]

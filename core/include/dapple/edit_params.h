@@ -113,6 +113,19 @@ struct EditParams {
   int rotate = 0;             // 0, 90, 180, 270 (clockwise)
   bool flip = false;
 
+  // Spectral film simulation (film.h, docs/film/README.md). With a stock set, the film replaces the tone, colour
+  // and look stages (it takes linear ProPhoto after white balance and exposure, outputs display sRGB); curves,
+  // LUT, vignette, crop and the detail stages still apply. "" = off: the output is then identical to a build
+  // without the simulator.
+  std::string filmStock;       // stock id (FilmLibrary names, e.g. "kodak_portra_400"), "" = off
+  std::string filmPaper;       // print paper id; "" = default for the stock; "none" = scan the film itself
+  float filmStrength = 100.f;  // 0..100, blend of the finished film render against the normal pipeline
+  float filmExposure = 0.f;    // EV, -3..3, exposure at the camera on top of `exposure` (print not re-balanced)
+  float filmWarmth = 0.f;      // -100..100, print filtration (yellow): positive = warmer print
+  float filmTint = 0.f;        // -100..100, print filtration (magenta): positive = more magenta
+  float filmGrain = 100.f;     // 0..100, grain amount (100 = the stock's reference grain, 0 = none)
+  float filmHalation = 100.f;  // 0..100, halation + scatter amount (100 = reference)
+
   // Optional creative look (3D LUT, .cube); applied in sRGB at the end.
   std::string lutPath;
   float lutAmount = 100.f;  // 0..100

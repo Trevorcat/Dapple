@@ -498,7 +498,7 @@ void addGrain(ImageF& img, float amount, float scale) {
 void applySpatial(ImageF& img, const SpatialParams& p) {
   if (img.empty() || !p.any()) return;
   const int w = img.width, h = img.height;
-  const float scale = float(std::max(w, h)) / 2048.f;
+  const float scale = p.scale > 0.f ? p.scale : float(std::max(w, h)) / 2048.f;
   Plane Y, tmp;
   const bool needY = p.nrLuma > 0 || p.nrColor > 0 || p.clarity != 0 || p.texture != 0 || p.sharpen > 0;
   if (needY) lumaOf(img, Y);

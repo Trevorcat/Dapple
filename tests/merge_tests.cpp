@@ -1632,6 +1632,36 @@ void testPerformance() {
 #endif
 
 // ===========================================================================
+void testDegenerateMergeRejected() {
+  bool real = false;
+  ImageF base = loadScene(400, real);
+  HdrCase c = makeHdrCase(base, false, 33);
+  // all-black frames -> error, never an all-zero image
+  std::vector<SourceImage> blk = c.frames;
+  for (auto& f : blk) std::fill(f.linear.data.begin(), f.linear.data.end(), 0.f);
+  auto rb = mergeHdrImages(blk, HdrOptions{});
+  CHECK(!rb.has_value());
+  // NaN frame -> either an error or a fully finite non-black image
+  std::vector<SourceImage> nn = c.frames;
+  std::fill(nn[0].linear.data.begin(), nn[0].linear.data.end(), std::nanf(""));
+  auto rn = mergeHdrImages(nn, HdrOptions{});
+  if (rn) {
+    float mx = 0;
+    bool fin = true;
+    for (float v : rn->image.linear.data) fin = fin && std::isfinite(v), mx = std::max(mx, v);
+    CHECK(fin && mx > 1e-6f);
+  }
+  // writers refuse all-NaN / all-zero images
+  ImageF bad(8, 8);
+  std::fill(bad.data.begin(), bad.data.end(), std::nanf(""));
+  CHECK(!writeLinearTiff16(bad, outDir() / "bad_nan.tif").has_value());
+  SourceImage badSrc;
+  badSrc.linear = bad;
+  CHECK(!writeLinearDng(badSrc, outDir() / "bad_nan.dng").has_value());
+  ImageF zero(8, 8);
+  CHECK(!writeLinearTiff16(zero, outDir() / "bad_zero.tif").has_value());
+}
+
 int main() {
   struct T {
     const char* name;
@@ -1641,6 +1671,7 @@ int main() {
 #ifdef DAPPLE_HAVE_OPENCV
       {"hdr synthetic", testHdrSynthetic},
       {"hdr fusion + errors", testHdrJpegFusionAndErrors},
+      {"degenerate merge", testDegenerateMergeRejected},
       {"pano synthetic", testPanoSynthetic},
       {"pano portrait", testPanoPortrait},
       {"c api merge", testCApiMerge},

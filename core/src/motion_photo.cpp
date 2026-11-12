@@ -893,33 +893,144 @@ void inspectMp4(const Bytes& mp4, MotionPhotoInfo& info) {
 
 }  // namespace
 
+namespace {
+
+// ---- Ultra HDR (JPEG_R) cover: primary JPEG + MPF + gain-map JPEG, with a Container directory in the primary's XMP -------
+// The Motion Photo directory then lists Primary, GainMap and MotionPhoto (video last), as Pixel's Ultra HDR motion
+// photos do. The primary grows by the new XMP, so the MPF entries (primary size, gain-map offset) are rewritten.
+
+// Adds the Motion Photo attributes and the video item to an existing XMP packet that has a Container directory.
+// Returns an empty string when the packet has no Container:Directory sequence to extend.
+std::string mergeMotionIntoXmp(const std::string& xmp, std::uint64_t videoLength, const std::string& videoMime, std::int64_t ptsUs,
+                               bool legacy) {
+  const std::size_t desc = xmp.find("<rdf:Description");
+  if (desc == std::string::npos || xmp.find("Container:Directory") == std::string::npos) return {};
+  std::size_t seqEnd = xmp.find("</rdf:Seq>", desc);
+  const std::size_t descEnd = xmp.find('>', desc);
+  if (seqEnd == std::string::npos || descEnd == std::string::npos || descEnd > seqEnd) return {};
+  std::string add;
+  if (xmp.find("xmlns:GCamera=") == std::string::npos) add += " xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\"";
+  add += " GCamera:MotionPhoto=\"1\" GCamera:MotionPhotoVersion=\"1\"";
+  if (legacy) {
+    add += " GCamera:MicroVideo=\"1\" GCamera:MicroVideoVersion=\"1\" GCamera:MicroVideoOffset=\"" + std::to_string(videoLength) + "\"";
+    if (ptsUs >= 0) add += " GCamera:MicroVideoPresentationTimestampUs=\"" + std::to_string(ptsUs) + "\"";
+  }
+  add += " GCamera:MotionPhotoPresentationTimestampUs=\"" + std::to_string(ptsUs) + "\"";
+  const std::size_t at = xmp[descEnd - 1] == '/' ? descEnd - 1 : descEnd;
+  std::string out = xmp.substr(0, at) + add + xmp.substr(at);
+  seqEnd += add.size();
+  const std::string li = "<rdf:li rdf:parseType=\"Resource\"><Container:Item Item:Mime=\"" + videoMime +
+                         "\" Item:Semantic=\"MotionPhoto\" Item:Length=\"" + std::to_string(videoLength) +
+                         "\" Item:Padding=\"0\"/></rdf:li>";
+  out.insert(seqEnd, li);
+  return out;
+}
+
+// Rewrites the MPF index of a primary JPEG whose total length changed. primaryLen = SOI..EOI of the new primary.
+bool patchMpf(Bytes& primary, std::size_t primaryLen) {
+  std::size_t sosAt = npos;
+  const auto segs = headerSegments(primary.data(), primary.size(), sosAt);
+  for (const auto& sg : segs) {
+    if (sg.marker != 0xE2 || sg.end - sg.start < 4 + 4 + 8) continue;
+    if (std::memcmp(primary.data() + sg.start + 4, "MPF\0", 4) != 0) continue;
+    const std::size_t T = sg.start + 8;  // start of the TIFF header (endian marker): offsets are relative to it
+    const bool le = primary[T] == 'I';
+    auto r16 = [&](std::size_t o) { return le ? std::uint16_t(primary[o] | (primary[o + 1] << 8)) : rd16(&primary[o]); };
+    auto r32 = [&](std::size_t o) {
+      return le ? std::uint32_t(primary[o] | (primary[o + 1] << 8) | (primary[o + 2] << 16) | (std::uint32_t(primary[o + 3]) << 24))
+                : rd32(&primary[o]);
+    };
+    auto w32 = [&](std::size_t o, std::uint32_t v) {
+      if (le) {
+        primary[o] = v & 0xff; primary[o + 1] = (v >> 8) & 0xff; primary[o + 2] = (v >> 16) & 0xff; primary[o + 3] = std::uint8_t(v >> 24);
+      } else {
+        primary[o] = std::uint8_t(v >> 24); primary[o + 1] = (v >> 16) & 0xff; primary[o + 2] = (v >> 8) & 0xff; primary[o + 3] = v & 0xff;
+      }
+    };
+    const std::size_t ifd = T + r32(T + 4);
+    if (ifd + 2 > sg.end) return false;
+    const unsigned n = r16(ifd);
+    for (unsigned i = 0; i < n; i++) {
+      const std::size_t e = ifd + 2 + i * 12;
+      if (e + 12 > sg.end) return false;
+      if (r16(e) != 0xB002) continue;  // MP Entry
+      const std::size_t arr = T + r32(e + 8);
+      const unsigned cnt = r32(e + 4) / 16;
+      if (cnt < 2 || arr + 32 > sg.end) return false;
+      w32(arr + 4, std::uint32_t(primaryLen));              // entry 0: size of the primary
+      w32(arr + 16 + 8, std::uint32_t(primaryLen - T));     // entry 1: gain map offset, relative to the MPF header
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 Result<Bytes> buildMotionPhoto(const Bytes& jpeg, const Bytes& mp4, const MotionPhotoOptions& opt) {
   if (jpeg.size() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8) return fail("Cover is not a JPEG");
   if (mp4.size() < 16 || rd32(mp4.data() + 4) != cc("ftyp")) return fail("Video does not look like an MP4/MOV (no ftyp)");
   const std::size_t end = jpegEnd(jpeg.data(), jpeg.size());
   if (end == npos) return fail("Cover JPEG is truncated (no EOI marker)");
 
+  // an Ultra HDR cover carries its gain map as a second JPEG right after the primary's EOI
+  Bytes gainMap;
+  if (jpeg.size() > end + 4 && jpeg[end] == 0xFF && jpeg[end + 1] == 0xD8) {
+    const std::size_t gEnd = jpegEnd(jpeg.data() + end, jpeg.size() - end);
+    if (gEnd != npos) gainMap.assign(jpeg.begin() + std::ptrdiff_t(end), jpeg.begin() + std::ptrdiff_t(end + gEnd));
+  }
+
   std::size_t sos = npos;
   const auto segs = headerSegments(jpeg.data(), end, sos);
   if (sos == npos) return fail("Cover JPEG has no scan data");
 
   // leading APP0 / Exif segments stay in front of the XMP packet
-  std::size_t insertAt = 2, firstRest = 2;
-  std::size_t k = 0;
-  for (; k < segs.size(); ++k) {
+  std::size_t insertAt = 2;
+  for (std::size_t k = 0; k < segs.size(); ++k) {
     if (segs[k].marker == 0xE0 || isExifSegment(jpeg.data(), segs[k])) insertAt = segs[k].end;
     else break;
   }
-  (void)firstRest;
 
   const bool isMov = rd32(mp4.data() + 8) == cc("qt  ");
-  const std::string xmp = makeXmp(mp4.size(), isMov ? "video/quicktime" : "video/mp4", opt.presentationTimestampUs,
-                                  opt.legacyMicroVideo);
+  const std::string mime = isMov ? "video/quicktime" : "video/mp4";
+
+  // Ultra HDR: extend the XMP the cover already has (its Container directory lists the gain map)
+  std::string xmp;
+  const JSeg* oldXmp = nullptr;
+  if (!gainMap.empty()) {
+    for (const auto& sg : segs)
+      if (isXmpSegment(jpeg.data(), sg)) { oldXmp = &sg; break; }
+    if (oldXmp) {
+      const std::string cur(reinterpret_cast<const char*>(jpeg.data() + oldXmp->start + 4 + sizeof(kXmpHeader)),
+                            oldXmp->end - oldXmp->start - 4 - sizeof(kXmpHeader));
+      xmp = mergeMotionIntoXmp(cur, mp4.size(), mime, opt.presentationTimestampUs, opt.legacyMicroVideo);
+    }
+    if (xmp.empty()) gainMap.clear();  // cannot describe it: keep the primary image alone (a plain Motion Photo)
+  }
+  if (gainMap.empty()) {
+    xmp = makeXmp(mp4.size(), mime, opt.presentationTimestampUs, opt.legacyMicroVideo);
+    oldXmp = nullptr;
+  }
   const std::size_t payload = sizeof(kXmpHeader) + xmp.size();  // header incl. NUL + packet
   if (payload + 2 > 0xFFFF) return fail("XMP packet too large");
 
   Bytes out;
-  out.reserve(end + payload + 8 + mp4.size());
+  out.reserve(end + payload + 8 + gainMap.size() + mp4.size());
+  if (!gainMap.empty() && oldXmp) {
+    // swap the cover's own XMP segment for the merged one, in place
+    out.insert(out.end(), jpeg.begin(), jpeg.begin() + std::ptrdiff_t(oldXmp->start));
+    out.push_back(0xFF);
+    out.push_back(0xE1);
+    out.push_back(std::uint8_t((payload + 2) >> 8));
+    out.push_back(std::uint8_t(payload + 2));
+    out.insert(out.end(), kXmpHeader, kXmpHeader + sizeof(kXmpHeader));
+    out.insert(out.end(), xmp.begin(), xmp.end());
+    out.insert(out.end(), jpeg.begin() + std::ptrdiff_t(oldXmp->end), jpeg.begin() + std::ptrdiff_t(end));
+    if (!patchMpf(out, out.size())) return fail("Ultra HDR cover: MPF index not found or malformed");
+    out.insert(out.end(), gainMap.begin(), gainMap.end());
+    out.insert(out.end(), mp4.begin(), mp4.end());
+    return out;
+  }
   out.insert(out.end(), jpeg.begin(), jpeg.begin() + std::ptrdiff_t(insertAt));
   out.push_back(0xFF);
   out.push_back(0xE1);

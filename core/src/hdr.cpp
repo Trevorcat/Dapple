@@ -519,6 +519,18 @@ Result<void> fitToBase(SourceImage& s, int w, int h) {
   return {};
 }
 
+// A merge must never hand back an empty or non-finite image: NaN/Inf are cleared and an all-zero result is an error.
+static Result<void> validateMerged(ImageF& im) {
+  float mx = 0.f;
+  std::size_t bad = 0;
+  for (float& v : im.data) {
+    if (!std::isfinite(v)) { v = 0.f; ++bad; }
+    else mx = std::max(mx, v);
+  }
+  if (mx <= 1e-6f) return fail(bad ? "Merge produced invalid (non-finite) pixels" : "Merge produced an empty (black) image");
+  return {};
+}
+
 Result<HdrResult> mergeEngine(int count, int baseIdx, const std::vector<std::string>& names, const FrameLoader& load,
                               const HdrOptions& opt, const MergeControl& ctl) {
   using clk = std::chrono::steady_clock;
@@ -557,7 +569,7 @@ Result<HdrResult> mergeEngine(int count, int baseIdx, const std::vector<std::str
       parallelRows(im.height, [&](int y) {
         const float* s = im.row(y);
         float* d = m.ptr<float>(y);
-        for (int i = 0; i < im.width * 3; ++i) d[i] = 255.f * std::pow(std::clamp(s[i], 0.f, 1.f), 1.f / 2.2f);  // OpenCV's Mertens divides every depth by 255
+        for (int i = 0; i < im.width * 3; ++i) d[i] = 255.f * std::pow(s[i] > 0.f ? std::min(s[i], 1.f) : 0.f, 1.f / 2.2f);  // OpenCV's Mertens divides every depth by 255
       });
       return m;
     };
@@ -612,6 +624,7 @@ Result<HdrResult> mergeEngine(int count, int baseIdx, const std::vector<std::str
       float* d = out.row(y);
       for (int i = 0; i < W * 3; ++i) d[i] = std::pow(std::max(0.f, s[i]), 2.2f);
     });
+    if (auto v = validateMerged(out); !v) return std::unexpected(v.error());
     res.image.linear = std::move(out);
     res.image.meta = baseMeta.meta;
     res.image.sceneReferred = false;
@@ -807,6 +820,7 @@ Result<HdrResult> mergeEngine(int count, int baseIdx, const std::vector<std::str
   rep.secAlign = secAlign;
   rep.secMerge = secMerge;
 
+  if (auto v = validateMerged(out); !v) return std::unexpected(v.error());
   res.image.linear = std::move(out);
   res.image.meta = base.meta;
   res.image.sceneReferred = true;

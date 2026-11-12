@@ -12,17 +12,26 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "dapple/auto_adjust.h"
 #include "dapple/camera.h"
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
 #include "dapple/encode.h"
+#include "dapple/film.h"
 #include "dapple/look.h"
 #include "dapple/lut.h"
 #include "dapple/renderer.h"
 #include "dapple/tone.h"
+#include "parallel.h"
+#include "sysperf.h"
 #include "dapple/xmp_preset.h"
+#include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
+#include "color.h"
+#ifdef DAPPLE_HAVE_GPU
+#include "dapple/gpu_hook.h"  // optional GPU backend (core/gpu), runtime flag, default off
+#endif
 
 #ifndef DAPPLE_VERSION_STRING
 #define DAPPLE_VERSION_STRING "0.1.0"
@@ -31,6 +40,26 @@
 struct DappleSession {
   dapple::SourceImage source;
   const dapple::CameraProfile* camera = nullptr;
+
+  // ---- interactive frame caches (see dapple_session_render_frame) ----
+  struct Scaled {
+    int longEdge = 0;
+    std::shared_ptr<dapple::SourceImage> img;
+    std::size_t bytes = 0;
+    unsigned stamp = 0;
+  };
+  std::mutex mtx;
+  std::vector<Scaled> scaled;
+  unsigned stamp = 0;
+  std::shared_ptr<dapple::SourceImage> proxy;                  // 256 px copy for the tonal analysis
+  std::vector<std::shared_ptr<const dapple::BakedLut>> bakes;  // newest last (three slots)
+  std::shared_ptr<const dapple::Lut3D> lutKeep;
+  dapple::EditParams lastParams;
+  bool haveLast = false;
+  dapple::engine::EngineSession engine;  // used only when DAPPLE_ENGINE is set (docs/engine/pipeline-architecture.md)
+#ifdef DAPPLE_HAVE_GPU
+  dapple::gpu::SessionSlot gpu;  // resident GPU copy of the source (created on first GPU frame)
+#endif
 };
 
 namespace {
@@ -193,6 +222,9 @@ bool renderSessionParams(DappleSession* s, const EditParams& params, const char*
   }
   Renderer renderer(params, *s->camera, lut.get());
   renderer.setToneReach(toneReach);
+#ifdef DAPPLE_HAVE_GPU
+  if (dapple::gpu::runtimeEnabled() && toneReach == 1.f && (outLongEdge <= 0 || outLongEdge >= 1500) && dapple::gpu::hookExport(s->gpu, s->source, renderer, outLongEdge, out)) return true;
+#endif
   if (outLongEdge > 0 && std::max(s->source.linear.width, s->source.linear.height) > outLongEdge) {
     SourceImage scaled;
     scaled.sceneReferred = s->source.sceneReferred;
@@ -303,6 +335,25 @@ const char* dapple_version(void) { return DAPPLE_VERSION_STRING; }
 const char* dapple_last_error(void) { return g_lastError.c_str(); }
 
 void dapple_free_string(char* s) { std::free(s); }
+
+// ---- optional GPU backend (core/gpu): runtime flag + status ----
+int32_t dapple_gpu_set_enabled(int32_t mode) {
+#ifdef DAPPLE_HAVE_GPU
+  dapple::gpu::setRuntimeEnabled(mode);
+  return dapple::gpu::runtimeEnabled() ? 1 : 0;
+#else
+  (void)mode;
+  return 0;
+#endif
+}
+
+char* dapple_gpu_status_json(void) {
+#ifdef DAPPLE_HAVE_GPU
+  return dupString(dapple::gpu::statusJson());
+#else
+  return dupString("{\"compiled\":false,\"enabled\":false,\"available\":false}");
+#endif
+}
 
 void dapple_free_image(DappleImage* image) {
   if (!image) return;
@@ -440,6 +491,229 @@ static std::string toneJson(const ToneAnalysis& a) {
   return j;
 }
 
+
+// Source scaled to `longEdge` (cached, at most ~160 MB of scaled copies); null when the session
+// source itself is not larger.
+static std::shared_ptr<SourceImage> scaledSource(DappleSession* s, int longEdge) {
+  const int own = std::max(s->source.linear.width, s->source.linear.height);
+  if (longEdge <= 0 || longEdge >= own) return nullptr;
+  ++s->stamp;
+  for (auto& e : s->scaled)
+    if (e.longEdge == longEdge) {
+      e.stamp = s->stamp;
+      return e.img;
+    }
+  auto img = std::make_shared<SourceImage>();
+  img->sceneReferred = s->source.sceneReferred;
+  img->linear = resizeToLongEdge(s->source.linear, longEdge);
+  DappleSession::Scaled e;
+  e.longEdge = longEdge;
+  e.img = img;
+  e.bytes = img->linear.data.size() * sizeof(float);
+  e.stamp = s->stamp;
+  s->scaled.push_back(e);
+  auto total = [&] {
+    std::size_t t = 0;
+    for (auto& x : s->scaled) t += x.bytes;
+    return t;
+  };
+  while (s->scaled.size() > 1 && (total() > (160u << 20) || s->scaled.size() > 4)) {
+    auto oldest = s->scaled.end();
+    for (auto it = s->scaled.begin(); it != s->scaled.end(); ++it)
+      if (it->img != img && (oldest == s->scaled.end() || it->stamp < oldest->stamp)) oldest = it;
+    if (oldest == s->scaled.end()) break;
+    s->scaled.erase(oldest);
+  }
+  return img;
+}
+
+// Foreground frames run on ONE dedicated, long-lived render thread: a stable tid for the ADPF hint session, pinned
+// to the performance cores on big.LITTLE. The calling isolate thread just waits (no CPU) for the result.
+class RenderThread {
+ public:
+  static RenderThread& instance() {
+    static RenderThread* r = new RenderThread;
+    return *r;
+  }
+  void run(const std::function<void()>& fn) {
+    std::lock_guard<std::mutex> serial(serial_);
+    std::unique_lock<std::mutex> lock(m_);
+    job_ = &fn;
+    done_ = false;
+    cv_.notify_all();
+    cv_.wait(lock, [&] { return done_; });
+    job_ = nullptr;
+  }
+  int tid() const { return tid_.load(); }
+
+ private:
+  RenderThread() {
+    std::thread([this] { loop(); }).detach();
+  }
+  void loop() {
+    if (sys::topology().hetero() && !std::getenv("DAPPLE_THREADS")) sys::setAffinity(sys::topology().perf);
+    sys::setInteractivePriority();
+    tid_.store(sys::gettid_());
+    sys::g_class = 1;
+    std::unique_lock<std::mutex> lock(m_);
+    for (;;) {
+      cv_.wait(lock, [&] { return job_ && !done_; });
+      lock.unlock();
+      (*job_)();
+      lock.lock();
+      done_ = true;
+      cv_.notify_all();
+    }
+  }
+  std::mutex serial_, m_;
+  std::condition_variable cv_;
+  const std::function<void()>* job_ = nullptr;
+  bool done_ = true;
+  std::atomic<int> tid_{0};
+};
+
+static bool nearEq(float a, float b) { return std::fabs(a - b) < 1e-6f; }
+
+static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lutPath, const DappleFrameRequest& rq,
+                 DappleImage* out, char** analysisOut) {
+  std::lock_guard<std::mutex> lock(s->mtx);
+  EditParams params;
+  if (!parseParams(paramsJson, params)) return false;
+  std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
+  std::shared_ptr<const Lut3D> lut;
+  if (!lutFile.empty()) {
+    lut = loadLut(lutFile);
+    if (!lut) return false;
+  }
+  const bool interactive = (rq.flags & DAPPLE_FRAME_INTERACTIVE) != 0;
+  const int own = std::max(s->source.linear.width, s->source.linear.height);
+
+  RenderRegion region;
+  const bool hasRegion = rq.region[2] > rq.region[0] && rq.region[3] > rq.region[1];
+  int srcLong = rq.long_edge > 0 ? std::min(rq.long_edge, own) : own;
+  if (hasRegion) {
+    region.x0 = rq.region[0];
+    region.y0 = rq.region[1];
+    region.x1 = rq.region[2];
+    region.y1 = rq.region[3];
+    region.outLongEdge = std::max(1, rq.region_long_edge);
+    const float frac = std::max(region.x1 - region.x0, region.y1 - region.y0);
+    const int need = int(std::ceil(float(region.outLongEdge) / std::max(frac, 1e-3f) * 1.15f));
+    srcLong = std::min(own, (need + 31) / 32 * 32);
+  }
+  std::shared_ptr<SourceImage> hold = scaledSource(s, srcLong);
+  const SourceImage& src = hold ? *hold : s->source;
+
+  if (!s->proxy) {
+    s->proxy = std::make_shared<SourceImage>();
+    s->proxy->sceneReferred = s->source.sceneReferred;
+    s->proxy->linear = resizeToLongEdge(s->source.linear, 256);
+  }
+  Renderer renderer(params, *s->camera, lut.get());
+  renderer.setToneProxy(s->proxy.get());
+
+  if (rq.flags & DAPPLE_FRAME_EXACT) {
+    // reference pipeline (no region)
+    const Image8 img = renderer.render(src);
+    if (!fillImage(img, out)) return false;
+    if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS))
+    {
+      ToneAnalysis a = analyzeTone(*s->proxy, *s->camera, params);
+      applyFilmHistogram(a, *s->proxy, *s->camera, params);
+      *analysisOut = dupString(toneJson(a));
+    }
+    return true;
+  }
+
+  // 57^3: smallest lattice within mean dE2000 0.5 of the exact path on colour drags (edit-bench); 65^3 for finals
+  const int n = rq.bake_size > 0 ? rq.bake_size : (interactive ? 57 : 65);
+  if (dapple::engine::mode() != dapple::engine::Mode::Off) {
+    // Frame engine: graph + table nodes + ResultCache replace the bakes[3] lookup (stage a2/a3). Same inputs, same outputs.
+    dapple::engine::FrameJob job{params, renderer, src, s->proxy.get(), *s->camera, lut.get(), {}, {}, {}};
+    job.request.longEdge = rq.long_edge;
+    job.request.interactive = interactive;
+    job.request.wantAnalysis = analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS);
+    job.request.bakeSize = n;
+    job.request.fastAnalysis = interactive && !std::getenv("DAPPLE_EXACT_ANALYSIS");
+    job.request.noise = !interactive || !s->haveLast || !nearEq(s->lastParams.nrLuma, params.nrLuma) ||
+                        !nearEq(s->lastParams.nrColor, params.nrColor);
+    job.fastOptions.spatial = interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
+    job.fastOptions.noise = job.request.noise;
+    job.fastOptions.region = region;
+    s->lutKeep = lut;
+    s->lastParams = params;
+    s->haveLast = true;
+#ifdef DAPPLE_HAVE_GPU
+    if (dapple::gpu::runtimeEnabled()) {
+      job.gpuHook = [&](const BakedLut& bk, int& gw, int& gh) {
+        return dapple::gpu::hookRenderFrame(s->gpu, s->source, renderer, bk, job.fastOptions, srcLong, gw, gh);
+      };
+    }
+#endif
+    dapple::engine::FrameResult res;
+    if (!s->engine.renderFrame(job, res)) {
+      setError(res.error.empty() ? "engine failure" : res.error);
+      return false;
+    }
+    out->width = res.w;
+    out->height = res.h;
+    out->rgba = res.rgba;
+    if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS)) {
+      ToneAnalysis a = res.analysis;
+      if (renderer.filmActive()) applyFrameHistogram(a, res.rgba, res.w, res.h);
+      *analysisOut = dupString(toneJson(a));
+    }
+    return true;
+  }
+  const std::string pk = renderer.pointKey() + "#";
+  std::shared_ptr<const BakedLut> bake;
+  for (auto& b : s->bakes)  // same parameters, at least as fine a lattice as asked for
+    if (b->n >= std::clamp(n, 17, 65) && b->key.size() > pk.size() && b->key.compare(0, pk.size(), pk) == 0 &&
+        (!bake || b->n > bake->n))
+      bake = b;
+  if (!bake) {
+    // A lattice with the same colour stage (only tone / white balance moved: every 光线 drag) is reused, the
+    // largest one available (the final frame's 65^3 is the most accurate): just the 1D tone table is rebuilt.
+    const std::string ck = renderer.colourKey();
+    const BakedLut* from = nullptr;
+    for (auto& b : s->bakes)
+      if (b->colourKey == ck && b->n >= std::clamp(n, 17, 65) && (!from || b->n > from->n)) from = b.get();
+    bake = renderer.bake(src, n, from, interactive && !std::getenv("DAPPLE_EXACT_ANALYSIS"));
+    s->bakes.push_back(bake);
+    if (s->bakes.size() > 3) s->bakes.erase(s->bakes.begin());
+    s->lutKeep = lut;
+  }
+
+  FastOptions fo;
+  fo.spatial = interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
+  fo.noise = !interactive || !s->haveLast || !nearEq(s->lastParams.nrLuma, params.nrLuma) ||
+             !nearEq(s->lastParams.nrColor, params.nrColor);
+  fo.region = region;
+  s->lastParams = params;
+  s->haveLast = true;
+
+  int w = 0, h = 0;
+  std::uint8_t* rgba = nullptr;
+#ifdef DAPPLE_HAVE_GPU
+  if (dapple::gpu::runtimeEnabled()) rgba = dapple::gpu::hookRenderFrame(s->gpu, s->source, renderer, *bake, fo, srcLong, w, h);
+#endif
+  if (!rgba) rgba = renderer.renderBakedRgba(src, *bake, fo, w, h);
+  if (!rgba) {
+    setError("out of memory");
+    return false;
+  }
+  out->width = w;
+  out->height = h;
+  out->rgba = rgba;
+  if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS)) {
+    ToneAnalysis a = bake->analysis;  // the lattice (and its class analysis) is shared across film exposure / warmth...
+    if (renderer.filmActive()) applyFrameHistogram(a, rgba, w, h);  // ...the histogram of a film edit is that of the frame
+    *analysisOut = dupString(toneJson(a));
+  }
+  return true;
+}
+
+
 char* dapple_session_analyze_json(DappleSession* session) { return dapple_session_analyze_params_json(session, nullptr); }
 
 char* dapple_session_analyze_params_json(DappleSession* session, const char* params_json) {
@@ -451,7 +725,9 @@ char* dapple_session_analyze_params_json(DappleSession* session, const char* par
         }
         EditParams params;
         if (!parseParams(params_json, params)) return nullptr;
-        return dupString(toneJson(analyzeTone(session->source, *session->camera, params)));
+        ToneAnalysis a = analyzeTone(session->source, *session->camera, params);
+        applyFilmHistogram(a, session->source, *session->camera, params);
+        return dupString(toneJson(a));
       },
       nullptr);
 }
@@ -471,6 +747,181 @@ int32_t dapple_session_render(DappleSession* session, const char* params_json, c
         return fillImage(img, out) ? DAPPLE_OK : DAPPLE_ERROR;
       },
       DAPPLE_ERROR);
+}
+
+int32_t dapple_session_render_frame(DappleSession* session, const char* params_json, const char* lut_path,
+                                    const DappleFrameRequest* request, DappleImage* out, char** analysis_json) {
+  return guarded(
+      [&]() -> int32_t {
+        if (analysis_json) *analysis_json = nullptr;
+        if (!out) {
+          setError("null output");
+          return DAPPLE_ERROR;
+        }
+        out->width = out->height = 0;
+        out->rgba = nullptr;
+        if (!session) {
+          setError("null session");
+          return DAPPLE_ERROR;
+        }
+        DappleFrameRequest rq{};
+        if (request) rq = *request;
+        bool ok = false;
+        if (rq.flags & DAPPLE_FRAME_BACKGROUND) {
+          // low priority work (detail session...): this thread, efficiency cores, never the shared pool
+          sys::setBackground(true);
+          try {
+            ok = renderFrame(session, params_json, lut_path, rq, out, analysis_json);
+          } catch (...) {
+            sys::setBackground(false);
+            throw;
+          }
+          sys::setBackground(false);
+          return ok ? DAPPLE_OK : DAPPLE_ERROR;
+        }
+        const bool timed = (rq.flags & DAPPLE_FRAME_INTERACTIVE) != 0;
+        const std::function<void()> job = [&] {
+          const auto t0 = std::chrono::steady_clock::now();
+          if (timed) {
+            std::vector<std::int32_t> tids = ThreadPool::instance().workerTids();
+            tids.push_back(RenderThread::instance().tid());
+            sys::adpf().ensure(tids);
+          }
+          try {
+            ok = renderFrame(session, params_json, lut_path, rq, out, analysis_json);
+          } catch (const std::exception& e) {
+            setError(e.what());
+            ok = false;
+          }
+          if (timed)
+            sys::adpf().reportDuration(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        };
+        RenderThread::instance().run(job);
+        return ok ? DAPPLE_OK : DAPPLE_ERROR;
+      },
+      DAPPLE_ERROR);
+}
+
+char* dapple_engine_info_json(void) { return dupString(dapple::engine::infoJson()); }
+
+void dapple_thread_background(int32_t on) { sys::setBackground(on != 0); }
+
+void dapple_perf_configure(int32_t thread_limit, int32_t target_frame_ms) {
+  ThreadPool::instance().setLimit(thread_limit);
+  sys::adpf().setTarget(int64_t(std::max(0, target_frame_ms)) * 1000000);
+}
+
+float dapple_thermal_headroom(int32_t forecast_seconds) { return sys::adpf().headroom(forecast_seconds); }
+
+char* dapple_perf_info_json(void) {
+  const sys::Topology& t = sys::topology();
+  ThreadPool& pool = ThreadPool::instance();
+  std::string j = "{\"cpus\":" + std::to_string(t.total) + ",\"perf\":" + std::to_string(t.perf.size()) +
+                  ",\"efficient\":" + std::to_string(t.efficient.size()) + ",\"pool\":" + std::to_string(pool.size()) +
+                  ",\"adpf\":" + (sys::adpf().hintAvailable() ? "true" : "false") +
+                  ",\"adpf_session\":" + (sys::adpf().sessionActive() ? "true" : "false") +
+                  ",\"thermal_status\":" + std::to_string(sys::adpf().status()) + "}";
+  return dupString(j);
+}
+
+int32_t dapple_film_load_pack(const char* path) {
+  return guarded(
+      [&]() -> int32_t {
+        std::string err;
+        if (!path || !film::setLibraryPath(toPath(path), &err)) {
+          setError("film pack: " + (err.empty() ? std::string("bad path") : err));
+          return DAPPLE_ERROR;
+        }
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+int32_t dapple_film_load_pack_memory(const void* data, size_t size) {
+  return guarded(
+      [&]() -> int32_t {
+        std::string err;
+        auto lib = data ? film::FilmLibrary::loadPackMemory(data, size, &err) : nullptr;
+        if (!lib) {
+          setError("film pack: " + (err.empty() ? std::string("no data") : err));
+          return DAPPLE_ERROR;
+        }
+        film::setLibrary(std::move(lib));
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+void dapple_film_set_pack_path(const char* path) { film::setLibraryPathLazy(toPath(path)); }
+
+char* dapple_film_list_json(void) {
+  return guarded(
+      [&]() -> char* {
+        const auto lib = film::defaultLibrary();
+        std::string j = std::string("{\"loaded\":") + (lib ? "true" : "false") + ",\"stocks\":[";
+        if (lib) {
+          bool first = true;
+          for (const film::StockInfo& s : film::listStocks(*lib)) {
+            j += std::string(first ? "" : ",") + "{\"id\":\"" + esc(s.id) + "\",\"name\":\"" + esc(s.name) +
+                 "\",\"type\":\"" + s.kind + "\"}";
+            first = false;
+          }
+        }
+        return dupString(j + "]}");
+      },
+      nullptr);
+}
+
+char* dapple_film_attribution(void) {
+  return guarded(
+      [&]() -> char* {
+        const auto lib = film::defaultLibrary();
+        return dupString(lib ? lib->attribution() : std::string());
+      },
+      nullptr);
+}
+
+// Fixed test patches (linear sRGB scene reflectances: 18 % grey, skin, sky) rendered through every camera stock with the
+// default paper; the stock's swatch in the UI. The result is a pure function of the pack: callers cache it.
+char* dapple_film_swatches_json(void) {
+  return guarded(
+      [&]() -> char* {
+        const auto lib = film::defaultLibrary();
+        std::string j = "{";
+        if (lib) {
+          static const float kPatch[3][3] = {{0.18f, 0.18f, 0.18f}, {0.50f, 0.30f, 0.22f}, {0.15f, 0.28f, 0.55f}};
+          constexpr int kCell = 16;  // pixels per patch edge: the centre pixel is read, away from any edge effect
+          SourceImage src;
+          src.sceneReferred = true;
+          src.linear = ImageF(3 * kCell, kCell);
+          for (int y = 0; y < kCell; ++y)
+            for (int x = 0; x < 3 * kCell; ++x) color::srgbToProPhoto().apply(kPatch[x / kCell], src.linear.row(y) + 3 * x);
+          const CameraProfile& cam = cameras().resolve("", "");
+          bool first = true;
+          for (const film::StockInfo& si : film::listStocks(*lib)) {
+            if (si.kind == "paper") continue;
+            EditParams p;
+            p.filmStock = si.id;
+            p.filmStrength = 100.f;
+            const ImageF out = Renderer(p, cam, nullptr).renderFloat(src, false);
+            if (out.width != 3 * kCell) continue;
+            j += std::string(first ? "" : ",") + "\"" + esc(si.id) + "\":[";
+            for (int k = 0; k < 3; ++k) {
+              const float* px = out.row(kCell / 2) + 3 * (k * kCell + kCell / 2);
+              char hex[16];
+              std::snprintf(hex, sizeof hex, "%s\"%02x%02x%02x\"", k ? "," : "",
+                            int(std::lround(std::clamp(px[0], 0.f, 1.f) * 255.f)),
+                            int(std::lround(std::clamp(px[1], 0.f, 1.f) * 255.f)),
+                            int(std::lround(std::clamp(px[2], 0.f, 1.f) * 255.f)));
+              j += hex;
+            }
+            j += "]";
+            first = false;
+          }
+        }
+        return dupString(j + "}");
+      },
+      nullptr);
 }
 
 char* dapple_looks_json(void) { return dupString(looksJson()); }

@@ -20,11 +20,35 @@ add_library(dapple_core STATIC
   src/xmp_preset.cpp
   src/decoders/jpeg_decoder.cpp
   src/decoders/libraw_decoder.cpp
+  src/film.cpp
+  src/film_color.cpp
+  src/film_model.cpp
+  src/film_params.cpp
+  src/film_profile.cpp
+  src/film_upsample.cpp
+  src/film_kernels_base.cpp
+  src/film_spatial.cpp
+  src/film_spatial_render.cpp
+  src/film_registry.cpp
+  engine/graph/params.cpp
+  engine/graph/graph.cpp
+  engine/graph/registry.cpp
+  engine/graph/builder.cpp
+  engine/exec/engine_session.cpp
 )
 add_library(Dapple::core ALIAS dapple_core)
 
+# Film run kernels: a second build of the same source with AVX2 + FMA, selected at runtime.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "[Aa][Mm][Dd]64|x86_64|x64|X86" AND NOT MSVC)
+  target_sources(dapple_core PRIVATE src/film_kernels_avx2.cpp)
+  set_source_files_properties(src/film_kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  target_compile_definitions(dapple_core PRIVATE DAPPLE_FILM_HAVE_AVX2=1)
+  set(DAPPLE_FILM_AVX2 ON CACHE INTERNAL "")
+endif()
+
 target_include_directories(dapple_core
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+          ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dapple_core PRIVATE dapple_libraw dapple_stb)
 if(TARGET dapple_opencv)
@@ -34,7 +58,7 @@ endif()
 if(MSVC)
   target_compile_options(dapple_core PRIVATE /W4 /utf-8)
 else()
-  target_compile_options(dapple_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  target_compile_options(dapple_core PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-math-errno)
 endif()
 
 # ---------------------------------------------------------------------------
