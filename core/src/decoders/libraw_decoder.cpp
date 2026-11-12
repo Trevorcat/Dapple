@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -12,6 +13,7 @@
 
 #include <stb_image.h>
 
+#include "dapple/illuminant.h"
 #include "dapple/decoder.h"
 #include "file_util.h"
 #include "parallel.h"
@@ -97,6 +99,54 @@ ShotMetadata readMetadata(const LibRaw& raw) {
 
   const float g = d.color.cam_mul[1] > 0 ? d.color.cam_mul[1] : 1.f;
   for (int c = 0; c < 3; ++c) m.asShotWb[c] = d.color.cam_mul[c] > 0 ? d.color.cam_mul[c] / g : 1.f;
+  {  // as-shot illuminant chromaticity: the camera's neutral (1 / multipliers) through the inverse of the XYZ -> camera matrix
+    const float(*cx)[3] = d.color.cam_xyz;
+    const double a = cx[0][0], b = cx[0][1], cc = cx[0][2], dd = cx[1][0], e = cx[1][1], f = cx[1][2], gg = cx[2][0], h = cx[2][1], k = cx[2][2];
+    const double det = a * (e * k - f * h) - b * (dd * k - f * gg) + cc * (dd * h - e * gg);
+    if (std::fabs(det) > 1e-9 && d.color.cam_mul[0] > 0 && d.color.cam_mul[1] > 0 && d.color.cam_mul[2] > 0) {
+      const double n[3] = {1.0 / d.color.cam_mul[0], 1.0 / d.color.cam_mul[1], 1.0 / d.color.cam_mul[2]};
+      const double inv[9] = {(e * k - f * h) / det, (cc * h - b * k) / det, (b * f - cc * e) / det,
+                             (f * gg - dd * k) / det, (a * k - cc * gg) / det, (cc * dd - a * f) / det,
+                             (dd * h - e * gg) / det, (b * gg - a * h) / det, (a * e - b * dd) / det};
+      const double X = inv[0] * n[0] + inv[1] * n[1] + inv[2] * n[2], Y = inv[3] * n[0] + inv[4] * n[1] + inv[5] * n[2],
+                   Z = inv[6] * n[0] + inv[7] * n[1] + inv[8] * n[2];
+      const double sum = X + Y + Z;
+      if (sum > 1e-9 && X > 0 && Y > 0 && Z > 0) m.asShotIlluminantXy[0] = float(X / sum), m.asShotIlluminantXy[1] = float(Y / sum);
+    }
+    // The matrix is the file's single (D65-based) XYZ -> camera matrix, so the estimate is biased cool towards warm light (dual-illuminant
+    // effect: -20 .. -39 mired on 14 Sony ARWs against the camera's own Kelvin table). Where the camera records its own Kelvin white-balance
+    // table (LibRaw WBCT_Coeffs: Sony) the correlated colour temperature comes from it (the as-shot multipliers projected onto the table in
+    // log(R/G), log(B/G) against mired); the matrix estimate only supplies the tint, its offset from the locus at its own temperature.
+    if (m.asShotIlluminantXy[0] > 0.f && d.color.cam_mul[0] > 0 && d.color.cam_mul[1] > 0 && d.color.cam_mul[2] > 0) {
+      struct Pt { double mired, lr, lb; };
+      std::vector<Pt> tab;
+      for (int i = 0; i < 64; ++i) {
+        const float* w = d.color.WBCT_Coeffs[i];
+        if (w[0] > 500.f && w[1] > 0.f && w[2] > 0.f && w[3] > 0.f) tab.push_back({1e6 / double(w[0]), std::log(double(w[1]) / double(w[2])), std::log(double(w[3]) / double(w[2]))});
+      }
+      std::sort(tab.begin(), tab.end(), [](const Pt& a, const Pt& b) { return a.mired < b.mired; });
+      const double xm = m.asShotIlluminantXy[0], ym = m.asShotIlluminantXy[1], Tm = dapple::xyToCct(xm, ym);
+      double Tc = Tm;
+      if (tab.size() >= 2) {
+        const double ql = std::log(double(d.color.cam_mul[0]) / double(d.color.cam_mul[1])), qb = std::log(double(d.color.cam_mul[2]) / double(d.color.cam_mul[1]));
+        double bestErr = 1e30, bestMired = 1e6 / Tm;
+        for (std::size_t i = 0; i + 1 < tab.size(); ++i) {
+          const double dl = tab[i + 1].lr - tab[i].lr, db = tab[i + 1].lb - tab[i].lb, den = dl * dl + db * db;
+          if (den <= 0) continue;
+          const double t = std::clamp(((ql - tab[i].lr) * dl + (qb - tab[i].lb) * db) / den, 0.0, 1.0);
+          const double el = ql - (tab[i].lr + t * dl), eb = qb - (tab[i].lb + t * db), err = el * el + eb * eb;
+          if (err < bestErr) bestErr = err, bestMired = tab[i].mired + t * (tab[i + 1].mired - tab[i].mired);
+        }
+        Tc = 1e6 / bestMired;
+        double lx, ly, mx, my;
+        dapple::cctToXy(Tc, lx, ly);
+        dapple::cctToXy(Tm, mx, my);
+        m.asShotIlluminantXy[0] = float(lx + (xm - mx));
+        m.asShotIlluminantXy[1] = float(ly + (ym - my));
+      }
+      m.asShotCct = float(Tc);
+    }
+  }
 
   if (m.make == "Sony") m.rawFormat = sonyRawFormat(d.makernotes.sony);
   if (m.make == "Fujifilm") m.inCameraLook = fujiFilmSimulation(d.makernotes.fuji.FilmMode);

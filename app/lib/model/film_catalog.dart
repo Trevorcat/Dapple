@@ -10,9 +10,12 @@ enum FilmGroup { negative, slide, cinema }
 const filmGroupNames = {FilmGroup.negative: '负片', FilmGroup.slide: '反转片', FilmGroup.cinema: '电影'};
 
 class FilmStock {
-  const FilmStock(this.id, this.engineName, this.group);
+  const FilmStock(this.id, this.engineName, this.group, [this.paper]);
   final String id, engineName;
   final FilmGroup group;
+
+  /// The paper the engine prints this stock on when the edit names none (the profile's own pairing, field "paper" of the list).
+  final String? paper;
   String get name => filmDisplayName(id, engineName);
 
   /// A negative (camera or cinema) is printed: it has a paper, print warmth and tint.
@@ -67,7 +70,7 @@ class FilmCatalog {
 
   /// Paper a printed stock gets when the edit names none (the engine's default).
   String defaultPaperOf(FilmStock s) {
-    final p = s.group == FilmGroup.cinema ? kDefaultCinemaPaper : kDefaultPaper;
+    final p = s.paper ?? (s.group == FilmGroup.cinema ? kDefaultCinemaPaper : kDefaultPaper);
     if (papers.any((x) => x.id == p)) return p;
     return papers.isEmpty ? kPaperNone : papers.first.id;
   }
@@ -96,7 +99,7 @@ class FilmCatalog {
         final id = m['id'] as String, name = (m['name'] as String?) ?? id;
         switch (m['type']) {
           case 'negative':
-            byGroup[isCinemaStock(id) ? FilmGroup.cinema : FilmGroup.negative]!.add(FilmStock(id, name, isCinemaStock(id) ? FilmGroup.cinema : FilmGroup.negative));
+            byGroup[isCinemaStock(id) ? FilmGroup.cinema : FilmGroup.negative]!.add(FilmStock(id, name, isCinemaStock(id) ? FilmGroup.cinema : FilmGroup.negative, m['paper'] as String?));
           case 'slide':
             byGroup[FilmGroup.slide]!.add(FilmStock(id, name, FilmGroup.slide));
           case 'paper':

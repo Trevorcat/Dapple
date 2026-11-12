@@ -25,6 +25,7 @@ add_library(dapple_core STATIC
   src/film_model.cpp
   src/film_params.cpp
   src/film_match.cpp
+  src/film_match_cache.cpp
   src/film_profile.cpp
   src/film_upsample.cpp
   src/film_kernels_base.cpp

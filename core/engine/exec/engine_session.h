@@ -94,6 +94,8 @@ struct FrameJob {
   // presenter (hal::ExternalImage: VkImage + layouts + semaphores). On success FrameResult::rgba stays null and `external` is
   // set; when the GPU cannot take the frame the CPU result is returned in rgba as usual (the presenter uploads it).
   const hal::ExternalImage* gpuTarget = nullptr;
+  // CPU time the C layer spent before the engine call (film exposure match, Renderer construction): reported in FrameResult::cpu
+  double matchMs = 0, rendererMs = 0;
 };
 
 struct FrameResult {
@@ -108,6 +110,11 @@ struct FrameResult {
   std::string why;       // when the CPU rendered although a GPU was asked for or could have been: the reason (Unsupported text, "GPU self-test running", ...)
   bool external = false; // the pixels are in FrameJob::gpuTarget, not in rgba
   GpuStats gpu;          // GPU runs only
+  // CPU time of this frame by stage, ms (reported by the throttled dapple_engine line): match = film exposure solve (C layer), renderer = Renderer
+  // construction (C layer), graph = ParamSet + graph + keys, tables = host tables (lattice, tone, film), exec = plan + executor incl. GPU wait
+  struct CpuSplit {
+    double matchMs = 0, rendererMs = 0, graphMs = 0, tablesMs = 0, execMs = 0, totalMs = 0;
+  } cpu;
 };
 
 struct EngineStats {

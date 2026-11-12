@@ -150,6 +150,7 @@ Key bakeKey(const FilmParams& p) {
   keyStr(k, p.enlarger.illuminant);
   keyNum(k, p.camera.exposureCompensationEv);
   for (double v : p.camera.filterUv) keyNum(k, v);
+  for (double v : {p.camera.sceneWhiteX, p.camera.sceneWhiteY, p.camera.adaptationDegree}) keyNum(k, v);
   for (double v : p.camera.filterIr) keyNum(k, v);
   keyNum(k, p.filmRender.densityCurveGamma);
   for (double v : p.filmRender.densityCurveGammaRgb) keyNum(k, v);
@@ -164,7 +165,6 @@ Key bakeKey(const FilmParams& p) {
   for (double v : d.gammaInterlayerGToRb) keyNum(k, v);
   for (double v : d.gammaInterlayerBToRg) keyNum(k, v);
   const auto& e = p.enlarger;
-  for (double v : {e.neutralMix, e.refMNeutral, e.refYNeutral}) keyNum(k, v);
   for (double v : {e.printExposure, double(e.printExposureCompensation), double(e.normalizePrintExposure), e.yFilterShift,
                    e.mFilterShift, e.yFilterNeutral, e.mFilterNeutral, e.cFilterNeutral, e.preflashExposure,
                    e.preflashYFilterShift, e.preflashMFilterShift})
@@ -199,6 +199,7 @@ Key rawKey(const FilmParams& p) {
   keyNum(k, p.io.inputGamutCompress);
   for (double v : {p.io.inputKnee.threshold, p.io.inputKnee.limit, p.io.inputKnee.power}) keyNum(k, v);
   for (double v : p.camera.filterUv) keyNum(k, v);
+  for (double v : {p.camera.sceneWhiteX, p.camera.sceneWhiteY, p.camera.adaptationDegree}) keyNum(k, v);
   for (double v : p.camera.filterIr) keyNum(k, v);
   return k;
 }

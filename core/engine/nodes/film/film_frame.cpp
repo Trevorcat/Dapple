@@ -262,7 +262,9 @@ bool filmFrameResolved(const FilmFrameArgs& a, FilmResolved& r) {
   r.tint = a.tint;
   r.printEv = a.printEv;
   r.black = a.black;
-  r.cast = a.cast;
+  r.sceneX = a.sceneX;
+  r.sceneY = a.sceneY;
+  r.adapt = a.adapt;
   r.grainPct = a.grainPct;
   r.halationPct = a.halationPct;
   r.formatScale = a.formatScale;
@@ -271,6 +273,7 @@ bool filmFrameResolved(const FilmFrameArgs& a, FilmResolved& r) {
   r.fx = a.fx;
   r.quality = std::uint8_t(a.quality);
   r.keepGrain = a.keepGrain ? 1 : 0;
+  r.coarse = a.coarse ? 1 : 0;
   r.fullLongEdge = a.fullLongEdge;
   r.frameIndex = a.frameIndex;
   r.seed = a.frameIndex ? filmSeed(a.frameIndex) : 0u;

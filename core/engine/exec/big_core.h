@@ -53,9 +53,22 @@ struct BigCoreScope {
     if (active) sched_setaffinity(0, sizeof prev, &prev);
   }
 };
+// Permanent form for a thread that records and submits frames for its whole life (the present loop thread, the GLES command thread): the
+// calling thread keeps the big cores only. DAPPLE_GPU_NO_PIN=1 turns it off. Returns whether the affinity changed.
+inline bool pinCurrentThreadToBigCores() {
+  if (std::getenv("DAPPLE_GPU_NO_PIN")) return false;
+  bool ok = false;
+  const cpu_set_t big = bigCoreSet(ok);
+  cpu_set_t cur, both;
+  if (!ok || sched_getaffinity(0, sizeof cur, &cur) != 0) return false;
+  CPU_AND(&both, &cur, &big);
+  if (CPU_COUNT(&both) == 0) return false;
+  return sched_setaffinity(0, sizeof both, &both) == 0;
+}
 }  // namespace dapple::engine::gpu::detail
 #else
 namespace dapple::engine::gpu::detail {
 struct BigCoreScope {};
+inline bool pinCurrentThreadToBigCores() { return false; }
 }  // namespace dapple::engine::gpu::detail
 #endif

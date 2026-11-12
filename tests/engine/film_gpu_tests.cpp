@@ -680,6 +680,10 @@ void testFrames() {
       {"film strength 55 + curves + LUT", [](EditParams& p) {
          p.filmStock = "kodak_portra_400"; p.filmStrength = 55; p.toneCurve = {{0.f, 0.f}, {128.f, 107.f}, {255.f, 255.f}}; p.lutAmount = 55; },
        nullptr, true, false, true},
+      // film white balance: the scene illuminant (3200 K, 7500 K) reaches the film with degree of adaptation 1 - film_wb
+      {"film_wb 0.5 under 3200 K", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmWb = 0.5f; p.filmSceneX = 0.4234f; p.filmSceneY = 0.3990f; }, nullptr, false, false, true},
+      {"film_wb 1 under 3200 K, WB edit", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmWb = 1.f; p.filmSceneX = 0.4234f; p.filmSceneY = 0.3990f; p.temperature = 25.f; }, nullptr, false, false, true},
+      {"film_wb 1 under 7500 K (tungsten stock)", [](EditParams& p) { p.filmStock = "kodak_vision3_500t"; p.filmWb = 1.f; p.filmSceneX = 0.2991f; p.filmSceneY = 0.3149f; }, nullptr, false, false, true},
       {"film tiled export", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }, nullptr, false, true, true},
       {"film tiled export, strength 50 + curves + LUT", [](EditParams& p) {
          p.filmStock = "kodak_portra_400"; p.filmStrength = 50; p.toneCurve = {{0.f, 0.f}, {128.f, 107.f}, {255.f, 255.f}}; p.lutAmount = 60; p.vignette = -20; },

@@ -136,8 +136,11 @@ struct EditParams {
   // between a dark and a light median, filmBlack the paper black (-1 matte, 0 true Dmax, +1 display black), filmLatitude the
   // in-range fraction the stock is rescued to (0.55 .. 0.80 .. 0.98).
   float filmShoot = 0.f, filmPrint = 0.f, filmBlack = 0.f, filmLatitude = 0.f;
-  // film_cast: partial neutralisation of the print filter pack (-1 = every stock fully neutral, 0 = default, +1 = most native cast)
-  float filmCast = 0.f;
+  // Film white balance (胶片白平衡), 0..1: 0 = the digital white balance (the scene white reaches the film as its own reference white), 1 =
+  // the stock's own balance sees the scene's real light (degree of adaptation D = 1 - filmWb).
+  float filmWb = 0.f;
+  // Internal, not serialised: CIE xy of the scene's as-shot illuminant (the C layer sets it from the RAW's white balance; 0 = unknown).
+  float filmSceneX = 0.f, filmSceneY = 0.f;
 
   // Optional creative look (3D LUT, .cube); applied in sRGB at the end.
   std::string lutPath;

@@ -101,6 +101,7 @@ struct Frame {
   float region[4] = {0, 0, 0, 0};
   int regionLong = 0;
   std::string lut;
+  std::string active;  // DappleFrameRequest::active_param (the slider being dragged), "" = none
 };
 
 struct Scenario {
@@ -570,6 +571,7 @@ void runScenario(const Scenario& sc, std::uint32_t seed, std::vector<GoldenHash>
     rq.bake_size = f.bake;
     for (int i = 0; i < 4; ++i) rq.region[i] = f.region[i];
     rq.region_long_edge = f.regionLong;
+    rq.active_param = f.active.empty() ? nullptr : f.active.c_str();
     DappleImage im{};
     char* an = nullptr;
     const std::string pj = toJson(f.p);
@@ -772,7 +774,116 @@ int selfcheck(bool haveFilm) {
   return bad ? 1 : 0;
 }
 
+// Cached film exposure match against the uncached one (docs/engine/pipeline-architecture.md 26.2): sequences with interleaved geometry, stock,
+// white balance, film_wb, vignette, exposure and drags of every pad parameter; every non-interactive frame must be bit identical.
+// DAPPLE_FILM_MATCH_UNCACHED is read per frame, so both runs happen in this process.
+void setEnv(const char* k, const char* v) {
+#ifdef _WIN32
+  _putenv_s(k, v);
+#else
+  setenv(k, v, 1);
+#endif
+}
+
+int seqCheck() {
+  const char* kStocks[] = {"kodak_portra_400", "fujifilm_velvia_100", "kodak_ektar_100"};
+  std::vector<Scenario> all;
+  auto frame = [](const EditParams& p, int flags, const char* label, const char* active = "") {
+    Frame f;
+    f.p = p;
+    f.flags = flags;
+    f.longEdge = 400;
+    f.label = label;
+    f.active = active;
+    return f;
+  };
+  {
+    Scenario s;
+    s.name = "mixed";
+    EditParams p = base();
+    p.filmStock = kStocks[0];
+    s.frames.push_back(frame(p, 0, "plain"));
+    p.crop = "4:5", p.straighten = 2.f;
+    s.frames.push_back(frame(p, 0, "geometry"));
+    p.vignette = -20.f;
+    s.frames.push_back(frame(p, 0, "vignette"));
+    p.rotate = 90;
+    s.frames.push_back(frame(p, 0, "rotate"));
+    p.temperature = 18.f, p.tint = -7.f;
+    s.frames.push_back(frame(p, 0, "wb"));
+    p.filmStock = kStocks[1];
+    s.frames.push_back(frame(p, 0, "slide"));
+    p.filmShoot = 0.5f;
+    s.frames.push_back(frame(p, 0, "slide_shoot"));
+    p.filmStock = kStocks[2], p.filmShoot = 0.f;
+    s.frames.push_back(frame(p, 0, "ektar"));
+    p.filmWb = 0.6f;
+    s.frames.push_back(frame(p, 0, "film_wb"));
+    p.exposure = -0.5f, p.nrColor = 30.f, p.sharpRadius = 20.f;
+    s.frames.push_back(frame(p, 0, "exposure_nr"));
+    p.vignette = 0.f, p.crop = "orig", p.straighten = 0.f, p.rotate = 0;
+    s.frames.push_back(frame(p, 0, "back"));
+    p.filmStock = kStocks[0];
+    s.frames.push_back(frame(p, 0, "portra_again"));
+    all.push_back(std::move(s));
+  }
+  struct Drag {
+    const char* key;
+    void (*set)(EditParams&, float);
+    float lo, hi;
+  };
+  const Drag drags[] = {{"film_shoot", [](EditParams& p, float v) { p.filmShoot = v; }, -1, 1},
+                        {"film_print", [](EditParams& p, float v) { p.filmPrint = v; }, -1, 1},
+                        {"film_black", [](EditParams& p, float v) { p.filmBlack = v; }, -1, 1},
+                        {"film_latitude", [](EditParams& p, float v) { p.filmLatitude = v; }, -1, 1},
+                        {"film_wb", [](EditParams& p, float v) { p.filmWb = v; }, 0, 1},
+                        {"film_warmth", [](EditParams& p, float v) { p.filmWarmth = v; }, -30, 30},
+                        {"film_tint", [](EditParams& p, float v) { p.filmTint = v; }, -30, 30},
+                        {"exposure", [](EditParams& p, float v) { p.exposure = v; }, -1, 1}};
+  for (const char* stock : {kStocks[0], kStocks[1]})
+    for (const Drag& d : drags) {
+      Scenario s;
+      s.name = std::string("drag_") + d.key + (stock == kStocks[1] ? "_slide" : "");
+      EditParams p = base();
+      p.filmStock = stock;
+      p.vignette = -15.f;
+      s.frames.push_back(frame(p, 0, "start"));
+      for (int i = 0; i < 6; ++i) {
+        d.set(p, d.lo + (d.hi - d.lo) * float(i) / 5.f);
+        s.frames.push_back(frame(p, DAPPLE_FRAME_INTERACTIVE, ("drag" + std::to_string(i)).c_str(), d.key));
+      }
+      s.frames.push_back(frame(p, 0, "settled"));
+      d.set(p, d.lo + (d.hi - d.lo) * 0.37f);
+      s.frames.push_back(frame(p, DAPPLE_FRAME_INTERACTIVE, "drag_b", d.key));
+      s.frames.push_back(frame(p, 0, "settled_b"));
+      all.push_back(std::move(s));
+    }
+  int bad = 0, n = 0;
+  for (const Scenario& sc : all) {
+    std::vector<GoldenHash> a, b;
+    setEnv("DAPPLE_FILM_MATCH_UNCACHED", "1");
+    runScenario(sc, 7, a);
+    setEnv("DAPPLE_FILM_MATCH_UNCACHED", "");
+    runScenario(sc, 7, b);
+    for (std::size_t i = 0; i < sc.frames.size(); ++i) {
+      if (sc.frames[i].flags & DAPPLE_FRAME_INTERACTIVE) continue;
+      ++n;
+      if (a[i].hash != b[i].hash || a[i].hash.rfind("ERROR", 0) == 0) {
+        ++bad;
+        std::printf("MISMATCH %s: uncached %s cached %s\n", a[i].name.c_str(), a[i].hash.c_str(), b[i].hash.c_str());
+      }
+    }
+  }
+  std::printf("seqcheck: %d settled frames in %zu sequences, %d mismatches\n", n, all.size(), bad);
+  return bad ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::string(argv[1]) == "seqcheck") {
+    const std::string ps = (fs::path(DAPPLE_SOURCE_DIR) / "core" / "data" / "film" / "dapple.dfp").string();
+    if (!fs::exists(ps) || dapple_film_load_pack(ps.c_str()) != DAPPLE_OK) return 77;
+    return seqCheck();
+  }
   if (argc >= 2 && std::string(argv[1]) == "selfcheck") {
     bool film = false;
     if (argc >= 3) {

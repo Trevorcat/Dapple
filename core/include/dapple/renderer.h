@@ -74,6 +74,9 @@ struct FastOptions {
   bool keepGrain = false;
   int fullLongEdge = 0;
   std::uint32_t frameIndex = 0;
+  // Film, interactive frames only: a print table that is not cached yet is baked coarsely (17^3 instead of 33^3) while a table slider moves; the
+  // frame after the drag bakes the exact one (docs/engine/pipeline-architecture.md section 26).
+  bool coarseFilm = false;
 };
 
 class FrameKernels;  // engine block fragments of the per-pixel pipeline (src/frame_kernels.h)

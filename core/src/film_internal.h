@@ -234,27 +234,20 @@ class FilmModel {
   // 33^3 print + scan LUT, glare white, sRGB decode (and the split-path tables).
   void bakeInput(FilmTables& t) const;
   void bakeCurves(FilmTables& t) const;
-  void bakePrintScan(FilmTables& t) const;
+  void bakePrintScan(FilmTables& t, int lutN = 0) const;  // lutN > 0: nodes per axis instead of settings.lutResolution (coarse tables while a slider moves)
   // Changes the enlarger filtration shifts (warmth / tint) without re-running the neutral solve.
   void rebalance(double mShift, double yShift);
   // Print exposure multiplier (paper exposure; for a scanned / projected film: 1 / pe is the lamp gain). Takes effect on the
   // next bake*(); the match solver (film_match.h) drives it as 2^-printEv.
   void setPrintExposure(double pe) { pe_ = pe; }
   // Paper black mix (scanner.blackMix) for the next bake*(); rebuilds the paper-to-screen mapping.
-  // Partial neutralisation: the print pack becomes lerp(solved pack, reference pack, k) for the next rebalance() / bake*().
-  void setCast(double refM, double refY, double k) {
-    if (scanFilm_ || !castKnown_) return;
-    p_.enlarger.neutralMix = k;
-    p_.enlarger.refMNeutral = refM;
-    p_.enlarger.refYNeutral = refY;
-    p_.enlarger.mFilterNeutral = mSolved_ + (refM - mSolved_) * k;
-    p_.enlarger.yFilterNeutral = ySolved_ + (refY - ySolved_) * k;
-  }
-  // The solved (fully neutralised) pack, whatever setCast() did since.
-  bool solvedNeutral(double& m, double& y) const {
-    m = mSolved_;
-    y = ySolved_;
-    return castKnown_;
+  // Film white balance: the scene illuminant (CIE xy, 0 = none) and the CAT16 degree of adaptation of the image path's input matrix (mInImg_)
+  // for the next bakeInput(); D = 1 (or no illuminant) is exactly the film's own balance.
+  void setInputAdaptation(double sx, double sy, double degree) {
+    p_.camera.sceneWhiteX = sx;
+    p_.camera.sceneWhiteY = sy;
+    p_.camera.adaptationDegree = degree;
+    buildInputMatrix();
   }
   void setBlackMix(double mix) {
     p_.scanner.blackMix = mix;
@@ -281,6 +274,7 @@ class FilmModel {
 
   // filming
   Mat3 mIn_{};
+  Mat3 mInImg_{};  // the image path's input matrix: mIn_, or with the scene illuminant partly adapted (camera.sceneWhite / adaptationDegree)
   double wx_ = 0, wy_ = 0;
   Spec iRef_{};
   std::shared_ptr<const RawLut> raw_;
@@ -312,8 +306,7 @@ class FilmModel {
   void buildPostMap();
   Vec3 rawPre_{};
   std::vector<double> paperAxis_, paperCurve_[3];
-  double mSolved_ = 0, ySolved_ = 0;
-  bool castKnown_ = false;
+  void buildInputMatrix();
   Vec3 dMidDir_{};
   Vec3 dMinFilm_{}, dMaxFilm_{};
   Vec3 dMinScan_{}, dMaxScan_{};

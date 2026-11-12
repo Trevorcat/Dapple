@@ -1,12 +1,10 @@
-// Editor interaction v2 (requirements 4.15): widget level behaviour on a Find N5 inner screen (floating
-// windows; the phone-portrait docked panel is tested in editor_panel_test.dart), plus screenshots written to test/goldens/editor_v2/ for review.
+// Editor interaction v2 (requirements 4.15): shared helpers (open, Finger, dump, ...) and the settings tests; the
+// control panel is tested in editor_panel_test.dart. Screenshots go to test/goldens/editor_v2/ for review.
 import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:dapple/editor/haptics.dart';
 import 'package:dapple/editor/value_mapping.dart';
-import 'package:dapple/editor/window_manager.dart';
-import 'package:dapple/model/params.dart';
 import 'package:dapple/screens/editor/editor_page.dart';
 import 'package:dapple/screens/editor/zoom_view.dart';
 import 'package:dapple/screens/library/settings_page.dart';
@@ -116,96 +114,6 @@ Future<void> tapKey(WidgetTester t, String k) async {
 ZoomController zoomOf(WidgetTester t) => t.widget<ZoomView>(find.byKey(const ValueKey('zoom-stage'))).controller;
 
 void main() {
-  group('Find N5 inner', () {
-    testWidgets('two windows and the histogram window; a third category replaces the least recent; no overflow', (t) async {
-      await open(t, phys: n5Phys, dpr: n5Dpr);
-      expect(find.byKey(const ValueKey('histogram-window')), findsOneWidget);
-      await tapKey(t, 'dock-${EGroup.light}');
-      await tapKey(t, 'dock-${EGroup.color}');
-      expect(find.byKey(const ValueKey('window-light')), findsOneWidget);
-      expect(find.byKey(const ValueKey('window-color')), findsOneWidget);
-      final l = t.getRect(find.byKey(const ValueKey('window-light'))), c = t.getRect(find.byKey(const ValueKey('window-color')));
-      expect(l.left, greaterThan(c.left), reason: 'first window on the dominant (right) side, second on the other');
-      await dump(t, 'n5_two_windows');
-      await tapKey(t, 'dock-${EGroup.curve}');
-      expect(find.byKey(const ValueKey('window-curve')), findsOneWidget);
-      expect(find.byKey(const ValueKey('window-light')), findsNothing, reason: 'least recently used replaced');
-      expect(find.byKey(const ValueKey('window-color')), findsOneWidget);
-    });
-
-    testWidgets('windows keep their content when the window class changes (fold / unfold)', (t) async {
-      await open(t, phys: n5Phys, dpr: n5Dpr);
-      await tapKey(t, 'dock-${EGroup.light}');
-      await tapKey(t, 'dock-${EGroup.color}');
-      setView(t, phonePhys, phoneDpr);
-      await settle(t, 10);
-      expect(find.byKey(const ValueKey('histogram-window')), findsNothing);
-      // phone portrait: the least recent window is suspended, the other becomes the docked panel
-      expect(find.byKey(const ValueKey('docked-panel')), findsOneWidget);
-      expect(find.byKey(const ValueKey('window-light')), findsNothing);
-      expect(find.byKey(const ValueKey('window-color')), findsNothing);
-      setView(t, n5Phys, n5Dpr);
-      await settle(t, 10);
-      expect(find.byKey(const ValueKey('window-light')), findsOneWidget);
-      expect(find.byKey(const ValueKey('window-color')), findsOneWidget);
-    });
-
-    testWidgets('no re-layout while a finger is adjusting: window rects are identical before and during the drag', (t) async {
-      final (_, _) = await open(t, phys: n5Phys, dpr: n5Dpr);
-      await tapKey(t, 'dock-${EGroup.light}');
-      await settle(t, 6);
-      final before = t.getRect(find.byKey(const ValueKey('window-light')));
-      final f = await Finger.down(t, const Offset(300, 300));
-      await f.drag(const Offset(100, 0));
-      await t.pump(const Duration(milliseconds: 300));
-      // the window is a one-line pill in place; its top-left corner has not moved
-      final pill = t.getRect(find.byKey(const ValueKey('pill-light')));
-      expect(pill.top, closeTo(before.top, 0.5));
-      expect(pill.right, closeTo(before.right, 0.5));
-      await f.up();
-      await settle(t, 8);
-      expect(t.getRect(find.byKey(const ValueKey('window-light'))), before);
-    });
-
-    testWidgets('dragging the window header snaps it to another edge and remembers it', (t) async {
-      await open(t, phys: n5Phys, dpr: n5Dpr);
-      await tapKey(t, 'dock-${EGroup.light}');
-      final h = t.getCenter(find.byKey(const ValueKey('header-light')));
-      final g = await Finger.down(t, h);
-      await g.drag(const Offset(-500, -40), step: 20);
-      await g.up();
-      await settle(t, 15);
-      final r = t.getRect(find.byKey(const ValueKey('window-light')));
-      expect(r.left, lessThan(60), reason: 'snapped to the left edge');
-    });
-  });
-
-  testWidgets('N5: a window dragged to the bottom becomes a wide two-column card', (t) async {
-    await open(t, phys: n5Phys, dpr: n5Dpr);
-    await tapKey(t, 'dock-${EGroup.light}');
-    final g = await Finger.down(t, t.getCenter(find.byKey(const ValueKey('header-light'))));
-    await g.drag(const Offset(-250, 0), step: 20);
-    await g.up();
-    await settle(t, 15);
-    final r = t.getRect(find.byKey(const ValueKey('window-light')));
-    expect(r.width, greaterThan(300));
-    expect(r.width, lessThanOrEqualTo(480));
-    expect(r.bottom, greaterThan(500), reason: 'docked to the bottom edge');
-    await dump(t, 'n5_bottom_card');
-  });
-
-  testWidgets('N5: the histogram window snaps to a corner after a drag', (t) async {
-    await open(t, phys: n5Phys, dpr: n5Dpr);
-    final before = t.getRect(find.byKey(const ValueKey('histogram-window')));
-    final g = await Finger.down(t, before.center);
-    await g.drag(const Offset(600, 250), step: 20);
-    await g.up();
-    await settle(t, 15);
-    final after = t.getRect(find.byKey(const ValueKey('histogram-window')));
-    expect(after.right, greaterThan(700), reason: 'snapped to the right side');
-    expect(after.size, before.size);
-  });
-
   group('settings', () {
     testWidgets('handedness segmented control, haptics switch and reset row', (t) async {
       setView(t, phonePhys, phoneDpr);
@@ -249,7 +157,4 @@ void main() {
     expect(fired, hasLength(2));
   });
 
-  test('window manager type is reachable from the editor', () {
-    expect(WindowManager(), isA<WindowManager>());
-  });
 }

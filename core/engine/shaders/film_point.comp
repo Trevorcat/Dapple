@@ -24,6 +24,7 @@ vec4 h16v(vec4 v) { return vec4(h16(v.x), h16(v.y), h16(v.z), v.w); }
 layout(constant_id = 0) const int MODE = 3;
 layout(constant_id = 1) const bool HAS_Q = false;  // MODE 1: the inhibitor field comes from FilmDirField instead of the pixel
 layout(constant_id = 2) const bool ENCODE = false;  // FUSED_POST: encode the linear light back to display sRGB (film_post MODE 5 without unsharp)
+layout(constant_id = 3) const bool CLAMP01 = false;  // FUSED_POST + ENCODE: clamp to 0..1 (the pure-clamp film_fin that would follow is skipped)
 
 layout(std140, binding = 0) uniform P {
   vec4 m0, m1, m2;     // input matrix columns (3x3 ProPhoto -> XYZ in the film white) already multiplied by the gain
@@ -207,6 +208,7 @@ void main() {
     o = decodeLin(o);
     if (u.src.z != 0) o += (texelFetch(uField, p + u.src.xy, 0).r * 0.01 - u.misc.w) * vec3(u.dmin.w, u.dscale.w, u.dsub.w);
     if (ENCODE) o = vec3(encodeS(o.r), encodeS(o.g), encodeS(o.b));
+    if (ENCODE && CLAMP01) o = clamp(o, vec3(0.0), vec3(1.0));
 #endif
   } else if (MODE == 6) {
     o = exp2(3.32192809 * tetra(s - u.dsub.xyz));  // 10^x (the CPU: exp2Scale(x, 3.32192809))

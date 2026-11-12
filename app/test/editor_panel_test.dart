@@ -1,5 +1,5 @@
-// Docked control panel of the phone-portrait editor (docs/design/editor-panel.md): chips, the one big
-// ruler, 2D pads, collapse, back order, photo never covered, and that large layouts keep their windows.
+// The control panel of the editor (docs/design/editor-panel.md): chips, the one big ruler, 2D pads, collapse, back
+// order, photo never covered, the adaptive placement (under the photo or beside it) and photo-as-pad.
 import 'package:dapple/model/params.dart';
 import 'package:dapple/screens/editor/dock_panel.dart' show kPanelCollapsedH, kPanelHandleH, kPanelStripH;
 import 'package:dapple/screens/editor/editor_overlays.dart';
@@ -116,11 +116,11 @@ void main() {
       expect((byPhoto - byRuler).abs(), lessThan(byRuler * 0.35), reason: 'ruler $byRuler vs photo $byPhoto');
     });
 
-    testWidgets('a drag on the photo shows live in the big value (sync); the selected ruler chip shows only its name; dragging far above the ruler is a finer band', (t) async {
+    testWidgets('a drag on the photo shows live in the big value (sync); the selected chip shows its value too; dragging far above the ruler is a finer band', (t) async {
       final (app, id) = await open(t);
       await dockTap(t, 'dock-${EGroup.light}');
       await settle(t, 10);
-      expect(find.descendant(of: find.byKey(const ValueKey('chip-light-exposure')), matching: find.byType(Text)), findsOneWidget, reason: 'name only: the value is the big number');
+      expect(find.descendant(of: find.byKey(const ValueKey('chip-light-exposure')), matching: find.byType(Text)), findsNWidgets(2), reason: 'name and value, the selected chip too');
       String big() => t.widget<Text>(find.descendant(of: find.byKey(const ValueKey('value-exposure')), matching: find.byType(Text))).data!;
       final before = big();
       final f = await Finger.down(t, const Offset(60, 300));
@@ -248,7 +248,7 @@ void main() {
     });
 
     testWidgets('pad sizing on 1140x2616 @ 2.75: full panel width, >= 40 % of the screen width tall, no scroll view around it', (t) async {
-      await open(t, title: '街角咖啡', phys: ownerPhys, dpr: ownerDpr);
+      await open(t, title: '外滩夕阳', phys: ownerPhys, dpr: ownerDpr);
       final screenW = 1140 / 2.75;
       await dockTap(t, 'dock-${EGroup.style}');
       await chipTap(t, 'chip-style-palette');
@@ -264,7 +264,7 @@ void main() {
     });
 
     testWidgets('colour pad: a drag changes the palette, one undo step, the chip shows the readout, the photo does not move', (t) async {
-      final (app, id) = await open(t, title: '街角咖啡', phys: ownerPhys, dpr: ownerDpr);
+      final (app, id) = await open(t, title: '外滩夕阳', phys: ownerPhys, dpr: ownerDpr);
       await dockTap(t, 'dock-${EGroup.style}');
       await chipTap(t, 'chip-style-palette');
       await settle(t, 30);
@@ -330,7 +330,7 @@ void main() {
     });
 
     testWidgets('curve pad: a vertical drag changes the selected point; a tap near the left edge selects the shadow point', (t) async {
-      final (app, id) = await open(t, title: '街角咖啡', phys: ownerPhys, dpr: ownerDpr);
+      final (app, id) = await open(t, title: '外滩夕阳', phys: ownerPhys, dpr: ownerDpr);
       await tapKey(t, 'dock-more');
       await tapKey(t, 'menu-curve');
       await chipTap(t, 'chip-curve-cv_rgb_H');
@@ -571,59 +571,312 @@ void main() {
     });
   });
 
-  group('large screens keep the floating windows', () {
-    testWidgets('phone landscape: side rail dock, one floating window, no docked panel', (t) async {
-      await open(t, phys: const Size(2400, 1080), dpr: 2.75);
-      await dockTap(t, 'dock-${EGroup.light}');
-      expect(find.byKey(const ValueKey('window-light')), findsOneWidget);
-      expect(find.byKey(const ValueKey('docked-panel')), findsNothing);
-      await dump(t, 'phone_landscape');
-    });
+  group('adaptive placement: under the photo or beside it', () {
+    const landPhys = Size(2616, 1140); // phone held in landscape, 951 x 414 dp
+    const tabletPhys = Size(2560, 1600); // tablet, 1280 x 800 dp at 2.0
 
-    testWidgets('inner screen / tablet width: floating windows, no docked panel', (t) async {
-      await open(t, phys: n5Phys, dpr: n5Dpr);
-      await dockTap(t, 'dock-${EGroup.light}');
-      expect(find.byKey(const ValueKey('window-light')), findsOneWidget);
-      expect(find.byKey(const ValueKey('docked-panel')), findsNothing);
-    });
+    void expectBeside(WidgetTester t, {bool trailing = true}) {
+      final p = panelRect(t), ph = photoRect(t), d = dockRect(t);
+      final w = t.view.physicalSize.width / t.view.devicePixelRatio;
+      expect(p.width, inInclusiveRange(280, 400), reason: 'pane width about 36 % of the screen, 300 to 400 dp');
+      if (trailing) {
+        expect(p.right, greaterThan(w - 20));
+        expect(ph.right, lessThanOrEqualTo(p.left + 0.5), reason: 'photo $ph pane $p');
+      } else {
+        expect(p.left, lessThan(20));
+        expect(ph.left, greaterThanOrEqualTo(p.right - 0.5), reason: 'photo $ph pane $p');
+      }
+      expect(d.top, greaterThanOrEqualTo(p.bottom - 0.5), reason: 'the dock sits at the bottom of the pane');
+      expect(d.left, greaterThanOrEqualTo(p.left - 0.5));
+      expect(d.right, lessThanOrEqualTo(p.right + 0.5));
+      expect(find.byKey(const ValueKey('chip-grid-light')), findsOneWidget, reason: 'chips wrap into a grid');
+    }
 
-    testWidgets('folding to the phone docks the panel, unfolding brings the window back', (t) async {
-      await open(t, phys: n5Phys, dpr: n5Dpr);
+    testWidgets('a phone held in landscape: the panel is a pane on the trailing edge, the photo is not covered, chips form a 2 or 3 column grid', (t) async {
+      await open(t, phys: landPhys, dpr: 2.75, title: '外滩夕阳');
       await dockTap(t, 'dock-${EGroup.light}');
-      expect(find.byKey(const ValueKey('window-light')), findsOneWidget);
-      setView(t, phonePhys, phoneDpr);
       await settle(t, 20);
-      expect(find.byKey(const ValueKey('docked-panel')), findsOneWidget);
-      expect(find.byKey(const ValueKey('window-light')), findsNothing);
-      setView(t, n5Phys, n5Dpr);
-      await settle(t, 20);
-      expect(find.byKey(const ValueKey('window-light')), findsOneWidget);
-      expect(find.byKey(const ValueKey('docked-panel')), findsNothing);
+      expectBeside(t);
+      expect(find.byKey(const ValueKey('chip-strip-light')), findsNothing);
+      final tops = <double>{};
+      final lefts = <double>{};
+      for (final k in ['exposure', 'contrast', 'highlights', 'shadows', 'whites', 'blacks']) {
+        final r = t.getRect(find.byKey(ValueKey('chip-light-$k')));
+        expect(r.height, greaterThanOrEqualTo(44), reason: k);
+        tops.add(r.top.roundToDouble());
+        lefts.add(r.left.roundToDouble());
+      }
+      expect(lefts.length, inInclusiveRange(2, 3), reason: 'two or three columns');
+      expect(tops.length, greaterThanOrEqualTo(2), reason: 'wrapping into rows');
+      expect(find.byKey(const ValueKey('panel-ruler')), findsOneWidget);
+      final ruler = t.getRect(find.byKey(const ValueKey('panel-ruler')));
+      expect(ruler.width, greaterThan(panelRect(t).width - 4), reason: 'the ruler spans the pane');
+      await dump(t, 'adapt_landscape_light');
     });
 
-    testWidgets('a pad inside a floating window claims its drags: it edits, the window neither scrolls nor folds, and it is big enough', (t) async {
-      final (app, id) = await open(t, phys: n5Phys, dpr: n5Dpr);
+    testWidgets('the leading edge for the left hand', (t) async {
+      setView(t, landPhys, 2.75);
+      await loadTestFonts();
+      final app = AppState.demo();
+      app.settings.handedness = 1;
+      final id = app.photos.firstWhere((p) => p.title == '外滩夕阳' && p.id.startsWith('d')).id;
+      await t.pumpWidget(MaterialApp(debugShowCheckedModeBanner: false, theme: buildTheme(Brightness.light), home: EditorPage(app: app, photoId: id, resamplePointers: false)));
+      await settle(t);
+      await dockTap(t, 'dock-${EGroup.light}');
+      await settle(t, 20);
+      expectBeside(t, trailing: false);
+    });
+
+    testWidgets('the unfolded inner screen: a portrait photo goes beside, a landscape photo goes under; never covered', (t) async {
+      await open(t, phys: n5Phys, dpr: n5Dpr, title: '街角咖啡');
+      await dockTap(t, 'dock-${EGroup.light}');
+      await settle(t, 20);
+      expectBeside(t);
+      await t.pumpWidget(const SizedBox());
+      await open(t, phys: n5Phys, dpr: n5Dpr, title: '外滩夕阳');
+      await dockTap(t, 'dock-${EGroup.light}');
+      await settle(t, 20);
+      final p = panelRect(t), ph = photoRect(t);
+      expect(find.byKey(const ValueKey('chip-strip-light')), findsOneWidget, reason: 'under the photo: the horizontal strip');
+      expect(ph.bottom, lessThanOrEqualTo(p.top + 0.5), reason: 'photo $ph panel $p');
+    });
+
+    testWidgets('a tablet: beside for a landscape photo', (t) async {
+      await open(t, phys: tabletPhys, dpr: 2.0, title: '外滩夕阳');
+      await dockTap(t, 'dock-${EGroup.light}');
+      await settle(t, 20);
+      expectBeside(t);
+    });
+
+    testWidgets('tall phones stay under the photo for every photo; the placement does not flip when moving between parameters', (t) async {
+      for (final title in ['街角咖啡', '外滩夕阳']) {
+        await open(t, phys: ownerPhys, dpr: ownerDpr, title: title);
+        await dockTap(t, 'dock-${EGroup.light}');
+        await settle(t, 20);
+        expect(find.byKey(const ValueKey('chip-strip-light')), findsOneWidget, reason: title);
+        final before = panelRect(t);
+        await chipTap(t, 'chip-light-contrast');
+        await settle(t, 20);
+        expect(panelRect(t).left, before.left);
+        expect(panelRect(t).width, before.width);
+        await t.pumpWidget(const SizedBox());
+      }
+    });
+
+    testWidgets('side pane: back order is fold, close, leave; hand-sized targets; dark mode; large text', (t) async {
+      await open(t, phys: landPhys, dpr: 2.75, title: '外滩夕阳', dark: true);
+      await dockTap(t, 'dock-${EGroup.light}');
+      await settle(t, 20);
+      await dump(t, 'adapt_landscape_dark');
+      await t.binding.handlePopRoute();
+      await settle(t, 20);
+      expect(find.byKey(const ValueKey('panel-ruler')), findsNothing, reason: 'folded to the chip grid');
+      expect(find.byKey(const ValueKey('chip-grid-light')), findsOneWidget);
+      await t.binding.handlePopRoute();
+      await settle(t, 20);
+      expect(find.byKey(const ValueKey('docked-panel')), findsNothing);
+      t.platformDispatcher.textScaleFactorTestValue = 1.6;
+      addTearDown(t.platformDispatcher.clearTextScaleFactorTestValue);
       await dockTap(t, 'dock-${EGroup.style}');
-      await tapKey(t, 'row-style-palette');
       await settle(t, 20);
-      final pad = find.byKey(const ValueKey('pad-palette'));
-      await t.ensureVisible(pad);
+      expect(t.takeException(), isNull);
+      final p = panelRect(t), ph = photoRect(t);
+      expect(ph.right, lessThanOrEqualTo(p.left + 0.5));
+    });
+
+    testWidgets('a 2D pad in the pane is a square at the pane width', (t) async {
+      await open(t, phys: n5Phys, dpr: n5Dpr, title: '街角咖啡');
+      await dockTap(t, 'dock-${EGroup.style}');
+      await chipTap(t, 'chip-style-palette');
+      await settle(t, 20);
+      final pad = t.getRect(find.byKey(const ValueKey('pad-palette')));
+      expect(pad.width, closeTo(pad.height, 1.5), reason: 'square');
+      expect(pad.width, greaterThanOrEqualTo(168));
+      expect(find.byKey(const ValueKey('pad-hint-palette')), findsNothing);
+      await dump(t, 'adapt_inner_pad');
+    });
+
+    testWidgets('fold transition: outer to inner carries the selection and the edit state over, and moves the panel', (t) async {
+      final (app, id) = await open(t, phys: ownerPhys, dpr: ownerDpr, title: '街角咖啡');
+      await dockTap(t, 'dock-${EGroup.light}');
+      await chipTap(t, 'chip-light-contrast');
+      app.applyEdit(id, (e) => e.withValue('contrast', 25).withValue('exposure', 10));
       await settle(t, 5);
-      final r = t.getRect(pad);
-      expect(r.width, greaterThanOrEqualTo(150));
-      expect(r.height, greaterThanOrEqualTo(120));
-      final sc = find.descendant(of: find.byKey(const ValueKey('window-scroll')), matching: find.byType(Scrollable));
-      final off0 = t.state<ScrollableState>(sc.first).position.pixels;
-      final f = await Finger.down(t, r.center);
-      await f.drag(const Offset(0, -50), step: 5); // vertical: would scroll the window if the pad did not claim it
-      await t.pump(const Duration(milliseconds: 300));
-      expect(find.byKey(const ValueKey('window-style')).hitTestable(), findsOneWidget, reason: 'the window stays under the finger');
-      await f.up();
-      await settle(t, 5);
-      expect(t.state<ScrollableState>(sc.first).position.pixels, closeTo(off0, 0.5));
-      expect(app.editOf(id).palette, isNotNull);
+      expect(find.byKey(const ValueKey('chip-strip-light')), findsOneWidget);
+      expect(find.byKey(const ValueKey('value-contrast')), findsOneWidget, reason: 'contrast is selected');
+      setView(t, n5Phys, n5Dpr);
+      await settle(t, 30);
+      expect(find.byKey(const ValueKey('chip-grid-light')), findsOneWidget, reason: 'portrait photo on the inner screen: beside');
+      expect(find.byKey(const ValueKey('value-contrast')), findsOneWidget, reason: 'the selection survived');
+      expect(app.editOf(id).value('contrast'), 25);
+      expect(app.editOf(id).value('exposure'), 10);
+      expect(find.byKey(const ValueKey('mark-exposure')), findsOneWidget);
+      setView(t, ownerPhys, ownerDpr);
+      await settle(t, 30);
+      expect(find.byKey(const ValueKey('chip-strip-light')), findsOneWidget, reason: 'and back');
+      expect(find.byKey(const ValueKey('value-contrast')), findsOneWidget);
     });
   });
+
+  group('no dead space, photo gets its room back', () {
+    testWidgets('photo as pad on the N5 outer screen with a portrait photo: the panel is the chip strip plus a slim row and the photo keeps at least 95 % of its size', (t) async {
+      await open(t, phys: ownerPhys, dpr: ownerDpr, title: '街角咖啡');
+      final noPanel = photoRect(t);
+      await dockTap(t, 'dock-${EGroup.style}');
+      await chipTap(t, 'chip-style-palette');
+      await settle(t, 25);
+      expect(find.byKey(const ValueKey('pad-hint-palette')), findsOneWidget);
+      final panel = panelRect(t), photo = photoRect(t);
+      expect(panel.height, lessThan(150), reason: 'strip + hint row only: the pad does not count, the tone grid does not either');
+      expect(photo.width, greaterThanOrEqualTo(noPanel.width * 0.95), reason: 'photo $photo without panel $noPanel');
+      expect(photo.height, greaterThanOrEqualTo(noPanel.height * 0.95));
+      expect(photo.overlaps(panel), isFalse);
+      await chipTap(t, 'chip-style-lookStrength');
+      await settle(t, 25);
+      expect(find.byKey(const ValueKey('panel-ruler')), findsOneWidget, reason: 'a ruler row: the panel grows to its own height');
+    });
+
+    testWidgets('no blank band taller than about 24 dp inside the panel, whichever control is shown', (t) async {
+      for (final (g, chips) in [
+        (EGroup.light, ['exposure', 'contrast']),
+        (EGroup.color, ['temp', 'band']),
+        (EGroup.effects, ['clarity']),
+        (EGroup.crop, ['ratio', 'straighten']),
+        (EGroup.style, ['look', 'lookStrength', 'toneStrength']),
+      ]) {
+        await open(t, phys: ownerPhys, dpr: ownerDpr, title: '外滩夕阳');
+        await dockTap(t, 'dock-$g');
+        for (final c in chips) {
+          await chipTap(t, 'chip-${g.name}-$c');
+          await settle(t, 25);
+          final panel = panelRect(t), strip = t.getRect(find.byKey(ValueKey('chip-strip-${g.name}')));
+          final panelFinder = find.byKey(const ValueKey('docked-panel'));
+          var minTop = double.infinity, maxBottom = 0.0;
+          for (final f in [find.byType(Text), find.byType(CustomPaint), find.byType(PhotoArt), find.byType(DecoratedBox)]) {
+            for (final e in find.descendant(of: panelFinder, matching: f).evaluate()) {
+              final box = e.renderObject;
+              if (box is! RenderBox || !box.hasSize) continue;
+              final r = box.localToGlobal(Offset.zero) & box.size;
+              if (r.top < strip.bottom - 1 || r.height < 1) continue; // the chip strip itself
+              minTop = minTop < r.top ? minTop : r.top;
+              maxBottom = maxBottom > r.bottom ? maxBottom : r.bottom;
+            }
+          }
+          expect(minTop - strip.bottom, lessThanOrEqualTo(48), reason: '${g.name}/$c: gap under the chips');
+          expect(panel.bottom - maxBottom, lessThanOrEqualTo(48), reason: '${g.name}/$c: gap at the bottom');
+        }
+        await t.pumpWidget(const SizedBox());
+      }
+    });
+  });
+
+  group('side pane details', () {
+    const landPhys = Size(2616, 1140);
+
+    testWidgets('the category reset has its own slot in the pane header and never overlaps a chip; the chip grid shows whole rows', (t) async {
+      final (app, id) = await open(t, phys: landPhys, dpr: 2.75, title: '外滩夕阳');
+      app.applyEdit(id, (e) => e.withValue('exposure', 20));
+      await dockTap(t, 'dock-${EGroup.light}');
+      await settle(t, 20);
+      final reset = t.getRect(find.byKey(const ValueKey('reset-light')));
+      expect(reset.width, greaterThanOrEqualTo(44));
+      for (final k in ['exposure', 'contrast', 'highlights', 'shadows', 'whites', 'blacks']) {
+        final f = find.byKey(ValueKey('chip-light-$k'));
+        if (f.evaluate().isEmpty) continue;
+        expect(t.getRect(f).overlaps(reset), isFalse, reason: k);
+      }
+      final grid = t.getRect(find.byKey(const ValueKey('chip-grid-light')));
+      final rowH = 48 + 6.0;
+      expect((grid.height - 8) / rowH, closeTo(((grid.height - 8) / rowH).round(), 0.02), reason: 'whole rows: no neighbouring row peeks in as a hairline');
+    });
+
+    testWidgets('beside the photo a pad uses the whole pane width (not necessarily square)', (t) async {
+      await open(t, phys: landPhys, dpr: 2.75, title: '外滩夕阳');
+      await dockTap(t, 'dock-${EGroup.style}');
+      await chipTap(t, 'chip-style-palette');
+      await settle(t, 20);
+      final pad = t.getRect(find.byKey(const ValueKey('pad-palette'))), panel = panelRect(t);
+      expect(pad.width, greaterThanOrEqualTo(panel.width - 28), reason: 'pad $pad pane $panel');
+      expect(pad.height, greaterThanOrEqualTo(100));
+    });
+
+    testWidgets('the inner screen shows the histogram above the chip grid; a pad takes that room instead', (t) async {
+      await open(t, phys: n5Phys, dpr: n5Dpr, title: '街角咖啡');
+      await dockTap(t, 'dock-${EGroup.light}');
+      await settle(t, 25);
+      final hist = t.getRect(find.byKey(const ValueKey('side-histogram')));
+      final grid = t.getRect(find.byKey(const ValueKey('chip-grid-light')));
+      expect(hist.bottom, lessThanOrEqualTo(grid.top + 0.5), reason: 'above the chips');
+      expect(find.byKey(const ValueKey('panel-histogram')), findsOneWidget, reason: 'one histogram, not two');
+      final drawn = t.getRect(find.byKey(const ValueKey('panel-histogram')));
+      expect(drawn.width, greaterThan(200), reason: 'the histogram is actually drawn at the pane width');
+      expect(drawn.height, greaterThan(60));
+      await tapKey(t, 'dock-${EGroup.light}');
+      await dockTap(t, 'dock-${EGroup.style}');
+      await chipTap(t, 'chip-style-palette');
+      await settle(t, 25);
+      expect(find.byKey(const ValueKey('side-histogram')), findsNothing);
+      expect(find.byKey(const ValueKey('pad-palette')), findsOneWidget);
+    });
+  });
+
+  group('photo as the pad', () {
+    testWidgets('a pad that would shrink the photo below 80 % is not shown: a slim hint row, and a drag on the photo drives both axes', (t) async {
+      final (app, id) = await open(t, phys: ownerPhys, dpr: ownerDpr, title: '街角咖啡');
+      await dockTap(t, 'dock-${EGroup.style}');
+      await chipTap(t, 'chip-style-palette');
+      await settle(t, 20);
+      expect(find.byKey(const ValueKey('pad-palette')), findsNothing, reason: 'portrait photo on a tall phone: the big pad is too costly');
+      expect(find.byKey(const ValueKey('pad-hint-palette')), findsOneWidget);
+      final hint = t.getRect(find.byKey(const ValueKey('pad-hint-palette')));
+      expect(hint.height, greaterThanOrEqualTo(36));
+      expect(find.byKey(const ValueKey('pad-hint-reset')), findsOneWidget);
+      final photo = photoRect(t), panel = t.getRect(find.byKey(const ValueKey('docked-panel')));
+      expect(photo.bottom, lessThanOrEqualTo(panel.top + 0.5));
+      final f = await Finger.down(t, photo.center);
+      await f.drag(const Offset(60, -80), step: 6);
+      await t.pump(const Duration(milliseconds: 250));
+      expect(find.byKey(const ValueKey('readout')), findsOneWidget, reason: 'a small readout near the top of the photo while dragging');
+      await f.drag(const Offset(30, -30));
+      await f.up();
+      await settle(t, 6);
+      final pal = app.editOf(id).palette;
+      expect(pal, isNotNull);
+      expect(pal!.dx, greaterThan(0.5), reason: 'both axes: x');
+      expect(pal.dy, lessThan(0.5), reason: 'both axes: y (up = warm)');
+      expect(find.descendant(of: find.byKey(const ValueKey('chip-style-palette')), matching: find.textContaining('暖')), findsOneWidget, reason: 'the chip shows the values');
+      app.undo(id);
+      expect(app.canUndo(id), isFalse, reason: 'one gesture, one undo step');
+    });
+
+    testWidgets('with room the big pad is shown (landscape photo on the same phone)', (t) async {
+      await open(t, phys: ownerPhys, dpr: ownerDpr, title: '外滩夕阳');
+      await dockTap(t, 'dock-${EGroup.style}');
+      await chipTap(t, 'chip-style-palette');
+      await settle(t, 20);
+      expect(find.byKey(const ValueKey('pad-palette')), findsOneWidget);
+      expect(find.byKey(const ValueKey('pad-hint-palette')), findsNothing);
+    });
+
+    testWidgets('the 80 % rule holds beside the photo too: the inner screen with a landscape photo uses the hint row', (t) async {
+      await open(t, phys: n5Phys, dpr: n5Dpr, title: '外滩夕阳');
+      await dockTap(t, 'dock-${EGroup.style}');
+      await chipTap(t, 'chip-style-palette');
+      await settle(t, 20);
+      expect(find.byKey(const ValueKey('pad-hint-palette')), findsOneWidget);
+      expect(find.byKey(const ValueKey('pad-palette')), findsNothing);
+      expect(photoRect(t).overlaps(panelRect(t)), isFalse, reason: 'the photo is never covered');
+      await dump(t, 'adapt_inner_photo_pad');
+    });
+
+    testWidgets('sliders are not affected: the ruler stays whatever the photo', (t) async {
+      await open(t, phys: ownerPhys, dpr: ownerDpr, title: '街角咖啡');
+      await dockTap(t, 'dock-${EGroup.light}');
+      await settle(t, 20);
+      expect(find.byKey(const ValueKey('panel-ruler')), findsOneWidget);
+    });
+  });
+
 }
 
 /// Dock tap, then let the panel finish growing (its spring runs about 400 ms).
@@ -661,3 +914,7 @@ void largeTextTests() {
     expect(t.takeException(), isNull);
   });
 }
+
+Rect panelRect(WidgetTester t) => t.getRect(find.byKey(const ValueKey('docked-panel')));
+Rect photoRect(WidgetTester t) => t.getRect(find.byType(PhotoArt));
+Rect dockRect(WidgetTester t) => t.getRect(find.byType(CategoryDock));

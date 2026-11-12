@@ -663,13 +663,27 @@ class FilmPaperStrip extends StatelessWidget {
 /// [ControlPad] around it owns the drag.
 class OffsetPadView extends StatelessWidget {
   const OffsetPadView(
-      {super.key, required this.x, required this.y, required this.labels, required this.width, required this.height, this.eff = const [true, true, true, true]});
+      {super.key,
+      required this.x,
+      required this.y,
+      required this.labels,
+      required this.width,
+      required this.height,
+      this.eff = const [true, true, true, true],
+      this.xMin = -1,
+      this.notes = const []});
   final double x, y;
   final List<String> labels;
 
   /// X -1 / X +1 / Y -1 (bottom) / Y +1 (top) change the render; an ineffective half is drawn hatched and unreachable.
   final List<bool> eff;
   final double width, height;
+
+  /// Left end of the X axis (-1 symmetric; 0 one-sided: the auto position is the left edge).
+  final double xMin;
+
+  /// Small notes under the left / right edge labels.
+  final List<String> notes;
 
   @override
   Widget build(BuildContext context) {
@@ -684,7 +698,7 @@ class OffsetPadView extends StatelessWidget {
           height: height,
           child: CustomPaint(
             key: const ValueKey('offset-pad-paint'),
-            painter: _OffsetPadPainter(x, y, labels, c.chip, c.sep, c.text2, c.accentBtn, DefaultTextStyle.of(context).style, eff),
+            painter: _OffsetPadPainter(x, y, labels, c.chip, c.sep, c.text2, c.accentBtn, DefaultTextStyle.of(context).style, eff, xMin, notes),
           ),
         ),
       ),
@@ -693,7 +707,9 @@ class OffsetPadView extends StatelessWidget {
 }
 
 class _OffsetPadPainter extends CustomPainter {
-  _OffsetPadPainter(this.x, this.y, this.labels, this.bg, this.grid, this.text, this.accent, this.base, this.eff);
+  _OffsetPadPainter(this.x, this.y, this.labels, this.bg, this.grid, this.text, this.accent, this.base, this.eff, this.xMin, this.notes);
+  final double xMin;
+  final List<String> notes;
   final double x, y;
   final List<String> labels;
   final List<bool> eff;
@@ -713,10 +729,13 @@ class _OffsetPadPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size s) {
     canvas.drawRect(Offset.zero & s, Paint()..color = bg);
+    // X positions keep 12 dp from the edges so a cursor at either end is whole; cx0 is the automatic position
+    double px(double v) => 12 + (v - xMin) / (1 - xMin) * (s.width - 24);
+    final cx0 = px(0);
     // ineffective halves: dimmed and hatched, the cursor cannot enter them
     final dead = <Rect>[
-      if (!eff[0]) Rect.fromLTWH(0, 0, s.width / 2, s.height),
-      if (!eff[1]) Rect.fromLTWH(s.width / 2, 0, s.width / 2, s.height),
+      if (!eff[0] && xMin < 0) Rect.fromLTWH(0, 0, s.width / 2, s.height),
+      if (!eff[1]) Rect.fromLTWH(cx0, 0, s.width - cx0, s.height),
       if (!eff[2]) Rect.fromLTWH(0, s.height / 2, s.width, s.height / 2),
       if (!eff[3]) Rect.fromLTWH(0, 0, s.width, s.height / 2),
     ];
@@ -743,7 +762,7 @@ class _OffsetPadPainter extends CustomPainter {
     final axis = Paint()
       ..color = text.withValues(alpha: 0.35)
       ..strokeWidth = 1.2;
-    final c = s.center(Offset.zero);
+    final c = Offset(cx0, s.center(Offset.zero).dy);
     canvas.drawLine(Offset(c.dx, 0), Offset(c.dx, s.height), axis);
     canvas.drawLine(Offset(0, c.dy), Offset(s.width, c.dy), axis);
     // the automatic position: a ring with its label
@@ -760,13 +779,23 @@ class _OffsetPadPainter extends CustomPainter {
       const m = 8.0;
       final l = _label(labels[0], text, base, 11), r = _label(labels[1], text, base, 11);
       final b = _label(labels[2], text, base, 11), t = _label(labels[3], text, base, 11);
-      l.paint(canvas, Offset(m, c.dy - l.height - 6));
-      r.paint(canvas, Offset(s.width - m - r.width, c.dy - r.height - 6));
-      t.paint(canvas, Offset(c.dx + 8, m));
-      b.paint(canvas, Offset(c.dx + 8, s.height - m - b.height));
+      l.paint(canvas, Offset(m, c.dy - l.height - 14));
+      if (notes.length == 2) {
+        if (notes[0].isNotEmpty) _label(notes[0], text, base, 10).paint(canvas, Offset(m, c.dy + 6));
+        if (notes[1].isNotEmpty) {
+          final nr = _label(notes[1], text, base, 10);
+          nr.paint(canvas, Offset(s.width - m - nr.width, c.dy + 6));
+        }
+      }
+      r.paint(canvas, Offset(s.width - m - r.width, c.dy - r.height - 14));
+      // the vertical labels sit beside the vertical axis; a one-sided pad has that axis on its left edge (under the
+      // fine switch), so they move to the middle
+      final vx = xMin < 0 ? c.dx + 8 : s.width / 2 + 8;
+      t.paint(canvas, Offset(vx, m));
+      b.paint(canvas, Offset(vx, s.height - m - b.height));
     }
     // cursor: screen y grows down, +1 is at the top
-    final p = Offset((x + 1) / 2 * s.width, (1 - y) / 2 * s.height);
+    final p = Offset(px(x), (1 - y) / 2 * s.height);
     canvas.drawCircle(p, 10, Paint()..color = const Color(0x33000000));
     canvas.drawCircle(p, 8.5, Paint()..color = Colors.white);
     canvas.drawCircle(
@@ -779,5 +808,5 @@ class _OffsetPadPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_OffsetPadPainter o) => o.x != x || o.y != y || o.bg != bg || o.text != text || o.labels != labels || o.eff.toString() != eff.toString();
+  bool shouldRepaint(_OffsetPadPainter o) => o.x != x || o.y != y || o.bg != bg || o.text != text || o.labels != labels || o.eff.toString() != eff.toString() || o.xMin != xMin || o.notes.toString() != notes.toString();
 }

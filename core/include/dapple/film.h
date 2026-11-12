@@ -29,6 +29,7 @@ constexpr int kCurveSamples = 256;    // log-exposure -3..4
 // One film stock or print paper (profile). NaN marks "not measured" (treated as zero light).
 struct FilmStock {
   std::string stock, name, type, support, stage, use, antihalation, referenceIlluminant, viewingIlluminant;
+  std::string targetPrint;  // profile info.target_print: the print paper / film this stock is made to be printed on ("" = none, slides)
   std::string copyright, license;  // attribution carried through from the source profile
   bool positive() const { return type == "positive"; }
   bool isPaper() const { return support == "paper"; }
@@ -161,6 +162,11 @@ struct CameraParams {
   bool autoExposure = true;
   std::string autoExposureMethod = "center_weighted";
   double lensBlurUm = 0.0, filmFormatMm = 35.0;
+  // Film white balance (EditParams::filmWb, CLI --adapt / --scene-cct): the scene's illuminant as assumed by the current white balance (CIE xy,
+  // 0 = unknown = full adaptation) and the degree of adaptation D (CAT16) of the film's input: 1 = the scene white reaches the film as its own
+  // reference white (the model's behaviour, digital white balance), 0 = the scene illuminant reaches the film unadapted (a daylight stock
+  // under tungsten goes orange). D = 1 - filmWb.
+  double sceneWhiteX = 0.0, sceneWhiteY = 0.0, adaptationDegree = 1.0;
   std::array<double, 3> filterUv{0.0, 410.0, 8.0}, filterIr{0.0, 675.0, 15.0};  // (amplitude, nm, width nm)
   DiffusionFilterParams diffusionFilter;
 };
@@ -170,9 +176,6 @@ struct EnlargerParams {
   bool printExposureCompensation = true, normalizePrintExposure = true;
   double yFilterShift = 0, mFilterShift = 0;
   double yFilterNeutral = 55, mFilterNeutral = 65, cFilterNeutral = 0;  // replaced by the solved balance
-  // Partial neutralisation (EditParams::filmCast): the solved neutral M / Y pack of this stock is moved `neutralMix` (0..1) of the way
-  // to the reference pack (refMNeutral / refYNeutral: the solved pack of the reference stock of this paper); 0 = fully neutralised.
-  double neutralMix = 0, refMNeutral = 0, refYNeutral = 0;
   DiffusionFilterParams diffusionFilter;
   double preflashExposure = 0, preflashYFilterShift = 0, preflashMFilterShift = 0;
 };
@@ -356,6 +359,7 @@ std::string lastLibraryError();  // why the last lazy / explicit load failed (""
 // One selectable stock for UIs: id, display name, kind "negative" | "slide" | "paper" (print paper / print film).
 struct StockInfo {
   std::string id, name, kind;
+  std::string paper;  // the paper a negative gets when the edit names none (defaultPaperFor); "" for slides and papers
 };
 std::vector<StockInfo> listStocks(const FilmLibrary& lib);
 // Paper used when EditParams::filmPaper is empty: a cine print film for cine stocks, "none" (scan) for slides,

@@ -58,14 +58,12 @@ class ClaimPanRecognizer extends OneSequenceGestureRecognizer {
 /// One-finger surface bound to [row] of the controller: a drag beyond 3 dp starts an adjust gesture
 /// ([axis] none = free 2D), a tap calls [onTap], a double tap resets the row.
 class ControlSurface extends StatefulWidget {
-  const ControlSurface({super.key, required this.ctl, required this.row, required this.axis, required this.child, this.fromWindow = false, this.onTap});
+  const ControlSurface({super.key, required this.ctl, required this.row, required this.axis, required this.child, this.onTap});
   final EditorController ctl;
   final ParamRow row;
   final LockAxis axis;
   final Widget child;
 
-  /// The surface sits inside a floating window: the window must not fold to its one-line readout.
-  final bool fromWindow;
   final ValueChanged<Offset>? onTap;
 
   @override
@@ -101,7 +99,7 @@ class _ControlSurfaceState extends State<ControlSurface> {
       _began = true;
       _tapTimer?.cancel();
       _tapTimer = null;
-      widget.ctl.beginOn(widget.row, widget.axis, _start.dx, _start.dy, fromWindow: widget.fromWindow);
+      widget.ctl.beginOn(widget.row, widget.axis, _start.dx, _start.dy);
       _lastMs = ms;
     }
     final d = e.position - _last;
@@ -193,10 +191,9 @@ class FineSwitch extends StatelessWidget {
 /// parameter's chip; the pad itself only draws the position. Repaints from the controller's readout
 /// notifier while a finger moves, never through the panel.
 class ControlPad extends StatelessWidget {
-  const ControlPad({super.key, required this.ctl, required this.row, this.fromWindow = false});
+  const ControlPad({super.key, required this.ctl, required this.row});
   final EditorController ctl;
   final ParamRow row;
-  final bool fromWindow;
 
   @override
   Widget build(BuildContext context) {
@@ -214,7 +211,6 @@ class ControlPad extends StatelessWidget {
               ctl: ctl,
               row: row,
               axis: LockAxis.none,
-              fromWindow: fromWindow,
               onTap: row.twoD == TwoD.curve ? (p) => _selectPoint(p.dx / w) : null,
               child: ListenableBuilder(
                 listenable: Listenable.merge([ctl.edits, ctl.readout]),
@@ -251,7 +247,7 @@ class ControlPad extends StatelessWidget {
         final sel = ['H', 'L', 'D', 'S'].indexWhere((r) => cvKey(ctl.sel.curveCh, r) == row.id);
         return CurveMini(analysis: ctl.analysis(), edit: e, channel: ctl.sel.curveCh, selected: sel, width: w, height: h);
       case TwoD.offset:
-        return OffsetPadView(x: e.value(row.padX!), y: e.value(row.padY!), labels: row.padLabels, width: w, height: h, eff: row.padEff);
+        return OffsetPadView(x: e.value(row.padX!), y: e.value(row.padY!), labels: row.padLabels, width: w, height: h, eff: row.padEff, xMin: row.padXMin, notes: row.padNotes);
       case TwoD.tone:
         return const SizedBox.shrink();
     }

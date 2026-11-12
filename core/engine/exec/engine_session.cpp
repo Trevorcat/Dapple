@@ -245,6 +245,7 @@ struct ExecLog {
   std::mutex mu;
   std::map<std::string, std::uint64_t> reasons;  // CPU frames by the reason the GPU did not render them (at most kMaxReasons distinct texts)
   std::uint64_t gpu = 0, cpu = 0, sinceLog = 0;
+  double maxTotalMs = 0;  // slowest frame since the last log line
   std::string lastExec, lastReason;
 };
 constexpr std::size_t kMaxReasons = 48;
@@ -278,6 +279,7 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
   const std::string reason = onGpu ? std::string() : (out.why.empty() ? std::string("none given") : out.why);
   ExecLog& L = execLog();
   bool doLog = false;
+  double maxMs = 0;
   std::uint64_t g = 0, cp = 0;
   {
     std::lock_guard<std::mutex> lk(L.mu);
@@ -288,10 +290,14 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
       if (it != L.reasons.end()) ++it->second;
       else ++L.reasons[L.reasons.size() < kMaxReasons ? reason : std::string("(other)")];
     }
+    L.maxTotalMs = std::max(L.maxTotalMs, out.cpu.totalMs);
     const bool changed = exec != L.lastExec || reason != L.lastReason;
-    doLog = changed || ++L.sinceLog >= 30;
+    static const bool every = std::getenv("DAPPLE_FRAME_PROFILE") != nullptr;  // one line per frame (bench)
+    doLog = changed || ++L.sinceLog >= 30 || every;
     if (doLog) {
       L.sinceLog = 0;
+      maxMs = L.maxTotalMs;
+      L.maxTotalMs = 0;
       L.lastExec = exec;
       L.lastReason = reason;
     }
@@ -302,8 +308,13 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
   const SpatialQuality q = job.fastOptions.spatial;
   const char* tier = q == SpatialQuality::Interactive ? "interactive" : q == SpatialQuality::Full ? "full" : "off";
   char line[512];
-  std::snprintf(line, sizeof line, "frame %dx%d tier=%s film=%s exec=%s%s%s | gpu %llu cpu %llu", out.w, out.h, tier, job.renderer.filmActive() ? "on" : "off",
-                exec.c_str(), onGpu ? "" : " reason=", onGpu ? "" : reason.c_str(), (unsigned long long)g, (unsigned long long)cp);
+  const FrameResult::CpuSplit& c = out.cpu;
+  int n = std::snprintf(line, sizeof line, "frame %dx%d tier=%s film=%s exec=%s%s%s | gpu %llu cpu %llu", out.w, out.h, tier, job.renderer.filmActive() ? "on" : "off",
+                        exec.c_str(), onGpu ? "" : " reason=", onGpu ? "" : reason.c_str(), (unsigned long long)g, (unsigned long long)cp);
+  // where the CPU side of the frame went (ms): match = film exposure solve, renderer = Renderer ctor, graph, tables, exec = plan + executor incl. GPU wait
+  if (n > 0 && n < int(sizeof line))
+    std::snprintf(line + n, sizeof line - std::size_t(n), " | cpu_ms %.1f (match %.1f renderer %.1f graph %.1f tables %.1f exec %.1f; upload %.1f gpu %.1f) max %.1f", c.totalMs, c.matchMs,
+                  c.rendererMs, c.graphMs, c.tablesMs, c.execMs, out.gpu.uploadMs, out.gpu.gpuMs, std::max(maxMs, c.totalMs));
 #if defined(__ANDROID__)
   __android_log_print(ANDROID_LOG_INFO, "dapple_engine", "%s", line);
 #else
@@ -758,7 +769,10 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   stats_.graphMs += msSince(t0);
 
   const int n = job.request.bakeSize;
+  const auto tTables = Clock::now();
+  out.cpu.graphMs = msSince(t0);
   const std::shared_ptr<const BakedLut> bake = runHostTables(job, ps, n, out);
+  out.cpu.tablesMs = msSince(tTables);
   if (!bake) {
     if (out.error.empty()) out.error = "tables";
     return false;
@@ -767,7 +781,12 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   // ---- the frame: GPU executor where it supports the plan, else the CpuExecutor on the same plan ---------------------------
   int w = 0, h = 0;
   std::uint8_t* rgba = nullptr;
+  const auto tExec = Clock::now();
   const int r = renderFull(job, ps, *bake, out);
+  out.cpu.execMs = msSince(tExec);
+  out.cpu.matchMs = job.matchMs;
+  out.cpu.rendererMs = job.rendererMs;
+  out.cpu.totalMs = msSince(t0) + job.matchMs + job.rendererMs;
   if (r < 0) return false;
   if (r == 0) {
     rgba = out.rgba;

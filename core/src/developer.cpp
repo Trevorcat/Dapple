@@ -44,6 +44,8 @@ Result<DevelopResult> Developer::develop(const DevelopRequest& req) const {
     result.timings.analyzeMs = msSince(t0);
   }
 
+  result.applied.filmSceneX = source->meta.asShotIlluminantXy[0];  // film white balance: the scene's as-shot illuminant
+  result.applied.filmSceneY = source->meta.asShotIlluminantXy[1];
   if (!result.applied.filmStock.empty()) {  // film exposure that keeps the photo's key (film_match.h)
     SourceImage proxy;
     proxy.sceneReferred = source->sceneReferred;

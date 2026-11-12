@@ -27,6 +27,7 @@
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
 #include "dapple/film_match.h"
+#include "dapple/illuminant.h"
 #include "dapple/auto_adjust.h"
 #include "dapple/renderer.h"
 #include "film_internal.h"
@@ -196,7 +197,7 @@ std::shared_ptr<FilmLibrary> loadLibrary(const std::string& pack, std::string& e
   return FilmLibrary::loadPack(P(path), &err);
 }
 
-bool loadInput(const std::string& path, ImageF& img, int maxEdge, std::string& err, std::string* make, std::string* model) {
+bool loadInput(const std::string& path, ImageF& img, int maxEdge, std::string& err, std::string* make, std::string* model, float* illumXy = nullptr) {
   const fs::path p = P(path);
   std::string ext = p.extension().string();
   std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
@@ -217,6 +218,7 @@ bool loadInput(const std::string& path, ImageF& img, int maxEdge, std::string& e
     img = std::move(src->linear);
     if (make) *make = src->meta.make;
     if (model) *model = src->meta.model;
+    if (illumXy) illumXy[0] = src->meta.asShotIlluminantXy[0], illumXy[1] = src->meta.asShotIlluminantXy[1];
   }
   if (maxEdge > 0) img = resizeToLongEdge(img, maxEdge);
   return true;
@@ -235,7 +237,7 @@ FilmParams paramsFromArgs(const Args& a, std::string& err) {
   FilmParams p;
   p.camera.autoExposure = false;  // harness contract: off unless --auto-exposure on
   if (a.has("--film")) p.film = a.get("--film");
-  if (a.has("--paper")) p.paper = a.get("--paper");
+  if (a.has("--paper")) p.paper = a.get("--paper");  // "default": the paper of the stock's profile (info.target_print), resolved in cmdFilm
   if (a.has("--exposure-ev")) p.camera.exposureCompensationEv = std::atof(a.get("--exposure-ev").c_str());
   if (a.has("--auto-exposure")) p.camera.autoExposure = a.get("--auto-exposure") == "on";  // "match" is applied in cmdFilm
   if (a.has("--no-spatial")) p.disableSpatialAndStochastic();
@@ -285,6 +287,7 @@ int cmdFilm(const std::vector<std::string>& args) {
     std::fprintf(stderr, "film: %s\n", err.c_str());
     return 1;
   }
+  if (p.paper == "default") p.paper = film::defaultPaperFor(*lib, p.film);
   // --neutral-from <film>: decision material, the print filter pack solved on that stock is used unchanged for this one (a single
   // shared pack per paper instead of a neutral solve per stock)
   if (a.has("--neutral-from")) {
@@ -303,18 +306,6 @@ int cmdFilm(const std::vector<std::string>& args) {
   }
   // the develop pipeline's paper-to-screen mapping (white / black correction) goes with the automatic exposure
   if (a.get("--auto-exposure", "match") == "match") applyFilmPaperMapping(p, std::strtof(a.get("--black", "0").c_str(), nullptr));
-  // film_cast: partial neutralisation of the print pack. --cast s (slider -1..1, default 0 in match mode) or --cast-k k (raw mix)
-  float castK = 0.f;
-  {
-    float k = -1.f;
-    if (a.has("--cast-k")) k = std::strtof(a.get("--cast-k").c_str(), nullptr);
-    else if (a.has("--cast")) k = filmCastMix(std::strtof(a.get("--cast").c_str(), nullptr));
-    else if (a.get("--auto-exposure", "match") == "match") k = filmCastMix(0.f);
-    if (k >= 0.f) {
-      applyFilmCastMix(p, lib, k);
-      castK = k;
-    }
-  }
   FilmSimulator sim(lib);
   FilmTimings bt;
   if (!sim.setParams(p, &err, &bt)) {
@@ -329,11 +320,27 @@ int cmdFilm(const std::vector<std::string>& args) {
   ImageF in, out;
   const auto tl = Clock::now();
   std::string metaMake, metaModel;
-  if (!loadInput(a.get("--in"), in, std::atoi(a.get("--max-edge", "0").c_str()), err, &metaMake, &metaModel)) {
+  float illumXy[2] = {0.f, 0.f};
+  if (!loadInput(a.get("--in"), in, std::atoi(a.get("--max-edge", "0").c_str()), err, &metaMake, &metaModel, illumXy)) {
     std::fprintf(stderr, "film: %s\n", err.c_str());
     return 1;
   }
   const double loadMs = msSince(tl);
+  // experiment: the film sees the scene's real light. --adapt D (0..1, CAT16 degree of adaptation; 1 = the model's behaviour), the scene
+  // illuminant from the RAW's as-shot white balance, or --scene-cct K / --scene-xy x y
+  if (a.has("--adapt") || a.has("--wb")) {
+    double x = illumXy[0], y = illumXy[1];
+    if (a.has("--scene-cct")) cctToXy(std::atof(a.get("--scene-cct").c_str()), x, y);
+    if (a.has("--scene-x")) x = std::atof(a.get("--scene-x").c_str());
+    if (a.has("--scene-y")) y = std::atof(a.get("--scene-y").c_str());
+    p.camera.adaptationDegree = a.has("--wb") ? 1.0 - std::atof(a.get("--wb").c_str()) : std::atof(a.get("--adapt").c_str());  // --wb = film_wb
+    if (x > 0 && y > 0) p.camera.sceneWhiteX = x, p.camera.sceneWhiteY = y;
+    std::fprintf(stderr, "scene: illuminant xy %.4f %.4f (CCT %.0f K), degree of adaptation %.2f\n", x, y, x > 0 ? xyToCct(x, y) : 0.0, p.camera.adaptationDegree);
+    if (!sim.setParams(p, &err)) {
+      std::fprintf(stderr, "film: %s\n", err.c_str());
+      return 2;
+    }
+  }
   const std::string aeMode = a.get("--auto-exposure", "match");
   float matchEv = 0.f, matchPrintEv = 0.f;
   float matchGain[3] = {1.f, 1.f, 1.f};
@@ -415,7 +422,6 @@ int cmdFilm(const std::vector<std::string>& args) {
       mi_in.shoot = std::atof(a.get("--shoot", "0").c_str());
       mi_in.print = std::atof(a.get("--print", "0").c_str());
       mi_in.latitude = std::atof(a.get("--latitude", "0").c_str());
-      mi_in.castK = castK;
       mi_in.negativeBiasEv = mopt.negativeBiasEv;
       mi_in.medianL = [&](float fev, float pev) {
         FilmParams qq = q;

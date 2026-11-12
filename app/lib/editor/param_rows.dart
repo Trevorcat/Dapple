@@ -73,6 +73,8 @@ class ParamRow {
     this.padY,
     this.padLabels = const [],
     this.padEff = const [true, true, true, true],
+    this.padXMin = -1,
+    this.padNotes = const [],
   });
 
   final String id, label;
@@ -115,6 +117,13 @@ class ParamRow {
   /// [TwoD.offset]: whether the X axis' -1 and +1 ends and the Y axis' -1 (bottom) and +1 (top) ends change the render.
   /// An ineffective end is unreachable: the cursor stops at the centre line and the dead half is drawn hatched.
   final List<bool> padEff;
+
+  /// The X axis runs from [padXMin] (left) to +1 (right); -1 = symmetric around the centre, 0 = one-sided (the default
+  /// sits at the left edge, e.g. film_wb).
+  final double padXMin;
+
+  /// Small notes under the left and right edge labels (the scene's and the stock's colour temperature).
+  final List<String> padNotes;
 
   /// Resets this row to its auto position.
   final EditState Function(EditState, RowContext)? reset;
@@ -199,7 +208,7 @@ class ParamRow {
             final s = e.value(grKey(z, 's'));
             return s == 0 ? '无' : '${fmtValue(Fmt.hue, e.value(grKey(z, 'h')))} · ${s.round()}';
           case TwoD.offset:
-            return offsetPadText(e.value(padX!), e.value(padY!));
+            return offsetPadText(e.value(padX!), e.value(padY!), xSigned: padXMin < 0);
         }
       case RowKind.action:
         return fmt?.call(value(c)) ?? '';
@@ -272,9 +281,9 @@ double latitudePercent(double v) => v <= 0 ? 80 + v * 25 : 80 + v * 18;
 double latitudeFromPercent(double p) => p <= 80 ? (p - 80) / 25 : (p - 80) / 18;
 
 /// Offset pad readout: both offsets as signed hundredths, "自动" at the centre.
-String offsetPadText(double x, double y) {
-  String f(double v) => v == 0 ? '0' : '${v > 0 ? '+' : '−'}${(v.abs() * 100).round()}';
-  return x == 0 && y == 0 ? '自动' : '${f(x)} ${f(y)}';
+String offsetPadText(double x, double y, {bool xSigned = true}) {
+  String f(double v, bool signed) => v == 0 ? '0' : '${signed ? (v > 0 ? '+' : '−') : ''}${(v.abs() * 100).round()}';
+  return x == 0 && y == 0 ? '自动' : '${f(x, xSigned)} ${f(y, true)}';
 }
 
 /// "偏暖 12，偏浓 8" (requirements 4.7 aria text).
@@ -316,6 +325,8 @@ ParamRow _custom({
   String? padY,
   List<String> padLabels = const [],
   List<bool> padEff = const [true, true, true, true],
+  double padXMin = -1,
+  List<String> padNotes = const [],
 }) =>
     ParamRow._(
       id: id,
@@ -342,6 +353,8 @@ ParamRow _custom({
       padY: padY,
       padLabels: padLabels,
       padEff: padEff,
+      padXMin: padXMin,
+      padNotes: padNotes,
     );
 
 /// Rows of category [g] for the current selections (requirements 4.15.5, top to bottom).
@@ -568,23 +581,27 @@ List<ParamRow> _filmRows(RowContext c) {
     ?_filmPadRow(c,
         id: 'film_texture',
         label: '质感',
-        x: 'film_cast',
+        x: 'film_wb',
+        xMin: 0,
         y: 'film_black',
-        labels: const ['中性', '本色', '抬黑', '压黑'],
-        hint: '横向：中性（校正过的冲印）到本色（保留胶片色偏）；纵向：黑位，抬黑到压黑。中心为自动'),
-    _custom(
-      id: 'film_latitude',
-      label: '宽容度',
-      kind: RowKind.oneD,
-      group: g,
-      min: 55,
-      max: 98,
-      auto: 80,
-      hint: '保证不溢出的亮度范围，80% 为自动',
-      read: (e) => latitudePercent(e.values['film_latitude'] ?? 0),
-      write: (e, v) => e.withValue('film_latitude', latitudeFromPercent(v)),
-      fmt: (v) => '${v.round()}%',
-    ),
+        labels: const ['数码', '胶片', '抬黑', '压黑'],
+        notes: [if (c.filmRanges.sceneK != null) '${c.filmRanges.sceneK}K' else '', if (c.filmRanges.stockK != null) '${c.filmRanges.stockK}K' else ''],
+        hint: '横向：数码白平衡到胶片白平衡（胶片自己的白平衡看到真实的光）；纵向：黑位，抬黑到压黑。左边缘为自动'),
+    // 宽容度: hidden when neither end changes the render, restricted to the effective side otherwise
+    if (!c.filmRanges.dead('film_latitude'))
+      _custom(
+        id: 'film_latitude',
+        label: '宽容度',
+        kind: RowKind.oneD,
+        group: g,
+        min: c.filmRanges.lo('film_latitude') ? 55 : 80,
+        max: c.filmRanges.hi('film_latitude') ? 98 : 80,
+        auto: 80,
+        hint: '保证不溢出的亮度范围，80% 为自动',
+        read: (e) => latitudePercent(e.values['film_latitude'] ?? 0),
+        write: (e, v) => e.withValue('film_latitude', latitudeFromPercent(v)),
+        fmt: (v) => '${v.round()}%',
+      ),
     ParamRow.spec('film_grain', hint: '颗粒量，100 为该胶片的标准颗粒'),
     ParamRow.spec('film_halation', hint: '高光向周围的红色渗光'),
     if (stock.printed && !scanned) ...[
@@ -598,18 +615,26 @@ List<ParamRow> _filmRows(RowContext c) {
 /// A film pad row for the current photo and stock: a 2D pad when both axes change the render, a one-axis ruler for the
 /// live axis when the other is dead, nothing when both are dead. A half-dead axis keeps the pad but makes that end unreachable.
 ParamRow? _filmPadRow(RowContext c,
-    {required String id, required String label, required String x, required String y, required List<String> labels, String? hint}) {
+    {required String id,
+    required String label,
+    required String x,
+    required String y,
+    required List<String> labels,
+    double xMin = -1,
+    List<String> notes = const [],
+    String? hint}) {
   final r = c.filmRanges;
   final xDead = r.dead(x), yDead = r.dead(y);
   if (xDead && yDead) return null;
   if (xDead || yDead) {
     final key = xDead ? y : x;
+    final oneSided = filmOneSidedKeys.contains(key);
     return _custom(
       id: id,
       label: label,
       kind: RowKind.oneD,
       group: EGroup.style,
-      min: r.lo(key) ? -100 : 0,
+      min: oneSided || !r.lo(key) ? 0 : -100,
       max: r.hi(key) ? 100 : 0,
       auto: 0,
       hint: hint,
@@ -618,7 +643,8 @@ ParamRow? _filmPadRow(RowContext c,
       fmt: (v) => fmtValue(Fmt.signed, v),
     );
   }
-  return _offsetPad(id: id, label: label, x: x, y: y, labels: labels, hint: hint, eff: [r.lo(x), r.hi(x), r.lo(y), r.hi(y)]);
+  return _offsetPad(
+      id: id, label: label, x: x, y: y, labels: labels, hint: hint, eff: [r.lo(x), r.hi(x), r.lo(y), r.hi(y)], xMin: xMin, notes: notes);
 }
 
 /// A film offset pad: two params-map keys, both normalised offsets in [-1, +1], 0 = automatic (the pad's centre).
@@ -629,7 +655,9 @@ ParamRow _offsetPad(
         required String y,
         required List<String> labels,
         String? hint,
-        List<bool> eff = const [true, true, true, true]}) =>
+        List<bool> eff = const [true, true, true, true],
+        double xMin = -1,
+        List<String> notes = const []}) =>
     _custom(
       id: id,
       label: label,
@@ -640,6 +668,8 @@ ParamRow _offsetPad(
       padY: y,
       padLabels: labels,
       padEff: eff,
+      padXMin: xMin,
+      padNotes: notes,
       hint: hint,
       reset: (e, c) => e.withValue(x, 0).withValue(y, 0),
     );

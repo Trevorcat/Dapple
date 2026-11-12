@@ -96,6 +96,8 @@ class Context : public std::enable_shared_from_this<Context> {
   // The shared device copy of a SourceStore (executors of one context reading the same store share it); `make` creates it.
   std::shared_ptr<void> residentFor(std::uint64_t identity, const std::function<std::shared_ptr<void>()>& make);
   const ContextOptions& options() const;
+  // Writes the device pipeline cache (Vulkan) to options().device.pipelineCachePath (atomically); bytes written, 0 = nothing to write.
+  std::size_t savePipelineCache();
   // Zero-readback seam (docs/engine/present.md): the handles of the Vulkan device behind the context, or false.
   bool nativeHandles(hal::NativeHandles* out) const;
 

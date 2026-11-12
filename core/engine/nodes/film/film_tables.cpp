@@ -17,6 +17,7 @@ namespace dapple::engine::filmnode {
 namespace {
 
 constexpr float kWarmthFilterUnits = 12.f;  // renderer.cpp: enlarger filtration at warmth / tint = +-100
+constexpr int kCoarseLutN = 17;           // nodes per axis of the print table baked while a print-table slider moves (33 otherwise)
 
 std::uint32_t mix32(std::uint32_t h) {
   h ^= h >> 16;
@@ -211,7 +212,11 @@ void resolveFilm(const ParamSet& ps, const FrameGeom& geom, FilmResolved& out) {
   for (int c = 0; c < 3; ++c) out.gain[c] = g[c] * evGain;
   out.printEv = e.filmPrintEv;
   out.black = e.filmBlack;
-  out.cast = e.filmCast;
+  {  // film white balance: the assumed scene illuminant and the degree of adaptation (D = 1: the film's own balance, no effect)
+    double sx, sy, sd;
+    dapple::filmInputAdaptation(e, &sx, &sy, &sd);
+    out.sceneX = float(sx), out.sceneY = float(sy), out.adapt = float(sd);
+  }
   out.warmth = e.filmWarmth;
   out.tint = e.filmTint;
   out.grainPct = e.filmGrain;
@@ -236,6 +241,8 @@ Status bakeRaw(const void* resolved, std::span<const void* const>, void** payloa
   auto t = std::make_unique<RawTable>();
   {
     std::lock_guard<std::mutex> lock(m->m);
+    // film white balance: only the 3x3 in front of the (shared, unchanged) raw LUT depends on the scene illuminant and D
+    m->model->setInputAdaptation(r.adapt < 1.f ? r.sceneX : 0.0, r.adapt < 1.f ? r.sceneY : 0.0, r.adapt);
     m->model->bakeInput(t->t);
   }
   *payloadOut = static_cast<PayloadBase*>(t.release());
@@ -265,7 +272,7 @@ Status bakeCurves(const void* resolved, std::span<const void* const>, void** pay
   return Status::Internal;
 }
 
-Status bakePrintScan(const void* resolved, std::span<const void* const>, void** payloadOut) try {
+Status bakePrintScanN(const void* resolved, int lutN, void** payloadOut) try {
   const FilmResolved& r = *static_cast<const FilmResolved*>(resolved);
   if (!usable(r)) return Status::Unsupported;
   std::string err;
@@ -275,19 +282,10 @@ Status bakePrintScan(const void* resolved, std::span<const void* const>, void** 
   {
     const dapple::film::FilmParams fp = makeParams(r, r.quality == 0 ? 0 : 2);
     std::lock_guard<std::mutex> lock(m->m);
-    {  // partial neutralisation: the pack of this stock moved towards the reference pack of its paper (resets to the solved pack at 0)
-      double rm = 0, ry = 0;
-      const float k = dapple::filmCastMix(r.cast);
-      const auto dl = dapple::film::defaultLibrary();
-      if (k > 0.f && !r.scan && r.paper && dl.get() == r.lib && dapple::filmCastReferencePack(dl, r.stock->stock, r.paper->stock, &rm, &ry))
-        m->model->setCast(rm, ry, k);
-      else
-        m->model->setCast(0, 0, 0);
-    }
     m->model->setBlackMix(fp.scanner.blackMix);
     m->model->rebalance(fp.enlarger.mFilterShift, fp.enlarger.yFilterShift);
     m->model->setPrintExposure(std::exp2(-double(std::clamp(r.printEv, -9.f, 9.f))));
-    m->model->bakePrintScan(t->t);
+    m->model->bakePrintScan(t->t, lutN);
   }
   *payloadOut = static_cast<PayloadBase*>(t.release());
   return Status::Ok;
@@ -296,6 +294,10 @@ Status bakePrintScan(const void* resolved, std::span<const void* const>, void** 
 } catch (...) {
   return Status::Internal;
 }
+
+Status bakePrintScan(const void* resolved, std::span<const void* const>, void** payloadOut) { return bakePrintScanN(resolved, 0, payloadOut); }
+// Coarse print table for interactive frames while a print-table slider moves (docs/engine/pipeline-architecture.md section 26)
+Status bakePrintScanCoarse(const void* resolved, std::span<const void* const>, void** payloadOut) { return bakePrintScanN(resolved, kCoarseLutN, payloadOut); }
 
 void freePayload(void* p) { delete static_cast<PayloadBase*>(p); }
 
@@ -342,6 +344,13 @@ std::shared_ptr<const T> cachedTable(TableLru<T>& c, const Hash128& key, Status 
   while (c.l.size() > 6) c.l.pop_back();
   return sp;
 }
+template <class T>
+bool cachedPeek(TableLru<T>& c, const Hash128& key) {
+  std::lock_guard<std::mutex> lock(c.m);
+  for (const auto& e : c.l)
+    if (e.first == key) return true;
+  return false;
+}
 }  // namespace
 
 bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
@@ -362,12 +371,29 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
   hp.f32(r.tint);
   hp.f32(r.printEv);
   hp.f32(r.black);
-  hp.f32(dapple::filmCastMix(r.cast));
   hp.i32(dapple::filmPaperMappingEnabled());
   hp.i32(r.fx.enlargerFilter != 0 && r.quality != 0 && !r.scan);  // split-path tables
-  out.raw = cachedTable(raws, ks, bakeRaw, r);
+  Hasher hr;  // the raw table also carries the input matrix: scene illuminant and degree of adaptation (only when the film's own balance is not in use)
+  hr.hash(ks);
+  if (r.adapt < 1.f && r.sceneX > 0.f) {
+    hr.f32(r.sceneX);
+    hr.f32(r.sceneY);
+    hr.f32(r.adapt);
+  }
+  out.raw = cachedTable(raws, hr.finish(), bakeRaw, r);
   out.curves = cachedTable(curves, ks, bakeCurves, r);
-  out.print = cachedTable(prints, hp.finish(), bakePrintScan, r);
+  const Hash128 kp = hp.finish();
+  // Interactive frame while a print-table slider moves (r.coarse): the exact table when it is cached, else a coarse one (cached on its own, so
+  // a drag does not evict the exact tables); the frame after the drag is not coarse and bakes the exact table.
+  if (r.coarse && !cachedPeek(prints, kp)) {
+    static TableLru<PrintTable> printsCoarse;
+    Hasher hc;
+    hc.hash(kp);
+    hc.i32(kCoarseLutN);
+    out.print = cachedTable(printsCoarse, hc.finish(), bakePrintScanCoarse, r);
+  } else {
+    out.print = cachedTable(prints, kp, bakePrintScan, r);
+  }
   return out.raw && out.curves && out.print;
 }
 

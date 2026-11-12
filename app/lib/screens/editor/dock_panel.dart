@@ -24,7 +24,7 @@ import 'control_pad.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart' show RulerPainter;
 import 'editor_widgets.dart';
-import 'float_window.dart' show NumberEntry, MiniHistogramBox;
+import 'panel_widgets.dart' show NumberEntry, MiniHistogramBox, groupIcons;
 import 'mini_maps.dart';
 import '../../services/perf_probe.dart';
 
@@ -37,6 +37,15 @@ const double kRulerH = 64;
 const double kRulerTierH = kRulerValueH + kRulerH + 4;
 const double kFilmStripH = 92;
 
+/// Header of the side pane: the category's name and its reset (its own slot, never over a chip).
+const double kSideHeaderH = 40;
+
+/// Histogram block at the top of the side pane (the column above the controls would otherwise be dead).
+const double kSideHistH = 112;
+
+/// Slim row that replaces a 2D pad when the photo itself is the pad (photo-as-pad).
+const double kPadHintH = 40;
+
 /// Panel height when folded to the handle and the chip strip.
 const double kPanelCollapsedH = kPanelHandleH + kPanelStripH + 4;
 
@@ -47,21 +56,66 @@ double panelCollapsedH(double textScale) => kPanelHandleH + panelStripH(textScal
 
 bool isFilmRow(ParamRow r) => r.id == 'film' || r.id == 'filmPaper' || r.id.startsWith('film_');
 
+/// Rows whose big control is a drag pad (palette, wheel, curve, the film pads; not the tone grid, which is taps).
+bool isPadRow(ParamRow r) => r.kind == RowKind.twoD && r.twoD != TwoD.tone;
+
 /// Smallest pad edge: 40 % of the screen width, at least 168 dp.
 double padMinHeight(double screenWidth) => math.max(screenWidth * 0.4, 168);
 
-double _tierNeed(ParamRow r, double screenWidth) {
+const double kHistGap = 22;
+const double kHistMax = 120;
+
+// ------------------------------------------------------------------ side pane metrics
+
+/// Chip grid of the side pane: 2 or 3 columns, as many rows as fit; the grid scrolls on its own when there are more.
+int sideGridCols(double paneW) => ((paneW - 12) / (88 + 6)).floor().clamp(2, 3);
+
+double sideChipH(double textScale) => 48 + math.max(0.0, textScale - 1) * 36;
+
+/// One row of the chip grid (it then scrolls).
+double sideGridMinHeight(double textScale) => 8 + sideChipH(textScale) + 6;
+
+/// Height of the chip grid for [n] chips: up to three rows, at least one.
+double sideGridHeight(int n, double paneW, double textScale) {
+  final rows = ((n + sideGridCols(paneW) - 1) ~/ sideGridCols(paneW)).clamp(1, 3);
+  return 8 + rows * (sideChipH(textScale) + 6);
+}
+
+// ------------------------------------------------------------------ needs
+
+/// What the selected control of a category needs, per placement, and how much taller it can usefully get.
+class PanelNeeds {
+  const PanelNeeds({required this.bottom, required this.side, required this.sideMin, required this.growBottom, required this.growSide, required this.growMin, required this.pad});
+
+  /// Heights of the whole panel (bottom) / of the pane without the dock (side).
+  final double bottom, side;
+
+  /// The least the side pane needs: its chip grid may shrink to one scrolling row.
+  final double sideMin;
+
+  /// How much taller a pad or the histogram can make it, and the least spare height that is worth it.
+  final double growBottom, growSide, growMin;
+
+  /// The selected row is a drag pad (candidate for photo-as-pad).
+  final bool pad;
+}
+
+double _rowTier(EditorController ctl, ParamRow r, RowContext rc, double w, {required bool side, required bool padOnPhoto}) {
   switch (r.kind) {
     case RowKind.oneD:
       return kRulerTierH;
     case RowKind.twoD:
-      return r.twoD == TwoD.tone ? 168 : padMinHeight(screenWidth) + 16;
+      if (r.twoD == TwoD.tone) return side ? 152 : 168;
+      if (padOnPhoto) return kPadHintH;
+      return (side ? 120.0 : padMinHeight(w)) + 16; // beside the photo the pad is wide and may be low
     case RowKind.discrete:
       switch (r.id) {
         case 'band':
           return 64;
         case 'look':
           return 100;
+        case 'film':
+          return kFilmStripH + 24; // the stock strip with its 12 dp of air above and below
         case 'filmPaper':
           return 64;
         default:
@@ -72,90 +126,121 @@ double _tierNeed(ParamRow r, double screenWidth) {
   }
 }
 
-/// Minimum panel height for category [g]: the tallest control any of its rows needs, so that moving
-/// between rows never moves the photo.
-double dockedPanelMinHeight(EditorController ctl, EGroup g, double screenWidth, {double textScale = 1}) {
-  var tier = 0.0;
-  var film = false;
-  for (final r in ctl.rowsOf(g)) {
-    if (isFilmRow(r)) {
-      film = true;
-      continue;
-    }
-    tier = math.max(tier, _tierNeed(r, screenWidth));
-  }
-  if (film) tier = math.max(tier, kFilmStripH + kRulerTierH);
-  return kPanelHandleH + panelStripH(textScale) + tier;
-}
-
-/// Height the selected parameter's controls need (handle + strip + lower tier).
-double dockedPanelNeed(EditorController ctl, EGroup g, double screenWidth, {double textScale = 1}) {
+/// The needs of category [g]. [groupLevel] takes the tallest row (the stable basis for choosing a placement);
+/// otherwise the selected row. [padOnPhoto] replaces the selected pad by the slim hint row.
+PanelNeeds panelNeeds(EditorController ctl, EGroup g,
+    {required double screenW, required double paneW, double textScale = 1, bool collapsed = false, bool groupLevel = false, bool padOnPhoto = false}) {
   final rows = ctl.rowsOf(g);
-  if (rows.isEmpty) return kPanelHandleH + panelStripH(textScale);
+  final rc = ctl.ctx();
+  final ts = textScale;
+  final gridH = sideGridHeight(rows.length, paneW, ts);
+  final strip = panelStripH(ts);
+  if (rows.isEmpty) {
+    return PanelNeeds(bottom: kPanelHandleH + strip, side: gridH + kSideHeaderH, sideMin: gridH + kSideHeaderH, growBottom: 0, growSide: 0, growMin: 0, pad: false);
+  }
   final active = ctl.activeRowOf(g, rows);
-  double tier;
-  if (isFilmRow(active) && !ctl.ctx().film.isEmpty && active.kind != RowKind.twoD) {
-    tier = kFilmStripH + (active.id == 'film' ? 8 : (active.id == 'filmPaper' ? 64 : kRulerTierH));
-  } else {
-    tier = _tierNeed(active, screenWidth);
+  var tierB = 0.0, tierS = 0.0;
+  if (collapsed) {
+    return PanelNeeds(
+        bottom: kPanelHandleH + strip + 4,
+        side: gridH + kSideHeaderH + 4,
+        sideMin: sideGridMinHeight(ts) + kSideHeaderH + 4,
+        growBottom: 0,
+        growSide: 0,
+        growMin: 0,
+        pad: false);
   }
-  return kPanelHandleH + panelStripH(textScale) + tier;
-}
-
-const double kHistGap = 22;
-const double kHistMax = 120;
-
-/// Panel height for [g]: what the selected parameter needs, plus what it can use of the [spare] height the
-/// photo leaves free. The panel hugs its content; whatever it cannot use stays with the photo region.
-/// A wide histogram (at most [kHistMax]) and a taller pad (at most square) are the only things that grow.
-double dockedPanelHeight(EditorController ctl, EGroup g, double screenWidth, {double textScale = 1, required double regionH, required double photoH}) {
-  final need = dockedPanelNeed(ctl, g, screenWidth, textScale: textScale);
-  final spare = math.max(0.0, regionH - photoH - 8 - need);
-  if (!dockedRoomy(ctl, g)) return need;
-  final rows = ctl.rowsOf(g);
-  final a = ctl.activeRowOf(g, rows);
-  if (a.kind == RowKind.twoD) {
-    final padMax = screenWidth - 24;
-    return need + math.min(spare, math.max(0.0, padMax - padMinHeight(screenWidth)));
+  final list = groupLevel ? rows : [active];
+  for (final r in list) {
+    tierB = math.max(tierB, _rowTier(ctl, r, rc, screenW, side: false, padOnPhoto: padOnPhoto));
+    tierS = math.max(tierS, _rowTier(ctl, r, rc, paneW, side: true, padOnPhoto: padOnPhoto));
   }
-  return need + (spare >= 70 ? kHistGap + math.min(kHistMax, spare - kHistGap) : 0);
+  if (!groupLevel) {
+    // The panel never gets lower than a ruler (so moving between rulers and pickers keeps one height) and grows for
+    // a taller control; a pad replaced by the hint row is just that row: the photo gets the room back.
+    if (padOnPhoto && isPadRow(active)) {
+      // tierB / tierS are already the hint row
+    } else {
+      final hasRuler = rows.any((r) => r.kind == RowKind.oneD);
+      var baseB = 0.0, baseS = 0.0;
+      for (final r in rows) {
+        if (isPadRow(r) || r.id == 'toneTarget') continue; // the tall ones size the panel only while selected
+        baseB = math.max(baseB, _rowTier(ctl, r, rc, screenW, side: false, padOnPhoto: padOnPhoto));
+        baseS = math.max(baseS, _rowTier(ctl, r, rc, paneW, side: true, padOnPhoto: padOnPhoto));
+      }
+      if (hasRuler) {
+        baseB = math.min(baseB, kRulerTierH);
+        baseS = math.min(baseS, kRulerTierH);
+      }
+      tierB = math.max(tierB, baseB);
+      tierS = math.max(tierS, baseS);
+    }
+  }
+  // Growth: a pad takes spare height, a ruler takes it for the wide histogram. At group level the tallest of its rows
+  // sets it, so the panel keeps one height while moving between the category's parameters.
+  var gb = 0.0, gs = 0.0, gm = 0.0;
+  var padGrows = false;
+  var pad = false;
+  for (final r in list) {
+    if (isPadRow(r)) {
+      pad = true;
+      if (!padOnPhoto) {
+        padGrows = true;
+        gb = math.max(gb, math.max(0.0, screenW - 24 - padMinHeight(screenW)));
+        gs = math.max(gs, math.max(0.0, paneW - 24 - 120));
+      }
+    }
+  }
+  // the wide histogram under a ruler: only a ruler can use that height (a picker would float in a blank band)
+  if (groupLevel || active.kind == RowKind.oneD) {
+    for (final r in rows) {
+      if (r.kind == RowKind.oneD && (g == EGroup.light || g == EGroup.curve || g == EGroup.style) && !isFilmRow(r)) {
+        gb = math.max(gb, kHistGap + kHistMax);
+        gm = 70;
+      }
+    }
+  }
+  if (padGrows) gm = 0;
+  // the side pane shows the histogram above its chips instead (not for a pad, which takes that room)
+  final sideHist = (!groupLevel && !isPadRow(active)) ? kSideHistH : 0.0;
+  if (!groupLevel && !isPadRow(active)) {
+    gs = 0;
+  }
+  return PanelNeeds(
+    bottom: kPanelHandleH + strip + tierB,
+    side: gridH + kSideHeaderH + tierS + sideHist,
+    sideMin: sideGridMinHeight(ts) + kSideHeaderH + tierS,
+    growBottom: gb,
+    growSide: gs,
+    growMin: gm,
+    pad: pad,
+  );
 }
 
-/// True when the selected parameter can use spare room: pads, and rulers of the categories that show a
-/// wide histogram. The pickers and plain rulers stay at their natural height.
-bool dockedRoomy(EditorController ctl, EGroup g) {
-  final rows = ctl.rowsOf(g);
-  if (rows.isEmpty) return false;
-  final a = ctl.activeRowOf(g, rows);
-  if (a.kind == RowKind.twoD) return a.twoD != TwoD.tone;
-  final hist = g == EGroup.light || g == EGroup.curve || g == EGroup.style;
-  return a.kind == RowKind.oneD && hist && !isFilmRow(a);
-}
+// ------------------------------------------------------------------ host (frame + animated rect)
 
-// ------------------------------------------------------------------ host (frame + animated height)
-
-/// Positions the panel above the dock and clips it to the animated [height]; the content is laid out at
-/// its final [contentHeight] and revealed from the top, so chips never reflow during the animation.
+/// The panel frame at the animated [rect] (bottom panel or side pane). The content is laid out at its final size
+/// ([contentSize]) and revealed from the top, so nothing reflows during the animation.
 class DockedPanelHost extends StatefulWidget {
   const DockedPanelHost({
     super.key,
     required this.controller,
-    required this.height,
-    required this.contentHeight,
+    required this.rect,
+    required this.contentSize,
     required this.group,
     required this.collapsed,
-    required this.bottom,
-    required this.left,
-    required this.right,
+    required this.side,
+    required this.padOnPhoto,
+    this.activeId,
   });
   final EditorController controller;
+  final String? activeId;
 
-  /// Animated visible height (0 = closed).
-  final ValueListenable<double> height;
-  final double contentHeight;
+  /// Animated visible rectangle (height 0 = closed).
+  final ValueListenable<Rect> rect;
+  final Size contentSize;
   final EGroup? group;
-  final bool collapsed;
-  final double bottom, left, right;
+  final bool collapsed, side, padOnPhoto;
 
   @override
   State<DockedPanelHost> createState() => _DockedPanelHostState();
@@ -163,8 +248,9 @@ class DockedPanelHost extends StatefulWidget {
 
 class _DockedPanelHostState extends State<DockedPanelHost> {
   EGroup? _last;
-  bool _lastCollapsed = false;
-  double _lastContent = kPanelCollapsedH;
+  bool _lastCollapsed = false, _lastSide = false, _lastPad = false;
+  String? _lastActive;
+  Size _lastContent = const Size(0, kPanelCollapsedH);
 
   @override
   Widget build(BuildContext context) {
@@ -172,22 +258,22 @@ class _DockedPanelHostState extends State<DockedPanelHost> {
     if (widget.group != null) {
       _last = widget.group;
       _lastCollapsed = widget.collapsed;
-      _lastContent = widget.contentHeight;
+      _lastSide = widget.side;
+      _lastPad = widget.padOnPhoto;
+      _lastActive = widget.activeId;
+      _lastContent = widget.contentSize;
     }
     final g = _last;
-    return Positioned(
-      left: widget.left,
-      right: widget.right,
-      bottom: widget.bottom,
-      child: ValueListenableBuilder<double>(
-        valueListenable: widget.height,
-        builder: (context, h, child) {
-          if (h < 1 || g == null) return const SizedBox.shrink();
-          return Opacity(
-            opacity: (h / 48).clamp(0.0, 1.0),
+    return ValueListenableBuilder<Rect>(
+      valueListenable: widget.rect,
+      builder: (context, r, _) {
+        if (r.height < 1 || r.width < 1 || g == null) return const SizedBox.shrink();
+        return Positioned.fromRect(
+          rect: r,
+          child: Opacity(
+            opacity: (r.height / 48).clamp(0.0, 1.0),
             child: Container(
               key: const ValueKey('docked-panel'),
-              height: h,
               decoration: BoxDecoration(
                 color: c.surface,
                 borderRadius: BorderRadius.circular(20),
@@ -197,14 +283,16 @@ class _DockedPanelHostState extends State<DockedPanelHost> {
               clipBehavior: Clip.antiAlias,
               child: OverflowBox(
                 alignment: Alignment.topCenter,
-                minHeight: _lastContent,
-                maxHeight: _lastContent,
-                child: DockedPanel(controller: widget.controller, group: g, collapsed: _lastCollapsed),
+                minWidth: _lastContent.width,
+                maxWidth: _lastContent.width,
+                minHeight: _lastContent.height,
+                maxHeight: _lastContent.height,
+                child: DockedPanel(controller: widget.controller, group: g, collapsed: _lastCollapsed, side: _lastSide, padOnPhoto: _lastPad, activeId: _lastActive),
               ),
             ),
-          );
-        },
-      ),
+          ),
+        );
+      },
     );
   }
 }
@@ -212,10 +300,19 @@ class _DockedPanelHostState extends State<DockedPanelHost> {
 // ------------------------------------------------------------------ panel
 
 class DockedPanel extends StatefulWidget {
-  const DockedPanel({super.key, required this.controller, required this.group, required this.collapsed});
+  const DockedPanel({super.key, required this.controller, required this.group, required this.collapsed, this.side = false, this.padOnPhoto = false, this.activeId});
+
+  /// The row the panel is laid out for; null = the controller's selection.
+  final String? activeId;
   final EditorController controller;
   final EGroup group;
   final bool collapsed;
+
+  /// The side pane: chips wrap into a grid, the control below uses the pane's width.
+  final bool side;
+
+  /// A 2D value is driven by dragging the photo: the big pad is replaced by a slim hint row.
+  final bool padOnPhoto;
 
   @override
   State<DockedPanel> createState() => _DockedPanelState();
@@ -251,18 +348,47 @@ class _DockedPanelState extends State<DockedPanel> {
     final g = widget.group;
     final rows = ctl.rowsOf(g);
     if (rows.isEmpty) return const SizedBox.shrink();
-    final active = ctl.activeRowOf(g, rows);
+    final active = rows.where((r) => r.id == widget.activeId).firstOrNull ?? ctl.activeRowOf(g, rows);
     final rc = ctl.ctx();
+    final ts = MediaQuery.textScalerOf(context).scale(15) / 15;
+    final tier = widget.collapsed ? null : _Tier(ctl: ctl, group: g, rows: rows, active: active, rc: rc, side: widget.side, padOnPhoto: widget.padOnPhoto);
+    if (widget.side) {
+      return Semantics(
+        container: true,
+        label: '${groupLabels[g]}调整面板',
+        child: LayoutBuilder(builder: (context, cons) {
+          // the grid takes what the control below leaves, between one scrolling row and its full height
+          final tierNeed = widget.collapsed ? 0.0 : _rowTier(ctl, active, rc, cons.maxWidth, side: true, padOnPhoto: widget.padOnPhoto);
+          // whole rows only: the leftover goes to the control below
+          final rowH = sideChipH(ts) + 6;
+          final fullRows = ((sideGridHeight(rows.length, cons.maxWidth, ts) - 8) / rowH).round();
+          final room = cons.maxHeight - kSideHeaderH - tierNeed;
+          // the histogram goes above the chips when there is room for it besides one row of chips (a pad takes the room instead)
+          final showHist = !widget.collapsed && !isPadRow(active) && room - sideGridMinHeight(ts) >= kSideHistH;
+          final fitRows = ((room - (showHist ? kSideHistH : 0) - 8) / rowH).floor().clamp(1, fullRows);
+          final gridH = 8 + fitRows * rowH;
+          return Column(key: ValueKey('panel-${g.name}'), children: [
+            _SideHeader(ctl: ctl, group: g),
+            if (showHist) SizedBox(key: const ValueKey('side-histogram'), height: kSideHistH, child: Padding(padding: const EdgeInsets.fromLTRB(12, 0, 12, 8), child: SizedBox.expand(child: _WideHistogram(ctl: ctl)))),
+            SizedBox(
+              height: gridH,
+              child: _ChipGrid(ctl: ctl, group: g, rows: rows, active: active, rc: rc, collapsed: widget.collapsed, cols: sideGridCols(cons.maxWidth), scrolls: fitRows < fullRows),
+            ),
+            if (tier != null) Expanded(child: tier),
+          ]);
+        }),
+      );
+    }
     return Semantics(
       container: true,
       label: '${groupLabels[g]}调整面板',
       child: Column(key: ValueKey('panel-${g.name}'), children: [
         _Handle(ctl: ctl, group: g, collapsed: widget.collapsed),
         SizedBox(
-          height: panelStripH(MediaQuery.textScalerOf(context).scale(15) / 15),
+          height: panelStripH(ts),
           child: _ChipStrip(ctl: ctl, group: g, rows: rows, active: active, rc: rc, collapsed: widget.collapsed),
         ),
-        if (!widget.collapsed) Expanded(child: _Tier(ctl: ctl, group: g, rows: rows, active: active, rc: rc)),
+        if (tier != null) Expanded(child: tier),
       ]),
     );
   }
@@ -415,7 +541,10 @@ class _ChipStripState extends State<_ChipStrip> {
 }
 
 class _RowChip extends StatelessWidget {
-  const _RowChip({super.key, required this.ctl, required this.group, required this.row, required this.rc, required this.selected, required this.collapsed});
+  const _RowChip({super.key, required this.ctl, required this.group, required this.row, required this.rc, required this.selected, required this.collapsed, this.width});
+
+  /// Fixed width (the side pane's grid cell); null = sized to the content (the strip).
+  final double? width;
   final EditorController ctl;
   final EGroup group;
   final ParamRow row;
@@ -441,8 +570,7 @@ class _RowChip extends StatelessWidget {
     final fg = modified ? c.accent : c.text;
     final valueStyle = T.small(selected ? c.accent : (modified ? c.accent : c.text2), w: FontWeight.w600, tabular: true);
     final rest = row.text(rc);
-    // A selected ruler parameter shows only its name: its value is the big number above the ruler.
-    final nameOnly = selected && row.kind == RowKind.oneD;
+    const nameOnly = false; // every chip shows its value, the selected one too (the big number above the ruler repeats it)
     Widget value = Text(rest, maxLines: 1, overflow: TextOverflow.ellipsis, style: valueStyle);
     if (selected && !isAction && !nameOnly) {
       value = ListenableBuilder(
@@ -455,7 +583,8 @@ class _RowChip extends StatelessWidget {
     }
     final body = Container(
       key: ValueKey('chip-body-${row.id}'),
-      constraints: const BoxConstraints(minWidth: 64, maxWidth: 132, minHeight: 48),
+      alignment: width != null ? Alignment.center : null,
+      constraints: width != null ? BoxConstraints(minWidth: width!, maxWidth: width!, minHeight: 48) : const BoxConstraints(minWidth: 64, maxWidth: 132, minHeight: 48),
       padding: const EdgeInsets.symmetric(horizontal: 10),
       decoration: BoxDecoration(
         color: selected ? c.accentSoft : c.chip,
@@ -505,10 +634,212 @@ class _RowChip extends StatelessWidget {
   }
 }
 
+// ------------------------------------------------------------------ side pane chip grid
+
+/// The side pane's chips: two or three columns, wrapping; the grid scrolls vertically on its own when there are more
+/// rows than its box holds (the control below is a separate region, so no gesture conflicts), and keeps the selected
+/// chip in view.
+class _ChipGrid extends StatefulWidget {
+  const _ChipGrid({required this.ctl, required this.group, required this.rows, required this.active, required this.rc, required this.collapsed, required this.cols, this.scrolls = false});
+
+  /// More rows than the box shows: fade the edges that have more behind them (the scroll cue).
+  final bool scrolls;
+  final EditorController ctl;
+  final EGroup group;
+  final List<ParamRow> rows;
+  final ParamRow active;
+  final RowContext rc;
+  final bool collapsed;
+  final int cols;
+
+  @override
+  State<_ChipGrid> createState() => _ChipGridState();
+}
+
+class _ChipGridState extends State<_ChipGrid> {
+  final ScrollController _sc = ScrollController();
+  final Map<String, GlobalKey> _keys = {};
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _reveal(false));
+  }
+
+  @override
+  void didUpdateWidget(_ChipGrid old) {
+    super.didUpdateWidget(old);
+    if (old.active.id != widget.active.id) WidgetsBinding.instance.addPostFrameCallback((_) => _reveal(true));
+  }
+
+  void _reveal(bool animate) {
+    final ctx = _keys[widget.active.id]?.currentContext;
+    if (!mounted || ctx == null || !_sc.hasClients) return;
+    Scrollable.ensureVisible(ctx, alignment: 0.5, duration: animate ? const Duration(milliseconds: 200) : Duration.zero);
+  }
+
+  @override
+  void dispose() {
+    _sc.dispose();
+    super.dispose();
+  }
+
+  double _off = 0, _max = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final ctl = widget.ctl;
+    return LayoutBuilder(builder: (context, cons) {
+      const gap = 6.0;
+      final cellW = (cons.maxWidth - 16 - (widget.cols - 1) * gap) / widget.cols;
+      final grid = SingleChildScrollView(
+        key: ValueKey('chip-grid-${widget.group.name}'),
+        controller: _sc,
+        padding: const EdgeInsets.fromLTRB(8, 0, 8, 0),
+        child: Wrap(spacing: gap, runSpacing: gap, children: [
+          for (final r in widget.rows)
+            KeyedSubtree(
+              key: _keys.putIfAbsent(r.id, GlobalKey.new),
+              child: _RowChip(
+                key: ValueKey('chip-${widget.group.name}-${r.id}'),
+                ctl: ctl,
+                group: widget.group,
+                row: r,
+                rc: widget.rc,
+                selected: r.id == widget.active.id,
+                collapsed: widget.collapsed,
+                width: cellW,
+              ),
+            ),
+        ]),
+      );
+      // more rows than fit: the edges that have more behind them fade out (the scroll cue; no neighbouring row peeks in as a hairline)
+      return NotificationListener<ScrollNotification>(
+        onNotification: (n) {
+          if (n.depth == 0 && (n.metrics.pixels != _off || n.metrics.maxScrollExtent != _max)) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) setState(() {});
+            });
+            _off = n.metrics.pixels;
+            _max = n.metrics.maxScrollExtent;
+          }
+          return false;
+        },
+        child: ShaderMask(
+          blendMode: BlendMode.dstIn,
+          shaderCallback: (r) {
+            final has = _sc.hasClients && _sc.position.hasContentDimensions;
+            // (the same widget tree whether it scrolls or not: a controller must never sit in two scroll views)
+            final up = widget.scrolls && has && _sc.position.pixels > 1;
+            final down = widget.scrolls && (!has || _sc.position.pixels < _sc.position.maxScrollExtent - 1);
+            const f = 14.0;
+            return LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [up ? const Color(0x00FFFFFF) : Colors.white, Colors.white, Colors.white, down ? const Color(0x00FFFFFF) : Colors.white],
+              stops: [0, f / r.height, 1 - f / r.height, 1],
+            ).createShader(r);
+          },
+          child: ClipRect(child: grid),
+        ),
+      );
+    });
+  }
+}
+
+/// Side pane header: the category's icon and name on the left, its reset in its own slot on the right.
+class _SideHeader extends StatelessWidget {
+  const _SideHeader({required this.ctl, required this.group});
+  final EditorController ctl;
+  final EGroup group;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final adjusted = ctl.edit.groupAdjusted(group);
+    return SizedBox(
+      height: kSideHeaderH,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 16),
+        child: Row(children: [
+          DIcon(groupIcons[group]!, size: 18, color: c.text2),
+          const SizedBox(width: 8),
+          Expanded(child: Text(groupLabels[group]!, maxLines: 1, overflow: TextOverflow.ellipsis, style: T.small(c.text2, w: FontWeight.w600))),
+          IgnorePointer(
+            ignoring: !adjusted,
+            child: Visibility(
+              visible: adjusted,
+              maintainSize: true,
+              maintainAnimation: true,
+              maintainState: true,
+              child: Semantics(
+                button: true,
+                label: '复位${groupLabels[group]}',
+                excludeSemantics: true,
+                child: GestureDetector(
+                  key: ValueKey('reset-${group.name}'),
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => ctl.resetCategoryOf(group),
+                  child: SizedBox(width: 48, height: kSideHeaderH, child: Center(child: DIcon(DI.reset, size: 18, color: c.text2))),
+                ),
+              ),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+// ------------------------------------------------------------------ photo-as-pad hint
+
+/// Replaces a 2D pad when it would shrink the photo too much: a drag on the photo drives both axes; this slim row
+/// names the axes and shows the values.
+class _PadHint extends StatelessWidget {
+  const _PadHint({required this.ctl, required this.row});
+  final EditorController ctl;
+  final ParamRow row;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    return Padding(
+      key: ValueKey('pad-hint-${row.id}'),
+      padding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
+      child: Row(children: [
+        DIcon(DI.compare, size: 18, color: c.text2),
+        const SizedBox(width: 10),
+        if (row.padLabels.length == 4) Text(row.padLabels[0], style: T.cap(c.text2)),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Center(
+            child: ListenableBuilder(
+              listenable: Listenable.merge([ctl.readout, ctl.edits]),
+              builder: (context, _) {
+                final live = ctl.dragging.value && ctl.readout.name == row.label;
+                return Text(live ? ctl.readout.value : row.text(ctl.ctx()), maxLines: 1, style: T.body(c.accent, w: FontWeight.w600, tabular: true));
+              },
+            ),
+          ),
+        ),
+        const SizedBox(width: 6),
+        if (row.padLabels.length == 4) Text(row.padLabels[1], style: T.cap(c.text2)),
+        GestureDetector(
+          key: const ValueKey('pad-hint-reset'),
+          behavior: HitTestBehavior.opaque,
+          onTap: () => ctl.resetRow(row),
+          child: SizedBox(width: 44, height: 44, child: Center(child: DIcon(DI.reset, size: 18, color: c.text2))),
+        ),
+      ]),
+    );
+  }
+}
+
 // ------------------------------------------------------------------ lower tier
 
 class _Tier extends StatelessWidget {
-  const _Tier({required this.ctl, required this.group, required this.rows, required this.active, required this.rc});
+  const _Tier({required this.ctl, required this.group, required this.rows, required this.active, required this.rc, this.side = false, this.padOnPhoto = false});
+  final bool side, padOnPhoto;
   final EditorController ctl;
   final EGroup group;
   final List<ParamRow> rows;
@@ -517,32 +848,22 @@ class _Tier extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // the stock strip stays above a ruler or the paper strip; a pad takes the room instead
-    final film = isFilmRow(active) && !rc.film.isEmpty && active.kind != RowKind.twoD;
-    if (!film) return _lower(context, active);
-    final filmRow = rows.firstWhere((r) => r.id == 'film', orElse: () => active);
-    final e = rc.edit;
-    return Column(children: [
-      SizedBox(
-        height: kFilmStripH,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 6),
-          child: FilmStrip(catalog: rc.film, selected: e.film, onSelect: (i) => ctl.selectDiscrete(filmRow, i)),
-        ),
-      ),
-      Expanded(child: active.id == 'film' ? const SizedBox.shrink() : _lower(context, active)),
-    ]);
+    // One control per selected chip: the stock strip is the 胶片 chip's control (a picker with air around it), not a
+    // second scroller stacked under the chip strip.
+    return _lower(context, active);
   }
 
   Widget _lower(BuildContext context, ParamRow row) {
     switch (row.kind) {
       case RowKind.oneD:
-        return RulerTier(ctl: ctl, row: row, group: group);
+        return RulerTier(ctl: ctl, row: row, group: group, histogram: !side);
       case RowKind.twoD:
         if (row.twoD == TwoD.tone) return _tone(context, row);
+        if (padOnPhoto) return Center(child: _PadHint(ctl: ctl, row: row));
         return Padding(
           padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-          child: SizedBox.expand(child: ControlPad(ctl: ctl, row: row)),
+          // a pane is narrow and tall: the pad is a square at the pane's width, never taller than there is room for
+          child: SizedBox.expand(child: ControlPad(ctl: ctl, row: row)), // the pad takes the whole width and the height there is (not necessarily square)
         );
       case RowKind.discrete:
         return _picker(context, row);
@@ -607,7 +928,7 @@ class _Tier extends StatelessWidget {
     if (child == null) return const SizedBox.shrink();
     return Container(
       key: ValueKey('extra-${row.id}'),
-      alignment: Alignment.topCenter,
+      alignment: Alignment.center, // a picker sits in the middle of the room its category's tallest control sets
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
       child: child,
     );
@@ -619,12 +940,15 @@ class _Tier extends StatelessWidget {
 /// Value line, reset and the full-width ruler of a 1D parameter. In a tall panel (a landscape photo
 /// leaves room) the histogram is drawn wide under the ruler; otherwise a small one sits in the value line.
 class RulerTier extends StatelessWidget {
-  const RulerTier({super.key, required this.ctl, required this.row, required this.group});
+  const RulerTier({super.key, required this.ctl, required this.row, required this.group, this.histogram = true});
   final EditorController ctl;
   final ParamRow row;
   final EGroup group;
 
-  bool get _hist => group == EGroup.light || group == EGroup.curve || group == EGroup.style;
+  /// False in the side pane: the histogram sits above the chips there.
+  final bool histogram;
+
+  bool get _hist => histogram && (group == EGroup.light || group == EGroup.curve || group == EGroup.style);
 
   @override
   Widget build(BuildContext context) {
@@ -681,9 +1005,10 @@ class RulerTier extends StatelessWidget {
         height: kRulerValueH,
         child: Row(children: [
           // a small histogram where a wide one does not fit; the same width as the reset slot keeps the value centred
-          SizedBox(width: 112, child: _hist && !wide ? Padding(padding: const EdgeInsets.only(left: 12), child: MiniHistogramBox(analysis: ctl.analysis())) : null),
+          // (the value takes what is left between them: a narrow pane has no room to balance the two sides)
+          if (_hist && !wide) Padding(padding: const EdgeInsets.only(left: 12), child: MiniHistogramBox(analysis: ctl.analysis())),
           Expanded(child: Center(child: valueText)),
-          const SizedBox(width: 112),
+          const SizedBox(width: 56),
         ]),
       );
       final ruler = SizedBox(height: kRulerH, child: DockRuler(ctl: ctl, row: row, restValue: rest));

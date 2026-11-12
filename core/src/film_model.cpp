@@ -261,6 +261,18 @@ FilmModel::FilmModel(const FilmStock& film, const FilmStock* paper, const FilmPa
   init();
 }
 
+// The image path's input matrix. The image is white balanced (scene white = ProPhoto D50): put the scene illuminant back, then adapt it to the
+// film's reference white with CAT16 degree D (cone gain D * Wd / Ws + 1 - D). D = 1 (or no scene illuminant) is exactly mIn_.
+void FilmModel::buildInputMatrix() {
+  mInImg_ = mIn_;
+  const double sx = p_.camera.sceneWhiteX, sy = p_.camera.sceneWhiteY, D = std::clamp(p_.camera.adaptationDegree, 0.0, 1.0);
+  if (!(sx > 0 && sy > 0 && D < 1.0)) return;
+  const Mat3 toScene = adaptationMatrix(cat16(), kD50x, kD50y, sx, sy);
+  const Vec3 rs = mul(cat16(), xyzOfWhite(sx, sy)), rd = mul(cat16(), xyzOfWhite(wx_, wy_));
+  const Mat3 toFilm = mul(inverse(cat16()), mul(diag({D * rd[0] / rs[0] + 1 - D, D * rd[1] / rs[1] + 1 - D, D * rd[2] / rs[2] + 1 - D}), cat16()));
+  mInImg_ = mul(toFilm, mul(toScene, prophotoToXyz()));
+}
+
 void FilmModel::init() {
   scanFilm_ = p_.io.scanFilm || !paper_;
   if (!illuminant(film_.referenceIlluminant, iRef_)) {
@@ -269,6 +281,7 @@ void FilmModel::init() {
   }
   xyOfXyz(illuminantXyz(iRef_), wx_, wy_);
   mIn_ = mul(adaptationMatrix(cat16(), kD50x, kD50y, wx_, wy_), prophotoToXyz());
+  buildInputMatrix();
   pe_ = p_.enlarger.printExposure;
   gam_ = {p_.filmRender.densityCurveGamma * p_.filmRender.densityCurveGammaRgb[0],
           p_.filmRender.densityCurveGamma * p_.filmRender.densityCurveGammaRgb[1],
@@ -375,13 +388,6 @@ void FilmModel::init() {
   }
   if (!scanFilm_) {
     if (p_.settings.neutralPrintFilters) solveNeutral();
-    mSolved_ = p_.enlarger.mFilterNeutral;
-    ySolved_ = p_.enlarger.yFilterNeutral;
-    castKnown_ = p_.settings.neutralPrintFilters;
-    if (castKnown_ && p_.enlarger.neutralMix != 0) {  // partial neutralisation (EditParams::filmCast)
-      p_.enlarger.mFilterNeutral = mSolved_ + (p_.enlarger.refMNeutral - mSolved_) * p_.enlarger.neutralMix;
-      p_.enlarger.yFilterNeutral = ySolved_ + (p_.enlarger.refYNeutral - ySolved_) * p_.enlarger.neutralMix;
-    }
     buildEnlarger(p_.enlarger.cFilterNeutral, p_.enlarger.mFilterNeutral + p_.enlarger.mFilterShift,
                   p_.enlarger.yFilterNeutral + p_.enlarger.yFilterShift);
     buildBlackWhite();
@@ -495,7 +501,7 @@ Vec3 FilmModel::exposureScaled(const Vec3& rgb, double scale, const Mat3* mm) co
 }
 
 Vec3 FilmModel::exposure(const Vec3& rgb) const {
-  return exposureScaled(rgb, std::exp2(p_.camera.exposureCompensationEv));
+  return exposureScaled(rgb, std::exp2(p_.camera.exposureCompensationEv), &mInImg_);
 }
 
 Vec3 FilmModel::logExposure(const Vec3& e) const {
@@ -842,9 +848,9 @@ FilmTables FilmModel::bake(BakeTimings* tm) const {
 // Input stage tables: the 3x3 into the film's balance white and the reflect-padded raw-exposure LUT.
 void FilmModel::bakeInput(FilmTables& t) const {
   for (int c = 0; c < 3; ++c) {
-    t.mIn[c * 4 + 0] = float(mIn_[0 * 3 + c]);
-    t.mIn[c * 4 + 1] = float(mIn_[1 * 3 + c]);
-    t.mIn[c * 4 + 2] = float(mIn_[2 * 3 + c]);
+    t.mIn[c * 4 + 0] = float(mInImg_[0 * 3 + c]);
+    t.mIn[c * 4 + 1] = float(mInImg_[1 * 3 + c]);
+    t.mIn[c * 4 + 2] = float(mInImg_[2 * 3 + c]);
     t.mIn[c * 4 + 3] = 0.f;
   }
   const int n = raw_->n;
@@ -882,9 +888,9 @@ void FilmModel::bakeCurves(FilmTables& t) const {
 }
 
 // film density -> display sRGB, whole print + scan chain (needs the paper; changes with the enlarger filtration)
-void FilmModel::bakePrintScan(FilmTables& t) const {
+void FilmModel::bakePrintScan(FilmTables& t, int lutN) const {
   // film density -> display sRGB, whole print + scan chain
-  const int N = p_.settings.lutResolution;
+  const int N = lutN > 0 ? lutN : p_.settings.lutResolution;
   t.lutN = N;
   for (int c = 0; c < 3; ++c) {
     t.dmin[c] = float(dMinFilm_[c]);

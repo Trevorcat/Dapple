@@ -170,9 +170,6 @@ class EditorController extends ChangeNotifier implements GestureSink {
   /// floating windows. Changes what back and a tap on the photo do to the open category.
   bool docked = false;
 
-  /// The running adjust gesture started on a control inside a floating window (a pad): that window
-  /// must stay open under the finger instead of folding to its one-line readout.
-  bool dragFromWindow = false;
 
   final Map<EGroup, String> _activeId = {};
 
@@ -234,10 +231,9 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   /// A control (docked ruler, pad) starts an adjust gesture on [row]: the same code path as a drag
   /// on the photo, so both stay in sync. Makes [row] the active row of its category first.
-  void beginOn(ParamRow row, LockAxis axis, double x, double y, {bool fromWindow = false}) {
+  void beginOn(ParamRow row, LockAxis axis, double x, double y) {
     if (row.switchable) _activeId[row.group] = row.id;
     wm.focus(row.group);
-    dragFromWindow = fromWindow;
     adjustBegin(axis, x, y);
   }
 
@@ -333,16 +329,17 @@ class EditorController extends ChangeNotifier implements GestureSink {
           // pad coordinates: x right = +1; y up = +1; the mapper works on 0..1 screen coordinates (y down)
           // an ineffective end of an axis is unreachable: the mapper stops at the centre line there
           final eff = row.padEff;
+          final xm = row.padXMin, defX = (0 - xm) / (1 - xm); // 0.5 symmetric, 0 for a one-sided axis (film_wb)
           _pal = PaletteMapper(
-              defX: 0.5,
+              defX: defX,
               defY: 0.5,
               lo: 0,
               hi: 1,
-              loX: eff[0] ? 0 : 0.5,
-              hiX: eff[1] ? 1 : 0.5,
+              loX: eff[0] ? 0 : defX,
+              hiX: eff[1] ? 1 : defX,
               loY: eff[3] ? 0 : 0.5,
               hiY: eff[2] ? 1 : 0.5)
-            ..begin((c.edit.value(row.padX!) + 1) / 2, (1 - c.edit.value(row.padY!)) / 2);
+            ..begin((c.edit.value(row.padX!) - xm) / (1 - xm), (1 - c.edit.value(row.padY!)) / 2);
       }
     }
 
@@ -494,11 +491,12 @@ class EditorController extends ChangeNotifier implements GestureSink {
         // map under row.padX / row.padY (film_shoot / film_print), normalised to [-1, +1],
         // 0 = automatic; EditState.toWire sends them like every other film_* key, so connecting the engine means
         // the engine's film node reading those keys; nothing else changes here.
-        final ox = p.snapped ? 0.0 : (((p.x * 2 - 1) * 100).round() / 100);
+        final xm = row.padXMin;
+        final ox = p.snapped ? 0.0 : (((xm + p.x * (1 - xm)) * 100).round() / 100);
         final oy = p.snapped ? 0.0 : (((1 - p.y * 2) * 100).round() / 100);
         _apply((e) => e.withValue(row.padX!, ox).withValue(row.padY!, oy));
         haptics.landmark(p.landmark);
-        readout.value = offsetPadText(ox, oy);
+        readout.value = offsetPadText(ox, oy, xSigned: xm < 0);
         if (p.landmark == Landmark.autoSnap) readout.flash++;
       case TwoD.wheel:
         final w = _wheel!;
@@ -557,7 +555,6 @@ class EditorController extends ChangeNotifier implements GestureSink {
     _undragTimer?.cancel();
     _undragTimer = Timer(const Duration(milliseconds: 150), () {
       dragging.value = false;
-      dragFromWindow = false;
     });
     _bump();
   }

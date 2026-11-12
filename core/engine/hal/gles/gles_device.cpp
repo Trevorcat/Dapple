@@ -23,6 +23,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "engine/exec/big_core.h"
 #include "engine/hal/gles/gles_device.h"
 #include "engine/hal/gles/gles_gl.h"
 #include "engine/hal/hal.h"
@@ -227,6 +228,7 @@ class GlThread {
 
  private:
   void loop() {
+    dapple::engine::gpu::detail::pinCurrentThreadToBigCores();  // every GL call of the device is recorded and submitted here
     for (;;) {
       std::function<void()> f;
       {

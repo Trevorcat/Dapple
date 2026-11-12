@@ -73,6 +73,10 @@ struct FilmImg {
 // The develop / grain / print / scan chain over `win`. The image is only valid inside `win` shrunk by filmWindowHalo() on the sides that are
 // not a frame border (the caller passes a window grown by the halo and clipped to the frame): the values there are those of a whole-frame run.
 // `pre` carries the frame-sized E2 / q images (externals of a persistent copy in a tiled export). fw x fh = the frame.
+// True when the last film pass of this frame clamps to 0..1 itself (film_pd ENCODE with FilmResolved::clampOut): the executor then skips film_fin when that
+// would be a pure clamp.
+bool filmEndsClamped(const FilmResolved& res);
+
 FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pr, const FilmPre& pre, int fw, int fh,
                          const FilmWin& win);
 int filmWindowHalo(const FilmResolved& res);

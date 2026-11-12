@@ -597,7 +597,9 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
   a.filmExposure = f.filmEv;
   a.printEv = f.printEv;
   a.black = f.black;
-  a.cast = f.cast;
+  a.sceneX = f.sceneX;
+  a.sceneY = f.sceneY;
+  a.adapt = f.adapt;
   a.warmth = f.warmth;
   a.tint = f.tint;
   a.grainPct = f.grainPct;
@@ -607,10 +609,12 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
   a.h = in.frame.outH;
   a.quality = f.quality;
   a.keepGrain = f.keepGrain;
+  a.coarse = f.coarse;
   a.fullLongEdge = f.fullLongEdge;
   a.frameIndex = f.frameIndex;
   // r.lib / r.stock point into the process-wide default library, which outlives the frame
   if (!filmnode::filmFrameResolved(a, r)) return fail(GpuFailure::Unsupported, "film stock / paper not available");
+  r.clampOut = f.strength >= 1.f && f.displayPlain && in.frame.vignette == 0.f;
   std::string why;
   if (!filmnode::filmGpuSupported(r, why)) return fail(GpuFailure::Unsupported, why);
   return true;
@@ -786,6 +790,7 @@ struct Executor::Walk {
   float strength = 1.f;
   FramePlan mainPlan;  // P without the vignette: the normal branch of a blend (the vignette follows the blend)
   int filmOx = 0, filmOy = 0;  // frame coordinates of pixel (0, 0) of filmH
+  bool filmClamped = false;    // the film plane is already clamped to 0..1 (a pure-clamp film_fin is skipped)
   filmnode::FilmPre pre;
 
   Walk(GpuRecorder& rec, const GpuRun& run, float resizeSharpen, bool wholeFrame)
@@ -852,6 +857,7 @@ struct Executor::Walk {
     const H in = filmInput();
     if (in < 0) return false;
     filmH = filmnode::recordFilmFrame(r, *fres, *ftab, *fplan, in, P.outW, P.outH);
+    filmClamped = filmH >= 0 && filmnode::filmEndsClamped(*fres);
     filmOx = filmOy = 0;
     return filmH >= 0;
   }
@@ -966,6 +972,10 @@ struct Executor::Walk {
         if (blend) {
           M = mainBranch(W, Hh, ox, oy);
           if (M < 0) return false;
+        }
+        if (filmClamped && !blend && !e.last && filmOx == 0 && filmOy == 0) {  // film_fin would only clamp: film_pd did it
+          D = filmH;
+          continue;
         }
         if (!filmFinish(e, D, W, Hh, ox, oy, M)) return false;
         continue;

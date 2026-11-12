@@ -170,7 +170,7 @@ film::FilmParams refParams(const ef::FilmResolved& r, int quality) {
   fp.camera.autoExposure = false;
   fp.enlarger.printExposure = std::exp2(-double(std::clamp(r.printEv, -9.f, 9.f)));
   applyFilmPaperMapping(fp, r.black);
-  applyFilmCast(fp, film::defaultLibrary(), r.cast);
+  fp.camera.sceneWhiteX = r.sceneX, fp.camera.sceneWhiteY = r.sceneY, fp.camera.adaptationDegree = r.adapt;  // film white balance
   fp.camera.filmFormatMm *= r.formatScale;
   fp.enlarger.yFilterShift = -r.warmth / 100.f * 12.f;
   fp.enlarger.mFilterShift = -r.tint / 100.f * 12.f;

@@ -1,5 +1,7 @@
 #include "render_loop.h"
 
+#include "engine/exec/big_core.h"
+
 #include <chrono>
 
 #if defined(__ANDROID__)
@@ -152,6 +154,7 @@ struct LoopAccess {
 #endif
 
 void RenderLoop::threadMain() {
+  dapple::engine::gpu::detail::pinCurrentThreadToBigCores();  // this thread renders and presents every frame
 #ifdef DAPPLE_PRESENT_CHOREO
   if (useVsync_) {
     impl_->looper = ALooper_prepare(0);

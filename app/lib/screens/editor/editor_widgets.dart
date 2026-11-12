@@ -52,7 +52,7 @@ class HistPainter extends CustomPainter {
         ..color = accent
         ..strokeWidth = 1.5;
       for (final q in [a.p5, a.p50, a.p95]) {
-        final x = (q * w).clamp(0.75, w - 0.75);
+        final x = (q * w).clamp(0.75, math.max(0.75, w - 0.75)).toDouble();
         for (double y = 0; y < h; y += 6) {
           canvas.drawLine(Offset(x, y), Offset(x, math.min(y + 3, h)), p);
         }

@@ -235,6 +235,12 @@ ParamRegistry::ParamRegistry() {
         in.edit.filmPrintEv = v ? 0.5f : -0.5f;
         return true;
       });
+  add("ctx.filmScene", C, [](const ParamInputs& in, Hasher& h) { h.f32(in.edit.filmSceneX), h.f32(in.edit.filmSceneY); },
+      [](ParamInputs& in, int v) {
+        in.edit.filmSceneX = v ? 0.33f : 0.40f;
+        in.edit.filmSceneY = v ? 0.35f : 0.39f;
+        return true;
+      });
   add("ctx.keepGrain", D, [](const ParamInputs& in, Hasher& h) { h.boolean(in.keepGrain); }, nullptr);
   add("ctx.activeParam", C, [](const ParamInputs& in, Hasher& h) { h.str(in.frame.activeParam); },
       [](ParamInputs& in, int v) { return perturbString(in.frame.activeParam, v, {"", "grain", "exposure"}); });

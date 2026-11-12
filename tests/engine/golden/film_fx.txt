@@ -12,7 +12,7 @@ boost never reached (x0 >= max) cda7210f1122e63c
 enlarger glimmerglass 6795e08ffd2eaeab
 enlarger black_pro_mist 9409990ae3f80986
 enlarger pro_mist strong x2 966658ea55907424
-enlarger cinebloom 3b4388326c5e60bb
+enlarger cinebloom 54b32f949bef7432
 enlarger interactive 25d7534d14b6ac7b
 enlarger, no grain, no halation 71719550081199f9
 enlarger cine + 2383 80f2d1771c5a53ae

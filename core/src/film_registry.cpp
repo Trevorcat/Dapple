@@ -126,7 +126,7 @@ std::vector<StockInfo> listStocks(const FilmLibrary& lib) {
     const FilmStock* s = lib.find(id);
     if (!s) continue;
     const char* kind = s->isPrintMedium() ? "paper" : (s->positive() ? "slide" : "negative");
-    out.push_back({id, s->name.empty() ? id : s->name, kind});
+    out.push_back({id, s->name.empty() ? id : s->name, kind, std::string(kind) == "negative" ? defaultPaperFor(lib, id) : std::string()});
   }
   return out;
 }
@@ -134,6 +134,9 @@ std::vector<StockInfo> listStocks(const FilmLibrary& lib) {
 std::string defaultPaperFor(const FilmLibrary& lib, const std::string& filmId) {
   const FilmStock* f = lib.find(filmId);
   if (!f || f->positive()) return "none";
+  // the paper the profile is made to be printed on (info.target_print): Fuji negatives on Crystal Archive, Kodak stills on Portra Endura,
+  // cine negatives on 2383
+  if (!f->targetPrint.empty() && lib.find(f->targetPrint) && lib.find(f->targetPrint)->isPrintMedium()) return f->targetPrint;
   if (f->use == "cine" && lib.find("kodak_2383")) return "kodak_2383";
   return lib.find("kodak_portra_endura") ? "kodak_portra_endura" : "none";
 }

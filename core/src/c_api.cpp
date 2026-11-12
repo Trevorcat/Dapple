@@ -55,7 +55,13 @@ struct DappleSession {
   // film exposure that keeps the photo's key (film_match.h): own 256 px proxy, results cached by filmMatchKey()
   std::mutex keyMtx;
   std::shared_ptr<dapple::SourceImage> keyProxy;
-  std::vector<std::pair<std::string, dapple::FilmExposure>> filmKeys;
+  struct FilmKeyEntry {
+    std::string key;
+    dapple::FilmExposure ev;
+    bool exact;
+  };
+  std::vector<FilmKeyEntry> filmKeys;
+  dapple::FilmMatchCache filmCache;  // image statistics + remembered medians of the match (film_match.h)
   // Where the executors read the full-resolution source from (the GPU keeps a device copy per store identity)
   std::once_flag storeOnce;
   std::unique_ptr<dapple::engine::MemorySourceStore> store;
@@ -179,17 +185,25 @@ bool parseParams(const char* paramsJson, EditParams& params) {
 
 // `params` with EditParams::filmKeyEv set: the EV that puts the film render's median lightness where the normal develop
 // render of the same edit has it (film_match.h). A few film evaluations of the 256 px proxy, cached by key.
-EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath = nullptr) {
+EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath = nullptr, bool interactive = false) {
   params.filmKeyEv = 0.f;
   params.filmPrintEv = 0.f;
+  params.filmSceneX = s->source.meta.asShotIlluminantXy[0];  // film white balance: the scene's as-shot illuminant (0 = unknown)
+  params.filmSceneY = s->source.meta.asShotIlluminantXy[1];
   if (params.filmStock.empty() || std::getenv("DAPPLE_FILM_MATCH_OFF")) return params;
   const std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
-  const std::string key = filmMatchKey(params) + "|" + lutFile;
+  // DAPPLE_FILM_MATCH_UNCACHED=1: the match as before section 26 (full key, every solve from scratch, no calibration warm-up): the A/B switch of the drag bench
+  const char* ue = std::getenv("DAPPLE_FILM_MATCH_UNCACHED");
+  const bool uncached = ue && ue[0];
+  const std::string key = (uncached ? filmMatchKey(params) : filmMatchKeyLean(params)) + "|" + lutFile + "|" + std::to_string(params.filmSceneX) + "," + std::to_string(params.filmSceneY);
+  if (!uncached) prewarmFilmCalibration(params, [] { sys::setBackground(true); });
   std::lock_guard<std::mutex> lock(s->keyMtx);
+  // A result that interpolated remembered medians (a print solve while a slider moves) serves interactive frames only; the frame after the
+  // drag solves for real (docs/engine/pipeline-architecture.md section 26).
   for (auto& e : s->filmKeys)
-    if (e.first == key) {
-      params.filmKeyEv = e.second.filmEv;
-      params.filmPrintEv = e.second.printEv;
+    if (e.key == key && (e.exact || interactive)) {
+      params.filmKeyEv = e.ev.filmEv;
+      params.filmPrintEv = e.ev.printEv;
       return params;
     }
   if (!s->keyProxy) {
@@ -199,9 +213,18 @@ EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath 
   }
   std::shared_ptr<const Lut3D> lut;
   if (!lutFile.empty()) lut = loadLut(lutFile);
-  const FilmExposure ev = matchFilmExposure(params, *s->camera, lut.get(), *s->keyProxy);
+  s->filmCache.proxyOwner = s->keyProxy;
+  s->filmCache.lutOwner = lut;
+  const FilmExposure ev = uncached ? matchFilmExposure(params, *s->camera, lut.get(), *s->keyProxy)
+                                   : matchFilmExposureCached(params, *s->camera, lut.get(), lutFile, *s->keyProxy, s->filmCache, !interactive);
+  const bool exact = uncached || !s->filmCache.lastApprox;
+  for (auto it = s->filmKeys.begin(); it != s->filmKeys.end(); ++it)
+    if (it->key == key) {
+      s->filmKeys.erase(it);
+      break;
+    }
   if (s->filmKeys.size() >= 12) s->filmKeys.erase(s->filmKeys.begin());
-  s->filmKeys.emplace_back(key, ev);
+  s->filmKeys.push_back({key, ev, exact});
   params.filmKeyEv = ev.filmEv;
   params.filmPrintEv = ev.printEv;
   return params;
@@ -659,7 +682,9 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   std::lock_guard<std::mutex> lock(s->mtx);
   EditParams params;
   if (!parseParams(paramsJson, params)) return false;
-  params = withFilmKey(s, params, lutPath);
+  const auto tMatch0 = std::chrono::steady_clock::now();
+  params = withFilmKey(s, params, lutPath, (rq.flags & DAPPLE_FRAME_INTERACTIVE) != 0);
+  const double matchMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tMatch0).count();
   std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
   std::shared_ptr<const Lut3D> lut;
   if (!lutFile.empty()) {
@@ -690,8 +715,10 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     s->proxy->sceneReferred = s->source.sceneReferred;
     s->proxy->linear = resizeToLongEdge(s->source.linear, 256);
   }
+  const auto tRen0 = std::chrono::steady_clock::now();
   Renderer renderer(params, *s->camera, lut.get());
   renderer.setToneProxy(s->proxy.get());
+  const double rendererMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tRen0).count();
   // Grain (14 Q8): a drag of a grain-family slider keeps grain in interactive frames; a frame smaller than the full
   // render previews it with grain statistically matched to the downscaled full-resolution grain.
   const std::string activeParam = rq.active_param ? rq.active_param : "";
@@ -724,6 +751,8 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   if (dapple::engine::engineInUse()) {
     // Frame engine: graph + table nodes + ResultCache replace the bakes[3] lookup (stage a2/a3). Same inputs, same outputs.
     dapple::engine::FrameJob job{params, renderer, src, s->proxy.get(), *s->camera, lut.get(), {}, {}, {}};
+    job.matchMs = matchMs;
+    job.rendererMs = rendererMs;
     job.request.longEdge = rq.long_edge;
     job.request.interactive = interactive;
     job.request.activeParam = rq.active_param ? rq.active_param : "";
@@ -736,6 +765,9 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     job.fastOptions.noise = job.request.noise;
     job.fastOptions.region = region;
     job.fastOptions.keepGrain = keepGrain;
+    // a table slider moves: a print table that is not cached is baked coarsely, the frame after the drag bakes the exact one (section 26)
+    job.fastOptions.coarseFilm = interactive && !activeParam.empty() && activeParam != "grain" && activeParam != "film_grain" && activeParam != "film_strength" &&
+                                 activeParam != "film_halation" && !std::getenv("DAPPLE_FILM_COARSE_OFF");
     job.fastOptions.fullLongEdge = fullLongEdge;
     s->lutKeep = lut;
     s->lastParams = params;
@@ -985,7 +1017,7 @@ char* dapple_film_list_json(void) {
           bool first = true;
           for (const film::StockInfo& s : film::listStocks(*lib)) {
             j += std::string(first ? "" : ",") + "{\"id\":\"" + esc(s.id) + "\",\"name\":\"" + esc(s.name) +
-                 "\",\"type\":\"" + s.kind + "\"}";
+                 "\",\"type\":\"" + s.kind + "\"" + (s.paper.empty() ? std::string() : ",\"paper\":\"" + esc(s.paper) + "\"") + "}";
             first = false;
           }
         }
@@ -1083,16 +1115,14 @@ char* dapple_session_film_pad_json(DappleSession* session, const char* params_js
                       double(pad.whiteL));
         std::string js = buf;
         js.pop_back();  // the closing brace: more axes follow
-        char b2[900];
+        char b2[1100];
         auto tf = [](bool v) { return v ? "true" : "false"; };
         std::snprintf(b2, sizeof b2,
-                      ",\"cast_k\":[%.3f,%.3f,%.3f],\"cast_grey_c\":[%.2f,%.2f,%.2f],\"cast_grey_worst\":[%.2f,%.2f,%.2f],\"cast_grey_mean\":[%.2f,%.2f,%.2f],"
-                      "\"effective_lo\":{\"film_shoot\":%s,\"film_print\":%s,\"film_black\":%s,\"film_cast\":%s},\"effective_hi\":{\"film_shoot\":%s,\"film_print\":%s,\"film_black\":%s,\"film_cast\":%s}}",
-                      double(pad.castK[0]), double(pad.castK[1]), double(pad.castK[2]), double(pad.castGreyC[0]), double(pad.castGreyC[1]),
-                      double(pad.castGreyC[2]), double(pad.castGreyWorst[0]), double(pad.castGreyWorst[1]), double(pad.castGreyWorst[2]),
-                      double(pad.castGreyMean[0]), double(pad.castGreyMean[1]), double(pad.castGreyMean[2]), tf(pad.effectiveLo[0]),
-                      tf(pad.effectiveLo[1]), tf(pad.effectiveLo[2]), tf(pad.effectiveLo[3]), tf(pad.effectiveHi[0]), tf(pad.effectiveHi[1]),
-                      tf(pad.effectiveHi[2]), tf(pad.effectiveHi[3]));
+                      ",\"scene_cct\":%.0f,\"reference_cct\":%.0f,"
+                      "\"effective_lo\":{\"film_shoot\":%s,\"film_print\":%s,\"film_black\":%s,\"film_wb\":%s,\"film_latitude\":%s},\"effective_hi\":{\"film_shoot\":%s,\"film_print\":%s,\"film_black\":%s,\"film_wb\":%s,\"film_latitude\":%s}}",
+                      double(pad.sceneCct), double(pad.referenceCct), tf(pad.effectiveLo[0]), tf(pad.effectiveLo[1]), tf(pad.effectiveLo[2]),
+                      tf(pad.effectiveLo[3]), tf(pad.effectiveLo[4]), tf(pad.effectiveHi[0]), tf(pad.effectiveHi[1]), tf(pad.effectiveHi[2]),
+                      tf(pad.effectiveHi[3]), tf(pad.effectiveHi[4]));
         return dupString(js + b2);
       },
       static_cast<char*>(nullptr));

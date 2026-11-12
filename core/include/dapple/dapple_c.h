@@ -118,12 +118,13 @@ DAPPLE_API char* dapple_film_swatch_bands_json(void);
  *   {"ok":true,"shared_ev":..,"final_ev":..,"fraction":..,"shoot_ev":[-1,0,+1],"print_l":[..],"black_l":[..],"latitude":[..],"white_l":..}
  * with the actual film EV at film_shoot -1/0/+1, the print's median L* at film_print -1/0/+1, the paper black L* at film_black
  * -1/0/+1 and the in-range fraction at film_latitude -1/0/+1,
- * plus "cast_k", "cast_grey_c" (mid grey), "cast_grey_worst", "cast_grey_mean" (C* of the neutral patches) at film_cast -1/0/+1 and
- * "effective_lo" / "effective_hi": {"film_shoot","film_print","film_black","film_cast"} booleans, true when that end of the axis actually changes the render
- * for this photo and film (a slide's film_print +1 does not, a stock that is its own reference has no film_cast).
- * {"ok":false} without an active film or with a legacy
+ * plus "scene_cct" / "reference_cct" (K; 0 = unknown): the correlated colour temperature of the scene illuminant as assumed by the current
+ * white balance (from the RAW's as-shot white balance) and of the stock's own reference illuminant, for labelling the film_wb axis, and
+ * "effective_lo" / "effective_hi": {"film_shoot","film_print","film_black","film_wb","film_latitude"} booleans, true when that end of the axis
+ * actually changes the render for this photo and film (a slide's film_print +1 does not; film_wb +1 does nothing when the scene light equals
+ * the stock's reference light or the scene illuminant is unknown). {"ok":false} without an active film or with a legacy
  * DAPPLE_FILM_MATCH_* mode. To preview a pad position render the 256 px proxy with params_json carrying the offsets
- * (film_shoot, film_print, film_black, film_latitude in -1..1): dapple_session_render with out_long_edge 256 (the match is cached
+ * (film_shoot, film_print, film_black, film_latitude in -1..1, film_wb in 0..1): dapple_session_render with out_long_edge 256 (the match is cached
  * per key, the print exposure of a moved film_print costs a few proxy renders). Free with dapple_free_string. */
 DAPPLE_API char* dapple_session_film_pad_json(DappleSession* session, const char* params_json);
 

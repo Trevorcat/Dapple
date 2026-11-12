@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 #include "dapple/film.h"
@@ -61,7 +62,8 @@ constexpr std::uint32_t tag4(const char (&s)[5]) {
   return std::uint32_t(std::uint8_t(s[0])) | std::uint32_t(std::uint8_t(s[1])) << 8 | std::uint32_t(std::uint8_t(s[2])) << 16 |
          std::uint32_t(std::uint8_t(s[3])) << 24;
 }
-constexpr std::uint32_t kTagAttr = tag4("ATTR"), kTagUpsm = tag4("UPSM"), kTagCmax = tag4("CMAX"), kTagStck = tag4("STCK");
+constexpr std::uint32_t kTagAttr = tag4("ATTR"), kTagUpsm = tag4("UPSM"), kTagCmax = tag4("CMAX"), kTagStck = tag4("STCK"),
+                     kTagPair = tag4("PAIR");  // film -> target print pairs (older readers skip the section)
 constexpr std::uint32_t kMaxStocks = 4096, kMaxFloats = 1u << 24, kMaxString = 1u << 20;
 
 std::uint32_t crc32(const unsigned char* p, std::size_t n) {
@@ -218,6 +220,7 @@ bool FilmLibrary::loadProfileJson(const std::filesystem::path& file, FilmStock& 
   s.antihalation = strOf(info->get("antihalation"));
   s.referenceIlluminant = strOf(info->get("reference_illuminant"));
   s.viewingIlluminant = strOf(info->get("viewing_illuminant"));
+  s.targetPrint = strOf(info->get("target_print"));
   if (meta) {
     s.copyright = strOf(meta->get("copyright"));
     s.license = strOf(meta->get("license"));
@@ -324,6 +327,18 @@ bool FilmLibrary::writePack(const std::filesystem::path& path, std::string* err)
     w.floats(cmax_.data);
     secs.push_back({kTagCmax, std::move(w.buf)});
   }
+  {  // film -> print paper pairs (info.target_print)
+    Writer w;
+    std::uint32_t n = 0;
+    for (const std::string& k : names()) n += !stocks_.at(k).targetPrint.empty();
+    w.u32(n);
+    for (const std::string& k : names())
+      if (!stocks_.at(k).targetPrint.empty()) {
+        w.str(k);
+        w.str(stocks_.at(k).targetPrint);
+      }
+    secs.push_back({kTagPair, std::move(w.buf)});
+  }
   for (const std::string& k : names()) {
     const FilmStock& s = stocks_.at(k);
     std::string e;
@@ -387,6 +402,7 @@ std::shared_ptr<FilmLibrary> FilmLibrary::loadPackMemory(const void* data, std::
     UpsampleTable up;
     CmaxTable cm;
     std::uint32_t nStocks = 0;
+    std::map<std::string, std::string> pairs;  // film -> target print (section PAIR, written before the stocks)
     Reader tr{base + 16, base + 16 + std::size_t(nSec) * 12};
     for (std::uint32_t i = 0; i < nSec; ++i) {
       const std::uint32_t tag = tr.u32(), off = tr.u32(), len = tr.u32();
@@ -412,6 +428,14 @@ std::shared_ptr<FilmLibrary> FilmLibrary::loadPackMemory(const void* data, std::
         cm.nJ = int(nj);
         cm.nH = int(nh);
         haveCm = true;
+      } else if (tag == kTagPair) {
+        const std::uint32_t n = r.u32();
+        if (n > kMaxStocks) return fail("corrupt pairing section");
+        for (std::uint32_t i = 0; i < n; ++i) {
+          std::string film = r.str();
+          pairs[film] = r.str();
+        }
+        if (!r.done()) return fail("corrupt pairing section");
       } else if (tag == kTagStck) {
         if (++nStocks > kMaxStocks) return fail("too many stocks");
         FilmStock s;
@@ -425,6 +449,8 @@ std::shared_ptr<FilmLibrary> FilmLibrary::loadPackMemory(const void* data, std::
         if (!r.done()) return fail("corrupt stock record");
         std::string e;
         if (!validateStock(s, &e)) return fail(e);
+        const auto pit = pairs.find(s.stock);
+        if (pit != pairs.end()) s.targetPrint = pit->second;
         lib->add(std::move(s));
       }  // unknown tags are skipped
     }

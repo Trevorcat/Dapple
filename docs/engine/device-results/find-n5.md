@@ -263,3 +263,136 @@ The "wall" column is the test harness (it converts the RGBA16F readback to float
 ### 9.3 Not measured on the phone (phone off adb)
 
 The develop + print fusion, the interactive component merge (pipeline-architecture 25.3), the `ensureFilm` table-cache fix (desktop `--film-interactive`: still frame 14.5 -> 3.9 ms), the app frame time, and a re-run of `film_gpu.parity` / `film_gpu.frames` / `gpu_tests --film-tiling` on the device. Rerun on reconnect: `adb -s 3B163700HQ200000 push build/w5-perf-arm64/bin/{dapple_film_gpu_tests,dapple_gpu_tests,libdapple.so} /data/local/tmp/dapple/`, then `DAPPLE_FILM_DATA=/data/local/tmp/dapple/film DAPPLE_GPU_PROFILE=1 DAPPLE_GPU_PASSLOG=1 DAPPLE_GPU_PROF_REPEAT=20 taskset 60 ./dapple_film_gpu_tests bench` and `./dapple_gpu_tests --film-interactive 1080`.
+
+
+
+## N5 wave 6 (2026-11-12, session on HEAD 919fbaf, clean `git worktree` build; folded outer display, unlocked)
+
+Builds: arm64 NDK r28, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`, binaries `build/n5/bin-w6/bin`, APK `build/n5/app-w6-arm64.apk` (release, arm64, debug key; `adb install -r` over the existing app worked). Needed from the main tree (untracked): `tools/` (junction), `build/shaderc/dapple_shaderc.exe`, `build/film/dapple_new.dfp` (same bytes as `app/assets/film/dapple.dfp`). Gradle needs `ANDROID_USER_HOME` as a Windows path (`F:\...`): with the `/f/...` path from `env.sh` the signing step fails (`...app\f\projects\...\debug.keystore`). Logs `build/n5/logs/w6_*`, screenshots `build/n5/w6app_*.png`. Thermal Status 0 before and after everything; battery 76 %, USB. The native runs were pinned with `taskset 60` (CPUs 5-6): `taskset -p` shows mask 60 for the main thread only, **driver / worker threads keep 0-6** (`/proc/<pid>/task/*/status`), so pinning is partial.
+
+### 1. Native
+
+Film GPU frame (`dapple_film_gpu_tests bench`, Portra 400, median of 10, GPU ms incl. readback copy / wall incl. harness readback; three runs, spread <= 2 %). Before = section 9.2 direct-taps column (wave 5, taken by the film perf engineer in a faster phone state).
+
+| case | before GPU / wall | wave 6 GPU / wall (runs 2, 3 GPU) | target | |
+|---|---|---|---|---|
+| 810x1080 interactive | 5.16 / 21.9 | **2.88** / 13.6 (2.81, 2.86) | <= 8.3 | met |
+| 1080 px (1080x720) interactive | 4.57 / 20.1 | **2.63** / 11.9 (2.67, 2.59) | <= 8.3 | met |
+| 1600 px interactive | 9.78 / 38.6 | **8.74** / 36.5 (8.80, 8.77) | <= 8.3 | **missed by 0.5 ms** |
+| 1600 px interactive, grain drag | 10.91 / 41.0 | 10.35 / 39.8 (10.47, 10.37) | <= 8.3 | missed |
+| 1600 px final | 14.98 / 48.2 | 15.99 / 44.7 (17.56, 17.59) | <= 16 | borderline (1 of 3 runs under) |
+| 1600 px final + highlight boost | 15.56 | 18.27 | | |
+| 1600 px final + enlarger diffusion | 27.92 | 30.98 | | (see bug 1) |
+| 810x1080 final | 9.07 | 10.29 (10.04, 10.20) | | |
+| 3600 px final | 81.49 | 91.15 | | |
+
+Fusion + merge helped the interactive cases; the final cases are 7-17 % slower than the section 9 numbers (no fusion/merge in the final tier; phone state differs). 1600 interactive is now 6 passes (film_point, gnoise, h3 x1, v3 x1, film_pd, readback).
+
+Per-pass (`DAPPLE_GPU_PROF_REPEAT=20`, ms): **1600 interactive**: film_point 0.528, gnoise 0.149, film_h3 (4 comps) 2.315, **film_v3 3.991**, film_pd (develop+print fused) 0.580, readback 0.743, total 8.305 (matches the 8.74 un-instrumented). 810x1080: 0.281 / 0.077 / 0.501 / 0.821 / 0.238 / 0.382 = 2.30. 1080x720: 0.250 / 0.070 / 0.445 / 0.727 / 0.209 / 0.339 = 2.04. 1600 grain drag: 11 passes, 9.68 ms (film_grain 0.53, f4h / f4v 0.25 each, film_enc 0.25). 1600 final: 32 passes, 15.36 ms, **film_v3 4.2 ms** and film_h3 1.9 ms are 40 % of it.
+
+GLES forced (`DAPPLE_GPU_API=gles`, no timestamps so "GPU" is the submit wall, readback included): 1600 final 24.7 / 51.8, 1600 interactive 14.7 / 41.1, 1600 grain 16.5 / 43.2, **1080 interactive 15.8 / 31.1 and 810x1080 interactive 19.7 / 36.3 (slower than 1600 px on GLES: odd, not investigated)**, 810x1080 final 17.5 / 34.5.
+
+First film frame in a fresh process (`dapple_gpu_tests --film-interactive`, whole session path): **1080: 349.5 ms wall (upload 110.6 = tables + plan + display, record 218.3 incl. pipeline creation, wait 13.3); 1600: 378.8 ms (119.4 / 217.7 / 25.9)**. Session path, median of 12, 2000x1500 source, wall ms: 1080 still 6.9 (wait 4.5), strength drag 7.1, film exposure drag 6.9, grain drag 9.1 (upload 0.7), halation 7.0, **film warmth drag 31.8 (upload 26.1: print LUT rebake)**; 1600 still 23.4 (wait 17.9), strength 24.0, grain 27.4, **warmth 50.4 (upload 28.9)**. The session path reports 10 passes for a still film frame at 1080 and 1600 (the `bench` Portra case has 6); wait is 4.5 ms (1080) / 17.9 ms (1600), 2-2.5x the bench GPU time. Not investigated which part differs.
+
+Correctness (arm64, Adreno 840):
+
+| gate | Vulkan | GLES |
+|---|---|---|
+| `dapple_gpu_tests` (default run) | PASSED, 0 failures | |
+| `dapple_film_gpu_tests` (film_gpu.parity) | **FAILED: 6 checks (bug 1)**, all other rows ok (point chain mean 0.014 p99 0.040, final grain off 0.030 / 0.098, boost 0.031 / 0.103, grain drag 0.026 / 0.081) | ok |
+| `dapple_film_gpu_tests frames` (film_gpu.frames) | ok (1536x1024 rows mean <= 0.078, p99 <= 0.87, max <= 1.87) | ok |
+| `dapple_gpu_tests --film-tiling` | PASSED, 0 differing px at tile 512 / 1000 / 2048 | PASSED |
+| `dapple_gpu_tests --coverage` | PASSED, 192 cases, 192 rendered by the GPU executor | |
+| `dapple_gpu_engine_tests` hal, box, sched, select, external | all PASSED | |
+| `dapple_golden selfcheck` (off vs full, arm64/NEON) | `selfcheck arch=arm64: 148 frames off vs full, 0 mismatches`, one-shot 0 differences, SELFCHECK OK; also with the film pack: OK | |
+| `dapple_exec_tests` whole / tiles / plan / cancel / analysis | all ok (whole byte-identical; 60 MP plan: tile 2048, peak 251 MB) | |
+
+**Bug 1 (Vulkan only): enlarger-diffusion film cases are wrong on the Adreno 840.** Six cases (`enlarger black_pro_mist`, `glimmerglass`, `cinebloom x2`, `pro_mist strong`, `boost + enlarger`, `enlarger + grain`), 960x640: dE2000 mean 40.0-40.7, p99 ~61, max 63-70. Log line: `enlarger black_pro_mist (portra, final) 960x640: dE2000 mean 40.5683 p99 61.9442 max 69.449`, worst pixel `cpu 0.8699 0.7846 0.2731  gpu -0.0004 0.4478 0.7788` (GPU output is blue-green, red 0, negative values). GLES passes the same cases. Not caused by direct taps, merge or workgroup size: same numbers with `DAPPLE_FILM_V3_DIRECT=0`, `DAPPLE_FILM_MERGE=0`, `DAPPLE_GPU_WG=128` (`w6_enlarger_isolate.log`). Not run: the same binary on a desktop GPU.
+
+Sustained loop (90 s, `810x1080 interactive` bench in a loop, 10 frames per 2 s so the GPU duty cycle is low, `w6_sustain_film.log`): GPU time 2.76-3.00 ms in all samples, wall 14.3-15.6 ms, Thermal Status 0 throughout: no drift, **but not a continuous-load soak** (the section 3.3 cap needs continuous load; not re-measured).
+
+### 2. GPU probe, fresh start (release APK, GPU auto)
+
+* Fresh start (force-stop, monkey): `dapple_engine: frame 175x117 ... exec=cpu reason=GPU self-test running | gpu 0 cpu 1`, then 147 ms later `... exec=vulkan | gpu 1 cpu 1`; same for the 192x128 thumbnail (CPU with the reason, then vulkan 95 ms later). So **the probe takes about 150-300 ms and frames before it are CPU with the reason "GPU self-test running"**. No `GpuProbe` / `dapple_present` line at that time and no duration is logged: the duration is read from frame timestamps. Vulkan was chosen.
+* Later start: the diagnostics page says `self-test cached pass (point+geometry: mean dE 0.040 p99 0.75 max 1.46 ok; spatial: mean dE 0.076 p99 0.86 max 1.45 ok; box scan vs direct: max diff 6.8e-06 ok)`, `mode auto · probe ready · in use`, `vulkan · Adreno (TM) 840`, device lost 0, demotions 0 (`w6app_43_diag_top.png`). The first start after `install -r` may already have used a record from the previous build (same versionName+versionCode and fingerprint): not checked.
+* `debug.dapple.gpu_api=gles` for one start: `exec=cpu reason=GPU self-test running`, then `exec=gles31` 105 ms / 143 ms later; the editor picture is correct (`w6app_40_gles.png`). Prop reset (empty).
+
+### 3. App, layout (outer display 1140x2616, system dark theme)
+
+* Home with photo permission (`w6app_03_home.png`): card `未连接相机 / 照片来自手机相册 · 2 张` + `连接相机`; without permission (`w6app_01_start1.png`): `还不能读取手机里的照片 / 允许后，手机相册里的照片会出现在这里` + `允许访问`. The permission was gone after `install -r`; I granted "全部照片和视频" in the system dialog.
+* Docked panel: it sits below the photo and the photo is re-fitted above it; **nothing covers the photo** in 光线 (ruler, `05`), 颜色 (ruler, `27`), 风格 + film strip + ruler (`09`, `13`: panel takes ~45 % of the screen, photo shrinks to about a third of the height), 曝光 film pad (`11`: 欠曝/过曝 horizontal, 浅/深 vertical, handle + hollow "auto" ring), 调色盘 pad (`32`), 宽容度 (`17`), 黑位 (`20`) rulers, collapsed panel (`26`: photo full width, only the chip row remains). Judgement: clean and legible, but (a) a selected chip loses its value (曝光, 宽容度, 黑位, 颗粒 show a blank under the name while selected; the big readout shows it), (b) the photo area changes size when the panel height changes between tabs, (c) chip row and film strip are two horizontal scrollers one above the other (a swipe 55 px too low scrolled the film strip instead; happened twice), (d) strong corner darkening in the captured photo is visible in the collapsed view (lens shading vs app vignette still not judged).
+* Reaction (pixel diff of the photo area before / after a swipe): 光线 exposure +1.7 -> +0.3 clearly darker; film strength 84 -> 71 %: mean diff 1.7 (max 109); film exposure pad `+14 +9`: mean 4.6 (max 156); **黑位 0 -> +34: mean 0.98 (max 13), visible but weak; 宽容度 75 % -> 98 %: mean 0.02 (max 9) = no visible change; 80 -> 75 %: diff exactly 0**. So `film_latitude` has no visible effect on this photo (tiny effect for this stock, or not applied in the interactive path; not isolated). 调色盘 `暖32 淡1` -> `暖34 淡4`: warm tint changes as expected.
+* The exposure pad moves the handle only part of the swipe distance (relative drag with a gain): final `+14 +9` after a ~560 px swipe.
+
+### 4. Frame times in the app (logcat `dapple_engine` / `dapple_view`, release APK, GPU auto)
+
+Every film frame in the app ran on the GPU: `frame ... tier=interactive film=on exec=vulkan | gpu N cpu 2` (cpu 2 = the two thumbnail frames during the probe), `ext` counts up with `host 1`, `hostBytes 3499200` flat, `tooSmall 0`, `refused 0`, `present` 0.4-1.4 ms.
+
+| drag | interactive size chosen | `render` ms (counter line; ema) | latency ms |
+|---|---|---|---|
+| film strength | 480x640 -> 810x1080 | 8.2 (ema 10.8), 2.0 (3.0), 4.0 (3.2) | 12-14 |
+| grain | 360x480 -> 608x810 -> 810x1080 | 1.7 (ema 21), 3.9 (4.3), 1.4 (2.3) | 12-16 |
+| **film exposure pad (shoot / print)** | **360x480** | 185 (ema 177), 35 (119), **178 (174)** | 80-212 |
+| **宽容度 (latitude)** | 360x480 | 138 (149) | 148 |
+| **黑位 (black)** | 360x480 | 44 (74), 33 (35) | 43-45 |
+| 光线 exposure ruler (film on) | 360x480 | 22.6 (33) | 33 |
+
+**Film frames run on the GPU in the app and strength / grain drags are 1.4-8 ms at 810x1080, but any change of the film exposure parameters (film_shoot / film_print / film_black / film_latitude) costs 35-185 ms per frame at 360x480** (probably a CPU table rebake like the warmth drag in section 1; the adaptive size then drops to 360x480; the CPU part is not logged). The adaptive ladder 360x480 / 480x640 / 608x810 / 810x1080 is visible in the log. `gfxinfo` showed 0 frames for the Flutter surface in every attempt, so no jank numbers.
+
+### 5. Lifecycle
+
+Home -> `am send-trim-memory com.dapple.dapple BACKGROUND` (process stayed, pid 19445) -> relaunch: `dapple_present: device Adreno ... (shared with the engine)`, `swapchain 848x1131 ... images 9` (re-created lazily), picture correct, drag changed the 调色盘 value and the picture, no error lines. Rotation: **not tested** (needs a system setting). Inner display / fold / unfold: **not tested** (outer display only).
+
+### 6. Engine A/B (exports of the same photo; the app does not persist edits so every open starts identical; default edit only, no extra drag)
+
+`debug.dapple.engine=off` with GPU auto: the log still shows `dapple_engine ... exec=vulkan` (the engine is forced when the GPU is on, as documented in `engine_session.h`). With `engine=off` + `debug.dapple.gpu=0`: no `dapple_engine` lines (old Renderer path). Exports (3072x4096 JPEG, 7 157 592 bytes, ~4 s each): default, engine off + GPU auto, engine off + GPU 0 are **byte-identical** (md5 `b517daa0d8de8be4a060da9ff8ba5846`; `build/n5/w6_export_*.jpg`). The test exports were deleted from the phone (file + MediaStore row).
+
+### 7. Codec diagnostics page (long-press 版本 on 设置; `w6app_43..46`)
+
+GPU block as in section 2. 运行自检, all PASS: `enc8avc c2.android.avc.encoder` 209 ms (8 frames, profile 0x10000, 219 luma levels), `enc8avc c2.qti.avc.encoder` 222 ms, `dec10 c2.qti.hevc.decoder.low_latency` 80 ms (P010 output, 652 distinct luma levels), `dec10 c2.qti.hevc.decoder` 96 ms (P010, 652), **`enc10 c2.qti.hevc.encoder.hdr` 242 ms (8 frames, Main10, decoded by c2.qti.hevc.decoder, 729 luma levels), `enc10 c2.qti.hevc.encoder` 477 ms (Main10, decoded, 729 levels)**, `enc8hevc` hdr 209 ms and plain 216 ms (Main, 221 levels). Ladders: encode 1080p30 = HEVC Main10 `c2.qti.hevc.encoder` first; decode HEVC10 = hardware P010. So HEVC Main10 encode (Surface input path of the app) and decode **work and the output is genuinely 10-bit**; the failure in section 6 above (m10 tool, P010 buffer input, no output) was the buffer-input path only.
+
+### 8. Camera
+
+Capture screen badge `RAW + JPEG`; one shot (phone face down, black picture) produced `DAP_20261112_182530.dng` 25 195 852 B and `.jpg` 1 696 619 B (Pictures/Dapple and MediaStore): badge matches the files; the editor opened on the black JPEG. The test shot (2 files + 2 MediaStore rows) was deleted; the earlier `DAP_20261112_154612.*` were left. The preview was black before the shot (dark scene), so the preview itself is not verified.
+
+### Not verified
+
+Continuous-load GPU soak; rotation; inner display; gfxinfo jank; the CPU time split of the 35-185 ms exposure-drag frames; bug 1 on a desktop GPU; whether `film_latitude` is meant to be this weak; edit-then-export A/B. End state: new APK installed, `debug.dapple.*` props empty, `/data/local/tmp/dapple` removed, worktree removed (the `tools` junction was removed first so `tools/` is intact). The gradle native build inside `flutter build apk` (~11 min) started before the 4-job limit message and ran at ninja's default parallelism; later steps used `org.gradle.workers.max=2` in the worktree only.
+
+## N5 wave 7 (2026-11-12, engine bug fixes on the working tree over b353e30; arm64 NDK r28, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`, `build/w7-arm64`, `taskset 60`; the phone left adb during the session: what ran is listed, the rest is marked NOT RUN)
+
+Analysis and design: `pipeline-architecture.md` section 26. Binaries pushed to `/data/local/tmp/dapple` (`dapple_film_gpu_tests`, `dapple_gpu_tests`, `dapple_drag_bench`, `libdapple.so`, the film pack, the 2048 px working copy of one ARW), removal at the end: **NOT DONE for the phone (it was gone from adb when the session ended): `/data/local/tmp/dapple` is still on 3B163700HQ200000 and must be removed (`adb -s 3B163700HQ200000 shell rm -r /data/local/tmp/dapple`)**.
+
+### Ran on the N5 (Adreno 840, thermal status 0 before and during)
+
+| gate | Vulkan | GLES 3.1 |
+|---|---|---|
+| `dapple_film_gpu_tests` (film_gpu.parity) | **ok, 0 failures; the six enlarger rows now mean dE 0.009-0.037, p99 <= 0.12, max <= 0.40 (before: mean 40, red 0)** | ok, 0 failures |
+| `dapple_film_gpu_tests frames` (film_gpu.frames) | ok | ok |
+| `dapple_gpu_tests --film-tiling` | PASSED (0 failures) | PASSED (0 failures) |
+
+Bug 1 of wave 6 (Vulkan-only enlarger-diffusion failure) is fixed: the cause was an unaligned `vkCmdCopyBufferToImage` source offset (section 26.2).
+
+### Drag cost through the C API (`dapple_drag_bench`: `dapple_session_render_frame`, INTERACTIVE, `active_param` set, GPU Vulkan, Portra 400, 19 frames, 6 s settle after a still frame; 360 px long edge = 240x360 output, not the app's 360x480; native process, so no Dart / presenter time)
+
+| drag | median ms | first frame of the drag | max |
+|---|---|---|---|
+| film_strength | 1.0 | 1.2 | 25.9 (one outlier) |
+| film_grain | 2.3 | 88.8 | 2.4 |
+| **film_shoot** | **5.4** | 7.6 | 6.9 |
+| **film_print** | **5.3** | **121.0** | 22.5 |
+| **film_black** | **6.2** | 6.2 | 8.0 |
+| **film_latitude** | 1.5 (no change on this photo) | 6.1 | 1.6 |
+| film_wb (film white balance, replaced film_cast in the tree) | 2.7 | 1.6 | 3.0 |
+| film_warmth | 6.6 | 7.4 | 7.3 |
+| film_tint | 7.0 | 7.6 | 7.5 |
+| film_exp | 1.2 | 7.3 | 1.4 |
+| exposure (film on) | 21.1 | 26.1 | 31.4 (measured before the `keyL0` reuse of pipeline-architecture 26.2, which takes it to 3.4 ms on the desktop) |
+
+Against the wave 6 app numbers (film exposure 35-185 ms, latitude 138-149, black 33-44, warmth 32-50 at 360x480) every table / match drag is now 5-7 ms in the native bench; the app adds Dart, the presenter and the 360x480 size (native 240x360 here): **the app-size number on the N5 is NOT measured**, and no "before" run of the same binary exists on the phone (the A/B switch `DAPPLE_FILM_MATCH_UNCACHED=1 DAPPLE_FILM_COARSE_OFF=1` was added after the phone left). The first frame of a film_print / film_grain drag is 89-121 ms (statistics, first print solve / grain plan): above the 16 ms worst case.
+
+### NOT RUN on the N5 (phone gone)
+
+* The same table at 480 px long edge and with the `keyL0` reuse; the A/B "before" with the switches above.
+* Items 3, 4, 6, 7 on the device: session-path pass count / wait at 1600 px (`--film-interactive`), cold and warm start with the new warm-up and the persisted Vulkan pipeline cache, the `dapple_engine` probe / `cpu_ms` log lines, big-core pinning of the present / GLES threads (`DAPPLE_GPU_NO_PIN=1` A/B). Desktop numbers for these are in section 26.
+* GLES forced frame times, a 1600 px interactive timing (target 8.3 ms; bench was 8.74 ms), the APK (`build/n5/app-w7-arm64.apk` not built), `adb install -r`, the app launch.

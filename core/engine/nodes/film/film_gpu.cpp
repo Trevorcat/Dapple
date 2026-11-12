@@ -583,7 +583,7 @@ bool uploadGpuTables(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables&
   }
   auto cl = dev.begin();
   if (!cl) return err = dev.lastError(), false;
-  if (!core.ensureStaging(cl->slot(), rawBytes + lutBytes + curveBytes + decBytes + l1Bytes + l3Bytes + pcBytes, err)) return false;
+  if (!core.ensureStaging(cl->slot(), rawBytes + lutBytes + curveBytes + decBytes + l1Bytes + l3Bytes + pcBytes + 1024, err)) return false;
   gpu::SlotRes& s = core.slot(cl->slot());
   auto* base = static_cast<std::uint8_t*>(s.staging.mapped);
   std::memcpy(base, raw.raw.data(), rawBytes);
@@ -597,7 +597,10 @@ bool uploadGpuTables(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables&
   g.copyBufferToBuffer(s.staging, g.externalBuf(out.curves), curveBytes, rawBytes + lutBytes);
   g.copyBufferToBuffer(s.staging, g.externalBuf(out.decode), decBytes, rawBytes + lutBytes + curveBytes);
   if (split) {
-    const std::uint64_t o1 = rawBytes + lutBytes + curveBytes + decBytes, o3 = o1 + l1Bytes, op = o3 + l3Bytes;
+    // bufferOffset of a buffer-to-image copy must be a multiple of the texel size (16 B for RGBA32F). The sRGB decode table is 16388 B,
+    // so the unaligned offsets shifted lut1 / lut3 by one float on Adreno Vulkan (red read as 0 in the enlarger diffusion path).
+    const auto al = [](std::uint64_t v) { return (v + 255) & ~std::uint64_t(255); };
+    const std::uint64_t o1 = al(rawBytes + lutBytes + curveBytes + decBytes), o3 = o1 + al(l1Bytes), op = o3 + al(l3Bytes);
     std::memcpy(base + o1, pr.lut1.data(), l1Bytes);
     std::memcpy(base + o3, pr.lut3.data(), l3Bytes);
     std::memcpy(base + op, pr.paperCurve.data(), pcBytes);
@@ -782,7 +785,13 @@ bool mergeEnabled() {
   static const bool on = [] { const char* e = std::getenv("DAPPLE_FILM_MERGE"); return !(e && e[0] == '0'); }();
   return on;
 }
+// Combined-weight limit of a merged group of small components (DAPPLE_FILM_MERGE_W overrides, for the exactness sweep in dapple_film_gpu_tests merge)
+double mergeWeightLimit() {
+  static const double w = [] { const char* e = std::getenv("DAPPLE_FILM_MERGE_W"); return e && e[0] ? std::atof(e) : 0.02; }();
+  return w;
+}
 void mergeSmallComps(fd::Mixture& m) {
+  const double wLimit = mergeWeightLimit();
   if (m.comps.size() < 3) return;
   std::vector<fd::GaussComp> v = m.comps;
   std::sort(v.begin(), v.end(), [](const fd::GaussComp& a, const fd::GaussComp& b) { return a.sigma < b.sigma; });
@@ -791,8 +800,8 @@ void mergeSmallComps(fd::Mixture& m) {
   while (i < v.size()) {
     double wsum = v[i].w, vsum = v[i].w * v[i].sigma * v[i].sigma;
     std::size_t j = i + 1;
-    if (v[i].w <= 0.02)
-      while (j < v.size() && wsum + v[j].w <= 0.02 && v[j].sigma <= 3.0 * v[i].sigma) {
+    if (v[i].w <= wLimit)
+      while (j < v.size() && wsum + v[j].w <= wLimit && v[j].sigma <= 3.0 * v[i].sigma) {
         wsum += v[j].w;
         vsum += v[j].w * v[j].sigma * v[j].sigma;
         ++j;
@@ -861,6 +870,16 @@ bool recordFilmPre(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTa
   out.e2 = E2;
   out.q = Q;
   return true;
+}
+
+bool filmEndsClamped(const FilmResolved& res) {
+  if (!res.clampOut) return false;
+  const auto pd = planOf(res);
+  if (!pd->error.empty() || !pd->plan.any()) return false;
+  const fd::SpatialPlan& pl = pd->plan;
+  const bool fuseDev = !pl.grain.active && !pd->split;
+  const bool us = !pd->unsharp.w.empty() && pl.unsharpAmount > 0 && pl.unsharpSigma > 0 && pd->unsharp.r > 0;
+  return fuseDev && pd->scanStage && pd->scan.r <= 0 && !us;  // = encodeHere of recordFilmWindow
 }
 
 FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pres, const FilmPre& pre, int fw, int fh,
@@ -1051,7 +1070,7 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
   // FilmPrintScan + the sRGB decode + the glare add in one pass: linear light
   H L;
   {
-    const hal::PipelineH p = r.pl("film_pd", {{0, fuseDev ? 8 : split ? 7 : 2}, {1, fuseDev && hasQ ? 1 : 0}, {2, encodeHere ? 1 : 0}});
+    const hal::PipelineH p = r.pl("film_pd", {{0, fuseDev ? 8 : split ? 7 : 2}, {1, fuseDev && hasQ ? 1 : 0}, {2, encodeHere ? 1 : 0}, {3, encodeHere && res.clampOut ? 1 : 0}});
     if (!p) return none;
     PointU u = split ? c.paperU(u0) : u0;
     u.dim[0] = w;

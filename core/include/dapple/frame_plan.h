@@ -44,11 +44,12 @@ struct FramePlan {
     float filmEv = 0.f;             // film_exp + the film exposure of the automatic match
     float printEv = 0.f;            // print exposure (EditParams::filmPrintEv)
     float black = 0.f;              // paper black (EditParams::filmBlack)
-    float cast = 0.f;               // partial neutralisation (EditParams::filmCast)
+    float sceneX = 0.f, sceneY = 0.f, adapt = 1.f;  // film white balance: assumed scene illuminant xy and degree of adaptation
     float warmth = 0.f, tint = 0.f, grainPct = 100.f, halationPct = 100.f;
     float formatScale = 1.f;
     int quality = 2;                // 0 off, 1 interactive, 2 full
     bool keepGrain = false;
+    bool coarse = false;             // interactive frame while a print-table slider moves: coarse print table if the exact one is not cached
     int fullLongEdge = 0;
     unsigned frameIndex = 0;
   } film;

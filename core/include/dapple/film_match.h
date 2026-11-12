@@ -25,6 +25,8 @@
 // window of film EVs in which the scene's shadows (p2) stay above the toe of the stock's green density curve and its
 // highlights (p99.5) stay below the shoulder. See docs/engine/pipeline-architecture.md section 18.
 #include <functional>
+#include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <vector>
@@ -73,11 +75,6 @@ constexpr float kFilmSystemGamma = 1.15f;
 // Owner decision (option C): only this share of the scene-key compensation is applied (the film chain keeps depth, the highlights
 // of a high-key scene roll off in the paper). DAPPLE_FILM_SCENE_EV_SCALE=1 reproduces the previous default.
 constexpr float kFilmSceneKeyScale = 0.5f;
-// film_cast (partial neutralisation of the print filter pack): film_cast 0 -> k0, +1 -> kmax, -1 -> 0 (every stock fully neutralised).
-constexpr float kFilmCastK0 = 0.25f;
-constexpr float kFilmCastKMax = 0.6f;
-// Print film (cine) papers have no "Endura" reference stock: this is the reference negative of 2383 / 2393.
-constexpr const char* kFilmCastCineReference = "kodak_vision3_250d";
 constexpr float kFilmShadowFloorY = 0.004f;  // floor of a pixel's luminance in the metering average
 // Per-stock usability guarantee: the share of scene pixels that must fall inside the stock's [toe, shoulder]; a stock whose range
 // fits keeps the shared exposure, a narrow one is moved just enough (docs section 18). The user's film_latitude moves it.
@@ -188,27 +185,21 @@ void scenePlacement(const FilmLatitude& lat, const SceneStats& st, float ev, flo
 // v5 stage 3: the print exposure (EV, positive = brighter) at which an 18.4 % grey card exposed at box speed + the type convention
 // prints to L* 50 relative to the paper white (paper "none": scan lamp). Calibrated once per (stock, paper), cached, image independent.
 float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper,
-                        float deltaEv = 0.f, float castK = 0.f);
+                        float deltaEv = 0.f);
 // The same for a negative whose film EV was moved by `deltaEv` from the shared exposure: the lab prints a denser / thinner
 // negative down / up (calibrated on a 0.5 EV grid and interpolated).
 float filmPrintConstantAt(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper,
-                          float deltaEv, float castK = 0.f);
+                          float deltaEv);
 
-// ---- film_cast: partial neutralisation of the print filter pack ('本色') ------------------------------------------------------
-// Mix k (0..1) from the slider -1..1: -1 -> 0, 0 -> kFilmCastK0, +1 -> kFilmCastKMax. 0 outside mode Meter / with the paper mapping off.
-float filmCastMixOf(float slider);
-float filmCastMix(float slider);
-// The reference stock whose solved pack is the reference of `paper` (the reference stock itself never changes).
-std::string filmCastReferenceStock(const film::FilmLibrary& lib, const std::string& paper);
-// Solved neutral M / Y pack of the reference stock of `paper`; false when there is no pack to mix with (slide / scan, unknown paper, or
-// `film` is the reference itself). Cached.
-bool filmCastReferencePack(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper,
-                           double* m, double* y);
-// Sets FilmParams::enlarger.neutralMix / refMNeutral / refYNeutral for mix k (fp.film and fp.paper must be set).
-void applyFilmCastMix(film::FilmParams& fp, const std::shared_ptr<const film::FilmLibrary>& lib, float k);
-inline void applyFilmCast(film::FilmParams& fp, const std::shared_ptr<const film::FilmLibrary>& lib, float slider) {
-  applyFilmCastMix(fp, lib, filmCastMix(slider));
-}
+// ---- film_wb: film white balance (胶片白平衡) ------------------------------------------------------------------------------
+// The scene illuminant (CIE xy) the current white balance declares white, and the degree of adaptation D = 1 - film_wb of the film's input.
+// The as-shot illuminant (EditParams::filmSceneX/Y, from the RAW) is put back and the user's white balance edit re-declares which colour is
+// neutral: the light is the as-shot light seen through the gain that the edit applies (a WB edit changes the assumed scene illuminant).
+// *D = 1 and *x = *y = 0 when film_wb is 0 or the scene illuminant is unknown: the film's own balance, exactly today's behaviour.
+void filmInputAdaptation(const EditParams& p, double* x, double* y, double* D);
+void applyFilmWb(film::FilmParams& fp, const EditParams& p);
+// CIE xy of the stock's reference illuminant (profile info.reference_illuminant); false when unknown.
+bool filmReferenceXy(const film::FilmStock& s, double* x, double* y);
 
 // Share of the scene's pixels inside the stock's [toe, shoulder] at film EV `ev` (on top of the stats' own gain).
 float inRangeFraction(const SceneStats& st, const FilmLatitude& lat, float ev);
@@ -222,7 +213,7 @@ struct MeterInputs {
   SceneStats st0, stFull;   // before / after the develop exposure (the diagnostics and the range use stFull)
   float keyL0 = 0.f;        // median L* of the develop render at exposure 0
   float shoot = 0.f, print = 0.f, latitude = 0.f;  // EditParams::filmShoot / filmPrint / filmLatitude
-  float castK = 0.f;       // partial neutralisation mix in use (filmCastMix(EditParams::filmCast))
+  double sceneX = 0, sceneY = 0;  // assumed scene illuminant xy (filmInputAdaptation with film_wb = 1; 0 = unknown), for the pad labels
   float negativeBiasEv = kFilmNegativeBiasEv;
   // median L* of the film render at (film EV, print EV); only needed for film_print != 0
   std::function<float(float, float)> medianL;
@@ -241,12 +232,10 @@ struct FilmPadInfo {
   float latitude[3] = {0, 0, 0};      // in-range fraction at film_latitude -1, 0, +1
   float sharedEv = 0.f, finalEv = 0.f, fractionAtFinal = 0.f;
   float whiteL = 0.f;
-  // film_cast: mix k at -1 / 0 / +1 and the grey-card chroma C* of this stock at those mixes (mid grey, and worst / mean over the four neutral
-  // patches of a ColorChecker-like chart)
-  float castK[3] = {0, 0, 0}, castGreyC[3] = {0, 0, 0};
-  float castGreyWorst[3] = {0, 0, 0}, castGreyMean[3] = {0, 0, 0};
-  // does -1 / +1 of each axis change the render for this image and stock (index: shoot, print, black, cast)
-  bool effectiveLo[4] = {false, false, false, false}, effectiveHi[4] = {false, false, false, false};
+  // film_wb: the correlated colour temperature of the assumed scene illuminant and of the stock's reference illuminant (0 = unknown)
+  float sceneCct = 0.f, referenceCct = 0.f;
+  // does -1 / +1 of each axis change the render for this image and stock (index: shoot, print, black, wb, latitude)
+  bool effectiveLo[5] = {false, false, false, false, false}, effectiveHi[5] = {false, false, false, false, false};  // index 4: film_latitude
 };
 FilmPadInfo filmPadInfo(const MeterInputs& in);
 // The same for an edit (develop pipeline + 256 px proxy); `ok` false without an active film or in a legacy mode.
@@ -303,5 +292,39 @@ std::string filmMatchKey(const EditParams& p);
 // `opt` null = FilmMatchOptions::fromEnv().
 FilmExposure matchFilmExposure(const EditParams& p, const CameraProfile& camera, const Lut3D* lut, const SourceImage& proxy,
                         FilmMatchInfo* info = nullptr, const FilmMatchOptions* opt = nullptr);
+
+
+// ---- Interactive sessions (docs/engine/pipeline-architecture.md section 26) --------------------------------------------------------
+// The image-dependent part of the v5 match, kept by the session: scene statistics of the develop edit and the median-L* samples of the
+// print solve. One cache per session (the caller serialises access).
+struct FilmMatchCache {
+  bool haveBase = false;
+  std::string baseKey, keyL0Key, seriesCtx;
+  float gain[3] = {1.f, 1.f, 1.f}, keyL0 = 0.f;
+  SceneStats st, st0;
+  std::map<int, std::vector<std::pair<float, float>>> series;  // film EV (x1000) -> (print EV, median L*) sorted by print EV
+  bool lastApprox = false;  // the last match interpolated a median (only while a slider moves)
+  int baseBuilds = 0, rendered = 0, interpolated = 0;  // counters (tests, the bench)
+  // background seeding of the print medians (first frame of a film_print drag); the owners keep the proxy / LUT alive for the thread
+  struct Seed {
+    std::mutex m;
+    std::string ctx;
+    float fev = 0.f;
+    std::vector<std::pair<float, float>> samples;
+  };
+  std::shared_ptr<Seed> seed;
+  std::string seededCtx;
+  std::shared_ptr<const SourceImage> proxyOwner;
+  std::shared_ptr<const Lut3D> lutOwner;
+};
+// Same result as matchFilmExposure in mode Meter without `info` (other modes and `info` are forwarded to it). `exact` = false lets a print solve
+// interpolate remembered medians (a slider is moving); the final frame must pass true. `lutId` identifies the look LUT in the cache key.
+FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& camera, const Lut3D* lut, const std::string& lutId,
+                                     const SourceImage& proxy, FilmMatchCache& cache, bool exact, FilmMatchInfo* info = nullptr);
+// filmMatchKey without the print filtration when no median of the print is evaluated (warmth / tint drags are then not a new match).
+std::string filmMatchKeyLean(const EditParams& p);
+// Computes the print-exposure calibrations a film_shoot drag of this stock + paper will need, once, on a detached thread
+// (`lowPriority` runs first on that thread: the caller lowers its scheduling class).
+void prewarmFilmCalibration(const EditParams& p, void (*lowPriority)() = nullptr);
 
 }  // namespace dapple

@@ -2,12 +2,14 @@
 // GpuProvider EngineSession selects executors through (docs/engine/pipeline-architecture.md 5.9, 6.6).
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -15,6 +17,8 @@
 
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"
+#include "dapple/film.h"
+#include "dapple/renderer.h"
 #include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
 #include "engine/hal/select.h"
@@ -24,6 +28,7 @@
 #include "engine/hal/gles/gles_device.h"
 #endif
 #if defined(__ANDROID__)
+#include <android/log.h>
 #include <sys/resource.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
@@ -143,6 +148,20 @@ std::shared_ptr<void> Context::residentFor(std::uint64_t identity, const std::fu
   return p;
 }
 const ContextOptions& Context::options() const { return d_->opt; }
+std::size_t Context::savePipelineCache() {
+  const std::string& path = d_->opt.device.pipelineCachePath;
+  if (path.empty() || !d_->core) return 0;
+  const std::vector<std::uint8_t> blob = d_->core->dev().pipelineCacheBlob();
+  if (blob.empty()) return 0;
+  {
+    std::ofstream f(path + ".tmp", std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(blob.data()), std::streamsize(blob.size()));
+    if (!f) return 0;
+  }
+  std::error_code ec;
+  std::filesystem::rename(path + ".tmp", path, ec);
+  return ec ? 0 : blob.size();
+}
 bool Context::nativeHandles(hal::NativeHandles* out) const { return d_->core->dev().nativeHandles(out); }
 
 std::string Context::deviceText() const {
@@ -215,6 +234,59 @@ bool pipelineSelfTest(const std::shared_ptr<Context>& ctx, std::string& report) 
   return ok;
 }
 
+
+// ---- start-up log + warm-up (docs/engine/pipeline-architecture.md section 26) --------------------------------------------------------
+void probeLog(const std::string& text) {
+#if defined(__ANDROID__)
+  __android_log_print(ANDROID_LOG_INFO, "dapple_engine", "%s", text.c_str());
+#else
+  const char* e = std::getenv("DAPPLE_ENGINE_LOG");
+  if (e && e[0] == '1') std::fprintf(stderr, "dapple_engine: %s\n", text.c_str());
+#endif
+}
+
+// Film pipelines and the default stock's tables, created before the first film frame asks for them (pipeline creation was 218 ms and the
+// table / plan upload 110-120 ms of the first film frame on the Find N5). Waits (bounded) for the app to set the film pack path. Returns the
+// milliseconds spent, -1 when there was nothing to warm.
+double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note) {
+  using Clk = std::chrono::steady_clock;
+  const auto t0 = Clk::now();
+  std::shared_ptr<const film::FilmLibrary> lib;
+  for (int i = 0; i < 100 && !(lib = film::defaultLibrary()); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  if (!lib) return note = "no film library", -1.0;
+  const char* stock = lib->find("kodak_portra_400") ? "kodak_portra_400" : nullptr;
+  if (!stock) return note = "default stock missing", -1.0;
+  const SourceImage src = dapple::gpu::makeTestImage(640, 427);
+  const auto cams = CameraRegistry::withBuiltins();
+  const CameraProfile& cam = cams.resolve("", "");
+  std::unique_ptr<IGpuExecutor> ex = ctx->createExecutor();
+  EngineSession es;
+  es.useGpuExecutor(ex.get(), true);
+  MemorySourceStore store(src);
+  struct Tier {
+    SpatialQuality q;
+    bool grain;
+  };
+  for (const Tier t : {Tier{SpatialQuality::Interactive, false}, Tier{SpatialQuality::Full, false}, Tier{SpatialQuality::Interactive, true}}) {
+    EditParams p;
+    p.filmStock = stock;
+    Renderer r(p, cam, nullptr);
+    FastOptions fo;
+    fo.spatial = t.q;
+    fo.keepGrain = t.grain;
+    fo.fullLongEdge = t.grain ? 2000 : 0;
+    FrameJob job{p, r, src, nullptr, cam, nullptr, {}, {}, {}};
+    job.request.bakeSize = 33;
+    job.request.interactive = t.q == SpatialQuality::Interactive;
+    job.request.activeParam = t.grain ? "film_grain" : "";
+    job.fastOptions = fo;
+    job.store = &store;
+    FrameResult res;
+    if (!es.renderFrame(job, res)) note += (note.empty() ? "" : "; ") + res.error;
+    std::free(res.rgba);
+  }
+  return std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+}
 struct SelfTestOut {
   std::string report;
   bool boxOk = true;
@@ -620,6 +692,7 @@ class ProviderImpl final : public GpuProvider {
 
  private:
   void probe() {
+    const auto tStart = std::chrono::steady_clock::now();
     std::string why, tried;
     std::shared_ptr<Context> c;
     try {
@@ -635,12 +708,29 @@ class ProviderImpl final : public GpuProvider {
     } catch (...) {
       why = "exception during the GPU self-test";
     }
-    std::lock_guard<std::mutex> lk(mtx_);
+    std::unique_lock<std::mutex> lock(mtx_);
     ctx_ = c;
     lastWhy_ = why;
     tried_ = tried;
     ++gen_;
     state_.store(c ? State::Ready : State::Failed);
+    lock.unlock();
+    const double probeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
+    if (!c) {
+      probeLog("gpu probe: no backend (" + why + ") after " + std::to_string(int(probeMs)) + " ms, frames stay on the CPU");
+      return;
+    }
+    const std::string st = c->selfTestReport();
+    const bool cached = st.rfind("cached pass", 0) == 0;
+    std::string line = std::string("gpu probe: api=") + hal::apiName(c->api()) + " device=\"" + c->caps().name + "\" driver=" + std::to_string(c->caps().driverVersion) +
+                       " self-test " + (cached ? "cached" : "fresh") + ", probe total " + std::to_string(int(probeMs)) + " ms" + (tried.empty() ? "" : " (skipped: " + tried + ")");
+    probeLog(line);
+    if (!std::getenv("DAPPLE_GPU_WARM_OFF")) {
+      std::string note;
+      const double wm = warmFilm(c, note);
+      const std::size_t pc = c->savePipelineCache();
+      probeLog("gpu warm-up: film pipelines + default stock " + (wm < 0 ? "skipped (" + note + ")" : std::to_string(int(wm)) + " ms" + (note.empty() ? "" : " (" + note + ")")) + ", pipeline cache " + (pc ? std::to_string(pc / 1024) + " KB saved" : "not saved") + (c->options().device.pipelineCachePath.empty() ? "" : " [" + c->options().device.pipelineCachePath + "]"));
+    }
   }
 
   // Tries the candidates in order (Vulkan -> GLES 3.1, or the one API forced by DAPPLE_GPU_API / debug.dapple.gpu_api), each wrapped in the
@@ -672,6 +762,7 @@ class ProviderImpl final : public GpuProvider {
     auto store = std::make_shared<SelfTestStore>(dir, app, fp);
     store->recoverMarker();
 
+    const bool userCache = !o.device.pipelineCachePath.empty();
     std::vector<std::string> cands;
     if (forced) cands = {api};
     else cands = {"vulkan", "gles"};
@@ -684,6 +775,13 @@ class ProviderImpl final : public GpuProvider {
         continue;
       }
       o.api = cand;
+      if (!userCache && !dir.empty()) {  // persisted pipeline cache, keyed by build fingerprint + app version + API (the driver also checks its own UUID header)
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "pipeline_cache_%016llx.bin", (unsigned long long)std::hash<std::string>{}(fp + "|" + app + "|" + cand));
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        o.device.pipelineCachePath = (std::filesystem::path(dir) / nm).string();
+      }
       o.cacheLookup = [store, cand](const std::string& k, bool* boxOk, std::string* d) { return store->lookup(cand, k, boxOk, d); };
       o.cacheStore = [store, cand](const std::string& k, bool ok, bool boxOk, const std::string& d) { store->store(cand, k, ok, boxOk, d); };
       store->arm(cand);

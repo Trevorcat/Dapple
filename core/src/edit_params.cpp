@@ -117,7 +117,7 @@ const std::vector<ParamField>& paramFields() {
     add("film_print", d.filmPrint, -1.f, 1.f, "film", 1.f);
     add("film_black", d.filmBlack, -1.f, 1.f, "film", 1.f);
     add("film_latitude", d.filmLatitude, -1.f, 1.f, "film", 1.f);
-    add("film_cast", d.filmCast, -1.f, 1.f, "film", 1.f);
+    add("film_wb", d.filmWb, 0.f, 1.f, "film", 1.f);
     return t;
   }();
   return table;

@@ -742,7 +742,7 @@ film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, Spatial
   fp.camera.autoExposure = false;  // the develop pipeline's own exposure slider is the exposure control
   fp.enlarger.printExposure = std::exp2(-double(std::clamp(p.filmPrintEv, -9.f, 9.f)));  // print exposure (film_match.h)
   applyFilmPaperMapping(fp, p.filmBlack);  // paper white / black -> display white / black (stage C)
-  applyFilmCast(fp, run.lib, p.filmCast);  // partial neutralisation of the print pack
+  applyFilmWb(fp, p);  // film white balance: the scene illuminant reaches the film with degree of adaptation 1 - film_wb
   // (the exposure offset is folded into the input gain in runFilmStage: it then costs no re-bake while dragging)
   fp.camera.filmFormatMm *= formatScale;
   // print filtration: more yellow / magenta filtration = less of that dye = cooler / greener print
@@ -783,7 +783,11 @@ bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], 
     a.filmExposure = p.filmExposure + p.filmKeyEv;
     a.printEv = p.filmPrintEv;
     a.black = p.filmBlack;
-    a.cast = p.filmCast;
+    {
+      double sx, sy, sd;
+      filmInputAdaptation(p, &sx, &sy, &sd);
+      a.sceneX = float(sx), a.sceneY = float(sy), a.adapt = float(sd);
+    }
     a.warmth = p.filmWarmth;
     a.tint = p.filmTint;
     a.grainPct = p.filmGrain;
@@ -794,6 +798,7 @@ bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], 
     a.quality = q == SpatialQuality::Off ? 0 : (q == SpatialQuality::Interactive ? 1 : 2);
     if (fo) {
       a.keepGrain = fo->keepGrain;
+      a.coarse = fo->coarseFilm;
       a.fullLongEdge = fo->fullLongEdge;
       a.frameIndex = fo->frameIndex;
     }
@@ -1553,7 +1558,11 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
     f.filmEv = p_.filmExposure + p_.filmKeyEv;
     f.printEv = p_.filmPrintEv;
     f.black = p_.filmBlack;
-    f.cast = p_.filmCast;
+    {
+      double sx, sy, sd;
+      filmInputAdaptation(p_, &sx, &sy, &sd);
+      f.sceneX = float(sx), f.sceneY = float(sy), f.adapt = float(sd);
+    }
     f.warmth = p_.filmWarmth;
     f.tint = p_.filmTint;
     f.grainPct = p_.filmGrain;
@@ -1562,6 +1571,7 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
     f.formatScale = pitch * float(std::max(d.w, d.h)) / float(std::max(srcW, srcH));
     f.quality = opt.spatial == SpatialQuality::Off ? 0 : (opt.spatial == SpatialQuality::Interactive ? 1 : 2);
     f.keepGrain = opt.keepGrain;
+    f.coarse = opt.coarseFilm;
     f.fullLongEdge = opt.fullLongEdge;
     f.frameIndex = opt.frameIndex;
   }

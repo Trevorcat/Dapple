@@ -58,7 +58,7 @@ struct FilmResolved {
   float warmth = 0, tint = 0;    // percent, -100..100
   float printEv = 0;             // EditParams::filmPrintEv: print exposure (paper) / scan lamp gain, stops
   float black = 0;               // EditParams::filmBlack, -1..1
-  float cast = 0;                // EditParams::filmCast, -1..1
+  float sceneX = 0, sceneY = 0, adapt = 1;  // film white balance: assumed scene illuminant xy (0 = none) and the degree of adaptation (EditParams::filmWb)
   float grainPct = 100, halationPct = 100;
   float pitch = 1;               // output pixel size in source pixels (1 = plain frame)
   float formatScale = 1;         // pitch * max(w,h) / max(srcW,srcH): scales the film frame in mm
@@ -68,6 +68,8 @@ struct FilmResolved {
   std::uint32_t frameIndex = 0;
   std::uint8_t quality = 2;      // 0 off, 1 interactive, 2 full
   std::uint8_t keepGrain = 0;    // interactive frame while a grain-family slider moves
+  std::uint8_t coarse = 0;       // coarse print table allowed (interactive frame while a print-table slider moves)
+  std::uint8_t clampOut = 0;     // GPU: the frame is followed by a pure clamp (strength 1, no display stages, no vignette): the last film pass may clamp itself
   std::uint8_t scan = 0;         // no paper: scan the developed film
   FilmFx fx;                     // highlight boost / enlarger diffusion filter (not part of the edit schema: tests, CLI, renderer entry)
 };
@@ -122,13 +124,14 @@ struct FilmFrameArgs {
   float filmExposure = 0;          // EV on top
   float printEv = 0;               // print exposure / scan lamp gain in stops (EditParams::filmPrintEv)
   float black = 0;                 // paper black, -1..1 (EditParams::filmBlack)
-  float cast = 0;                  // partial neutralisation, -1..1 (EditParams::filmCast)
+  float sceneX = 0, sceneY = 0, adapt = 1;  // film white balance (EditParams::filmWb): assumed scene illuminant xy and degree of adaptation
   float warmth = 0, tint = 0, grainPct = 100, halationPct = 100;
   float formatScale = 1;
   int w = 0, h = 0;
   FilmFx fx;                       // optional effects (default off)
   int quality = 2;                 // 0 off, 1 interactive, 2 full
   bool keepGrain = false;          // interactive tier while a grain-family slider moves
+  bool coarse = false;             // interactive tier while a print-table slider moves (FastOptions::coarseFilm)
   int fullLongEdge = 0;            // scale-aware grain: long edge of the full-resolution render (0 = none)
   std::uint32_t frameIndex = 0;
 };

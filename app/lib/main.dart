@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'app.dart';
+import 'services/debug_open.dart';
 import 'services/perf_probe.dart';
 import 'state/app_state.dart';
 
@@ -25,6 +26,7 @@ class _RootState extends State<_Root> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     state.init();
+    DebugOpen.start(state); // debug builds only
   }
 
   @override
