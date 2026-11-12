@@ -104,6 +104,8 @@ typedef _TonePreviews = ffi.Int32 Function(
 typedef _TonePreviewsD = int Function(
     ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, int, double, ffi.Pointer<DappleImageStruct>);
 
+typedef _EmbedThumb = ffi.Int32 Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _EmbedThumbD = int Function(ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
 typedef _ExtractPreview = ffi.Int32 Function(ffi.Pointer<Utf8>, ffi.Int32, ffi.Pointer<DappleImageStruct>);
 typedef _ExtractPreviewD = int Function(ffi.Pointer<Utf8>, int, ffi.Pointer<DappleImageStruct>);
 
@@ -216,6 +218,9 @@ class DappleBindings {
         sessionTonePreviews = lib.providesSymbol('dapple_session_render_tone_previews')
             ? lib.lookupFunction<_TonePreviews, _TonePreviewsD>('dapple_session_render_tone_previews')
             : null,
+        dngEmbedThumbnail = lib.providesSymbol('dapple_dng_embed_thumbnail')
+            ? lib.lookupFunction<_EmbedThumb, _EmbedThumbD>('dapple_dng_embed_thumbnail')
+            : null,
         extractPreview = lib.providesSymbol('dapple_extract_preview')
             ? lib.lookupFunction<_ExtractPreview, _ExtractPreviewD>('dapple_extract_preview')
             : null,
@@ -289,6 +294,7 @@ class DappleBindings {
   final _PreviewsD? sessionLookPreviews;
   final _TonePreviewsD? sessionTonePreviews;
   final _ExtractPreviewD? extractPreview;
+  final _EmbedThumbD? dngEmbedThumbnail;
   final _MergeAvailD? mergeAvailable;
   final _OpenMergedD? sessionOpenMerged;
   final _SaveLinearD? sessionSaveLinear;

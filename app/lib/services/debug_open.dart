@@ -4,7 +4,8 @@
 // with  {"photo":"<file name substring or index>","group":"light","row":"exposure","collapsed":false,"stock":"kodak_portra_400"}
 // (group: an EGroup name, the panel's categories being light / color / style (= 胶片) / effects (= 质地) / crop; row: the panel
 // layer - items, map, curve, hsl, grade, paper; "look":"warm" selects a style; "pad":{"light":[x,y,a]} sets a pad state before opening (x, y in -1..1,
-// a in 0..1, 0.5 = 100 %); "hold":"light" shows the hold popup; all optional; {"close":true} goes back to the library).
+// a in 0..1, 0.5 = 100 %); "hold":"light" shows the hold popup; all optional; {"close":true} goes back to the library; {"purgeCaptures":true} removes the
+// in-app capture test shots from the library).
 // The file is read once a second and deleted when it has been applied. Release builds never start this.
 import 'dart:async';
 import 'dart:convert';
@@ -41,7 +42,8 @@ class DebugOpen {
       final ctx = app.navigatorKey.currentContext;
       if (nav == null || ctx == null) return;
       nav.popUntil((r) => r.isFirst);
-      if (j['close'] == true) return;
+      if (j['purgeCaptures'] == true) debugPrint('debug_open: purged ${app.purgeCaptures()} captures');
+      if (j['close'] == true || j['purgeCaptures'] == true) return;
       final list = app.editable;
       final sel = j['photo'];
       Photo? photo;

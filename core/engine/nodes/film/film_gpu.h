@@ -31,6 +31,8 @@ struct GpuFilmTables {
 
 // Uploads the three table payloads (device local). Bit-identical: texels are copied, never recomputed.
 bool uploadGpuTables(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables& out, std::string& err);
+// Replaces only the print LUT texels (same raw / curve tables, same LUT size, no split path); false when not applicable.
+bool updateGpuPrintLut(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables& out, std::string& err);
 void releaseGpuTables(gpu::Core& core, GpuFilmTables& t);
 
 // False (with `why`) only when a blur kernel exceeds the 19 tap table of its pass (dye-cloud blur and grain micro-structure are ported:

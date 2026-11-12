@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'app.dart';
+import 'platform/ios_autotest.dart';
 import 'platform/ios_debug_open.dart';
 import 'services/debug_open.dart';
 import 'services/perf_probe.dart';
@@ -29,6 +30,7 @@ class _RootState extends State<_Root> with WidgetsBindingObserver {
     state.init();
     DebugOpen.start(state); // debug builds only
     IosDebugOpen.start(state); // debug builds on iOS only (DAPPLE_OPEN)
+    IosAutotest.runIfRequested(); // --dart-define=DAPPLE_IOS_AUTOTEST=true builds only
   }
 
   @override

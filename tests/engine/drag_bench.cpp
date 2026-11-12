@@ -2,6 +2,7 @@
 //   dapple_drag_bench <image> <film pack .dfp> [long edge=360] [frames=14] [case substring]
 // Env: DAPPLE_GPU=1 (GPU executor), DAPPLE_ENGINE_LOG=1. Prints per case: first frame, median and max of the following frames (wall ms).
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -87,6 +88,60 @@ int main(int argc, char** argv) {
       dapple_free_image(&b);
     }
     dapple_free_image(&ref);
+    return 0;
+  }
+  if (filter == "converge") {  // a drag that stops on a value converges to the table of that value without further input (wave 8, async print tables)
+    static std::atomic<std::int64_t> fired{0};
+    static std::atomic<int> count{0};
+    dapple_set_repaint_callback(
+        [](void*) {
+          fired.store(std::chrono::duration_cast<std::chrono::microseconds>(Clk::now().time_since_epoch()).count());
+          count.fetch_add(1);
+        },
+        nullptr);
+    auto frame = [&](float v, DappleImage* out) {
+      char js[200];
+      std::snprintf(js, sizeof js, "{\"film\":\"kodak_portra_400\",\"film_black\":%.4f}", double(v));
+      DappleFrameRequest rq{};
+      rq.size = sizeof rq;
+      rq.long_edge = le;
+      rq.flags = DAPPLE_FRAME_INTERACTIVE;
+      rq.active_param = "film_black";
+      return dapple_session_render_frame(s, js, nullptr, &rq, out, nullptr) == DAPPLE_OK;
+    };
+    auto diff = [](const DappleImage& a, const DappleImage& b) {
+      double sum = 0;
+      const size_t n = size_t(a.width) * a.height * 4;
+      for (size_t i = 0; i < n; ++i) sum += std::abs(int(a.rgba[i]) - int(b.rgba[i]));
+      return sum / double(n);
+    };
+    DappleImage warm{};
+    if (!frame(0.f, &warm)) return 1;
+    dapple_free_image(&warm);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+    for (int run = 0; run < 3; ++run) {
+      const float target = 0.25f + 0.2f * float(run);
+      DappleImage last{};
+      auto tStop = Clk::now();
+      int c0 = count.load();
+      for (int i = 0; i <= 10; ++i) {
+        dapple_free_image(&last);
+        tStop = Clk::now();  // the landing is timed from the start of the last drag frame (it can land while that frame is still rendering)
+        c0 = count.load();
+        if (!frame(target * float(i) / 10.f, &last)) return 1;
+      }
+      while (count.load() == c0 && std::chrono::duration<double>(Clk::now() - tStop).count() < 3.0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      const double landMs = count.load() > c0 ? double(fired.load() - std::chrono::duration_cast<std::chrono::microseconds>(tStop.time_since_epoch()).count()) / 1000.0 : -1.0;
+      DappleImage a{}, b{};
+      if (!frame(target, &a)) return 1;
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      if (!frame(target, &b)) return 1;
+      std::printf("  run %d: stopped on %.2f, table landed %.1f ms after the start of the last drag frame (-1 = never); last drag frame vs converged: mean |d| %.3f /255; converged vs 500 ms later: %.3f (0 = already exact)\n",
+                  run, double(target), landMs, diff(last, a), diff(a, b));
+      dapple_free_image(&last);
+      dapple_free_image(&a);
+      dapple_free_image(&b);
+    }
     return 0;
   }
   if (filter == "compare") {  // coarse (interactive drag) tables against the exact ones, same parameters

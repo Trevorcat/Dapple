@@ -33,9 +33,9 @@ if(MSVC)
 else()
   target_compile_options(dapple_dng_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-foreach(id parse gainmap vignette warp e2e illuminant anchor)
-  add_test(NAME dng.${id} COMMAND dapple_dng_tests ${id})
-  set_tests_properties(dng.${id} PROPERTIES TIMEOUT 300)
+foreach(id parse gainmap vignette warp e2e illuminant anchor jxl)
+  add_test(NAME dng.${id} COMMAND dapple_dng_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(dng.${id} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 endforeach()
 
 # Spectral film engine tests (profiles, film pack, grey neutrality, baked-vs-direct dE2000, hooks).

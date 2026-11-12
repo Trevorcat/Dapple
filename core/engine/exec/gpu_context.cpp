@@ -382,7 +382,7 @@ bool Context::rebuild(std::string& err) {
     std::lock_guard<std::mutex> lk(d_->mtx);
     if (d_->rebuilds >= 1) return err = "device already rebuilt once in this process", false;
     ++d_->rebuilds;
-    hal::Selection sel = hal::selectDevice(d_->opt.device, hal::apiName(d_->api) == std::string("gles31") ? "gles" : "vulkan");
+    hal::Selection sel = hal::selectDevice(d_->opt.device, d_->api == hal::Api::Gles31 ? "gles" : d_->api == hal::Api::Metal ? "metal" : "vulkan");
     if (!sel.device) {
       for (const hal::Attempt& a : sel.attempts) err += (err.empty() ? "" : "; ") + a.detail;
       return false;
@@ -648,7 +648,7 @@ class ProviderImpl final : public GpuProvider {
     std::string j = std::string("{\"mode\":\"") + (m == Mode::Off ? "off" : m == Mode::On ? "on" : "auto") + "\",\"state\":\"" + st[int(state_.load())] +
                     "\",\"enabled\":" + (en ? "true" : "false") + ",\"available\":" + (c ? "true" : "false");
     if (c)
-      j += ",\"api\":\"" + std::string(c->api() == hal::Api::Gles31 ? "gles31" : "vulkan") + "\",\"device\":\"" + jsonEsc(c->caps().name) + "\",\"deviceKey\":\"" +
+      j += ",\"api\":\"" + std::string(hal::apiName(c->api())) + "\",\"device\":\"" + jsonEsc(c->caps().name) + "\",\"deviceKey\":\"" +
            c->caps().key() + "\",\"selfTest\":\"" + jsonEsc(c->selfTestReport()) + "\",\"selection\":" + c->selectionJson();
     else if (m != Mode::Off) j += ",\"reason\":\"" + jsonEsc(inactiveReason()) + "\"";
     if (!tried.empty()) j += ",\"skipped\":\"" + jsonEsc(tried) + "\"";
@@ -798,10 +798,14 @@ class ProviderImpl final : public GpuProvider {
     const bool userCache = !o.device.pipelineCachePath.empty();
     std::vector<std::string> cands;
     if (forced) cands = {api};
+#if defined(__APPLE__)
+    else cands = {"metal", "gles"};  // Apple: Api::Metal (the Vulkan factory symbol there is only an alias of the Metal device)
+#else
     else cands = {"vulkan", "gles"};
+#endif
     std::string reasons;
     for (const std::string& cand : cands) {
-      const hal::Api a = cand == "vulkan" ? hal::Api::Vulkan : cand == "gles" ? hal::Api::Gles31 : hal::Api::Null;
+      const hal::Api a = cand == "vulkan" ? hal::Api::Vulkan : cand == "gles" ? hal::Api::Gles31 : cand == "metal" ? hal::Api::Metal : hal::Api::Null;
       if (excluded.count(a)) continue;
       if (!forced && store->crashed(cand)) {  // earlier run died or hung in this API's self-test: not again for this OS build + app version
         reasons += (reasons.empty() ? "" : "; ") + cand + ": the self-test crashed or hung in an earlier run (cached)";

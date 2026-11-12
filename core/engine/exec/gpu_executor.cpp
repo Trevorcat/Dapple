@@ -628,6 +628,12 @@ std::shared_ptr<DeviceFilm> Executor::ensureFilm(const filmnode::FilmResolved& r
   // (The uncached bakeFilmTables ran here on every frame: about 12 ms on the desktop, and a fresh upload each time.)
   if (!filmnode::tablesFor(r, tb)) return fail(GpuFailure::Unsupported, "film tables: bake failed"), nullptr;
   const auto pd = filmnode::planOf(r);
+  // only the print table changed (a drag landed a new coarse table): replace the LUT texels in place instead of re-creating and re-uploading everything
+  if (film_ && film_->epoch == epoch_ && film_->tb.raw == tb.raw && film_->tb.curves == tb.curves && film_->tb.print != tb.print && film_->haveTables &&
+      !std::getenv("DAPPLE_FILM_LUT_INPLACE_OFF")) {
+    std::string uerr;
+    if (filmnode::updateGpuPrintLut(core(), tb, film_->gt, uerr)) film_->tb = tb;
+  }
   if (!film_ || film_->epoch != epoch_ || film_->tb.raw != tb.raw || film_->tb.curves != tb.curves || film_->tb.print != tb.print) {
     film_.reset();
     auto f = std::make_shared<DeviceFilm>();

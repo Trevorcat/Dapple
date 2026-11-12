@@ -16,6 +16,9 @@
 #include "engine/exec/cpu_executor.h"
 #include "engine/plan/plan.h"
 
+namespace dapple::engine::filmnode {
+void filmAsyncTableStats(unsigned long long*, unsigned long long*, unsigned long long*);
+}
 namespace dapple::engine {
 
 namespace {
@@ -275,7 +278,7 @@ std::string jsonStr(const std::string& s) {
 // One frame of the engine finished: count it and log "frame WxH tier film exec reason" once per 30 frames and whenever the executor or reason changes.
 void noteFrame(const FrameJob& job, const FrameResult& out) {
   const std::string exec = out.executor.empty() ? "cpu" : out.executor;
-  const bool onGpu = exec == "vulkan" || exec == "gles31";
+  const bool onGpu = exec == "vulkan" || exec == "gles31" || exec == "metal";
   const std::string reason = onGpu ? std::string() : (out.why.empty() ? std::string("none given") : out.why);
   ExecLog& L = execLog();
   bool doLog = false;
@@ -325,6 +328,12 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
   if (n > 0 && n < int(sizeof line))
     std::snprintf(line + n, sizeof line - std::size_t(n), " | cpu_ms %.1f (match %.1f renderer %.1f graph %.1f tables %.1f exec %.1f; upload %.1f gpu %.1f) max %.1f", c.totalMs, c.matchMs,
                   c.rendererMs, c.graphMs, c.tablesMs, c.execMs, out.gpu.uploadMs, out.gpu.gpuMs, std::max(maxMs, c.totalMs));
+  if (job.renderer.filmActive()) {  // background print tables of the film drag (wave 8): frames that used the previous step, tables finished, requests
+    unsigned long long su = 0, bk = 0, rq = 0;
+    filmnode::filmAsyncTableStats(&su, &bk, &rq);
+    const std::size_t len = std::strlen(line);
+    if (len + 64 < sizeof line) std::snprintf(line + len, sizeof line - len, " | film_tables stale %llu baked %llu requested %llu", su, bk, rq);
+  }
 #if defined(__ANDROID__)
   __android_log_print(ANDROID_LOG_INFO, "dapple_engine", "%s", line);
 #else
@@ -993,7 +1002,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
     out.h = go.h;
     out.external = job.gpuTarget != nullptr && go.rgba == nullptr;
     out.gpu = go.stats;
-    out.executor = gpuLastApi_ == hal::Api::Gles31 ? "gles31" : "vulkan";
+    out.executor = gpuLastApi_ == hal::Api::Gles31 ? "gles31" : gpuLastApi_ == hal::Api::Metal ? "metal" : "vulkan";
     return 0;
   }
   if (r == -2) {

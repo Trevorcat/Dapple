@@ -111,3 +111,64 @@ End state: `/data/local/tmp/dapple` removed from the Redmi at the end, no `debug
 ## 10. Gates added in round 2
 
 Size sweep and cadence benches are test-side only (`DAPPLE_BENCH_SIZE`, `DAPPLE_BENCH_PERIOD_MS`, `DAPPLE_BENCH_ADPF`). The shader state at the end of round 2 equals round 1 (the mediump experiment was reverted), so the round 1 gates stand. `tools/check-all.sh`: see the final report.
+
+# Round 3 (print tables off the frame thread, Metal case, film log)
+
+## 11. Per-drag CPU cost: background print tables
+
+Cause (same on the Pixel 5): every drag frame of film_print / shoot / black / warmth / tint / wb had a new print-table key, so the frame thread baked the 17^3 coarse table (`bakePrintScanCoarse`, 17-60 ms on an A78) and uploaded it; the `match` / calibration part is a separate cost (section 8).
+
+Fix (`film_tables.cpp`, `parallel.h`): an interactive drag frame never bakes a print table on the frame thread any more. It uses the coarse table of its own values when cached, otherwise the most recent table of the same stock / paper / mapping / split path (the previous step of the drag, or the settled table the drag started from) and hands the wanted table to one worker thread (latest request wins) that bakes it on a second thread pool (`ThreadPool::background()`: half of the capability-chosen cores, never the frame pool, normal priority). The first table of a stock (nothing to fall back to) still bakes on the frame thread. The settled frame is not coarse and bakes / fetches the exact table exactly as before; `DAPPLE_FILM_ASYNC_TABLES=0` restores the synchronous path. The calibration warm-up workers also run on the background pool now (they no longer take the frame pool).
+
+Not done from the brief: moving the dependency out of the table (print exposure, warmth and tint act before the paper curve, the paper layers cross-talk spectrally: no exact pre / post transform, and `film_black` was not isolated as a post-mapping), GPU interpolation between bracketing tables, sub-data table upload (the upload of a 17^3 RGBA32F table is 79 KB; the measured cost was the bake), grain tables and calibration persisted on disk, bake-at-selection of grain tables.
+
+Redmi, native session bench, 480 px (320x480 frames), medians (first frame), after warm-up, `DAPPLE_BENCH_SETTLE_MS`:
+
+| drag | before (round 1) | after |
+|---|---|---|
+| film_shoot | 21-35 (73-627) | 7.0-11 (7-19; 757 when started within 1.3 s of the stock) |
+| film_print | 22 (68-108) | 8.6-9.5 (64-212: first print solve) |
+| film_black | 23 (21-24) | 9.4-10 (8.5-11.7) |
+| film_warmth / film_tint | 23 (23-38) | 10.1-10.3 (10-23) in a fast run, 24.9 in a slow-state run |
+| film_latitude (GPU only, no table) | 11.6 | 11.9 (22 in the slow-state run) |
+| film_grain | 9.7 | 10-16 (first frame 88-143: CPU grain plan / table 103 ms, not fixed) |
+
+The device alternates between a fast and a slow state (the GPU-only latitude drag moves between 11 and 22 ms); table drags now sit on the GPU-only floor in either state. 8.3 ms median is **not** reached at 480 px (floor 7.3 ms film_strength in the fast state, 11 ms for the others). The calibration warm-up (15 buckets, two workers on the background pool) finishes **3.2 s** after the first match of a stock (`DAPPLE_ENGINE_LOG=1` prints it); a drag started earlier meets cold buckets (film_shoot first frame 757 ms in the worst run). The develop-exposure drag with a film on still costs 17-44 ms (the per-frame film match: statistics of the 256 px proxy, 7-34 ms on this CPU), not addressed.
+
+Colour lag: while the worker bakes, frames show the previous step's table (a stale-by-one-or-two-steps colour); `film_tables stale S baked B requested R` in the log line counts it (601 stale frames of 1441 in the scripted session, 527 tables baked). The settled frame after the finger lifts is exact; a finger held still on the last value shows the stale colour until it lifts or the next frame (the engine has no repaint request).
+
+30 s scripted session (12 drag cases, 120 frames each, 1441 interactive frames, 480 px, `cpu_ms` incl. GPU wait, Vulkan, settled warm-up): **p50 15.1, p95 24.8, p99 27.0, max 1317 ms (the cold first film frame of the process); 9 frames over 33 ms** (cold first frames of the cases: grain 111, print 65, strength outlier 78, black 122). Round 1 for the same session at 480 px: p50 20.0, p95 27.5, p99 43.2.
+
+## 12. Other round 3 items
+
+* **Film log line (item 5):** film frames already go through the same `noteFrame` as every frame (the view path calls `dapple_session_render_frame` -> `EngineSession::renderFrame`; the log is always on on Android); the Pixel app log has the film line. The throttle (one line per 30 frames, plus every frame over 25 ms, plus every frame with `setprop debug.dapple.frame_profile 1`) is why a short drag shows one line. Not reproduced for the Note10+ (its only log on record, `app_start1_logcat.log`, ends at start-up). The line now ends with `film_tables stale S baked B requested R` for film frames.
+* **Metal (item 7):** `gpu_context.cpp` / `engine_session.cpp` know `Api::Metal`: the JSON status takes `hal::apiName` ("metal" / "vulkan" / "gles31"), the rebuild path re-selects the same API, Apple tries `metal` then `gles` instead of the Vulkan alias, `exec == "metal"` counts as GPU, `FrameResult::executor` can be "metal". Desktop ctest (film, golden, match_cache, gpu_parity, engine.exec, engine.cache: 50 / 50) and the arm64 build / device gates are unaffected; **not compiled on Apple** (no Mac here).
+* **Not done:** item 2 (bands under the 16 MiB step), item 3 (raster prototype), item 4 (micro-benchmark seed and the interactive-vs-settled dE table), item 6 (re-pointing film_match / film_match_cache proxies to the engine).
+
+Gates on the Redmi after round 3: `dapple_match_cache_tests` ok, `golden seqcheck` 60 frames 0 mismatches, `selfcheck` 148 frames 0 mismatches, `film_gpu_tests frames` ok, `--coverage` 192 / 192, `exec_tests` ok.
+
+# Round 4 (repaint, device table updates)
+
+## 13. Item 1: repaint when a queued table lands
+
+`film_async.h` (`addTableLandedListener`), `film_tables.cpp`, `view.cpp`, `dapple_c.h` (`dapple_set_repaint_callback`). A frame that used a previous-step table sets a flag *before* it queues the wanted table; when the worker finishes the newest request (no newer one pending) and the flag is set, the listeners are called on the worker thread. `dapple_view` registers itself (live views tracked under a lock) and resubmits its newest snapshot, so the picture converges without input; a host that renders frames itself registers `dapple_set_repaint_callback` and renders the last frame again. **Untested in the app** (no install); tested natively with `dapple_drag_bench ... converge` (a film_black drag that stops on a value, no further input), Redmi, 480 px:
+
+| run (stop value) | table landed after the start of the last drag frame | last drag frame vs converged frame (mean abs, /255) | converged frame vs the same frame 500 ms later |
+|---|---|---|---|
+| 0.25 | 7.0 ms | 0.019 | 0.000 |
+| 0.45 | 7.2 ms | 0.034 | 0.000 |
+| 0.65 | 7.2 ms | 0.052 | 0.000 |
+
+So staleness at the end of a drag lasts about 7 ms (one table bake on the background pool) plus the repaint frame (one vsync); the repainted frame is already the exact coarse table of the stop value. The difference between the stale frame and the converged one was 0.02-0.05 /255 for an 11-step drag (larger for a faster drag). Over a whole scripted session (1441 frames) 601 frames showed a previous-step table.
+
+## 14. Item 2 (partly): the device-side table update
+
+Finding: with the bake off the frame thread, the remaining spikes of a table drag were `uploadGpuTables`: every changed print table re-created the raw / LUT / curve / decode resources and re-uploaded all of them (including the 600 KB raw table) with a full `waitAll()` (26-61 ms on this phone). New `updateGpuPrintLut` replaces only the print LUT texels in place when only the print table changed (same raw / curves, same LUT size, no split path), `DAPPLE_FILM_LUT_INPLACE_OFF=1` disables it. Session bench (fast device state), 480 px medians: film_shoot 9.0, film_print 8.8, film_black 8.5, film_warmth 7.9 ms (GPU-only drag film_latitude 8.0), against 10-12 before the in-place update in the same state; spikes of 26-61 ms remain in some landing frames (the `waitAll` and the staging copy: not isolated).
+
+Frames over 33 ms in the 721-frame scripted session (12 cases x 60 frames, settled warm-up): 32 (p50 10.3, p95 30.9, p99 53.3, max 1240 ms). By cause: the cold first film frame (1240 ms: match 468 + exec 772 + upload 356), the first grain frame (76 ms: tables 12 + plan upload), the first print frame (62 ms: first print solve 43 ms of `match`), a handful of table landings (26-61 ms upload), and **about 25 frames of the develop-exposure drag with a film on (33-58 ms: the per-frame film match 7-43 ms, rest GPU wait)**. The synchronous-slow-state run of the same session gave p50 17.3, p99 36.2 with 13 frames over 33 ms: the device state moves these numbers by 2x.
+
+Not done in item 2: baking the print table at the current values, the grain plan / tables and the first print solve at stock selection on the background pool; disk persistence (calibration results, grain tables) with a size cap; the exposure-drag match (async result + repaint, or analytic: not checked whether the statistics scale with the gain; the exposure drag recomputes the develop render of the 256 px proxy per frame, so they do not scale exactly through the tone curves).
+
+## 15. Items 3-6 of round 4
+
+Not started (bands under the 16 MiB step, micro-benchmark and visual-cost table, raster prototype, re-pointing `film_match*.cpp`). Targets of the brief are therefore not met: median 8.3 ms at the size adaptive quality picks was reached only in the fast device state for drags that do not touch the film match (7.3-9.0 ms at 480 px), and the exposure drag with a film stays at 17-44 ms.

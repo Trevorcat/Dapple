@@ -69,13 +69,13 @@ class MediaStoreIngestSource implements IngestSource {
 
   @override
   Future<List<IncomingFile>> scan({int limit = 100, int sinceSec = 0}) async {
-    if (!Platform.isAndroid) return const [];
-    return MediaBridge.queryNew(limit: limit, sinceSec: sinceSec);
+    if (!Platform.isAndroid && !Platform.isIOS) return const [];
+    return MediaBridge.queryNew(limit: limit, sinceSec: sinceSec); // iOS: PhotoKit (DappleEnginePlugin.swift), same maps
   }
 
   @override
   Stream<void> get changes {
-    if (!Platform.isAndroid) return const Stream.empty();
+    if (!Platform.isAndroid && !Platform.isIOS) return const Stream.empty();
     return _mediaEvents.receiveBroadcastStream().map((_) {});
   }
 }
@@ -97,6 +97,7 @@ class PickerIngestSource implements IngestSource {
 
   /// Shows the picker and returns the imported copies.
   Future<List<IncomingFile>> pick() async {
+    if (Platform.isIOS) return _pickPhotos();
     final res = await FilePicker.pickFiles(type: FileType.any);
     if (res.isEmpty) return const [];
     await inboxDir.create(recursive: true);
@@ -117,5 +118,20 @@ class PickerIngestSource implements IngestSource {
           size: await File(dest).length()));
     }
     return out;
+  }
+}
+
+const MethodChannel _photos = MethodChannel('dapple/photos');
+
+extension on PickerIngestSource {
+  /// iOS: the system photo picker (PHPicker, out of process, no permission needed); the originals (RAW first) are copied into [inboxDir].
+  Future<List<IncomingFile>> _pickPhotos() async {
+    await inboxDir.create(recursive: true);
+    final rows = await _photos.invokeListMethod<Map>('pick', {'dest': inboxDir.path});
+    final now = DateTime.now().millisecondsSinceEpoch;
+    return [
+      for (final r in rows ?? const <Map>[])
+        IncomingFile(id: 'imp:${r['name']}', name: r['name'] as String, addedMs: now, path: r['path'] as String, size: (r['size'] as num?)?.toInt() ?? 0)
+    ];
   }
 }

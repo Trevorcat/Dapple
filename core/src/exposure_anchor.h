@@ -23,9 +23,11 @@ struct ExposureAnchor {
   int previewPixels = 0;
   float previewSpread = 0.f;
   float statsEv = 0.f;
+  std::string source;  // "embedded-preview", "reference-image" or "" (tag / statistics)
 };
 
 // `linear`: scene-referred linear ProPhoto after white balance (the decoder output, any decode quality), `dngBaselineEv`: NaN = no tag.
-ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const ImageF& linear, float dngBaselineEv);
+// `reference`: an upright 8-bit sRGB rendering of this frame to use instead of the embedded preview (paired camera JPEG / sidecar), or null.
+ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const ImageF& linear, float dngBaselineEv, const Image8* reference = nullptr);
 
 }  // namespace dapple

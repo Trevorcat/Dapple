@@ -11,12 +11,18 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <fstream>
 #include <string>
 #include <vector>
 
 #include "dapple/camera.h"
+#include "dapple/encode.h"
+#include "color.h"
 #include "dapple/decoder.h"
 #include "decoders/dng_illuminant.h"
+#include "decoders/dng_jxl.h"
+#include "dng_thumbnail.h"
 #include "decoders/dng_opcodes.h"
 
 using namespace dapple;
@@ -643,6 +649,51 @@ static void testAnchor() {
     CHECK(m.exposureAnchorEv >= -1.5f && m.exposureAnchorEv <= 3.5f && m.exposureAnchorConfidence < 0.5f, "stats EV %.2f conf %.2f", m.exposureAnchorEv, m.exposureAnchorConfidence);
     std::printf("  anchor, no preview / no tag: tier %d, %+.2f EV, confidence %.2f (%s)%s", m.exposureAnchorTier, m.exposureAnchorEv, m.exposureAnchorConfidence, m.exposureAnchorNote.c_str(), "\n");
   }
+  // a reference rendering of the same frame (RAW+JPEG sibling / DecodeOptions::referenceImage): tier 1, and the EV follows the reference level
+  {
+    auto jpegLevel = [&](const char* name, int level) {
+      Image8 im;
+      im.width = 256, im.height = 192;
+      im.data.assign(std::size_t(256) * 192 * 3, std::uint8_t(level));
+      CHECK(writeJpeg(im, dir / name, JpegOptions{97}).has_value(), "write reference jpeg");
+    };
+    jpegLevel("ref128.jpg", 128);
+    jpegLevel("ref160.jpg", 160);
+    DecodeOptions o128{DecodeQuality::Full}, o160{DecodeQuality::Full};
+    o128.referenceImage = dir / "ref128.jpg";
+    o160.referenceImage = dir / "ref160.jpg";
+    auto r128 = makeLibRawDecoder()->decode(dir / "none.dng", o128), r160 = makeLibRawDecoder()->decode(dir / "none.dng", o160);
+    CHECK(r128.has_value() && r160.has_value(), "decode with reference");
+    if (r128 && r160) {
+      const float want = std::log2(color::srgbDecode(160.f / 255.f) / color::srgbDecode(128.f / 255.f));
+      CHECK(r128->meta.exposureAnchorTier == 1 && r128->meta.exposureAnchorSource == "reference-image", "tier %d source '%s'", r128->meta.exposureAnchorTier, r128->meta.exposureAnchorSource.c_str());
+      CHECK(std::fabs((r160->meta.exposureAnchorEv - r128->meta.exposureAnchorEv) - want) < 0.05f, "EV step %.3f want %.3f", r160->meta.exposureAnchorEv - r128->meta.exposureAnchorEv, want);
+      std::printf("  anchor from a reference JPEG: level 128 -> %+.2f EV, 160 -> %+.2f EV (step %.3f, want %.3f)%s", r128->meta.exposureAnchorEv, r160->meta.exposureAnchorEv, r160->meta.exposureAnchorEv - r128->meta.exposureAnchorEv, want, "\n");
+    }
+    // RAW-only capture: the JPEG embedded into the DNG itself (dng_thumbnail.h) is the embedded preview afterwards
+    {
+      fs::copy_file(dir / "none.dng", dir / "emb.dng", fs::copy_options::overwrite_existing);
+      std::ifstream jf(dir / "ref160.jpg", std::ios::binary);
+      std::vector<std::uint8_t> jb((std::istreambuf_iterator<char>(jf)), std::istreambuf_iterator<char>());
+      std::string err;
+      CHECK(dapple::embedDngThumbnail(dir / "emb.dng", jb, 256, 192, &err), "embed: %s", err.c_str());
+      CHECK(!dapple::embedDngThumbnail(dir / "emb.dng", jb, 256, 192, &err), "a second embed must be refused (SubIFDs present)");
+      auto pv = extractEmbeddedPreview(dir / "emb.dng", 0);
+      CHECK(pv.has_value() && pv->width == 256 && pv->height == 192, "embedded preview not found by LibRaw");
+      auto e = makeLibRawDecoder()->decode(dir / "emb.dng", DecodeOptions{DecodeQuality::Full});
+      CHECK(e.has_value() && e->meta.exposureAnchorTier == 1 && e->meta.exposureAnchorSource == "embedded-preview", "tier %d source '%s'", e ? e->meta.exposureAnchorTier : -1,
+            e ? e->meta.exposureAnchorSource.c_str() : "");
+      CHECK(e.has_value() && r160 && std::fabs(e->meta.exposureAnchorEv - r160->meta.exposureAnchorEv) < 0.02f, "embedded anchor %.3f vs reference anchor %.3f", e ? e->meta.exposureAnchorEv : 0.f,
+            r160 ? r160->meta.exposureAnchorEv : 0.f);
+      // the raw data of the patched file is untouched
+      auto plain = decode("none.dng"), patched = makeLibRawDecoder()->decode(dir / "emb.dng", DecodeOptions{DecodeQuality::Full});
+      CHECK(plain && patched && plain->linear.data == patched->linear.data, "patched DNG decodes differently");
+    }
+    // sibling discovery: none.jpg next to none.dng
+    fs::copy_file(dir / "ref128.jpg", dir / "none.jpg", fs::copy_options::overwrite_existing);
+    auto sib = decode("none.dng");
+    CHECK(sib.has_value() && sib->meta.exposureAnchorTier == 1 && sib->meta.exposureAnchorSource == "reference-image", "sibling JPEG not picked up");
+  }
   auto b = decode("tag.dng");
   CHECK(b.has_value(), "decode tag");
   if (b) {
@@ -656,6 +707,42 @@ static void testAnchor() {
   fs::remove_all(dir, ec);
 }
 
+// DNG 1.7 JPEG XL: the public Samsung S22 sample (CC0, not in the repo: build/rawsamples, see scripts/samples/download.sh) is decoded by libjxl through
+// our tile reader and through the decoder; skipped (exit 77) when the file or the JPEG XL decoder is absent.
+static int testJxl() {
+  const fs::path f = fs::path("build/rawsamples/Samsung/SM-S901E/20250305_173647.dng");
+  std::error_code ec;
+  if (!fs::exists(f, ec)) {
+    std::printf("  JPEG XL: sample not present, skipped%s", "\n");
+    return 77;
+  }
+  if (!dng::isJxlDng(f)) {
+    CHECK(false, "the sample is not recognised as a JPEG XL DNG");
+    return 1;
+  }
+  const dng::JxlRaw r = dng::decodeJxlDng(f);
+  if (!r.error.empty() && r.error.find("no JPEG XL decoder") != std::string::npos) {
+    std::printf("  JPEG XL: built without libjxl, skipped%s", "\n");
+    return 77;
+  }
+  CHECK(r.error.empty(), "decode: %s", r.error.c_str());
+  CHECK(r.width == 4000 && r.height == 3000 && r.channels == 3 && r.data.size() == std::size_t(4000) * 3000 * 3, "size %dx%d x%d", r.width, r.height, r.channels);
+  if (r.error.empty()) {
+    double sum = 0;
+    std::uint16_t mx = 0;
+    for (std::uint16_t v : r.data) sum += v, mx = std::max(mx, v);
+    CHECK(sum / double(r.data.size()) > 500 && mx > 20000, "samples look empty: mean %.0f max %u", sum / double(r.data.size()), unsigned(mx));
+    std::printf("  JPEG XL tiles decoded: %dx%d, 3 samples, mean %.0f, max %u%s", r.width, r.height, sum / double(r.data.size()), unsigned(mx), "\n");
+  }
+  auto dec = makeLibRawDecoder()->decode(f, DecodeOptions{DecodeQuality::Preview});
+  CHECK(dec.has_value(), "decoder: %s", dec ? "" : dec.error().message.c_str());
+  if (dec) {
+    CHECK(dec->linear.width == 1500 && dec->linear.height == 2000, "preview decode %dx%d (want 1500x2000, orientation 6, half size)", dec->linear.width, dec->linear.height);
+    CHECK(dec->meta.exposureAnchorTier > 0, "no exposure anchor");
+  }
+  return g_fail ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
   const std::string which = argc > 1 ? argv[1] : "all";
   auto want = [&](const char* n) { return which == "all" || which == n; };
@@ -666,6 +753,7 @@ int main(int argc, char** argv) {
   if (want("e2e")) testEndToEnd();
   if (want("illuminant")) testIlluminant();
   if (want("anchor")) testAnchor();
+  if (which == "jxl") return testJxl();
   std::printf(g_fail ? "FAILED (%d)\n" : "OK\n", g_fail);
   return g_fail ? 1 : 0;
 }

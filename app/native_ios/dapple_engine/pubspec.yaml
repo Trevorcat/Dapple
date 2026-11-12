@@ -15,4 +15,5 @@ flutter:
   plugin:
     platforms:
       ios:
+        pluginClass: DappleEnginePlugin
         ffiPlugin: true

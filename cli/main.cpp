@@ -99,6 +99,7 @@ struct Options {
   bool autoAdjust = true;
   float strength = 1.f;
   bool full = false;
+  std::string reference;  // info --anchor: reference image of the frame (paired camera JPEG)
   bool anchor = false;  // info: also decode (preview quality) and print the exposure anchor
   int longEdge = 2560;
   int quality = 92;
@@ -145,6 +146,7 @@ bool parseArgs(const std::vector<std::string>& args, Options& o, std::string& er
     else if (a == "--strength") { if (!number(d)) return false; o.strength = float(d); }
     else if (a == "--full") o.full = true;
     else if (a == "--anchor") o.anchor = true;
+    else if (a == "--reference") { if (!value(o.reference)) return false; }
     else if (a == "--long-edge") { if (!number(d)) return false; o.longEdge = int(d); }
     else if (a == "--quality") { if (!number(d)) return false; o.quality = int(d); }
     else if (a == "--dump-params") o.dumpParams = true;
@@ -170,7 +172,7 @@ const char* supportText(Support s) {
   }
 }
 
-int cmdInfo(const std::vector<std::string>& files, bool anchor, bool full) {
+int cmdInfo(const std::vector<std::string>& files, bool anchor, bool full, const std::string& reference) {
   if (files.empty()) {
     std::fputs("info: no files given\n", stderr);
     return 2;
@@ -211,14 +213,14 @@ int cmdInfo(const std::vector<std::string>& files, bool anchor, bool full) {
                 cam.transfer.vendorApp.empty() ? "" : " via ", cam.transfer.vendorApp.c_str());
     if (!cam.notes.empty()) std::printf("  notes       %s\n", cam.notes.c_str());
     if (anchor) {  // the file's own exposure anchor (core/src/exposure_anchor.h)
-      auto src = decoder->decode(p, DecodeOptions{full ? DecodeQuality::Full : DecodeQuality::Preview});
+      auto src = decoder->decode(p, [&] { DecodeOptions d{full ? DecodeQuality::Full : DecodeQuality::Preview}; if (!reference.empty()) d.referenceImage = pathFromUtf8(reference); return d; }());
       if (!src) {
         std::printf("  anchor      decode failed: %s\n", src.error().message.c_str());
       } else {
         const ShotMetadata& s = src->meta;
         static const char* kTier[] = {"none (not a camera RAW)", "1 embedded preview", "2 DNG BaselineExposure", "3 scene statistics", "4 nothing usable"};
         std::printf("  anchor      tier %s, %+.2f EV, confidence %.2f  (profile %s baseline %+.2f EV)\n", kTier[std::clamp(s.exposureAnchorTier, 0, 4)], s.exposureAnchorEv, s.exposureAnchorConfidence, cam.id.c_str(), cam.baselineExposureEv);
-        std::printf("              %s; preview %+.2f EV, stats %+.2f EV%s\n", s.exposureAnchorNote.c_str(), s.exposureAnchorPreviewEv, s.exposureAnchorStatsEv, s.exposureAnchorHasDng ? (", DNG tag " + std::to_string(s.exposureAnchorDngEv)).c_str() : "");
+        std::printf("              source %s; %s; preview %+.2f EV, stats %+.2f EV%s\n", s.exposureAnchorSource.empty() ? "-" : s.exposureAnchorSource.c_str(), s.exposureAnchorNote.c_str(), s.exposureAnchorPreviewEv, s.exposureAnchorStatsEv, s.exposureAnchorHasDng ? (", DNG tag " + std::to_string(s.exposureAnchorDngEv)).c_str() : "");
       }
     }
   }
@@ -585,7 +587,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", err.c_str());
     return 2;
   }
-  if (cmd == "info") return cmdInfo(o.positional, o.anchor, o.full);
+  if (cmd == "info") return cmdInfo(o.positional, o.anchor, o.full, o.reference);
   if (cmd == "develop") return cmdDevelop(o);
   if (cmd == "watch") return cmdWatch(o);
   if (cmd == "bench") return cmdBench(o);

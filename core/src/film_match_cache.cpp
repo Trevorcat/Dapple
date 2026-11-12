@@ -5,6 +5,8 @@
 // median-L* evaluations of film_print are remembered per (stock, paper, film EV): a pad move is arithmetic on the cached statistics.
 // While a slider moves (exact = false) a median that lies between two remembered samples closer than kBracketEv is interpolated; the frame
 // after the drag (exact = true) evaluates everything for real, so the final render is identical to the uncached match.
+#include <chrono>
+#include <cstdio>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -12,6 +14,7 @@
 #include <thread>
 
 #include "dapple/film_match.h"
+#include "parallel.h"
 #include "dapple/renderer.h"
 
 namespace dapple {
@@ -241,13 +244,21 @@ void prewarmFilmCalibration(const EditParams& p, void (*lowPriority)()) {
   const unsigned hc = std::max(1u, std::thread::hardware_concurrency());
   const int workers = hc >= 4 ? 2 : 1;
   auto next = std::make_shared<std::atomic<int>>(0);
+  auto nDone = std::make_shared<std::atomic<int>>(0);
+  const auto tStart = std::chrono::steady_clock::now();
   for (int wk = 0; wk < workers; ++wk)
-    std::thread([lib, film = p.filmStock, paper, lowPriority, next, workers] {
+    std::thread([lib, film = p.filmStock, paper, lowPriority, next, workers, nDone, tStart] {
+      ThreadPool::tlUse() = &ThreadPool::background();
       if (lowPriority && workers == 1) lowPriority();
       try {
         // +-3.5 EV: film_shoot reaches +-3 EV and the constant interpolates to the next bucket. Outward from 0: a drag starts at the automatic exposure
         // and the buckets next to it are needed first (it was -3.5 .. +3.5)
-        for (int i; (i = next->fetch_add(1)) < 15;) filmPrintConstant(lib, film, paper, i == 0 ? 0.f : (i & 1 ? 0.5f : -0.5f) * float((i + 1) / 2));
+        for (int i; (i = next->fetch_add(1)) < 15;) {
+          filmPrintConstant(lib, film, paper, i == 0 ? 0.f : (i & 1 ? 0.5f : -0.5f) * float((i + 1) / 2));
+          if (nDone->fetch_add(1) + 1 == 15 && std::getenv("DAPPLE_ENGINE_LOG"))
+            std::fprintf(stderr, "dapple_engine: print calibration warm-up done after %.0f ms\n",
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count());
+        }
       } catch (...) {
       }
     }).detach();

@@ -120,5 +120,7 @@ Status bakePrintScan(const void* resolved, std::span<const void* const> inputs, 
 void freePayload(void*);
 // The three tables from the process-wide cache (per-table keys); false when a bake failed.
 bool tablesFor(const FilmResolved& r, FilmTablesHandle& out);
+// Counters of the background print tables (wave 8): frames that used a stale table while the worker bakes, tables the worker finished, requests made.
+void filmAsyncTableStats(unsigned long long* staleUses, unsigned long long* baked, unsigned long long* requested);
 
 }  // namespace dapple::engine::filmnode

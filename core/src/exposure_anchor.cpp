@@ -45,7 +45,7 @@ void midWindow(float& lo, float& hi) {
 
 }  // namespace
 
-ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const ImageF& linear, float dngBaselineEv) {
+ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const ImageF& linear, float dngBaselineEv, const Image8* reference) {
   ExposureAnchor a;
   if (linear.empty()) return a;
 
@@ -65,12 +65,17 @@ ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const Ima
     constexpr float kMeanTarget = 0.22f, kPrior = 1.0f, kShrink = 0.5f, kHighlightCap = 1.5f;
     float ev = kShrink * std::log2(kMeanTarget / mean) + (1.f - kShrink) * kPrior;
     ev = std::min(ev, std::log2(kHighlightCap / hi));
-    a.statsEv = std::clamp(ev, -1.5f, 3.5f);
+    // A frame whose mean is below 1 % of white (6.6 stops under it) is a black frame or a noise frame: it carries no exposure information and a
+    // lift would only amplify noise (a Galaxy Note10+ frame at 0.4 % got +3.2 EV). The largest tier 1 anchor of the 36 samples is 1.87 EV, so
+    // the statistic never goes above 2.0 EV, and below 1 % it is held at the prior.
+    ev = std::min(ev, 2.0f);
+    if (mean < 0.01f) ev = std::min(ev, kPrior);
+    a.statsEv = std::clamp(ev, -1.5f, 2.0f);
   }
 
   // ---- tier 1: the embedded preview ----
   bool tier1 = false;
-  auto prev = extractEmbeddedPreview(raw, 0);
+  Result<Image8> prev = reference ? Result<Image8>(*reference) : extractEmbeddedPreview(raw, 0);
   if (!prev) {
     a.note = "no embedded preview";
   } else if (std::max(prev->width, prev->height) < kMinPreviewEdge) {
@@ -84,29 +89,49 @@ ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const Ima
       a.note = "preview aspect cannot be reconciled";
     } else {
       const double arP2 = ratio > 1.02 ? std::min(arP, arR) : arP, arR2 = ratio > 1.02 ? std::min(arP, arR) : arR;
-      const ImageF pc = resizeToLongEdge(cropToAspect(p, arP2), kEdge);
+      const ImageF pc0 = resizeToLongEdge(cropToAspect(p, arP2), kEdge);
       const ImageF rc = resizeToLongEdge(cropToAspect(linear, arR2), kEdge);
-      const int W = std::min(pc.width, rc.width), H = std::min(pc.height, rc.height);
       float midLo, midHi;
       midWindow(midLo, midHi);
-      std::vector<float> lr;
-      lr.reserve(std::size_t(W) * H);
-      const int bx = int(W * kBorder), by = int(H * kBorder);
-      std::size_t total = 0;
-      for (int y = by; y < H - by; ++y)
-        for (int x = bx; x < W - bx; ++x) {
-          ++total;
-          const float* q = pc.row(y) + 3 * x;
-          const float* r = rc.row(y) + 3 * x;
-          const float enc = 0.2126729f * q[0] + 0.7151522f * q[1] + 0.0721750f * q[2];  // encoded luma
-          if (enc < midLo || enc > midHi) continue;
-          if (std::max({q[0], q[1], q[2]}) > 0.97f || std::min({q[0], q[1], q[2]}) < 0.03f) continue;
-          if (std::max({r[0], r[1], r[2]}) > 0.95f) continue;  // clipped raw
-          const float yo = color::proPhotoLuma(r);
-          if (yo < 2e-4f) continue;
-          const float yp = 0.2126729f * color::srgbDecode(q[0]) + 0.7151522f * color::srgbDecode(q[1]) + 0.0721750f * color::srgbDecode(q[2]);
-          lr.push_back(std::log2(yp / yo));
+      // log-ratios of the mid-tone pixels for one orientation of the preview
+      struct Run { std::vector<float> lr; std::size_t total = 0; float spread = 1e9f; };
+      auto collect = [&](const ImageF& pcv) {
+        Run run;
+        const int W = std::min(pcv.width, rc.width), H = std::min(pcv.height, rc.height);
+        run.lr.reserve(std::size_t(W) * H);
+        const int bx = int(W * kBorder), by = int(H * kBorder);
+        for (int y = by; y < H - by; ++y)
+          for (int x = bx; x < W - bx; ++x) {
+            ++run.total;
+            const float* q = pcv.row(y) + 3 * x;
+            const float* r = rc.row(y) + 3 * x;
+            const float enc = 0.2126729f * q[0] + 0.7151522f * q[1] + 0.0721750f * q[2];  // encoded luma
+            if (enc < midLo || enc > midHi) continue;
+            if (std::max({q[0], q[1], q[2]}) > 0.97f || std::min({q[0], q[1], q[2]}) < 0.03f) continue;
+            if (std::max({r[0], r[1], r[2]}) > 0.95f) continue;  // clipped raw
+            const float yo = color::proPhotoLuma(r);
+            if (yo < 2e-4f) continue;
+            const float yp = 0.2126729f * color::srgbDecode(q[0]) + 0.7151522f * color::srgbDecode(q[1]) + 0.0721750f * color::srgbDecode(q[2]);
+            run.lr.push_back(std::log2(yp / yo));
+          }
+        if (run.lr.size() >= 50) {
+          std::vector<float> t2 = run.lr, t3 = run.lr;
+          run.spread = (percentileOf(t3, 0.75) - percentileOf(t2, 0.25)) / 1.349f;
         }
+        return run;
+      };
+      Run run = collect(pc0);
+      // A preview may keep the sensor orientation or be upright; for 180 degrees the two differ and the file's Orientation tag cannot tell which
+      // one an embedded thumbnail follows: try the preview turned by 180 degrees too and keep the orientation that agrees with the raw better.
+      if (run.spread > 0.35f) {
+        ImageF rot(pc0.width, pc0.height);
+        for (int y = 0; y < pc0.height; ++y)
+          for (int x = 0; x < pc0.width; ++x) std::copy_n(pc0.row(pc0.height - 1 - y) + 3 * (pc0.width - 1 - x), 3, rot.row(y) + 3 * x);
+        Run alt = collect(rot);
+        if (alt.spread < run.spread - 0.15f) run = std::move(alt);
+      }
+      std::vector<float>& lr = run.lr;
+      const std::size_t total = run.total;
       a.previewPixels = int(lr.size());
       if (total > 0 && lr.size() >= std::max<std::size_t>(300, total / 50)) {
         std::vector<float> t1 = lr, t2 = lr, t3 = lr;
@@ -127,6 +152,7 @@ ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const Ima
 
   if (tier1) {
     a.tier = 1, a.ev = a.previewEv, a.confidence = a.previewConfidence;
+    a.source = reference ? "reference-image" : "embedded-preview";
   } else if (std::isfinite(dngBaselineEv) && dngBaselineEv != 0.f) {  // 0 is the specification default: not information
     a.tier = 2, a.ev = dngBaselineEv, a.confidence = 0.5f;
     a.note += (a.note.empty() ? "" : "; ") + std::string("DNG BaselineExposure");

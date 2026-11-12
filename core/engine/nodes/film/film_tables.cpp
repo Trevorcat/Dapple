@@ -3,11 +3,18 @@
 // tables are bit-identical to the ones FilmSimulator::setParams bakes (tested), but cached under three narrower keys:
 // dragging print warmth / tint re-bakes only the print LUT (about 10 ms), on a model whose neutral solve is reused.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <list>
 #include <map>
 #include <mutex>
+#include <thread>
+#include <vector>
+
+#include "parallel.h"
+#include "engine/nodes/film/film_async.h"
 
 #include "dapple/film_match.h"
 #include "engine/nodes/film/film_node_internal.h"
@@ -351,28 +358,155 @@ bool cachedPeek(TableLru<T>& c, const Hash128& key) {
     if (e.first == key) return true;
   return false;
 }
+template <class T>
+std::shared_ptr<const T> cachedFind(TableLru<T>& c, const Hash128& key) {
+  std::lock_guard<std::mutex> lock(c.m);
+  for (auto it = c.l.begin(); it != c.l.end(); ++it)
+    if (it->first == key) {
+      c.l.splice(c.l.begin(), c.l, it);
+      return c.l.front().second;
+    }
+  return nullptr;
+}
+}  // namespace
+
+namespace {
+// ---- background print tables while a print-table slider moves (wave 8, Redmi / Pixel 5: 17-124 ms of CPU bake + upload per drag frame) --------
+// An interactive drag frame never bakes on the frame thread: it uses the coarse table of its own parameter values when one is cached, else the
+// most recent table of the same stock / paper / mapping (the previous step of the drag), and asks the worker to bake the coarse table for the
+// values it wanted. The worker runs on the background pool (own threads, same capability-chosen cores) and keeps only the latest request.
+// The settled frame is not coarse and bakes / fetches the exact table on the frame thread exactly as before (DAPPLE_FILM_ASYNC_TABLES=0
+// restores the synchronous path, the engine tests use it).
+TableLru<PrintTable>& printsExact() {
+  static TableLru<PrintTable> t;
+  return t;
+}
+TableLru<PrintTable>& printsCoarseLru() {
+  static TableLru<PrintTable> t;
+  return t;
+}
+struct LastPrint {
+  std::mutex m;
+  Hash128 base;
+  std::shared_ptr<const PrintTable> t;
+};
+LastPrint& lastPrint() {
+  static LastPrint l;
+  return l;
+}
+void noteLastPrint(const Hash128& base, const std::shared_ptr<const PrintTable>& t) {
+  LastPrint& l = lastPrint();
+  std::lock_guard<std::mutex> lock(l.m);
+  l.base = base;
+  l.t = t;
+}
+std::shared_ptr<const PrintTable> staleFor(const Hash128& base) {
+  LastPrint& l = lastPrint();
+  std::lock_guard<std::mutex> lock(l.m);
+  return l.t && l.base == base ? l.t : nullptr;
+}
+std::atomic<unsigned long long> g_staleUses{0};
+std::atomic<bool> g_staleOutstanding{false};  // a frame used a stale table and no table has landed since
+struct Listeners {
+  std::mutex m;
+  std::vector<std::pair<TableLandedFn, void*>> v;
+};
+Listeners& listeners() {
+  static Listeners* l = new Listeners;
+  return *l;
+}
+void notifyLanded() {
+  std::vector<std::pair<TableLandedFn, void*>> copy;
+  {
+    std::lock_guard<std::mutex> lock(listeners().m);
+    copy = listeners().v;
+  }
+  for (auto& e : copy) e.first(e.second);
+}
+struct PrintWorker {
+  std::mutex m;
+  std::condition_variable cv;
+  bool have = false, started = false;
+  FilmResolved r{};
+  Hash128 key{}, base{};
+  std::atomic<unsigned> baked{0}, requested{0};
+  void request(const FilmResolved& rr, const Hash128& k, const Hash128& b) {
+    {
+      std::lock_guard<std::mutex> lock(m);
+      r = rr;
+      key = k;
+      base = b;
+      have = true;
+      requested.fetch_add(1);
+      if (!started) {
+        started = true;
+        std::thread([this] { loop(); }).detach();
+      }
+    }
+    cv.notify_one();
+  }
+  void loop() {
+    ThreadPool::tlUse() = &ThreadPool::background();
+    for (;;) {
+      FilmResolved rr;
+      Hash128 k, b;
+      {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] { return have; });
+        rr = r, k = key, b = base;
+        have = false;
+      }
+      try {
+        auto t = cachedTable(printsCoarseLru(), k, bakePrintScanCoarse, rr);
+        if (t) noteLastPrint(b, t);
+      } catch (...) {
+      }
+      baked.fetch_add(1);
+      bool newer;
+      {
+        std::lock_guard<std::mutex> lock(m);
+        newer = have;
+      }
+      if (!newer && g_staleOutstanding.exchange(false)) notifyLanded();
+    }
+  }
+};
+PrintWorker& printWorker() {
+  static PrintWorker* w = new PrintWorker;  // leaked: the thread outlives static destruction
+  return *w;
+}
+bool asyncTables() {
+  static const bool on = [] {
+    const char* e = std::getenv("DAPPLE_FILM_ASYNC_TABLES");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
 }  // namespace
 
 bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
   static TableLru<RawTable> raws;
   static TableLru<CurvesTable> curves;
-  static TableLru<PrintTable> prints;
+  TableLru<PrintTable>& prints = printsExact();
   Hasher hs;
   hs.u64(std::uintptr_t(r.lib));
   hs.u64(std::uintptr_t(r.stock));
   hs.i32(r.quality == 0);
   const Hash128 ks = hs.finish();
+  Hasher hb;  // what a stale print table must share with the wanted one: everything but warmth / tint / print exposure / black
+  hb.hash(ks);
+  hb.u64(std::uintptr_t(r.paper));
+  hb.i32(r.scan);
+  hb.i32(r.quality == 0);
+  hb.i32(dapple::filmPaperMappingEnabled());
+  hb.i32(r.fx.enlargerFilter != 0 && r.quality != 0 && !r.scan);  // split-path tables
+  const Hash128 base = hb.finish();
   Hasher hp;
-  hp.hash(ks);
-  hp.u64(std::uintptr_t(r.paper));
-  hp.i32(r.scan);
-  hp.i32(r.quality == 0);
+  hp.hash(base);
   hp.f32(r.warmth);
   hp.f32(r.tint);
   hp.f32(r.printEv);
   hp.f32(r.black);
-  hp.i32(dapple::filmPaperMappingEnabled());
-  hp.i32(r.fx.enlargerFilter != 0 && r.quality != 0 && !r.scan);  // split-path tables
   Hasher hr;  // the raw table also carries the input matrix: scene illuminant and degree of adaptation (only when the film's own balance is not in use)
   hr.hash(ks);
   if (r.adapt < 1.f && r.sceneX > 0.f) {
@@ -383,17 +517,31 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
   out.raw = cachedTable(raws, hr.finish(), bakeRaw, r);
   out.curves = cachedTable(curves, ks, bakeCurves, r);
   const Hash128 kp = hp.finish();
+  bool usedStale = false;
   // Interactive frame while a print-table slider moves (r.coarse): the exact table when it is cached, else a coarse one (cached on its own, so
   // a drag does not evict the exact tables); the frame after the drag is not coarse and bakes the exact table.
   if (r.coarse && !cachedPeek(prints, kp)) {
-    static TableLru<PrintTable> printsCoarse;
     Hasher hc;
     hc.hash(kp);
     hc.i32(kCoarseLutN);
-    out.print = cachedTable(printsCoarse, hc.finish(), bakePrintScanCoarse, r);
+    const Hash128 kc = hc.finish();
+    if (asyncTables()) {
+      out.print = cachedFind(printsCoarseLru(), kc);
+      if (!out.print) {
+        g_staleOutstanding.store(true);  // before the request: the worker may land the table before this frame has used the stale one
+        printWorker().request(r, kc, base);
+        out.print = staleFor(base), usedStale = out.print != nullptr;
+        if (usedStale) g_staleUses.fetch_add(1, std::memory_order_relaxed);
+        else g_staleOutstanding.store(false);  // nothing stale was shown (the table baked synchronously below)  // the previous step of the drag (or the settled table it started from)
+        if (!out.print) out.print = cachedTable(printsCoarseLru(), kc, bakePrintScanCoarse, r);  // the first table of this stock: bake here
+      }
+    } else {
+      out.print = cachedTable(printsCoarseLru(), kc, bakePrintScanCoarse, r);
+    }
   } else {
     out.print = cachedTable(prints, kp, bakePrintScan, r);
   }
+  if (out.print && !usedStale) noteLastPrint(base, out.print);
   return out.raw && out.curves && out.print;
 }
 
@@ -582,4 +730,25 @@ FilmHalos halosOf(const FilmResolved& r) {
   return h;
 }
 
+}  // namespace dapple::engine::filmnode
+
+namespace dapple::engine::filmnode {
+void filmAsyncTableStats(unsigned long long* staleUses, unsigned long long* baked, unsigned long long* requested) {
+  if (staleUses) *staleUses = g_staleUses.load();
+  if (baked) *baked = printWorker().baked.load();
+  if (requested) *requested = printWorker().requested.load();
+}
+}  // namespace dapple::engine::filmnode
+
+namespace dapple::engine::filmnode {
+void addTableLandedListener(TableLandedFn fn, void* user) {
+  std::lock_guard<std::mutex> lock(listeners().m);
+  listeners().v.push_back({fn, user});
+}
+void removeTableLandedListener(TableLandedFn fn, void* user) {
+  std::lock_guard<std::mutex> lock(listeners().m);
+  auto& v = listeners().v;
+  v.erase(std::remove(v.begin(), v.end(), std::make_pair(fn, user)), v.end());
+}
+bool filmTablesStale() { return g_staleOutstanding.load(); }
 }  // namespace dapple::engine::filmnode

@@ -40,6 +40,7 @@ struct ShotMetadata {
   float exposureAnchorEv = 0.f;
   float exposureAnchorConfidence = 0.f;
   std::string exposureAnchorNote;
+  std::string exposureAnchorSource;  // "embedded-preview", "paired-jpeg" / "reference-image" (DecodeOptions::referenceImage or a sibling .jpg), "" = tag / statistics
   float exposureAnchorPreviewEv = 0.f, exposureAnchorStatsEv = 0.f;  // diagnostics: what tier 1 / tier 3 said whatever won
   float exposureAnchorDngEv = 0.f; bool exposureAnchorHasDng = false;
   std::string illuminantSource;  // where asShotIlluminantXy / asShotCct came from: "dng-dual" (DNG spec ch. 6 solve), "wbct" (camera Kelvin table), "matrix" (single matrix, uncorrected), empty = unknown

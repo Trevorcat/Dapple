@@ -170,6 +170,10 @@ void main() {
       expect(ph.pairedJpeg, endsWith('.jpg'));
       expect(ph.previewPath, ph.pairedJpeg);
       expect(File(ph.path!).existsSync() && File(ph.pairedJpeg!).existsSync(), isTrue);
+      // the engine finds the paired camera JPEG as the exposure-anchor reference by name (core/src/exposure_anchor.h, DecodeOptions::referenceImage):
+      // same directory, same stem, .jpg next to the .dng
+      expect(p.dirname(ph.path!), p.dirname(ph.pairedJpeg!));
+      expect(p.basenameWithoutExtension(ph.path!), p.basenameWithoutExtension(ph.pairedJpeg!));
       expect(src.listSync(), isEmpty, reason: 'moved out of the capture cache');
       expect(ph.takenMs, isNotNull);
       expect(app.photoById(ph.id), same(ph));
@@ -186,6 +190,39 @@ void main() {
       expect(ph.path, ph.previewPath);
       await Future<void>.delayed(Duration.zero);
       expect(fake.gallery, ['SYS_1.jpg|image/jpeg']);
+    });
+
+    test('RAW only with a viewfinder thumbnail: it is embedded into the moved DNG (exposure anchor reference) and the thumbnail file is removed', () async {
+      final src = Directory(p.join(tmp.path, 'cache'))..createSync();
+      final dng = File(p.join(src.path, 'DAP_20261112_131502.dng'))..writeAsBytesSync([0x49, 0x49, 0x2A, 0x00, 9]);
+      final thumb = File(p.join(src.path, 'DAP_20261112_131502.thumb.jpg'))..writeAsBytesSync([0xFF, 0xD8, 1, 2, 3]);
+      final calls = <String>[];
+      app.dngThumbnailEmbedder = (d, j) async {
+        calls.add('${p.basename(d)}|${p.basename(j)}|${File(d).existsSync()}|${File(j).existsSync()}');
+        return true;
+      };
+      final ph = await app.ingestCapture(CaptureResult(dngPath: dng.path, thumbPath: thumb.path));
+      expect(calls, ['DAP_20261112_131502.dng|DAP_20261112_131502.thumb.jpg|true|true'], reason: 'embedded into the file in the inbox, before the develop queue sees it');
+      expect(File(ph.path!).existsSync(), isTrue);
+      expect(thumb.existsSync(), isFalse, reason: 'the cache copy of the thumbnail is deleted');
+    });
+
+    test('RAW + JPEG ignores a thumbnail (the paired JPEG is the reference), a failing embedder does not break the ingest', () async {
+      final src = Directory(p.join(tmp.path, 'cache'))..createSync();
+      final r = _files(src, stem: 'DAP_20261112_131503');
+      var called = false;
+      app.dngThumbnailEmbedder = (d, j) async {
+        called = true;
+        throw StateError('boom');
+      };
+      final ph = await app.ingestCapture(r);
+      expect(called, isFalse);
+      final src2 = Directory(p.join(tmp.path, 'cache2'))..createSync();
+      final dng = File(p.join(src2.path, 'DAP_20261112_131504.dng'))..writeAsBytesSync([0x49, 0x49, 0x2A, 0x00, 9]);
+      final thumb = File(p.join(src2.path, 't.jpg'))..writeAsBytesSync([0xFF, 0xD8, 1]);
+      final ph2 = await app.ingestCapture(CaptureResult(dngPath: dng.path, thumbPath: thumb.path));
+      expect(called, isTrue);
+      expect(File(ph2.path!).existsSync() && ph.pairedJpeg != null, isTrue);
     });
 
     test('RAW only (no camera JPEG): the DNG alone is the source, no preview yet, only the DNG goes to the gallery at once', () async {
@@ -205,6 +242,16 @@ void main() {
       expect(app.galleryJpegPending, contains(ph.id), reason: 'the developed JPEG follows the develop');
       await Future<void>.delayed(Duration.zero);
       expect(fake.gallery, ['DAP_20261112_131501.dng|image/x-adobe-dng']);
+    });
+
+    test('purgeCaptures removes the capture photos (debug cleanup; the files go with them, a Windows handle may delay that)', () async {
+      final src = Directory(p.join(tmp.path, 'cache'))..createSync();
+      final ph = await app.ingestCapture(_files(src));
+      final n = app.photos.length;
+      expect(app.purgeCaptures(), 1);
+      expect(app.photoById(ph.id), isNull);
+      expect(app.purgeCaptures(), 0);
+      expect(n, greaterThan(0));
     });
 
     test('a capture with a camera JPEG needs no developed gallery copy', () async {

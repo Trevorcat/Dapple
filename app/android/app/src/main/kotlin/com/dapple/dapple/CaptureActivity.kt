@@ -54,6 +54,7 @@ class CaptureActivity : ComponentActivity() {
     companion object {
         const val EXTRA_JPG = "jpg"
         const val EXTRA_DNG = "dng"
+        const val EXTRA_THUMB = "thumb"
         const val EXTRA_SOURCE = "source"
         const val EXTRA_ERROR = "error"
         private const val TAG = "DappleCapture"
@@ -285,6 +286,8 @@ class CaptureActivity : ComponentActivity() {
         val dng = File(dir, "DAP_$stamp.dng")
         val ex = ContextCompat.getMainExecutor(this)
         val mode = st.mode
+        // RAW-only: the DNG written by CameraX has no preview; keep the viewfinder frame of this shot as a JPEG for Dart to embed (CaptureThumb)
+        thumbFile = if (mode == CaptureMode.RAW) CaptureThumb.save(preview.bitmap, File(dir, "DAP_$stamp.thumb.jpg")) else null
         val outputs = if (mode == CaptureMode.RAW_JPEG) 2 else 1
         var left = outputs
         var errored = false
@@ -390,7 +393,7 @@ class CaptureActivity : ComponentActivity() {
                     shotFailed(mode, attempt); return
                 }
                 st?.markVerified()
-                deliver(null, dng, "camerax")
+                deliver(null, dng, "camerax", thumbFile)
             }
             CaptureMode.RAW_JPEG -> {
                 // CameraX writes (raw, jpeg) in that order; verify by magic bytes instead of trusting it
@@ -421,12 +424,15 @@ class CaptureActivity : ComponentActivity() {
         }
     }
 
-    private fun deliver(jpg: File?, dng: File?, source: String) {
+    private var thumbFile: File? = null
+
+    private fun deliver(jpg: File?, dng: File?, source: String, thumb: File? = null) {
         if (finished) return
         finished = true
         setResult(RESULT_OK, Intent().putExtra(EXTRA_SOURCE, source).apply {
             if (jpg != null) putExtra(EXTRA_JPG, jpg.absolutePath)
             if (dng != null) putExtra(EXTRA_DNG, dng.absolutePath)
+            if (thumb != null && thumb.length() > 0) putExtra(EXTRA_THUMB, thumb.absolutePath)
         })
         finish()
     }

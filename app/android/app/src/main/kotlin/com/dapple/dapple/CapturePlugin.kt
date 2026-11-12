@@ -58,6 +58,7 @@ class CapturePlugin(private val activity: Activity, messenger: BinaryMessenger) 
                 val m = HashMap<String, Any?>()
                 m["jpg"] = data?.getStringExtra(CaptureActivity.EXTRA_JPG)
                 m["dng"] = data?.getStringExtra(CaptureActivity.EXTRA_DNG)
+                m["thumb"] = data?.getStringExtra(CaptureActivity.EXTRA_THUMB)
                 m["source"] = data?.getStringExtra(CaptureActivity.EXTRA_SOURCE) ?: "camerax"
                 r.success(m)
             }

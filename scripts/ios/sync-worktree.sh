@@ -15,8 +15,8 @@ with open(sys.argv[2], 'wb') as f:
         if n and n not in dele and os.path.isfile(n):
             f.write(n.encode('utf-8') + b'\0')
 PY
-tar --null -T "$LIST" -cf - | ssh "$H" 'mkdir -p ~/dapple/src && tar -x -C ~/dapple/src'
+tar --null -T "$LIST" -cf - | ssh "$H" 'mkdir -p ~/dapple/src && tar -x -m -C ~/dapple/src'
 [ -s "$DEL" ] && ssh "$H" 'cd ~/dapple/src && xargs rm -f' < "$DEL"
-tar -c tools/shaderc | ssh "$H" 'tar -x -C ~/dapple/src'
+tar -c tools/shaderc | ssh "$H" 'tar -x -m -C ~/dapple/src'
 ssh "$H" 'find ~/dapple/src/scripts/ios -name "*.sh" -exec sed -i "" "s/\r$//" {} + ; date > ~/dapple/src/.synced-worktree'
 rm -f "$LIST" "$DEL"

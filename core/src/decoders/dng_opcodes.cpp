@@ -249,6 +249,33 @@ void applyMosaic(const OpcodeList& list, MosaicView& v, ApplyReport& rep) {
       }
       scale(0, v.height, 1, 0, v.width, 1, [&](int r, int c) { return f.at(c, r, v.width, v.height); });
       rep.applied.push_back("FixVignetteRadial");
+    } else if (op.id == kFixBadPixelsConstant) {
+      // Constant (u32), BayerPhase (u32): every pixel whose raw value equals Constant is replaced by the mean of its same-colour neighbours
+      // (two pixels up / down / left / right on a Bayer lattice, the good ones only). The raw values are compared as stored (OpcodeList1,
+      // before linearisation).
+      if (op.params.size() < 8) {
+        note(rep.skipped, "FixBadPixelsConstant");
+        continue;
+      }
+      const std::uint32_t k = (std::uint32_t(op.params[0]) << 24) | (std::uint32_t(op.params[1]) << 16) | (std::uint32_t(op.params[2]) << 8) | op.params[3];
+      long fixed = 0;
+      for (int r = 0; r < v.height; ++r) {
+        std::uint16_t* row = v.px + (std::size_t(v.top) + r) * v.pitch + v.left;
+        for (int c = 0; c < v.width; ++c) {
+          if (row[c] != k) continue;
+          int sum = 0, n = 0;
+          const int dr[4] = {-2, 2, 0, 0}, dc[4] = {0, 0, -2, 2};
+          for (int d = 0; d < 4; ++d) {
+            const int rr = r + dr[d], cc = c + dc[d];
+            if (rr < 0 || rr >= v.height || cc < 0 || cc >= v.width) continue;
+            const std::uint16_t nv = v.px[(std::size_t(v.top) + rr) * v.pitch + v.left + cc];
+            if (nv == k) continue;
+            sum += nv, ++n;
+          }
+          if (n) row[c] = std::uint16_t((sum + n / 2) / n), ++fixed;
+        }
+      }
+      rep.applied.push_back("FixBadPixelsConstant (" + std::to_string(fixed) + " px)");
     } else if (op.id == kWarpRectilinear || op.id == kWarpFisheye || op.id == kWarpRectilinear2) {
       note(rep.skipped, std::string(opName(op.id)) + " (needs the demosaiced image)");
     } else {

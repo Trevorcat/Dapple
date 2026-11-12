@@ -24,11 +24,13 @@
 #include "dapple/look.h"
 #include "dapple/lut.h"
 #include "dapple/renderer.h"
+#include "dng_thumbnail.h"
 #include "dapple/tone.h"
 #include "parallel.h"
 #include "sysperf.h"
 #include "dapple/xmp_preset.h"
 #include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
+#include "engine/nodes/film/film_async.h"
 #include "color.h"
 #ifdef DAPPLE_HAVE_GPU
 #include "engine/exec/gpu_runtime.h"  // optional GPU executor (core/gpu): runtime flag, status; frames go through EngineSession
@@ -502,6 +504,23 @@ void dapple_free_image(DappleImage* image) {
   image->height = 0;
 }
 
+int32_t dapple_dng_embed_thumbnail(const char* dng_path, const char* jpeg_path) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!dng_path || !jpeg_path) {
+          setError("null path");
+          return DAPPLE_ERROR;
+        }
+        std::string err;
+        if (!embedDngThumbnailFile(toPath(dng_path), toPath(jpeg_path), &err)) {
+          setError(err);
+          return DAPPLE_ERROR;
+        }
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
 int32_t dapple_extract_preview(const char* path, int32_t long_edge, DappleImage* out) {
   return guarded(
       [&]() -> int32_t {
@@ -968,6 +987,20 @@ void dapple_perf_configure(int32_t thread_limit, int32_t target_frame_ms) {
 }
 
 float dapple_thermal_headroom(int32_t forecast_seconds) { return sys::adpf().headroom(forecast_seconds); }
+
+int32_t dapple_set_repaint_callback(DappleRepaintFn fn, void* user) {
+  static DappleRepaintFn cur = nullptr;
+  static void* curUser = nullptr;
+  using namespace dapple::engine::filmnode;
+  if (cur) removeTableLandedListener(reinterpret_cast<TableLandedFn>(cur), curUser);
+  cur = nullptr;
+  curUser = nullptr;
+  if (!fn) return DAPPLE_OK;
+  cur = fn;
+  curUser = user;
+  addTableLandedListener(reinterpret_cast<TableLandedFn>(fn), user);
+  return DAPPLE_OK;
+}
 
 char* dapple_perf_info_json(void) {
   const sys::Topology& t = sys::topology();

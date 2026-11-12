@@ -1,9 +1,7 @@
 // iOS implementation of PlatformServices (docs/ios/platform-interface.md, docs/ios/README.md).
 //
-// Working today: a file based media library (the app's Documents/Photos folder, which is also visible in the Files app under
-// "On My iPhone / Dapple": copy RAW / JPEG files there, or push them with `simctl` on the simulator) and the system share sheet.
-// Stubs that fail gracefully: capture, wireless transfer, video / codec layer, saving to the Photos library (Swift side planned:
-// AVFoundation, Network.framework, VideoToolbox, PhotoKit).
+// PhotoKit media library (DappleEnginePlugin.swift: list / copy / save / system picker / change notifications), the share sheet (share_plus),
+// and graceful stubs for capture, wireless transfer and the video / codec layer (docs/ios/platform-interface.md).
 import 'dart:async';
 import 'dart:io';
 
@@ -13,6 +11,7 @@ import 'package:path_provider/path_provider.dart';
 import '../services/capture.dart';
 import '../services/ftp_ingest.dart';
 import '../services/ingest.dart';
+import '../services/media_permission.dart';
 import '../services/share_service.dart';
 import 'platform_services.dart';
 
@@ -20,7 +19,7 @@ class IosPlatformServices implements PlatformServices {
   @override
   String get name => 'ios';
   @override
-  final MediaLibrary media = IosDocumentsLibrary();
+  final MediaLibrary media = IosPhotoLibrary();
   @override
   final CaptureBackend capture = NullCaptureBackend();
   @override
@@ -35,21 +34,35 @@ class IosPlatformServices implements PlatformServices {
 
 const _photoExt = ['.arw', '.raf', '.dng', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.jpg', '.jpeg', '.heic'];
 
-/// Documents/Photos as the photo source. Files are read in place (the engine takes paths), nothing is copied.
-class IosDocumentsLibrary implements MediaLibrary {
-  final IosDocumentsSource _src = IosDocumentsSource();
+/// PhotoKit through DappleEnginePlugin.swift: `dapple/media` lists / copies / saves, `dapple/photos` asks for access and runs the system picker.
+/// Limited access works as full access for the listing (the system only shows the chosen photos); [presentLimitedPicker] widens the selection.
+class IosPhotoLibrary implements MediaLibrary {
+  final IngestSource _src = MediaStoreIngestSource();
+  final MediaPermission _perm = MediaPermission();
   @override
   IngestSource get source => _src;
   @override
-  Future<bool> permissionGranted() async => true; // files in the app's own sandbox need no permission
+  Future<bool> permissionGranted() => _perm.isGranted();
   @override
-  Future<bool> requestPermission() async => true;
+  Future<bool> requestPermission() => _perm.request();
+  Future<String> accessLevel() => MediaPermission.iosStatus();
+  Future<void> presentLimitedPicker() => MediaPermission.presentLimitedPicker();
   @override
-  Future<String?> copyToFile(IncomingFile f, String destPath) async => f.path;
+  Future<String?> copyToFile(IncomingFile f, String destPath) async => f.uri == null ? f.path : MediaBridge.copyToFile(f.uri!, destPath);
   @override
-  Future<bool> saveToLibrary(String path, String name, {bool replace = false}) async => false; // PhotoKit: planned
+  Future<List<IncomingFile>> pick(Directory inbox) => PickerIngestSource(inbox).pick();
+  @override
+  Future<bool> saveToLibrary(String path, String name, {bool replace = false}) async {
+    try {
+      await MediaBridge.saveToGallery(path, name, replace: replace);
+      return true;
+    } catch (_) {
+      return false; // no permission / cancelled: the caller shows its own message
+    }
+  }
 }
 
+/// Documents/Photos as a photo source (files dropped there through the Files app or `simctl`); used by the debug / autotest hooks.
 class IosDocumentsSource implements IngestSource {
   @override
   String get id => 'documents';

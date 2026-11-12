@@ -33,6 +33,43 @@ if(WIN32)
   target_link_libraries(dapple_libraw PUBLIC ws2_32)
 endif()
 
+# OpenMP in LibRaw: the X-Trans demosaic (3-pass Markesteijn, the Fujifilm path: 17 s for a 40 MP frame single-threaded) and the other demosaics
+# have OpenMP loops (LIBRAW_USE_OPENMP). Not available on Apple (the iOS / macOS toolchains ship no OpenMP): there the demosaic stays single
+# threaded (the engine runs its own work in parallel elsewhere). Android links the NDK's libomp statically, Windows needs libomp.dll next to
+# the executables (copied after the build).
+option(DAPPLE_LIBRAW_OPENMP "Build LibRaw with OpenMP (parallel X-Trans / Bayer demosaic)" ON)
+if(DAPPLE_LIBRAW_OPENMP AND NOT APPLE AND NOT MSVC)
+  include(CheckCXXCompilerFlag)
+  set(CMAKE_REQUIRED_LINK_OPTIONS "-fopenmp")
+  check_cxx_compiler_flag("-fopenmp" DAPPLE_HAVE_FOPENMP)
+  unset(CMAKE_REQUIRED_LINK_OPTIONS)
+  if(DAPPLE_HAVE_FOPENMP)
+    target_compile_options(dapple_libraw PRIVATE -fopenmp)
+    target_compile_definitions(dapple_libraw PRIVATE LIBRAW_USE_OPENMP LIBRAW_FORCE_OPENMP)  # libraw_types.h #undefs it on mingw otherwise
+    if(ANDROID)
+      target_link_libraries(dapple_libraw PUBLIC -fopenmp -static-openmp)
+    elseif(WIN32)
+      # the toolchains build with -static, which hides the import library libomp.dll.a: link it by path
+      get_filename_component(_cc_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+      file(GLOB _omp_lib "${_cc_dir}/../x86_64-w64-mingw32/lib/libomp.dll.a")
+      if(_omp_lib)
+        list(GET _omp_lib 0 _omp_lib0)
+        target_link_libraries(dapple_libraw PUBLIC "${_omp_lib0}")
+      endif()
+    else()
+      target_link_libraries(dapple_libraw PUBLIC -fopenmp)
+    endif()
+    if(WIN32)
+      file(GLOB _omp_dll "${_cc_dir}/../x86_64-w64-mingw32/bin/libomp.dll" "${_cc_dir}/../aarch64-w64-mingw32/bin/libomp.dll")
+      if(_omp_dll AND CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+        list(GET _omp_dll 0 _omp_dll0)
+        add_custom_command(TARGET dapple_libraw POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_omp_dll0}" "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+      endif()
+    endif()
+    message(STATUS "LibRaw: OpenMP on")
+  endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # stb_image / stb_image_write (public domain), vendored at a pinned commit.
 # ---------------------------------------------------------------------------

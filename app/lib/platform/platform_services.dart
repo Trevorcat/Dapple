@@ -29,6 +29,10 @@ abstract class MediaLibrary {
   /// Makes the item readable by path for the engine (Android content:// copy). Null when it cannot be read.
   Future<String?> copyToFile(IncomingFile f, String destPath);
 
+  /// The platform's own photo picker: iOS PHPicker (no permission needed), Android the document picker. The picked originals are copied into
+  /// [inbox]; empty when the user cancelled.
+  Future<List<IncomingFile>> pick(Directory inbox);
+
   /// Adds a finished file to the user's photo library (Android Pictures/Dapple, iOS Photos album "Dapple"). False when the
   /// platform cannot do it (yet).
   Future<bool> saveToLibrary(String path, String name, {bool replace = false});
@@ -99,6 +103,8 @@ class _AndroidMedia implements MediaLibrary {
   @override
   Future<String?> copyToFile(IncomingFile f, String destPath) async => f.uri == null ? f.path : MediaBridge.copyToFile(f.uri!, destPath);
   @override
+  Future<List<IncomingFile>> pick(Directory inbox) => PickerIngestSource(inbox).pick();
+  @override
   Future<bool> saveToLibrary(String path, String name, {bool replace = false}) async {
     await MediaBridge.saveToGallery(path, name, replace: replace);
     return true;
@@ -147,6 +153,8 @@ class NullMediaLibrary implements MediaLibrary {
   Future<bool> requestPermission() async => true;
   @override
   Future<String?> copyToFile(IncomingFile f, String destPath) async => f.path;
+  @override
+  Future<List<IncomingFile>> pick(Directory inbox) async => const [];
   @override
   Future<bool> saveToLibrary(String path, String name, {bool replace = false}) async => false;
 }

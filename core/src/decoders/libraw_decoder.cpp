@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -19,9 +20,11 @@
 #include "dapple/illuminant.h"
 #include "dapple/decoder.h"
 #include "decoders/dng_illuminant.h"
+#include "decoders/dng_jxl.h"
 #include "decoders/dng_opcodes.h"
 #include "exposure_anchor.h"
 #include "file_util.h"
+#include "color.h"
 #include "parallel.h"
 
 namespace dapple {
@@ -423,6 +426,166 @@ class PathDatastream final : public LibRaw_abstract_datastream {
   INT64 size_ = 0;
 };
 
+// Deep-shadow chroma floor. LibRaw (like every converter that works in unsigned integers) clips the black-subtracted noise at zero, which gives
+// each channel a positive bias of about 0.4 sigma; the white balance multipliers (R x 2, B x 1.8) then turn that into a magenta cast in the
+// darkest pixels (a Galaxy Note10+ frame at 0.5 - 2 DN above black with sigma 7 DN came out R 0.0070 / G 0.0041 / B 0.0097). Below a linear luma
+// of kShadowFloor the chroma is faded out (luma kept), smoothly: a pixel that dark has no colour information, only noise.
+void suppressShadowChroma(ImageF& img) {
+  constexpr float kShadowFloor = 0.008f;
+  const int h = img.height, w = img.width;
+  parallelRows(h, [&](int y) {
+    float* p = img.row(y);
+    for (int x = 0; x < w; ++x, p += 3) {
+      const float l = 0.2880f * p[0] + 0.7119f * p[1] + 0.0001f * p[2];
+      if (l >= kShadowFloor) continue;
+      const float t = std::max(l, 0.f) / kShadowFloor, k = t * t * (3.f - 2.f * t);
+      for (int c = 0; c < 3; ++c) p[c] = l + (p[c] - l) * k;
+    }
+  });
+}
+
+// the file's exposure anchor (core/src/exposure_anchor.h) into out.meta: an explicit reference first, else the embedded preview, else a sibling camera JPEG
+void attachExposureAnchor(SourceImage& out, const std::filesystem::path& path, const DecodeOptions& options, float dngBaselineEv) {
+  // camera RAW (not a Dapple linear merge): the file's own exposure anchor
+  // reference of this frame: an explicit one first, else the embedded preview, else a sibling camera JPEG (RAW+JPEG)
+  ExposureAnchor an;
+  std::optional<Image8> ref;
+  if (!options.referenceImage.empty()) {
+  if (auto r = loadReferenceJpeg(options.referenceImage)) ref = std::move(*r);
+  }
+  an = computeExposureAnchor(path, out.linear, dngBaselineEv, ref ? &*ref : nullptr);
+  if (an.tier != 1 && !ref) {
+  for (const char* ext : {".jpg", ".JPG", ".jpeg", ".JPEG"}) {
+    std::filesystem::path sib = path;
+    sib.replace_extension(ext);
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(sib, ec)) continue;
+    auto r = loadReferenceJpeg(sib);
+    if (!r) continue;
+    const ExposureAnchor a2 = computeExposureAnchor(path, out.linear, dngBaselineEv, &*r);
+    if (a2.tier == 1) {
+      an = a2;
+      break;
+    }
+  }
+  }
+  out.meta.exposureAnchorTier = an.tier;
+  out.meta.exposureAnchorEv = an.ev;
+  out.meta.exposureAnchorConfidence = an.confidence;
+  out.meta.exposureAnchorNote = an.note;
+  out.meta.exposureAnchorSource = an.source;
+  out.meta.exposureAnchorPreviewEv = an.previewEv;
+  out.meta.exposureAnchorStatsEv = an.statsEv;
+  out.meta.exposureAnchorHasDng = std::isfinite(dngBaselineEv);
+  out.meta.exposureAnchorDngEv = std::isfinite(dngBaselineEv) ? dngBaselineEv : 0.f;
+  }
+
+// DNG 1.7 JPEG XL files (LinearRaw, three samples per pixel): LibRaw cannot unpack them, so the samples come from libjxl (dng_jxl.h) and the
+// conversion LibRaw would do is done here: black / white level, as-shot white balance, DNG ForwardMatrix (or the inverse ColorMatrix) to
+// XYZ D50, then ProPhoto. LibRaw is still used to open the file for the metadata and the colour tags.
+Result<SourceImage> decodeJxlDngFile(LibRaw& raw, const std::filesystem::path& path, const DecodeOptions& options) {
+  const auto& d = raw.imgdata;
+  dng::JxlRaw jr = dng::decodeJxlDng(path);
+  if (!jr.error.empty()) return fail("JPEG XL DNG: " + jr.error);
+  if (jr.channels != 3) return fail("JPEG XL DNG with " + std::to_string(jr.channels) + " sample(s) per pixel (CFA mosaic) is not supported yet");
+  double wxy[2] = {0, 0};
+  ShotMetadata meta = readMetadata(raw, readDngWhiteXy(path, wxy) ? wxy : nullptr);
+  const auto& dc = d.color;
+  float black[3] = {0, 0, 0}, white[3] = {65535.f, 65535.f, 65535.f};
+  for (int c = 0; c < 3; ++c) {
+    if (dc.dng_levels.dng_whitelevel[c] > 0) white[c] = float(dc.dng_levels.dng_whitelevel[c]);
+    black[c] = dc.dng_levels.dng_fblack + dc.dng_levels.dng_fcblack[c];
+    if (black[c] == 0.f) black[c] = float(dc.dng_levels.dng_black) + float(dc.dng_levels.dng_cblack[c]);
+  }
+  // white balance: AsShotNeutral (camera RGB of a white object); else the multipliers LibRaw found
+  double neutral[3] = {1, 1, 1};
+  const auto& an = dc.dng_levels.asshotneutral;
+  if (an[0] > 0 && an[1] > 0 && an[2] > 0) {
+    for (int c = 0; c < 3; ++c) neutral[c] = an[c];
+  } else if (meta.asShotWb[0] > 0 && meta.asShotWb[2] > 0) {
+    for (int c = 0; c < 3; ++c) neutral[c] = 1.0 / meta.asShotWb[c];
+  }
+  // camera (white balanced) -> XYZ D50
+  double wgt = 1.0;  // weight of calibration 0 (interpolated by inverse CCT between the two illuminants)
+  const double T0 = illuminantCodeCct(dc.dng_color[0].illuminant), T1 = illuminantCodeCct(dc.dng_color[1].illuminant);
+  if (T0 > 0 && T1 > 0 && std::fabs(1.0 / T0 - 1.0 / T1) > 1e-9 && meta.asShotCct > 0)
+    wgt = std::clamp((1.0 / meta.asShotCct - 1.0 / T1) / (1.0 / T0 - 1.0 / T1), 0.0, 1.0);
+  auto sumAbs = [](const float(*m)[4]) {
+    double s = 0;
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c) s += std::fabs(double(m[r][c]));
+    return s;
+  };
+  double toXyz[9];  // camera (already divided by the neutral) -> XYZ D50
+  bool ok = false;
+  if (sumAbs(dc.dng_color[0].forwardmatrix) > 1e-6 && sumAbs(dc.dng_color[1].forwardmatrix) > 1e-6) {
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c) toXyz[r * 3 + c] = wgt * dc.dng_color[0].forwardmatrix[r][c] + (1 - wgt) * dc.dng_color[1].forwardmatrix[r][c];
+    ok = true;
+  } else {
+    // no ForwardMatrix: XYZ = inverse(ColorMatrix(w)) * camera, then Bradford from the illuminant white to D50
+    double cm[9], inv[9];
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c) cm[r * 3 + c] = wgt * dc.dng_color[0].colormatrix[r][c] + (1 - wgt) * dc.dng_color[1].colormatrix[r][c];
+    if (detail::invert3(cm, inv)) {
+      const double x = meta.asShotIlluminantXy[0] > 0 ? meta.asShotIlluminantXy[0] : 0.3457, y = meta.asShotIlluminantXy[1] > 0 ? meta.asShotIlluminantXy[1] : 0.3585;
+      const double ws[3] = {x / y, 1.0, (1 - x - y) / y}, wd[3] = {0.96422, 1.0, 0.82521};
+      const double B[9] = {0.8951, 0.2664, -0.1614, -0.7502, 1.7135, 0.0367, 0.0389, -0.0685, 1.0296};
+      const double Bi[9] = {0.9869929, -0.1470543, 0.1599627, 0.4323053, 0.5183603, 0.0492912, -0.0085287, 0.0400428, 0.9684867};
+      double cs[3], cd[3];
+      for (int r = 0; r < 3; ++r) {
+        cs[r] = B[r * 3] * ws[0] + B[r * 3 + 1] * ws[1] + B[r * 3 + 2] * ws[2];
+        cd[r] = B[r * 3] * wd[0] + B[r * 3 + 1] * wd[1] + B[r * 3 + 2] * wd[2];
+      }
+      double S[9] = {0}, t[9], A[9];
+      for (int r = 0; r < 3; ++r) S[r * 3 + r] = cd[r] / cs[r];
+      detail::mul3(S, B, t);
+      detail::mul3(Bi, t, A);
+      detail::mul3(A, inv, toXyz);
+      ok = true;
+    }
+  }
+  if (!ok) return fail("JPEG XL DNG without usable colour matrices");
+  float m[9];  // camera -> ProPhoto, folded with 1 / neutral
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c) {
+      double v = 0;
+      for (int k = 0; k < 3; ++k) v += double(color::kXyzD50ToProPhoto.m[r][k]) * toXyz[k * 3 + c];
+      m[r * 3 + c] = float(v / neutral[c]);
+    }
+  const int W = jr.width, H = jr.height;
+  const int half = options.quality == DecodeQuality::Preview ? 2 : 1;  // the preview decode needs no more than a quarter of the samples
+  const int ow = W / half, oh = H / half;
+  SourceImage out;
+  out.meta = meta;
+  out.sceneReferred = true;
+  out.linear = ImageF(ow, oh);
+  parallelRows(oh, [&](int y) {
+    float* dst = out.linear.row(y);
+    for (int x = 0; x < ow; ++x) {
+      float cam[3] = {0, 0, 0};
+      for (int dy = 0; dy < half; ++dy)
+        for (int dx = 0; dx < half; ++dx) {
+          const std::uint16_t* s = &jr.data[(std::size_t(y * half + dy) * W + (x * half + dx)) * 3];
+          for (int c = 0; c < 3; ++c) cam[c] += std::max(0.f, (float(s[c]) - black[c]) / (white[c] - black[c]));
+        }
+      const float inv = 1.f / float(half * half);
+      for (int c = 0; c < 3; ++c) cam[c] *= inv;
+      for (int r = 0; r < 3; ++r) dst[3 * x + r] = m[r * 3] * cam[0] + m[r * 3 + 1] * cam[1] + m[r * 3 + 2] * cam[2];
+    }
+  });
+  out.linear = rotateFlip(out.linear, d.sizes.flip);
+  out.meta.sensorWidth = (d.sizes.flip & 4) ? H : W;
+  out.meta.sensorHeight = (d.sizes.flip & 4) ? W : H;
+  suppressShadowChroma(out.linear);
+  out.meta.dngCorrections = "JPEG XL (libjxl), levels, forward matrix";
+  if (!out.meta.rawFormat.empty()) out.meta.rawFormat += ", ";
+  out.meta.rawFormat += "DNG 1.7 JPEG XL";
+  const float be = dc.dng_levels.baseline_exposure > -50.f && dc.dng_levels.baseline_exposure < 16.f ? dc.dng_levels.baseline_exposure : std::numeric_limits<float>::quiet_NaN();
+  if (anchorEnabled()) attachExposureAnchor(out, path, options, be);
+  return out;
+}
+
 class LibRawDecoder final : public ImageDecoder {
  public:
   const char* name() const override { return "libraw"; }
@@ -460,9 +623,11 @@ class LibRawDecoder final : public ImageDecoder {
     params.highlight = 0;     // clip; highlight reconstruction is done by us later
     params.half_size = options.quality == DecodeQuality::Preview ? 1 : 0;
     params.user_qual = 3;     // AHD for Bayer; X-Trans uses its own 3-pass method
+    if (const char* q = std::getenv("DAPPLE_USER_QUAL")) params.user_qual = std::atoi(q);  // experiments
 
     if (int rc = raw->open_datastream(&stream); rc != LIBRAW_SUCCESS)
       return fail("LibRaw open failed: " + std::string(libraw_strerror(rc)));
+    if (dng::isJxlDng(path)) return decodeJxlDngFile(*raw, path, options);  // DNG 1.7 JPEG XL: LibRaw cannot unpack it
     if (int rc = raw->unpack(); rc != LIBRAW_SUCCESS)
       return fail("LibRaw unpack failed: " + std::string(libraw_strerror(rc)));
     double wxy[2] = {0, 0};
@@ -483,7 +648,18 @@ class LibRawDecoder final : public ImageDecoder {
         l3 = dngList(*raw, 2);
         for (const dng::OpcodeList* l : {&l1, &l2, (const dng::OpcodeList*)&l3})
           if (!l->error.empty()) corr.skipped.push_back("malformed list (" + l->error + ")");
-        if (!l1.ops.empty()) corr.skipped.push_back("OpcodeList1 (" + std::to_string(l1.ops.size()) + " ops, pre-linearisation, not applied)");
+        if (!l1.ops.empty()) {  // OpcodeList1 acts on the raw values as stored: bad pixel fixes are applied, the rest is reported
+          const auto& S1 = raw->imgdata.sizes;
+          if (raw->imgdata.rawdata.raw_image && raw->imgdata.idata.filters != 0 && S1.width > 0 && S1.height > 0) {
+            dng::MosaicView v;
+            v.px = raw->imgdata.rawdata.raw_image;
+            v.pitch = std::size_t(S1.raw_pitch) / sizeof(std::uint16_t);
+            v.top = S1.top_margin, v.left = S1.left_margin, v.width = S1.width, v.height = S1.height;
+            dng::applyMosaic(l1, v, corr);
+          } else {
+            corr.skipped.push_back("OpcodeList1 (no 16-bit mosaic)");
+          }
+        }
         const auto& S = raw->imgdata.sizes;
         if (!l2.ops.empty()) {
           if (raw->imgdata.rawdata.raw_image && raw->imgdata.idata.filters != 0 && S.width > 0 && S.height > 0) {
@@ -565,17 +741,8 @@ class LibRawDecoder final : public ImageDecoder {
       out.linear = rotateFlip(out.linear, fileFlip);
     }
     out.meta.dngCorrections = corr.summary();
-    if (dappleGain == 1.f && anchorEnabled()) {  // camera RAW (not a Dapple linear merge): the file's own exposure anchor
-      const ExposureAnchor an = computeExposureAnchor(path, out.linear, dngBaselineEv);
-      out.meta.exposureAnchorTier = an.tier;
-      out.meta.exposureAnchorEv = an.ev;
-      out.meta.exposureAnchorConfidence = an.confidence;
-      out.meta.exposureAnchorNote = an.note;
-      out.meta.exposureAnchorPreviewEv = an.previewEv;
-      out.meta.exposureAnchorStatsEv = an.statsEv;
-      out.meta.exposureAnchorHasDng = std::isfinite(dngBaselineEv);
-      out.meta.exposureAnchorDngEv = std::isfinite(dngBaselineEv) ? dngBaselineEv : 0.f;
-    }
+    if (dappleGain == 1.f) suppressShadowChroma(out.linear);  // not for Dapple merges (their values are not sensor data)
+    if (dappleGain == 1.f && anchorEnabled()) attachExposureAnchor(out, path, options, dngBaselineEv);
     return out;
   }
 };

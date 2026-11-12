@@ -7,6 +7,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 
 #if defined(__ANDROID__)
@@ -14,6 +15,7 @@
 #include <sys/system_properties.h>
 #endif
 #include "dapple/dapple_view.h"
+#include "engine/nodes/film/film_async.h"
 #ifdef DAPPLE_HAVE_GPU
 #include "engine/exec/gpu_runtime.h"
 #endif
@@ -205,6 +207,36 @@ struct DappleView {
   }
 };
 
+// Repaint when a background film table lands (wave 8): the newest snapshot is rendered again, so a drag that stopped on a value converges to the table of
+// that value without any further input. Live views are tracked under a lock so a callback never meets a destroyed view.
+namespace {
+std::mutex g_liveMu;
+std::set<DappleView*> g_live;
+void onTableLanded(void*) {
+  std::lock_guard<std::mutex> lk(g_liveMu);
+  for (DappleView* v : g_live) {
+    Snapshot s;
+    bool have;
+    {
+      std::lock_guard<std::mutex> l(v->mu);
+      s = v->last;
+      have = !s.payload.empty() && v->loop;
+    }
+    if (have && !v->loop->hasPending()) v->loop->submit(std::move(s));
+  }
+}
+void registerRepaint(DappleView* v) {
+  std::lock_guard<std::mutex> lk(g_liveMu);
+  if (g_live.empty()) dapple::engine::filmnode::addTableLandedListener(&onTableLanded, nullptr);
+  g_live.insert(v);
+}
+void unregisterRepaint(DappleView* v) {
+  std::lock_guard<std::mutex> lk(g_liveMu);
+  g_live.erase(v);
+  if (g_live.empty()) dapple::engine::filmnode::removeTableLandedListener(&onTableLanded, nullptr);
+}
+}  // namespace
+
 extern "C" {
 
 DappleView* dapple_view_create(const DappleViewOptions* o) {
@@ -226,11 +258,13 @@ DappleView* dapple_view_create(const DappleViewOptions* o) {
   DappleView* raw = v.get();
   v->loop = std::make_unique<RenderLoop>([raw](Snapshot&& s, std::int64_t t) { raw->renderFrame(std::move(s), t); },
                                           (flags & DAPPLE_VIEW_TIMER_LOOP) == 0);
+  registerRepaint(raw);
   return v.release();
 }
 
 void dapple_view_destroy(DappleView* v) {
   if (!v) return;
+  unregisterRepaint(v);
   v->loop.reset();  // joins the thread (a frame in flight finishes first)
   {
     std::lock_guard<std::mutex> l(v->cbMu);

@@ -38,7 +38,19 @@ class MediaPermission {
   final Future<PermissionStatus> Function(Permission) _status;
   final Future<PermissionStatus> Function(Permission) _request;
 
-  Future<bool> isGranted() async => mediaStatusGrants(await _status(mediaPermissionForSdk(await _sdkInt())));
+  Future<bool> isGranted() async {
+    if (Platform.isIOS) return _iosGranted(await _photos.invokeMethod<String>('authorizationStatus'));
+    return mediaStatusGrants(await _status(mediaPermissionForSdk(await _sdkInt())));
+  }
 
-  Future<bool> request() async => mediaStatusGrants(await _request(mediaPermissionForSdk(await _sdkInt())));
+  Future<bool> request() async {
+    if (Platform.isIOS) return _iosGranted(await _photos.invokeMethod<String>('requestAuthorization'));
+    return mediaStatusGrants(await _request(mediaPermissionForSdk(await _sdkInt())));
+  }
+
+  /// iOS (PhotoKit): full and limited access both let the app list photos; "limited" can be widened with [presentLimitedPicker].
+  static bool _iosGranted(String? s) => s == 'authorized' || s == 'limited';
+  static const MethodChannel _photos = MethodChannel('dapple/photos');
+  static Future<String> iosStatus() async => await _photos.invokeMethod<String>('authorizationStatus') ?? 'notDetermined';
+  static Future<void> presentLimitedPicker() async => _photos.invokeMethod<void>('presentLimitedLibraryPicker');
 }

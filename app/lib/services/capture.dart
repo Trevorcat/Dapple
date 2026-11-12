@@ -8,10 +8,13 @@ enum CapturePerm { granted, denied, blocked }
 
 /// Files of one shutter press: JPEG only, RAW + JPEG, or a DNG alone (RAW-only capture; the library develops the DNG itself).
 class CaptureResult {
-  const CaptureResult({this.jpegPath, this.dngPath, this.source = 'camerax'})
+  const CaptureResult({this.jpegPath, this.dngPath, this.thumbPath, this.source = 'camerax'})
       : assert(jpegPath != null || dngPath != null, 'a capture has at least one file');
   final String? jpegPath;
   final String? dngPath;
+
+  /// RAW-only capture: a JPEG of the viewfinder frame at the shutter press, to embed into the DNG as its preview (exposure anchor reference).
+  final String? thumbPath;
 
   /// File name stem shared by the files of this shot.
   String get stem => _stemOf((jpegPath ?? dngPath)!);
@@ -63,7 +66,7 @@ class ChannelCaptureBackend implements CaptureBackend {
     final jpg = r?['jpg'] as String?;
     final dng = r?['dng'] as String?;
     if (r == null || (jpg == null && dng == null)) return null;
-    return CaptureResult(jpegPath: jpg, dngPath: dng, source: (r['source'] as String?) ?? 'camerax');
+    return CaptureResult(jpegPath: jpg, dngPath: dng, thumbPath: r['thumb'] as String?, source: (r['source'] as String?) ?? 'camerax');
   }
 
   @override

@@ -161,6 +161,28 @@ class JpegDecoder final : public ImageDecoder {
 
 }  // namespace
 
+Result<Image8> loadReferenceJpeg(const std::filesystem::path& path) {
+  auto bytes = readFile(path);
+  if (!bytes) return std::unexpected(bytes.error());
+  int w = 0, h = 0, n = 0;
+  std::unique_ptr<stbi_uc, void (*)(void*)> px(stbi_load_from_memory(bytes->data(), int(bytes->size()), &w, &h, &n, 3), stbi_image_free);
+  if (!px) return fail("JPEG decode failed: " + std::string(stbi_failure_reason()));
+  const ExifInfo exif = readExif(*bytes);
+  Image8 out;
+  if (exif.orientation > 1 && exif.orientation <= 8) {
+    ImageF f(w, h);
+    for (std::size_t i = 0; i < f.data.size(); ++i) f.data[i] = px.get()[i] / 255.f;
+    f = applyOrientation(f, exif.orientation);
+    out.width = f.width, out.height = f.height;
+    out.data.resize(f.data.size());
+    for (std::size_t i = 0; i < f.data.size(); ++i) out.data[i] = std::uint8_t(std::clamp(f.data[i], 0.f, 1.f) * 255.f + 0.5f);
+  } else {
+    out.width = w, out.height = h;
+    out.data.assign(px.get(), px.get() + std::size_t(w) * h * 3);
+  }
+  return out;
+}
+
 std::unique_ptr<ImageDecoder> makeJpegDecoder() { return std::make_unique<JpegDecoder>(); }
 
 DecoderRegistry DecoderRegistry::withBuiltins() {

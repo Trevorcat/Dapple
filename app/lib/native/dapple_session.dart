@@ -378,6 +378,19 @@ class DappleSession {
     }
   }
 
+  /// Embeds [jpegPath] as the preview of the DNG [dngPath] (RAW-only captures have none), so the engine's exposure anchor can use it (tier 1).
+  static Future<bool> embedDngThumbnail(String dngPath, String jpegPath) => Isolate.run(() {
+        final f = _b().dngEmbedThumbnail;
+        if (f == null) return false;
+        final a = dngPath.toNativeUtf8(), j = jpegPath.toNativeUtf8();
+        try {
+          return f(a, j) == dappleOk;
+        } finally {
+          malloc.free(a);
+          malloc.free(j);
+        }
+      });
+
   /// The JPEG embedded in a RAW file (the camera's own rendering), upright, scaled to [longEdge].
   /// Fast (no demosaic); null when the file has none or the library predates the symbol.
   static Future<RenderedImage?> extractPreview(String path, {int longEdge = 1280}) => Isolate.run(() {

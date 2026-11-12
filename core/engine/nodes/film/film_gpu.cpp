@@ -623,6 +623,28 @@ bool uploadGpuTables(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables&
   return true;
 }
 
+// Sub-data update of the print LUT of already uploaded tables (wave 8): only the print table changed (a table-moving drag lands a new coarse table), the
+// raw / curve / decode resources and the LUT image stay, only its texels are replaced. Not for the split (enlarger diffusion) path or a different size.
+bool updateGpuPrintLut(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables& out, std::string& err) {
+  const fd::FilmTables& pr = tb.print->t;
+  if (out.split || pr.split || out.lutN != pr.lutN || !out.lut.impl) return err = "print LUT update not applicable", false;
+  hal::Device& dev = core.dev();
+  std::copy(pr.dmin, pr.dmin + 4, out.dmin);
+  std::copy(pr.dscale, pr.dscale + 4, out.dscale);
+  std::copy(pr.glareRgb, pr.glareRgb + 4, out.glareRgb);
+  const std::uint64_t lutBytes = pr.lut.size() * 4;
+  auto cl = dev.begin();
+  if (!cl) return err = dev.lastError(), false;
+  if (!core.ensureStaging(cl->slot(), lutBytes + 256, err)) return false;
+  gpu::SlotRes& s = core.slot(cl->slot());
+  std::memcpy(s.staging.mapped, pr.lut.data(), lutBytes);
+  GpuGraph g(dev, core.pool());
+  g.copyBufferToImage(s.staging, g.external(out.lut), std::uint32_t(pr.lutN), std::uint32_t(pr.lutN), std::uint32_t(pr.lutN), 0);
+  if (gpu::runGraph(dev, g, *cl, nullptr, err) != hal::Status::Ok) return false;
+  if (dev.waitAll() != hal::Status::Ok) return err = dev.lastError(), false;
+  return true;
+}
+
 void releaseGpuTables(gpu::Core& core, GpuFilmTables& t) {
   hal::Device& dev = core.dev();
   dev.waitIdle();

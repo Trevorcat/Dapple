@@ -123,7 +123,11 @@ Selection selectDevice(const DeviceOptions& opt, const std::string& forcedIn, Se
     tryApi(Api::Gles31, opt, glesTest, s);
     return s;
   }
+#if defined(DAPPLE_HAL_METAL)
+  if (tryApi(Api::Metal, opt, vkTest, s)) return s;  // Apple: Metal is the primary API (there is no Vulkan)
+#else
   if (tryApi(Api::Vulkan, opt, vkTest, s)) return s;
+#endif
   if (tryApi(Api::Gles31, opt, glesTest, s)) return s;
   return s;  // CPU
 }

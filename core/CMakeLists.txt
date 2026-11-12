@@ -21,6 +21,8 @@ add_library(dapple_core STATIC
   src/decoders/jpeg_decoder.cpp
   src/decoders/libraw_decoder.cpp
   src/decoders/dng_opcodes.cpp
+  src/dng_thumbnail.cpp
+  src/decoders/dng_jxl.cpp
   src/exposure_anchor.cpp
   src/film.cpp
   src/film_color.cpp
@@ -62,6 +64,10 @@ target_include_directories(dapple_core
           ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dapple_core PRIVATE dapple_libraw dapple_stb)
+if(TARGET dapple_jxl)
+  target_link_libraries(dapple_core PRIVATE dapple_jxl)
+  target_compile_definitions(dapple_core PRIVATE DAPPLE_HAVE_JXL=1)
+endif()
 if(TARGET dapple_opencv)
   target_link_libraries(dapple_core PRIVATE dapple_opencv)
 endif()

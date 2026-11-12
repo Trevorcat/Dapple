@@ -90,6 +90,8 @@ class AppState extends ChangeNotifier {
   /// Phone-camera capture (testing convenience, requirements 4.2.6); tests substitute a fake.
   CaptureBackend captureBackend = ChannelCaptureBackend();
   Directory? captureInboxOverride; // tests
+  /// Embeds the viewfinder JPEG of a RAW-only capture into its DNG (tests substitute a fake).
+  Future<bool> Function(String dng, String jpeg) dngThumbnailEmbedder = DappleSession.embedDngThumbnail;
 
   /// Engine entry points of the HDR / panorama / Motion Photo tools (tests substitute a fake).
   MergeEngine engine = const NativeMergeEngine();
@@ -668,14 +670,14 @@ class AppState extends ChangeNotifier {
   // ---------------------------------------------------------------- permissions
   final MediaPermission _mediaPerm = MediaPermission();
   Future<void> refreshPermission() async {
-    if (!Platform.isAndroid || isDemo) return;
+    if (!(Platform.isAndroid || Platform.isIOS) || isDemo) return;
     mediaPermitted = await _mediaPerm.isGranted(); // READ_MEDIA_IMAGES on 13+, READ_EXTERNAL_STORAGE before
     linkDown = !mediaPermitted;
     notifyListeners();
   }
 
   Future<void> requestPermission() async {
-    if (!Platform.isAndroid || isDemo) return;
+    if (!(Platform.isAndroid || Platform.isIOS) || isDemo) return;
     mediaPermitted = await _mediaPerm.request();
     linkDown = !mediaPermitted;
     notifyListeners();
@@ -706,7 +708,7 @@ class AppState extends ChangeNotifier {
 
   /// Pages through everything added since the persisted high-water mark (DATE_ADDED seconds).
   Future<void> scan() async {
-    if (isDemo || !Platform.isAndroid || !mediaPermitted) return;
+    if (isDemo || !(Platform.isAndroid || Platform.isIOS) || !mediaPermitted) return;
     if (_scanning) {
       _rescan = true;
       return;
@@ -769,6 +771,21 @@ class AppState extends ChangeNotifier {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final jpg = r.jpegPath == null ? null : await _moveInto(r.jpegPath!, p.join(dir.path, '$stem.jpg'));
     final raw = r.dngPath == null ? null : await _moveInto(r.dngPath!, p.join(dir.path, '$stem.dng'));
+    final thumb = r.thumbPath;
+    if (raw != null && jpg == null && thumb != null) {
+      // RAW only: the DNG has no preview, so the engine's per-file exposure anchor would fall back to scene statistics; put the viewfinder frame of
+      // the shot into the file itself (works after the file is copied elsewhere too). Failure is harmless: the anchor falls back.
+      try {
+        if (!await dngThumbnailEmbedder(raw, thumb)) debugPrint('capture: thumbnail not embedded in $raw');
+      } catch (e) {
+        debugPrint('capture: thumbnail embedding failed: $e');
+      }
+    }
+    if (thumb != null) {
+      try {
+        await File(thumb).delete();
+      } catch (_) {}
+    }
     final src = raw ?? jpg!;
     final id = 'cap:$stem';
     final ph = Photo(
@@ -809,6 +826,20 @@ class AppState extends ChangeNotifier {
     } catch (e) {
       debugPrint('capture gallery jpeg failed: $e');
     }
+  }
+
+  /// Debug builds only (DebugOpen `{"purgeCaptures":true}`): removes every in-app capture (`cap:` ids) and its private files from the library.
+  /// The library has no delete action; this is how test shots are cleaned up on a device.
+  int purgeCaptures() {
+    final ids = _photos.keys.where((k) => k.startsWith('cap:')).toList();
+    for (final id in ids) {
+      final ph = _photos.remove(id)!;
+      _tryDelete(ph.path);
+      _tryDelete(ph.pairedJpeg);
+      _tryDelete(ph.previewPath);
+    }
+    if (ids.isNotEmpty) changed();
+    return ids.length;
   }
 
   Future<String> _moveInto(String from, String to) async {

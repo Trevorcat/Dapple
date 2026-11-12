@@ -935,9 +935,11 @@ void* nativeMetalDevice(Device& d) { return dynamic_cast<MetalDev*>(&d) ? static
 
 }  // namespace dapple::hal::metal
 
-// The executor selects "the Vulkan slot" first (gpu_context.cpp tries Api::Vulkan, then Api::Gles31). Apple has no Vulkan and the
-// context code is not Apple aware yet, so on Apple the Vulkan factory hal.cpp links against creates the Metal device
-// (caps().api says Metal). When gpu_context.cpp learns Api::Metal this alias goes away.
+// hal.cpp declares the Vulkan factory; on Apple there is none (Api::Metal is a first-class backend: hal::createDevice(Api::Metal),
+// selectDevice() tries it first, gpu_context.cpp lists it as a candidate).
 namespace dapple::hal::vk {
-std::unique_ptr<Device> createVulkanDevice(const DeviceOptions& opt, std::string& err) { return metal::createMetalDevice(opt, err); }
+std::unique_ptr<Device> createVulkanDevice(const DeviceOptions&, std::string& err) {
+  err = "Vulkan is not part of the Apple build (Metal is used)";
+  return nullptr;
+}
 }  // namespace dapple::hal::vk

@@ -122,7 +122,7 @@ target_sources(dapple_gpu PRIVATE "${_mt_dir}/metal_device.mm" "${_mgen}/dapple_
 set_source_files_properties("${_mt_dir}/metal_device.mm" PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
 target_include_directories(dapple_gpu PRIVATE "${_mgen}")
 target_compile_definitions(dapple_gpu PUBLIC DAPPLE_HAL_METAL=1)
-target_link_libraries(dapple_gpu PUBLIC "-framework Metal" "-framework Foundation")
+target_link_libraries(dapple_gpu PUBLIC "-framework Metal" "-framework Foundation" "-framework QuartzCore")
 
 if(DAPPLE_BUILD_TESTS AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
   # ---- Metal specific tests + the registration of the Apple variants of the shared suites ----

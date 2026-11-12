@@ -34,6 +34,7 @@ option(DAPPLE_BUILD_TESTS "Build unit tests" ON)
 option(DAPPLE_WITH_OPENCV "Build with OpenCV for HDR alignment and panorama stitching" ON)
 
 include(cmake/Dependencies.cmake)
+include(cmake/Jxl.cmake)
 if(DAPPLE_WITH_OPENCV)
   include(cmake/OpenCV.cmake)
 endif()

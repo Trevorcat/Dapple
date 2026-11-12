@@ -37,6 +37,17 @@ class ThreadPool {
     static ThreadPool* pool = new ThreadPool;
     return *pool;
   }
+  // A second, smaller pool for background table baking (wave 8): jobs of the frame thread never queue behind a bake and the other way round.
+  // Half of the pool cpus (at least 2 threads in total), same capability-chosen cores, normal scheduler priority.
+  static ThreadPool& background() {
+    static ThreadPool* pool = new ThreadPool(true);
+    return *pool;
+  }
+  // The pool parallelFor uses on this thread (null = the main pool); set by background workers.
+  static ThreadPool*& tlUse() {
+    static thread_local ThreadPool* p = nullptr;
+    return p;
+  }
 
   // Calls fn(begin, end) over disjoint ranges covering [0, n), in chunks of `chunk` items.
   void run(int n, int chunk, const std::function<void(int, int)>& fn) {
@@ -86,7 +97,7 @@ class ThreadPool {
   }
 
  private:
-  ThreadPool() {
+  explicit ThreadPool(bool background = false) : bg_(background) {
     // big.LITTLE: the performance cores take part (workers pinned to them) when there are enough of them,
     // otherwise all cpus (see sys::poolCpus)
     const sys::Topology& topo = sys::topology();
@@ -94,6 +105,7 @@ class ThreadPool {
     if (n <= 0) n = int(std::max(1u, std::thread::hardware_concurrency()));
     if (const char* env = std::getenv("DAPPLE_THREADS")) n = std::max(1, std::atoi(env));
     if (const char* env = std::getenv("DAPPLE_SPIN_US")) spinUs_ = std::clamp(std::atoi(env), 0, 1000);
+    if (bg_) n = std::max(2, n / 2);
     threads_ = n - 1;
     limit_.store(n);
     for (int i = 0; i < threads_; ++i) std::thread([this, i] { loop(i); }).detach();
@@ -128,7 +140,7 @@ class ThreadPool {
   void loop(int idx) {
     unsigned seen = 0;
     if (!std::getenv("DAPPLE_THREADS")) sys::setAffinity(sys::poolCpus(sys::topology()));
-    sys::setInteractivePriority();
+    if (!bg_) sys::setInteractivePriority();
     {
       std::lock_guard<std::mutex> lock(mtx_);
       tids_.push_back(sys::gettid_());
@@ -172,6 +184,7 @@ class ThreadPool {
   std::atomic<int> pendingA_{0};      // mirror of pending_ for the caller's spin
   int spinUs_ = 60;  // bounded spin before blocking (one pass gap is typically 5-50 us); env DAPPLE_SPIN_US
   int active_ = 0;
+  bool bg_ = false;
   std::atomic<int> limit_{1};
   std::vector<int> tids_;
 
@@ -202,7 +215,7 @@ class CancelScope {
 // Runs fn(i) for every i in [0, n) across all hardware threads.
 template <class Fn>
 void parallelFor(int n, Fn&& fn, int chunk = 1) {
-  ThreadPool::instance().run(n, chunk, [&](int a, int b) {
+  (ThreadPool::tlUse() ? *ThreadPool::tlUse() : ThreadPool::instance()).run(n, chunk, [&](int a, int b) {
     for (int i = a; i < b; ++i) fn(i);
   });
 }

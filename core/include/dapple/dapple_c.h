@@ -59,6 +59,10 @@ DAPPLE_API void dapple_free_image(DappleImage* image);
  * scaled to long_edge (0 = native size). Much faster than a session; for instant placeholders.
  * Fills *out (release with dapple_free_image). Returns DAPPLE_ERROR if the file has none. */
 DAPPLE_API int32_t dapple_extract_preview(const char* path, int32_t long_edge, DappleImage* out);
+/* Embeds a JPEG file as the preview (reduced-resolution SubIFD) of a DNG that has none, in place (core/src/dng_thumbnail.h). The exposure anchor of the
+ * file (tier 1, the camera rendering of this frame) reads it afterwards, also when the DNG is copied elsewhere. DAPPLE_OK on success; an error when
+ * the DNG already has SubIFDs, is not a classic TIFF, or the JPEG is unreadable. */
+DAPPLE_API int32_t dapple_dng_embed_thumbnail(const char* dng_path, const char* jpeg_path);
 
 /* Metadata of a file without decoding pixels. Returns JSON or NULL:
  * {"make","model","lens","iso","shutter","aperture","focalLength","timestamp",
@@ -237,6 +241,12 @@ DAPPLE_API void dapple_thread_background(int32_t on);
 DAPPLE_API float dapple_thermal_headroom(int32_t forecast_seconds);
 /* {"cpus":N,"perf":N,"efficient":N,"pool":N,"adpf":bool,"thermal_status":N}; free with dapple_free_string. */
 DAPPLE_API char* dapple_perf_info_json(void);
+
+/* Wave 8: film tables the drag needs are baked on a background worker; while one is pending a frame shows the previous step's table. The callback fires (on a
+ * worker thread, keep it short) once the newest requested table has landed and frames since then were stale: render the last frame again (a view does it itself).
+ * Returns 0 on success. Pass fn = NULL to remove the callback registered with the same user pointer. */
+typedef void (*DappleRepaintFn)(void* user);
+DAPPLE_API int32_t dapple_set_repaint_callback(DappleRepaintFn fn, void* user);
 
 /* Frame engine diagnostics (DAPPLE_ENGINE: default full; off = the old Renderer path, golden oracle / A/B): {"engine":"off|full","frames":N,
  * "fullHits":N,"latticeReuse":N,"latticeBake":N,...}; free with dapple_free_string. Additive. */
