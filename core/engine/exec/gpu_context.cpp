@@ -248,7 +248,7 @@ void probeLog(const std::string& text) {
 // Film pipelines and the default stock's tables, created before the first film frame asks for them (pipeline creation was 218 ms and the
 // table / plan upload 110-120 ms of the first film frame on the Find N5). Waits (bounded) for the app to set the film pack path. Returns the
 // milliseconds spent, -1 when there was nothing to warm.
-double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note) {
+double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note, bool* wrong = nullptr) {
   using Clk = std::chrono::steady_clock;
   const auto t0 = Clk::now();
   std::shared_ptr<const film::FilmLibrary> lib;
@@ -283,6 +283,24 @@ double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note) {
     job.store = &store;
     FrameResult res;
     if (!es.renderFrame(job, res)) note += (note.empty() ? "" : "; ") + res.error;
+    if (wrong && !t.grain && t.q == SpatialQuality::Interactive && res.rgba) {
+      // wave 8: the film path is part of the verdict. Forced GLES gave wrong film colours (mean dE 3 vs the CPU) on the Adreno 620 / 640 while the
+      // point and spatial self-test passed; the same frame on the CPU is the reference, a device that disagrees is demoted by the caller.
+      EngineSession cpuSession;
+      FrameJob cj{p, r, src, nullptr, cam, nullptr, {}, {}, {}};
+      cj.request.bakeSize = 33;
+      cj.request.interactive = true;
+      cj.fastOptions = fo;
+      FrameResult cr;
+      if (cpuSession.renderFrame(cj, cr) && cr.rgba && cr.w == res.w && cr.h == res.h) {
+        const dapple::gpu::DeStats s = dapple::gpu::compareRgba8(res.rgba, cr.rgba, std::size_t(res.w) * res.h);
+        char b[120];
+        std::snprintf(b, sizeof b, "film check: mean dE %.3f p99 %.2f max %.2f", s.mean, s.p99, s.max);
+        note += (note.empty() ? "" : "; ") + std::string(b);
+        if (!(s.mean <= 1.0 && s.p99 <= 5.0 && s.max <= 25.0)) *wrong = true;
+      }
+      std::free(cr.rgba);
+    }
     std::free(res.rgba);
   }
   return std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
@@ -727,8 +745,23 @@ class ProviderImpl final : public GpuProvider {
     probeLog(line);
     if (!std::getenv("DAPPLE_GPU_WARM_OFF")) {
       std::string note;
-      const double wm = warmFilm(c, note);
+      bool filmWrong = false;
+      const double wm = warmFilm(c, note, &filmWrong);
       const std::size_t pc = c->savePipelineCache();
+      if (filmWrong) {  // wave 8: the film frame disagrees with the CPU: give this API up, the next one (Vulkan -> GLES -> CPU) takes over
+        probeLog(std::string("gpu probe: ") + hal::apiName(c->api()) + " renders film frames wrong (" + note + "): demoted");
+        std::lock_guard<std::mutex> lk(mtx_);
+        excluded_.insert(c->api());
+        ctx_.reset();
+        ++gen_;
+        std::string w2;
+        std::shared_ptr<Context> n = make(&w2, excluded_, nullptr);
+        ctx_ = n;
+        lastWhy_ = n ? std::string() : "film check failed: " + w2;
+        state_.store(n ? State::Ready : State::Failed);
+        if (!n) return;
+        ++gen_;
+      }
       probeLog("gpu warm-up: film pipelines + default stock " + (wm < 0 ? "skipped (" + note + ")" : std::to_string(int(wm)) + " ms" + (note.empty() ? "" : " (" + note + ")")) + ", pipeline cache " + (pc ? std::to_string(pc / 1024) + " KB saved" : "not saved") + (c->options().device.pipelineCachePath.empty() ? "" : " [" + c->options().device.pipelineCachePath + "]"));
     }
   }

@@ -283,7 +283,8 @@ inline void applyFilmPaperMapping(film::FilmParams& p, float blackMix = 0.f) {
 }
 
 // Everything the match depends on, as a string: the edit minus the film's user offset, strength, grain and halation, minus
-// the neighbourhood stages (the match is a function of the tonal pipeline and the stock/paper/print filtration only).
+// the stages matchFilmExposure clears (clarity, texture, dehaze, grain, sharpen, nrLuma); vignette, nrColor and sharpRadius ARE part of the key
+// (wave 8: the solve's develop render reads them), so a vignette edit with a film on re-meters.
 // Empty when no film is active. Equal keys -> equal EV for the same proxy.
 std::string filmMatchKey(const EditParams& p);
 

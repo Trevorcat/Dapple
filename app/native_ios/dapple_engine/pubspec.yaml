@@ -1,0 +1,18 @@
+name: dapple_engine
+description: The Dapple C++ engine as dapple.xcframework (iOS). Carries no Dart API; lib/native/dapple_bindings.dart loads the symbols.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      ios:
+        ffiPlugin: true

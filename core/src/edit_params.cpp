@@ -111,8 +111,8 @@ const std::vector<ParamField>& paramFields() {
     add("film_exp", d.filmExposure, -3.f, 3.f, "film", 20.f);
     add("film_warmth", d.filmWarmth, -100.f, 100.f, "film");
     add("film_tint", d.filmTint, -100.f, 100.f, "film");
-    add("film_grain", d.filmGrain, 0.f, 100.f, "film", 1.f, false);
-    add("film_halation", d.filmHalation, 0.f, 100.f, "film", 1.f, false);
+    add("film_grain", d.filmGrain, 0.f, 200.f, "film", 1.f, false);
+    add("film_halation", d.filmHalation, 0.f, 200.f, "film", 1.f, false);
     add("film_shoot", d.filmShoot, -1.f, 1.f, "film", 1.f);
     add("film_print", d.filmPrint, -1.f, 1.f, "film", 1.f);
     add("film_black", d.filmBlack, -1.f, 1.f, "film", 1.f);

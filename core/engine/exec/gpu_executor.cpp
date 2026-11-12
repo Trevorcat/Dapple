@@ -734,7 +734,7 @@ bool Executor::validate(const GpuRun& in) {
     filmnode::FilmResolved fr;
     if (!filmResolve(in, fr)) return false;
     if (pl.mode == ExecMode::TiledExport && !filmnode::filmWindowable(fr))
-      return fail(GpuFailure::Unsupported, "the enlarger diffusion filter blurs the whole frame: no tiled export");
+      return fail(GpuFailure::Unsupported, "the enlarger diffusion filter blurs the whole frame (mixture halo = 4 sigma of the widest component, pyramid levels need aligned windows): no tiled export, CPU executor");
   }
   bool sweep = false;
   for (const Stage& st : pl.stages) {

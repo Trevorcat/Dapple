@@ -40,7 +40,8 @@
 
 struct DappleSession {
   dapple::SourceImage source;
-  const dapple::CameraProfile* camera = nullptr;
+  const dapple::CameraProfile* camera = nullptr;  // &cameraOwned: the profile with this file's exposure anchor
+  dapple::CameraProfile cameraOwned;
 
   // ---- interactive frame caches (see dapple_session_render_frame) ----
   std::mutex mtx;
@@ -577,7 +578,8 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         auto session = std::make_unique<DappleSession>();
         session->source = std::move(*src);
         if (long_edge > 0) session->source.linear = resizeToLongEdge(session->source.linear, long_edge);
-        session->camera = &cameras().resolve(session->source.meta.make, session->source.meta.model);
+        session->cameraOwned = dapple::effectiveCamera(cameras(), session->source.meta);
+        session->camera = &session->cameraOwned;
         return session.release();
       },
       nullptr);
@@ -1278,7 +1280,8 @@ DappleSession* dapple_session_open_merged(const char* const* paths, int32_t coun
           setError("unknown merge kind '" + k + "' (expected \"hdr\" or \"pano\")");
           return nullptr;
         }
-        session->camera = &cameras().resolve(session->source.meta.make, session->source.meta.model);
+        session->cameraOwned = dapple::effectiveCamera(cameras(), session->source.meta);
+        session->camera = &session->cameraOwned;
         return session.release();
       },
       nullptr);

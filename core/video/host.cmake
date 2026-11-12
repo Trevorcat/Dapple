@@ -1,0 +1,26 @@
+# `dapple_video_host`: core/video/dapple_video.cpp as a static library for the command line tool and the native video tests, linked against the FFmpeg
+# that tools/ffmpeg/build-host.sh (Windows desktop, llvm-mingw, shared DLLs) or tools/ffmpeg/build.sh (Android ABIs, shared .so) installed. It is a test /
+# tooling build: the app uses the JNI library dapple_video (core/video/CMakeLists.txt). Without that FFmpeg install nothing is defined
+# (DAPPLE_HAVE_VIDEO_HOST stays OFF) and the consumers (`dapple motion render`, tests/video/video_session_tests) skip the parts that need it.
+set(DAPPLE_HAVE_VIDEO_HOST OFF)
+set(DAPPLE_FFMPEG_HOST_DLLS "" CACHE INTERNAL "")
+if(WIN32)
+  set(_ffh "${CMAKE_SOURCE_DIR}/tools/ffmpeg/install/windows-x64")
+  set(_ffl "${_ffh}/lib/avformat.lib" "${_ffh}/lib/avcodec.lib" "${_ffh}/lib/swscale.lib" "${_ffh}/lib/swresample.lib" "${_ffh}/lib/avutil.lib")
+  set(_ffprobe "${_ffh}/lib/avcodec.lib")
+elseif(ANDROID)
+  set(_ffh "${CMAKE_SOURCE_DIR}/tools/ffmpeg/install/${ANDROID_ABI}")
+  set(_ffl "${_ffh}/lib/libavformat.so" "${_ffh}/lib/libavcodec.so" "${_ffh}/lib/libswscale.so" "${_ffh}/lib/libswresample.so" "${_ffh}/lib/libavutil.so" mediandk log)
+  set(_ffprobe "${_ffh}/lib/libavcodec.so")
+endif()
+if(_ffprobe AND EXISTS "${_ffprobe}")
+  add_library(dapple_video_host STATIC ${CMAKE_SOURCE_DIR}/core/video/dapple_video.cpp)
+  target_include_directories(dapple_video_host PUBLIC ${CMAKE_SOURCE_DIR}/core/video PRIVATE "${_ffh}/include")
+  target_link_libraries(dapple_video_host PUBLIC ${_ffl})
+  set(DAPPLE_FFMPEG_HOST_DIR "${_ffh}" CACHE INTERNAL "")
+  set(DAPPLE_HAVE_VIDEO_HOST ON)
+  if(WIN32)
+    file(GLOB _ffdlls "${_ffh}/bin/*.dll")
+    set(DAPPLE_FFMPEG_HOST_DLLS ${_ffdlls} CACHE INTERNAL "")
+  endif()
+endif()

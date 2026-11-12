@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <sstream>
 
+#if defined(DAPPLE_HAL_METAL)
+#include "engine/hal/metal/metal_device.h"
+#endif
+
 namespace dapple::hal {
 
 namespace vk {
@@ -90,6 +94,9 @@ std::string blockReason(const DeviceCaps& di, const std::vector<BlockRule>& rule
 std::unique_ptr<Device> createDevice(Api api, const DeviceOptions& opt, std::string& err) {
   switch (api) {
     case Api::Vulkan: return vk::createVulkanDevice(opt, err);
+#if defined(DAPPLE_HAL_METAL)
+    case Api::Metal: return metal::createMetalDevice(opt, err);
+#endif
     default: err = "backend not built"; return nullptr;
   }
 }

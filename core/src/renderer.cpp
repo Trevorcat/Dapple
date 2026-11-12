@@ -748,15 +748,15 @@ film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, Spatial
   // print filtration: more yellow / magenta filtration = less of that dye = cooler / greener print
   fp.enlarger.yFilterShift = -p.filmWarmth / 100.f * kWarmthFilterUnits;
   fp.enlarger.mFilterShift = -p.filmTint / 100.f * kWarmthFilterUnits;
-  const double g = std::clamp(p.filmGrain / 100.f, 0.f, 1.f);
+  const double g = std::clamp(p.filmGrain / 100.f, 0.f, 2.f);
   if (g <= 0) {
     fp.filmRender.grain.active = false;
   } else {
     fp.filmRender.grain.particleAreaUm2 *= g * g;  // grain amplitude ~ sqrt(particle area)
   }
-  const double h = std::clamp(p.filmHalation / 100.f, 0.f, 1.f);
-  fp.filmRender.halation.halationAmount = h;
-  fp.filmRender.halation.scatterAmount = h;
+  const double h = std::clamp(p.filmHalation / 100.f, 0.f, 2.f);
+  fp.filmRender.halation.halationAmount = h;  // 0..2: above 1 the halation is heavier than the stock's own
+  fp.filmRender.halation.scatterAmount = std::min(h, 1.0);  // the scatter is a mix weight: above 1 it would extrapolate (negative lobe)
   if (q == SpatialQuality::Off) fp.disableSpatialAndStochastic();
   else if (q == SpatialQuality::Interactive) fp.settings.previewMode = true;
   return fp;

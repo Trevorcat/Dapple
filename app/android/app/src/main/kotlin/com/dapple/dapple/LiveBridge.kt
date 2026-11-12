@@ -254,10 +254,12 @@ class LiveBridge(private val ctx: Context) {
 
     /**
      * Decodes (core/video) and re-encodes [startMs, startMs + durationMs] into [dest] (MP4): HEVC Main10 when the device has an
-     * encoder for it, else 8-bit H.264 ([compat] forces the 8-bit H.264 + SDR sharing version); LPCM audio becomes AAC.
+     * encoder for it, else 8-bit H.264 ([compat] forces the 8-bit H.264 + SDR sharing version); LPCM audio becomes AAC. [edit] = the still's edit
+     * (film included): every frame goes through the engine's node graph before it is encoded (docs/engine/pipeline-architecture.md section 27).
      */
-    fun trim(uri: String, startMs: Long, durationMs: Long, dest: String, mute: Boolean, source: Int, compat: Boolean, film: Boolean = false): Map<String, Any?> {
+    fun trim(uri: String, startMs: Long, durationMs: Long, dest: String, mute: Boolean, source: Int, compat: Boolean, film: Boolean = false, edit: EditSpec? = null): Map<String, Any?> {
         requireDecodable(uri)
-        return sw.clip(uri, decodeSel(uri), source, startMs, durationMs, dest, mute, compat, film)
+        if (edit != null && !DappleVideoEdit.available) throw UnsupportedVideo("the edit engine is not available in this build")
+        return sw.clip(uri, decodeSel(uri), source, startMs, durationMs, dest, mute, compat, film, edit)
     }
 }

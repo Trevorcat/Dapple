@@ -120,7 +120,7 @@ int gpuBench(const std::vector<std::string>& args) {
   }
   std::printf("%s\ndecoded %dx%d in %.0f ms (CPU threads %u)\n", path.c_str(), full->linear.width, full->linear.height, msSince(t0),
               std::thread::hardware_concurrency());
-  const CameraProfile& cam = cameras.resolve(full->meta.make, full->meta.model);
+  const CameraProfile cam = effectiveCamera(cameras, full->meta);
 
   EditParams prm = computeAutoAdjust(*full, cam).correction;
   prm.toneStrength = 60.f;

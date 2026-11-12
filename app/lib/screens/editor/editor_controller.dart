@@ -1,45 +1,29 @@
-// Hoisted editor state and intent handling: the [GestureSink] of the single gesture arbiter, the
-// floating window model, the transient readout, numeric entry, resets, haptics and handedness
-// bookkeeping. Widgets listen to the small notifiers here instead of rebuilding the page.
+// Hoisted editor state and intent handling: the [GestureSink] of the single gesture arbiter (the photo only zooms, pans and
+// compares now), the control pads (docs/design/editor-panel.md), the panel's layers, the transient readout, resets,
+// haptics and handedness bookkeeping. Widgets listen to the small notifiers here instead of rebuilding the page.
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:flutter/widgets.dart';
 
 import '../../editor/gesture_arbiter.dart';
 import '../../editor/handedness.dart';
 import '../../editor/haptics.dart';
-import '../../editor/param_rows.dart';
-import '../../editor/value_mapping.dart';
 import '../../editor/window_manager.dart';
-import '../../model/catalog.dart';
 import '../../model/film_pad.dart';
+import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../services/editor_engine.dart';
 import '../../state/app_state.dart';
 import 'zoom_view.dart';
-import '../../services/perf_probe.dart';
 
-/// Transient readout near the top of the photo (requirements 4.15.9). One mutable instance is
-/// reused for the whole gesture: no per-move allocation, listeners repaint only what they show.
+/// Transient readout near the top of the photo: the "原片" pill and the "n / N" counter.
 class ReadoutModel extends ChangeNotifier {
   bool visible = false;
   bool compare = false;
 
-  /// Placed in the lower part of the screen (the finger started close to the top readout).
-  bool low = false;
-
   /// The finger entered the readout area mid-gesture: fade, never move.
   bool dimmed = false;
-  String name = '', value = '', bandText = '';
-  RowKind kind = RowKind.oneD;
-  TwoD? twoD;
-  double v = 0, min = 0, max = 1, auto = 0, step = 1;
-  int endSide = 0;
-  PrecisionBand band = PrecisionBand.standard;
-
-  /// Bumped when the auto marker should flash (snap landmark).
-  int flash = 0;
+  String name = '';
   Timer? _hide;
 
   void notify() => notifyListeners();
@@ -59,6 +43,26 @@ class ReadoutModel extends ChangeNotifier {
     _hide?.cancel();
     super.dispose();
   }
+}
+
+/// UI-only selections inside the panel (not part of the photo's edit record).
+class PanelSel {
+  int band = 1; // colour range, default orange
+  int curveCh = 0;
+  int gradeZone = 0;
+  int hslPart = 1; // 0 hue, 1 saturation, 2 luminance
+  int gradePart = 0; // 0 luminance, 1 blend, 2 balance
+  int curvePoint = 1;
+}
+
+/// The three layers of the panel: layer 2 is the pad (or the film map), layer 3 the itemised view (or one of the complex editors).
+enum PanelExtra { curve, hsl, grade, paper, tone }
+
+/// A hold-to-adjust popup above the dock.
+class HoldPopup {
+  const HoldPopup(this.cat, this.anchorX);
+  final PadCat cat;
+  final double anchorX;
 }
 
 class EditorController extends ChangeNotifier implements GestureSink {
@@ -152,412 +156,473 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   final ReadoutModel readout = ReadoutModel();
 
-  /// Bumped whenever window contents must refresh (edits, selections, undo).
+  /// Bumped whenever the panel's structure must refresh (selections, layers, undo, first step of a gesture).
   final ValueNotifier<int> edits = ValueNotifier(0);
 
-  /// True while an adjust gesture is running: windows show one line.
+  /// True while a pad / strip / ruler gesture is running.
   final ValueNotifier<bool> dragging = ValueNotifier(false);
   final ValueNotifier<bool> compare = ValueNotifier(false);
   final ValueNotifier<bool> immersive = ValueNotifier(false);
 
-  /// Id of the row currently typed into, or null.
+  /// Id of the item whose value is being typed, or null.
   final ValueNotifier<String?> editingRow = ValueNotifier(null);
 
-  /// Mini-map "fine" switch of 2D controls (kept for the session).
-  final ValueNotifier<bool> fine2D = ValueNotifier(false);
+  /// The hold-to-adjust popup, or null.
+  final ValueNotifier<HoldPopup?> hold = ValueNotifier(null);
 
-  /// Phone portrait: the category controls are a panel docked under the photo (set by the page), not
-  /// floating windows. Changes what back and a tap on the photo do to the open category.
+  /// Phone portrait: the category controls are a panel docked under the photo (set by the page).
   bool docked = false;
 
-
-  final Map<EGroup, String> _activeId = {};
-
-  /// A screen reader explores by touch: one-finger drags must not change values.
+  /// A screen reader explores by touch.
   bool exploring = false;
 
-  /// Height available to the photo (scales the precision-band thresholds).
+  /// Height available to the photo.
   double availableHeight = 800;
 
-  /// Region of the top readout (to keep it away from the finger).
+  /// Region of the top readout.
   Rect readoutArea = Rect.zero;
 
   Timer? _idleTimer;
-  Timer? _undragTimer;
   int _seq = 0;
 
   String get id => photoId();
   EditState get edit => app.editOf(id);
 
-  // ------------------------------------------------------------ rows
-
-  RowContext ctx() => RowContext(
-        edit: edit,
-        defaultLookId: app.settings.defaultLookId,
-        defaultTone: app.settings.toneStrength,
-        nearestTone: analysis().nearest,
-        sel: sel,
-        film: app.film,
-        filmRanges: filmRanges.value,
-      );
-
-  List<ParamRow> rowsOf(EGroup g) => rowsFor(g, ctx());
-
-  /// Active row of category [g] (remembered for the editing session; first row by default).
-  ParamRow activeRowOf(EGroup g, [List<ParamRow>? rows]) {
-    final rs = rows ?? rowsOf(g);
-    final wanted = _activeId[g];
-    for (final r in rs) {
-      if (r.id == wanted) return r;
-    }
-    return rs.firstWhere((r) => r.switchable, orElse: () => rs.first);
-  }
-
-  ParamRow? get activeRow {
-    final w = wm.focused;
-    return w == null ? null : activeRowOf(w.group);
-  }
-
-  void setActive(EGroup g, ParamRow r) {
-    if (!r.switchable) return;
-    _activeId[g] = r.id;
-    wm.focus(g);
-    _bump();
-  }
+  PadCtx get padCtx => PadCtx(defaultTone: app.settings.toneStrength, defaultLookId: app.settings.defaultLookId);
 
   void _bump() {
     edits.value++;
   }
 
-  /// A control (docked ruler, pad) starts an adjust gesture on [row]: the same code path as a drag
-  /// on the photo, so both stay in sync. Makes [row] the active row of its category first.
-  void beginOn(ParamRow row, LockAxis axis, double x, double y) {
-    if (row.switchable) _activeId[row.group] = row.id;
-    wm.focus(row.group);
-    adjustBegin(axis, x, y);
+  // ------------------------------------------------------------ panel layers
+
+  bool itemised = false;
+  bool filmMapOpen = false;
+  PanelExtra? extra;
+  int selItem = 0;
+
+  /// The pad category of the open panel, or null (nothing open, or 裁切).
+  PadCat? get openCat {
+    final g = wm.focused?.group;
+    return g == null ? null : PadCatX.ofGroup(g);
   }
 
-  /// Chip tap in the docked panel: selects the row (or runs an action row) and opens a collapsed panel.
-  void selectRow(EGroup g, ParamRow r) {
-    if (r.kind == RowKind.action) {
-      performAction(r);
-      return;
-    }
-    _activeId[g] = r.id;
-    wm.focus(g);
-    if (wm.windowOf(g)?.collapsed ?? false) wm.setCollapsed(g, false);
+  void _resetLayers() {
+    itemised = false;
+    filmMapOpen = false;
+    extra = null;
+    selItem = 0;
+  }
+
+  void setItemised(bool v) {
+    itemised = v;
+    filmMapOpen = false;
+    extra = null;
+    selItem = 0;
     _bump();
   }
 
-  // ------------------------------------------------------------ GestureSink: context
-
-  @override
-  ArbiterMode get mode => wm.adjustMode ? ArbiterMode.adjust : ArbiterMode.browse;
-
-  @override
-  ActiveKind get activeKind => activeRow?.activeKind ?? ActiveKind.none;
-
-  @override
-  bool get zoomed => zoom.zoomed;
-
-  @override
-  bool get adjustEnabled => !exploring;
-
-  // ------------------------------------------------------------ adjust gesture
-
-  ParamRow? _row;
-  LockAxis _axis = LockAxis.none;
-  RelativeMapper? _m1;
-  DetentStepper? _st, _gx, _gy, _switcher;
-  PaletteMapper? _pal;
-  WheelMapper? _wheel;
-  List<ParamRow> _switchRows = const [];
-  BandTracker _bands = BandTracker();
-  String _gestureKey = '';
-  double _lastQ = double.nan;
-  double _px = 0, _py = 0;
-  EGroup? _group;
-  String _lastTone = '';
-
-  @override
-  void adjustBegin(LockAxis axis, double x, double y) {
-    final w = wm.focused;
-    if (w == null) return;
-    _group = w.group;
-    _axis = axis;
-    _px = x;
-    _py = y;
-    final c = ctx();
-    final rows = rowsFor(w.group, c);
-    final row = activeRowOf(w.group, rows);
-    _row = row;
-    _bands = BandTracker(availableHeight: availableHeight);
-    _gestureKey = '${row.id}#${++_seq}';
-    _firstApply = true;
-    _lastQ = double.nan;
-    _m1 = _st = _gx = _gy = _switcher = null;
-    _pal = null;
-    _wheel = null;
-
-    if (axis == LockAxis.vertical) {
-      _switchRows = [for (final r in rows) if (r.switchable) r];
-      final idx = _switchRows.indexWhere((r) => r.id == row.id);
-      _switcher = DetentStepper(stepDp: 40, count: _switchRows.length)..begin(idx < 0 ? 0 : idx);
-    } else if (row.kind == RowKind.oneD) {
-      _m1 = RelativeMapper(min: row.min, max: row.max, auto: row.auto, step: row.step)..begin(row.value(c));
-    } else if (row.kind == RowKind.discrete) {
-      _st = DetentStepper(stepDp: 48, count: row.count)..begin(row.readIndex!(c));
-    } else if (row.kind == RowKind.twoD) {
-      switch (row.twoD!) {
-        case TwoD.palette:
-          final look = lookById(c.edit.look ?? c.defaultLookId);
-          final p = c.edit.palette ?? Offset(look.px, look.py);
-          _pal = PaletteMapper(defX: look.px, defY: look.py)..begin(p.dx, p.dy);
-        case TwoD.tone:
-          final cur = c.edit.toneTarget ?? c.nearestTone;
-          final parts = cur.split('-');
-          final r = toneKeys.indexOf(parts[0]).clamp(0, 2), col = toneRanges.indexOf(parts[1]).clamp(0, 2);
-          _gx = DetentStepper(stepDp: 56, count: 3)..begin(col);
-          _gy = DetentStepper(stepDp: 56, count: 3)..begin(r);
-          _lastTone = cur;
-        case TwoD.curve:
-          _m1 = RelativeMapper(min: row.min, max: row.max, auto: row.auto)..begin(row.value(c));
-        case TwoD.wheel:
-          final z = c.sel.gradeZone;
-          _wheel = WheelMapper()..begin(c.edit.value(grKey(z, 'h')), c.edit.value(grKey(z, 's')));
-        case TwoD.offset:
-          // pad coordinates: x right = +1; y up = +1; the mapper works on 0..1 screen coordinates (y down)
-          // an ineffective end of an axis is unreachable: the mapper stops at the centre line there
-          final eff = row.padEff;
-          final xm = row.padXMin, defX = (0 - xm) / (1 - xm); // 0.5 symmetric, 0 for a one-sided axis (film_wb)
-          _pal = PaletteMapper(
-              defX: defX,
-              defY: 0.5,
-              lo: 0,
-              hi: 1,
-              loX: eff[0] ? 0 : defX,
-              hiX: eff[1] ? 1 : defX,
-              loY: eff[3] ? 0 : 0.5,
-              hiY: eff[2] ? 1 : 0.5)
-            ..begin((c.edit.value(row.padX!) - xm) / (1 - xm), (1 - c.edit.value(row.padY!)) / 2);
-      }
-    }
-
-    // readout placement: away from the finger (decided once, never moved during the gesture)
-    readout.low = readoutArea != Rect.zero && readoutArea.inflate(72).contains(Offset(x, y));
-    readout.dimmed = false;
-    readout.cancelHide();
-    wm.setInteracting(true);
-    engine.beginInteraction(activeParam: row.padX ?? row.id); // film pads: the X key names the pad to the engine
-    _undragTimer?.cancel();
-    dragging.value = true;
-    _publish(row, c, PrecisionBand.standard);
+  void setFilmMap(bool v) {
+    filmMapOpen = v;
+    itemised = false;
+    extra = null;
+    _bump();
   }
 
-  /// Structural refresh is needed on the first step of a gesture (edited marks appear) and, for the crop
-  /// window, on every step (the photo itself rotates / crops); the other pointer moves only change the
-  /// windows' one-line readout, which listens to the readout model.
+  void openExtra(PanelExtra? e) {
+    extra = e;
+    _bump();
+  }
+
+  void selectItem(int i) {
+    if (selItem == i) return;
+    selItem = i;
+    _bump();
+  }
+
+  void openCategory(EGroup g) {
+    final was = wm.focused?.group;
+    wm.toggle(g);
+    if (was != g) _resetLayers();
+    _bump();
+  }
+
+  /// Opens [g] without toggling (debug link, tests): layers back to the pad.
+  void showCategory(EGroup g) {
+    if (wm.focused?.group != g) wm.toggle(g);
+    _resetLayers();
+    _bump();
+  }
+
+  // ------------------------------------------------------------ pads
+
+  PadState padView(PadCat cat) => padViewOf(edit, cat, padCtx);
+  PadState padFull(PadCat cat) => padStateOf(edit, cat, padCtx);
+
+  /// Reachable pad area (only the film pad has dead ends).
+  PadLimits padLimits(PadCat cat) {
+    if (cat != PadCat.film) return PadLimits.full;
+    final r = filmRanges.value;
+    return PadLimits(
+      xLo: r.lo('film_shoot') ? -1 : 0,
+      xHi: r.hi('film_shoot') ? 1 : 0,
+      yLo: r.lo('film_print') ? -1 : 0,
+      yHi: r.hi('film_print') ? 1 : 0,
+    );
+  }
+
+  String? get defaultStockId {
+    final c = app.film;
+    if (c.isEmpty) return null;
+    // N400C (a general-purpose 400 negative) when the library has it, else the first stock
+    return c.stocks.where((s) => s.name == 'N400C').firstOrNull?.id ?? c.stocks.first.id;
+  }
+
+  String _gestureKey = '';
   bool _firstApply = true;
+  PadCat? _padCat;
+  bool _gestureOn = false;
+
+  /// A control gesture starts (pad, strip, ruler, radar, film map): one undo step until [gestureEnd].
+  void gestureBegin(String tag, {String? param}) {
+    if (_gestureOn) gestureEnd();
+    _gestureOn = true;
+    _gestureKey = '$tag#${++_seq}';
+    _firstApply = true;
+    wm.setInteracting(true);
+    engine.beginInteraction(activeParam: param);
+    dragging.value = true;
+  }
+
+  void gestureEnd() {
+    if (!_gestureOn) return;
+    _gestureOn = false;
+    _padCat = null;
+    engine.endInteraction();
+    wm.setInteracting(false);
+    dragging.value = false;
+    _bump();
+  }
 
   void _apply(EditState Function(EditState) f) {
+    if (!_gestureOn) {
+      app.applyEdit(id, f);
+      _bump();
+      return;
+    }
     app.applyEdit(id, f, coalesce: _gestureKey, gesture: true);
-    if (_firstApply || _group == EGroup.crop) {
+    if (_firstApply) {
       _firstApply = false;
       _bump();
     }
   }
 
-  @override
-  void adjustMove(double dx, double dy, double offX, double offY, double vx, double vy, double dtMs) {
-    final row = _row;
-    if (row == null) return;
-    final t0 = PerfProbe.begin();
-    _adjustMove(row, dx, dy, offX, offY, vx, vy, dtMs);
-    PerfProbe.end('move', t0);
+  /// The engine parameter a pad gesture names to the engine (grain-family keys keep grain in interactive frames).
+  static String padParam(PadCat cat) => switch (cat) {
+        PadCat.light => 'exposure',
+        PadCat.color => 'temp',
+        PadCat.film => 'film_shoot',
+        PadCat.texture => 'sharpen',
+      };
+
+  void padBegin(PadCat cat) {
+    gestureBegin('pad:${cat.name}', param: padParam(cat));
+    _padCat = cat;
   }
 
-  void _adjustMove(ParamRow row, double dx, double dy, double offX, double offY, double vx, double vy, double dtMs) {
-    _px += dx;
-    _py += dy;
-    final inReadout = readoutArea != Rect.zero && !readout.low && readoutArea.contains(Offset(_px, _py));
-    if (inReadout != readout.dimmed) {
-      readout.dimmed = inReadout;
-      readout.notify();
-    }
-    final speed = vx.abs();
-    if (_axis == LockAxis.vertical) {
-      final sw = _switcher!;
-      if (sw.update(dy)) {
-        final r = _switchRows[sw.index];
-        _activeId[_group!] = r.id;
-        _row = r;
-        _bump();
-        _publish(r, ctx(), PrecisionBand.standard);
-      }
-      haptics.landmark(sw.landmark);
-      return;
-    }
-    switch (row.kind) {
-      case RowKind.oneD:
-        _moveOneD(row, dx, speed, offY, dtMs);
-      case RowKind.discrete:
-        final st = _st!;
-        if (st.update(dx)) _setDiscrete(row, st.index);
-        haptics.landmark(st.landmark);
-      case RowKind.twoD:
-        _moveTwoD(row, dx, dy, vx, vy, dtMs);
-      case RowKind.action:
-        break;
-    }
+  /// Cursor to the absolute pad position ([x], [y] in -1..1). A little snap to the centre per axis.
+  void padMove(PadCat cat, double x, double y) {
+    if (_padCat != cat) padBegin(cat);
+    final lim = padLimits(cat);
+    var px = x.clamp(-1.0, 1.0).toDouble(), py = y.clamp(-1.0, 1.0).toDouble();
+    if (px.abs() < kPadSnap) px = 0;
+    if (py.abs() < kPadSnap) py = 0;
+    final c = lim.clamp(px, py);
+    px = c.dx;
+    py = c.dy;
+    final before = padView(cat);
+    if (before.x == px && before.y == py) return;
+    if (px == 0 && py == 0 && (before.x != 0 || before.y != 0)) haptics.fire(HapticKind.autoSnap);
+    final ctx = padCtx;
+    final stock = defaultStockId;
+    _apply((e) {
+      var n = e;
+      if (cat == PadCat.film && n.film == null && stock != null) n = n.copyWith(film: stock, filmPaper: null);
+      final s = padStateOf(n, cat, ctx);
+      return applyPadState(n, cat, s.copyWith(x: px, y: py), ctx);
+    });
   }
 
-  void _moveOneD(ParamRow row, double dx, double speed, double offY, double dtMs) {
-    final m = _m1!;
-    final band = _bands.update(offY);
-    m.update(dx, speed, band, dtMs);
-    final q = m.quantized;
-    if (q != _lastQ) {
-      _lastQ = q;
-      _apply((e) => row.write!(e, q));
-    }
-    haptics.landmark(m.landmark);
-    readout
-      ..v = m.value
-      ..value = row.fmt!(q)
-      ..band = band
-      ..bandText = bandLabel(band)
-      ..endSide = m.endSide;
-    if (m.landmark == Landmark.autoSnap) readout.flash++;
-    readout.notify();
+  /// The strength strip to [a] (0..1, 0.5 = 100 %). Snaps to 100 %.
+  void stripSet(PadCat cat, double a) {
+    if (_padCat != cat) padBegin(cat);
+    var v = a.clamp(0.0, 1.0).toDouble();
+    if ((v - 0.5).abs() < kStripSnap) v = 0.5;
+    final before = padView(cat);
+    if (before.a == v) return;
+    if (v == 0.5) haptics.fire(HapticKind.autoSnap);
+    final ctx = padCtx;
+    final stock = defaultStockId;
+    _apply((e) {
+      var n = e;
+      if (cat == PadCat.film && n.film == null && stock != null) n = n.copyWith(film: stock, filmPaper: null);
+      final s = padStateOf(n, cat, ctx);
+      return applyPadState(n, cat, s.copyWith(a: v), ctx);
+    });
   }
 
-  void _setDiscrete(ParamRow row, int i) {
-    if (row.uiSet != null) {
-      row.uiSet!(sel, i);
+  void padEnd() => gestureEnd();
+
+  /// A style preset on the colour pad: selects the look and moves the cursor there (one undo step).
+  void selectPreset(ColorPreset p) {
+    final ctx = padCtx;
+    app.applyEdit(id, (e) {
+      var n = e.copyWith(look: p.look == ctx.defaultLookId ? null : p.look, palette: null);
+      final s = padStateOf(n, PadCat.color, ctx);
+      n = applyPadState(n, PadCat.color, s.copyWith(x: p.x, y: p.y), ctx);
+      return n;
+    });
+    haptics.fire(HapticKind.detent);
+    _bump();
+  }
+
+  // ------------------------------------------------------------ itemised view
+
+  /// Items of the open category (the radar's spokes), for the current stock.
+  List<PadItem> itemsOf(PadCat cat) {
+    final stock = app.film.stock(edit.film);
+    return padItems(cat, printed: stock?.printed ?? true);
+  }
+
+  /// Sets one item (radar / ruler): the pad keeps its position; the item gets an offset.
+  void itemSet(PadCat cat, PadItem it, double v) {
+    final ctx = padCtx;
+    final stock = defaultStockId;
+    _apply((e) {
+      var n = e;
+      if (cat == PadCat.film && n.film == null && stock != null) n = n.copyWith(film: stock, filmPaper: null);
+      return setItemValue(n, cat, it, v, ctx);
+    });
+  }
+
+  void itemBegin(PadCat cat, PadItem it) => gestureBegin('item:${it.id}', param: it.id);
+
+  void itemEnd() => gestureEnd();
+
+  void resetItem(PadCat cat, PadItem it) {
+    final ctx = padCtx;
+    final s = padStateOf(edit, cat, ctx);
+    final r = padRecipe(cat, s.x, s.y, s.a, ctx: ctx);
+    app.applyEdit(id, (e) => setItemValue(e, cat, it, r[it.id] ?? it.auto, ctx));
+    haptics.fire(HapticKind.autoSnap);
+    _bump();
+  }
+
+  /// Typed value for the selected item. True when the text parsed.
+  bool commitItem(PadCat cat, PadItem it, String text) {
+    editingRow.value = null;
+    wm.setInteracting(false);
+    final t = text.trim().replaceAll('−', '-').replaceAll('EV', '').replaceAll('%', '').trim();
+    final n = double.tryParse(t);
+    if (n == null) {
       _bump();
-    } else {
-      final c = ctx();
-      _apply((e) => row.writeIndex!(e, i, c));
+      return false;
     }
-    readout
-      ..value = row.itemLabel!(i)
-      ..v = i.toDouble();
-    readout.notify();
+    final v = it.clampV(typedToStored(it, n));
+    app.applyEdit(id, (e) => setItemValue(e, cat, it, v, padCtx));
+    _bump();
+    return true;
   }
 
-  void _moveTwoD(ParamRow row, double dx, double dy, double vx, double vy, double dtMs) {
-    final speed = math.sqrt(vx * vx + vy * vy);
-    final fine = fine2D.value ? 0.25 : 1.0;
-    switch (row.twoD!) {
-      case TwoD.palette:
-        final p = _pal!;
-        p.update(dx, dy, speed, dtMs, fineScale: fine);
-        final pos = Offset(p.x, p.y);
-        final snapped = p.snapped;
-        _apply((e) => e.copyWith(palette: snapped ? null : pos));
-        haptics.landmark(p.landmark);
-        readout.value = paletteText(pos);
-        if (p.landmark == Landmark.autoSnap) readout.flash++;
-      case TwoD.tone:
-        final a = _gx!.update(dx), b = _gy!.update(dy);
-        if (a || b) {
-          final id2 = toneClassId(toneKeys[_gy!.index], toneRanges[_gx!.index]);
-          if (id2 != _lastTone) {
-            _lastTone = id2;
-            _apply((e) => e.copyWith(toneTarget: id2));
-          }
-          readout.value = tonePlain(id2);
-          // the nearest class is the auto position: a firmer tick when entering it
-          haptics.landmark(id2 == analysis().nearest ? Landmark.autoSnap : Landmark.detent);
-        }
-      case TwoD.curve:
-        final m = _m1!;
-        m.update(-dy, vy.abs(), fine2D.value ? PrecisionBand.fine : PrecisionBand.standard, dtMs);
-        final q = m.quantized;
-        if (q != _lastQ) {
-          _lastQ = q;
-          _apply((e) => row.write!(e, q));
-        }
-        haptics.landmark(m.landmark);
-        readout
-          ..v = m.value
-          ..value = row.fmt!(q)
-          ..endSide = m.endSide;
-        if (m.landmark == Landmark.autoSnap) readout.flash++;
-      case TwoD.offset:
-        final p = _pal!;
-        p.update(dx, dy, speed, dtMs, fineScale: fine);
-        // NATIVE BINDING (film pads): the only place the two offsets are written. They land in the edit's params
-        // map under row.padX / row.padY (film_shoot / film_print), normalised to [-1, +1],
-        // 0 = automatic; EditState.toWire sends them like every other film_* key, so connecting the engine means
-        // the engine's film node reading those keys; nothing else changes here.
-        final xm = row.padXMin;
-        final ox = p.snapped ? 0.0 : (((xm + p.x * (1 - xm)) * 100).round() / 100);
-        final oy = p.snapped ? 0.0 : (((1 - p.y * 2) * 100).round() / 100);
-        _apply((e) => e.withValue(row.padX!, ox).withValue(row.padY!, oy));
-        haptics.landmark(p.landmark);
-        readout.value = offsetPadText(ox, oy, xSigned: xm < 0);
-        if (p.landmark == Landmark.autoSnap) readout.flash++;
-      case TwoD.wheel:
-        final w = _wheel!;
-        w.update(dx, dy, speed, dtMs, fineScale: fine);
-        final z = sel.gradeZone;
-        final h = w.hue.roundToDouble() % 360, s = w.sat.roundToDouble();
-        _apply((e) {
-          var n = e.withValue(grKey(z, 's'), s);
-          if (s > 0) n = n.withValue(grKey(z, 'h'), h);
-          return n;
-        });
-        haptics.landmark(w.landmark);
-        readout.value = s == 0 ? '无' : '${h.round()}° · ${s.round()}';
-        if (w.landmark == Landmark.autoSnap) readout.flash++;
-    }
-    readout.notify();
+  void beginNumeric(PadItem it) {
+    editingRow.value = it.id;
+    wm.setInteracting(true);
+    _bump();
   }
 
-  void _publish(ParamRow row, RowContext c, PrecisionBand band) {
-    final w = readout;
-    w
-      ..visible = true
-      ..compare = false
-      ..name = row.label
-      ..kind = row.kind
-      ..twoD = row.twoD
-      ..band = band
-      ..bandText = bandLabel(band)
-      ..endSide = 0
-      ..value = row.text(c);
-    if (row.kind == RowKind.oneD || row.twoD == TwoD.curve) {
-      w
-        ..v = row.value(c)
-        ..min = row.min
-        ..max = row.max
-        ..auto = row.auto
-        ..step = row.step;
-    }
-    w.notify();
-  }
-
-  @override
-  void adjustEnd({required bool byMultiTouch}) {
-    if (_row == null && !dragging.value) return;
-    _row = null;
-    _m1 = _st = _gx = _gy = _switcher = null;
-    _pal = null;
-    _wheel = null;
-    engine.endInteraction();
+  void cancelNumeric() {
+    if (editingRow.value == null) return;
+    editingRow.value = null;
     wm.setInteracting(false);
     _bump();
-    readout.dimmed = false;
-    readout.hideAfter(const Duration(milliseconds: 600));
-    readout.notify();
-    // The window springs back 150 ms after the finger lifts.
-    _undragTimer?.cancel();
-    _undragTimer = Timer(const Duration(milliseconds: 150), () {
-      dragging.value = false;
+  }
+
+  /// The text the entry shows for [it]: the value as the display prints it, without unit.
+  String inputText(PadItem it, double stored) => storedToTyped(it, stored);
+
+  // ------------------------------------------------------------ film
+
+  /// The film map: the stock follows the finger; the whole press is one undo step.
+  void stockBegin() => gestureBegin('stock', param: 'film');
+
+  void stockSet(String? stockId) {
+    if (edit.film == stockId) return;
+    _apply((e) {
+      if (stockId == null) return clearFilm(e);
+      return e.copyWith(film: stockId, filmPaper: null);
     });
+  }
+
+  void stockEnd() => gestureEnd();
+
+  /// The 无 button: no film (one undo step).
+  void stockNone() {
+    stockBegin();
+    stockSet(null);
+    stockEnd();
+  }
+
+  /// Film off: the stock, the paper and every film knob go back to their defaults.
+  static EditState clearFilm(EditState e) {
+    final m = Map<String, double>.of(e.values)..removeWhere((k, v) => filmValueKeys.contains(k));
+    final p = Map<String, PadState>.of(e.pads)..remove(PadCat.film.name);
+    return e.copyWith(film: null, filmPaper: null, values: m, pads: p);
+  }
+
+  void selectPaper(String? paperId) {
+    app.applyEdit(id, (e) => e.copyWith(filmPaper: paperId));
     _bump();
   }
+
+  // ------------------------------------------------------------ plain values (crop, curve, colour ranges, grading)
+
+  void valueBegin(String key) => gestureBegin('value:$key', param: key);
+
+  void valueSet(String key, double v) {
+    final s = specByKey[key]!;
+    final c = v.clamp(s.min, s.max).toDouble();
+    _apply((e) => e.withValue(key, c));
+  }
+
+  void valueEnd() => gestureEnd();
+
+  void valueReset(String key) {
+    app.applyEdit(id, (e) => e.withValue(key, specByKey[key]!.def));
+    haptics.fire(HapticKind.autoSnap);
+    _bump();
+  }
+
+  /// The grading wheel: hue and saturation together.
+  void wheelSet(int zone, double hue, double sat) {
+    _apply((e) {
+      var n = e.withValue(grKey(zone, 's'), sat);
+      if (sat > 0) n = n.withValue(grKey(zone, 'h'), hue);
+      return n;
+    });
+  }
+
+  void setCropRatio(String ratio) {
+    app.applyEdit(id, (e) => e.copyWith(crop: ratio));
+    _bump();
+  }
+
+  void rotate90() {
+    app.applyEdit(id, (e) => e.copyWith(rot: (e.rot + 90) % 360));
+    _bump();
+  }
+
+  void toggleFlip() {
+    app.applyEdit(id, (e) => e.copyWith(flip: !e.flip));
+    _bump();
+  }
+
+  /// 明暗目标: the tone class under the finger (inside a gesture), or back to automatic.
+  void toneTargetSet(String id) => _apply((e) => e.copyWith(toneTarget: id));
+
+  void toneTargetAuto() {
+    app.applyEdit(id, (e) => e.copyWith(toneTarget: null));
+    haptics.fire(HapticKind.autoSnap);
+    _bump();
+  }
+
+  // ------------------------------------------------------------ resets
+
+  void resetPad(PadCat cat) {
+    if (!padCatAdjusted(edit, cat, padCtx)) return;
+    final before = edit;
+    app.applyEdit(id, (e) {
+      var n = resetPadCat(e, cat, padCtx);
+      if (cat == PadCat.light) n = _resetGroup(n, EGroup.curve);
+      if (cat == PadCat.color) n = _resetGroup(_resetGroup(n, EGroup.grade), EGroup.color);
+      if (cat == PadCat.texture) n = _resetGroup(_resetGroup(n, EGroup.effects), EGroup.detail);
+      return n;
+    });
+    if (edit.sameAs(before)) return;
+    _bump();
+    haptics.fire(HapticKind.autoSnap);
+    final pid = id;
+    app.showToast('已复位${cat.label}', actionLabel: '撤销', onAction: () => app.undo(pid));
+  }
+
+  EditState _resetGroup(EditState e, EGroup g) {
+    final m = Map<String, double>.of(e.values)..removeWhere((k, v) => specByKey[k]!.group == g);
+    return e.copyWith(values: m);
+  }
+
+  void resetCrop() {
+    app.applyEdit(id, (e) {
+      final m = Map<String, double>.of(e.values)..remove('straighten');
+      return e.copyWith(crop: 'orig', rot: 0, flip: false, values: m);
+    });
+    _bump();
+    haptics.fire(HapticKind.autoSnap);
+  }
+
+  // ------------------------------------------------------------ hold-to-adjust (the popup above the dock)
+
+  PadState? _holdStart;
+  double _holdPx = 0;
+
+  /// Pad extent (dp) that one full range of the pad takes while holding: the popup is about 216 dp wide.
+  static const double kHoldSpan = 94;
+
+  void holdBegin(PadCat cat, double anchorX) {
+    wm.closeAll();
+    _resetLayers();
+    hold.value = HoldPopup(cat, anchorX);
+    _holdStart = padView(cat);
+    _holdPx = kHoldSpan;
+    padBegin(cat);
+    _bump();
+  }
+
+  /// [dx], [dy]: finger travel since the press (screen, y down). Moves the value relative to its start.
+  void holdMove(double dx, double dy) {
+    final h = hold.value;
+    final s = _holdStart;
+    if (h == null || s == null) return;
+    padMove(h.cat, s.x + dx / _holdPx, s.y - dy / _holdPx);
+  }
+
+  void holdEnd() {
+    if (hold.value == null) return;
+    hold.value = null;
+    _holdStart = null;
+    gestureEnd();
+  }
+
+  // ------------------------------------------------------------ GestureSink: context
+
+  @override
+  ArbiterMode get mode => ArbiterMode.browse; // the photo only zooms, pans and compares
+
+  @override
+  ActiveKind get activeKind => ActiveKind.none;
+
+  @override
+  bool get zoomed => zoom.zoomed;
+
+  @override
+  bool get adjustEnabled => false;
+
+  @override
+  void adjustBegin(LockAxis axis, double x, double y) {}
+
+  @override
+  void adjustMove(double dx, double dy, double offX, double offY, double vx, double vy, double dtMs) {}
+
+  @override
+  void adjustEnd({required bool byMultiTouch}) {}
 
   // ------------------------------------------------------------ browse / zoom
 
@@ -585,10 +650,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
       ..compare = on
       ..visible = on
       ..dimmed = false;
-    if (on) {
-      readout.cancelHide();
-      readout.low = false;
-    }
+    if (on) readout.cancelHide();
     readout.notify();
   }
 
@@ -611,7 +673,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
   void tap(double x, double y) {
     if (editingRow.value != null) {
       editingRow.value = null; // the entry widget commits on losing focus
-      _bump(); // the cached window card must rebuild to drop the field
+      _bump();
       return;
     }
     if (wm.adjustMode) {
@@ -650,131 +712,37 @@ class EditorController extends ChangeNotifier implements GestureSink {
     }
   }
 
-  // ------------------------------------------------------------ window / row actions
-
-  void openCategory(EGroup g) {
-    wm.toggle(g);
-    _bump();
-  }
-
-  void showReadout(ParamRow row) {
-    _publish(row, ctx(), PrecisionBand.standard);
-    readout
-      ..low = false
-      ..dimmed = false;
-    readout.hideAfter(const Duration(milliseconds: 600));
-  }
-
   /// Short plain-text readout (e.g. the "n / N" photo counter, 800 ms).
   void showText(String text, {Duration hold = const Duration(milliseconds: 800)}) {
     readout
       ..visible = true
       ..compare = false
       ..name = text
-      ..value = ''
-      ..bandText = ''
-      ..kind = RowKind.action
-      ..twoD = null
-      ..low = false
       ..dimmed = false;
     readout.hideAfter(hold);
     readout.notify();
   }
 
-  void resetRow(ParamRow row) {
-    final c = ctx();
-    app.applyEdit(id, (e) => row.resetRow(e, c));
-    _bump();
-    haptics.fire(HapticKind.autoSnap);
-    showReadout(row);
-  }
-
-  void resetCategoryOf(EGroup g) {
-    if (!edit.groupAdjusted(g)) return;
-    app.applyEdit(id, (e) => resetCategory(g, e));
-    _bump();
-    haptics.fire(HapticKind.autoSnap);
-    final pid = id;
-    app.showToast('已复位${groupLabels[g]}', actionLabel: '撤销', onAction: () => app.undo(pid));
-  }
-
-  /// Taps in the pickers inside the window (swatches, colour dots, channel chips, tone cells).
-  void selectDiscrete(ParamRow row, int i) {
-    if (row.uiSet != null) {
-      row.uiSet!(sel, i);
-    } else {
-      final c = ctx();
-      app.applyEdit(id, (e) => row.writeIndex!(e, i, c));
-    }
-    _bump();
-  }
-
-  void selectTone(String toneId) {
-    app.applyEdit(id, (e) => e.copyWith(toneTarget: toneId));
-    _bump();
-  }
-
-  void performAction(ParamRow row) {
-    if (row.act == null) return;
-    app.applyEdit(id, row.act!);
-    _bump();
-  }
-
-  /// Accessibility / keyboard: change the row by [steps] steps ([big] = 5 % of the range).
-  void stepRow(ParamRow row, int steps, {bool big = false}) {
-    final c = ctx();
-    if (row.kind == RowKind.discrete) {
-      final i = (row.readIndex!(c) + steps).clamp(0, row.count - 1);
-      selectDiscrete(row, i);
-      return;
-    }
-    if (row.write == null) return;
-    final d = (big ? row.bigStep : row.step) * steps;
-    final v = (row.value(c) + d).clamp(row.min, row.max).toDouble();
-    app.applyEdit(id, (e) => row.write!(e, v), coalesce: 'a11y:${row.id}');
-    _bump();
-    showReadout(row);
-  }
-
-  // ------------------------------------------------------------ numeric entry
-
-  void beginNumeric(ParamRow row) {
-    if (!row.typeable) return;
-    editingRow.value = row.id;
-    wm.setInteracting(true);
-    _bump();
-  }
-
-  /// Commits typed [text] for [row]; empty / invalid = cancel. Returns true when the value was changed.
-  bool commitNumeric(ParamRow row, String text) {
-    editingRow.value = null;
-    wm.setInteracting(false);
-    final v = row.parseInput(text);
-    if (v == null) return false;
-    if (row.inputOutOfRange(text)) app.showToast('已调整到范围内');
-    app.applyEdit(id, (e) => row.write!(e, v));
-    _bump();
-    showReadout(row);
-    return true;
-  }
-
-  void cancelNumeric() {
-    if (editingRow.value == null) return;
-    editingRow.value = null;
-    wm.setInteracting(false);
-    _bump();
-  }
-
   // ------------------------------------------------------------ back
 
-  /// System back, in the spec's order (4.15.6 #24). Returns true when something was dismissed.
+  /// System back: typed value, then the layers (extra editor, itemised view, film map), then fold, then close, then zoom.
+  /// Returns true when something was dismissed.
   bool handleBack() {
     if (editingRow.value != null) {
       cancelNumeric();
       return true;
     }
+    if (extra != null) {
+      openExtra(null);
+      return true;
+    }
+    if (itemised || filmMapOpen) {
+      itemised = false;
+      filmMapOpen = false;
+      _bump();
+      return true;
+    }
     if (docked) {
-      // docked panel: first back folds it to its chip strip, the next closes it
       final w = wm.focused;
       if (w != null && !w.collapsed) {
         wm.setCollapsed(w.group, true);
@@ -782,6 +750,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
       }
     }
     if (wm.closeLatest()) {
+      _resetLayers();
       _bump();
       return true;
     }
@@ -804,14 +773,51 @@ class EditorController extends ChangeNotifier implements GestureSink {
     _rangesTimer?.cancel();
     filmRanges.dispose();
     _idleTimer?.cancel();
-    _undragTimer?.cancel();
     readout.dispose();
     edits.dispose();
     dragging.dispose();
     compare.dispose();
     immersive.dispose();
     editingRow.dispose();
-    fine2D.dispose();
+    hold.dispose();
     super.dispose();
+  }
+}
+
+/// Per-axis snap to the pad centre (in pad units, 1 = the pad's edge) and the strip's snap to 100 %.
+const double kPadSnap = 0.04;
+const double kStripSnap = 0.03;
+
+/// Typed text <-> stored value of an item: what the user reads and types is what the display prints (EV for exposure,
+/// hundredths for the +-1 film keys).
+double typedToStored(PadItem it, double typed) {
+  switch (it.id) {
+    case 'exposure':
+      return typed * 20;
+    case 'film_shoot':
+    case 'film_print':
+    case 'film_black':
+    case 'film_wb':
+      return typed / 100;
+    case 'film_latitude':
+      return typed <= 80 ? (typed - 80) / 25 : (typed - 80) / 18;
+    default:
+      return typed;
+  }
+}
+
+String storedToTyped(PadItem it, double stored) {
+  switch (it.id) {
+    case 'exposure':
+      return (stored / 20).toStringAsFixed(2);
+    case 'film_shoot':
+    case 'film_print':
+    case 'film_black':
+    case 'film_wb':
+      return (stored * 100).round().toString();
+    case 'film_latitude':
+      return (stored <= 0 ? 80 + stored * 25 : 80 + stored * 18).round().toString();
+    default:
+      return stored.round().toString();
   }
 }

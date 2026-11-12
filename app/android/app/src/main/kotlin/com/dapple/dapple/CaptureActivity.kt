@@ -12,7 +12,10 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -54,6 +57,9 @@ class CaptureActivity : ComponentActivity() {
         const val EXTRA_SOURCE = "source"
         const val EXTRA_ERROR = "error"
         private const val TAG = "DappleCapture"
+        private const val RAW_TIMEOUT_MS = 10_000L
+        private const val JPEG_TIMEOUT_MS = 15_000L
+        private const val RAW_GRACE_MS = 3_000L
 
         fun outDir(ctx: Context) = File(ctx.cacheDir, "capture").apply { mkdirs() }
     }
@@ -64,10 +70,18 @@ class CaptureActivity : ComponentActivity() {
     private var provider: ProcessCameraProvider? = null
     private var imageCapture: ImageCapture? = null
     private var back = true
-    private var raw = false
     private var busy = false
     private var finished = false
     private var systemFile: File? = null
+    private lateinit var message: TextView
+    private val handler = Handler(Looper.getMainLooper())
+
+    /** Capture mode of the bound lens (RAW+JPEG / RAW / JPEG), remembered per camera id and build. */
+    private var strategy: CaptureStrategy? = null
+
+    /** Incremented per shutter press and per abandoned attempt; late callbacks of an abandoned capture are ignored. */
+    private var shot = 0
+    private var lastLens = true
 
     private val systemCamera = registerForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
         val f = systemFile
@@ -142,6 +156,17 @@ class CaptureActivity : ComponentActivity() {
         root.addView(badge, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER_HORIZONTAL or Gravity.TOP).apply {
             topMargin = dp(18f).toInt()
         })
+        message = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            setPadding(dp(14f).toInt(), dp(6f).toInt(), dp(14f).toInt(), dp(6f).toInt())
+            background = GradientDrawable().apply { cornerRadius = dp(14f); setColor(0xB0000000.toInt()) }
+        }
+        root.addView(message, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM).apply {
+            bottomMargin = dp(140f).toInt()
+        })
         setContentView(root)
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
             val i = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
@@ -150,12 +175,37 @@ class CaptureActivity : ComponentActivity() {
         }
     }
 
+    /** States what the next shutter press will really write (see [CaptureStrategy.badge]). */
     private fun setBadge() {
-        badge.text = if (raw) "RAW + JPEG" else "JPEG"
+        badge.text = strategy?.badge() ?: "JPEG"
+    }
+
+    private fun say(text: String?) {
+        if (text == null) { message.visibility = View.GONE; return }
+        message.text = text
+        message.visibility = View.VISIBLE
     }
 
     private fun selector(backLens: Boolean) = CameraSelector.Builder()
         .requireLensFacing(if (backLens) CameraSelector.LENS_FACING_BACK else CameraSelector.LENS_FACING_FRONT).build()
+
+    private val store by lazy {
+        object : StrategyStore {
+            private val sp = getSharedPreferences("dapple_capture", Context.MODE_PRIVATE)
+            override fun get(key: String): String? = sp.getString(key, null)
+            override fun put(key: String, value: String) { sp.edit().putString(key, value).apply() }
+        }
+    }
+
+    @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+    private fun strategyFor(info: androidx.camera.core.CameraInfo): CaptureStrategy {
+        val formats = ImageCapture.getImageCaptureCapabilities(info).supportedOutputFormats
+        val id = try { androidx.camera.camera2.interop.Camera2CameraInfo.from(info).cameraId } catch (_: Exception) { "?" }
+        return CaptureStrategy(
+            store, "$id|${Build.FINGERPRINT}",
+            formats.contains(ImageCapture.OUTPUT_FORMAT_RAW_JPEG), formats.contains(ImageCapture.OUTPUT_FORMAT_RAW),
+        )
+    }
 
     private fun bind() {
         val p = provider ?: return
@@ -166,11 +216,14 @@ class CaptureActivity : ComponentActivity() {
             sel = selector(back)
             if (!p.hasCamera(sel)) { launchSystemCamera(); return }
         }
-        val rawOk = sel.filter(p.availableCameraInfos).firstOrNull()?.let {
-            ImageCapture.getImageCaptureCapabilities(it).supportedOutputFormats.contains(ImageCapture.OUTPUT_FORMAT_RAW_JPEG)
-        } ?: false
+        val info = sel.filter(p.availableCameraInfos).firstOrNull()
+        if (info == null) { launchSystemCamera(); return }
+        val st = strategy?.takeIf { lastLens == back } ?: strategyFor(info)
+        strategy = st
+        lastLens = back
         val rot = display?.rotation ?: 0
-        for (wantRaw in if (rawOk) listOf(true, false) else listOf(false)) {
+        while (true) {
+            val mode = st.mode
             try {
                 p.unbindAll()
                 // highest resolution the lens offers (including the sensor's high-resolution mode), 4:3
@@ -184,7 +237,13 @@ class CaptureActivity : ComponentActivity() {
                     .setResolutionSelector(hi)
                     .setJpegQuality(97)
                     .setTargetRotation(rot)
-                    .apply { if (wantRaw) setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW_JPEG) }
+                    .apply {
+                        when (mode) {
+                            CaptureMode.RAW_JPEG -> setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW_JPEG)
+                            CaptureMode.RAW -> setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW)
+                            CaptureMode.JPEG -> {}
+                        }
+                    }
                     .build()
                 val pv = Preview.Builder()
                     .setResolutionSelector(
@@ -195,11 +254,12 @@ class CaptureActivity : ComponentActivity() {
                 pv.surfaceProvider = preview.surfaceProvider
                 p.bindToLifecycle(this, sel, pv, ic)
                 imageCapture = ic
-                raw = wantRaw
                 setBadge()
                 return
             } catch (e: Exception) {
-                Log.w(TAG, "bind(raw=$wantRaw) failed: $e")
+                Log.w(TAG, "bind($mode) failed: $e")
+                if (mode == CaptureMode.JPEG) break
+                st.failed()
             }
         }
         if (imageCapture == null) launchSystemCamera()
@@ -210,59 +270,142 @@ class CaptureActivity : ComponentActivity() {
         display?.rotation?.let { imageCapture?.targetRotation = it }
     }
 
-    private fun takePicture() {
+    /** [attempt] counts the automatic re-shoots after a mode fell back (RAW+JPEG -> RAW -> JPEG: at most two). */
+    private fun takePicture(attempt: Int = 0) {
         val ic = imageCapture ?: return
+        val st = strategy ?: return
         if (busy) return
         busy = true
         shutter.alpha = 0.4f
+        say(null)
+        val id = ++shot
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val dir = outDir(this)
         val jpg = File(dir, "DAP_$stamp.jpg")
         val dng = File(dir, "DAP_$stamp.dng")
         val ex = ContextCompat.getMainExecutor(this)
-        var left = if (raw) 2 else 1
+        val mode = st.mode
+        val outputs = if (mode == CaptureMode.RAW_JPEG) 2 else 1
+        var left = outputs
         var errored = false
+        var saved = 0
+        val t0 = System.currentTimeMillis()
         val cb = object : ImageCapture.OnImageSavedCallback {
+            override fun onCaptureStarted() {
+                Log.i(TAG, "shot $id ($mode): exposure started (+${System.currentTimeMillis() - t0} ms)")
+            }
+
             override fun onImageSaved(r: ImageCapture.OutputFileResults) {
-                if (--left == 0) finishCapture(jpg, if (raw && !errored) dng else null)
+                if (id != shot || finished) return
+                saved++
+                Log.i(TAG, "shot $id ($mode): saved $saved/$outputs (+${System.currentTimeMillis() - t0} ms)")
+                if (--left == 0) {
+                    handler.removeCallbacksAndMessages(null)
+                    finishCapture(mode, jpg, dng, errored, attempt)
+                } else if (mode == CaptureMode.RAW_JPEG) {
+                    // the JPEG of a stalling RAW+JPEG lands in ~0.7 s and the DNG never does: do not wait for the full timeout
+                    handler.removeCallbacksAndMessages(null)
+                    handler.postDelayed({
+                        if (id != shot || finished) return@postDelayed
+                        Log.w(TAG, "shot $id: DNG missing ${RAW_GRACE_MS} ms after the other output")
+                        shotFailed(mode, attempt)
+                    }, RAW_GRACE_MS)
+                }
             }
 
             override fun onError(e: ImageCaptureException) {
-                Log.w(TAG, "capture failed: $e")
-                // a lost RAW still leaves the JPEG usable; a lost JPEG fails the shot
+                if (id != shot || finished) return
+                Log.w(TAG, "shot $id ($mode): capture failed (code ${e.imageCaptureError}): $e")
                 errored = true
-                if (--left == 0) finishCapture(jpg, null)
+                if (--left == 0) {
+                    handler.removeCallbacksAndMessages(null)
+                    shotFailed(mode, attempt)
+                }
             }
         }
+        // every capture ends: saved, or (after the timeout) the mode steps down and the shot is repeated / an error is shown
+        handler.postDelayed({
+            if (id != shot || finished) return@postDelayed
+            Log.w(TAG, "shot $id: timeout after ${System.currentTimeMillis() - t0} ms ($mode, saved=$saved)")
+            shotFailed(mode, attempt)
+        }, if (mode == CaptureMode.JPEG) JPEG_TIMEOUT_MS else RAW_TIMEOUT_MS)
         try {
-            if (raw) {
-                ic.takePicture(
+            when (mode) {
+                CaptureMode.RAW_JPEG -> ic.takePicture(
                     ImageCapture.OutputFileOptions.Builder(dng).build(),
                     ImageCapture.OutputFileOptions.Builder(jpg).build(), ex, cb
                 )
-            } else {
-                ic.takePicture(ImageCapture.OutputFileOptions.Builder(jpg).build(), ex, cb)
+                CaptureMode.RAW -> ic.takePicture(ImageCapture.OutputFileOptions.Builder(dng).build(), ex, cb)
+                CaptureMode.JPEG -> ic.takePicture(ImageCapture.OutputFileOptions.Builder(jpg).build(), ex, cb)
             }
         } catch (e: Exception) {
-            fail(e.message ?: "capture")
+            Log.w(TAG, "takePicture threw: $e")
+            handler.removeCallbacksAndMessages(null)
+            shotFailed(mode, attempt)
         }
     }
 
-    private fun isJpeg(f: File): Boolean = try {
-        f.inputStream().use { it.read() == 0xFF && it.read() == 0xD8 }
-    } catch (_: Exception) { false }
+    private fun isJpeg(f: File) = CaptureFiles.isJpeg(f)
+    private fun jpgOk(f: File) = CaptureFiles.jpgOk(f)
+    private fun isDng(f: File) = CaptureFiles.isDng(f)
 
-    private fun finishCapture(jpg: File, dng: File?) {
-        if (finished) return
-        var d = dng
-        // CameraX writes (raw, jpeg) in that order; verify by magic bytes instead of trusting it
-        if (d != null && d.length() > 0 && jpg.length() > 0 && !isJpeg(jpg) && isJpeg(d)) {
-            val t = File(jpg.parentFile, "swap.tmp")
-            jpg.renameTo(t); d.renameTo(jpg); t.renameTo(d)
+    /**
+     * The shot of [wasMode] did not produce what it promised. The shutter never stays greyed: the lens steps down
+     * (RAW+JPEG -> RAW-only -> JPEG-only, remembered) and the picture is taken again automatically.
+     */
+    private fun shotFailed(wasMode: CaptureMode, attempt: Int) {
+        shot++ // abandon late callbacks of this attempt
+        busy = false
+        shutter.alpha = 1f
+        val st = strategy
+        if (st != null && st.mode == wasMode && wasMode != CaptureMode.JPEG) {
+            val next = st.failed()
+            Log.w(TAG, "$wasMode failed on this lens, now $next")
+            bind() // unbindAll cancels the stalled requests; binds the next mode
+            if (attempt < 2 && imageCapture != null && st.mode != wasMode) {
+                say(if (st.mode == CaptureMode.RAW) "RAW+JPEG 不可用，改为仅 RAW，正在重拍" else "RAW 不可用，已改为 JPEG，正在重拍")
+                takePicture(attempt + 1)
+                return
+            }
+        } else {
+            try { provider?.unbindAll() } catch (_: Exception) {}
+            imageCapture = null
+            bind() // a fresh pipeline for the next try
         }
-        if (d != null && d.length() == 0L) d = null
-        if (jpg.length() == 0L) { fail("empty"); return }
-        deliver(jpg, d, "camerax")
+        say("拍摄失败，请重试")
+    }
+
+    private fun finishCapture(mode: CaptureMode, jpg: File, dng: File, errored: Boolean, attempt: Int) {
+        if (finished) return
+        val st = strategy
+        when (mode) {
+            CaptureMode.JPEG -> {
+                if (!jpgOk(jpg)) { shotFailed(mode, attempt); return }
+                st?.markVerified()
+                deliver(jpg, null, "camerax")
+            }
+            CaptureMode.RAW -> {
+                if (errored || !isDng(dng)) {
+                    Log.w(TAG, "RAW-only wrote no valid DNG (${dng.length()} bytes)")
+                    shotFailed(mode, attempt); return
+                }
+                st?.markVerified()
+                deliver(null, dng, "camerax")
+            }
+            CaptureMode.RAW_JPEG -> {
+                // CameraX writes (raw, jpeg) in that order; verify by magic bytes instead of trusting it
+                if (dng.length() > 0 && jpg.length() > 0 && !isJpeg(jpg) && isJpeg(dng)) {
+                    val t = File(jpg.parentFile, "swap.tmp")
+                    jpg.renameTo(t); dng.renameTo(jpg); t.renameTo(dng)
+                }
+                if (errored || !isDng(dng) || !jpgOk(jpg)) {
+                    Log.w(TAG, "RAW+JPEG incomplete (dng ${dng.length()} bytes, jpg ${jpg.length()} bytes)")
+                    shotFailed(mode, attempt); return
+                }
+                st?.markVerified()
+                deliver(jpg, dng, "camerax")
+            }
+        }
     }
 
     private fun launchSystemCamera() {
@@ -278,10 +421,11 @@ class CaptureActivity : ComponentActivity() {
         }
     }
 
-    private fun deliver(jpg: File, dng: File?, source: String) {
+    private fun deliver(jpg: File?, dng: File?, source: String) {
         if (finished) return
         finished = true
-        setResult(RESULT_OK, Intent().putExtra(EXTRA_JPG, jpg.absolutePath).putExtra(EXTRA_SOURCE, source).apply {
+        setResult(RESULT_OK, Intent().putExtra(EXTRA_SOURCE, source).apply {
+            if (jpg != null) putExtra(EXTRA_JPG, jpg.absolutePath)
             if (dng != null) putExtra(EXTRA_DNG, dng.absolutePath)
         })
         finish()
@@ -302,6 +446,7 @@ class CaptureActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         try { provider?.unbindAll() } catch (_: Exception) {}
         super.onDestroy()
     }

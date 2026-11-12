@@ -311,7 +311,14 @@ class DappleBindings {
     final override = Platform.environment['DAPPLE_LIB'];
     if (override != null && override.isNotEmpty && !Platform.isAndroid && !Platform.isIOS) return ffi.DynamicLibrary.open(override);
     if (Platform.isAndroid) return ffi.DynamicLibrary.open('libdapple.so');
-    if (Platform.isIOS || Platform.isMacOS) return ffi.DynamicLibrary.process();
+    if (Platform.isIOS || Platform.isMacOS) {
+      // iOS: the engine is dapple.framework (xcframework in the dapple_engine plugin, embedded and signed by Xcode). Its symbols are
+      // visible to process() when dyld loaded the framework at launch; otherwise open it by name.
+      final self = ffi.DynamicLibrary.process();
+      if (self.providesSymbol('dapple_version')) return self;
+      if (Platform.isIOS) return ffi.DynamicLibrary.open('dapple.framework/dapple');
+      return self;
+    }
     if (Platform.isWindows) return ffi.DynamicLibrary.open('dapple.dll');
     return ffi.DynamicLibrary.open('libdapple.so');
   }

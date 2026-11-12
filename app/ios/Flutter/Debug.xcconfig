@@ -1,1 +1,4 @@
 #include "Generated.xcconfig"
+
+// The engine xcframework has an arm64 simulator slice only (Apple silicon Macs); see docs/ios/README.md
+EXCLUDED_ARCHS[sdk=iphonesimulator*] = x86_64

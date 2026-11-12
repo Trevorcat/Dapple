@@ -24,13 +24,24 @@ class QualityRung {
 class AdaptiveQuality {
   AdaptiveQuality({this.budgetMs = 55, this.downAfter = 2, this.upAfter = 12, this.upMargin = 0.6});
 
+  /// Budget for a display of [hz]: one display refresh (the drag frame should fit in a vsync), never tighter than 8.3 ms (120 Hz) and never looser than
+  /// the 55 ms default. Wave 8: a mid-range Adreno 710 phone renders the 810x1080 interactive film frame in ~12 ms on the GPU, so with a 55 ms budget it
+  /// stayed on the top rung at 25 Hz; with the refresh period as the budget it steps down to the rung that fits (measured, not a fixed size).
+  static double budgetForRefresh(double hz) => hz.isFinite && hz >= 24 ? (1000.0 / hz).clamp(8.3, 55.0) : 55.0;
+
   /// Rungs from best to cheapest. Only the frame size steps down: the lattice stays at 57^3 on every rung, the
   /// smallest size that keeps a colour drag (fresh bake per frame) within mean dE2000 0.5 of the exact pipeline on
   /// every surveyed photo (edit-bench "drag frames vs exact": 41^3 reached 0.77, 29^3 1.2). Tone / white-balance
   /// drags do not bake at all (the engine reuses the final frame's 65^3 lattice), so this only costs on colour drags.
-  static const rungs = [QualityRung(1080, 57), QualityRung(810, 57), QualityRung(640, 57), QualityRung(480, 57)];
+  static const rungs = [
+    QualityRung(1080, 57),
+    QualityRung(810, 57),
+    QualityRung(640, 57),
+    QualityRung(480, 57),
+    QualityRung(360, 57), // wave 8: the 120 Hz budget on a mid-range GPU needs a rung below 480
+  ];
 
-  final double budgetMs;
+  double budgetMs;
   final int downAfter, upAfter;
   final double upMargin;
 

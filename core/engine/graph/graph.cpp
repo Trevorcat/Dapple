@@ -84,6 +84,21 @@ void Graph::computeKeys(const ParamSet& ps, const NodeRegistry& reg) {
   }
 }
 
+void Graph::computeKeysHoldingSolves(const ParamSet& ps, const NodeRegistry& reg) {
+  computeKeys(ps, reg);
+  if (ps.ctx().frameIndex == 0) return;
+  ParamInputs in = ps.inputs();
+  in.ctx.frameIndex = 0;
+  const ParamSet ps0 = ParamSet::make(std::move(in));
+  Graph ref = *this;
+  ref.computeKeys(ps0, reg);
+  for (std::size_t i = 0; i < nodes_.size(); ++i)
+    if (nodes_[i].type == NodeType::Dehaze || nodes_[i].type == NodeType::Detail) {
+      nodes_[i].key = ref.nodes_[i].key;
+      nodes_[i].family = ref.nodes_[i].family;
+    }
+}
+
 std::string Graph::dump(bool withKeys) const {
   std::string s;
   const NodeRegistry& reg = NodeRegistry::instance();

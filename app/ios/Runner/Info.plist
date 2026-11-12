@@ -66,5 +66,17 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Dapple reads the photos you choose to edit.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Dapple saves your edited photos to the Photos library.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Dapple can take a RAW photo with the phone camera for testing.</string>
 </dict>
 </plist>

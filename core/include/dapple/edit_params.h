@@ -123,8 +123,8 @@ struct EditParams {
   float filmExposure = 0.f;    // EV, -3..3, exposure at the camera on top of `exposure` (print not re-balanced)
   float filmWarmth = 0.f;      // -100..100, print filtration (yellow): positive = warmer print
   float filmTint = 0.f;        // -100..100, print filtration (magenta): positive = more magenta
-  float filmGrain = 100.f;     // 0..100, grain amount (100 = the stock's reference grain, 0 = none)
-  float filmHalation = 100.f;  // 0..100, halation + scatter amount (100 = reference)
+  float filmGrain = 100.f;     // 0..200, grain amount (100 = the stock's reference grain, 0 = none, 200 = twice the amplitude)
+  float filmHalation = 100.f;  // 0..200, halation amount (100 = reference; the scatter mix saturates at 100)
   // Internal, not serialised and not a slider: EV the film is exposed on top of `exposure + filmExposure` so that its
   // mid-tone lightness equals the normal develop render's (matchFilmExposure, film_match.h). Set by the C layer / CLI.
   float filmKeyEv = 0.f;

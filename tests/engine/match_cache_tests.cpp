@@ -41,7 +41,9 @@ static SourceImage proxy(int w, int h) {
 
 int main() {
   std::string err;
-  const std::filesystem::path pack = std::filesystem::path(DAPPLE_SOURCE_DIR) / "core" / "data" / "film" / "dapple.dfp";
+  // pack folder: DAPPLE_FILM_DATA (a phone: the pushed folder holding dapple.dfp), else the source tree
+  const char* envData = std::getenv("DAPPLE_FILM_DATA");
+  const std::filesystem::path pack = (envData ? std::filesystem::path(envData) : std::filesystem::path(DAPPLE_SOURCE_DIR) / "core" / "data" / "film") / "dapple.dfp";
   if (!film::setLibraryPath(pack, &err)) return std::printf("SKIP: no film pack (%s)\n", err.c_str()), 77;
   const CameraRegistry cams = CameraRegistry::withBuiltins();
   const CameraProfile& cam = cams.resolve("", "");
@@ -112,6 +114,15 @@ int main() {
     EditParams c = base;
     c.contrast = 20.f;
     CHECK(filmMatchKeyLean(base) != filmMatchKeyLean(c), "a tonal edit must change the key");
+    // wave 8: every input the solve reads is in both keys (vignette, nrColor, sharpRadius were not)
+    for (int f = 0; f < 3; ++f) {
+      EditParams v = base;
+      if (f == 0) v.vignette = -30.f;
+      if (f == 1) v.nrColor = 40.f;
+      if (f == 2) v.sharpRadius = 2.f;
+      CHECK(filmMatchKeyLean(base) != filmMatchKeyLean(v), "vignette / nrColor / sharpRadius must be part of the lean key");
+      CHECK(filmMatchKey(base) != filmMatchKey(v), "vignette / nrColor / sharpRadius must be part of the legacy key");
+    }
   }
   std::printf(g_fail ? "FAILED (%d)\n" : "ok\n", g_fail);
   return g_fail ? 1 : 0;

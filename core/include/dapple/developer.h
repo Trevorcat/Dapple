@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <memory>
 #include <optional>
 
 #include "dapple/auto_adjust.h"
@@ -28,7 +29,8 @@ struct DevelopTimings {
 struct DevelopResult {
   Image8 image;
   ShotMetadata meta;
-  const CameraProfile* camera = nullptr;
+  const CameraProfile* camera = nullptr;  // points into cameraStore (profile with the file's exposure anchor)
+  std::shared_ptr<const CameraProfile> cameraStore;
   std::optional<AutoResult> autoResult;
   EditParams applied;  // look + automatic correction actually rendered
   DevelopTimings timings;

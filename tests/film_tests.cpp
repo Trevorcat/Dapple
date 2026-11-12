@@ -2047,8 +2047,9 @@ void testDevelopFilmIntegration() {
       m /= n;
       return std::sqrt(std::max(0.0, q / n - m * m));
     };
-    const double s0 = stdDev(0), s50 = stdDev(50), s100 = stdDev(100);
-    std::printf("  grain knob: std dev 0 -> %.5f, 50 -> %.5f, 100 -> %.5f (encoded, flat patch)\n", s0, s50, s100);
+    const double s0 = stdDev(0), s50 = stdDev(50), s100 = stdDev(100), s150 = stdDev(150), s200 = stdDev(200);
+    std::printf("  grain knob: std dev 0 -> %.5f, 50 -> %.5f, 100 -> %.5f, 150 -> %.5f, 200 -> %.5f (encoded, flat patch)\n", s0, s50, s100, s150, s200);
+    CHECK(s150 > s100 * 1.1 && s200 > s150 * 1.1);  // the range is 0..200: above 100 the grain is heavier than the stock's own, not clamped
     CHECK(s0 < 3e-4);  // what remains is the stochastic glare of the print, not the grain
     CHECK(s50 > s0 * 2 && s100 > s50 * 1.15);
   }
@@ -2084,6 +2085,11 @@ void testDevelopFilmIntegration() {
     CHECK(big.first > 1.0 && small.first > 0.5);  // halation adds light around the disc
     CHECK(big.second > 0.01);
     CHECK(std::fabs(big.second - small.second) < 0.3 * big.second);  // same physical spread at both resolutions
+    // 0..200: the halation energy keeps growing above 100
+    const ImageF none = spread(768, 0.f);
+    const double e100 = profile(spread(768, 100.f), none).first, e150 = profile(spread(768, 150.f), none).first, e200 = profile(spread(768, 200.f), none).first;
+    std::printf("  halation energy (red excess): 100 -> %.2f, 150 -> %.2f, 200 -> %.2f\n", e100, e150, e200);
+    CHECK(e150 > e100 * 1.1 && e200 > e150 * 1.05);
   }
 
   // ---- accuracy against the slow double-precision oracle through the whole develop path ----

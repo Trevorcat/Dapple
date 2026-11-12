@@ -293,7 +293,17 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
     L.maxTotalMs = std::max(L.maxTotalMs, out.cpu.totalMs);
     const bool changed = exec != L.lastExec || reason != L.lastReason;
     static const bool every = std::getenv("DAPPLE_FRAME_PROFILE") != nullptr;  // one line per frame (bench)
-    doLog = changed || ++L.sinceLog >= 30 || every;
+    // one line per frame on a phone too: `setprop debug.dapple.frame_profile 1` (read per frame, a cheap property lookup)
+    bool everyProp = false;
+#if defined(__ANDROID__)
+    {
+      char pv[PROP_VALUE_MAX] = {0};
+      everyProp = __system_property_get("debug.dapple.frame_profile", pv) > 0 && pv[0] == '1';
+    }
+#endif
+    // a frame whose CPU side alone took over 25 ms is always logged (wave 8: any frame over 33 ms in a drag must be attributable from logcat)
+    const bool slow = out.cpu.totalMs > 25.0;
+    doLog = changed || ++L.sinceLog >= 30 || every || everyProp || slow;
     if (doLog) {
       L.sinceLog = 0;
       maxMs = L.maxTotalMs;
@@ -373,7 +383,8 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     out.error = "engine graph: " + v.error;
     return -1;
   }
-  g.computeKeys(ps);
+  if (job.holdSolves) g.computeKeysHoldingSolves(ps);
+  else g.computeKeys(ps);
   const Plan plan = Planner::plan(g, makeRequest(fk, ExecMode::Whole, 0, 0, 4), &cache_);
   {
     const double ms = msSince(t0);
@@ -387,12 +398,12 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     return 1;
   }
   const int w = fk.width(), h = fk.height();
-  auto* rgba = static_cast<std::uint8_t*>(std::malloc(std::size_t(w) * h * 4));
-  if (!rgba) {
+  auto* rgba = job.outFloat ? nullptr : static_cast<std::uint8_t*>(std::malloc(std::size_t(w) * h * 4));
+  if (!rgba && !job.outFloat) {
     out.error = "out of memory";
     return -1;
   }
-  ExecEnv env{fk, g, cache_, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, rgba, 4};
+  ExecEnv env{fk, g, cache_, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, rgba, job.outFloat ? 3 : 4, job.outFloat};
   ExecStats es;
   const auto t1 = Clock::now();
   const Status s = CpuExecutor::run(plan, env, &es);
@@ -409,6 +420,7 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     out.rgba = rgba;
     out.w = w;
     out.h = h;
+    out.floatOut = job.outFloat != nullptr;
     out.executor = "cpu";
     return 0;
   }
@@ -799,7 +811,7 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
                 (job.renderer.filmActive() ? " [film: unknown stock / paper or failed table bake]" : "");
     return false;
   }
-  if (!rgba && !out.external) {
+  if (!rgba && !out.external && !out.floatOut) {
     out.error = "out of memory";
     return false;
   }
@@ -838,7 +850,7 @@ void EngineSession::injectGpuFailure(GpuFailure f, int count) {
 }
 
 bool EngineSession::gpuUsable(const FrameJob& job) const {
-  if (!job.store) return false;
+  if (!job.store || job.outFloat) return false;
   if (gpuOverride_) return true;
   GpuProvider* p = gpuProvider();
   return p && p->enabled();
@@ -915,6 +927,7 @@ int EngineSession::runOnGpu(const GpuRun& run, GpuOut& go) {
       }
       default:
         ++stats_.gpuUnsupported;
+        if (go.error.find("enlarger diffusion") != std::string::npos) ++stats_.gpuEnlargerTiled;
         totals().gpuFallbacks.fetch_add(1, std::memory_order_relaxed);
         frameWhy_ = go.error.empty() ? "unsupported (no reason given)" : go.error;
         return 1;
@@ -952,7 +965,8 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
     out.error = "engine graph: " + v.error;
     return -1;
   }
-  g.computeKeys(ps);
+  if (job.holdSolves) g.computeKeysHoldingSolves(ps);
+  else g.computeKeys(ps);
   // the GPU plan is made against the executor's own cache of device solves (the session cache holds CPU payloads): a frame whose dehaze / clarity
   // solve is still on the device skips the accumulation sweep and the solve
   IGpuExecutor* gx = gpuExecutor();

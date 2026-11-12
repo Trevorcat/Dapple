@@ -55,6 +55,51 @@ enum LiveSource {
   static LiveSource fromCode(int? c) => c != null && c >= 0 && c < values.length ? values[c] : auto;
 }
 
+/// The still's edit as it goes to the Motion Photo clip (docs/engine/pipeline-architecture.md section 27): every frame of the clip is rendered through
+/// the same node graph, film simulation included. The native side meters the film once on the reference frame and holds it for the clip.
+class EditedClip {
+  const EditedClip({
+    required this.paramsJson,
+    this.lutPath,
+    this.refMs = -1,
+    this.stillAspect = 0,
+    this.stillLongEdge = 0,
+    this.sceneX = 0,
+    this.sceneY = 0,
+    this.cameraMake = '',
+    this.cameraModel = '',
+  });
+
+  /// EditParams JSON, exactly what the editor sends to the engine for the still.
+  final String paramsJson;
+  final String? lutPath;
+
+  /// Source-stream time (ms) of the reference frame: the cover frame of the Motion Photo (< 0: the first frame of the window).
+  final int refMs;
+
+  /// width / height of the upright still: a clip of another shape is centre-cropped to it (0 = keep).
+  final double stillAspect;
+
+  /// Long edge of the still render (film grain scale), 0 = the clip's own scale.
+  final int stillLongEdge;
+
+  /// As-shot illuminant xy of the still (film white balance), 0 = unknown.
+  final double sceneX, sceneY;
+  final String cameraMake, cameraModel;
+
+  Map<String, dynamic> toMap() => {
+        'paramsJson': paramsJson,
+        'lutPath': lutPath ?? '',
+        'refMs': refMs,
+        'stillAspect': stillAspect,
+        'stillLongEdge': stillLongEdge,
+        'sceneX': sceneX,
+        'sceneY': sceneY,
+        'cameraMake': cameraMake,
+        'cameraModel': cameraModel,
+      };
+}
+
 /// What the clip encoder / decoder actually did (recorded with the Motion Photo).
 class ClipInfo {
   ClipInfo(this.map);
@@ -163,7 +208,8 @@ class LiveBridge {
     }
   }
 
-  /// Decodes and re-encodes the clip: HEVC Main10 when the device can, else H.264 8-bit; [compat] = 8-bit H.264 for sharing.
+  /// Decodes and re-encodes the clip: HEVC Main10 when the device can, else H.264 8-bit; [compat] = 8-bit H.264 for sharing. [edit]: every frame goes
+  /// through the engine's node graph with the still's edit (film included) before it is encoded; null = the clip as recorded.
   static Future<TrimResult> trim(String uri,
       {required int startMs,
       required int durationMs,
@@ -171,9 +217,11 @@ class LiveBridge {
       required bool mute,
       LiveSource source = LiveSource.auto,
       bool compat = false,
-      bool film = false}) async {
+      bool film = false,
+      EditedClip? edit}) async {
     final m = (await _live.invokeMapMethod<String, dynamic>('trim', {
       'uri': uri, 'startMs': startMs, 'durationMs': durationMs, 'dest': dest, 'mute': mute, 'source': source.code, 'compat': compat, 'film': film,
+      if (edit != null) 'edit': edit.toMap(),
     }))!;
     return TrimResult(m['path'] as String, (m['actualStartMs'] as num).toInt(), (m['durationMs'] as num).toInt(),
         (m['frames'] as num).toInt(), m['audio'] == true, ClipInfo(m.cast<String, dynamic>()));

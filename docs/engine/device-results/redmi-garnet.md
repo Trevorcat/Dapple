@@ -1,0 +1,113 @@
+# Xiaomi Redmi (2312DRA50C "garnet") device results, wave 8, 2026-11-12
+
+Native only. The app could not be installed: `adb install -r` fails with `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user` (MIUI `AdbInstallActivity` of `com.miui.securitycenter` waits for a tap on the phone; the screenshot of the prompt is black, a secure window). No setting was changed and no input was injected. Nothing was installed, so **no in-app number (logcat `dapple_view`, cadence, first photo, rotation, background/return, 30 s app session) exists**. The APK built from this tree is `build/redmi/app-w8-arm64.apk` (not installed).
+
+## 1. Device facts (getprop / dumpsys)
+
+| | |
+|---|---|
+| Model / device | 2312DRA50C / garnet, Android 16 (SDK 36), HyperOS `ro.miui.ui.version.name` V816 |
+| SoC | `ro.soc.model` SM7435, board `parrot` (Snapdragon 7s Gen 2): 4 x 1.958 GHz (cpu0-3) + 4 x 2.4 GHz (cpu4-7) per `cpuinfo_max_freq` |
+| GPU | Adreno (TM) 710, Vulkan 1.1.128 (driver 2150002787), GLES 3.2 V@0615.99; subgroup 64, shared 32 KB, fp16 arithmetic and 16-bit storage yes, linear filter RGBA32F no, timestamps yes, unified memory |
+| Panel | 1220 x 2712, modes 60 / 90 / 120 Hz, active 120 Hz (`mActiveSfDisplayMode` id 1), display id 4630946545580055170 |
+| State | keyguard not showing, thermal status 0 before and after a 90 s sustained load, Battery Saver off (`low_power` 0); GPU clock / busy nodes under `/sys/class/kgsl` are `Permission denied` (no root): GPU clock was NOT logged |
+| Other | Dapple not installed before or after. Native runs use `taskset f0` (cpu4-7); `DAPPLE_GPU_NO_PIN=1` made no difference to the GPU passes |
+
+## 2. Native baseline (tree HEAD 1088f2d + working tree before my changes), Vulkan, `dapple_film_gpu_tests bench`
+
+Per pass with `DAPPLE_GPU_PROFILE=1 DAPPLE_GPU_PASSLOG=1 DAPPLE_GPU_PROF_REPEAT=10` (each pass repeated 10 times back to back = clock hot), ms:
+
+| pass | 810x1080 interactive before | after | 1080x720 after | 1600x1067 before | 1600 after |
+|---|---|---|---|---|---|
+| film_point | 2.45 | 2.44 | 2.17 | 9.88 | 10.0 |
+| film_gnoise | 0.66 | 0.66 | 0.59 | 1.28 | 1.28 |
+| film_d3 (new, half-resolution levels) | | 0.71 | 0.63 | | 1.39 |
+| film_h3 | 7.63 | 1.63 + 0.73 | 1.45 + 0.64 | 33.75 | 7.24 + 2.17 |
+| film_v3 | 5.25 | 0.66 + 2.97 | 0.58 + 2.65 | 20.37 | 1.75 + 8.65 |
+| film_pd | 2.31 | 2.15 | 1.90 | 5.36 | 4.47 |
+| readback (bench only) | 2.85 | 2.82 | 2.49 | 5.45 | 5.45 |
+| **total** | **21.2** | **14.75** (11.9 without readback) | 13.1 | **76.1** | **42.4** |
+
+Un-profiled bench (GPU idle between frames, the harness' "GPU ms" is the submit-to-wait wall): 810x1080 interactive 50.7 ms alone against 18.6 ms hot, 1600 px interactive 121.6 (hot 71.5 before / 42 after), 1600 final 196, 810x1080 final 89 (hot 87), 3600 px final 776. The ratio cold / hot of 2.4-2.7 is the clock ramp (or per-submission overhead): GB/s of the passes in the table are 2-8 (film_h3 1600: 2.1), i.e. the film passes are nowhere near memory bandwidth; they are ALU / register bound on this GPU (section 3).
+
+1600 px is super-linear against 810x1080 (2x the pixels, 3-4x the time in film_point / film_h3 / film_v3): not explained (cache capacity is the suspect, not isolated).
+
+## 3. Causes found and what each fix bought (810x1080 interactive, hot, ms; every change keeps film_gpu.parity / frames within budget)
+
+| cause | fix | before -> after |
+|---|---|---|
+| integer division in `reflectIdx` evaluated for every tap even for in-range indices (Catmull-Rom upsample: 8 calls per pixel) | early return `if (i >= 0 && i < n)` (`film_mix3.comp`) | level-0 film_v3 6.0 -> 4.5 |
+| dynamically indexed `float wE[4] / wO[4]` and a conditional pick inside the 4x4 loop | two `vec4` weights chosen once per pixel, column indices hoisted | film_v3 4.5 -> 3.0 |
+| `vec3 acc[4]` indexed by the slot loop in film_h3 | explicit `a0..a3`, taps read once per k | film_h3 1.88 -> 1.63 |
+| wide tail components (sigma 2..3, r 8) at full resolution in the interactive tier | `Mix3::fastLow`: sigma >= 2 goes to pyramid level >= 1 (`kMinLowSigma` 1.0, `DAPPLE_FILM_FASTLOW=0` off) | film_h3 7.63 -> 2.36 (two passes incl. level 1), film_v3 5.25 -> 3.6 |
+| total of the three | | **21.2 -> 14.75** (incl. 2.8 readback of the bench) |
+
+Measured and rejected (slower or no gain, reverted): 4 output pixels per invocation in film_h3 (22.0 vs 7.6 ms: spill), shared-memory tile for the upsample (v3 6.3 vs 4.5), staged film_v3 (`DAPPLE_FILM_V3_DIRECT=0`, 18.6 vs 5.3), workgroup 64 (film_point 7.7 vs 2.4), explicit-array-free tetrahedral lookup in film_point (no change), ADPF from a native process (no session is granted to a shell binary: `adpf_session:false`), a concurrent GPU load while the session-path bench ran (17.5 -> 18.0 ms: not a clock issue in steady state).
+
+## 4. Session path (`dapple_drag_bench`, C API, INTERACTIVE, host readback, big cores, Vulkan; one parameter moving; wall ms)
+
+Steady `film_strength` frames by long edge: 120 px 1.0, 240 px 2.1, 480 px 7.5, 810 px 17.8, 1080 px 34.8 ms (all of it `exec` in the `cpu_ms` split; match / tables / upload 0). **The engine cannot hold 8.3 ms above about 400 px long edge on this phone**, and the number includes the host readback of a native bench; the zero-readback display path of the app saves part of it (not measured).
+
+Drag bench at 480 px (320x480 frames), medians (first frame), after the changes, with the app's start-up probe + warm-up (`DAPPLE_BENCH_PROBE`):
+
+| drag | median | first frame | notes |
+|---|---|---|---|
+| film_strength | 7.4 | 6.9 | one 150-250 ms outlier per run (max) not attributed |
+| film_grain | 9.7 | 104-145 | first frame: CPU grain tables 103 ms + pipelines (`cpu_ms ... tables 103.5 exec 112.9`) |
+| film_shoot | 21-35 | 73-627 | before the warm-up change 191 median; first frame = cold print-constant buckets when the drag starts < 1.3 s after the stock |
+| film_print | 22 | 68-108 | |
+| film_black | 23 | 21-24 | CPU table bake + upload (`upload 17-60 ms`) |
+| film_latitude / film_wb / film_exp | 11.6 / 11.4 / 11.5 | 13-16 | |
+| film_warmth / film_tint | 23 | 23-38 | table bake |
+| exposure (film on) | 19-40 | 32-50 | |
+
+30 s scripted session (all 12 drag cases, 120 frames each, 1440 interactive frames, `DAPPLE_FRAME_PROFILE=1` logcat `cpu_ms` = CPU side + GPU wait): 480 px: p50 20.0, p95 27.5, p99 43.2, **max 1406** ms (the cold first film frame of the process); 640 px: p50 35.3, p95 60.9, p99 64.9, max 1572. So **no budget of the brief is met on this phone**: 8.3 ms interactive (810x1080: 14.7 hot, 17.5 session), first drag frame <= 16 ms (grain 104-145, print 68-108, shoot 73-627), no frame over 33 ms (p99 43 at 480 px), first film frame after choosing a stock <= 50 ms (cold process 379-506 ms: upload 190-240 = tables + plan + display, record 136-146 incl. pipeline creation, wait 34-97; a warm number was not isolated). Thermal status stayed 0 over the ~90 s of continuous load (no 60 s app soak was possible).
+
+Floor reached and what adaptive quality should do: at the measured cost the interactive long edge that fits 8.3 ms is about 360-400 px (`film_strength` 2.1 ms at 240, 7.5 at 480); the Dart controller now takes the budget from the panel refresh (`budgetForRefresh(120) = 8.33`) and has a 360 px rung, so on this phone it would settle at 360-480 px in a film drag; the 1220 px wide picture is then upscaled for the duration of the drag and replaced by the exact settled frame. The settled frame is unchanged (final tier). The visual cost (dE of interactive vs settled at screen size) was **not measured**. The calibration / micro-benchmark that would seed the rung before the first drag was not built.
+
+## 5. Gates on the Redmi (this tree)
+
+| gate | Vulkan | GLES 3.1 (`DAPPLE_GPU_API=gles`) |
+|---|---|---|
+| `dapple_film_gpu_tests` (film_gpu.parity, 40 cases) | ok, 0 failures, e.g. halation interactive mean 0.017 p99 0.053, final grain off 0.030 / 0.098 | ok, identical dE values, 0 failures |
+| `dapple_film_gpu_tests frames` | ok (1536x1024 mean <= 0.078, p99 <= 0.85, max <= 1.87) | ok |
+| `dapple_gpu_tests --film-tiling` | first run FAILED: `exact look LUT + spatial: mean 0.109` (budget 0.1), second run PASSED (mean 0.090). That case has no film and runs none of the shaders I changed; Adreno 710 results move between runs (self-test spatial mean 0.076 / 0.112, point+geometry 0.040 / 0.054): a device numeric noise near the budget, not a regression of this wave | PASSED |
+| `dapple_gpu_tests --coverage` | PASSED, 192 / 192 on the GPU executor | PASSED |
+| `dapple_golden selfcheck` | arm64: 148 frames, 0 mismatches, SELFCHECK OK | |
+| `dapple_golden seqcheck` (engine.match_cache_seq) | 60 settled frames, 17 sequences, 0 mismatches | |
+| `dapple_match_cache_tests` | ok (now takes the pack from `DAPPLE_FILM_DATA`) | |
+| `dapple_exec_tests` | ok | |
+| GLES film correctness (the Adreno 620 / 640 wrong-colour report) | | **not reproduced on the Adreno 710**: all film rows pass with the same dE as Vulkan; the Pixel 5 was not touched (battery) |
+
+Desktop (RTX 4060 Ti, `build/w8a`): `ctest -R "film_gpu|golden|match_cache|gpu_parity|engine\.|exec"` 35 / 35 passed (includes film_gpu.parity, film_gpu.frames, gpu_parity_swiftshader, engine.golden_*, engine.match_cache_seq). Full `check-all` was not run (other engineers' files do not build: `tests/video/video_session_tests.cpp` was mid-edit during my arm64 build).
+
+## 6. Warm-up on this phone
+
+`gpu probe: api=vulkan ... self-test cached, probe total 47 ms`; `gpu warm-up: film pipelines + default stock 790 ms (film check: mean dE 0.044 p99 0.75 max 1.67)` (GLES: 52 ms / 658 ms, same dE). Frames before the probe is ready run on the CPU with the reason "GPU self-test running" (nothing waits on it; first photo opening in the app was not observed). Fresh first film frame of a process (session path): 379-609 ms.
+
+## 7. Not done / not verified
+
+App install and everything in the app; GPU clock / busy logs (not readable); a per-device micro-benchmark and a cross-device ratio table (Pixel 5 not used); ADPF and cadence effect in the app; Vulkan-vs-GLES choice by measurement (on this phone GLES drag frames were not slower: film_strength 480 px median 12.5 vs 14.9 ms Vulkan, 5 frames each, noisy); first-drag-frame targets; the remaining per-frame CPU cost of table drags (17-60 ms, bake + upload) on this SoC; the Pixel 5 `cpu_ms 234 (match 110 upload 124)` pad-drag case; the 60 s soak in the app; rotation, background/return.
+
+End state: `/data/local/tmp/dapple` removed from the Redmi at the end, no `debug.dapple.*` property was set, no setting was changed.
+
+# Round 2 (same day, owner direction: find where the hardware is not used; nothing per device in code)
+
+## 8. Findings
+
+* **Core selection is capability-driven already.** `exec/big_core.h` picks the cores whose `cpuinfo_max_freq` is >= 80 % of the top one (no indices, no names). The only fixed mask was mine: `taskset f0` in the bench scripts. Dropped: without it the engine's own pinning gives the same numbers (film_strength 480 px median 7.3 ms with and without). Nothing else in `core/` names a model, GPU or core.
+* **Precision (mediump / RelaxedPrecision): no gain, reverted.** `precision mediump float;` on `film_mix3.comp` does reach the SPIR-V (`glslc -O` output has 71 `RelaxedPrecision` decorations, checked with `spirv-dis`), and the Adreno 710 per-pass times did not move (film_h3 1.635 -> 1.635 ms, film_v3 2.97 -> 2.90, total 14.75 -> 14.84). So these passes are not limited by fp32 ALU rate; the driver either already runs them as fp16-eligible or the limit is elsewhere (load/store latency, occupancy). Not applied to other shaders and the GLES path was not tried. On the GLES wrong-colour bug of the Adreno 620 / 640: from the shaders alone nothing supports a precision cause (the film shaders use the same highp ESSL path as on the Adreno 710, where GLES matches Vulkan to the last digit, and the only mediump-sensitive operations, the `h16` rounding helper and `floatBitsToUint`, are precision independent); a driver bug in image load/store or `texelFetch` of RGBA16F planes is as likely. The new warm-up film check demotes such a device by behaviour.
+* **Cadence (item 5), native session bench, 480 px film_strength, median ms:** back-to-back 7.3, paced at 8.33 ms 7.5, 11.1 ms 8.3, 16.7 ms 8.5. At 640 px: 14.7 back-to-back, 14.7 at 16.7 ms, 18.3 at 33 ms. At 810 px the numbers were noisy and device-state dependent (24.5 back-to-back in this run, 17.8 in the earlier one; 35.2 paced at 16.7 ms, 25.3 at 33 ms). So vsync-paced frames cost 0 to 15 % more at sizes that fit the period and up to 1.4x in a noisy case at a size that does not; no clear "cold clock" signature at the sizes that matter, **no keep-warm was implemented** (nothing measurable to justify the battery cost). ADPF could not be measured natively (no session for a shell binary: `adpf_session:false`); the app already creates the session in `configurePerf` (`core/src/sysperf.h`), untested on this phone.
+* **Superlinear cost (item 4): a cliff between 15.2 and 17.8 MB, not a slope.** Size sweep of the interactive film frame (film_point, hot, ms): 600x800 1.35, 810x1080 2.43, 1100x780 2.64, **1200x800 2.65 (source 15.4 MB, 0.96 MP)**, **1300x867 7.5-8.3 (source 18.0 MB, 1.13 MP)**, 1400x933 8.9, 1500x1000 9.4, 1600x1067 10.0. Same pixel rate below the step (2.7 ns/px) and 7-8 ns/px above it; film_h3 shows the same step (3.3 ms at 1200x800 for the level-0 pass, 7.2 at 1600). The step sits where the RGBA32F source (and the 8 B/px RGBA16F planes) cross about 16 MiB. Not isolated further (no GPU counters without root): candidates are a driver limit on large linear images (no compression, TLB reach) or the system cache. Consequence: every interactive rung of the Dart ladder (<= 810x1080, 14 MB) is below the step, the 1600 px still / detail frames are above it; **a banded (windowed) record of frames above the step is the fix** (the film window record exists for tiled export), not done.
+* **Ratios to the best simple pass (Redmi, hot):** the fastest pass in the 1600 px grain-drag frame is `film_enc` at 30 GB/s (reference "copy-like" pass), film_point 4.1 (0.13), film_h3 2.1 (0.07), film_v3 4.9 (0.16), film_pd 6.8 (0.22); at 810x1080 film_point 8.5 (0.28), film_h3 13 (0.43), film_v3 10 (0.33), film_pd 8 (0.27). The N5 records (wave 6, `find-n5.md`): simple passes over 100 GB/s, film_v3 10-26 GB/s (0.1-0.26). So relative to its own simple passes the Redmi is no worse than the N5 on the film passes, and its simple passes are 3-4x slower in absolute terms: the gap to the N5 is mostly raw throughput (memory system and ALU) plus the 16 MiB step above 1.2 MP, not a pass that is pathological here. The measurement was done by hand from the bench tables; the in-engine micro-benchmark that would produce it at warm-up and seed adaptive quality was **not built**.
+* **Per-drag costs (item 6) and the Pixel 5 log, from code:** `cpu_ms 234 (match 110 ... upload 123.8)` on a film pad drag is the table-moving drag path (film_print / film_shoot / film_black / warmth / tint): each frame re-bakes the 17^3 coarse print table on the CPU and re-uploads it (17-60 ms here on an A78, 124 ms on the Pixel 5's A76/A55 mix is the same mechanism at a slower CPU), and `match` is the first print solve / cold calibration bucket (110 ms there, 440 here for a cold bucket). Neither is keyed by the interactive size: the table key is film + paper + parameters, the match key is the lean key; changing the interactive size mid-drag was not reproduced. Not fixed: the bake needs to move to worker threads outside the frame pool with interpolated tables, or onto the GPU; also not done: grain tables cached on disk, bake-at-selection. The warm-up workers share the pool with the frame thread (19 -> 23 ms on table drags while they run).
+* **Visual cost of the interactive size (item 7):** not measured. Adaptive quality: budget = one refresh and a 360 px rung (round 1); the calibration seed and the oscillation guard beyond the existing up-after-12-frames hysteresis were not added.
+* **Compute vs raster (item 2):** not prototyped (a render-pass path in the Vulkan HAL was out of reach in this round). No numbers.
+
+## 9. APK (item 8)
+
+`:app:lintVitalAnalyzeRelease` crashes inside Kotlin lint ("Unexpected failure during lint analysis of **CodecSelfTest.kt**", `KotlinIllegalArgumentExceptionWithAttachments` from the K2 FIR symbol code): the offender is `app/android/app/src/main/kotlin/com/dapple/dapple/CodecSelfTest.kt` (modified in the working tree, not mine; not edited). Workaround for this build only: a temporary Gradle init script in `tools/gradle-home/init.d/` disabling `lintVital*` (removed again), then `flutter build apk --release --target-platform android-arm64`: **`build/redmi/app-w8-arm64.apk`** (36 MB, debug key, same as the earlier APKs) for the owner to install by hand. **Untested**: it was never installed or launched (MIUI install prompt). It carries this tree's engine changes (shader fixes, warm-up film check, two prewarm workers) and the Dart adaptive-quality change.
+
+## 10. Gates added in round 2
+
+Size sweep and cadence benches are test-side only (`DAPPLE_BENCH_SIZE`, `DAPPLE_BENCH_PERIOD_MS`, `DAPPLE_BENCH_ADPF`). The shader state at the end of round 2 equals round 1 (the mediump experiment was reverted), so the round 1 gates stand. `tools/check-all.sh`: see the final report.

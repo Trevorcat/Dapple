@@ -182,7 +182,8 @@ class MainActivity : FlutterActivity() {
                     val src = call.argument<Int>("source") ?: 0
                     val compat = call.argument<Boolean>("compat") ?: false
                     val film = call.argument<Boolean>("film") ?: false
-                    run { live.trim(u, s0, dur, d, mute, src, compat, film) }
+                    val edit = EditSpec.fromMap(call.argument<Map<String, Any?>>("edit"))
+                    run { live.trim(u, s0, dur, d, mute, src, compat, film, edit) }
                 }
                 else -> result.notImplemented()
             }

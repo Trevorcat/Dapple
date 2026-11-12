@@ -225,7 +225,7 @@ int cmdEval(const std::vector<std::string>& args) {
 
   for (std::size_t idx = 0; idx < cases.size(); ++idx) {
     const Case& c = cases[idx];
-    CameraProfile cam = dev.cameras().resolve(c.src.meta.make, c.src.meta.model);
+    CameraProfile cam = effectiveCamera(dev.cameras(), c.src.meta);
     if (matchOff) cam.colorMatch = {};
     Row row;
     row.index = int(idx);

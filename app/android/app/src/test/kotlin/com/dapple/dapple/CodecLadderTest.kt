@@ -114,8 +114,9 @@ class CodecLadderTest {
     }
 
     @Test fun decoderWithoutP010OrWithFailedSelfTestFallsToSoftware() {
+        // no P010 in the colour list is no longer a reason to skip the hardware decoder: the self-test decides (see note10Plus tests below)
         val noP010 = decoders.map { if (it.name == "hw.hevc.dec") it.copy(colorFormats = listOf(FLEX)) else it }
-        assertEquals(listOf(DecodeRoute.SOFTWARE), Ladder.decode(noP010, hevc10).map { it.route })
+        assertEquals(listOf(DecodeRoute.HW_NATIVE_P010, DecodeRoute.SOFTWARE), Ladder.decode(noP010, hevc10).map { it.route })
         val cache = SelfTestCache(MapKv(), "b")
         cache.record(SelfTestKind.DEC10, "hw.hevc.dec", false, "8-bit picture", 100)
         assertEquals(listOf(DecodeRoute.SOFTWARE), Ladder.decode(decoders, hevc10, cache).map { it.route })
@@ -132,8 +133,9 @@ class CodecLadderTest {
         // a decoder that declares only High10 must not be taken for High 4:2:2
         val high10 = listOf(dec("avc10", Mime.AVC, true, listOf(Prof.AVC_HIGH, Prof.AVC_HIGH10)))
         assertEquals(listOf(DecodeRoute.SOFTWARE), Ladder.decode(high10, sony).map { it.route })
-        // 10-bit 4:2:0 H.264 needs High10 AND P010
-        assertEquals(listOf(DecodeRoute.SOFTWARE), Ladder.decode(high10, StreamSpec(Mime.AVC, Prof.AVC_HIGH10, 10, 1)).map { it.route })
+        // 10-bit 4:2:0 H.264 needs High10; P010 in the colour list is not required (the self-test decides), but a High10-less decoder is software
+        assertEquals(listOf(DecodeRoute.HW_NATIVE_P010, DecodeRoute.SOFTWARE), Ladder.decode(high10, StreamSpec(Mime.AVC, Prof.AVC_HIGH10, 10, 1)).map { it.route })
+        assertEquals(listOf(DecodeRoute.SOFTWARE), Ladder.decode(listOf(dec("avc8", Mime.AVC, true, listOf(Prof.AVC_HIGH))), StreamSpec(Mime.AVC, Prof.AVC_HIGH10, 10, 1)).map { it.route })
         val high10p = listOf(dec("avc10", Mime.AVC, true, listOf(Prof.AVC_HIGH10), listOf(FLEX, P)))
         assertEquals(DecodeRoute.HW_NATIVE_P010, Ladder.decode(high10p, StreamSpec(Mime.AVC, Prof.AVC_HIGH10, 10, 1))[0].route)
         // requiredProfile -1 (no Android constant): software
@@ -235,5 +237,112 @@ class CodecLadderTest {
     @Test fun unknownCodecHasNoStateAndNoneLedgerIsEmpty() {
         assertEquals(TestState.UNKNOWN, TestLedger.NONE.state("x", "y"))
         assertNull(SelfTestCache(MapKv(), "f").result("a", "b"))
+    }
+
+    // ---- Samsung Galaxy Note10+ (Android 12, Snapdragon 855) as declared, docs/engine/device-results/note10plus.md section 5 ----------------------
+    private val QCOM_VENDOR = 0x7fa30c04  // a Qualcomm vendor colour format (not P010)
+    private val note10Plus = listOf(
+        // HW HEVC encoder: Main + Main10HDR10, no P010 in the colour list (Surface, Flexible, SemiPlanar, vendor)
+        hevcEnc("OMX.qcom.video.encoder.hevc", true, listOf(Prof.HEVC_MAIN, Prof.HEVC_MAIN10_HDR10), listOf(ColorFmt.SURFACE, FLEX, ColorFmt.NV12, QCOM_VENDOR), 4096, 2304),
+        hevcEnc("c2.android.hevc.encoder", false, listOf(Prof.HEVC_MAIN, 4), listOf(FLEX), 512, 512),
+        avcEnc("OMX.qcom.video.encoder.avc", true), avcEnc("c2.android.avc.encoder", false),
+        dec("OMX.qcom.video.decoder.hevc", Mime.HEVC, true, listOf(Prof.HEVC_MAIN, Prof.HEVC_MAIN10, Prof.HEVC_MAIN10_HDR10), listOf(FLEX, QCOM_VENDOR, ColorFmt.SURFACE)),
+        dec("OMX.qcom.video.decoder.avc", Mime.AVC, true, listOf(1, 2, Prof.AVC_HIGH)),
+        dec("c2.android.hevc.decoder", Mime.HEVC, false, listOf(Prof.HEVC_MAIN, Prof.HEVC_MAIN10)),
+    )
+
+    @Test fun note10PlusHardwareMain10DecoderIsTriedEvenWithoutP010InItsList() {
+        val picks = Ladder.decode(note10Plus, hevc10)
+        assertEquals(listOf(DecodeRoute.HW_NATIVE_P010, DecodeRoute.SOFTWARE), picks.map { it.route })
+        assertEquals("OMX.qcom.video.decoder.hevc", picks[0].codec)
+    }
+
+    @Test fun note10PlusDecoderThatDeliversAVendorFormatFailsWithThatFormatInTheReasonAndSoftwareTakesOver() {
+        val v = Decode10.verdict("OMX.qcom.video.decoder.hevc", QCOM_VENDOR, 700, listOf(FLEX, QCOM_VENDOR, ColorFmt.SURFACE))
+        assertEquals(false, v.first)
+        assertTrue(v.second, v.second.contains("0x7fa30c04") && v.second.contains("only P010"))
+        val cache = SelfTestCache(MapKv(), "n10")
+        cache.record(SelfTestKind.DEC10, "OMX.qcom.video.decoder.hevc", v.first, v.second, 40)
+        assertEquals(listOf(DecodeRoute.SOFTWARE), Ladder.decode(note10Plus, hevc10, cache).map { it.route })
+    }
+
+    @Test fun decode10VerdictAcceptsP010WithMoreThan256LevelsOnly() {
+        assertEquals(true, Decode10.verdict("c", ColorFmt.P010, 640, listOf(ColorFmt.P010)).first)
+        assertEquals(false, Decode10.verdict("c", ColorFmt.P010, 220, listOf(ColorFmt.P010)).first)   // truncated to 8 bit
+        assertEquals(false, Decode10.verdict("c", FLEX, 640, listOf(FLEX)).first)                       // 8-bit flexible for a 10-bit stream
+        assertEquals(false, Decode10.verdict("c", -1, 0, emptyList()).first)
+    }
+
+    @Test fun note10PlusMain10HdrEncoderIsOfferedAsMain10CandidateAfterCodecsListingP010_andAskedForItsDeclaredProfile() {
+        val picks = Ladder.encode(note10Plus, job)
+        assertEquals(EncodeRung.HEVC_MAIN10, picks[0].rung)
+        assertEquals("OMX.qcom.video.encoder.hevc", picks[0].codec)
+        assertEquals(Prof.HEVC_MAIN10_HDR10, picks[0].profile)      // only Main10HDR10 declared: ask for that, not Main10
+        // a codec that lists P010 outranks one that does not
+        val withP010 = note10Plus + hevcEnc("other.hevc", true, listOf(Prof.HEVC_MAIN10), listOf(FLEX, P))
+        assertEquals("other.hevc", Ladder.encode(withP010, job)[0].codec)
+        // after a failed self-test the phone is back to 8-bit HEVC
+        val cache = SelfTestCache(MapKv(), "n10")
+        cache.record(SelfTestKind.ENC10, "OMX.qcom.video.encoder.hevc", false, "configure failed", 20)
+        assertEquals(EncodeRung.HEVC_MAIN, Ladder.encode(note10Plus, job, cache)[0].rung)
+    }
+
+    @Test fun main10EncodeRowAlwaysExistsWithStateAndReason() {
+        val cache = SelfTestCache(MapKv(), "n10")
+        fun rows() = Diagnostics.main10EncodeRows(note10Plus) { k, c -> cache.result(k, c) }
+        // before any test: one row per HEVC encoder
+        var r = rows()
+        assertEquals(listOf("OMX.qcom.video.encoder.hevc", "c2.android.hevc.encoder"), r.map { it.codec })
+        assertEquals(Diagnostics.UNTESTED, r[0].state)
+        assertTrue(r[0].reason, r[0].reason.contains("Main10HDR10") && r[0].reason.contains("Surface"))
+        assertEquals(Diagnostics.NOT_DECLARED, r[1].state)
+        cache.record(SelfTestKind.ENC10, "OMX.qcom.video.encoder.hevc", false, "configure failed: -10000 (Unsupported eColorFormat)", 12)
+        r = rows()
+        assertEquals(Diagnostics.UNTESTED, rows()[0].state)           // the Surface mode of this codec is still untested
+        cache.record(SelfTestKind.ENC10_SURFACE, "OMX.qcom.video.encoder.hevc", false, "no 10-bit EGL surface", 5)
+        r = rows()
+        assertEquals(Diagnostics.FAILED, r[0].state)
+        assertTrue(r[0].reason, r[0].reason.contains("Unsupported eColorFormat") && r[0].reason.contains("no 10-bit EGL surface"))
+        cache.record(SelfTestKind.ENC10_SURFACE, "OMX.qcom.video.encoder.hevc", true, "surface input, 10-bit EGL, 8 frames, profile Main10HDR10, 640 levels", 300)
+        r = rows()
+        assertEquals(Diagnostics.PASSED, r[0].state)
+        assertTrue(r[0].reason, r[0].reason.startsWith("input mode passed: surface"))
+        cache.record(SelfTestKind.ENC10, "OMX.qcom.video.encoder.hevc", true, "8 frames", 300)
+        assertTrue(rows()[0].reason.startsWith("input mode passed: buffer P010 + surface"))
+        // a device with no HEVC encoder at all still has the row
+        val none = Diagnostics.main10EncodeRows(listOf(avcEnc("a", true))) { _, _ -> null }
+        assertEquals(1, none.size)
+        assertEquals(Diagnostics.NOT_DECLARED, none[0].state)
+    }
+
+    // ---- Surface input (Main10 only through an input Surface, like many hardware encoders) ----------------------------------------------------------
+    private val surfaceOnly = listOf(hevcEnc("hw.hevc.surface", true, listOf(Prof.HEVC_MAIN, Prof.HEVC_MAIN10), listOf(ColorFmt.SURFACE, FLEX)), avcEnc("hw.avc", true))
+
+    @Test fun surfaceModeIsOfferedOnlyToJobsThatCanFeedASurface() {
+        val bufferJob = Ladder.encode(surfaceOnly, EncodeJob(1920, 1080, 30))
+        assertEquals(listOf(InputMode.BUFFER), bufferJob.filter { it.rung == EncodeRung.HEVC_MAIN10 }.map { it.input })
+        val edited = Ladder.encode(surfaceOnly, EncodeJob(1920, 1080, 30, surfaceOk = true)).filter { it.rung == EncodeRung.HEVC_MAIN10 }
+        // a codec that does not list P010 tries its Surface input first
+        assertEquals(listOf(InputMode.SURFACE, InputMode.BUFFER), edited.map { it.input })
+        assertEquals(listOf(SelfTestKind.ENC10_SURFACE, SelfTestKind.ENC10), edited.map { it.testKind })
+    }
+
+    @Test fun eachInputModeHasItsOwnVerdictAndDemotion() {
+        val cache = SelfTestCache(MapKv(), "dev")
+        cache.record(SelfTestKind.ENC10_SURFACE, "hw.hevc.surface", false, "no 10-bit EGL surface", 4)
+        val picks = Ladder.encode(surfaceOnly, EncodeJob(1920, 1080, 30, surfaceOk = true), cache).filter { it.rung == EncodeRung.HEVC_MAIN10 }
+        assertEquals(listOf(InputMode.BUFFER), picks.map { it.input })        // surface failed: only the buffer mode is left
+        cache.record(SelfTestKind.ENC10, "hw.hevc.surface", false, "configure failed", 4)
+        assertEquals(EncodeRung.HEVC_MAIN, Ladder.encode(surfaceOnly, EncodeJob(1920, 1080, 30, surfaceOk = true), cache)[0].rung)  // both failed: 8-bit HEVC
+        val passed = SelfTestCache(MapKv(), "dev2")
+        passed.record(SelfTestKind.ENC10, "hw.hevc.surface", true, "ok", 4)
+        passed.record(SelfTestKind.ENC10_SURFACE, "hw.hevc.surface", true, "ok", 4)
+        assertEquals(InputMode.BUFFER, Ladder.encode(surfaceOnly, EncodeJob(1920, 1080, 30, surfaceOk = true), passed)[0].input)  // both passed: the buffer path first
+    }
+
+    @Test fun editFormatFollowsRungDepthAndHdr() {
+        assertEquals(EditFormat.P010, EditFormat.forEncoder(true, false))
+        assertEquals(EditFormat.P010_HDR, EditFormat.forEncoder(true, true))
+        assertEquals(EditFormat.I420, EditFormat.forEncoder(false, true))     // an 8-bit rung is always SDR
     }
 }

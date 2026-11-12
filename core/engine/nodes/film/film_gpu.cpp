@@ -293,6 +293,9 @@ bool v3Direct(const hal::Device& d) {
 struct Mix3 {
   gpu::GpuRecorder& r;
   bool ok = true;
+  // interactive tier (quality 1): every component of sigma >= 3 goes to pyramid level >= 1 (kMinLowSigma 1.5 instead of 2.0): the wide halation tail then
+  // costs a quarter of the pixels (wave 8, Adreno 710: film_h3 + film_v3 were 60 % of the frame); DAPPLE_FILM_FASTLOW=0 turns it off
+  bool fastLow = false;
   H img(int w, int h) { return r.g.transient(hal::Format::RGBA16F, std::uint32_t(w), std::uint32_t(h)); }
   H tapsH = -1;
   // `n` vec4 of tap table in the slot's host-visible buffer; returns the offset (vec4 units) or -1
@@ -376,6 +379,13 @@ struct Mix3 {
         }
         std::fprintf(stderr, "\n");
       }
+      // per-slot radius for the direct vertical pass (tap table entry 0, w; the taps use rgb): a slot of radius 1 next to a slot of radius 16 loops 1, not 16
+      for (int jj = 0; jj < nc; ++jj) {
+        int rj = 0;
+        for (int c = 0; c < 3; ++c)
+          if (j0 + jj < comps[c].size()) rj = std::max(rj, comps[c][j0 + jj].r);
+        vt[(jj * 20) * 4 + 3] = float(rj);
+      }
       hu.dim[2] = vu.dim[2] = R;
       vu.sz[2] = r.lx;
       vu.sz[3] = r.ly;
@@ -397,7 +407,7 @@ struct Mix3 {
   }
   // `src`: full resolution (W x Hh) RGBA32F input, or the half-resolution input when `half`.
   H mixture(H src, int W, int Hh, const fd::Mixture* mix, bool half) {
-    const double kMinLowSigma = half ? 1.6 : 2.0;
+    const double kMinLowSigma = half ? 1.6 : (fastLow ? 1.0 : 2.0), lowCut = fastLow ? 2.0 : 3.0;
     int avail = 0;
     {
       int w = W, h = Hh;
@@ -420,7 +430,7 @@ struct Mix3 {
         Comp3 lc;
         int k = 0;
         double sl = g.sigma;
-        if (g.sigma >= 3.0) {
+        if (g.sigma >= lowCut) {
           k = int(std::floor(std::log2(g.sigma / kMinLowSigma)));
           k = std::clamp(k, half ? 1 : 0, avail);
           if (k > 0) {
@@ -430,7 +440,7 @@ struct Mix3 {
         }
         std::vector<float> taps;
         int rr;
-        if (g.sigma < 3.0) {
+        if (g.sigma < lowCut) {
           fd::gaussTaps(g.sigma, taps, rr);
         } else {
           rr = int(std::ceil(4.0 * sl));
@@ -844,6 +854,7 @@ bool recordFilmPre(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTa
     if (E < 0) return false;
   }
   Mix3 mix3{r};  // three channels at once
+  { static const bool fl = [] { const char* e = std::getenv("DAPPLE_FILM_FASTLOW"); return !(e && e[0] == '0'); }(); mix3.fastLow = fl && res.quality == 1; }
   H E2 = E;
   fd::Mixture preM[3] = {pl.pre[0], pl.pre[1], pl.pre[2]}, haloM[3] = {pl.halo[0], pl.halo[1], pl.halo[2]};
   if (res.quality == 1 && mergeEnabled())

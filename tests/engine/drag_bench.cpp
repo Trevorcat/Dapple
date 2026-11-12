@@ -27,6 +27,13 @@ int main(int argc, char** argv) {
   const int le = argc > 3 ? std::atoi(argv[3]) : 360;
   const int frames = argc > 4 ? std::atoi(argv[4]) : 14;
   const std::string filter = argc > 5 ? argv[5] : "";
+  if (const char* ap = std::getenv("DAPPLE_BENCH_ADPF")) {  // wave 8: Android Performance Hint target in ms, like the app's configurePerf
+    dapple_perf_configure(0, std::atoi(ap));
+    if (char* j = dapple_perf_info_json()) {
+      std::fprintf(stderr, "perfinfo %s\n", j);
+      dapple_free_string(j);
+    }
+  }
   if (dapple_film_load_pack(argv[2]) != DAPPLE_OK) return std::fprintf(stderr, "pack: %s\n", dapple_last_error()), 1;
   if (const char* pdir = std::getenv("DAPPLE_BENCH_PROBE")) {  // the app's start-up: configure + background probe (+ warm-up), then wait
     dapple_gpu_configure(pdir, "bench-1", "bench-fp");
@@ -125,8 +132,14 @@ int main(int argc, char** argv) {
       dapple_free_image(&img);
       std::this_thread::sleep_for(std::chrono::milliseconds(settleMs));
     }
+    const double periodMs = std::getenv("DAPPLE_BENCH_PERIOD_MS") ? std::atof(std::getenv("DAPPLE_BENCH_PERIOD_MS")) : 0.0;  // vsync-paced frames (wave 8): one frame start per period
+    auto nextStart = Clk::now();
     std::vector<double> t;
     for (int i = 0; i < frames; ++i) {
+      if (periodMs > 0) {
+        std::this_thread::sleep_until(nextStart);
+        nextStart = std::max(nextStart + std::chrono::duration_cast<Clk::duration>(std::chrono::duration<double, std::milli>(periodMs)), Clk::now());
+      }
       const float v = c.lo + (c.hi - c.lo) * float(i) / float(std::max(1, frames - 1));
       char json[512];
       std::snprintf(json, sizeof json, "{\"film\":\"kodak_portra_400\",\"%s\":%.4f}", c.key, double(v));

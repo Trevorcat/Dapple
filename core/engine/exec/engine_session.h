@@ -96,6 +96,11 @@ struct FrameJob {
   const hal::ExternalImage* gpuTarget = nullptr;
   // CPU time the C layer spent before the engine call (film exposure match, Renderer construction): reported in FrameResult::cpu
   double matchMs = 0, rendererMs = 0;
+  // Video frames (docs/engine/pipeline-architecture.md section 30): non-null = the clamped, display-encoded float frame goes here instead of the
+  // 8-bit rgba (CPU executor, Whole plan; the GPU executor writes 8-bit, so such a frame is always a CPU frame). FrameResult::rgba stays null.
+  ImageF* outFloat = nullptr;
+  // Video clips: the frame-global solves (dehaze, detail base) are found under the keys of frame index 0, i.e. they are held from the reference frame.
+  bool holdSolves = false;
 };
 
 struct FrameResult {
@@ -109,6 +114,7 @@ struct FrameResult {
   std::string executor;  // "cpu", "vulkan" or "gles31": who produced the pixels (Full mode)
   std::string why;       // when the CPU rendered although a GPU was asked for or could have been: the reason (Unsupported text, "GPU self-test running", ...)
   bool external = false; // the pixels are in FrameJob::gpuTarget, not in rgba
+  bool floatOut = false; // the pixels are in FrameJob::outFloat, not in rgba
   GpuStats gpu;          // GPU runs only
   // CPU time of this frame by stage, ms (reported by the throttled dapple_engine line): match = film exposure solve (C layer), renderer = Renderer
   // construction (C layer), graph = ParamSet + graph + keys, tables = host tables (lattice, tone, film), exec = plan + executor incl. GPU wait
@@ -126,6 +132,8 @@ struct EngineStats {
   double planMs = 0, execMs = 0;
   // GPU executor (5.9): frames it produced, plans it could not run (CPU took them), transient failures, device losses
   std::uint64_t gpuFrames = 0, gpuUnsupported = 0, gpuTransients = 0, gpuLost = 0;
+  // of gpuUnsupported: tiled exports of a film with the enlarger diffusion filter (a whole-frame blur, no window form, docs/engine/pipeline-architecture.md 28.3)
+  std::uint64_t gpuEnlargerTiled = 0;
 };
 
 // Process-wide GPU counters (dapple_gpu_status_json).

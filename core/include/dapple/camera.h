@@ -91,4 +91,8 @@ class CameraRegistry {
   CameraProfile generic_;
 };
 
+// The camera profile for one file: the registry's profile for its make / model, with baselineExposureEv replaced by the file's own exposure
+// anchor when the decoder computed one (ShotMetadata::exposureAnchorTier > 0). DAPPLE_PROFILE=generic forces the generic profile (diagnostic).
+CameraProfile effectiveCamera(const CameraRegistry& registry, const ShotMetadata& meta);
+
 }  // namespace dapple

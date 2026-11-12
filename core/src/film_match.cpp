@@ -46,8 +46,7 @@ std::string filmMatchKey(const EditParams& p) {
   k.filmGrain = 0.f;
   k.filmHalation = 0.f;
   k.clarity = k.texture = k.dehaze = k.grain = 0.f;
-  k.sharpen = k.sharpRadius = k.nrLuma = k.nrColor = 0.f;
-  k.vignette = 0.f;
+  k.sharpen = k.nrLuma = 0.f;  // vignette, nrColor and sharpRadius stay in the key: the solve's develop render reads them (matchFilmExposure clears only the fields above)
   return toJson(k);
 }
 

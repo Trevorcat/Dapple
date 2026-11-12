@@ -303,6 +303,11 @@ class EditorEngine extends ChangeNotifier {
     _openMs = _clock.elapsedMilliseconds;
     if (!_perfConfigured) {
       _perfConfigured = true;
+      // wave 8: the drag budget is one display refresh (8.3 ms on a 120 Hz panel), the rung follows the measured frame time
+      try {
+        final ds = ui.PlatformDispatcher.instance.displays;
+        if (ds.isNotEmpty) quality.budgetMs = AdaptiveQuality.budgetForRefresh(ds.first.refreshRate);
+      } catch (_) {}
       // ADPF target = the drag frame budget; threads: all performance cores (the engine picks them on big.LITTLE)
       DappleSession.configurePerf(targetFrameMs: quality.budgetMs.round());
       PerfProbe.log('perfinfo', DappleSession.perfInfo() ?? const {});

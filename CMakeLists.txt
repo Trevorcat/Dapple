@@ -39,6 +39,7 @@ if(DAPPLE_WITH_OPENCV)
 endif()
 
 add_subdirectory(core)
+include(core/video/host.cmake)  # desktop video core (only when tools/ffmpeg/build-host.sh has run)
 
 # Software video decoding for Motion Photos (FFmpeg, LGPL, dynamically linked; docs/legal/ffmpeg-lgpl.md). Android only.
 if(ANDROID)

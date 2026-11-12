@@ -4,9 +4,12 @@
 #include <libraw/libraw.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -15,6 +18,9 @@
 
 #include "dapple/illuminant.h"
 #include "dapple/decoder.h"
+#include "decoders/dng_illuminant.h"
+#include "decoders/dng_opcodes.h"
+#include "exposure_anchor.h"
 #include "file_util.h"
 #include "parallel.h"
 
@@ -59,7 +65,140 @@ std::string fujiFilmSimulation(unsigned mode) {
   }
 }
 
-ShotMetadata readMetadata(const LibRaw& raw) {
+// DNG default crop (DNG specification: DefaultCropOrigin / DefaultCropSize, relative to the ActiveArea) in active-area pixels,
+// origin and size rounded to even numbers so that the half-size preview crops to exactly half of it. False when the file is not a
+// DNG, records no crop, or the crop covers the whole active area. (Sony writes the crop tags raw-relative into raw_inset_crops, and
+// Sony DNGs are not the phone case: left to LibRaw metadata.)
+bool dngDefaultCrop(const LibRaw& raw, int& x0, int& y0, int& w, int& h) {
+  const auto& d = raw.imgdata;
+  if (d.idata.dng_version == 0 || d.sizes.raw_inset_crops[0].cwidth == 0 || d.sizes.raw_inset_crops[0].cheight == 0) return false;
+  if (std::strncmp(d.idata.make, "SONY", 4) == 0 || std::strncmp(d.idata.make, "Sony", 4) == 0) return false;
+  const auto& c = d.sizes.raw_inset_crops[0];
+  int cx = int(c.cleft) - int(d.sizes.left_margin), cy = int(c.ctop) - int(d.sizes.top_margin);
+  int cw = int(c.cwidth), ch = int(c.cheight);
+  if (cx < 0 || cy < 0 || cx + cw > int(d.sizes.width) || cy + ch > int(d.sizes.height)) return false;
+  const int ex = cx & ~1, ey = cy & ~1;
+  cw = (cw + (cx - ex)) & ~1, ch = (ch + (cy - ey)) & ~1;
+  cx = ex, cy = ey;
+  cw = std::min(cw, int(d.sizes.width) - cx), ch = std::min(ch, int(d.sizes.height) - cy);
+  if (cw < 16 || ch < 16 || (cx == 0 && cy == 0 && cw >= int(d.sizes.width) - 1 && ch >= int(d.sizes.height) - 1)) return false;
+  x0 = cx, y0 = cy, w = cw, h = ch;
+  return true;
+}
+
+bool anchorEnabled() {  // DAPPLE_ANCHOR=off: the profile's baselineExposureEv only (A/B)
+  static const bool on = [] {
+    const char* e = std::getenv("DAPPLE_ANCHOR");
+    return !(e && (std::strcmp(e, "off") == 0 || std::strcmp(e, "0") == 0));
+  }();
+  return on;
+}
+
+// DNG BaselineExposureOffset (tag 51109, SRATIONAL, 1.7+), which LibRaw does not expose: read from the first IFD; NaN = absent.
+float dngBaselineOffsetEv(const std::filesystem::path& path);
+
+bool dngOpcodesEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("DAPPLE_DNG_OPCODES");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
+dng::OpcodeList dngList(const LibRaw& raw, int i) {
+  const auto& o = raw.imgdata.color.dng_levels.rawopcodes[i];
+  return o.data && o.len ? dng::parseOpcodeList(o.data, o.len) : dng::OpcodeList{};
+}
+
+int gcdInt(int a, int b) { return b ? gcdInt(b, a % b) : a; }
+
+// Black-level pattern of the raw buffer for the gain maps (LibRaw adds the common level, the per-colour level and the repeat pattern).
+void fillBlackPattern(LibRaw& raw, dng::MosaicView& v) {
+  const auto& cm = raw.imgdata.color;
+  const int br = int(cm.cblack[4]), bc = int(cm.cblack[5]);
+  const bool pat = br > 0 && bc > 0 && br * bc <= int(LIBRAW_CBLACK_SIZE) - 6;
+  const int pr = pat ? 2 * br / gcdInt(2, br) : 2, pc = pat ? 2 * bc / gcdInt(2, bc) : 2;
+  v.bpr = pr, v.bpc = pc;
+  v.black.assign(std::size_t(pr) * pc, 0.f);
+  for (int r = 0; r < pr; ++r)
+    for (int c = 0; c < pc; ++c) {
+      const int ch = raw.COLOR(r, c) & 3;
+      v.black[std::size_t(r) * pc + c] = float(cm.black) + float(cm.cblack[ch]) + (pat ? float(cm.cblack[6 + (r % br) * bc + (c % bc)]) : 0.f);
+    }
+}
+
+ImageF rotateFlip(const ImageF& in, int flip) {
+  if (flip != 3 && flip != 5 && flip != 6) return in;
+  const int W = in.width, H = in.height;
+  ImageF out = flip == 3 ? ImageF(W, H) : ImageF(H, W);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      int dx, dy;
+      if (flip == 3) dx = W - 1 - x, dy = H - 1 - y;
+      else if (flip == 6) dx = H - 1 - y, dy = x;  // 90 degrees clockwise
+      else dx = y, dy = W - 1 - x;                 // 90 degrees counter-clockwise
+      std::memcpy(out.row(dy) + std::size_t(dx) * 3, in.row(y) + std::size_t(x) * 3, 3 * sizeof(float));
+    }
+  return out;
+}
+
+// AsShotWhiteXY (DNG tag 50729) of the first IFD: LibRaw does not expose it, and a DNG may record it instead of AsShotNeutral.
+bool readDngWhiteXy(const std::filesystem::path& path, double* xy) {
+  std::ifstream f(path, std::ios::binary);
+  unsigned char h[8];
+  if (!f.read(reinterpret_cast<char*>(h), 8)) return false;
+  const bool le = h[0] == 'I' && h[1] == 'I';
+  if (!le && !(h[0] == 'M' && h[1] == 'M')) return false;
+  auto u16 = [&](const unsigned char* p) { return le ? unsigned(p[0] | p[1] << 8) : unsigned(p[1] | p[0] << 8); };
+  auto u32 = [&](const unsigned char* p) { return le ? (unsigned(p[0]) | unsigned(p[1]) << 8 | unsigned(p[2]) << 16 | unsigned(p[3]) << 24) : (unsigned(p[3]) | unsigned(p[2]) << 8 | unsigned(p[1]) << 16 | unsigned(p[0]) << 24); };
+  if (u16(h + 2) != 42) return false;
+  f.seekg(u32(h + 4));
+  unsigned char nb[2];
+  if (!f.read(reinterpret_cast<char*>(nb), 2)) return false;
+  const unsigned n = u16(nb);
+  for (unsigned i = 0; i < n && i < 512; ++i) {
+    unsigned char e[12];
+    if (!f.read(reinterpret_cast<char*>(e), 12)) return false;
+    if (u16(e) != 50729 || u16(e + 2) != 5 || u32(e + 4) != 2) continue;
+    f.seekg(u32(e + 8));
+    unsigned char v[16];
+    if (!f.read(reinterpret_cast<char*>(v), 16)) return false;
+    const double d0 = u32(v + 4), d1 = u32(v + 12);
+    if (d0 <= 0 || d1 <= 0) return false;
+    xy[0] = u32(v) / d0, xy[1] = u32(v + 8) / d1;
+    return true;
+  }
+  return false;
+}
+
+float dngBaselineOffsetEv(const std::filesystem::path& path) {
+  std::ifstream f(path, std::ios::binary);
+  unsigned char h[8];
+  if (!f.read(reinterpret_cast<char*>(h), 8)) return std::numeric_limits<float>::quiet_NaN();
+  const bool le = h[0] == 'I' && h[1] == 'I';
+  if (!le && !(h[0] == 'M' && h[1] == 'M')) return std::numeric_limits<float>::quiet_NaN();
+  auto u16 = [&](const unsigned char* p) { return le ? unsigned(p[0] | p[1] << 8) : unsigned(p[1] | p[0] << 8); };
+  auto u32 = [&](const unsigned char* p) { return le ? (unsigned(p[0]) | unsigned(p[1]) << 8 | unsigned(p[2]) << 16 | unsigned(p[3]) << 24) : (unsigned(p[3]) | unsigned(p[2]) << 8 | unsigned(p[1]) << 16 | unsigned(p[0]) << 24); };
+  if (u16(h + 2) != 42) return std::numeric_limits<float>::quiet_NaN();
+  f.seekg(u32(h + 4));
+  unsigned char nb[2];
+  if (!f.read(reinterpret_cast<char*>(nb), 2)) return std::numeric_limits<float>::quiet_NaN();
+  const unsigned n = u16(nb);
+  for (unsigned i = 0; i < n && i < 512; ++i) {
+    unsigned char e[12];
+    if (!f.read(reinterpret_cast<char*>(e), 12)) break;
+    if (u16(e) != 51109 || u16(e + 2) != 10 || u32(e + 4) != 1) continue;
+    f.seekg(u32(e + 8));
+    unsigned char v[8];
+    if (!f.read(reinterpret_cast<char*>(v), 8)) break;
+    const double den = double(std::int32_t(u32(v + 4)));
+    if (den == 0) break;
+    return float(double(std::int32_t(u32(v))) / den);
+  }
+  return std::numeric_limits<float>::quiet_NaN();
+}
+
+ShotMetadata readMetadata(const LibRaw& raw, const double* whiteXy = nullptr) {
   const auto& d = raw.imgdata;
   ShotMetadata m;
   m.make = d.idata.normalized_make[0] ? d.idata.normalized_make : d.idata.make;
@@ -72,8 +211,13 @@ ShotMetadata readMetadata(const LibRaw& raw) {
   m.timestamp = static_cast<long long>(d.other.timestamp);
 
   const bool swap = (d.sizes.flip & 4) != 0;
-  m.sensorWidth = swap ? d.sizes.height : d.sizes.width;
-  m.sensorHeight = swap ? d.sizes.width : d.sizes.height;
+  int sw = d.sizes.width, sh = d.sizes.height;
+  {
+    int cx, cy, cw, ch;
+    if (dngOpcodesEnabled() && dngDefaultCrop(raw, cx, cy, cw, ch)) sw = cw, sh = ch;  // the decode crops to the DNG default crop
+  }
+  m.sensorWidth = swap ? sh : sw;
+  m.sensorHeight = swap ? sw : sh;
 
   if (d.idata.filters == 9) {
     m.cfa = CfaKind::XTrans;
@@ -85,6 +229,8 @@ ShotMetadata readMetadata(const LibRaw& raw) {
     // Sony M/S RAW (e.g. A7R V "M" = 26 MP) is a binned, already 3-colour
     // image without a CFA mosaic, so half-size decoding gains nothing.
     m.cfa = CfaKind::None;
+  } else if (d.idata.colors == 3 && d.idata.filters == 0) {
+    m.cfa = CfaKind::None;  // already three-colour, no mosaic: Canon sRAW / mRAW (YCbCr 4:2:2, LibRaw reports filters 0)
   } else {
     // LibRaw has not resolved the pattern at this stage; the camera profile
     // knows the sensor type.
@@ -97,14 +243,73 @@ ShotMetadata readMetadata(const LibRaw& raw) {
     m.bitsPerSample = maxValue > 0 ? int(std::ceil(std::log2(double(maxValue) + 1))) : 0;
   }
 
-  const float g = d.color.cam_mul[1] > 0 ? d.color.cam_mul[1] : 1.f;
-  for (int c = 0; c < 3; ++c) m.asShotWb[c] = d.color.cam_mul[c] > 0 ? d.color.cam_mul[c] / g : 1.f;
-  {  // as-shot illuminant chromaticity: the camera's neutral (1 / multipliers) through the inverse of the XYZ -> camera matrix
+  // As-shot multipliers: the file's AsShotNeutral. DNGs that record only AsShotWhiteXY (Pixel 8 Pro) leave cam_mul empty; their
+  // multipliers come from the white point below.
+  float camMul[4] = {d.color.cam_mul[0], d.color.cam_mul[1], d.color.cam_mul[2], d.color.cam_mul[3]};
+  const float g = camMul[1] > 0 ? camMul[1] : 1.f;
+  for (int c = 0; c < 3; ++c) m.asShotWb[c] = camMul[c] > 0 ? camMul[c] / g : 1.f;
+  bool haveDual = false;
+  {  // DNG files: both calibration illuminants' matrices + the as-shot neutral, the iterative solve of DNG specification chapter 6
+    const auto& dc = d.color;
+    auto hasCm = [&](int i) {  // LibRaw copies the matrices without their parsed-field flags: a populated matrix is the test
+      double sum = 0;
+      for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) sum += std::fabs(double(dc.dng_color[i].colormatrix[r][c]));
+      return sum > 1e-6;
+    };
+    const bool cmOk = d.idata.dng_version != 0 && d.idata.colors == 3 && hasCm(0) && hasCm(1) && dc.dng_color[0].illuminant > 0 && dc.dng_color[1].illuminant > 0;
+    const auto& an = dc.dng_levels.asshotneutral;
+    const bool haveAn = an[0] > 0 && an[1] > 0 && an[2] > 0;
+    const bool haveWhite = !haveAn && whiteXy && whiteXy[0] > 0.0 && whiteXy[1] > 0.0 && whiteXy[0] + whiteXy[1] < 1.0;
+    if (cmOk && (haveAn || haveWhite)) {
+      DngCalibration cal[2];
+      bool ok = true;
+      for (int i = 0; i < 2; ++i) {
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c) {
+            cal[i].cm[r * 3 + c] = dc.dng_color[i].colormatrix[r][c];
+            if (std::fabs(double(dc.dng_color[i].calibration[0][0])) > 1e-6 && std::fabs(double(dc.dng_color[i].calibration[1][1])) > 1e-6 &&
+                std::fabs(double(dc.dng_color[i].calibration[2][2])) > 1e-6)
+              cal[i].cc[r * 3 + c] = dc.dng_color[i].calibration[r][c];
+          }
+        cal[i].cct = illuminantCodeCct(dc.dng_color[i].illuminant);
+        ok = ok && cal[i].cct > 0;
+      }
+      if (ok && cal[0].cct > cal[1].cct) std::swap(cal[0], cal[1]);  // spec: calibration 1 is the lower temperature; the weights do not care, the order does for clarity
+      double ab[3] = {1, 1, 1};
+      for (int c = 0; c < 3; ++c)
+        if (dc.dng_levels.analogbalance[c] > 0) ab[c] = dc.dng_levels.analogbalance[c];
+      double neutral[3] = {an[0], an[1], an[2]};
+      double x = 0, y = 0;
+      if (haveWhite && ok) {  // the recorded white point is the illuminant; the neutral follows from the forward model of chapter 6
+        x = whiteXy[0], y = whiteXy[1];
+        const double T = std::clamp(xyToCct(x, y), 1500.0, 20000.0);
+        const double w = std::clamp((1.0 / T - 1.0 / cal[1].cct) / (1.0 / cal[0].cct - 1.0 / cal[1].cct), 0.0, 1.0);
+        double mx[9];
+        detail::dngXyzToCamera(cal, 2, w, ab, mx);
+        const double XYZ[3] = {x / y, 1.0, (1.0 - x - y) / y};
+        for (int r = 0; r < 3; ++r) neutral[r] = mx[r * 3] * XYZ[0] + mx[r * 3 + 1] * XYZ[1] + mx[r * 3 + 2] * XYZ[2];
+        if (neutral[0] > 0 && neutral[1] > 0 && neutral[2] > 0) {
+          for (int c = 0; c < 3; ++c) m.asShotWb[c] = float(neutral[1] / neutral[c]);
+          m.asShotIlluminantXy[0] = float(x), m.asShotIlluminantXy[1] = float(y);
+          m.asShotCct = float(T);
+          m.illuminantSource = "dng-whitexy";
+          haveDual = true;
+        }
+      } else if (ok && solveIlluminantFromNeutral(cal, 2, ab, neutral, x, y)) {
+        m.asShotIlluminantXy[0] = float(x), m.asShotIlluminantXy[1] = float(y);
+        m.asShotCct = float(std::clamp(xyToCct(x, y), 1500.0, 20000.0));
+        m.illuminantSource = "dng-dual";
+        haveDual = true;
+      }
+    }
+  }
+  if (!haveDual) {  // as-shot illuminant chromaticity: the camera's neutral (1 / multipliers) through the inverse of the XYZ -> camera matrix
     const float(*cx)[3] = d.color.cam_xyz;
     const double a = cx[0][0], b = cx[0][1], cc = cx[0][2], dd = cx[1][0], e = cx[1][1], f = cx[1][2], gg = cx[2][0], h = cx[2][1], k = cx[2][2];
     const double det = a * (e * k - f * h) - b * (dd * k - f * gg) + cc * (dd * h - e * gg);
-    if (std::fabs(det) > 1e-9 && d.color.cam_mul[0] > 0 && d.color.cam_mul[1] > 0 && d.color.cam_mul[2] > 0) {
-      const double n[3] = {1.0 / d.color.cam_mul[0], 1.0 / d.color.cam_mul[1], 1.0 / d.color.cam_mul[2]};
+    if (std::fabs(det) > 1e-9 && camMul[0] > 0 && camMul[1] > 0 && camMul[2] > 0) {
+      const double n[3] = {1.0 / camMul[0], 1.0 / camMul[1], 1.0 / camMul[2]};
       const double inv[9] = {(e * k - f * h) / det, (cc * h - b * k) / det, (b * f - cc * e) / det,
                              (f * gg - dd * k) / det, (a * k - cc * gg) / det, (cc * dd - a * f) / det,
                              (dd * h - e * gg) / det, (b * gg - a * h) / det, (a * e - b * dd) / det};
@@ -117,7 +322,7 @@ ShotMetadata readMetadata(const LibRaw& raw) {
     // effect: -20 .. -39 mired on 14 Sony ARWs against the camera's own Kelvin table). Where the camera records its own Kelvin white-balance
     // table (LibRaw WBCT_Coeffs: Sony) the correlated colour temperature comes from it (the as-shot multipliers projected onto the table in
     // log(R/G), log(B/G) against mired); the matrix estimate only supplies the tint, its offset from the locus at its own temperature.
-    if (m.asShotIlluminantXy[0] > 0.f && d.color.cam_mul[0] > 0 && d.color.cam_mul[1] > 0 && d.color.cam_mul[2] > 0) {
+    if (m.asShotIlluminantXy[0] > 0.f && camMul[0] > 0 && camMul[1] > 0 && camMul[2] > 0) {
       struct Pt { double mired, lr, lb; };
       std::vector<Pt> tab;
       for (int i = 0; i < 64; ++i) {
@@ -125,10 +330,11 @@ ShotMetadata readMetadata(const LibRaw& raw) {
         if (w[0] > 500.f && w[1] > 0.f && w[2] > 0.f && w[3] > 0.f) tab.push_back({1e6 / double(w[0]), std::log(double(w[1]) / double(w[2])), std::log(double(w[3]) / double(w[2]))});
       }
       std::sort(tab.begin(), tab.end(), [](const Pt& a, const Pt& b) { return a.mired < b.mired; });
+      if (std::getenv("DAPPLE_ILL_MATRIX_ONLY")) tab.clear();
       const double xm = m.asShotIlluminantXy[0], ym = m.asShotIlluminantXy[1], Tm = dapple::xyToCct(xm, ym);
       double Tc = Tm;
       if (tab.size() >= 2) {
-        const double ql = std::log(double(d.color.cam_mul[0]) / double(d.color.cam_mul[1])), qb = std::log(double(d.color.cam_mul[2]) / double(d.color.cam_mul[1]));
+        const double ql = std::log(double(camMul[0]) / double(camMul[1])), qb = std::log(double(camMul[2]) / double(camMul[1]));
         double bestErr = 1e30, bestMired = 1e6 / Tm;
         for (std::size_t i = 0; i + 1 < tab.size(); ++i) {
           const double dl = tab[i + 1].lr - tab[i].lr, db = tab[i + 1].lb - tab[i].lb, den = dl * dl + db * db;
@@ -145,10 +351,20 @@ ShotMetadata readMetadata(const LibRaw& raw) {
         m.asShotIlluminantXy[1] = float(ly + (ym - my));
       }
       m.asShotCct = float(Tc);
+      m.illuminantSource = tab.size() >= 2 ? "wbct" : "matrix";
     }
   }
 
   if (m.make == "Sony") m.rawFormat = sonyRawFormat(d.makernotes.sony);
+  if (m.make == "Fujifilm" && (d.makernotes.fuji.DevelopmentDynamicRange > 0 || d.makernotes.fuji.DynamicRange > 0)) {  // DR modes expose the RAW lower on purpose
+    char b[96];
+    std::snprintf(b, sizeof b, "DR%u, exposure mid-point shift %+.1f", unsigned(d.makernotes.fuji.DevelopmentDynamicRange ? d.makernotes.fuji.DevelopmentDynamicRange : d.makernotes.fuji.DynamicRange), d.makernotes.fuji.ExpoMidPointShift);
+    m.rawFormat = b;
+  }
+  if (d.idata.raw_count > 1) {  // pixel-shift / multi-shot files: LibRaw decodes the first frame only, say so
+    if (!m.rawFormat.empty()) m.rawFormat += ", ";
+    m.rawFormat += "multi-shot file (" + std::to_string(d.idata.raw_count) + " frames), frame 1 decoded, no composite";
+  }
   if (m.make == "Fujifilm") m.inCameraLook = fujiFilmSimulation(d.makernotes.fuji.FilmMode);
   return m;
 }
@@ -224,7 +440,8 @@ class LibRawDecoder final : public ImageDecoder {
     auto raw = std::make_unique<LibRaw>();
     if (int rc = raw->open_datastream(&stream); rc != LIBRAW_SUCCESS)
       return fail("LibRaw open failed: " + std::string(libraw_strerror(rc)));
-    return readMetadata(*raw);
+    double wxy[2] = {0, 0};
+    return readMetadata(*raw, readDngWhiteXy(path, wxy) ? wxy : nullptr);
   }
 
   Result<SourceImage> decode(const std::filesystem::path& path, const DecodeOptions& options) const override {
@@ -248,13 +465,58 @@ class LibRawDecoder final : public ImageDecoder {
       return fail("LibRaw open failed: " + std::string(libraw_strerror(rc)));
     if (int rc = raw->unpack(); rc != LIBRAW_SUCCESS)
       return fail("LibRaw unpack failed: " + std::string(libraw_strerror(rc)));
-    const ShotMetadata meta = readMetadata(*raw);  // before processing alters sizes/filters
+    double wxy[2] = {0, 0};
+    ShotMetadata meta = readMetadata(*raw, readDngWhiteXy(path, wxy) ? wxy : nullptr);  // before processing alters sizes/filters
+    if (meta.illuminantSource == "dng-whitexy")  // the file has no AsShotNeutral: use the multipliers of its white point
+      for (int c = 0; c < 3; ++c) raw->imgdata.params.user_mul[c] = meta.asShotWb[c];
+    raw->imgdata.params.user_mul[3] = meta.illuminantSource == "dng-whitexy" ? meta.asShotWb[1] : 0.f;
+    // DNG opcode lists (phone DNGs): LibRaw does not apply them. OpcodeList2 (GainMap lens shading, FixVignetteRadial) acts on the
+    // mosaic here, before LibRaw demosaics; OpcodeList3 (WarpRectilinear, ...) and the default crop act on the demosaiced image below.
+    dng::OpcodeList l3;
+    dng::ApplyReport corr;
+    int cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+    bool cropIt = false, geom = false;
+    const int fileFlip = raw->imgdata.sizes.flip;
+    if (raw->imgdata.idata.dng_version != 0 && dngOpcodesEnabled()) {
+      try {
+        const dng::OpcodeList l1 = dngList(*raw, 0), l2 = dngList(*raw, 1);
+        l3 = dngList(*raw, 2);
+        for (const dng::OpcodeList* l : {&l1, &l2, (const dng::OpcodeList*)&l3})
+          if (!l->error.empty()) corr.skipped.push_back("malformed list (" + l->error + ")");
+        if (!l1.ops.empty()) corr.skipped.push_back("OpcodeList1 (" + std::to_string(l1.ops.size()) + " ops, pre-linearisation, not applied)");
+        const auto& S = raw->imgdata.sizes;
+        if (!l2.ops.empty()) {
+          if (raw->imgdata.rawdata.raw_image && raw->imgdata.idata.filters != 0 && S.width > 0 && S.height > 0) {
+            dng::MosaicView v;
+            v.px = raw->imgdata.rawdata.raw_image;
+            v.pitch = std::size_t(S.raw_pitch) / sizeof(std::uint16_t);
+            v.top = S.top_margin, v.left = S.left_margin, v.width = S.width, v.height = S.height;
+            fillBlackPattern(*raw, v);
+            dng::applyMosaic(l2, v, corr);
+          } else {
+            if (!dng::isIdentityGainList(l2)) corr.skipped.push_back("OpcodeList2 (no 16-bit mosaic)");  // Samsung LinearRaw: identity maps only
+          }
+        }
+        cropIt = dngDefaultCrop(*raw, cropX, cropY, cropW, cropH);
+        geom = !l3.ops.empty() || cropIt;
+        if (geom) raw->imgdata.params.user_flip = 0;  // geometry runs in sensor orientation; rotated afterwards
+      } catch (...) {
+        l3 = {};
+        cropIt = geom = false;
+        raw->imgdata.params.user_flip = -1;
+        corr.skipped.push_back("exception");
+      }
+    }
     // Linear DNGs written by Dapple's HDR/panorama merge store value / headroom and record
     // BaselineExposure = log2(headroom); undo it so merged values above 1.0 survive a round trip.
     float dappleGain = 1.f;
     if (std::strcmp(raw->imgdata.color.UniqueCameraModel, "Dapple Linear Merge") == 0 &&
         raw->imgdata.color.dng_levels.baseline_exposure > -50.f && raw->imgdata.color.dng_levels.baseline_exposure < 16.f)
       dappleGain = std::exp2(raw->imgdata.color.dng_levels.baseline_exposure);
+    const float dngBaselineEv = raw->imgdata.idata.dng_version != 0 && raw->imgdata.color.dng_levels.baseline_exposure > -50.f &&
+                                        raw->imgdata.color.dng_levels.baseline_exposure < 16.f
+                                    ? raw->imgdata.color.dng_levels.baseline_exposure + (std::isfinite(dngBaselineOffsetEv(path)) ? dngBaselineOffsetEv(path) : 0.f)
+                                    : std::numeric_limits<float>::quiet_NaN();
     if (int rc = raw->dcraw_process(); rc != LIBRAW_SUCCESS)
       return fail("LibRaw processing failed: " + std::string(libraw_strerror(rc)));
 
@@ -264,7 +526,7 @@ class LibRawDecoder final : public ImageDecoder {
       return fail("LibRaw image export failed: " + std::string(libraw_strerror(rc)));
     std::unique_ptr<libraw_processed_image_t, void (*)(libraw_processed_image_t*)> guard(
         mem, [](libraw_processed_image_t* p) { LibRaw::dcraw_clear_mem(p); });
-    if (mem->type != LIBRAW_IMAGE_BITMAP || mem->colors != 3 || mem->bits != 16)
+    if (mem->type != LIBRAW_IMAGE_BITMAP || (mem->colors != 3 && mem->colors != 1) || mem->bits != 16)  // 1 = monochrome sensor (Leica M Monochrom, Pentax K-3 III Monochrome)
       return fail("Unexpected LibRaw output layout");
 
     // Free LibRaw's own image buffers before allocating the float copy.
@@ -276,13 +538,44 @@ class LibRawDecoder final : public ImageDecoder {
     out.linear = ImageF(mem->width, mem->height);
     const auto* src = reinterpret_cast<const std::uint16_t*>(mem->data);
     const int w = mem->width;
+    const bool mono = mem->colors == 1;
     const float kScale = dappleGain / 65535.f;
     parallelRows(mem->height, [&](int y) {
-      const std::uint16_t* s = src + std::size_t(y) * w * 3;
       float* d = out.linear.row(y);
+      if (mono) {
+        const std::uint16_t* s = src + std::size_t(y) * w;
+        for (int i = 0; i < w; ++i) d[3 * i] = d[3 * i + 1] = d[3 * i + 2] = s[i] * kScale;
+        return;
+      }
+      const std::uint16_t* s = src + std::size_t(y) * w * 3;
       for (int i = 0; i < w * 3; ++i) d[i] = s[i] * kScale;
     });
     guard.reset();  // release the 16-bit copy
+    if (geom) {
+      try {
+        dng::applyImage(l3, out.linear, corr);
+        if (cropIt) {
+          const int k = options.quality == DecodeQuality::Preview ? 2 : 1;
+          out.linear = dng::cropImage(out.linear, cropX / k, cropY / k, cropW / k, cropH / k);
+          corr.applied.push_back("DefaultCrop");
+        }
+      } catch (...) {
+        corr.skipped.push_back("exception in geometry");
+      }
+      out.linear = rotateFlip(out.linear, fileFlip);
+    }
+    out.meta.dngCorrections = corr.summary();
+    if (dappleGain == 1.f && anchorEnabled()) {  // camera RAW (not a Dapple linear merge): the file's own exposure anchor
+      const ExposureAnchor an = computeExposureAnchor(path, out.linear, dngBaselineEv);
+      out.meta.exposureAnchorTier = an.tier;
+      out.meta.exposureAnchorEv = an.ev;
+      out.meta.exposureAnchorConfidence = an.confidence;
+      out.meta.exposureAnchorNote = an.note;
+      out.meta.exposureAnchorPreviewEv = an.previewEv;
+      out.meta.exposureAnchorStatsEv = an.statsEv;
+      out.meta.exposureAnchorHasDng = std::isfinite(dngBaselineEv);
+      out.meta.exposureAnchorDngEv = std::isfinite(dngBaselineEv) ? dngBaselineEv : 0.f;
+    }
     return out;
   }
 };
@@ -329,6 +622,9 @@ Result<Image8> extractEmbeddedPreview(const std::filesystem::path& rawPath, int 
   // says portrait but the preview is landscape.
   const int flip = raw->imgdata.sizes.flip;
   if ((flip & 4) != 0 && w > h) img = rotate90(img, flip == 6);
+  else if (flip == 3) {  // 180 degrees (DNG Orientation 3, e.g. Pixel 7 Pro): the preview keeps sensor orientation like the others
+    std::reverse(reinterpret_cast<std::array<std::uint8_t, 3>*>(img.data.data()), reinterpret_cast<std::array<std::uint8_t, 3>*>(img.data.data()) + std::size_t(w) * h);
+  }
 
   if (longEdge > 0 && std::max(img.width, img.height) > longEdge) {
     ImageF f(img.width, img.height);

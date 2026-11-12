@@ -269,12 +269,19 @@ class SoftwareMedia(private val ctx: Context) {
      * MediaCodec along the encode ladder ([Ladder.encode]): HEVC Main10 (10-bit 4:2:0, BT.709 SDR or BT.2020 HLG / PQ with HDR
      * metadata) -> HEVC Main 8-bit -> H.264 High 8-bit. Each rung is used only after its one-time self-test passed on this
      * device; a failed self-test, a stalled encoder or a downgraded profile moves on to the next rung. [compat] (the
-     * sharing-compatible version) and [film] (film applied) always take the 8-bit rungs. Audio (Sony LPCM) is transcoded to AAC;
-     * AAC is copied; [mute] drops it. The result carries the chosen path ("codecSummary").
+     * sharing-compatible version) and [film] (the legacy flag: film applied outside the graph) always take the 8-bit rungs. Audio (Sony LPCM)
+     * is transcoded to AAC; AAC is copied; [mute] drops it. The result carries the chosen path ("codecSummary").
+     *
+     * [edit] != null: the clip follows the still's edit. Every decoded frame (half-float linear RGBA, no truncation) goes through the engine's node graph
+     * ([DappleVideoEdit]: film exposure, tone analysis and solves held from the reference frame, grain per frame) and comes out as P010 for a Main10 rung
+     * or I420 for an 8-bit rung; the encoder size is the edit's output size (crop / rotate applied, the container rotation is baked in). [edit] == null is
+     * the pass-through path, unchanged.
      */
-    fun clip(uri: String, dec: SwVideo.DecodeSel, source: Int, startMs: Long, durationMs: Long, dest: String, mute: Boolean, compat: Boolean, film: Boolean = false): Map<String, Any?> {
+    fun clip(uri: String, dec: SwVideo.DecodeSel, source: Int, startMs: Long, durationMs: Long, dest: String, mute: Boolean, compat: Boolean, film: Boolean = false,
+             edit: EditSpec? = null): Map<String, Any?> {
         val tStart = System.nanoTime()
         val s = SwVideo.open(ctx, uri, dec, source)
+        var ed: EditRun? = null
         val destFile = File(dest)
         destFile.parentFile?.mkdirs()
         destFile.delete()
@@ -290,9 +297,15 @@ class SoftwareMedia(private val ctx: Context) {
                 audio = audioCopy(uri, startUs, endUs)
                 if (audio == null) audio = try { audioFromCore(s, startUs, endUs) } catch (e: Exception) { Log.w(TAG, "audio failed: $e"); null }
             }
-            // output size is known after begin()
-            s.begin(startUs, endUs, CLIP_MAX_EDGE, CLIP_MAX_FPS, SwVideo.I420, false)
-            val job = EncodeJob(s.outW, s.outH, outFps, hdrSource = s.info.colorKind == 2 || s.info.colorKind == 3, eightBitOnly = compat || film)
+            // output size is known after begin() (with an edit: after the reference frame went through the graph)
+            if (edit != null) {
+                ed = EditRun.start(s, edit, startUs, endUs)
+                s.begin(startUs, endUs, CLIP_MAX_EDGE, CLIP_MAX_FPS, SwVideo.RGBAF16, false)
+            } else {
+                s.begin(startUs, endUs, CLIP_MAX_EDGE, CLIP_MAX_FPS, SwVideo.I420, false)
+            }
+            val job = EncodeJob(ed?.session?.outW ?: s.outW, ed?.session?.outH ?: s.outH, outFps, surfaceOk = ed != null,
+                hdrSource = if (ed != null) ed.session.hdr else (s.info.colorKind == 2 || s.info.colorKind == 3), eightBitOnly = compat || (film && edit == null))
             val picks = mgr.encodeCandidates(job)
             var result: Map<String, Any?>? = null
             var chosen: EncodePick? = null
@@ -300,7 +313,7 @@ class SoftwareMedia(private val ctx: Context) {
             for (pick in picks) {
                 if (!mgr.verifyEncoder(pick)) { attempts.add("${pick.rung.label} ${pick.codec}: self-test failed"); continue }
                 try {
-                    result = encodeVideo(s, startUs, endUs, outFps, dest, audio, pick)
+                    result = encodeVideo(s, startUs, endUs, outFps, dest, audio, pick, ed)
                     chosen = pick
                     break
                 } catch (e: EncoderUnreliable) {
@@ -318,7 +331,7 @@ class SoftwareMedia(private val ctx: Context) {
                 // nothing on the ladder (the device declares no usable encoder, or all failed): the platform default H.264 encoder as the last resort
                 val last = EncodePick(EncodeRung.AVC_HIGH, "", false, 0)
                 try {
-                    result = encodeVideo(s, startUs, endUs, outFps, dest, audio, last)
+                    result = encodeVideo(s, startUs, endUs, outFps, dest, audio, last, ed)
                     chosen = last
                 } catch (e: Exception) {
                     destFile.delete()
@@ -338,6 +351,7 @@ class SoftwareMedia(private val ctx: Context) {
             full["captureGamma"] = s.info.captureGamma
             full["compat"] = compat
             full["film"] = film
+            full["edited"] = edit != null
             full["rung"] = c.rung.label
             full["encoderHardware"] = if (c.codec.isEmpty()) false else c.hardware
             full["demoted"] = attempts.joinToString("; ")
@@ -357,8 +371,45 @@ class SoftwareMedia(private val ctx: Context) {
             destFile.delete()
             throw e
         } finally {
+            ed?.close()
             s.close()
         }
+    }
+
+    /**
+     * The graph side of an edited clip: the native session (frozen on the reference frame) and the buffer of one decoded frame. [start] decodes the
+     * reference frame (the cover frame of the Motion Photo when [EditSpec.refMs] says so, else the first frame of the window), freezes the session on it
+     * and thereby sizes the encoder input.
+     */
+    class EditRun private constructor(val session: DappleVideoEdit.Session, val kind: Int, val rotation: Int) : AutoCloseable {
+        lateinit var src: ByteBuffer      // one decoded RGBAF16 frame
+        var frameNo = 0
+        companion object {
+            fun start(s: SwVideo.Session, spec: EditSpec, startUs: Long, endUs: Long): EditRun {
+                val sess = DappleVideoEdit.open(spec)
+                try {
+                    val refUs = if (spec.refMs >= 0) (spec.refMs * 1000L).coerceIn(startUs, max(startUs, endUs)) else startUs
+                    s.begin(refUs, refUs, CLIP_MAX_EDGE, 0.0, SwVideo.RGBAF16, false)
+                    val buf = ByteBuffer.allocateDirect(s.bufferSize(SwVideo.RGBAF16)).order(ByteOrder.nativeOrder())
+                    if (s.next(buf) < 0) throw IllegalStateException("no reference frame for the edit")
+                    val run = EditRun(sess, s.info.colorKind, s.info.rotation)
+                    sess.setReference(buf, s.outW, s.outH, run.kind, run.rotation)
+                    run.src = buf
+                    return run
+                } catch (e: Exception) {
+                    sess.close()
+                    throw e
+                }
+            }
+        }
+
+        /** Frame index n >= 1 seeds the grain; the cover frame (the still) is index 0 and is not rendered here. */
+        fun render(decodedW: Int, decodedH: Int, format: Int, dst: ByteBuffer) {
+            frameNo++
+            session.render(src, decodedW, decodedH, kind, rotation, frameNo, format, dst)
+        }
+
+        override fun close() = session.close()
     }
 
     /** The native 10-bit decoder was chosen but the core ended up in software (open or mid-pass): demote it for this OS build. */
@@ -368,18 +419,27 @@ class SoftwareMedia(private val ctx: Context) {
         }
     }
 
-    private fun encodeVideo(s: SwVideo.Session, startUs: Long, endUs: Long, outFps: Int, dest: String, audio: AudioClip?, pick: EncodePick): Map<String, Any?> {
+    private fun encodeVideo(s: SwVideo.Session, startUs: Long, endUs: Long, outFps: Int, dest: String, audio: AudioClip?, pick: EncodePick, ed: EditRun? = null): Map<String, Any?> {
         val tenBit = pick.rung.tenBit
         val format = if (tenBit) SwVideo.P010 else SwVideo.I420
-        s.begin(startUs, endUs, CLIP_MAX_EDGE, CLIP_MAX_FPS, format, false)
-        val w = s.outW
-        val h = s.outH
-        val tags = s.tags()
-        val hdrInfo = if (tenBit) s.hdrStaticInfo() else null
+        // an edited clip is decoded to half-float RGBA and packed by the graph session (BT.709 SDR: the film and the edit's tone are display referred)
+        s.begin(startUs, endUs, CLIP_MAX_EDGE, CLIP_MAX_FPS, if (ed != null) SwVideo.RGBAF16 else format, false)
+        val decW = s.outW
+        val decH = s.outH
+        val w = ed?.session?.outW ?: decW
+        val h = ed?.session?.outH ?: decH
+        // an edited clip carries what the session decided (section 30.8): BT.709 SDR, or HLG / PQ on BT.2020 for an HDR source edited without film
+        val tags = if (ed != null) (if (tenBit) ed.session.tags else intArrayOf(1, 1, 1, 1)) else s.tags()
+        val hdrOut = ed != null && tenBit && ed.session.hdr
+        val hdrInfo = if (tenBit && (ed == null || hdrOut)) s.hdrStaticInfo() else null
         val mime = pick.rung.mime
+        // input Surface (docs/engine/pipeline-architecture.md section 30.9): the edited frame is packed as RGB10A2 and drawn into the encoder's surface through EGL
+        val surfaceMode = pick.input == InputMode.SURFACE && ed != null && tenBit
+        val editFormat = if (surfaceMode) (if (hdrOut) EditFormat.RGB10A2_HDR else EditFormat.RGB10A2) else EditFormat.forEncoder(tenBit, hdrOut)
+        var feeder: SurfaceFeeder? = null
         val bitrate = (w.toLong() * h * outFps * (if (tenBit) 0.085 else 0.1)).toLong().coerceIn(3_000_000L, 20_000_000L).toInt()
         val fmt = MediaFormat.createVideoFormat(mime, w, h).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, if (tenBit) COLOR_FormatYUVP010 else MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, if (surfaceMode) ColorFmt.SURFACE else if (tenBit) COLOR_FormatYUVP010 else MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, outFps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
@@ -394,12 +454,19 @@ class SoftwareMedia(private val ctx: Context) {
         var muxerStarted = false
         try {
             enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            val inSurface = if (surfaceMode) enc.createInputSurface() else null
             enc.start()
+            if (inSurface != null) {
+                feeder = SurfaceFeeder(inSurface, w, h, wantTenBit = true)
+                if (feeder.bits != 10) throw EncoderUnreliable("input surface: no 10-bit EGL surface (${feeder.configDescription})")
+            }
             File(dest).delete()
             muxer = MediaMuxer(dest, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            muxer.setOrientationHint(s.info.rotation)
+            muxer.setOrientationHint(if (ed != null) 0 else s.info.rotation)  // the graph session rotates edited frames upright
 
-            val frame = ByteBuffer.allocateDirect(s.bufferSize(format)).order(ByteOrder.nativeOrder())
+            val frame = ByteBuffer.allocateDirect(if (ed != null) ed.session.frameBytes(editFormat) else s.bufferSize(format)).order(ByteOrder.nativeOrder())
+            val srcF16 = ed?.src ?: frame
+            ed?.frameNo = 0
             val row = ByteArray(w * 2)
             val info = MediaCodec.BufferInfo()
             val wd = StallWatchdog()
@@ -452,10 +519,27 @@ class SoftwareMedia(private val ctx: Context) {
                 if (outDone) break
                 if (!eosQueued) {
                     if (pendingPts < 0 && !sourceDone) {
-                        val t = s.next(frame)
-                        if (t < 0) sourceDone = true else pendingPts = t
+                        val t = s.next(srcF16)
+                        if (t < 0) sourceDone = true else {
+                            pendingPts = t
+                            ed?.render(decW, decH, editFormat, frame)
+                        }
                     }
-                    val ii = enc.dequeueInputBuffer(if (drained) 0 else 5_000)
+                    if (feeder != null) {
+                        if (pendingPts >= 0) {
+                            var rel = max(0L, pendingPts - startUs)
+                            if (rel <= lastRelUs) rel = lastRelUs + 1
+                            lastRelUs = rel
+                            feeder.draw(frame, rel * 1000L)
+                            wd.onQueued()
+                            pendingPts = -1
+                        } else if (sourceDone) {
+                            enc.signalEndOfInputStream()
+                            eosQueued = true
+                            wd.onEos()
+                        }
+                    }
+                    val ii = if (feeder != null) -1 else enc.dequeueInputBuffer(if (drained) 0 else 5_000)
                     if (ii >= 0) {
                         if (pendingPts >= 0) {
                             val n = CodecInput.fill(enc, ii, frame, w, h, tenBit, row)
@@ -490,6 +574,7 @@ class SoftwareMedia(private val ctx: Context) {
                 "videoProfile" to (if (outProfile >= 0) CodecCatalog.profileName(mime, outProfile) else if (tenBit) "Main10" else if (mime == MediaFormat.MIMETYPE_VIDEO_HEVC) "Main" else "High"),
                 "bitDepth" to (if (tenBit) 10 else 8),
                 "encoder" to enc.name,
+                "inputMode" to (if (surfaceMode) "surface" else "buffer"),
                 "colorStandard" to standardOf(tags[2]),
                 "colorTransfer" to transferOf(tags[1]),
                 "hdrStaticInfo" to (hdrInfo != null),
@@ -499,6 +584,7 @@ class SoftwareMedia(private val ctx: Context) {
                 "encodedFormat" to (of?.toString() ?: ""),
             )
         } finally {
+            try { feeder?.close() } catch (_: Exception) {}
             try { enc.stop() } catch (_: Exception) {}
             try { enc.release() } catch (_: Exception) {}
             try { muxer?.release() } catch (_: Exception) {}

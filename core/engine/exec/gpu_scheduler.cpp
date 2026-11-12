@@ -364,12 +364,15 @@ Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err) {
     }
     switch (n.kind) {
       case GpuGraph::Node::Dispatch: {
-        cl.bindPipeline(n.pl);
-        for (std::size_t i = 0; i < n.uses.size(); ++i) {
-          const auto& r = res[std::size_t(n.uses[i].res)];
-          if (r.hasImg) cl.bind(std::uint32_t(i), r.img);
-          else cl.bind(std::uint32_t(i), r.buf);
-        }
+        auto bindNode = [&] {
+          cl.bindPipeline(n.pl);
+          for (std::size_t i = 0; i < n.uses.size(); ++i) {
+            const auto& r = res[std::size_t(n.uses[i].res)];
+            if (r.hasImg) cl.bind(std::uint32_t(i), r.img);
+            else cl.bind(std::uint32_t(i), r.buf);
+          }
+        };
+        bindNode();
         Status s = cl.setParams(n.params.data(), n.params.size());
         if (s == Status::Ok) s = cl.dispatch(n.gx, n.gy, n.gz);
         if (prof) {
@@ -380,6 +383,15 @@ Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err) {
             cl.barrier(hal::kAll);
             s = cl.setParams(n.params.data(), n.params.size());
             if (s == Status::Ok) s = cl.dispatch(n.gx, n.gy, n.gz);
+            // the repeats count towards the submission splitter too (wave 8: REPEAT=20 was one 5 s submission that lost the Pixel 5's device)
+            workSince += double(n.gx) * n.gy * n.gz * n.weight;
+            if (s == Status::Ok && workSince >= split) {
+              s = cl.flushPart();
+              dirty.clear();
+              readSince.clear();
+              workSince = 0;
+              if (s == Status::Ok) bindNode();
+            }
           }
         }
         if (s != Status::Ok) return err = dev.lastError().empty() ? std::string("dispatch of ") + n.name + " failed" : dev.lastError(), s;

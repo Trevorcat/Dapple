@@ -1,97 +1,9 @@
-// Painters shared by the editor overlays: histogram, palette backdrop, curve chart.
+// The curve chart of the 曲线 editor (docs/design/editor-panel.md section 5).
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
 import '../../services/editor_engine.dart';
-
-// ------------------------------------------------------------------ histogram
-
-class HistPainter extends CustomPainter {
-  HistPainter(this.a, this.fill, this.line, this.zoneA, this.accent, {this.zones = true});
-  final Analysis a;
-  final Color fill, line, zoneA, accent;
-  final bool zones;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final w = size.width, h = size.height;
-    if (zones) {
-      final bw = w / 11;
-      for (var i = 0; i < 11; i += 2) {
-        canvas.drawRect(Rect.fromLTWH(i * bw, 0, bw, h), Paint()..color = zoneA);
-      }
-    }
-    final hist = a.hist;
-    final mx = hist.fold<double>(0, math.max);
-    if (mx > 0) {
-      final pts = [
-        for (var i = 0; i < hist.length; i++) Offset(i / (hist.length - 1) * w, h - hist[i] / mx * h * 0.92 - 1)
-      ];
-      final top = Path()..moveTo(pts.first.dx, pts.first.dy);
-      for (var i = 1; i < pts.length - 1; i++) {
-        final m = (pts[i] + pts[i + 1]) / 2;
-        top.quadraticBezierTo(pts[i].dx, pts[i].dy, m.dx, m.dy);
-      }
-      top.lineTo(pts.last.dx, pts.last.dy);
-      final area = Path.from(top)
-        ..lineTo(w, h)
-        ..lineTo(0, h)
-        ..close();
-      canvas.drawPath(area, Paint()..color = fill);
-      canvas.drawPath(
-          top,
-          Paint()
-            ..color = line
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = 1.5
-            ..strokeJoin = StrokeJoin.round);
-    }
-    if (zones) {
-      final p = Paint()
-        ..color = accent
-        ..strokeWidth = 1.5;
-      for (final q in [a.p5, a.p50, a.p95]) {
-        final x = (q * w).clamp(0.75, math.max(0.75, w - 0.75)).toDouble();
-        for (double y = 0; y < h; y += 6) {
-          canvas.drawLine(Offset(x, y), Offset(x, math.min(y + 3, h)), p);
-        }
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(HistPainter o) => o.a != a || o.fill != fill;
-}
-
-// ------------------------------------------------------------------ palette backdrop
-
-class PaletteBackdropPainter extends CustomPainter {
-  PaletteBackdropPainter(this.top, this.mid, this.bot, this.dot, this.gray);
-  final Color top, mid, bot, dot, gray;
-  @override
-  void paint(Canvas canvas, Size s) {
-    final r = Offset.zero & s;
-    canvas.drawRect(
-        r,
-        Paint()
-          ..shader = LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [top, mid, bot])
-              .createShader(r));
-    canvas.drawRect(
-        r,
-        Paint()
-          ..shader = LinearGradient(colors: [gray, gray.withValues(alpha: 0)]).createShader(r));
-    final p = Paint()..color = dot;
-    for (double y = s.height / 16; y < s.height; y += s.height / 8) {
-      for (double x = s.width / 16; x < s.width; x += s.width / 8) {
-        canvas.drawCircle(Offset(x, y), 1.5, p);
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(PaletteBackdropPainter o) => o.top != top || o.dot != dot;
-}
 
 // ------------------------------------------------------------------ curve chart
 

@@ -123,8 +123,18 @@ class _CodecDiagnosticsPageState extends State<CodecDiagnosticsPage> {
       b.writeln('        ${t['detail']}');
     }
     b.writeln();
+    // always present: one row per HEVC encoder, state = not declared / declared, not tested yet / passed / failed, with the reason
+    b.writeln('HEVC Main10 encode');
+    final m10 = (r['main10Encode'] as List? ?? const []);
+    if (m10.isEmpty) b.writeln('  -');
+    for (final t in m10) {
+      b.writeln('  ${t['state']}  ${t['codec']}  ${t['hardware'] == true ? 'hw' : 'sw'}');
+      b.writeln('        ${t['reason']}');
+    }
+    b.writeln();
     for (final k in const [
       'encodeLadder1080p30',
+      'encodeLadder1080p30Edited',
       'encodeLadder1080p30Hdr',
       'encodeLadder8Bit',
       'decodeLadderHevc10',

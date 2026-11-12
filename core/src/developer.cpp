@@ -34,7 +34,8 @@ Result<DevelopResult> Developer::develop(const DevelopRequest& req) const {
   if (req.longEdge > 0) source->linear = resizeToLongEdge(source->linear, req.longEdge);
 
   result.meta = source->meta;
-  result.camera = &cameras_.resolve(source->meta.make, source->meta.model);
+  result.cameraStore = std::make_shared<const CameraProfile>(effectiveCamera(cameras_, source->meta));
+  result.camera = result.cameraStore.get();
 
   result.applied = req.look;
   if (req.autoAdjust) {

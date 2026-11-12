@@ -29,7 +29,7 @@ void main() {
     expect(w['look'], 'std');
     expect(w['toneTarget'], 'low-long');
     expect(w['toneStrength'], 60);
-    expect(w['palette'], {'x': 0.6, 'y': 0.3});
+    expect(w.containsKey('palette'), isFalse, reason: 'the palette moved into the colour pad (docs/design/editor-panel.md)');
   });
 
   test('sync merges, paste replaces, copy drops crop', () {

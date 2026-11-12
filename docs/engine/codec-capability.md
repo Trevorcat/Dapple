@@ -73,3 +73,11 @@ There are no user-facing switches.
   emulator has no Main10 decoder: NV12 output exercises Annex B conversion, csd, output layout, pts, flush/seek, EOS, release),
   the 10-bit request falling back to software with identical pixels, the 10-bit asset (628 distinct luma levels in a row).
 * Flutter: diagnostics page and the long-press route, clip summary, swatches.
+
+## 6. Edited clips (Motion Photo follows the still's edit)
+
+An edited clip (`SoftwareMedia.clip(edit = EditSpec)`) changes what feeds the encoder, not how the ladder is chosen: the decoder is picked as before (hardware first, software fallback), but frames are requested as `RGBAF16` (half-float linear, no truncation) and go through the engine's node graph (`VideoFrameSession`, pipeline-architecture.md section 30); the session packs **P010** for a Main10 rung and **I420** for the 8-bit rungs, at the edit's output size (crop / rotate applied, container rotation baked in, `setOrientationHint(0)`). The encoder is tagged BT.709 / SDR with no HDR static info (an edited clip is display referred). `compat` still forces the 8-bit rungs; the legacy `film` flag only forces them when no `edit` is given. Without `edit` nothing changes. The graph runs on the CPU executor for P010 (the GPU executor writes 8-bit only).
+
+## 7. Declared profile is the candidate, the self-test decides (wave 8)
+
+A hardware 10-bit decoder / Main10 encoder is a candidate when it declares the profile (Main10 or Main10HDR10); P010 in its colour list only ranks it first. The one-time self-test asks for P010 and judges what the codec really delivers (`Decode10.verdict`: P010 and more than 256 distinct luma levels, otherwise the failure names the delivered format). The diagnostics report always carries `main10Encode`: one row per HEVC encoder with `not declared` / `declared, not tested yet` / `passed` / `failed` and the reason. Surface-input encode is not implemented. See pipeline-architecture.md section 30.7.

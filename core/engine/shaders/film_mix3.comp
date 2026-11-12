@@ -64,6 +64,7 @@ vec3 scaledBy(vec3 w, vec3 a) {
 }
 
 int reflectIdx(int i, int n) {
+  if (i >= 0 && i < n) return i;  // the common case without the integer division below
   if (n == 1) return 0;
   const int period = 2 * n;
   // floor modulo without the GLSL '%' on negative operands (undefined in the specification)
@@ -75,19 +76,22 @@ int reflectIdx(int i, int n) {
 #if MODE == 2 || MODE == 3
 vec3 upsampled(ivec2 p) {
   // levelCombine up path: even / odd output column and row use the two Catmull-Rom phases (t = 0.75 / 0.25)
+  // (wave 8: weights picked once as vec4 by parity and the four column indices hoisted out of the row loop: no dynamically indexed arrays)
   const ivec2 lsz = u.sz.xy;
-  const float wE[4] = float[4](-0.0234375, 0.2265625, 0.8671875, -0.0703125);
-  const float wO[4] = float[4](-0.0703125, 0.8671875, 0.2265625, -0.0234375);
+  const vec4 wE = vec4(-0.0234375, 0.2265625, 0.8671875, -0.0703125);
+  const vec4 wO = vec4(-0.0703125, 0.8671875, 0.2265625, -0.0234375);
+  const bool ox = (p.x & 1) != 0, oy = (p.y & 1) != 0;
+  const vec4 wx = ox ? wO : wE, wy = oy ? wO : wE;
   const int jy = p.y >> 1, ix = p.x >> 1;
-  const int byy = (p.y & 1) != 0 ? jy - 1 : jy - 2;
-  const int bxx = (p.x & 1) != 0 ? ix - 1 : ix - 2;
+  const int byy = oy ? jy - 1 : jy - 2;
+  const int bxx = ox ? ix - 1 : ix - 2;
+  const int c0 = reflectIdx(bxx, lsz.x), c1 = reflectIdx(bxx + 1, lsz.x), c2 = reflectIdx(bxx + 2, lsz.x), c3 = reflectIdx(bxx + 3, lsz.x);
   vec3 acc = vec3(0.0);
   for (int t = 0; t < 4; ++t) {
     const int row = reflectIdx(byy + t, lsz.y);
-    vec3 rowAcc = vec3(0.0);
-    for (int k = 0; k < 4; ++k)
-      rowAcc += ((p.x & 1) != 0 ? wO[k] : wE[k]) * texelFetch(uB, ivec2(reflectIdx(bxx + k, lsz.x), row), 0).rgb;
-    acc += ((p.y & 1) != 0 ? wO[t] : wE[t]) * rowAcc;
+    const vec3 rowAcc = wx.x * texelFetch(uB, ivec2(c0, row), 0).rgb + wx.y * texelFetch(uB, ivec2(c1, row), 0).rgb +
+                        wx.z * texelFetch(uB, ivec2(c2, row), 0).rgb + wx.w * texelFetch(uB, ivec2(c3, row), 0).rgb;
+    acc += wy[t] * rowAcc;
   }
   return acc;
 }
@@ -119,7 +123,8 @@ void main() {
       for (int j = 0; j < NJ; ++j) {
         const int tb = u.dim.w + j * 20;
         vec3 a = tv[tb].rgb * fetchT(j, p).rgb;
-        for (int k = 1; k <= r; ++k) {
+        const int rj = int(tv[tb].w);  // this slot's own radius (host written): a narrow slot does not loop to the widest one's radius
+        for (int k = 1; k <= rj; ++k) {
           int ya = p.y - k, yb = p.y + k;
           if (ya < 0 || ya >= h) ya = reflectIdx(ya, h);
           if (yb < 0 || yb >= h) yb = reflectIdx(yb, h);
@@ -166,16 +171,23 @@ void main() {
 #elif MODE == 1
   const int r = u.dim.z, w = u.dim.x;
   const vec3 c0 = texelFetch(uA, p, 0).rgb;
-  vec3 acc[4];
-  for (int j = 0; j < NJ; ++j) acc[j] = tv[u.dim.w + j * 20].rgb * c0;
+  // explicit accumulators (no dynamically indexed array: spills on the mid-range Adreno), taps read once per k
+  const int tb = u.dim.w;
+  vec3 a0 = tv[tb].rgb * c0, a1 = vec3(0.0), a2 = vec3(0.0), a3 = vec3(0.0);
+  if (NJ > 1) a1 = tv[tb + 20].rgb * c0;
+  if (NJ > 2) a2 = tv[tb + 40].rgb * c0;
+  if (NJ > 3) a3 = tv[tb + 60].rgb * c0;
   for (int k = 1; k <= r; ++k) {
     const vec3 s = texelFetch(uA, ivec2(reflectIdx(p.x - k, w), p.y), 0).rgb + texelFetch(uA, ivec2(reflectIdx(p.x + k, w), p.y), 0).rgb;
-    for (int j = 0; j < NJ; ++j) acc[j] += tv[u.dim.w + j * 20 + k].rgb * s;
+    a0 += tv[tb + k].rgb * s;
+    if (NJ > 1) a1 += tv[tb + 20 + k].rgb * s;
+    if (NJ > 2) a2 += tv[tb + 40 + k].rgb * s;
+    if (NJ > 3) a3 += tv[tb + 60 + k].rgb * s;
   }
-  imageStore(uT0, p, h16v(vec4(acc[0], 1.0)));
-  if (NJ > 1) imageStore(uT1, p, h16v(vec4(acc[1], 1.0)));
-  if (NJ > 2) imageStore(uT2, p, h16v(vec4(acc[2], 1.0)));
-  if (NJ > 3) imageStore(uT3, p, h16v(vec4(acc[3], 1.0)));
+  imageStore(uT0, p, h16v(vec4(a0, 1.0)));
+  if (NJ > 1) imageStore(uT1, p, h16v(vec4(a1, 1.0)));
+  if (NJ > 2) imageStore(uT2, p, h16v(vec4(a2, 1.0)));
+  if (NJ > 3) imageStore(uT3, p, h16v(vec4(a3, 1.0)));
 #else
   vec3 v = scaledBy(u.w0.rgb, texelFetch(uA, p, 0).rgb);
   if (HAS_UP) v += upsampled(p);

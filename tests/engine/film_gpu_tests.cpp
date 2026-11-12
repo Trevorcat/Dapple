@@ -451,6 +451,16 @@ void testMixture(GpuCtx& G) {
 }
 
 // Steady-state timings of the film frame on this GPU: per-pass GPU time (timestamps) and wall time of submit + wait.
+// DAPPLE_BENCH_SIZE=WxH: the 'sweep env' bench case (size sweep, wave 8)
+int benchEnvW() {
+  const char* e = std::getenv("DAPPLE_BENCH_SIZE");
+  return e ? std::atoi(e) : 640;
+}
+int benchEnvH() {
+  const char* e = std::getenv("DAPPLE_BENCH_SIZE");
+  const char* x = e ? std::strchr(e, 'x') : nullptr;
+  return x ? std::atoi(x + 1) : 480;
+}
 void testBench(GpuCtx& G) {
   struct B {
     const char* name;
@@ -465,6 +475,12 @@ void testBench(GpuCtx& G) {
                   {"1600 px, interactive tier", "kodak_portra_400", 1600, 1067, 1, false},
                   {"1600 px, interactive, grain drag", "kodak_portra_400", 1600, 1067, 1, true},
                   {"1080 px, interactive tier", "kodak_portra_400", 1080, 720, 1, false},
+                  {"sweep 1200x800, interactive", "kodak_portra_400", 1200, 800, 1, false},
+                  {"sweep 1300x867, interactive", "kodak_portra_400", 1300, 867, 1, false},
+                  {"sweep 1400x933, interactive", "kodak_portra_400", 1400, 933, 1, false},
+                  {"sweep 1500x1000, interactive", "kodak_portra_400", 1500, 1000, 1, false},
+                  {"sweep 600x800, interactive", "kodak_portra_400", 600, 800, 1, false},
+                  {"sweep env, interactive", "kodak_portra_400", benchEnvW(), benchEnvH(), 1, false},
                   {"810x1080 (app), interactive tier", "kodak_portra_400", 810, 1080, 1, false},
                   {"810x1080 (app), final tier", "kodak_portra_400", 810, 1080, 2, false},
                   {"3600 px (8.6 MP), final tier", "kodak_portra_400", 3600, 2400, 2, false}};

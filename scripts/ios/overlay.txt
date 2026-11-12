@@ -1,0 +1,19 @@
+# files of the iOS port that are overlaid on the HEAD snapshot (globs ok)
+scripts/ios/*
+docs/ios/*
+core/engine/hal/metal/*
+tools/shaderc/*
+core/engine/hal/hal.cpp
+core/engine/hal/select.cpp
+core/gpu/CMakeLists.txt
+cmake/apple_framework.cmake
+cmake/apple_framework_info.plist.in
+app/native_ios
+app/lib/platform
+app/lib/main.dart
+app/lib/native/dapple_bindings.dart
+app/ios/Runner/Info.plist
+app/ios/Runner/AppDelegate.swift
+app/ios/Runner.xcodeproj/project.pbxproj
+app/ios/Flutter/Debug.xcconfig
+app/ios/Flutter/Release.xcconfig

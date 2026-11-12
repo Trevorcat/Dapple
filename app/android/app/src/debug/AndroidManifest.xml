@@ -4,4 +4,8 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Debug builds only: runs the clip export without the UI (DebugClipReceiver.kt). -->
+    <application>
+        <receiver android:name="com.dapple.dapple.DebugClipReceiver" android:exported="true"/>
+    </application>
 </manifest>

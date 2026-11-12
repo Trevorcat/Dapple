@@ -41,6 +41,9 @@ dependencies:
   path_provider: ^2.1.6
   path: ^1.9.1
   permission_handler: 12.0.1
+  # iOS: the C++ engine as dapple.xcframework (docs/ios/README.md); other platforms ignore it
+  dapple_engine:
+    path: native_ios/dapple_engine
 
 dev_dependencies:
   flutter_test:
@@ -68,6 +71,7 @@ flutter:
   # Volpato) and its notices. test/film_assets_test.dart keeps the copies identical to core/data/film.
   assets:
     - assets/film/dapple.dfp
+    - assets/film/film_map.json
     - assets/film/NOTICE.md
     - assets/film/SPEKTRAFILM_LICENSE.txt
 

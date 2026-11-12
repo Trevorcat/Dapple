@@ -1,0 +1,122 @@
+{
+  "fujifilm_c200": {
+    "x": 0.633,
+    "y": 0.732,
+    "type": "neg",
+    "code": "N200A"
+  },
+  "kodak_gold_200": {
+    "x": 0.025,
+    "y": -0.009,
+    "type": "neg",
+    "code": "N200B"
+  },
+  "kodak_verita_200d": {
+    "x": -0.402,
+    "y": -0.917,
+    "type": "neg",
+    "code": "N200C"
+  },
+  "kodak_ektar_100": {
+    "x": 0.172,
+    "y": 0.066,
+    "type": "neg",
+    "code": "N100"
+  },
+  "kodak_portra_160": {
+    "x": -0.227,
+    "y": 0.021,
+    "type": "neg",
+    "code": "N160"
+  },
+  "fujifilm_pro_400h": {
+    "x": 0.063,
+    "y": 0.203,
+    "type": "neg",
+    "code": "N400A"
+  },
+  "fujifilm_xtra_400": {
+    "x": 0.842,
+    "y": 0.939,
+    "type": "neg",
+    "code": "N400B"
+  },
+  "kodak_portra_400": {
+    "x": 0.061,
+    "y": 0.027,
+    "type": "neg",
+    "code": "N400C"
+  },
+  "kodak_ultramax_400": {
+    "x": 0.04,
+    "y": -0.203,
+    "type": "neg",
+    "code": "N400D"
+  },
+  "kodak_portra_800": {
+    "x": -0.04,
+    "y": -0.311,
+    "type": "neg",
+    "code": "N800"
+  },
+  "kodak_portra_800_push1": {
+    "x": 0.615,
+    "y": 0.454,
+    "type": "neg",
+    "code": "N800+1"
+  },
+  "kodak_portra_800_push2": {
+    "x": 0.994,
+    "y": 0.845,
+    "type": "neg",
+    "code": "N800+2"
+  },
+  "kodak_vision3_50d": {
+    "x": -0.207,
+    "y": -0.278,
+    "type": "cine",
+    "code": "C50D"
+  },
+  "kodak_vision3_200t": {
+    "x": -0.372,
+    "y": -0.579,
+    "type": "cine",
+    "code": "C200T"
+  },
+  "kodak_vision3_250d": {
+    "x": -0.353,
+    "y": -0.589,
+    "type": "cine",
+    "code": "C250D"
+  },
+  "kodak_vision3_500t": {
+    "x": -0.53,
+    "y": -0.55,
+    "type": "cine",
+    "code": "C500T"
+  },
+  "fujifilm_provia_100f": {
+    "x": -0.885,
+    "y": 0.005,
+    "type": "rev",
+    "code": "R100A"
+  },
+  "fujifilm_velvia_100": {
+    "x": 0.429,
+    "y": 0.48,
+    "type": "rev",
+    "code": "R100B"
+  },
+  "kodak_ektachrome_100": {
+    "x": -0.757,
+    "y": -0.56,
+    "type": "rev",
+    "code": "R100C"
+  },
+  "kodak_kodachrome_64": {
+    "x": -0.848,
+    "y": -0.846,
+    "type": "rev",
+    "code": "R64"
+  }
+}

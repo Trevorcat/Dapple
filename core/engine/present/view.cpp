@@ -11,6 +11,7 @@
 
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <sys/system_properties.h>
 #endif
 #include "dapple/dapple_view.h"
 #ifdef DAPPLE_HAVE_GPU
@@ -186,7 +187,13 @@ struct DappleView {
     polThermal(steadyNowNs());
 #if defined(__ANDROID__)
     // diagnostics: one line per 30 shown frames (zero-readback counters + the split of the last frame), logcat tag dapple_view
-    if (status == DAPPLE_VIEW_SHOWN && (shown.load() % 30) == 0)
+    // one line per 30 shown frames, every shown frame with `setprop debug.dapple.frame_profile 1`, and always a frame whose render + present took over 33 ms
+    bool perFrame = false;
+    {
+      char pv[PROP_VALUE_MAX] = {0};
+      perFrame = __system_property_get("debug.dapple.frame_profile", pv) > 0 && pv[0] == '1';
+    }
+    if (status == DAPPLE_VIEW_SHOWN && ((shown.load() % 30) == 0 || perFrame || renderMs + presentMs > 33.0))
       __android_log_print(ANDROID_LOG_INFO, "dapple_view",
                           "shown %llu ext %llu host %llu hostBytes %llu tooSmall %llu refused %llu | last %dx%d render %.2f ms present %.2f ms "
                           "latency %.2f ms | ema render %.2f present %.2f fenceWait %.2f",

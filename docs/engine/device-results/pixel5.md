@@ -186,3 +186,35 @@ Decoders: `c2.qti.hevc.decoder` (+ `.low_latency`, `.secure`) is hardware and li
 ## 7. Not measured
 
 60 MP tiled export (memory), the app-level run with `debug.dapple.gpu` and the perf probe (needs a `DAPPLE_PERF` build; app/ was being built by someone else), power (no Perfetto/battery stats; battery 9-10 % and not charging), a multi-minute thermal soak (only 70 s), `film-bench`, a true O(1) box, other device classes, `AHardwareBuffer` readback, simpleperf (the cause of the hang was found by bisection; kernel-side behaviour is not observable without root).
+
+
+## Wave 8 (2026-11-12, HEAD 1088f2d clean worktree build; arm64 NDK r28 Release `DAPPLE_GPU=ON DAPPLE_GLES=ON`, release APK; phone physically in landscape, 90 Hz mode (60/90 available), Battery Saver off, battery 7-9 % on USB, Thermal Status 0 before and after everything)
+
+Logs `build/dev2/pixel5/logs/`, screenshots `build/dev2/pixel5/app_*.png`, `cam_*.png`, `sample.dng`. Native binaries in `/data/local/tmp/dapple` (removed at the end), not pinned.
+
+**Correctness (Vulkan, Adreno 620):** `dapple_gpu_tests --quick` and the full run PASSED; film_gpu.parity ok (the six enlarger rows now mean dE 0.02-0.037, p99 <= 0.12, max <= 0.40: the unaligned-LUT-upload fix holds on Adreno Vulkan); film_gpu.frames ok; `--film-tiling` PASSED; `--coverage` 192/192 on the GPU executor; `dapple_golden selfcheck` OK; `dapple_exec_tests` all ok; `dapple_gpu_engine_tests` hal/box/sched/select/external PASSED. `dapple_match_cache_tests` SKIPs on a phone (pack path hard-coded to `DAPPLE_SOURCE_DIR`): NOT RUN.
+
+**GLES forced (`DAPPLE_GPU_API=gles`) FAILS the film checks.** `dapple_gpu_tests --quick`: 40 failures (all film rows, e.g. `film portra400, all effects: mean dE 3.05 p99 5.75`); film_gpu.parity 23 failed rows (final tier mean dE 2.9-3.3, enlarger 4-14, dye-cloud / micro-structure 21-54; worst pixel `cpu 0.9141 0.4543 0.8473  gpu 0.9438 0.5151 0.8926`); film_gpu.frames 52 failures; `--film-tiling` 3 failures (`exact film portra: mean 3.045`). The point chain rows pass (mean 0.014). Identical counts on the Note10+ (Adreno 640) and seen on a Redmi (Adreno 710): all Adreno 6xx/7xx, passes on the Adreno 840.
+
+**Film GPU frame (Vulkan `dapple_film_gpu_tests bench`, median of 10, GPU ms / wall ms incl. readback, 3 runs, spread < 1 %):**
+
+| case | GPU / wall | vs 8.3 / 11.1 / 16.7 |
+|---|---|---|
+| 810x1080 interactive | 99 / 226 | missed 12x / 9x / 6x |
+| 1080 px interactive | 94 / 210 | missed |
+| 1600 px interactive | 249 / 500 | missed |
+| 1600 px interactive, grain drag | 271 / 520 | missed |
+| 1600 px final | 438 / 690 | missed |
+| 810x1080 final | 284 / 408 | |
+| 3600 px final | 1988 / 3300 | |
+
+GLES forced (wrong colours): 810x1080 interactive 141 / 185, 1600 interactive 303 / 366. Per pass (`DAPPLE_GPU_PROFILE=1 DAPPLE_GPU_PROF_REPEAT=8`, 810x1080): film_point 7.1, gnoise 1.7, **film_h3 18.2, film_v3 21.7**, film_pd 3.8, readback 1.1 = 53.5 ms (h3 / v3 achieve 1.6-2.0 GB/s, 0.9 GB/s at 1600 px). **`DAPPLE_GPU_PROF_REPEAT=20` gives `vkQueueSubmit failed (VkResult -4)` (device lost)**: profiling repeat bypasses the submission splitter (one submission ~5 s); repeat 8 / 3 / 2 is fine. No hang or reset in any normal run.
+
+First film frame in a fresh process (`dapple_gpu_tests --film-interactive`): 1080 px 457 ms (upload 177, record 164, wait 106); 1600 px 656 ms (184 / 166 / 286). Session path wall ms (still / strength / exposure / grain / warmth): 1080 px 61.6 / 66.1 / 63.3 / 79.1 / **104.1** (upload 42.6); 1600 px 245 / 254 / 247 / 279 / 292.
+Drag bench (`dapple_drag_bench`, 480 px long edge, `DAPPLE_GPU=1`, median ms): strength 16.2, grain 21.8 (first 141), **film_shoot 166.7**, print 27.3, black 27.3, latitude 16.3, wb 15.5, warmth 27.2, tint 27.8, film_exp 15.5, exposure (film on) 28.7 (CPU path: shoot 189, print 50, exposure 144).
+Non-film 1600 px: point 22.5 wall, interactive 48.1 (GPU 33.9, 29 passes), full 75.2 (GPU 61.6). 24 MP whole: point 241, interactive 790, full 1255 ms (readback 118-124). Tiled export 24 MP: tile 2048 2.9 s (8.3-8.8 MP/s), tile 1024 2.9 s; vs the CPU full frame dE mean 0.0357 p99 0.474 (seams ok). 60 s sustained loop (810x1080 interactive bench): GPU 99.1-99.6 ms, Thermal 0, flat.
+
+**App (first install; photo access through the system "limited access" picker with one synthetic test photo):** fresh start `gpu probe: api=vulkan device="Adreno (TM) 620" self-test fresh, probe total 798 ms`; frames before it were `exec=cpu reason=GPU self-test running`; warm-up `film pipelines + default stock 2076 ms` (518 ms on the second start). Zero-copy present works: `dapple_present: device Adreno (TM) 620 type 1 ... (shared with the engine)`, swapchain 1600x1066 / 1118x745, `dapple_view: shown 60 ext 59 host 1 hostBytes 3110400 tooSmall 0 refused 0`, present 0.3-0.4 ms. Exposure drag (film off, 1080x720): cpu_ms 24-29 (tables 8.8, upload 15-20), view render ema 16.7-34 ms. **Film pad drag at 480x320: `cpu_ms 234.3 (match 110.2 ... upload 123.8) max 2397.1`, view `render ema 118.42 ms`** (first drag frames up to 2.4 s). Film grain drag after warm-up: cpu_ms 0.5-0.8, view render ema 5.3 ms, tier 480 -> 640 -> 1080.
+Layout (landscape 2340x1080, 440 dpi): the right-hand panel works, but (a) in 风格 the chip grid shows 1.5 rows; the film chip and film pads are below the fold, and a swipe aimed at a ruler scrolled the tone-target grid instead; (b) before a tab is chosen the film strip and the toolbar float over the photo; (c) the last chip of the tab bar is clipped; (d) the `更多` popup's first item `分级` sits under the status bar (tapping its centre does nothing); (e) **Settings: the category list (相机 ... 编辑) is clipped and does not scroll, so 关于 and the codec diagnostics page (long-press on 版本) are unreachable in landscape.** Portrait NOT checked (phone was lying sideways; rotating is a system setting).
+Camera: badge `RAW + JPEG`; one shot (phone face down, black picture) saved `Pictures/Dapple/DAP_20261112_233223.dng` 24 415 172 B + `.jpg` 1 444 918 B (MediaStore rows 1000000200 / 1000000201), the editor opened on the JPEG: badge matches the files. `sample.dng` pulled (a black frame). Test shots, `DT_synth24.jpg` and their rows deleted.
+NOT verified: codec diagnostics page (unreachable), Main10, portrait layout, film latitude visibility, edit-then-export.

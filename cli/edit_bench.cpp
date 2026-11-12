@@ -95,7 +95,7 @@ int editBench(const std::vector<std::string>& args) {
   t0 = Clock::now();
   src->linear = resizeToLongEdge(src->linear, 2048);
   const double resizeOpenMs = msSince(t0);
-  const CameraProfile& cam = cameras.resolve(src->meta.make, src->meta.model);
+  const CameraProfile cam = effectiveCamera(cameras, src->meta);
   std::printf("%s\nsession source %dx%d (decode %.0f ms + resize %.0f ms)\n", path.c_str(), src->linear.width,
               src->linear.height, decodeMs, resizeOpenMs);
 

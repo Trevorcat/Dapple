@@ -59,6 +59,7 @@ class CodecSelfTest(private val ctx: Context, private val caps: List<CodecCaps>,
 
     // ---- encode ------------------------------------------------------------------------------------------------------
     fun encode(c: CodecCaps, pick: EncodePick): Outcome {
+        if (pick.input == InputMode.SURFACE) return encodeSurface(c, pick)
         val t0 = System.nanoTime()
         val ten = pick.rung.tenBit
         var enc: MediaCodec? = null
@@ -142,11 +143,104 @@ class CodecSelfTest(private val ctx: Context, private val caps: List<CodecCaps>,
         }
     }
 
+    /** RGB10A2 test frame: a horizontal grey ramp over the full 10-bit range, moving by 6 px per frame (what the encoder's RGB to YUV conversion turns into the luma ramp). */
+    private fun rampRgb10(frame: Int): ByteBuffer {
+        val b = ByteBuffer.allocateDirect(W * H * 4).order(ByteOrder.nativeOrder())
+        for (x in 0 until W) {
+            val v = ((x + frame * 6) % W) * 1023 / (W - 1)
+            val word = v or (v shl 10) or (v shl 20) or (3 shl 30)
+            for (y in 0 until H) b.putInt((y * W + x) * 4, word)
+        }
+        b.rewind()
+        return b
+    }
+
+    /**
+     * Main10 encode through the encoder's input Surface (docs/engine/pipeline-architecture.md section 30.9): the same checks as the buffer test (output
+     * arrives, the output profile really is Main10, the stream decodes back with more than 256 luma levels) plus: the EGL surface must really be 10-bit.
+     */
+    private fun encodeSurface(c: CodecCaps, pick: EncodePick): Outcome {
+        val t0 = System.nanoTime()
+        var enc: MediaCodec? = null
+        var feeder: SurfaceFeeder? = null
+        try {
+            val fmt = MediaFormat.createVideoFormat(c.mime, W, H).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, ColorFmt.SURFACE)
+                setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
+                setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+                setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                if (pick.profile != 0) setInteger(MediaFormat.KEY_PROFILE, pick.profile)
+            }
+            enc = MediaCodec.createByCodecName(c.name)
+            enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            val surface = enc.createInputSurface()
+            enc.start()
+            feeder = SurfaceFeeder(surface, W, H, wantTenBit = pick.rung.tenBit)
+            if (pick.rung.tenBit && feeder.bits != 10) return done(t0, false, "surface input: the device gave no 10-bit EGL surface (${feeder.configDescription})")
+            val wd = StallWatchdog()
+            val samples = ArrayList<Sample>()
+            var outFmt: MediaFormat? = null
+            val info = MediaCodec.BufferInfo()
+            var queued = 0
+            var finished = false
+            var eosSent = false
+            val limit = System.currentTimeMillis() + 20_000
+            while (!finished) {
+                val now = System.currentTimeMillis()
+                if (now > limit) return done(t0, false, "timed out")
+                if (wd.stalled(now)) return done(t0, false, "no output: ${wd.pending} frames accepted, none returned within 3 s")
+                if (queued < FRAMES) {
+                    feeder.draw(rampRgb10(queued), queued * 1_000_000_000L / FPS)
+                    queued++
+                    wd.onQueued()
+                } else if (!eosSent) {
+                    enc.signalEndOfInputStream()
+                    eosSent = true
+                    wd.onEos()
+                }
+                while (true) {
+                    val oi = enc.dequeueOutputBuffer(info, if (eosSent) 10_000 else 0)
+                    if (oi == MediaCodec.INFO_TRY_AGAIN_LATER) break
+                    if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) { outFmt = enc.outputFormat; continue }
+                    if (oi < 0) continue
+                    val ob = enc.getOutputBuffer(oi)!!
+                    if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 && info.size > 0) {
+                        val d = ByteArray(info.size)
+                        ob.position(info.offset); ob.limit(info.offset + info.size); ob.get(d)
+                        samples.add(Sample(d, info.presentationTimeUs, info.flags))
+                        wd.onOutput(System.currentTimeMillis())
+                    }
+                    val last = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                    enc.releaseOutputBuffer(oi, false)
+                    if (last) { finished = true; break }
+                }
+            }
+            if (samples.size < FRAMES / 2) return done(t0, false, "only ${samples.size} of $FRAMES frames came back")
+            val of = outFmt ?: return done(t0, false, "no output format")
+            val prof = if (of.containsKey(MediaFormat.KEY_PROFILE)) of.getInteger(MediaFormat.KEY_PROFILE) else -1
+            if (pick.rung.tenBit && !isMain10Profile(prof)) {
+                return done(t0, false, if (prof < 0) "output format carries no profile" else "output profile ${CodecCatalog.profileName(c.mime, prof)} is not Main10 (silently downgraded)")
+            }
+            val dec = decodeBack(c.mime, of, samples, pick.rung.tenBit)
+            if (!dec.first) return done(t0, false, dec.second)
+            return done(t0, true, "surface input, ${feeder.bits}-bit EGL, ${samples.size} frames, profile ${if (prof < 0) "n/a" else CodecCatalog.profileName(c.mime, prof)}, ${dec.second}")
+        } catch (e: Throwable) {
+            return done(t0, false, "surface input: exception $e")
+        } finally {
+            try { feeder?.close() } catch (_: Exception) {}
+            try { enc?.stop() } catch (_: Exception) {}
+            try { enc?.release() } catch (_: Exception) {}
+        }
+    }
+
     /** Decodes [samples] and checks the distinct luma levels. Returns (ok, detail). */
     private fun decodeBack(mime: String, of: MediaFormat, samples: List<Sample>, ten: Boolean): Pair<Boolean, String> {
         val candidates = if (ten)
-            caps.filter { !it.encoder && it.mime == mime && it.declaresProfile(Prof.HEVC_MAIN10) && it.hasP010 && ledger.state(SelfTestKind.DEC10, it.name) != TestState.FAIL }
-                .sortedBy { if (it.hardware) 0 else 1 }
+            caps.filter { !it.encoder && it.mime == mime && it.declaresProfile(Prof.HEVC_MAIN10) && ledger.state(SelfTestKind.DEC10, it.name) != TestState.FAIL }
+                .sortedBy { (if (it.hardware) 0 else 2) + (if (it.hasP010) 0 else 1) }
         else
             caps.filter { !it.encoder && it.mime == mime }.sortedBy { if (it.hardware) 0 else 1 }
         if (candidates.isEmpty()) return false to "no ${if (ten) "10-bit " else ""}decoder to verify the stream"
@@ -288,9 +382,8 @@ class CodecSelfTest(private val ctx: Context, private val caps: List<CodecCaps>,
                 }
             }
             if (got == 0) return done(t0, false, "${c.name}: no frame")
-            if (outColor != ColorFmt.P010) return done(t0, false, "${c.name}: output colour format $outColor, not P010")
-            if (levels.size <= 256) return done(t0, false, "${c.name}: only ${levels.size} distinct luma levels (8-bit picture)")
-            return done(t0, true, "${c.name}: P010 output, ${levels.size} distinct luma levels")
+            val v = Decode10.verdict(c.name, outColor, levels.size, c.colorFormats)
+            return done(t0, v.first, v.second)
         } catch (e: Throwable) {
             return done(t0, false, "${c.name}: exception $e")
         } finally {

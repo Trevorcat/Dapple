@@ -84,7 +84,7 @@ Result<void> developTo(const SourceImage& src, const fs::path& out, int longEdge
   s.sceneReferred = src.sceneReferred;
   s.meta = src.meta;
   s.linear = longEdge > 0 ? resizeToLongEdge(src.linear, longEdge) : src.linear;
-  const CameraProfile& cam = cameras.resolve(s.meta.make, s.meta.model);
+  const CameraProfile cam = effectiveCamera(cameras, s.meta);
   EditParams params;
   AutoOptions ao;
   params += computeAutoAdjust(s, cam, ao).correction;

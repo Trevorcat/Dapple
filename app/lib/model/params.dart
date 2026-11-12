@@ -3,6 +3,8 @@
 // dapple_session_render; the engine ignores keys it does not know yet.
 import 'dart:ui' show Offset;
 
+import 'pad_model.dart' show migratePalette;
+
 enum EGroup { style, light, color, curve, effects, detail, grade, crop }
 
 const groupLabels = {
@@ -78,8 +80,8 @@ List<SliderSpec> _buildSpecs() {
     const SliderSpec('straighten', '拉直', -45, 45, 0, Fmt.deg, EGroup.crop),
     // Film simulation (docs/film/README.md). Strength / grain / halation 100 = the full effect of the stock.
     const SliderSpec('film_strength', '胶片强度', 0, 100, 100, Fmt.pct, EGroup.style),
-    const SliderSpec('film_grain', '颗粒', 0, 100, 100, Fmt.pct, EGroup.style),
-    const SliderSpec('film_halation', '光晕', 0, 100, 100, Fmt.pct, EGroup.style),
+    const SliderSpec('film_grain', '颗粒', 0, 200, 100, Fmt.pct, EGroup.style), // the engine schema (core/src/edit_params.cpp) allows 0..200
+    const SliderSpec('film_halation', '光晕', 0, 200, 100, Fmt.pct, EGroup.style),
     const SliderSpec('film_warmth', '冲印冷暖', -100, 100, 0, Fmt.signed, EGroup.style),
     const SliderSpec('film_tint', '冲印色调', -100, 100, 0, Fmt.signed, EGroup.style),
     // Old edits only: the 胶片曝光 slider left the UI (replaced by the 曝光 pad: film_shoot / film_print); the field stays.
@@ -207,6 +209,41 @@ SyncCat? syncCatOfKey(String key) {
 
 // ---------------------------------------------------------------- edit state
 
+/// The state of one control pad (docs/design/editor-panel.md section 3): where the cursor sits (x, y in [-1, +1], 0 =
+/// automatic), the strength strip ([a] in 0..1, 0.5 = 100 %) and the item offsets the itemised view adds on top of what
+/// the pad position implies (key -> offset in the item's own units). The edit's slider values stay the source of truth for
+/// the engine; this record only lets a reopened edit restore the pad. The engine never sees it.
+class PadState {
+  const PadState({this.x = 0, this.y = 0, this.a = 0.5, this.off = const {}});
+  final double x, y, a;
+  final Map<String, double> off;
+
+  static const centre = PadState();
+
+  bool get isCentre => x == 0 && y == 0 && a == 0.5 && off.isEmpty;
+
+  PadState copyWith({double? x, double? y, double? a, Map<String, double>? off}) =>
+      PadState(x: x ?? this.x, y: y ?? this.y, a: a ?? this.a, off: off ?? this.off);
+
+  bool same(PadState o) =>
+      x == o.x && y == o.y && a == o.a && off.length == o.off.length && off.entries.every((e) => o.off[e.key] == e.value);
+
+  Map<String, dynamic> toJson() => {'x': x, 'y': y, 'a': a, if (off.isNotEmpty) 'off': off};
+
+  static PadState? fromJson(Object? j) {
+    if (j is! Map) return null;
+    double n(Object? v, double d) => v is num && v.isFinite ? v.toDouble() : d;
+    final off = <String, double>{};
+    final o = j['off'];
+    if (o is Map) {
+      o.forEach((k, v) {
+        if (k is String && v is num && v.isFinite) off[k] = v.toDouble();
+      });
+    }
+    return PadState(x: n(j['x'], 0).clamp(-1.0, 1.0), y: n(j['y'], 0).clamp(-1.0, 1.0), a: n(j['a'], 0.5).clamp(0.0, 1.0), off: off);
+  }
+}
+
 /// Per-photo edit record (requirements 6.2). Immutable; everything that equals
 /// its default is simply absent, so "adjusted" == "has any override".
 class EditState {
@@ -222,7 +259,11 @@ class EditState {
     this.crop = 'orig',
     this.rot = 0,
     this.flip = false,
+    this.pads = const {},
   });
+
+  /// Control pad states by category name (`light`, `color`, `film`, `texture`); absent = pad at the centre.
+  final Map<String, PadState> pads;
 
   /// null = follow the global default look.
   final String? look;
@@ -265,6 +306,7 @@ class EditState {
     String? crop,
     int? rot,
     bool? flip,
+    Map<String, PadState>? pads,
   }) =>
       EditState(
         look: identical(look, _keep) ? this.look : look as String?,
@@ -278,6 +320,7 @@ class EditState {
         crop: crop ?? this.crop,
         rot: rot ?? this.rot,
         flip: flip ?? this.flip,
+        pads: pads ?? this.pads,
       );
 
   static const Object _keep = Object();
@@ -321,7 +364,9 @@ class EditState {
       rot == o.rot &&
       flip == o.flip &&
       values.length == o.values.length &&
-      values.entries.every((e) => o.values[e.key] == e.value);
+      values.entries.every((e) => o.values[e.key] == e.value) &&
+      pads.length == o.pads.length &&
+      pads.entries.every((e) => o.pads[e.key]?.same(e.value) ?? false);
 
   /// Copy settings (clipboard): everything except crop / rot / flip / straighten.
   EditState withoutCrop() {
@@ -334,7 +379,8 @@ class EditState {
         toneStrength: toneStrength,
         film: film,
         filmPaper: filmPaper,
-        values: m);
+        values: m,
+        pads: pads);
   }
 
   /// Paste = replace everything except the target's own crop.
@@ -352,7 +398,8 @@ class EditState {
         values: m,
         crop: crop,
         rot: rot,
-        flip: flip);
+        flip: flip,
+        pads: clip.pads);
   }
 
   /// Sync = merge: only what the source overrides, only the chosen categories,
@@ -374,6 +421,18 @@ class EditState {
       if (c != null && cats.contains(c)) m[e.key] = e.value;
     }
     out = out.copyWith(values: m);
+    // the pad states travel with the categories they belong to
+    final np = Map<String, PadState>.of(out.pads);
+    for (final e in const {'light': SyncCat.light, 'color': SyncCat.color, 'film': SyncCat.style, 'texture': SyncCat.detail}.entries) {
+      if (!cats.contains(e.value)) continue;
+      final sp = src.pads[e.key];
+      if (sp != null) {
+        np[e.key] = sp;
+      } else if (src.values.keys.any((k) => syncCatOfKey(k) == e.value)) {
+        np.remove(e.key);
+      }
+    }
+    out = out.copyWith(pads: np);
     if (cats.contains(SyncCat.crop)) {
       if (src.crop != 'orig') out = out.copyWith(crop: src.crop);
       if (src.rot != 0) out = out.copyWith(rot: src.rot);
@@ -390,7 +449,6 @@ class EditState {
       'lookStrength': lookStrength,
       'toneStrength': toneStrength ?? defaultToneStrength,
     };
-    if (palette != null) m['palette'] = {'x': palette!.dx, 'y': palette!.dy};
     if (toneTarget != null) m['toneTarget'] = toneTarget;
     if (film != null) {
       m['film'] = film;
@@ -418,11 +476,12 @@ class EditState {
         'crop': crop,
         'rot': rot,
         'flip': flip,
+        if (pads.isNotEmpty) 'pads': {for (final e in pads.entries) e.key: e.value.toJson()},
       };
 
   factory EditState.fromJson(Map<String, dynamic> j) {
     final pal = j['palette'];
-    return EditState(
+    final e = EditState(
       look: j['look'] as String?,
       lookStrength: ((j['lookStrength'] as num?) ?? 100).toDouble(),
       palette: pal is List && pal.length == 2 ? Offset((pal[0] as num).toDouble(), (pal[1] as num).toDouble()) : null,
@@ -436,8 +495,21 @@ class EditState {
       crop: (j['crop'] as String?) ?? 'orig',
       rot: (j['rot'] as num?)?.toInt() ?? 0,
       flip: (j['flip'] as bool?) ?? false,
+      pads: _padsFromJson(j['pads']),
     );
+    return e.palette == null ? e : migratePalette(e);
   }
+}
+
+Map<String, PadState> _padsFromJson(Object? j) {
+  final out = <String, PadState>{};
+  if (j is Map) {
+    j.forEach((k, v) {
+      final p = PadState.fromJson(v);
+      if (k is String && p != null) out[k] = p;
+    });
+  }
+  return out;
 }
 
 /// Per-photo undo / redo (requirements 3.2): 800 ms coalescing, depth 80.

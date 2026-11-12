@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 
 namespace dapple {
 
@@ -162,6 +163,20 @@ const char* toString(CfaKind kind) {
     case CfaKind::None: return "none";
     default: return "unknown";
   }
+}
+
+}  // namespace dapple
+
+namespace dapple {
+
+CameraProfile effectiveCamera(const CameraRegistry& registry, const ShotMetadata& meta) {
+  static const bool forceGeneric = [] {
+    const char* e = std::getenv("DAPPLE_PROFILE");
+    return e && std::string(e) == "generic";
+  }();
+  CameraProfile p = forceGeneric ? registry.resolve("", "") : registry.resolve(meta.make, meta.model);
+  if (meta.exposureAnchorTier > 0) p.baselineExposureEv = meta.exposureAnchorEv;
+  return p;
 }
 
 }  // namespace dapple

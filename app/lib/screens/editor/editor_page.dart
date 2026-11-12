@@ -13,9 +13,9 @@ import '../../editor/handedness.dart';
 import '../../editor/haptics.dart';
 import '../../editor/springs.dart';
 import '../../editor/panel_layout.dart';
-import '../../editor/param_rows.dart' show RowKind;
 import '../../editor/window_manager.dart';
 import '../../model/catalog.dart';
+import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../models.dart';
 import '../../services/editor_engine.dart';
@@ -24,7 +24,8 @@ import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
 import '../../widgets/photo_art.dart';
 import '../publish/publish_page.dart';
-import 'dock_panel.dart';
+import 'pad_dock.dart';
+import 'pad_panel.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart';
 import 'gesture_surface.dart';
@@ -33,13 +34,13 @@ import 'zoom_view.dart';
 import '../../services/perf_probe.dart';
 
 /// Opens the viewer / editor on [photoId] (full-screen route; the global navigation is hidden).
-void openEditor(BuildContext context, AppState app, String photoId, {EGroup? initialGroup, String? initialRow, bool initialCollapsed = false}) {
+void openEditor(BuildContext context, AppState app, String photoId, {EGroup? initialGroup, String? initialRow, bool initialCollapsed = false, String? initialHold}) {
   Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => EditorPage(app: app, photoId: photoId, initialGroup: initialGroup, initialRow: initialRow, initialCollapsed: initialCollapsed)));
+      builder: (_) => EditorPage(app: app, photoId: photoId, initialGroup: initialGroup, initialRow: initialRow, initialCollapsed: initialCollapsed, initialHold: initialHold)));
 }
 
 class EditorPage extends StatefulWidget {
-  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher, this.initialGroup, this.initialRow, this.initialCollapsed = false});
+  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher, this.initialGroup, this.initialRow, this.initialCollapsed = false, this.initialHold});
   final AppState app;
   final String photoId;
 
@@ -50,6 +51,9 @@ class EditorPage extends StatefulWidget {
   final EGroup? initialGroup;
   final String? initialRow;
   final bool initialCollapsed;
+
+  /// Debug link / tests: shows the hold popup of this pad category (name) without a finger.
+  final String? initialHold;
 
   /// Test hook: replaces the engine query for the film pads' effective ranges.
   final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
@@ -71,7 +75,6 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
   bool menuOpen = false;
   int lastRev = 0;
   bool _resampling = false;
-  bool _styleOpen = false;
 
   Photo get ph => app.photoById(id)!;
 
@@ -102,7 +105,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     ctl.dragging.addListener(_onDragging);
     _t.addListener(() => _panelRect.value = _geoNow().panel);
     engine.attach(ph, neighbors: _neighborsOf(id));
-    if (widget.initialGroup != null) WidgetsBinding.instance.addPostFrameCallback((_) => _applyInitial());
+    if (widget.initialGroup != null || widget.initialHold != null) WidgetsBinding.instance.addPostFrameCallback((_) => _applyInitial());
     if (widget.resamplePointers) {
       GestureBinding.instance.resamplingEnabled = true;
       _resampling = true;
@@ -131,11 +134,27 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
 
   void _applyInitial() {
     final g = widget.initialGroup;
+    final hold = PadCat.values.where((c) => c.name == widget.initialHold).firstOrNull;
+    if (mounted && hold != null) ctl.hold.value = HoldPopup(hold, _env == null ? 200 : _env!.size.width / 2);
     if (!mounted || g == null) return;
-    wm.toggle(g);
-    final rows = ctl.rowsOf(g);
-    final r = rows.where((e) => e.id == widget.initialRow).firstOrNull;
-    if (r != null) ctl.selectRow(g, r);
+    ctl.showCategory(g);
+    // initialRow names the layer: items (分项), map (胶片地图), curve / hsl / grade / paper (the complex editors)
+    switch (widget.initialRow) {
+      case 'items':
+        ctl.setItemised(true);
+      case 'map':
+        ctl.setFilmMap(true);
+      case 'curve':
+        ctl.openExtra(PanelExtra.curve);
+      case 'hsl':
+        ctl.openExtra(PanelExtra.hsl);
+      case 'grade':
+        ctl.openExtra(PanelExtra.grade);
+      case 'paper':
+        ctl.openExtra(PanelExtra.paper);
+      case 'tone':
+        ctl.openExtra(PanelExtra.tone);
+    }
     if (widget.initialCollapsed) wm.setCollapsed(g, true);
   }
 
@@ -160,9 +179,6 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
   }
 
   void _onWm() {
-    final styleNow = wm.windowOf(EGroup.style) != null;
-    if (styleNow && !_styleOpen) engine.refreshTiles();
-    _styleOpen = styleNow;
     if (mounted) WidgetsBinding.instance.addPostFrameCallback((_) => _retarget());
   }
 
@@ -215,8 +231,6 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
         open: false,
         group: null,
         collapsed: false,
-        padOnPhoto: false,
-        activeId: null,
       );
     }
     final regionTop = e.topBarBottom + 8;
@@ -241,46 +255,30 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
           margin: e.marginL,
           force: force,
         );
-    // [group]: the tallest control of the category (decides the placement, which must not flip while moving between
-    // its parameters). Otherwise what is shown now: never lower than a ruler (so rulers and pickers keep one height),
-    // taller for a big pad or the tone grid, and just the hint row when the photo is the pad.
-    PanelNeeds needs({bool pad = false, bool group = false}) =>
-        panelNeeds(ctl, w.group, screenW: size.width, paneW: sw - e.marginL, textScale: e.textScale, collapsed: w.collapsed, groupLevel: group, padOnPhoto: pad);
+    // The panel is as tall as its category needs and never changes height within it; the placement (bottom / side) is
+    // decided per category, screen, photo and hand side, never during a drag.
+    final region = dockTop - 8 - regionTop;
+    PanelNeeds needsFor({required bool collapsed, required bool itemised}) => panelNeeds(
+        screenW: size.width, paneW: sw - e.marginL, screenH: e.size.height, region: region, photoW: size.width - e.photoPad.horizontal, aspect: aspect,
+        textScale: e.textScale, collapsed: collapsed, itemised: itemised);
+    PanelNeeds needs() => needsFor(collapsed: w.collapsed, itemised: ctl.itemised && PadCatX.ofGroup(w.group) != null);
     final key = '${w.group.name}|${size.width.round()}x${size.height.round()}|${aspect.toStringAsFixed(3)}|$trailing|$id';
     if (key != _placeKey && !ctl.dragging.value) {
       _placeKey = key;
-      _place = solve(needs(group: true)).place;
+      _place = solve(needsFor(collapsed: false, itemised: false)).place;
     }
-    var n = needs();
-    var padPhoto = false;
-    var place = _place;
-    if (n.pad && !w.collapsed) {
-      // A pad that would leave under 80 % of the photo's edge is not shown, in either placement: the other placement
-      // may show it properly; otherwise the photo is the pad (slim hint row) and the larger photo decides the placement.
-      final fb = solve(n, force: PanelPlace.bottom), fs = solve(n, force: PanelPlace.side);
-      final cur = place == PanelPlace.side ? fs : fb, other = place == PanelPlace.side ? fb : fs;
-      if (cur.fill < 0.8) {
-        if (other.fits && other.place != place && other.fill >= 0.8) {
-          place = other.place;
-        } else {
-          padPhoto = true;
-          n = needs(pad: true);
-          place = solve(n).place;
-        }
-      }
-    }
-    final l = solve(n, force: place);
-    final rows = ctl.rowsOf(w.group);
+    final l = solve(needs(), force: _place);
+    // a wide screen (the unfolded inner screen, a tablet) does not stretch the panel into a long strip
+    var panel = l.panel;
+    if (l.place == PanelPlace.bottom && panel.width > kPanelMaxW) panel = Rect.fromCenter(center: panel.center, width: kPanelMaxW, height: panel.height);
     return _PanelGeo(
         region: l.photoRegion,
-        panel: l.panel,
+        panel: panel,
         dock: l.dock,
         place: l.place,
         open: true,
         group: w.group,
-        collapsed: w.collapsed,
-        padOnPhoto: padPhoto,
-        activeId: rows.isEmpty ? null : ctl.activeRowOf(w.group, rows).id);
+        collapsed: w.collapsed);
   }
 
   void _retarget() {
@@ -336,7 +334,6 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     ctl.compare.value = false;
     setState(() => id = next.id);
     engine.attach(next, neighbors: _neighborsOf(next.id));
-    if (wm.windowOf(EGroup.style) != null) engine.refreshTiles();
     ctl.edits.value++;
     if (announce != null) ctl.showText(announce);
   }
@@ -496,8 +493,6 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
             group: to.group,
             collapsed: to.collapsed,
             side: to.place == PanelPlace.side,
-            padOnPhoto: to.padOnPhoto,
-            activeId: to.activeId,
           );
         },
       ),
@@ -505,19 +500,17 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
       ListenableBuilder(
         listenable: ctl.readout,
         builder: (context, _) {
-          final low = ctl.readout.low;
-          final show = ctl.readout.compare || ctl.readout.kind == RowKind.action || ((_to?.padOnPhoto ?? false) && ctl.readout.kind == RowKind.twoD);
+          final show = ctl.readout.compare || ctl.readout.name.isNotEmpty;
           return Positioned(
             left: 0,
             right: 0,
-            top: low ? null : topBarBottom + 8,
-            bottom: low ? size.height - dockTop + 12 : null,
+            top: topBarBottom + 8,
             child: Center(
               child: Visibility(
                 visible: show,
                 maintainState: true,
                 maintainAnimation: true,
-                child: ReadoutOverlay(controller: ctl, compactHist: true),
+                child: ReadoutOverlay(controller: ctl),
               ),
             ),
           );
@@ -557,7 +550,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
                     top: topBarTop,
                     left: marginL + (sideOpen && !trailing ? paneW : 0),
                     right: marginR + (sideOpen && trailing ? paneW : 0),
-                    child: EditorTopBar(app: app, photoId: () => id, onBack: () => Navigator.of(context).maybePop()),
+                    child: EditorTopBar(app: app, photoId: () => id, onBack: () => Navigator.of(context).maybePop(), onMore: _toggleMenu),
                   );
                 },
               ),
@@ -565,7 +558,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
                 animation: _t,
                 builder: (context, _) => Positioned.fromRect(
                   rect: _geoNow().dock,
-                  child: Align(alignment: Alignment.center, child: CategoryDock(controller: ctl, groups: phoneDockOrder, onMore: _toggleMenu)),
+                  child: Align(alignment: Alignment.center, child: PadDock(ctl: ctl)),
                 ),
               ),
             ]),
@@ -573,7 +566,8 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
         ),
       ),
       ToastLayer(app: app, bottom: size.height - dockTop + 12, maxWidth: 480),
-      if (menuOpen) _menu(size, _geoNow().dock, phoneMoreOrder),
+            HoldPopupLayer(ctl: ctl, dockTop: dockTop, screenW: size.width),
+      if (menuOpen) _menu(size, _geoNow().dock, const []),
     ]);
   }
 
@@ -601,7 +595,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
         final original = ctl.compare.value;
         final focusGroup = wm.focused?.group;
         final showGrid = focusGroup == EGroup.crop && !original;
-        final fine = showGrid && ctl.activeRow?.id == 'straighten';
+        final fine = showGrid && ctl.dragging.value;
         final aspect = _frameRatio(p, original);
         if ((aspect - _lastAspect).abs() > 1e-3) {
           _lastAspect = aspect;
@@ -867,18 +861,13 @@ class _PanelGeo {
       required this.place,
       required this.open,
       required this.group,
-      required this.collapsed,
-      required this.padOnPhoto,
-      required this.activeId});
-  static const empty = _PanelGeo(region: Rect.zero, panel: Rect.zero, dock: Rect.zero, place: PanelPlace.bottom, open: false, group: null, collapsed: false, padOnPhoto: false, activeId: null);
+      required this.collapsed});
+  static const empty = _PanelGeo(region: Rect.zero, panel: Rect.zero, dock: Rect.zero, place: PanelPlace.bottom, open: false, group: null, collapsed: false);
 
   final Rect region, panel, dock;
   final PanelPlace place;
-  final bool open, collapsed, padOnPhoto;
+  final bool open, collapsed;
   final EGroup? group;
-
-  /// The selected row the panel is laid out for (the panel shows this row until the geometry has caught up).
-  final String? activeId;
 
   static _PanelGeo lerp(_PanelGeo a, _PanelGeo b, double t) => t >= 1
       ? b
@@ -890,13 +879,11 @@ class _PanelGeo {
           open: b.open,
           group: b.group,
           collapsed: b.collapsed,
-          padOnPhoto: b.padOnPhoto,
-          activeId: b.activeId,
         );
 
   @override
-  bool operator ==(Object o) => o is _PanelGeo && o.region == region && o.panel == panel && o.dock == dock && o.place == place && o.open == open && o.group == group && o.collapsed == collapsed && o.padOnPhoto == padOnPhoto && o.activeId == activeId;
+  bool operator ==(Object o) => o is _PanelGeo && o.region == region && o.panel == panel && o.dock == dock && o.place == place && o.open == open && o.group == group && o.collapsed == collapsed;
 
   @override
-  int get hashCode => Object.hash(region, panel, dock, place, open, group, collapsed, padOnPhoto, activeId);
+  int get hashCode => Object.hash(region, panel, dock, place, open, group, collapsed);
 }

@@ -24,6 +24,20 @@ endif()
 add_test(NAME merge_tests COMMAND dapple_merge_tests WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(merge_tests PROPERTIES TIMEOUT 900)
 
+# DNG opcode lists (GainMap / FixVignetteRadial / WarpRectilinear), default crop and orientation, on synthetic DNG fixtures.
+add_executable(dapple_dng_tests dng_opcode_tests.cpp)
+target_link_libraries(dapple_dng_tests PRIVATE dapple_core)
+target_include_directories(dapple_dng_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src)
+if(MSVC)
+  target_compile_options(dapple_dng_tests PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(dapple_dng_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+foreach(id parse gainmap vignette warp e2e illuminant anchor)
+  add_test(NAME dng.${id} COMMAND dapple_dng_tests ${id})
+  set_tests_properties(dng.${id} PROPERTIES TIMEOUT 300)
+endforeach()
+
 # Spectral film engine tests (profiles, film pack, grey neutrality, baked-vs-direct dE2000, hooks).
 # The C API under test is compiled into the executable (not the dapple DLL): the registry and the thread pool are
 # process singletons, so linking both libdapple_core.a and the DLL would test two separate copies.
@@ -194,3 +208,34 @@ target_include_directories(dapple_match_cache_tests PRIVATE ${PROJECT_SOURCE_DIR
 target_compile_definitions(dapple_match_cache_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 add_test(NAME engine.match_cache COMMAND dapple_match_cache_tests WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(engine.match_cache PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+
+# VideoFrameSession (wave 8, motion-photo): a Motion Photo clip through the node graph, docs/engine/pipeline-architecture.md section 27.
+# depth10 / e2e / verify need the desktop FFmpeg (tools/ffmpeg/build-host.sh); the others run on synthetic frames.
+add_executable(dapple_video_session_tests video/video_session_tests.cpp)
+target_link_libraries(dapple_video_session_tests PRIVATE dapple_core)
+target_include_directories(dapple_video_session_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core)
+target_compile_definitions(dapple_video_session_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+if(DAPPLE_HAVE_VIDEO_HOST)
+  target_link_libraries(dapple_video_session_tests PRIVATE dapple_video_host)
+  target_include_directories(dapple_video_session_tests PRIVATE "${DAPPLE_FFMPEG_HOST_DIR}/include")
+  target_compile_definitions(dapple_video_session_tests PRIVATE DAPPLE_HAVE_VIDEO_HOST=1)
+  if(DAPPLE_FFMPEG_HOST_DLLS)
+    add_custom_command(TARGET dapple_video_session_tests POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DAPPLE_FFMPEG_HOST_DLLS} $<TARGET_FILE_DIR:dapple_video_session_tests>)
+  endif()
+endif()
+if(NOT MSVC)
+  target_compile_options(dapple_video_session_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+foreach(id convert oracle hold depth10 flicker grain perf e2e hdr anchor)
+  add_test(NAME video_session.${id} COMMAND dapple_video_session_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(video_session.${id} PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+endforeach()
+if(DAPPLE_HAVE_VIDEO_HOST)
+  # the CLI end to end: decode a 10-bit HEVC clip, film through the graph, FFV1 10-bit out; then decode the output again and count the code values
+  add_test(NAME video_session.cli_motion_render
+           COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:dapple_cli> -DTESTER=$<TARGET_FILE:dapple_video_session_tests> -DSRC=${PROJECT_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/motion_render_test.mkv -P ${CMAKE_CURRENT_SOURCE_DIR}/video/cli_motion_render.cmake
+           WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(video_session.cli_motion_render PROPERTIES TIMEOUT 600)
+endif()

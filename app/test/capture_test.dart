@@ -188,6 +188,31 @@ void main() {
       expect(fake.gallery, ['SYS_1.jpg|image/jpeg']);
     });
 
+    test('RAW only (no camera JPEG): the DNG alone is the source, no preview yet, only the DNG goes to the gallery at once', () async {
+      final src = Directory(p.join(tmp.path, 'cache'))..createSync();
+      final dng = File(p.join(src.path, 'DAP_20261112_131501.dng'))..writeAsBytesSync([0x49, 0x49, 0x2A, 0x00, 9]);
+      final r = CaptureResult(dngPath: dng.path);
+      expect(r.stem, 'DAP_20261112_131501');
+      final ph = await app.ingestCapture(r);
+      expect(ph.id, 'cap:DAP_20261112_131501');
+      expect(ph.name, 'DAP_20261112_131501.dng');
+      expect(ph.isRaw, isTrue);
+      expect(ph.pairedJpeg, isNull);
+      expect(ph.previewPath, isNull, reason: 'the thumbnail comes from the engine develop of the DNG');
+      expect(File(ph.path!).existsSync(), isTrue);
+      expect(src.listSync(), isEmpty);
+      expect(ph.openable, isTrue);
+      expect(app.galleryJpegPending, contains(ph.id), reason: 'the developed JPEG follows the develop');
+      await Future<void>.delayed(Duration.zero);
+      expect(fake.gallery, ['DAP_20261112_131501.dng|image/x-adobe-dng']);
+    });
+
+    test('a capture with a camera JPEG needs no developed gallery copy', () async {
+      final src = Directory(p.join(tmp.path, 'cache'))..createSync();
+      final ph = await app.ingestCapture(_files(src));
+      expect(app.galleryJpegPending, isNot(contains(ph.id)));
+    });
+
     test('goes through the same develop queue as camera arrivals (pending until the engine runs)', () async {
       final src = Directory(p.join(tmp.path, 'cache'))..createSync();
       final ph = await app.ingestCapture(_files(src));

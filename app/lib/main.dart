@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'app.dart';
+import 'platform/ios_debug_open.dart';
 import 'services/debug_open.dart';
 import 'services/perf_probe.dart';
 import 'state/app_state.dart';
@@ -27,6 +28,7 @@ class _RootState extends State<_Root> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     state.init();
     DebugOpen.start(state); // debug builds only
+    IosDebugOpen.start(state); // debug builds on iOS only (DAPPLE_OPEN)
   }
 
   @override

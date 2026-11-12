@@ -878,9 +878,15 @@ int seqCheck() {
   return bad ? 1 : 0;
 }
 
+// film pack: DAPPLE_FILM_DATA (a phone: the pushed folder holding dapple.dfp), else the source tree
+static fs::path packPathFromEnv() {
+  const char* e = std::getenv("DAPPLE_FILM_DATA");
+  return (e && *e ? fs::path(e) : fs::path(DAPPLE_SOURCE_DIR) / "core" / "data" / "film") / "dapple.dfp";
+}
+
 int main(int argc, char** argv) {
   if (argc >= 2 && std::string(argv[1]) == "seqcheck") {
-    const std::string ps = (fs::path(DAPPLE_SOURCE_DIR) / "core" / "data" / "film" / "dapple.dfp").string();
+    const std::string ps = (packPathFromEnv()).string();
     if (!fs::exists(ps) || dapple_film_load_pack(ps.c_str()) != DAPPLE_OK) return 77;
     return seqCheck();
   }
@@ -889,7 +895,7 @@ int main(int argc, char** argv) {
     if (argc >= 3) {
       film = dapple_film_load_pack(argv[2]) == DAPPLE_OK;
     } else {
-      const std::string ps = (fs::path(DAPPLE_SOURCE_DIR) / "core" / "data" / "film" / "dapple.dfp").string();
+      const std::string ps = (packPathFromEnv()).string();
       film = fs::exists(ps) && dapple_film_load_pack(ps.c_str()) == DAPPLE_OK;
     }
     if (!film) std::fputs("note: film pack not loaded, film scenarios skipped\n", stderr);
@@ -900,7 +906,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string cmd = argv[1], file = argv[2];
-  const fs::path pack = fs::path(DAPPLE_SOURCE_DIR) / "core" / "data" / "film" / "dapple.dfp";
+  const fs::path pack = packPathFromEnv();
   bool haveFilm = false;
   if (fs::exists(pack)) {
     const std::string ps = pack.string();

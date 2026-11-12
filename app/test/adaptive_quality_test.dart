@@ -2,6 +2,7 @@ import 'package:dapple/services/adaptive_quality.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  refreshBudgetTests();
   test('steps down after two frames over budget, not after one', () {
     final q = AdaptiveQuality(budgetMs: 55);
     expect(q.rung.longEdge, 1080);
@@ -35,7 +36,7 @@ void main() {
     for (var i = 0; i < 20; i++) {
       q.record(500);
     }
-    expect(q.rung.longEdge, 480);
+    expect(q.rung.longEdge, 360);
 
     final small = AdaptiveQuality()..setDisplayLongEdge(700);
     expect(small.rung.longEdge, 810); // the smallest rung still >= the on-screen size
@@ -58,5 +59,30 @@ void main() {
     for (final r in AdaptiveQuality.rungs) {
       expect(r.bake, greaterThanOrEqualTo(57));
     }
+  });
+}
+
+// wave 8: the budget follows the display refresh period and the rung follows the measured frame time
+void refreshBudgetTests() {
+  test('budget is one display refresh, clamped to 8.3..55 ms', () {
+    expect(AdaptiveQuality.budgetForRefresh(120), closeTo(8.33, 0.01));
+    expect(AdaptiveQuality.budgetForRefresh(144), 8.3);
+    expect(AdaptiveQuality.budgetForRefresh(60), closeTo(16.67, 0.01));
+    expect(AdaptiveQuality.budgetForRefresh(30), closeTo(33.3, 0.1));
+    expect(AdaptiveQuality.budgetForRefresh(0), 55);
+    expect(AdaptiveQuality.budgetForRefresh(double.nan), 55);
+  });
+
+  test('a 120 Hz budget steps a slow GPU down to the rung that fits', () {
+    final q = AdaptiveQuality(budgetMs: AdaptiveQuality.budgetForRefresh(120));
+    // cost scales with pixels: 12 ms at 810x1080 -> 810 -> 640 (7.5 ms) fits
+    var cost = 17.0; // at 1080
+    for (var i = 0; i < 40; i++) {
+      final px = q.rung.longEdge / 1080;
+      cost = 17.0 * px * px;
+      q.record(cost);
+    }
+    expect(q.rung.longEdge, lessThan(1080));
+    expect(cost, lessThanOrEqualTo(8.3));
   });
 }

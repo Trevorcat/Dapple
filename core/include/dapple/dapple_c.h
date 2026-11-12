@@ -361,6 +361,36 @@ DAPPLE_API void dapple_gpu_warmup(void);
  * "lastReason":"...","unsupported":{"<reason the GPU did not render a frame>":count,...}}. Free with dapple_free_string. */
 DAPPLE_API char* dapple_engine_stats_json(void);
 
+/* ---- Edited Motion Photo clips (docs/engine/pipeline-architecture.md section 30) ----------------------------------------------------
+ * Decoded video frames go through the same node graph as the still, with the still's edit (film simulation included). The frames are
+ * half-float linear RGBA as the video core delivers them (DV_RGBAF16: BT.709 primaries, 1.0 = SDR white; S-Log3 scene linear), so no
+ * 10 to 8 bit step exists before the graph. The film exposure match, tone analysis and frame-global solves are taken once from the
+ * reference frame and held for the clip; the grain follows frame_index.
+ *   options_json: {"cameraMake","cameraModel","sceneX","sceneY" (as-shot illuminant xy, 0 = unknown),"maxLongEdge","stillAspect",
+ *                  "stillLongEdge","allowGpu"}  (all optional)
+ *   colour_kind: 0 standard SDR, 1 BT.2020 SDR, 2 HLG, 3 PQ, 4 S-Log3 (DvColorKind).  rotation_deg: container rotation, clockwise.
+ *   format: 0 RGBA8 (sRGB), 1 I420 8-bit BT.709 limited, 2 P010 10-bit BT.709 limited (value in the top 10 bits of 16-bit LE words),
+ *           3 P010 in the clip's output transfer (HDR: HLG / PQ BT.2020), 4 RGB10A2 packed (input Surface), 5 RGB10A2 in the output transfer.
+ *   options also: "hdr":0 forces an SDR output.
+ * The first set_reference / render defines the clip's frame size. Frames are rendered one at a time per handle. Errors: dapple_last_error()
+ * is not used here; dapple_video_edit_last_error() holds the text for the calling thread. */
+typedef struct DappleVideoEdit DappleVideoEdit;
+DAPPLE_API DappleVideoEdit* dapple_video_edit_open(const char* params_json, const char* lut_path, const char* options_json);
+DAPPLE_API void dapple_video_edit_close(DappleVideoEdit* edit);
+DAPPLE_API int32_t dapple_video_edit_set_reference(DappleVideoEdit* edit, const uint16_t* rgba_f16, int32_t width, int32_t height,
+                                                   int32_t colour_kind, int32_t rotation_deg);
+/* Size of the frames dapple_video_edit_render produces (after the edit's geometry, even). Needs a reference. */
+DAPPLE_API int32_t dapple_video_edit_output_size(DappleVideoEdit* edit, int32_t out_wh[2]);
+DAPPLE_API int64_t dapple_video_edit_frame_bytes(DappleVideoEdit* edit, int32_t format);
+/* frame_index: 0 = like a still, n >= 1 = clip frame n (seeds the film grain). */
+DAPPLE_API int32_t dapple_video_edit_render(DappleVideoEdit* edit, const uint16_t* rgba_f16, int32_t width, int32_t height,
+                                            int32_t colour_kind, int32_t rotation_deg, uint32_t frame_index, int32_t format, uint8_t* dst,
+                                            int64_t dst_size);
+/* What the clip is written as: 0 SDR BT.709, 1 HLG BT.2020, 2 PQ BT.2020 (HDR source, edit without film, no geometry edit; docs section 30.8), -1 on error.
+ * tags = primaries, transfer, matrix, range (FFmpeg AVCOL_*); note (static string) says why. Format 3 / 5 are then HLG / PQ encoded BT.2020 frames. */
+DAPPLE_API int32_t dapple_video_edit_output_kind(DappleVideoEdit* edit, int32_t tags[4], const char** note);
+DAPPLE_API const char* dapple_video_edit_last_error(void);
+
 #ifdef __cplusplus
 }
 #endif

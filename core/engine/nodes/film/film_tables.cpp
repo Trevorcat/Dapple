@@ -39,15 +39,15 @@ dapple::film::FilmParams makeParams(const FilmResolved& r, int quality) {
   fp.camera.filmFormatMm *= r.formatScale;
   fp.enlarger.yFilterShift = -r.warmth / 100.f * kWarmthFilterUnits;
   fp.enlarger.mFilterShift = -r.tint / 100.f * kWarmthFilterUnits;
-  const double g = std::clamp(r.grainPct / 100.f, 0.f, 1.f);
+  const double g = std::clamp(r.grainPct / 100.f, 0.f, 2.f);
   if (g <= 0) {
     fp.filmRender.grain.active = false;
   } else {
     fp.filmRender.grain.particleAreaUm2 *= g * g;  // grain amplitude ~ sqrt(particle area)
   }
-  const double h = std::clamp(r.halationPct / 100.f, 0.f, 1.f);
-  fp.filmRender.halation.halationAmount = h;
-  fp.filmRender.halation.scatterAmount = h;
+  const double h = std::clamp(r.halationPct / 100.f, 0.f, 2.f);
+  fp.filmRender.halation.halationAmount = h;  // as renderer.cpp
+  fp.filmRender.halation.scatterAmount = std::min(h, 1.0);
   fp.filmRender.halation.boostEv = r.fx.boostEv;
   fp.filmRender.halation.boostRange = r.fx.boostRange;
   fp.filmRender.halation.protectEv = r.fx.protectEv;
@@ -553,7 +553,9 @@ std::shared_ptr<const FilmPlanData> planOf(const FilmResolved& r) {
     pd->streamGrain[c] = stream(1 + c);
     pd->streamMicro[c] = stream(11 + c);
   }
-  pd->streamGlare = stream(21);
+  // The print flare's noise belongs to the print / enlarger, not to a negative frame: it is held across a clip (frameIndex 0's stream), so only the grain and the
+  // emulsion micro-structure animate from frame to frame (docs/engine/pipeline-architecture.md section 30.4). A still (seed 0) is unchanged.
+  pd->streamGlare = mix32(0u * 0x9E3779B1u + 21u * 0x85EBCA6Bu + 0x165667B1u);
   pd->dirHalf = pl.dirDiffuse && fd::mixtureFitsHalf(pl.dir[0]) && fd::mixtureFitsHalf(pl.dir[1]) && fd::mixtureFitsHalf(pl.dir[2]);
   std::lock_guard<std::mutex> lock(C.m);
   C.l.emplace_front(key, pd);

@@ -28,6 +28,8 @@ object Prof {
     const val AVC_HIGH444 = 0x40
 
     fun isHevcMain10(p: Int) = p == HEVC_MAIN10 || p == HEVC_MAIN10_HDR10 || p == HEVC_MAIN10_HDR10_PLUS
+
+    fun hevcName(p: Int) = when (p) { 1 -> "Main"; 2 -> "Main10"; 4 -> "MainStill"; 0x1000 -> "Main10HDR10"; 0x2000 -> "Main10HDR10Plus"; else -> "0x" + p.toString(16) }
 }
 
 object ColorFmt {
@@ -80,7 +82,12 @@ data class EncodeJob(
     val hdrSource: Boolean = false,
     /** The 兼容版 export and the film-applied path always use 8-bit. */
     val eightBitOnly: Boolean = false,
+    /** The frames come from the engine session (an edited clip), so they can be packed as RGB10A2 and fed through an encoder input Surface. */
+    val surfaceOk: Boolean = false,
 )
+
+/** How the frames reach the encoder: ByteBuffers (P010 / I420) or the encoder's input Surface (RGB10A2 through EGL, SurfaceInput.kt). */
+enum class InputMode { BUFFER, SURFACE }
 
 enum class EncodeRung(val label: String, val mime: String, val tenBit: Boolean) {
     HEVC_MAIN10("HEVC Main10", Mime.HEVC, true),
@@ -88,9 +95,9 @@ enum class EncodeRung(val label: String, val mime: String, val tenBit: Boolean) 
     AVC_HIGH("H.264 High 8-bit", Mime.AVC, false),
 }
 
-data class EncodePick(val rung: EncodeRung, val codec: String, val hardware: Boolean, val profile: Int) {
-    /** Self-test kind recorded for this pick. */
-    val testKind get() = if (rung.tenBit) SelfTestKind.ENC10 else if (rung == EncodeRung.HEVC_MAIN) SelfTestKind.ENC8_HEVC else SelfTestKind.ENC8_AVC
+data class EncodePick(val rung: EncodeRung, val codec: String, val hardware: Boolean, val profile: Int, val input: InputMode = InputMode.BUFFER) {
+    /** Self-test kind recorded for this pick (10-bit: one per input mode, so the diagnostics say which one passed). */
+    val testKind get() = if (rung.tenBit) (if (input == InputMode.SURFACE) SelfTestKind.ENC10_SURFACE else SelfTestKind.ENC10) else if (rung == EncodeRung.HEVC_MAIN) SelfTestKind.ENC8_HEVC else SelfTestKind.ENC8_AVC
 }
 
 /** What the stream to decode needs (from its SPS). requiredProfile 0 = any, -1 = no platform profile exists for it. */
@@ -109,7 +116,8 @@ enum class DecodeRoute(val hwPref: Int, val label: String) {
 data class DecodePick(val route: DecodeRoute, val codec: String?)
 
 object SelfTestKind {
-    const val ENC10 = "enc10"
+    const val ENC10 = "enc10"                  // HEVC Main10 through ByteBuffer P010 input
+    const val ENC10_SURFACE = "enc10s"         // HEVC Main10 through an input Surface (RGB10A2 via EGL)
     const val ENC8_HEVC = "enc8hevc"
     const val ENC8_AVC = "enc8avc"
     const val DEC10 = "dec10"
@@ -138,24 +146,49 @@ object Ladder {
         for (rung in EncodeRung.values()) {
             if (rung.tenBit && job.eightBitOnly) continue
             val kind = EncodePick(rung, "", false, 0).testKind
+            val kindS = SelfTestKind.ENC10_SURFACE
             caps.filter { it.encoder && it.mime == rung.mime && it.supportsSize(job.w, job.h, job.fps) }
                 .filter { c ->
                     when (rung) {
-                        EncodeRung.HEVC_MAIN10 -> c.profiles.any { Prof.isHevcMain10(it) } && c.hasP010
+                        // a declared Main10 (or Main10HDR10) profile is enough: whether the codec really takes P010 input although its colour list does not say so
+                        // (OMX.qcom.video.encoder.hevc of the Note10+) is for the one-time self-test to decide, so such codecs come after the ones that list P010
+                        EncodeRung.HEVC_MAIN10 -> c.profiles.any { Prof.isHevcMain10(it) }
                         EncodeRung.HEVC_MAIN -> c.has8BitInput && (c.profiles.isEmpty() || c.profiles.contains(Prof.HEVC_MAIN))
                         EncodeRung.AVC_HIGH -> c.has8BitInput
                     }
                 }
-                .filter { ledger.state(kind, it.name) != TestState.FAIL }
-                .sortedBy { order(it, ledger, kind) }
+                .filter { rung == EncodeRung.HEVC_MAIN10 || ledger.state(kind, it.name) != TestState.FAIL }
+                .sortedBy {
+                    if (rung != EncodeRung.HEVC_MAIN10) order(it, ledger, kind) * 2
+                    else {
+                        val pass = ledger.state(kind, it.name) == TestState.PASS || ledger.state(kindS, it.name) == TestState.PASS
+                        (if (it.hardware) 0 else 10) + (if (pass) 0 else 2) + (if (it.hasP010) 0 else 1)
+                    }
+                }
                 .forEach { c ->
                     val profile = when (rung) {
                         EncodeRung.HEVC_MAIN10 ->
-                            if (job.hdrSource && c.profiles.contains(Prof.HEVC_MAIN10_HDR10) && !c.profiles.contains(Prof.HEVC_MAIN10)) Prof.HEVC_MAIN10_HDR10 else Prof.HEVC_MAIN10
+                            // a codec that declares only Main10HDR10 gets asked for exactly that (asking for Main10 makes it reset the profile silently)
+                            if (c.profiles.contains(Prof.HEVC_MAIN10_HDR10) && !c.profiles.contains(Prof.HEVC_MAIN10)) Prof.HEVC_MAIN10_HDR10 else Prof.HEVC_MAIN10
                         EncodeRung.HEVC_MAIN -> Prof.HEVC_MAIN
                         EncodeRung.AVC_HIGH -> if (c.profiles.contains(Prof.AVC_HIGH)) Prof.AVC_HIGH else 0
                     }
-                    out.add(EncodePick(rung, c.name, c.hardware, profile))
+                    if (rung != EncodeRung.HEVC_MAIN10) {
+                        out.add(EncodePick(rung, c.name, c.hardware, profile))
+                    } else {
+                        // Main10 input modes of this codec, best first. The colour list says what the codec declares; the self-test of each mode decides:
+                        //  buffer P010: a codec that does not list P010 is still tried once (it may accept it), a failed test removes the mode;
+                        //  surface: only when the codec declares Surface input and the job can feed one; a failed test removes the mode.
+                        val bufferState = ledger.state(kind, c.name)
+                        val surfaceState = ledger.state(kindS, c.name)
+                        val modes = ArrayList<InputMode>()
+                        if (bufferState != TestState.FAIL) modes.add(InputMode.BUFFER)
+                        if (job.surfaceOk && c.hasSurface && surfaceState != TestState.FAIL) modes.add(InputMode.SURFACE)
+                        val surfaceFirst = surfaceState == TestState.PASS && bufferState != TestState.PASS ||
+                            (bufferState != TestState.PASS && surfaceState != TestState.PASS && !c.hasP010 && c.hasSurface)
+                        if (surfaceFirst) modes.sortBy { if (it == InputMode.SURFACE) 0 else 1 }
+                        modes.forEach { out.add(EncodePick(rung, c.name, c.hardware, profile, it)) }
+                    }
                 }
         }
         return out
@@ -174,8 +207,11 @@ object Ladder {
             if (stream.bitDepth <= 8) {
                 dec.firstOrNull()?.let { out.add(DecodePick(DecodeRoute.HW_FFMPEG, it.name)) }
             } else if (stream.bitDepth == 10) {
-                dec.filter { it.hasP010 && ledger.state(SelfTestKind.DEC10, it.name) != TestState.FAIL }
-                    .sortedBy { if (ledger.state(SelfTestKind.DEC10, it.name) == TestState.PASS) 0 else 1 }
+                // Every hardware decoder that declares the profile is tried; P010 in its colour list is NOT required (OMX.qcom.video.decoder.hevc declares Main10
+                // and no P010). The self-test asks for P010 and records the format the decoder really delivers; only P010 is accepted (Decode10.verdict), so a
+                // decoder that offers a vendor 10-bit layout fails with that format in the reason and software takes over. Codecs listing P010 come first.
+                dec.filter { ledger.state(SelfTestKind.DEC10, it.name) != TestState.FAIL }
+                    .sortedBy { (if (ledger.state(SelfTestKind.DEC10, it.name) == TestState.PASS) 0 else 2) + (if (it.hasP010) 0 else 1) }
                     .forEach { out.add(DecodePick(DecodeRoute.HW_NATIVE_P010, it.name)) }
             }
         }
@@ -278,3 +314,64 @@ fun isMain10Profile(p: Int) = Prof.isHevcMain10(p)
 
 /** Bytes to queue for one raw 4:2:0 input frame given the codec's input layout (stride * slice-height, never w*h*3). */
 fun inputFrameBytes(stride: Int, sliceHeight: Int, capacity: Int): Int = minOf(capacity, stride * sliceHeight * 3 / 2)
+
+/** The pure judgement of the hardware 10-bit decode self-test (what the decoder delivered), unit tested without a device. */
+object Decode10 {
+    /** Output layouts the engine converts: only P010 for now (the native decoder in core/video refuses anything else rather than truncating). */
+    val CONVERTIBLE = setOf(ColorFmt.P010)
+
+    /** (pass, reason). [outColor] = KEY_COLOR_FORMAT of the output format (-1 none), [levels] = distinct luma levels read from the first frame. */
+    fun verdict(codec: String, outColor: Int, levels: Int, declaredFormats: List<Int>): Pair<Boolean, String> {
+        if (outColor < 0) return false to "$codec: no output format reported"
+        if (outColor !in CONVERTIBLE)
+            return false to "$codec: delivers colour format ${colorLabel(outColor)} for a 10-bit stream; the engine converts only P010 " +
+                "(declared: ${declaredFormats.joinToString(",") { colorLabel(it) }})"
+        if (levels <= 256) return false to "$codec: only $levels distinct luma levels (8-bit picture)"
+        return true to "$codec: P010 output, $levels distinct luma levels"
+    }
+
+    fun colorLabel(f: Int): String = when (f) {
+        ColorFmt.P010 -> "P010"; ColorFmt.NV12 -> "NV12"; ColorFmt.I420 -> "I420"; ColorFmt.FLEXIBLE -> "Flexible"; ColorFmt.SURFACE -> "Surface"
+        else -> "0x" + f.toString(16)
+    }
+}
+
+/** One line of the diagnostics page: HEVC Main10 encode, per encoder (always at least one line). */
+data class Main10Row(val codec: String, val hardware: Boolean, val state: String, val reason: String)
+
+object Diagnostics {
+    const val NOT_DECLARED = "not declared"
+    const val UNTESTED = "declared, not tested yet"
+    const val PASSED = "passed"
+    const val FAILED = "failed"
+
+    /**
+     * The "HEVC Main10 encode" rows: one per HEVC encoder (declared Main10 / Main10HDR10 or not), or one row saying that no HEVC encoder exists. [result]
+     * gives the cached self-test result of (kind, codec). Never empty, so the page always has the row.
+     */
+    fun main10EncodeRows(caps: List<CodecCaps>, result: (String, String) -> TestResult?): List<Main10Row> {
+        val enc = caps.filter { it.encoder && it.mime == Mime.HEVC }
+        if (enc.isEmpty()) return listOf(Main10Row("(no HEVC encoder)", false, NOT_DECLARED, "the device lists no HEVC encoder"))
+        fun profs(c: CodecCaps, only10: Boolean) = c.profiles.filter { !only10 || Prof.isHevcMain10(it) }.joinToString(",") { Prof.hevcName(it) }
+        return enc.map { c ->
+            val inputs = ((if (c.hasP010) "P010 " else "") + (if (c.hasSurface) "Surface " else "") + (if (c.has8BitInput) "8-bit" else "")).trim()
+            if (c.profiles.none { Prof.isHevcMain10(it) }) {
+                Main10Row(c.name, c.hardware, Diagnostics.NOT_DECLARED, "profiles ${profs(c, false)}; inputs $inputs")
+            } else {
+                // two input modes, each with its own self-test: ByteBuffer P010 and an input Surface (RGB10A2 through EGL); the row says which one passed
+                val rb = result(SelfTestKind.ENC10, c.name)
+                val rs = if (c.hasSurface) result(SelfTestKind.ENC10_SURFACE, c.name) else null
+                fun part(label: String, r: TestResult?, available: Boolean) =
+                    if (!available) "$label: not offered by the codec" else if (r == null) "$label: not tested yet" else if (r.pass) "$label: passed (${r.detail})" else "$label: failed (${r.detail})"
+                val detail = part("buffer P010", rb, true) + "; " + part("surface", rs, c.hasSurface)
+                val passedModes = listOfNotNull(if (rb?.pass == true) "buffer P010" else null, if (rs?.pass == true) "surface" else null)
+                val untested = rb == null || (c.hasSurface && rs == null)
+                when {
+                    passedModes.isNotEmpty() -> Main10Row(c.name, c.hardware, Diagnostics.PASSED, "input mode passed: ${passedModes.joinToString(" + ")}. $detail")
+                    untested -> Main10Row(c.name, c.hardware, Diagnostics.UNTESTED, "declares ${profs(c, true)}; inputs $inputs. $detail")
+                    else -> Main10Row(c.name, c.hardware, Diagnostics.FAILED, detail)
+                }
+            }
+        }
+    }
+}

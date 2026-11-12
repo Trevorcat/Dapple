@@ -631,6 +631,11 @@ zone ∈ shadows, mid, highlights, global。
   - 静帧与视频封面帧的渲染结果须一致（同一节点图、同一参数；色差预算见引擎文档）。
 - **性能目标**：3 s × 30 fps @1080p。GPU 执行器整段 ≤ 3 s（N5，估计值，待真机验证）；CPU 兜底须能完成，并显示进度、可取消、可后台。
 - **前置条件**：渲染管线迁移阶段 (b) 完成，胶片模拟已成为 GPU 节点，见 `docs/engine/pipeline-architecture.md` §15。
+- **实现状态（2026-11-12，第 8 波，详见 `docs/engine/pipeline-architecture.md` §30）**：
+  - 已完成（桌面软件路径，已测）：`VideoFrameSession`（`core/engine/video`）把解码帧（半精度线性 RGB，无 10→8 bit 截断）送进与静帧相同的节点图；胶片曝光匹配、调性分析、查找表、去朦胧求解都取自参考帧并锁定；颗粒与乳剂微结构随帧序号变化（同帧重复渲染逐位一致），印放眩光噪声固定；输出 10-bit（P010）或 8-bit（I420）；`dapple motion render` 命令端到端（解码、编辑含胶片、编码）。
+  - 已测数字：与静帧管线逐像素一致（最大差 0）；10-bit 渲染后仍有 641 / 652 个亮度码值（8-bit 路径 219）；静态片段关颗粒后帧间差为 0；1080p CPU 每帧 21-47 ms（含胶片）。
+  - Android 导出路径已接入（`EditSpec` / `SoftwareMedia.clip(edit)` / `LiveBridge.trim(edit)` / Dart `EditedClip`），不带 `edit` 时行为与以前完全相同；编辑器尚未传 `edit`（`app_state.dart` 的接入点已留好）。
+  - 未完成 / 未验证：真机 HEVC Main10 硬件解码 → 节点图 → 硬件编码、耗时与发热（清单见 §30.5）；GPU 执行器的 10-bit 输出（目前 GPU 只输出 8-bit，10-bit 走 CPU 执行器）；硬件解码缓冲零拷贝进入节点图。
 
 #### 4.9.6 任务进度与失败
 

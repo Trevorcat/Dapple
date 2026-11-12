@@ -56,6 +56,9 @@ class CodecManager private constructor(private val ctx: Context) {
         }
     }
 
+    /** Runs one encode self-test without touching the cache (tooling: DebugClipReceiver probes the Surface input mechanism with an 8-bit codec on an emulator). */
+    fun probeEncode(pick: EncodePick): CodecSelfTest.Outcome? = synchronized(lock) { capsOf(pick.codec, true)?.let { tester.encode(it, pick) } }
+
     /** A real encode showed the codec does not deliver what it declares (stall, downgraded profile): remember, demote. */
     fun markEncoderFailed(pick: EncodePick, why: String) = synchronized(lock) {
         cache.record(pick.testKind, pick.codec, false, "during a job: $why", 0)
@@ -98,14 +101,14 @@ class CodecManager private constructor(private val ctx: Context) {
     // ---- diagnostics ---------------------------------------------------------------------------------------------------
     /** Runs every self-test this device could need (1080p30 encode ladder + hardware 10-bit decoders). [force] repeats finished ones. */
     fun runAll(force: Boolean) = synchronized(lock) {
-        val probe = EncodeJob(1920, 1080, 30)
+        val probe = EncodeJob(1920, 1080, 30, surfaceOk = true)   // both Main10 input modes: ByteBuffer P010 and the input Surface
         for (p in Ladder.encode(caps, probe, TestLedger.NONE)) {
             if (!force && cache.state(p.testKind, p.codec) != TestState.UNKNOWN) continue
             val c = capsOf(p.codec, true) ?: continue
             val o = tester.encode(c, p)
             cache.record(p.testKind, p.codec, o.pass, o.detail, o.ms)
         }
-        for (c in caps.filter { !it.encoder && it.hardware && it.mime == Mime.HEVC && it.declaresProfile(Prof.HEVC_MAIN10) && it.hasP010 }) {
+        for (c in caps.filter { !it.encoder && it.hardware && it.mime == Mime.HEVC && it.declaresProfile(Prof.HEVC_MAIN10) }) {
             if (!force && cache.state(SelfTestKind.DEC10, c.name) != TestState.UNKNOWN) continue
             val o = tester.decode10(c)
             cache.record(SelfTestKind.DEC10, c.name, o.pass, o.detail, o.ms)
@@ -137,9 +140,14 @@ class CodecManager private constructor(private val ctx: Context) {
             tests.put(JSONObject().apply { put("kind", kind); put("codec", codec); put("pass", r.pass); put("detail", r.detail); put("ms", r.ms); put("at", r.atMs) })
         }
         j.put("selfTests", tests)
-        fun ladder(job: EncodeJob) = JSONArray(Ladder.encode(caps, job, cache).map { "${it.rung.label} · ${it.codec}${if (it.hardware) "" else " (sw)"}" })
+        fun ladder(job: EncodeJob) = JSONArray(Ladder.encode(caps, job, cache).map { "${it.rung.label} · ${it.codec}${if (it.hardware) "" else " (sw)"}${if (it.input == InputMode.SURFACE) " [surface input]" else ""}" })
         fun dec(spec: StreamSpec) = JSONArray(Ladder.decode(caps, spec, cache).map { "${it.route.label}${it.codec?.let { c -> " · $c" } ?: ""}" })
+        // always present: HEVC Main10 encode per encoder: declared / not declared / passed / failed with the reason
+        j.put("main10Encode", JSONArray(Diagnostics.main10EncodeRows(caps) { k, c -> cache.result(k, c) }.map { r ->
+            JSONObject().apply { put("codec", r.codec); put("hardware", r.hardware); put("state", r.state); put("reason", r.reason) }
+        }))
         j.put("encodeLadder1080p30", ladder(EncodeJob(1920, 1080, 30)))
+        j.put("encodeLadder1080p30Edited", ladder(EncodeJob(1920, 1080, 30, surfaceOk = true)))
         j.put("encodeLadder1080p30Hdr", ladder(EncodeJob(1920, 1080, 30, hdrSource = true)))
         j.put("encodeLadder8Bit", ladder(EncodeJob(1920, 1080, 30, eightBitOnly = true)))
         j.put("decodeLadderHevc10", dec(StreamSpec(Mime.HEVC, Prof.HEVC_MAIN10, 10, 1)))

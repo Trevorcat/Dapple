@@ -6,11 +6,21 @@ import 'package:permission_handler/permission_handler.dart';
 /// Camera permission as the capture flow needs to tell it: [blocked] = only the system settings can grant it now.
 enum CapturePerm { granted, denied, blocked }
 
-/// Files of one shutter press. [dngPath] is set when the lens delivered RAW next to the JPEG.
+/// Files of one shutter press: JPEG only, RAW + JPEG, or a DNG alone (RAW-only capture; the library develops the DNG itself).
 class CaptureResult {
-  const CaptureResult({required this.jpegPath, this.dngPath, this.source = 'camerax'});
-  final String jpegPath;
+  const CaptureResult({this.jpegPath, this.dngPath, this.source = 'camerax'})
+      : assert(jpegPath != null || dngPath != null, 'a capture has at least one file');
+  final String? jpegPath;
   final String? dngPath;
+
+  /// File name stem shared by the files of this shot.
+  String get stem => _stemOf((jpegPath ?? dngPath)!);
+
+  static String _stemOf(String path) {
+    final name = path.split(RegExp(r'[\\/]')).last;
+    final dot = name.lastIndexOf('.');
+    return dot > 0 ? name.substring(0, dot) : name;
+  }
 
   /// `camerax` (in-app capture) or `system` (ACTION_IMAGE_CAPTURE fallback).
   final String source;
@@ -51,8 +61,9 @@ class ChannelCaptureBackend implements CaptureBackend {
   Future<CaptureResult?> capture() async {
     final r = await _channel.invokeMapMethod<String, dynamic>('capture');
     final jpg = r?['jpg'] as String?;
-    if (r == null || jpg == null) return null;
-    return CaptureResult(jpegPath: jpg, dngPath: r['dng'] as String?, source: (r['source'] as String?) ?? 'camerax');
+    final dng = r?['dng'] as String?;
+    if (r == null || (jpg == null && dng == null)) return null;
+    return CaptureResult(jpegPath: jpg, dngPath: dng, source: (r['source'] as String?) ?? 'camerax');
   }
 
   @override

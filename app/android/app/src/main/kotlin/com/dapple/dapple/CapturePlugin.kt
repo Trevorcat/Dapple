@@ -30,6 +30,7 @@ class CapturePlugin(private val activity: Activity, messenger: BinaryMessenger) 
                     pending = result
                     activity.startActivityForResult(Intent(activity, CaptureActivity::class.java), REQ)
                 }
+                "sdkInt" -> result.success(android.os.Build.VERSION.SDK_INT)
                 "saveToGallery" -> {
                     val src = File(call.argument<String>("path")!!)
                     val name = call.argument<String>("name")!!
@@ -68,6 +69,7 @@ class CapturePlugin(private val activity: Activity, messenger: BinaryMessenger) 
 
     /** Pictures/Dapple, same place and conventions as the Motion Photos (the ingest scan skips this folder). */
     private fun save(src: File, name: String, mime: String): String {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) return saveLegacy(src, name, mime)
         val cr = activity.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
@@ -86,6 +88,16 @@ class CapturePlugin(private val activity: Activity, messenger: BinaryMessenger) 
             throw e
         }
         return uri.toString()
+    }
+
+    /** API 24-28 has no RELATIVE_PATH / IS_PENDING: copy into the public Pictures/Dapple folder (WRITE_EXTERNAL_STORAGE, maxSdk 28) and index it. */
+    private fun saveLegacy(src: File, name: String, mime: String): String {
+        @Suppress("DEPRECATION")
+        val pictures = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_PICTURES)
+        val target = CaptureFiles.legacyTarget(pictures, name)
+        src.inputStream().use { i -> target.outputStream().use { o -> i.copyTo(o, 1 shl 20) } }
+        android.media.MediaScannerConnection.scanFile(activity, arrayOf(target.absolutePath), arrayOf(mime), null)
+        return target.absolutePath
     }
 
     companion object { const val REQ = 7421 }

@@ -66,8 +66,7 @@ std::string filmMatchKeyLean(const EditParams& p) {
   k.filmGrain = 0.f;
   k.filmHalation = 0.f;
   k.clarity = k.texture = k.dehaze = k.grain = 0.f;
-  k.sharpen = k.sharpRadius = k.nrLuma = k.nrColor = 0.f;  // identical to filmMatchKey (the uncached key), so a settled frame is bit identical, stale-key behaviour included
-  k.vignette = 0.f;
+  k.sharpen = k.nrLuma = 0.f;  // identical to filmMatchKey (the uncached key). vignette, nrColor and sharpRadius stay in: the solve reads them
   // The print filtration only matters when a median of the print is evaluated: film_print != 0 (and a slide's film_shoot, see solveMeter).
   // The key stays complete for those; otherwise a warmth / tint drag is not a new match.
   std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
@@ -211,6 +210,7 @@ FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& c
 
 }  // namespace dapple
 
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -235,13 +235,22 @@ void prewarmFilmCalibration(const EditParams& p, void (*lowPriority)()) {
     std::lock_guard<std::mutex> lock(mtx);
     if (!done.insert(key).second) return;
   }
-  std::thread([lib, film = p.filmStock, paper, lowPriority] {
-    if (lowPriority) lowPriority();
-    try {
-      for (int i = -7; i <= 7; ++i) filmPrintConstant(lib, film, paper, 0.5f * float(i));  // +-3.5 EV: film_shoot reaches +-3 EV and the constant interpolates to the next bucket
-    } catch (...) {
-    }
-  }).detach();
+  // Wave 8 (Redmi, Adreno 710 / SM7435): one low-priority thread on an efficiency core needed more than 10 s for the 15 buckets, so a drag started a few
+  // seconds after choosing the stock met a cold bucket (~190 ms) in nearly every frame. Two workers on the normal scheduler class (the big cores) pull the
+  // buckets outward from 0; `lowPriority` is kept only for a single-core device.
+  const unsigned hc = std::max(1u, std::thread::hardware_concurrency());
+  const int workers = hc >= 4 ? 2 : 1;
+  auto next = std::make_shared<std::atomic<int>>(0);
+  for (int wk = 0; wk < workers; ++wk)
+    std::thread([lib, film = p.filmStock, paper, lowPriority, next, workers] {
+      if (lowPriority && workers == 1) lowPriority();
+      try {
+        // +-3.5 EV: film_shoot reaches +-3 EV and the constant interpolates to the next bucket. Outward from 0: a drag starts at the automatic exposure
+        // and the buckets next to it are needed first (it was -3.5 .. +3.5)
+        for (int i; (i = next->fetch_add(1)) < 15;) filmPrintConstant(lib, film, paper, i == 0 ? 0.f : (i & 1 ? 0.5f : -0.5f) * float((i + 1) / 2));
+      } catch (...) {
+      }
+    }).detach();
 }
 
 }  // namespace dapple

@@ -20,6 +20,8 @@ add_library(dapple_core STATIC
   src/xmp_preset.cpp
   src/decoders/jpeg_decoder.cpp
   src/decoders/libraw_decoder.cpp
+  src/decoders/dng_opcodes.cpp
+  src/exposure_anchor.cpp
   src/film.cpp
   src/film_color.cpp
   src/film_model.cpp
@@ -43,6 +45,7 @@ add_library(dapple_core STATIC
   engine/exec/cpu_executor.cpp
   engine/plan/planner.cpp
   engine/nodes/main/cpu_nodes.cpp
+  engine/video/video_frame_session.cpp
 )
 add_library(Dapple::core ALIAS dapple_core)
 
@@ -76,7 +79,7 @@ endif()
 # ---------------------------------------------------------------------------
 # film_swatch.cpp (a C API function of its own) is compiled into the shared library itself: as a member of the static core nothing
 # references it, so the linker would drop it from libdapple.
-add_library(dapple SHARED src/c_api.cpp src/film_swatch.cpp)
+add_library(dapple SHARED src/c_api.cpp src/film_swatch.cpp engine/video/video_c_api.cpp engine/video/video_jni.cpp)
 target_include_directories(dapple PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dapple PRIVATE dapple_core)
 target_compile_definitions(dapple PRIVATE DAPPLE_VERSION_STRING="${PROJECT_VERSION}")

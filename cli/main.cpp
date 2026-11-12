@@ -36,6 +36,7 @@
 #include "eval.h"
 #include "film_cmds.h"
 #include "merge_cmds.h"
+#include "motion_render.h"
 
 namespace dapple::benchtool { int editBench(const std::vector<std::string>& args); }
 #ifdef DAPPLE_HAVE_GPU
@@ -98,6 +99,7 @@ struct Options {
   bool autoAdjust = true;
   float strength = 1.f;
   bool full = false;
+  bool anchor = false;  // info: also decode (preview quality) and print the exposure anchor
   int longEdge = 2560;
   int quality = 92;
   bool dumpParams = false;
@@ -142,6 +144,7 @@ bool parseArgs(const std::vector<std::string>& args, Options& o, std::string& er
     else if (a == "--no-auto") o.autoAdjust = false;
     else if (a == "--strength") { if (!number(d)) return false; o.strength = float(d); }
     else if (a == "--full") o.full = true;
+    else if (a == "--anchor") o.anchor = true;
     else if (a == "--long-edge") { if (!number(d)) return false; o.longEdge = int(d); }
     else if (a == "--quality") { if (!number(d)) return false; o.quality = int(d); }
     else if (a == "--dump-params") o.dumpParams = true;
@@ -167,7 +170,7 @@ const char* supportText(Support s) {
   }
 }
 
-int cmdInfo(const std::vector<std::string>& files) {
+int cmdInfo(const std::vector<std::string>& files, bool anchor, bool full) {
   if (files.empty()) {
     std::fputs("info: no files given\n", stderr);
     return 2;
@@ -200,12 +203,24 @@ int cmdInfo(const std::vector<std::string>& files) {
     if (!m.rawFormat.empty()) std::printf("  raw format  %s\n", m.rawFormat.c_str());
     if (!m.inCameraLook.empty()) std::printf("  in-cam look %s\n", m.inCameraLook.c_str());
     std::printf("  as-shot WB  R %.3f  G 1  B %.3f\n", m.asShotWb[0], m.asShotWb[2]);
+    if (m.asShotCct > 0) std::printf("  illuminant  %.0f K  xy (%.4f, %.4f)  [%s]\n", m.asShotCct, m.asShotIlluminantXy[0], m.asShotIlluminantXy[1], m.illuminantSource.empty() ? "?" : m.illuminantSource.c_str());
     std::printf("  profile     %s (%s)  baseline %+.2f EV, contrast %+.0f\n", cam.id.c_str(), cam.displayName.c_str(),
                 cam.baselineExposureEv, cam.baselineContrast);
     std::printf("  transfer    FTP push: %s | USB PTP: %s | vendor app auto-send: %s%s%s\n", supportText(cam.transfer.ftpPush),
                 supportText(cam.transfer.usbPtp), supportText(cam.transfer.vendorAppAutoSend),
                 cam.transfer.vendorApp.empty() ? "" : " via ", cam.transfer.vendorApp.c_str());
     if (!cam.notes.empty()) std::printf("  notes       %s\n", cam.notes.c_str());
+    if (anchor) {  // the file's own exposure anchor (core/src/exposure_anchor.h)
+      auto src = decoder->decode(p, DecodeOptions{full ? DecodeQuality::Full : DecodeQuality::Preview});
+      if (!src) {
+        std::printf("  anchor      decode failed: %s\n", src.error().message.c_str());
+      } else {
+        const ShotMetadata& s = src->meta;
+        static const char* kTier[] = {"none (not a camera RAW)", "1 embedded preview", "2 DNG BaselineExposure", "3 scene statistics", "4 nothing usable"};
+        std::printf("  anchor      tier %s, %+.2f EV, confidence %.2f  (profile %s baseline %+.2f EV)\n", kTier[std::clamp(s.exposureAnchorTier, 0, 4)], s.exposureAnchorEv, s.exposureAnchorConfidence, cam.id.c_str(), cam.baselineExposureEv);
+        std::printf("              %s; preview %+.2f EV, stats %+.2f EV%s\n", s.exposureAnchorNote.c_str(), s.exposureAnchorPreviewEv, s.exposureAnchorStatsEv, s.exposureAnchorHasDng ? (", DNG tag " + std::to_string(s.exposureAnchorDngEv)).c_str() : "");
+      }
+    }
   }
   return rc;
 }
@@ -375,7 +390,7 @@ int cmdBench(const Options& o) {
     return 1;
   }
   if (o.longEdge > 0) src->linear = resizeToLongEdge(src->linear, o.longEdge);
-  const CameraProfile& cam = dev.cameras().resolve(src->meta.make, src->meta.model);
+  const CameraProfile cam = effectiveCamera(dev.cameras(), src->meta);
   std::vector<double> ms;
   int w = 0, h = 0;
   for (int i = 0; i < std::max(1, o.repeat) + 1; ++i) {
@@ -480,6 +495,8 @@ int cmdDumpLinear(const Options& o) {
   const std::int32_t hdr[2] = {img.width, img.height};
   f.write(reinterpret_cast<const char*>(hdr), sizeof hdr);
   f.write(reinterpret_cast<const char*>(img.data.data()), std::streamsize(img.data.size() * sizeof(float)));
+  std::printf("  as-shot WB %.3f %.3f %.3f  illuminant %.0f K [%s]\n", src->meta.asShotWb[0], src->meta.asShotWb[1], src->meta.asShotWb[2], src->meta.asShotCct, src->meta.illuminantSource.c_str());
+  if (!src->meta.dngCorrections.empty()) std::printf("  dng corrections: %s\n", src->meta.dngCorrections.c_str());
   std::printf("%s -> %s (%dx%d)\n", o.positional[0].c_str(), o.out.c_str(), img.width, img.height);
   return f ? 0 : 1;
 }
@@ -551,6 +568,8 @@ int main(int argc, char** argv) {
   }
   const std::string cmd = args[0];
   filmtool::installDefaultLibrary();
+  if (cmd == "motion-render") return motiontool::run({args.begin() + 1, args.end()});
+  if (cmd == "motion" && args.size() > 1 && args[1] == "render") return motiontool::run({args.begin() + 2, args.end()});
   if (mergetool::handles(cmd)) return mergetool::run(cmd, {args.begin() + 1, args.end()});
   if (filmtool::handles(cmd)) return filmtool::run(cmd, {args.begin() + 1, args.end()});
   if (cmd == "eval") return evaltool::cmdEval({args.begin() + 1, args.end()});
@@ -566,7 +585,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", err.c_str());
     return 2;
   }
-  if (cmd == "info") return cmdInfo(o.positional);
+  if (cmd == "info") return cmdInfo(o.positional, o.anchor, o.full);
   if (cmd == "develop") return cmdDevelop(o);
   if (cmd == "watch") return cmdWatch(o);
   if (cmd == "bench") return cmdBench(o);

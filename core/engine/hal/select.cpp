@@ -115,6 +115,10 @@ Selection selectDevice(const DeviceOptions& opt, const std::string& forcedIn, Se
     tryApi(Api::Vulkan, opt, vkTest, s);
     return s;
   }
+  if (f == "metal") {
+    tryApi(Api::Metal, opt, vkTest, s);
+    return s;
+  }
   if (f == "gles") {
     tryApi(Api::Gles31, opt, glesTest, s);
     return s;

@@ -3,6 +3,20 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+// Desktop test build (llvm-mingw): pread / O_BINARY shims. The file position is restored; the desktop decoder is single threaded per clip.
+#include <io.h>
+static ssize_t pread(int fd, void* buf, size_t n, off_t off) {
+  const long long cur = _lseeki64(fd, 0, SEEK_CUR);
+  if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
+  const int r = _read(fd, buf, (unsigned)n);
+  _lseeki64(fd, cur, SEEK_SET);
+  return r;
+}
+#define DV_O_BINARY O_BINARY
+#else
+#define DV_O_BINARY 0
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -393,7 +407,7 @@ extern "C" double dv_slog3_tonemap(double x) { return slogTonemap(x); }
 extern "C" int dv_detect_sony_gamma(const char* path, char* gamma, int gammaLen, char* primaries, int primLen) {
   std::string g, p;
   int r = 0;
-  int fd = open(path, O_RDONLY);
+  int fd = open(path, O_RDONLY | DV_O_BINARY);
   if (fd >= 0) {
     r = nrtFromFd(fd, g, p);
     close(fd);
@@ -673,7 +687,7 @@ extern "C" DvVideo* dv_open(const char* url, const DvOpenOptions* opts, DvInfo* 
     u = "fd:";
   } else {
     path = u;
-    v->srcFd = open(u.c_str(), O_RDONLY);
+    v->srcFd = open(u.c_str(), O_RDONLY | DV_O_BINARY);
   }
   int r = avformat_open_input(&v->fmt, u.c_str(), nullptr, &o);
   av_dict_free(&o);

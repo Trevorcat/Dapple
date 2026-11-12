@@ -49,6 +49,10 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
+  void _openCodecDiagnostics() {
+    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const CodecDiagnosticsPage()));
+  }
+
   Widget _phone(BuildContext context) => ListView(padding: const EdgeInsets.only(bottom: 120), children: [
         for (var i = 0; i < _cats.length; i++) ...[SectionTitle(_cats[i]), ..._section(context, i)],
       ]);
@@ -58,7 +62,8 @@ class _SettingsPageState extends State<SettingsPage> {
     return Row(children: [
       SizedBox(
         width: 240,
-        child: Column(children: [
+        // scrolls: on short (landscape) screens the six categories do not fit
+        child: ListView(key: const ValueKey('cat-list'), children: [
           for (var i = 0; i < _cats.length; i++)
             Semantics(
               button: true,
@@ -290,10 +295,15 @@ class _SettingsPageState extends State<SettingsPage> {
               key: 'licenses',
               onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => LicensesPage(app: app))),
               trailing: DIcon(DI.forward, size: 16, color: c.text2)),
-          // long-press: hidden codec diagnostics (no user-facing switches)
+          _row(context, '编解码器诊断',
+              key: 'codec-diagnostics',
+              sub: '本机视频编解码器与自检结果',
+              onTap: _openCodecDiagnostics,
+              trailing: DIcon(DI.forward, size: 16, color: c.text2)),
+          // the long-press on the version is kept as a shortcut
           _row(context, '版本',
               key: 'about-version',
-              onLongPress: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const CodecDiagnosticsPage())),
+              onLongPress: _openCodecDiagnostics,
               trailing: Text(kAppVersion, key: const ValueKey('about-version-value'), style: T.body17(c.text2, w: FontWeight.w400))),
         ];
       default:

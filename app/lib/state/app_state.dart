@@ -9,6 +9,8 @@ import 'package:flutter/widgets.dart' show GlobalKey, NavigatorState;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import '../services/live_edit.dart';
+import '../services/media_permission.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../model/catalog.dart';
@@ -338,12 +340,12 @@ class AppState extends ChangeNotifier {
           showToast('已连接');
           notifyListeners();
         } else {
-          // No camera transport yet: only the gallery permission can be (re)granted here.
+          // Wireless transfer works (camera FTP ingest, see the settings section): only the gallery permission can be (re)granted here.
           if (!mediaPermitted) {
             await requestPermission();
             if (!mediaPermitted) showToast('需要允许访问照片');
           } else {
-            showToast('相机无线接收暂未开放，目前从手机相册导入');
+            showToast('正在等待相机：请在相机上开启 FTP 传输并选择这台手机');
           }
         }
         break;
@@ -664,18 +666,17 @@ class AppState extends ChangeNotifier {
   }
 
   // ---------------------------------------------------------------- permissions
+  final MediaPermission _mediaPerm = MediaPermission();
   Future<void> refreshPermission() async {
     if (!Platform.isAndroid || isDemo) return;
-    final st = await Permission.photos.status; // READ_MEDIA_IMAGES on 13+, READ_EXTERNAL_STORAGE before
-    mediaPermitted = st.isGranted || st.isLimited;
+    mediaPermitted = await _mediaPerm.isGranted(); // READ_MEDIA_IMAGES on 13+, READ_EXTERNAL_STORAGE before
     linkDown = !mediaPermitted;
     notifyListeners();
   }
 
   Future<void> requestPermission() async {
     if (!Platform.isAndroid || isDemo) return;
-    final st = await Permission.photos.request();
-    mediaPermitted = st.isGranted || st.isLimited;
+    mediaPermitted = await _mediaPerm.request();
     linkDown = !mediaPermitted;
     notifyListeners();
     if (mediaPermitted) unawaited(scan());
@@ -754,18 +755,21 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// A phone-camera shot becomes a library photo like a camera arrival: the DNG is the source when the lens gave
-  /// one (the JPEG is kept as its instant preview and the gallery copy), else the JPEG is. Both files also go to
-  /// the gallery (Pictures/Dapple). Returns the new photo; development starts right away.
+  /// Capture ids whose developed JPEG still has to be written to the gallery (a DNG-only shot has no camera JPEG).
+  final Set<String> _galleryJpegPending = {};
+
+  /// A phone-camera shot becomes a library photo like a camera arrival: the DNG is the source when the lens gave one
+  /// (the camera JPEG, when there is one, is kept as its instant preview and the gallery copy), else the JPEG is.
+  /// A DNG without a camera JPEG gets its thumbnail and its gallery JPEG (Pictures/Dapple, next to the DNG) from the
+  /// engine's own develop of the DNG, as soon as that has run. Returns the new photo; development starts right away.
   Future<Photo> ingestCapture(CaptureResult r) async {
     final dir = captureInboxOverride ?? inbox;
     await dir.create(recursive: true);
-    final stem = p.basenameWithoutExtension(r.jpegPath);
-    final dng = r.dngPath;
+    final stem = r.stem;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final jpg = await _moveInto(r.jpegPath, p.join(dir.path, '$stem.jpg'));
-    final raw = dng == null ? null : await _moveInto(dng, p.join(dir.path, '$stem.dng'));
-    final src = raw ?? jpg;
+    final jpg = r.jpegPath == null ? null : await _moveInto(r.jpegPath!, p.join(dir.path, '$stem.jpg'));
+    final raw = r.dngPath == null ? null : await _moveInto(r.dngPath!, p.join(dir.path, '$stem.dng'));
+    final src = raw ?? jpg!;
     final id = 'cap:$stem';
     final ph = Photo(
       id: id,
@@ -777,18 +781,34 @@ class AppState extends ChangeNotifier {
       takenMs: nowMs,
     );
     _photos[id] = ph;
+    if (jpg == null) _galleryJpegPending.add(id);
     changed();
     _enqueue(id);
     _scheduleDetect();
     unawaited(() async {
       try {
-        await captureBackend.saveToGallery(jpg, '$stem.jpg', 'image/jpeg');
+        if (jpg != null) await captureBackend.saveToGallery(jpg, '$stem.jpg', 'image/jpeg');
         if (raw != null) await captureBackend.saveToGallery(raw, '$stem.dng', 'image/x-adobe-dng');
       } catch (e) {
         debugPrint('capture gallery save failed: $e');
       }
     }());
     return ph;
+  }
+
+  /// Capture ids still waiting for their developed gallery JPEG (tests).
+  @visibleForTesting
+  Set<String> get galleryJpegPending => _galleryJpegPending;
+
+  /// The developed JPEG of a DNG-only capture goes to the gallery next to the DNG (full size per the save-size setting).
+  Future<void> saveCaptureJpegToGallery(Photo ph) async {
+    if (!_galleryJpegPending.remove(ph.id)) return;
+    try {
+      final out = await exportStill(ph);
+      await captureBackend.saveToGallery(out, '${p.basenameWithoutExtension(ph.name)}.jpg', 'image/jpeg');
+    } catch (e) {
+      debugPrint('capture gallery jpeg failed: $e');
+    }
   }
 
   Future<String> _moveInto(String from, String to) async {
@@ -893,6 +913,7 @@ class AppState extends ChangeNotifier {
         final ph = _photos[_queue.removeAt(0)];
         if (ph == null || ph.status == PhotoStatus.done) continue;
         await _develop(ph);
+        if (ph.status == PhotoStatus.done && _galleryJpegPending.contains(ph.id)) await saveCaptureJpegToGallery(ph);
       }
     } finally {
       _working = false;
@@ -994,6 +1015,59 @@ class AppState extends ChangeNotifier {
   /// Renders a full-quality JPEG of [ph] into the exports cache. [cropOverride] applies a
   /// destination aspect ratio at export time only (requirements 4.11.2).
   Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride}) async {
+    // A Motion Photo made from a video exports as a Motion Photo: the edited still plus the clip rendered with the same edit (film included).
+    if (ph.kind == PhotoKind.live && ph.liveSrc != null && !isDemo) {
+      final live = await exportLive(ph, longEdge: longEdge, cropOverride: cropOverride);
+      if (live != null) return live;
+    }
+    return exportStill(ph, longEdge: longEdge, cropOverride: cropOverride);
+  }
+
+  /// Does the clip of [ph] go through the node graph? (the still has an edit, the automatic correction applies, or a destination crop is asked for)
+  bool liveEdited(Photo ph, {String? cropOverride}) => liveClipEdited(
+      userEdited: jsonEncode(ph.edit.toJson()) != jsonEncode(EditState.empty.toJson()),
+      autoCorrectionApplied: settings.autoProcess && (ph.correction?.isNotEmpty ?? false),
+      cropOverride: cropOverride);
+
+  /// The Motion Photo export: the edited still ([exportStill]) + the clip trimmed with [LiveBridge.trim] (with the still's edit when the still is
+  /// edited, as recorded otherwise) + the container. Null = the clip could not be produced (source video gone, decoder failure): the caller falls back
+  /// to the still alone, as before.
+  Future<String?> exportLive(Photo ph, {int? longEdge, String? cropOverride}) async {
+    final src = ph.liveSrc, startMs = ph.liveStartMs, coverMs = ph.liveCoverMs;
+    if (src == null || startMs == null || coverMs == null) return null;
+    final le = longEdge ?? settings.exportLongEdge;
+    final extra = <String, dynamic>{if (cropOverride != null && cropOverride != 'orig') 'crop': cropOverride};
+    final wire = wireParams(ph, override: extra);
+    final edited = liveEdited(ph, cropOverride: cropOverride);
+    final tag = jsonEncode([wire, le, settings.jpegQuality, edited, startMs, coverMs, ph.liveMute]).hashCode.toRadixString(16);
+    final stem = p.basenameWithoutExtension(ph.name).replaceFirst(RegExp(r'_MP$'), '');
+    final out = p.join(exports.path, '${stem}_dapple_${tag}_MP.jpg');
+    if (await File(out).exists()) return out;
+    final clip = p.join(exports.path, '${stem}_dapple_$tag.clip.mp4');
+    try {
+      final still = await exportStill(ph, longEdge: longEdge, cropOverride: cropOverride);
+      final edit = editedClipFor(wire: wire, edited: edited, coverMs: coverMs, stillLongEdge: le);
+      final t = await LiveBridge.trim(src,
+          startMs: startMs,
+          durationMs: (LiveDraft.windowSec * 1000).round(),
+          dest: clip,
+          mute: ph.liveMute,
+          source: LiveSource.fromCode(ph.liveSource),
+          edit: edit);
+      final rel = ((coverMs - t.actualStartMs) / 1000.0).clamp(0.0, LiveDraft.windowSec + 1.0).toDouble();
+      await engine.writeMotionPhoto(jpeg: still, mp4: clip, out: out, coverSec: rel);
+      return out;
+    } catch (e) {
+      debugPrint('exportLive: $e (the still is exported alone)');
+      _tryDelete(out);
+      return null;
+    } finally {
+      _tryDelete(clip);
+    }
+  }
+
+  /// Renders a full-quality JPEG of the still of [ph] (no clip).
+  Future<String> exportStill(Photo ph, {int? longEdge, String? cropOverride}) async {
     final le = longEdge ?? settings.exportLongEdge; // 0 = original size
     final extra = <String, dynamic>{if (cropOverride != null && cropOverride != 'orig') 'crop': cropOverride};
     final params = wireParams(ph, override: extra);
@@ -1044,7 +1118,7 @@ class AppState extends ChangeNotifier {
           continue;
         }
         final f = await exportJpeg(ph, longEdge: longEdge, cropOverride: cropOverride);
-        await MediaBridge.saveToGallery(f, '${p.basenameWithoutExtension(ph.name)}_dapple.jpg');
+        await MediaBridge.saveToGallery(f, f.endsWith('_MP.jpg') ? '${p.basenameWithoutExtension(ph.name).replaceFirst(RegExp(r'_MP$'), '')}_dapple_MP.jpg' : '${p.basenameWithoutExtension(ph.name)}_dapple.jpg');
         ph.exported = true;
         n++;
       } catch (e) {

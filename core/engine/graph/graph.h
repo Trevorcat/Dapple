@@ -81,6 +81,10 @@ class Graph {
   Hash128 structureHash() const;
   // Fills NodeInstance::key / family from a ParamSet.
   void computeKeys(const ParamSet& ps, const NodeRegistry& reg = NodeRegistry::instance());
+  // Video clips (docs/engine/pipeline-architecture.md section 30.4): computeKeys, then the keys of the frame-global solve nodes (Dehaze, Detail) are replaced by those of the
+  // same frame with ctx.frameIndex = 0, so the solve built from the reference frame is found again for every later frame (the film grain upstream of the solve
+  // carries the frame index into the keys; a solve per frame would make the airlight and the detail base flicker).
+  void computeKeysHoldingSolves(const ParamSet& ps, const NodeRegistry& reg = NodeRegistry::instance());
   // Stable text form used by the snapshot tests: one line per node with its inputs.
   std::string dump(bool withKeys = false) const;
 

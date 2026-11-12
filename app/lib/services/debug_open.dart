@@ -2,7 +2,9 @@
 // screenshots do not depend on blind taps. Push a JSON file into the app's external files folder
 //   adb push debug_open.json /sdcard/Android/data/com.dapple.dapple/files/debug_open.json
 // with  {"photo":"<file name substring or index>","group":"light","row":"exposure","collapsed":false,"stock":"kodak_portra_400"}
-// (group: an EGroup name; row: a parameter row id; both optional; {"close":true} goes back to the library).
+// (group: an EGroup name, the panel's categories being light / color / style (= 胶片) / effects (= 质地) / crop; row: the panel
+// layer - items, map, curve, hsl, grade, paper; "look":"warm" selects a style; "pad":{"light":[x,y,a]} sets a pad state before opening (x, y in -1..1,
+// a in 0..1, 0.5 = 100 %); "hold":"light" shows the hold popup; all optional; {"close":true} goes back to the library).
 // The file is read once a second and deleted when it has been applied. Release builds never start this.
 import 'dart:async';
 import 'dart:convert';
@@ -12,6 +14,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../model/pad_model.dart';
 import '../model/params.dart';
 import '../models.dart';
 import '../screens/editor/editor_page.dart';
@@ -54,10 +57,27 @@ class DebugOpen {
       photo ??= list.isEmpty ? null : list.first;
       if (photo == null) return;
       final g = j['group'] is String ? EGroup.values.where((e) => e.name == j['group']).firstOrNull : null;
+      if (j['reset'] == true) app.applyEdit(photo.id, (_) => EditState.empty);
       final stock = j['stock'];
       if (stock is String) app.applyEdit(photo.id, (e) => e.copyWith(film: stock.isEmpty ? null : stock));
+      final look = j['look'];
+      if (look is String) app.applyEdit(photo.id, (e) => e.copyWith(look: look.isEmpty ? null : look));
+      final pads = j['pad'];
+      if (pads is Map) {
+        final ctx = PadCtx(defaultTone: app.settings.toneStrength, defaultLookId: app.settings.defaultLookId);
+        for (final c in PadCat.values) {
+          final v = pads[c.name];
+          if (v is List && v.length >= 3) {
+            app.applyEdit(photo.id, (e) {
+              var n = e;
+              if (c == PadCat.film && n.film == null && app.film.stocks.isNotEmpty) n = n.copyWith(film: app.film.stocks.first.id);
+              return applyPadState(n, c, PadState(x: (v[0] as num).toDouble(), y: (v[1] as num).toDouble(), a: (v[2] as num).toDouble()), ctx);
+            });
+          }
+        }
+      }
       if (!ctx.mounted) return;
-      openEditor(ctx, app, photo.id, initialGroup: g, initialRow: j['row'] as String?, initialCollapsed: j['collapsed'] == true);
+      openEditor(ctx, app, photo.id, initialGroup: g, initialRow: j['row'] as String?, initialCollapsed: j['collapsed'] == true, initialHold: j['hold'] as String?);
     } catch (e) {
       debugPrint('debug_open failed: $e');
     }
