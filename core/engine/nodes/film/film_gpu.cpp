@@ -286,9 +286,15 @@ struct Mix3U {
 // film_v3 reads its taps straight through the texture path (no shared-memory column tile) on unified-memory GPUs (phone SoCs: Adreno
 // 840 runs it 2.2x faster, find-n5.md); the staged version stays for discrete GPUs (a few percent faster there).
 // DAPPLE_FILM_V3_DIRECT=0 / 1 forces either.
+std::atomic<int> g_v3Override{-1}, g_v3Verdict{-1};
 bool v3Direct(const hal::Device& d) {
   static const int forced = [] { const char* e = std::getenv("DAPPLE_FILM_V3_DIRECT"); return e && (e[0] == '0' || e[0] == '1') ? e[0] - '0' : -1; }();
-  return forced >= 0 ? forced == 1 : d.caps().unifiedMemory;
+  if (forced >= 0) return forced == 1;
+  const int o = g_v3Override.load();  // the warm-up measurement renders the frame with each variant
+  if (o >= 0) return o == 1;
+  const int v = g_v3Verdict.load();  // the measured verdict of this device (cached with the probe); no rule on platform or vendor
+  if (v >= 0) return v == 1;
+  return d.caps().unifiedMemory;  // before the measurement: the rule measured on Adreno
 }
 struct Mix3 {
   gpu::GpuRecorder& r;
@@ -857,6 +863,8 @@ void mergeSmallComps(fd::Mixture& m) {
 }  // namespace
 
 void setFilmMergeForTest(int mode) { g_mergeOverride = mode; }
+void setFilmV3Override(int direct) { g_v3Override = direct; }
+void setFilmV3Verdict(int direct) { g_v3Verdict = direct; }
 
 bool recordFilmPre(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, H src, int w, int h, FilmPre& out) {
   out = FilmPre{};
@@ -1077,7 +1085,10 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
   // the glare field first (it does not depend on the picture): blurred log-normal hash noise over the window grown by the blur radius
   H field = -1;
   int rgl = 0;
-  if (pl.glare) {
+  // the interactive tier leaves out the zero-mean glare noise (std dev ~3e-4 of the display range, wave 8: film_gnoise + its blur were 1.1 ms of a 7 ms frame on the
+  // Adreno 710); the settled frame has it. DAPPLE_FILM_GLARE_NOISE_INTERACTIVE=1 keeps it.
+  static const bool keepGlare = [] { const char* e = std::getenv("DAPPLE_FILM_GLARE_NOISE_INTERACTIVE"); return e && e[0] == '1'; }();
+  if (pl.glare && (res.quality != 1 || keepGlare)) {
     rgl = pd->rgl;
     if (rgl > kMaxTaps) {
       r.err = "film GPU: glare blur too wide";

@@ -4,6 +4,9 @@
 // sweep (docs/engine/pipeline-architecture.md 5.1 - 5.5).
 #include "engine/exec/gpu_executor.h"
 #include "determinism.h"
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include "engine/nodes/film/film_async.h"
 
 #include <algorithm>
@@ -29,7 +32,11 @@ namespace dapple::engine::gpu {
 // ============================================================================================ Core ===
 std::unique_ptr<Core> Core::create(const hal::DeviceOptions& opt, std::string& err) {
   std::unique_ptr<Core> c(new Core);
+#if defined(DAPPLE_HAL_METAL)
+  c->own_ = hal::createDevice(hal::Api::Metal, opt, err);
+#else
   c->own_ = hal::createDevice(hal::Api::Vulkan, opt, err);
+#endif
   if (!c->own_) return nullptr;
   c->dev_ = c->own_.get();
   return c->init(err) ? std::move(c) : nullptr;
@@ -1261,6 +1268,22 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   st.sweeps = in.plan.sweeps();
   st.passTimes.clear();
   for (const auto& t : cs.times) st.passTimes.push_back({t.name, t.ms});
+  {  // DAPPLE_GPU_PROFILE=1: the per-pass GPU times of every frame go to the log (wave 8: where a strength / kept-grain frame spends its time)
+    static const bool logPasses = std::getenv("DAPPLE_GPU_PROFILE") != nullptr && std::getenv("DAPPLE_GPU_PASSLOG") != nullptr;
+    if (logPasses && !cs.times.empty()) {
+      std::string line = "gpu passes:";
+      char b[64];
+      for (const auto& t : cs.times) {
+        std::snprintf(b, sizeof b, " %s %.2f;", t.name.c_str(), t.ms);
+        line += b;
+      }
+#if defined(__ANDROID__)
+      __android_log_print(ANDROID_LOG_INFO, "dapple_engine", "%s", line.c_str());
+#else
+      std::fprintf(stderr, "dapple_engine: %s\n", line.c_str());
+#endif
+    }
+  }
   st.uploadMs = uploadMs;
   st.readbackMs = copyMs;
   st.trimMs = trimMs;

@@ -21,6 +21,7 @@
 #include "dapple/renderer.h"
 #include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
+#include "engine/nodes/film/film_gpu.h"
 #include "engine/hal/select.h"
 #include "engine/nodes/gpu_common.h"
 #include "parity.h"
@@ -248,12 +249,13 @@ void probeLog(const std::string& text) {
 // Film pipelines and the default stock's tables, created before the first film frame asks for them (pipeline creation was 218 ms and the
 // table / plan upload 110-120 ms of the first film frame on the Find N5). Waits (bounded) for the app to set the film pack path. Returns the
 // milliseconds spent, -1 when there was nothing to warm.
+void measureFilmV3(const std::shared_ptr<Context>& ctx, const char* stock, std::string& note);
 double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note, bool* wrong = nullptr) {
   using Clk = std::chrono::steady_clock;
   const auto t0 = Clk::now();
   std::shared_ptr<const film::FilmLibrary> lib;
   for (int i = 0; i < 100 && !(lib = film::defaultLibrary()); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  if (!lib) return note = "no film library", -1.0;
+  if (!lib) return note = "film check skipped: no film library", -1.0;
   const char* stock = lib->find("kodak_portra_400") ? "kodak_portra_400" : nullptr;
   if (!stock) return note = "default stock missing", -1.0;
   const SourceImage src = dapple::gpu::makeTestImage(640, 427);
@@ -284,11 +286,13 @@ double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note, bool* wr
     job.request.bakeSize = 33;
     job.request.interactive = t.q == SpatialQuality::Interactive;
     job.request.activeParam = t.grain ? "film_grain" : (t.active ? t.active : "");
-    job.fastOptions.coarseFilm = t.active && std::string(t.active) != "film_strength";
+    fo.coarseFilm = t.active && std::string(t.active) != "film_strength";
     job.fastOptions = fo;
     job.store = &store;
     FrameResult res;
     if (!es.renderFrame(job, res)) note += (note.empty() ? "" : "; ") + res.error;
+    if (wrong && !t.grain && t.q == SpatialQuality::Interactive && !res.rgba)
+      note += (note.empty() ? "" : "; ") + std::string("film check skipped: the GPU frame returned no host pixels");
     if (wrong && !t.grain && t.q == SpatialQuality::Interactive && res.rgba) {
       // wave 8: the film path is part of the verdict. Forced GLES gave wrong film colours (mean dE 3 vs the CPU) on the Adreno 620 / 640 while the
       // point and spatial self-test passed; the same frame on the CPU is the reference, a device that disagrees is demoted by the caller.
@@ -309,6 +313,7 @@ double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note, bool* wr
     }
     std::free(res.rgba);
   }
+  measureFilmV3(ctx, stock, note);
   return std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
 }
 struct SelfTestOut {
@@ -424,6 +429,8 @@ Mode envMode() {
   char buf[PROP_VALUE_MAX] = {0};
   if (__system_property_get("debug.dapple.gpu", buf) > 0 && buf[0]) return buf[0] == '0' ? Mode::Off : buf[0] == '1' ? Mode::On : Mode::Auto;
   return Mode::Auto;  // the default: on after the self-test passed (docs/engine/pipeline-architecture.md 24)
+#elif defined(__APPLE__)
+  return Mode::Auto;  // Metal: probed in the background, CPU frames until it passed (the iOS app also sets DAPPLE_GPU=auto itself)
 #else
   return Mode::Off;
 #endif
@@ -455,6 +462,91 @@ struct Config {
 Config& config() {
   static Config* c = new Config;
   return *c;
+}
+
+// The dominant mixture pass both ways, once per device (wave 8): film_v3 with direct taps through the texture path or with the staged shared-memory
+// column tile. The answer depends on the GPU (Adreno 710: direct 5.3 ms vs staged 18.6; Apple M1: staged 5.5 vs direct 10.4, docs/ios/metal-backend.md), so
+// no rule on the platform, the vendor or the memory model: a final-tier film frame is rendered with each variant and the faster one is used for this
+// device. The verdict is cached next to the probe verdicts, keyed by build fingerprint + app version + API + device key.
+void measureFilmV3(const std::shared_ptr<Context>& ctx, const char* stock, std::string& note) {
+  using Clk = std::chrono::steady_clock;
+  if (const char* e = std::getenv("DAPPLE_FILM_V3_DIRECT")) {
+    if (e[0] == '0' || e[0] == '1') return;  // forced
+  }
+  std::string dir, app, fp;
+  {
+    std::lock_guard<std::mutex> lk(config().mu);
+    dir = config().dir;
+    app = config().app;
+    fp = config().fingerprint;
+  }
+  std::string path;
+  if (!dir.empty()) {
+    char nm[96];
+    const std::string key = fp + "|" + app + "|" + hal::apiName(ctx->api()) + "|" + ctx->caps().key();
+    std::snprintf(nm, sizeof nm, "film_v3_verdict_%016llx.txt", (unsigned long long)std::hash<std::string>{}(key));
+    path = (std::filesystem::path(dir) / nm).string();
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+      int v = -1;
+      const bool ok = std::fscanf(f, "%d", &v) == 1;
+      std::fclose(f);
+      if (ok && (v == 0 || v == 1)) {
+        engine::filmnode::setFilmV3Verdict(v);
+        note += (note.empty() ? "" : "; ") + std::string("film_v3 ") + (v ? "direct" : "staged") + " (cached verdict)";
+        return;
+      }
+    }
+  }
+  const SourceImage src = dapple::gpu::makeTestImage(1024, 683);
+  const auto cams = CameraRegistry::withBuiltins();
+  const CameraProfile& cam = cams.resolve("", "");
+  std::unique_ptr<IGpuExecutor> ex = ctx->createExecutor();
+  EngineSession es;
+  es.useGpuExecutor(ex.get(), true);
+  MemorySourceStore store(src);
+  auto timeVariant = [&](int direct) -> double {
+    engine::filmnode::setFilmV3Override(direct);
+    double best = 1e30;
+    for (int rep = 0; rep < 3; ++rep) {  // rep 0 compiles the variant's pipelines
+      EditParams p;
+      p.filmStock = stock;
+      Renderer r(p, cam, nullptr);
+      FastOptions fo;
+      fo.spatial = SpatialQuality::Full;
+      FrameJob job{p, r, src, nullptr, cam, nullptr, {}, {}, {}};
+      job.request.bakeSize = 33;
+      job.fastOptions = fo;
+      job.store = &store;
+      FrameResult res;
+      const auto t0 = Clk::now();
+      const bool ok = es.renderFrame(job, res);
+      const double ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+      std::free(res.rgba);
+      if (!ok || res.executor == "cpu") return -1.0;
+      if (rep > 0) best = std::min(best, ms);
+    }
+    return best;
+  };
+  const double tDirect = timeVariant(1), tStaged = timeVariant(0);
+  engine::filmnode::setFilmV3Override(-1);
+  if (tDirect < 0 || tStaged < 0) {
+    note += (note.empty() ? "" : "; ") + std::string("film_v3 not measured (the GPU frame failed)");
+    return;
+  }
+  const bool dflt = ctx->caps().unifiedMemory;  // the old rule decides a tie
+  const int verdict = tStaged < tDirect * 0.95 ? 0 : (tDirect < tStaged * 0.95 ? 1 : (dflt ? 1 : 0));
+  engine::filmnode::setFilmV3Verdict(verdict);
+  char b[160];
+  std::snprintf(b, sizeof b, "film_v3 direct %.1f ms vs staged %.1f ms -> %s", tDirect, tStaged, verdict ? "direct" : "staged");
+  note += (note.empty() ? "" : "; ") + std::string(b);
+  if (!path.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+      std::fprintf(f, "%d\n", verdict);
+      std::fclose(f);
+    }
+  }
 }
 
 std::string clean(std::string s) {
@@ -721,7 +813,7 @@ class ProviderImpl final : public GpuProvider {
     std::shared_ptr<Context> c;
     try {
 #if defined(__ANDROID__)
-      setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 10);  // never compete with the first paint
+      if (!std::getenv("DAPPLE_GPU_PROBE_NICE_OFF")) setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 10);  // never compete with the first paint
 #endif
       std::set<hal::Api> ex;
       {
@@ -777,6 +869,7 @@ class ProviderImpl final : public GpuProvider {
   std::shared_ptr<Context> make(std::string* why, const std::set<hal::Api>& excluded, std::string* tried) {
     ContextOptions o;
     if (const char* v = std::getenv("DAPPLE_GPU_SOFTWARE")) o.device.allowSoftware = v[0] == '1';
+    if (std::getenv("DAPPLE_GPU_PROFILE")) o.device.profile = true;  // per-pass timestamps (the engine log prints them with DAPPLE_GPU_PASSLOG=1)
     if (const char* v = std::getenv("DAPPLE_GPU_PIPELINE_CACHE")) o.device.pipelineCachePath = v;  // persisted VkPipelineCache
     const int pe = g_presentExt.load();
     o.device.presentExtensions = pe >= 0 ? pe != 0 : (std::getenv("DAPPLE_GPU_PRESENT") && std::getenv("DAPPLE_GPU_PRESENT")[0] == '1');

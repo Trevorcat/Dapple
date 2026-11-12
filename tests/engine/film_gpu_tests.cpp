@@ -678,6 +678,11 @@ void testFrames() {
   };
   const std::vector<Case> cases = {
       {"film portra400, all effects", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }, nullptr},
+      // the grain knob goes to 200 (wave 8): a path that clamps at 100 shows up here as a parity failure against the CPU (the iOS engineer's arm64 report)
+      {"film grain 150", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmGrain = 150; }, nullptr, false, false, true},
+      {"film grain 200", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmGrain = 200; }, nullptr, false, false, true},
+      {"film interactive grain drag 200", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmGrain = 200; },
+       [](FastOptions& o) { o.spatial = SpatialQuality::Interactive; o.noise = false; o.keepGrain = true; o.fullLongEdge = 3000; }},
       {"film velvia (slide), no grain", [](EditParams& p) { p.filmStock = "fujifilm_velvia_100"; p.filmGrain = 0; }, nullptr},
       {"film + geometry + vignette", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.straighten = 3.f; p.crop = "4:5"; p.vignette = -30; }, nullptr},
       {"film + NR, clarity, sharpen", [](EditParams& p) { p.filmStock = "kodak_ektar_100"; p.nrLuma = 30; p.clarity = 30; p.sharpen = 50; }, nullptr},

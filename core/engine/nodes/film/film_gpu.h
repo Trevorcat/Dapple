@@ -53,6 +53,9 @@ void releaseGpuPlan(gpu::Core& core, GpuFilmPlanRes& t);
 // RGBA32F display image (sRGB encoded, unclamped) or -1 (unsupported effect / error in `r.err`).
 // Test hook: -1 environment (default: on), 0 / 1 force the interactive-tier merging of the small exposure-mixture components off / on.
 void setFilmMergeForTest(int mode);
+// film_v3 variant (direct taps = 1, staged column tile = 0, -1 = no override): the warm-up renders a frame each way and keeps the faster one for the device
+void setFilmV3Override(int direct);
+void setFilmV3Verdict(int direct);
 gpu::H recordFilmFrame(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pr, gpu::H src,
                        int w, int h);
 

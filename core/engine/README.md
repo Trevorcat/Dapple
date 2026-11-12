@@ -44,3 +44,7 @@ whole-frame composition `runFilmFrame` is what a Film group executes (byte-ident
 Two more image nodes carry the enlarger diffusion filter (`FilmPrintExposure`, `FilmEnlargerBlur`, identity without the filter) and the highlight boost
 is part of `FilmBlurExposure`; both are driven by `FilmResolved::fx` (docs section 22, `film_boost.comp`, `film_point.comp` MODE 6 / 7).
 Gates: `film_nodes.*` (CPU, `film_nodes.fx` for the two effects) and `film_gpu.parity` (`-DDAPPLE_GPU=ON`, `DAPPLE_GPU_API=gles` for GLES). `DAPPLE_FILM_NODES=0` makes `renderer.cpp` use the simulator again.
+
+## Demosaic node (core/engine/nodes/demosaic, docs/engine/pipeline-architecture.md section 32)
+
+RAW mosaic -> linear working RGB: `decodeRawMosaic` (dapple/mosaic.h) returns the 16-bit mosaic with CFA, black / white, multipliers, matrix; `demosaic::demosaic` (CPU, std::thread tiles + halo, region of interest) and `demosaic::GpuDemosaic` (single-source GLSL `shaders/demosaic_*.comp`, Vulkan / GLES 3.1 / Metal) run the same Bayer (gradient-weighted Hamilton-Adams) and X-Trans (directional green + guide-weighted colour differences + median) kernels; `MosaicCache` caches the mosaic and the demosaiced picture by file content hash. Not yet a graph node: planner / executor / C API wiring is the hunk list in 32.9. Tests `demosaic.*` (ctest), evaluation against LibRaw `dapple_demosaic_eval file --out build/demosaic --gpu 1024 --proxy --cache`.
