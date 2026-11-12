@@ -3,19 +3,29 @@ package com.dapple.dapple
 import android.content.ContentUris
 import android.content.Context
 import android.graphics.Bitmap
+import android.media.Image
 import android.media.MediaCodec
+import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
+import android.os.Build
 import android.provider.MediaStore
+import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 
-/** Platform side of "video -> Motion Photo": listing, filmstrip / cover frames, stream-copy trimming. */
+/** The platform has no decoder that can decode this stream correctly; it would hand back false-colour frames. */
+class UnsupportedVideo(msg: String) : Exception(msg)
+
+/** Platform side of "video -> Motion Photo": MediaStore listing, the decoder decision (probe), and the calls into core/video + the encoders ([SoftwareMedia]). */
 class LiveBridge(private val ctx: Context) {
+    private companion object { const val TAG = "DappleLive" }
+    private val sw by lazy { SoftwareMedia(ctx) }
+
 
     fun listVideos(limit: Int): List<Map<String, Any?>> {
         val base = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
@@ -46,6 +56,28 @@ class LiveBridge(private val ctx: Context) {
         return out
     }
 
+    /** The newest MediaStore video whose file name is [stem].<ext>, same shape as a listVideos row; null when gone. */
+    fun findVideo(stem: String): Map<String, Any?>? {
+        val base = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        val proj = arrayOf(
+            MediaStore.Video.Media._ID, MediaStore.Video.Media.DISPLAY_NAME, MediaStore.Video.Media.DURATION,
+            MediaStore.Video.Media.SIZE, MediaStore.Video.Media.DATE_ADDED, MediaStore.Video.Media.WIDTH, MediaStore.Video.Media.HEIGHT,
+        )
+        val esc = stem.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        ctx.contentResolver.query(base, proj, "${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? ESCAPE '\\' AND ${MediaStore.Video.Media.SIZE} > 0",
+            arrayOf("$esc.%"), "${MediaStore.Video.Media.DATE_ADDED} DESC")?.use { c ->
+            if (c.moveToFirst()) {
+                val id = c.getLong(0)
+                return mapOf(
+                    "id" to id, "uri" to ContentUris.withAppendedId(base, id).toString(), "name" to c.getString(1),
+                    "durationMs" to c.getLong(2), "size" to c.getLong(3), "addedMs" to c.getLong(4) * 1000L,
+                    "width" to c.getInt(5), "height" to c.getInt(6),
+                )
+            }
+        }
+        return null
+    }
+
     private fun retriever(uri: String): MediaMetadataRetriever {
         val r = MediaMetadataRetriever()
         if (uri.startsWith("/")) r.setDataSource(uri) else r.setDataSource(ctx, Uri.parse(uri))
@@ -63,161 +95,169 @@ class LiveBridge(private val ctx: Context) {
                 "rotation" to (s(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0),
                 "hasAudio" to (s(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes"),
                 "mime" to s(MediaMetadataRetriever.METADATA_KEY_MIMETYPE),
-            )
+                "decodable" to (probe(uri)["decodable"] == true),
+                "software" to (probe(uri)["software"] == true),
+                "format" to probe(uri)["format"],
+            ) + coreInfo(uri)
         } finally {
             r.release()
         }
     }
 
-    private fun scaleDown(b: Bitmap, maxEdge: Int): Bitmap {
-        if (maxEdge <= 0 || maxOf(b.width, b.height) <= maxEdge) return b
-        val k = maxEdge.toFloat() / maxOf(b.width, b.height)
-        val s = Bitmap.createScaledBitmap(b, maxOf(1, (b.width * k).toInt()), maxOf(1, (b.height * k).toInt()), true)
-        if (s !== b) b.recycle()
-        return s
-    }
 
-    private fun frame(r: MediaMetadataRetriever, timeMs: Long, maxEdge: Int, exact: Boolean): Bitmap? {
-        val opt = if (exact) MediaMetadataRetriever.OPTION_CLOSEST else MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-        val t = timeMs * 1000L
-        if (maxEdge > 0) {
-            try {
-                val w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
-                val h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
-                val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-                val uw = if (rot == 90 || rot == 270) h else w
-                val uh = if (rot == 90 || rot == 270) w else h
-                if (uw > 0 && uh > 0) {
-                    val k = maxEdge.toFloat() / maxOf(uw, uh)
-                    if (k < 1f) return r.getScaledFrameAtTime(t, opt, maxOf(1, (uw * k).toInt()), maxOf(1, (uh * k).toInt()))
-                }
-            } catch (_: Exception) {}
-        }
-        return r.getFrameAtTime(t, opt)?.let { scaleDown(it, maxEdge) }
-    }
-
-    private fun writeJpeg(b: Bitmap, dest: File, quality: Int) {
-        dest.parentFile?.mkdirs()
-        FileOutputStream(dest).use { b.compress(Bitmap.CompressFormat.JPEG, quality, it) }
-    }
-
-    /** One JPEG per entry of [timesMs] (filmstrip). Missing frames are null. */
-    fun thumbs(uri: String, timesMs: List<Long>, maxEdge: Int, destDir: String, prefix: String): List<String?> {
-        val r = retriever(uri)
-        try {
-            val dir = File(destDir)
-            return timesMs.mapIndexed { i, t ->
-                try {
-                    val b = frame(r, t, maxEdge, false) ?: return@mapIndexed null
-                    val f = File(dir, "${prefix}_$i.jpg")
-                    writeJpeg(b, f, 80)
-                    b.recycle()
-                    f.path
-                } catch (_: Exception) { null }
+    /** What the core finds in the file: bit depth, colour classification, Sony S-Log3 metadata, audio. Empty when it cannot open it. */
+    private fun coreInfo(uri: String): Map<String, Any?> {
+        if (!SwVideo.available || probe(uri)["decodable"] != true) return emptyMap()
+        return try {
+            SwVideo.open(ctx, uri, decodeSel(uri), SwVideo.SRC_AUTO).use { s ->
+                val i = s.info
+                mapOf(
+                    "bitDepth" to i.bitDepth, "chroma" to i.chroma, "colorKind" to i.colorKind, "hdr" to i.hdr,
+                    "slogDetected" to i.slogDetected, "captureGamma" to i.captureGamma, "capturePrimaries" to i.capturePrimaries,
+                    "decoder" to i.decoder, "hardwareDecode" to i.hardware, "audioCodec" to i.audioCodec,
+                )
             }
-        } finally {
-            r.release()
-        }
+        } catch (_: Exception) { emptyMap() }
     }
 
-    /** The exact frame at [timeMs] as a JPEG (the Motion Photo still). */
-    fun frameToFile(uri: String, timeMs: Long, dest: String, maxEdge: Int, quality: Int): String {
-        val r = retriever(uri)
-        try {
-            val b = frame(r, timeMs, maxEdge, true) ?: throw IllegalStateException("no frame at $timeMs ms")
-            writeJpeg(b, File(dest), quality)
-            b.recycle()
-            return dest
-        } finally {
-            r.release()
-        }
+    private val probeCache = HashMap<String, Map<String, Any?>>()
+
+    /**
+     * Can the platform decode the first video track of [uri] correctly? Platform decoders (the emulator's in
+     * particular) can accept a 4:2:2 / 10-bit H.264 stream and still return false-colour frames instead of failing,
+     * so the stream is checked against the decoders' advertised profiles before any frame is trusted.
+     */
+    fun probe(uri: String): Map<String, Any?> = synchronized(probeCache) {
+        probeCache.getOrPut(uri) { doProbe(uri) }
     }
 
     /**
-     * Stream-copies [startMs, startMs + durationMs] of the video into [dest] (MP4, no re-encode). The cut starts at
-     * the preceding key frame, so the clip may begin up to one GOP earlier than asked; the real start is returned.
-     * Audio that MP4 cannot carry (PCM) is left out.
+     * Probes the video embedded in a Motion Photo JPEG (located through the Container XMP item length; the MP4 is the
+     * file tail). Used to find items written before the software path existed, whose clip is an undecodable
+     * 10-bit / 4:2:2 stream copy. Same map as [probe]; "decodable" is true when the file has no clip.
      */
-    fun trim(uri: String, startMs: Long, durationMs: Long, dest: String, mute: Boolean): Map<String, Any?> {
-        val ex = MediaExtractor()
-        if (uri.startsWith("/")) ex.setDataSource(uri) else ex.setDataSource(ctx, Uri.parse(uri), null)
-        var vTrack = -1
-        var aTrack = -1
-        for (i in 0 until ex.trackCount) {
-            val mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
-            if (mime.startsWith("video/") && vTrack < 0) vTrack = i
-            else if (mime.startsWith("audio/") && aTrack < 0) aTrack = i
+    fun probeEmbedded(path: String): Map<String, Any?> {
+        try {
+            val file = File(path)
+            val head = ByteArray(minOf(file.length(), 262144L).toInt())
+            file.inputStream().use { it.read(head) }
+            val xmp = String(head, Charsets.ISO_8859_1)
+            val m = Regex("Item:Mime=\"video/mp4\"[^>]*?Item:Length=\"(\\d+)\"|Item:Length=\"(\\d+)\"[^>]*?Item:Mime=\"video/mp4\"").find(xmp)
+            val len = (m?.groupValues?.get(1)?.toLongOrNull() ?: m?.groupValues?.get(2)?.toLongOrNull()) ?: 0L
+            if (len <= 0 || len >= file.length()) return mapOf("decodable" to true, "software" to false, "format" to "no clip")
+            return doProbe(path, file.length() - len, len)
+        } catch (e: Exception) {
+            return mapOf("decodable" to true, "software" to false, "format" to "unknown")
         }
-        if (vTrack < 0) { ex.release(); throw IllegalStateException("no video track") }
-        var rotation = 0
+    }
+
+    private fun doProbe(uri: String, offset: Long = -1, length: Long = -1): Map<String, Any?> {
+        val ex = MediaExtractor()
         try {
-            val r = retriever(uri)
-            rotation = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-            r.release()
-        } catch (_: Exception) {}
-        val destFile = File(dest)
-        destFile.parentFile?.mkdirs()
-        destFile.delete()
-        val muxer = MediaMuxer(dest, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        try {
-            muxer.setOrientationHint(rotation)
-            val vOut = muxer.addTrack(ex.getTrackFormat(vTrack))
-            var aOut = -1
-            if (!mute && aTrack >= 0) {
-                try { aOut = muxer.addTrack(ex.getTrackFormat(aTrack)) } catch (_: Exception) { aOut = -1 }
+            if (offset >= 0) {
+                java.io.FileInputStream(uri).use { ex.setDataSource(it.fd, offset, length) }
+            } else if (uri.startsWith("/")) ex.setDataSource(uri) else ex.setDataSource(ctx, Uri.parse(uri), null)
+            var f: MediaFormat? = null
+            for (i in 0 until ex.trackCount) {
+                val tf = ex.getTrackFormat(i)
+                if ((tf.getString(MediaFormat.KEY_MIME) ?: "").startsWith("video/")) { f = tf; break }
             }
-            val startUs = startMs * 1000L
-            val endUs = (startMs + durationMs) * 1000L
-            ex.selectTrack(vTrack)
-            ex.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-            val baseUs = maxOf(0L, ex.sampleTime)
-            if (aOut >= 0) {
-                ex.selectTrack(aTrack)
-                ex.seekTo(baseUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            if (f == null) return mapOf("decodable" to false, "reason" to "no video track", "format" to "none")
+            val mime = f.getString(MediaFormat.KEY_MIME)!!
+            var need = 0
+            var label = mime
+            var bitDepth = 8
+            var chroma = 1
+            if (f.containsKey("csd-0") && (mime == "video/avc" || mime == "video/hevc")) {
+                val bb = f.getByteBuffer("csd-0")!!.duplicate()
+                val arr = ByteArray(bb.remaining()); bb.get(arr)
+                if (mime == "video/avc") {
+                    val fmt = StreamProbe.parseAvcSps(arr)
+                    if (fmt != null) { label = fmt.label; need = fmt.requiredProfile; bitDepth = fmt.bitDepthLuma; chroma = fmt.chromaFormatIdc }
+                } else {
+                    val fmt = HevcProbe.parseSps(arr)
+                    if (fmt != null) { label = fmt.label; need = fmt.requiredProfile; bitDepth = fmt.bitDepthLuma; chroma = fmt.chromaFormatIdc }
+                }
+            } else if (Build.VERSION.SDK_INT >= 33 && f.containsKey(MediaFormat.KEY_PROFILE)) {
+                need = f.getInteger(MediaFormat.KEY_PROFILE)
+                label = "$mime profile $need"
             }
-            var maxIn = 1 shl 20
-            for (t in listOf(vTrack, aTrack)) if (t >= 0) {
-                val f = ex.getTrackFormat(t)
-                if (f.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) maxIn = maxOf(maxIn, f.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
-            }
-            var buf = ByteBuffer.allocateDirect(maxOf(maxIn, 4 shl 20))
-            val info = MediaCodec.BufferInfo()
-            muxer.start()
-            var frames = 0
-            var lastUs = baseUs
-            while (true) {
-                val track = ex.sampleTrackIndex
-                if (track < 0) break
-                val pts = ex.sampleTime
-                if (track == vTrack && pts > endUs) break
-                if (track == aTrack && pts > endUs) { ex.advance(); continue }
-                if (track == aTrack && pts < baseUs) { ex.advance(); continue }
-                val size = ex.sampleSize.toInt()
-                if (size > buf.capacity()) buf = ByteBuffer.allocateDirect(size)
-                buf.clear()
-                val n = ex.readSampleData(buf, 0)
-                if (n < 0) break
-                info.set(0, n, pts - baseUs, 0)
-                info.flags = if (ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                if (track == vTrack) { muxer.writeSampleData(vOut, buf, info); frames++; lastUs = maxOf(lastUs, pts) }
-                else if (aOut >= 0 && track == aTrack) muxer.writeSampleData(aOut, buf, info)
-                ex.advance()
-            }
-            muxer.stop()
+            val hw = need >= 0 && try {
+                MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { ci ->
+                    if (ci.isEncoder || !ci.supportedTypes.any { it.equals(mime, true) }) return@any false
+                    // plain 8-bit 4:2:0 needs no particular profile; anything else must be advertised
+                    need == 0 || ci.getCapabilitiesForType(mime).profileLevels.any {
+                        it.profile == need || (mime == "video/hevc" && need == 2 && (it.profile == 0x1000 || it.profile == 0x2000))
+                    }
+                }
+            } catch (_: Exception) { true }
+            // No platform decoder: fall back to the FFmpeg software decoder (H.264 / HEVC only).
+            val sw = !hw && (mime == "video/avc" || mime == "video/hevc") && SwVideo.available
+            // the codec ladder decides which decoder the core uses: declared profile + output format, and for 10-bit hardware a
+            // one-time self-test (CodecManager); software FFmpeg is always the last rung
+            val pick = if (hw && SwVideo.available) CodecManager.get(ctx).decodeFor(StreamSpec(mime, need, bitDepth, chroma)) else DecodePick(DecodeRoute.SOFTWARE, null)
+            Log.i(TAG, "probe $label: ${if (hw) "declared by the platform" else if (sw) "software (FFmpeg)" else "unsupported"}; decode route ${pick.route} ${pick.codec ?: ""}")
             return mapOf(
-                "actualStartMs" to baseUs / 1000L,
-                "durationMs" to (lastUs - baseUs) / 1000L,
-                "frames" to frames,
-                "audio" to (aOut >= 0),
-                "path" to dest,
+                "decodable" to (hw || sw), "hardware" to (pick.route != DecodeRoute.SOFTWARE), "software" to (sw || pick.route == DecodeRoute.SOFTWARE),
+                "route" to pick.route.name, "hwPref" to pick.route.hwPref, "hwCodec" to pick.codec,
+                "reason" to (if (hw || sw) "" else label), "format" to label,
             )
         } catch (e: Exception) {
-            try { muxer.release() } catch (_: Exception) {}
-            destFile.delete()
-            throw e
+            // unreadable source: let the normal paths report their own error
+            return mapOf("decodable" to true, "reason" to "", "format" to "unknown")
         } finally {
-            try { muxer.release() } catch (_: Exception) {}
             ex.release()
         }
+    }
+
+    private fun requireDecodable(uri: String) {
+        val p = probe(uri)
+        if (p["decodable"] != true) throw UnsupportedVideo("unsupported video: ${p["reason"]}")
+    }
+
+    private fun decodeSel(uri: String): SwVideo.DecodeSel {
+        val p = probe(uri)
+        return SwVideo.DecodeSel((p["hwPref"] as? Int) ?: if (p["hardware"] == true) 1 else 0, p["hwCodec"] as? String)
+    }
+
+    /**
+     * What the clip encoder can do on this device: whether an HEVC Main10 (P010) encoder exists for 1080p30 and which one.
+     * The probe's verdict on [uri] is the decoder decision input; this is its encoder counterpart.
+     */
+    fun capabilities(): Map<String, Any?> {
+        val mgr = CodecManager.get(ctx)
+        val first = mgr.encodeCandidates(EncodeJob(1920, 1080, 30)).firstOrNull()
+        return mapOf(
+            "main10Encoder" to first?.takeIf { it.rung.tenBit }?.codec, "ultraHdr" to (Build.VERSION.SDK_INT >= 34),
+            "videoLib" to SwVideo.version(),
+        )
+    }
+
+    /** The codec capability report (declared capabilities, ladders, self-test results) as JSON; [run] first runs every missing self-test, [force] repeats all. */
+    fun codecReport(run: Boolean, force: Boolean): String {
+        val mgr = CodecManager.get(ctx)
+        if (run || force) mgr.runAll(force)
+        return mgr.report().toString()
+    }
+
+    /** One JPEG per entry of [timesMs] (filmstrip). Missing frames are null. */
+    fun thumbs(uri: String, timesMs: List<Long>, maxEdge: Int, destDir: String, prefix: String, source: Int): List<String?> {
+        if (probe(uri)["decodable"] != true) return timesMs.map { null }
+        return sw.thumbs(uri, decodeSel(uri), source, timesMs, maxEdge, destDir, prefix)
+    }
+
+    /** The exact frame at [timeMs] as a JPEG (the Motion Photo still): Ultra HDR for HDR sources, dithered SDR otherwise. */
+    fun frameToFile(uri: String, timeMs: Long, dest: String, maxEdge: Int, quality: Int, source: Int, compat: Boolean): Map<String, Any?> {
+        requireDecodable(uri)
+        return sw.frame(uri, decodeSel(uri), source, timeMs, dest, maxEdge, quality, compat)
+    }
+
+    /**
+     * Decodes (core/video) and re-encodes [startMs, startMs + durationMs] into [dest] (MP4): HEVC Main10 when the device has an
+     * encoder for it, else 8-bit H.264 ([compat] forces the 8-bit H.264 + SDR sharing version); LPCM audio becomes AAC.
+     */
+    fun trim(uri: String, startMs: Long, durationMs: Long, dest: String, mute: Boolean, source: Int, compat: Boolean, film: Boolean = false): Map<String, Any?> {
+        requireDecodable(uri)
+        return sw.clip(uri, decodeSel(uri), source, startMs, durationMs, dest, mute, compat, film)
     }
 }

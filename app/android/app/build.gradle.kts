@@ -34,7 +34,10 @@ android {
                     "-DANDROID_STL=c++_shared",
                     "-DFETCHCONTENT_SOURCE_DIR_LIBRAW=F:/projects/sony-render/tools/_dl/libraw/LibRaw-0.22.2",
                 )
-                targets("dapple")
+                // GPU compute backend (core/gpu, docs/engine/gpu-backend.md): off unless built with -Pdapple.gpu=true.
+                // Even then it only runs when the runtime flag is set (dapple_gpu_set_enabled / debug.dapple.gpu).
+                if (project.hasProperty("dapple.gpu")) arguments("-DDAPPLE_GPU=ON")
+                targets("dapple", "dapple_video")
             }
         }
     }
@@ -46,6 +49,8 @@ android {
             version = "3.31.6"
         }
     }
+
+    sourceSets["main"].jniLibs.srcDir("../../../tools/ffmpeg/jniLibs")
 
     packaging {
         jniLibs {
@@ -71,4 +76,8 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    testImplementation("junit:junit:4.13.2")
 }

@@ -39,6 +39,24 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         val messenger = flutterEngine.dartExecutor.binaryMessenger
 
+        // Editor landmark haptics (requirements 4.15.9): View.performHapticFeedback with the
+        // finest constant the OS offers. Numeric values so this compiles against any compileSdk.
+        MethodChannel(messenger, "dapple/haptics").setMethodCallHandler { call, result ->
+            if (call.method != "perform") {
+                result.notImplemented()
+                return@setMethodCallHandler
+            }
+            val sdk = Build.VERSION.SDK_INT
+            val constant = when (call.arguments as? String) {
+                "autoSnap" -> if (sdk >= 34) 27 /* SEGMENT_TICK */ else 4 /* CLOCK_TICK */
+                "detent" -> if (sdk >= 34) 26 /* SEGMENT_FREQUENT_TICK */ else 4
+                "endStop" -> if (sdk >= 30) 16 /* CONFIRM */ else 0 /* LONG_PRESS */
+                else -> -1
+            }
+            if (constant >= 0) window.decorView.performHapticFeedback(constant)
+            result.success(null)
+        }
+
         MethodChannel(messenger, "dapple/media").setMethodCallHandler { call, result ->
             when (call.method) {
                 "queryNew" -> {
@@ -74,6 +92,7 @@ class MainActivity : FlutterActivity() {
                     val name = call.argument<String>("name")!!
                     io.execute {
                         try {
+                            if (call.argument<Boolean>("replace") == true) removeOwnGalleryItems(name)
                             val uri = saveJpegToGallery(src, name)
                             main.post { result.success(uri) }
                         } catch (e: Exception) {
@@ -106,19 +125,25 @@ class MainActivity : FlutterActivity() {
                     val v = f()
                     main.post { result.success(v) }
                 } catch (e: Exception) {
-                    main.post { result.error("live", e.message ?: e.toString(), null) }
+                    main.post { result.error(if (e is UnsupportedVideo) "unsupported" else "live", e.message ?: e.toString(), null) }
                 }
             }
             when (call.method) {
                 "listVideos" -> { val n = call.argument<Int>("limit") ?: 50; run { live.listVideos(n) } }
                 "info" -> { val u = call.argument<String>("uri")!!; run { live.info(u) } }
+                "probe" -> { val u = call.argument<String>("uri")!!; run { live.probe(u) } }
+                "capabilities" -> run { live.capabilities() }
+                "codecReport" -> { val r = call.argument<Boolean>("run") ?: false; val f = call.argument<Boolean>("force") ?: false; run { live.codecReport(r, f) } }
+                "findVideo" -> { val n = call.argument<String>("stem")!!; run { live.findVideo(n) } }
+                "probeEmbedded" -> { val u = call.argument<String>("path")!!; run { live.probeEmbedded(u) } }
                 "thumbs" -> {
                     val u = call.argument<String>("uri")!!
                     val t = call.argument<List<Number>>("timesMs")!!.map { it.toLong() }
                     val edge = call.argument<Int>("maxEdge") ?: 160
                     val dir = call.argument<String>("destDir")!!
                     val prefix = call.argument<String>("prefix") ?: "t"
-                    run { live.thumbs(u, t, edge, dir, prefix) }
+                    val src = call.argument<Int>("source") ?: 0
+                    run { live.thumbs(u, t, edge, dir, prefix, src) }
                 }
                 "frame" -> {
                     val u = call.argument<String>("uri")!!
@@ -126,7 +151,9 @@ class MainActivity : FlutterActivity() {
                     val d = call.argument<String>("dest")!!
                     val edge = call.argument<Int>("maxEdge") ?: 0
                     val q = call.argument<Int>("quality") ?: 92
-                    run { live.frameToFile(u, t, d, edge, q) }
+                    val src = call.argument<Int>("source") ?: 0
+                    val compat = call.argument<Boolean>("compat") ?: false
+                    run { live.frameToFile(u, t, d, edge, q, src, compat) }
                 }
                 "trim" -> {
                     val u = call.argument<String>("uri")!!
@@ -134,7 +161,10 @@ class MainActivity : FlutterActivity() {
                     val dur = (call.argument<Number>("durationMs") ?: 3000).toLong()
                     val d = call.argument<String>("dest")!!
                     val mute = call.argument<Boolean>("mute") ?: false
-                    run { live.trim(u, s0, dur, d, mute) }
+                    val src = call.argument<Int>("source") ?: 0
+                    val compat = call.argument<Boolean>("compat") ?: false
+                    val film = call.argument<Boolean>("film") ?: false
+                    run { live.trim(u, s0, dur, d, mute, src, compat, film) }
                 }
                 else -> result.notImplemented()
             }
@@ -243,6 +273,20 @@ class MainActivity : FlutterActivity() {
             }
         }
         return out
+    }
+
+    /** Deletes this app's earlier Pictures/Dapple items called [name] (a regenerated Motion Photo replaces them). */
+    private fun removeOwnGalleryItems(name: String) {
+        try {
+            val n = contentResolver.delete(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                "${MediaStore.Images.Media.DISPLAY_NAME} = ? AND ${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?",
+                arrayOf(name, "Pictures/Dapple%"),
+            )
+            android.util.Log.i("DappleLive", "replaced $n gallery item(s) named $name")
+        } catch (e: Exception) {
+            android.util.Log.w("DappleLive", "could not remove old gallery item $name: $e")
+        }
     }
 
     private fun saveJpegToGallery(src: File, name: String): String {
