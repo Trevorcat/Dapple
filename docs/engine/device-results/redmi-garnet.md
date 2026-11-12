@@ -278,3 +278,59 @@ The 4-5 ms every frame seemed to cost in app-like mode is a **measurement artifa
 ## 29. Not done in round 7
 
 Item 5 (fence-and-swap upload, disk persistence of per-stock tables / calibration / grain tables, 'warm from disk'), item 6 (bands under the 16 MiB step), item 7 (interactive-size seeding and the visual-cost table), item 8 (raster prototype: no evidence for Adreno either way, closed only by measurement; the M1 report argues against it), item 9 (re-point `film_match*.cpp`). The demosaic engineer's hunks have not arrived.
+
+# Round 8 (touch keep-warm, interactive-size seed, fence-and-swap LUT)
+
+## 30. Item 1: the idle-gap clock, measured as the user feels it, and a keep-warm that works
+
+Bench `dapple_drag_bench ... idlegap` (Redmi, 480 px interactive frames, a film_latitude drag of 30 frames after a pause; per-frame times of the first 10 printed; app-like probe/warm-up mode). **The slow clock after a pause does not ramp within the drag**: it stays for all 30 frames (0.2-0.6 s) at a lower level and a normal drag never lifts it, because its frames (7-11 ms with host gaps) do not keep the GPU busy enough for the governor.
+
+| gap before the drag | no hint: first frame | frames 1-10 mean | frames 11-30 median |
+|---|---|---|---|
+| 1 s | 10.7-11.1 ms | 6.9-7.1 | 6.4-6.6 |
+| 3 s | 17.8-21.4 | 10.6-12.4 | 10.3-11.1 |
+| 10 s | 18.7-21.7 | 11.7-12.4 | 10.1-11.1 (one run of the day: 19.8-21.5, the phone's slower state) |
+
+Keep-warm: **`dapple_session_touch_hint(session, burst_ms)`** (`c_api.cpp`, `dapple_c.h`; burst_ms < 0 = "prepare": one burst-size frame so its plans exist, call it once at idle after the first frame; 0 = no-op). On pointer-down, before the first parameter change, a background thread renders the newest interactive frame request again at 3x the long edge (`DAPPLE_HINT_SCALE`, default 3; the GPU has to be close to saturated, the same-size frame and 2x did not lift the clock: first frame 10.9 -> 10.9 and 11.2 ms medians) for `burst_ms` or until a real frame is requested; the results are dropped. It costs power only while a finger is down, ~80 ms per touch.
+
+| gap | hint 80-120 ms, first movement >= 100 ms after touch-down: first frame | frames 1-10 mean | frames 11-30 median |
+|---|---|---|---|
+| 1 s | 4.7-11.4 ms | 4.1-4.8 | 3.9-4.1 |
+| 3 s | 4.5-5.2 | 4.1-4.2 | 4.0-4.1 |
+| 10 s | 4.9 | 4.2 | 4.0 |
+
+So with the hint every frame of the drag is ~4 ms (top clock, below the fast state's 6.5) instead of 10-11 ms; the first frame goes 18-21 -> 4.5-5 ms. If the first movement comes sooner than the burst ends, the real frame waits for the burst frame in flight (touch-down to movement 60 ms, burst 120 ms: first frame 32-43 ms, then 3-4 ms: frames 1-10 mean 6.8-7.9 vs 10.6-12.4 without the hint), so the app should use burst_ms 80 and call the hint on pointer-down, and call the prepare form once per photo. The view API does not wrap it yet (`dapple_view` has the session: one line in the Dart pointer-down handler of the editor via `dapple_session_touch_hint`; **not wired and not run in the app**). ADPF through the app layer (PerformanceHintManager) was not built: the burst works without it and is the same mechanism on every platform; ADPF would be an additional hint where present.
+
+## 31. Item 4: interactive-size seed and the visual cost of the interactive size
+
+The warm-up that decides film_v3 now also times the interactive film frame (960x640 test image, up to 14 rounds until three consecutive rounds agree within 15 %, the minimum is kept) and stores **ms per megapixel** in the same cached verdict file (`film_v3_verdict_*.txt`, `<verdict> <ms/Mpx>`), exported as `"filmMsPerMpx"` in `dapple_gpu_status_json`. `AdaptiveQuality.seedFromMeasurement` (Dart, `adaptive_quality.dart`, called from `editor_engine.dart` at photo open until seeded) starts the drag at the largest rung whose predicted cost (a 3:2 frame) fits 80 % of the refresh budget and never above the display / thermal floor; the normal hysteresis moves it from there. On the Redmi the measurement gave 57.8 / 59.2 ms/Mpx in two runs and 125-127 in one run in a lower clock state (the drag bench measures 44 ms/Mpx in the fast state at 480 px): at 58 ms/Mpx and a 120 Hz budget the seed picks the 360 px rung, one rung more conservative than the fast state allows; the controller then steps up after 12 frames predicted to fit. Unit test added; **not run in the app**.
+
+Visual cost (`dapple_drag_bench ... visualcost`, Redmi, Portra 400 with grain, halation, clarity 20, sharpen 30; the interactive frame at the ladder size upscaled bilinearly to the settled frame's size, 1080x1620 = a 1080-wide panel; CIEDE2000 against the settled frame; sharpness = mean absolute gradient of the green channel, relative to the settled frame):
+
+| interactive long edge | dE2000 mean | p95 | p99 | sharpness vs settled |
+|---|---|---|---|---|
+| 360 px (240x360) | 3.03 | 9.4 | 19.4 | 47 % |
+| 480 px | 2.66 | 7.6 | 16.6 | 52 % |
+| 640 px | 2.37 | 6.2 | 13.9 | 57 % |
+| 810 px | 2.22 | 5.4 | 12.1 | 59 % |
+| 1080 px | 2.05 | 4.6 | 10.1 | 63 % |
+
+The floor of about dE 2 and 63 % sharpness is the tier difference (no grain, no clarity / sharpen detail at the interactive tier), not the resolution: going from 360 to 810 px halves nothing (3.0 -> 2.2 mean), and the p99 of 10-19 sits on edges and grain. Where it becomes visible: a mean dE2000 above ~2 is just noticeable in a flat area, the edges at 360-480 px lose about half their contrast (47-52 %). Between 480 and 640 px the change is small; the settled frame after the finger lifts is exact.
+
+## 32. Item 2: fence-and-swap LUT upload (done), disk persistence (not done)
+
+`startGpuPrintLutUpdate` / `finishGpuPrintLutUpdate` (`film_gpu.cpp`, `gpu_executor.cpp ensureFilm`): an interactive frame that sees a new print table of the same size records the copy into a new LUT image, submits it with a fence and does not wait; the frame that finds the fence done swaps the binding and destroys the old image; the frame meanwhile shows the bound table. Settled frames (non-interactive) still wait and update in place; a size change or the split path still takes the in-place / full path; `DAPPLE_FILM_LUT_SYNC=1` restores the blocking update. Measurement (Redmi, 12 film drags x 60 frames after the first three frames of the run, wall `cpu_ms` incl. GPU wait, twice each): synchronous p50 8.2 / 7.6, p95 12.7 / 12.3, p99 15.8 / 17.4, 5 / 7 frames over 16.7 ms; fence-and-swap p50 8.2 / 7.9, p95 12.8 / 12.1, p99 16.2 / 17.0, 6 / 7 over 16.7 ms: **no measurable difference**: the 15-49 ms landing spikes of earlier rounds came from the LUT image being re-created on the exact 33^3 <-> coarse 17^3 size change (fixed in round 5), not from the wait; the remaining frames over 25 ms are the cold first frames of cases. The mechanism stays because a landing can no longer block the frame thread.
+
+**Disk persistence of per-stock tables, calibration and grain tables ("warm from disk") was not built**: the FilmTables payloads carry about thirty fields and vectors; a versioned (pack hash + build fingerprint), size-capped, corruption-tolerant serializer with the measurement of second-start cost did not fit this round.
+
+## 33. Items 3, 5, 6
+
+Item 3 (bands under the 16 MiB step) and item 5 (re-pointing `film_match*.cpp`) were not started. Item 6 (raster prototype): not built; with the touch hint every drag frame is 4 ms at 480 px (the strength frame +0.3 ms, the kept-grain frame about +3 ms in the fast state), so no frame of the seeded size is above one refresh and the question stays closed as "not needed on this phone".
+
+## 34. Gates
+
+Full `check-all` in own dirs: PASS (build, ctest, golden-selfcheck, flutter analyze / test (219), jvm, video-host). Redmi Vulkan: match_cache ok, seqcheck 60 / 0 mismatches, selfcheck 148 / 0, film_gpu frames ok, coverage PASSED, film-tiling PASSED; GLES frames and film-tiling PASSED. `build/redmi/app-w9-arm64.apk`: see the report.
+
+## 35. APK
+
+`build/redmi/app-w9-arm64.apk` (38.3 MB, `libdapple.so` stripped 10,457,520 bytes, debug key, never installed or launched) is built from a clean `git worktree` at HEAD 7ae3b60 plus only my hunks of this round (the working tree's demosaic edits break the Android build of `libraw_decoder.cpp`: libc++ `false_type` / `true_type` unknown class names, `core/src/decoders/libraw_mosaic.inc`, not mine, and they are excluded from the APK). The release lint tasks were skipped by a temporary Gradle init script (the `CodecSelfTest.kt` lint crash), removed again; the worktree is removed. The 2 MB growth of `libdapple.so` over the wave 7 APK (8.41 MB) is in HEAD itself (wave 8b / 8c code), not in this round's hunks.

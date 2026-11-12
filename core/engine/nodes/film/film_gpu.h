@@ -24,6 +24,13 @@ struct GpuFilmTables {
   int paperN = 0;
   float paperX0 = 0, paperInvDx = 0, dminS[4] = {}, dscaleS[4] = {};
   int rawN = 0, curveN = 0, lutN = 0;
+  // asynchronous print LUT update (startGpuPrintLutUpdate): the new image and its copy fence; the old image stays bound until the copy completed
+  hal::ImageH lutNext;
+  hal::FenceH lutFence;
+  bool lutNextActive = false;
+  int lutNextN = 0;
+  float dminNext[4] = {}, dscaleNext[4] = {}, glareRgbNext[4] = {};
+  std::shared_ptr<const PrintTable> printNext;
   // the table constants the passes need (copied at upload so a frame needs no CPU table)
   float mIn[12] = {}, gamma[4] = {}, curveX0 = 0, curveInvDx = 0, dirQ[12] = {}, dirQ0[4] = {}, dmin[4] = {}, dscale[4] = {};
   float glareRgb[4] = {};
@@ -33,6 +40,10 @@ struct GpuFilmTables {
 bool uploadGpuTables(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables& out, std::string& err);
 // Replaces only the print LUT texels (same raw / curve tables, same LUT size, no split path); false when not applicable.
 bool updateGpuPrintLut(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables& out, std::string& err);
+// Fence-and-swap form (wave 8): startGpuPrintLutUpdate records the copy into a NEW LUT image and submits it without waiting; finishGpuPrintLutUpdate (poll each frame)
+// swaps the binding when the fence completed and destroys the old image. No waitAll, no staging copy that the frame thread waits for. Returns false when not applicable.
+bool startGpuPrintLutUpdate(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables& out, std::string& err);
+bool finishGpuPrintLutUpdate(gpu::Core& core, GpuFilmTables& out);
 void releaseGpuTables(gpu::Core& core, GpuFilmTables& t);
 
 // False (with `why`) only when a blur kernel exceeds the 19 tap table of its pass (dye-cloud blur and grain micro-structure are ported:
@@ -56,6 +67,9 @@ void setFilmMergeForTest(int mode);
 // film_v3 variant (direct taps = 1, staged column tile = 0, -1 = no override): the warm-up renders a frame each way and keeps the faster one for the device
 void setFilmV3Override(int direct);
 void setFilmV3Verdict(int direct);
+// Measured at warm-up: milliseconds per megapixel of an interactive film frame on this device (0 = not measured). Seeds the interactive size.
+void setFilmInteractiveMsPerMpx(float v);
+float filmInteractiveMsPerMpx();
 gpu::H recordFilmFrame(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pr, gpu::H src,
                        int w, int h);
 

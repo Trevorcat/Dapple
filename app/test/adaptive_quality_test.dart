@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   refreshBudgetTests();
+  seedTests();
   test('steps down after two frames over budget, not after one', () {
     final q = AdaptiveQuality(budgetMs: 55);
     expect(q.rung.longEdge, 1080);
@@ -84,5 +85,28 @@ void refreshBudgetTests() {
     }
     expect(q.rung.longEdge, lessThan(1080));
     expect(cost, lessThanOrEqualTo(8.3));
+  });
+}
+
+// wave 8: the starting rung comes from the warm-up measurement
+void seedTests() {
+  test('the seed picks the largest rung whose predicted cost fits the budget', () {
+    final q = AdaptiveQuality(budgetMs: 8.33);
+    // 20 ms / Mpx: a 3:2 frame of long edge 480 is 0.154 Mpx = 3.1 ms, 810 is 0.437 Mpx = 8.7 ms (> 0.8 * 8.33), 640 is 0.273 Mpx = 5.5 ms
+    expect(q.seedFromMeasurement(20), isTrue);
+    expect(q.rung.longEdge, 640);
+    expect(q.seeded, isTrue);
+    // a faster device keeps the top rung
+    final fast = AdaptiveQuality(budgetMs: 8.33);
+    expect(fast.seedFromMeasurement(5), isFalse);
+    expect(fast.rung.longEdge, 1080);
+    // a very slow one takes the cheapest rung, never below it
+    final slow = AdaptiveQuality(budgetMs: 8.33);
+    slow.seedFromMeasurement(500);
+    expect(slow.rung.longEdge, 360);
+    // garbage does nothing
+    final none = AdaptiveQuality();
+    expect(none.seedFromMeasurement(0), isFalse);
+    expect(none.seeded, isFalse);
   });
 }

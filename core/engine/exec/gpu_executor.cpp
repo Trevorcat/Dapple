@@ -654,10 +654,22 @@ std::shared_ptr<DeviceFilm> Executor::ensureFilm(const filmnode::FilmResolved& r
   if (!filmnode::tablesFor(r, tb)) return fail(GpuFailure::Unsupported, "film tables: bake failed"), nullptr;
   const auto pd = filmnode::planOf(r);
   // only the print table changed (a drag landed a new coarse table): replace the LUT texels in place instead of re-creating and re-uploading everything
+  // a landed asynchronous copy: swap the binding (the frame that finds the fence done uses the new table)
+  if (film_ && film_->epoch == epoch_ && film_->gt.lutNextActive && filmnode::finishGpuPrintLutUpdate(core(), film_->gt)) film_->tb.print = film_->gt.printNext;
   if (film_ && film_->epoch == epoch_ && film_->tb.raw == tb.raw && film_->tb.curves == tb.curves && film_->tb.print != tb.print && film_->haveTables &&
       !std::getenv("DAPPLE_FILM_LUT_INPLACE_OFF")) {
     std::string uerr;
-    if (filmnode::updateGpuPrintLut(core(), tb, film_->gt, uerr)) film_->tb = tb;
+    if (r.quality == 1 && film_->gt.lutN == tb.print->t.lutN && !std::getenv("DAPPLE_FILM_LUT_SYNC")) {
+      // interactive frame: fence and swap, no wait on the frame thread; the frame shows the table that is bound now (the next landing is one frame behind)
+      if (!film_->gt.lutNextActive) filmnode::startGpuPrintLutUpdate(core(), tb, film_->gt, uerr);
+      tb.print = film_->tb.print;  // the bound table is the current one for this frame (raw / curves are the same); the plan below is checked as usual
+    } else {
+      if (film_->gt.lutNextActive) {  // a settled frame wants the exact table: wait for the pending copy first
+        core().dev().waitAll();
+        if (filmnode::finishGpuPrintLutUpdate(core(), film_->gt)) film_->tb.print = film_->gt.printNext;
+      }
+      if (film_->tb.print != tb.print && filmnode::updateGpuPrintLut(core(), tb, film_->gt, uerr)) film_->tb = tb;
+    }
   }
   if (!film_ || film_->epoch != epoch_ || film_->tb.raw != tb.raw || film_->tb.curves != tb.curves || film_->tb.print != tb.print) {
     film_.reset();

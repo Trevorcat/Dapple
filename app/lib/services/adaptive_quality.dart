@@ -57,6 +57,32 @@ class AdaptiveQuality {
   QualityRung get rung => rungs[_rung];
   double get emaMs => _ema;
 
+  bool _seeded = false;
+  bool get seeded => _seeded;
+
+  /// Seeds the starting rung from the engine's warm-up measurement ([msPerMpx]: hot milliseconds per megapixel of an interactive film frame): the largest
+  /// rung whose predicted cost (a 3:2 frame of that long edge) fits [fill] of the budget. The first drag then already meets the frame period instead of
+  /// stepping down through slow frames; the normal hysteresis moves it from there. Returns true when the rung changed.
+  bool seedFromMeasurement(double msPerMpx, {double fill = 0.8}) {
+    if (!(msPerMpx > 0) || !msPerMpx.isFinite) return false;
+    _seeded = true;
+    var pick = rungs.length - 1;
+    for (var i = 0; i < rungs.length; i++) {
+      final e = rungs[i].longEdge.toDouble();
+      final predicted = msPerMpx * (e * e * 2 / 3) / 1e6;
+      if (predicted <= budgetMs * fill) {
+        pick = i;
+        break;
+      }
+    }
+    final floor = _displayCap > _thermalCap ? _displayCap : _thermalCap;
+    if (pick < floor) pick = floor;
+    if (pick <= _rung) return false;
+    _rung = pick;
+    _ema = 0;
+    return true;
+  }
+
   /// [displayLongEdge]: on-screen long edge of the picture in device pixels.
   void setDisplayLongEdge(int displayLongEdge) {
     var i = 0;

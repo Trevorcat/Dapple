@@ -488,11 +488,15 @@ void measureFilmV3(const std::shared_ptr<Context>& ctx, const char* stock, std::
     path = (std::filesystem::path(dir) / nm).string();
     if (FILE* f = std::fopen(path.c_str(), "r")) {
       int v = -1;
-      const bool ok = std::fscanf(f, "%d", &v) == 1;
+      float mpx = 0.f;
+      const bool ok = std::fscanf(f, "%d %f", &v, &mpx) >= 1;
       std::fclose(f);
-      if (ok && (v == 0 || v == 1)) {
+      if (ok && (v == 0 || v == 1) && mpx > 0.f) {
         engine::filmnode::setFilmV3Verdict(v);
-        note += (note.empty() ? "" : "; ") + std::string("film_v3 ") + (v ? "direct" : "staged") + " (cached verdict)";
+        engine::filmnode::setFilmInteractiveMsPerMpx(mpx);
+        char b[96];
+        std::snprintf(b, sizeof b, " (cached verdict), interactive %.1f ms/Mpx (cached)", double(mpx));
+        note += (note.empty() ? "" : "; ") + std::string("film_v3 ") + (v ? "direct" : "staged") + b;
         return;
       }
     }
@@ -536,14 +540,48 @@ void measureFilmV3(const std::shared_ptr<Context>& ctx, const char* stock, std::
   const bool dflt = ctx->caps().unifiedMemory;  // the old rule decides a tie
   const int verdict = tStaged < tDirect * 0.95 ? 0 : (tDirect < tStaged * 0.95 ? 1 : (dflt ? 1 : 0));
   engine::filmnode::setFilmV3Verdict(verdict);
+  // the interactive frame (what a drag renders) at two sizes with the chosen variant: milliseconds per megapixel, hot (the minimum of the later rounds). It seeds the starting
+  // interactive size of the editor (AdaptiveQuality) instead of stepping down through slow frames.
+  float msPerMpx = 0.f;
+  {
+    const SourceImage isrc = dapple::gpu::makeTestImage(960, 640);
+    MemorySourceStore istore(isrc);
+    double best = 1e30, prev1 = 0, prev2 = 0;
+    for (int rep = 0; rep < 14; ++rep) {  // until the last three agree within 15 %: the GPU clock has ramped (a drag runs hot)
+      EditParams p;
+      p.filmStock = stock;
+      Renderer r(p, cam, nullptr);
+      FastOptions fo;
+      fo.spatial = SpatialQuality::Interactive;
+      FrameJob job{p, r, isrc, nullptr, cam, nullptr, {}, {}, {}};
+      job.request.bakeSize = 33;
+      job.request.interactive = true;
+      job.fastOptions = fo;
+      job.store = &istore;
+      FrameResult res;
+      const auto t0 = Clk::now();
+      const bool ok = es.renderFrame(job, res);
+      const double ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+      const double mpx = double(res.w) * double(res.h) / 1e6;
+      std::free(res.rgba);
+      if (!ok || res.executor == "cpu" || mpx <= 0) break;
+      const double v = ms / mpx;
+      if (rep >= 2) best = std::min(best, v);
+      if (rep >= 5 && prev1 > 0 && prev2 > 0 && std::max({v, prev1, prev2}) < 1.15 * std::min({v, prev1, prev2})) break;
+      prev2 = prev1;
+      prev1 = v;
+    }
+    if (best < 1e29) msPerMpx = float(best);
+  }
+  if (msPerMpx > 0.f) engine::filmnode::setFilmInteractiveMsPerMpx(msPerMpx);
   char b[160];
-  std::snprintf(b, sizeof b, "film_v3 direct %.1f ms vs staged %.1f ms -> %s", tDirect, tStaged, verdict ? "direct" : "staged");
+  std::snprintf(b, sizeof b, "film_v3 direct %.1f ms vs staged %.1f ms -> %s, interactive %.1f ms/Mpx", tDirect, tStaged, verdict ? "direct" : "staged", double(msPerMpx));
   note += (note.empty() ? "" : "; ") + std::string(b);
   if (!path.empty()) {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     if (FILE* f = std::fopen(path.c_str(), "w")) {
-      std::fprintf(f, "%d\n", verdict);
+      std::fprintf(f, "%d %.4f\n", verdict, double(msPerMpx));
       std::fclose(f);
     }
   }
@@ -747,7 +785,8 @@ class ProviderImpl final : public GpuProvider {
                     "\",\"enabled\":" + (en ? "true" : "false") + ",\"available\":" + (c ? "true" : "false");
     if (c)
       j += ",\"api\":\"" + std::string(hal::apiName(c->api())) + "\",\"device\":\"" + jsonEsc(c->caps().name) + "\",\"deviceKey\":\"" +
-           c->caps().key() + "\",\"selfTest\":\"" + jsonEsc(c->selfTestReport()) + "\",\"selection\":" + c->selectionJson();
+           c->caps().key() + "\",\"selfTest\":\"" + jsonEsc(c->selfTestReport()) + "\",\"selection\":" + c->selectionJson() +
+           ",\"filmMsPerMpx\":" + std::to_string(double(engine::filmnode::filmInteractiveMsPerMpx()));
     else if (m != Mode::Off) j += ",\"reason\":\"" + jsonEsc(inactiveReason()) + "\"";
     if (!tried.empty()) j += ",\"skipped\":\"" + jsonEsc(tried) + "\"";
     j += ",\"frames\":" + std::to_string(cnt.frames) + ",\"fallbacks\":" + std::to_string(cnt.fallbacks) + ",\"transients\":" + std::to_string(cnt.transients) +

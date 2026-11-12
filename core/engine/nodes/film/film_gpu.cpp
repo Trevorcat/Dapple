@@ -658,9 +658,62 @@ bool updateGpuPrintLut(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTable
   return true;
 }
 
+bool startGpuPrintLutUpdate(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables& out, std::string& err) {
+  const fd::FilmTables& pr = tb.print->t;
+  if (out.lutNextActive) return err = "a print LUT update is already pending", false;
+  if (out.split || pr.split || !out.lut.impl) return err = "print LUT update not applicable", false;
+  hal::Device& dev = core.dev();
+  hal::ImageH img;
+  if (dev.createImage({hal::Format::RGBA32F, std::uint32_t(pr.lutN), std::uint32_t(pr.lutN), std::uint32_t(pr.lutN)}, &img) != hal::Status::Ok) return err = dev.lastError(), false;
+  const std::uint64_t lutBytes = pr.lut.size() * 4;
+  auto cl = dev.begin();
+  if (!cl) {
+    dev.destroy(img);
+    return err = dev.lastError(), false;
+  }
+  if (!core.ensureStaging(cl->slot(), lutBytes + 256, err)) {
+    dev.destroy(img);
+    return false;
+  }
+  gpu::SlotRes& s = core.slot(cl->slot());
+  std::memcpy(s.staging.mapped, pr.lut.data(), lutBytes);
+  GpuGraph g(dev, core.pool());
+  g.copyBufferToImage(s.staging, g.external(img), std::uint32_t(pr.lutN), std::uint32_t(pr.lutN), std::uint32_t(pr.lutN), 0);
+  hal::FenceH f;
+  if (gpu::runGraph(dev, g, *cl, &f, err) != hal::Status::Ok) {
+    dev.destroy(img);
+    return false;
+  }
+  out.lutNext = img;
+  out.lutFence = f;
+  out.lutNextActive = true;
+  out.lutNextN = pr.lutN;
+  std::copy(pr.dmin, pr.dmin + 4, out.dminNext);
+  std::copy(pr.dscale, pr.dscale + 4, out.dscaleNext);
+  std::copy(pr.glareRgb, pr.glareRgb + 4, out.glareRgbNext);
+  out.printNext = tb.print;
+  return true;
+}
+
+bool finishGpuPrintLutUpdate(gpu::Core& core, GpuFilmTables& out) {
+  if (!out.lutNextActive) return false;
+  hal::Device& dev = core.dev();
+  if (!dev.poll(out.lutFence)) return false;  // the copy is still running: the frame keeps the old table
+  dev.destroy(out.lut);  // frames are waited for before the next one starts: nothing in flight references it
+  out.lut = out.lutNext;
+  out.lutNext = {};
+  out.lutN = out.lutNextN;
+  std::copy(out.dminNext, out.dminNext + 4, out.dmin);
+  std::copy(out.dscaleNext, out.dscaleNext + 4, out.dscale);
+  std::copy(out.glareRgbNext, out.glareRgbNext + 4, out.glareRgb);
+  out.lutNextActive = false;
+  return true;
+}
+
 void releaseGpuTables(gpu::Core& core, GpuFilmTables& t) {
   hal::Device& dev = core.dev();
   dev.waitIdle();
+  if (t.lutNextActive) dev.destroy(t.lutNext);
   dev.destroy(t.raw);
   dev.destroy(t.lut);
   dev.destroy(t.curves);
@@ -865,6 +918,9 @@ void mergeSmallComps(fd::Mixture& m) {
 void setFilmMergeForTest(int mode) { g_mergeOverride = mode; }
 void setFilmV3Override(int direct) { g_v3Override = direct; }
 void setFilmV3Verdict(int direct) { g_v3Verdict = direct; }
+static std::atomic<float> g_interactiveMsPerMpx{0.f};
+void setFilmInteractiveMsPerMpx(float v) { g_interactiveMsPerMpx = v; }
+float filmInteractiveMsPerMpx() { return g_interactiveMsPerMpx.load(); }
 
 bool recordFilmPre(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, H src, int w, int h, FilmPre& out) {
   out = FilmPre{};

@@ -314,6 +314,13 @@ class EditorEngine extends ChangeNotifier {
       PerfProbe.textBench();
     }
     _pollThermal();
+    if (!quality.seeded) {
+      // wave 8: the GPU warm-up measured the interactive film frame (ms per megapixel, hot): start the drag at the size that fits one refresh
+      try {
+        final m = RegExp(r'"filmMsPerMpx":([0-9.eE+-]+)').firstMatch(DappleSession.gpuStatusJson() ?? '');
+        if (m != null) quality.seedFromMeasurement(double.parse(m.group(1)!));
+      } catch (_) {}
+    }
     if (photo?.id != p.id) app.sessions.closeDetail(); // the high-resolution session belongs to one photo
     photo = p;
     _neighbors = neighbors;
@@ -783,6 +790,13 @@ class EditorEngine extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// The edit acts on pixels only (nothing refers to the whole picture's geometry): a region session renders it exactly like the full picture.
+  static bool _regionNeutral(Map<String, dynamic> p) {
+    num n(String k) => (p[k] is num) ? p[k] as num : 0;
+    final crop = p['crop'];
+    return (crop == null || crop == 'orig') && n('rot') == 0 && n('straighten') == 0 && p['flip'] != true && p['flip'] != 1 && n('vignette') == 0;
+  }
+
   Future<void> _renderDetail() async {
     final ph = photo;
     final img = image;
@@ -814,6 +828,34 @@ class EditorEngine extends ChangeNotifier {
     final gen = ++_detailGen, myGen = _gen, version = _viewVersion;
     _detailBusy = true;
     try {
+      // True resolution first (RAW files): the visible rectangle at the picture's native pixels, one region at a time. Only for edits that act on pixels
+      // alone: crop / rotate / flip / straighten / vignette refer to the whole picture, so they keep the half-resolution detail session below.
+      final wp = app.wireParams(ph);
+      if (_regionNeutral(wp)) {
+        final rd = await app.sessions.regionDetail(ph, region);
+        if (gen != _detailGen || myGen != _gen) return;
+        if (rd != null) {
+          final r = rd.rect;
+          final local = ui.Rect.fromLTRB(((region.left - r.left) / r.width).clamp(0.0, 1.0), ((region.top - r.top) / r.height).clamp(0.0, 1.0),
+              ((region.right - r.left) / r.width).clamp(0.0, 1.0), ((region.bottom - r.top) / r.height).clamp(0.0, 1.0));
+          final frame = await rd.session.renderFrame(wp, region: local, regionLongEdge: out, analysis: false, background: true);
+          if (gen != _detailGen || myGen != _gen) {
+            frame.dispose();
+            return;
+          }
+          final im = await frame.toImage();
+          if (gen != _detailGen || myGen != _gen) {
+            im.dispose();
+            return;
+          }
+          detail?.dispose();
+          detail = im;
+          detailRect = region;
+          notifyListeners();
+          if (myGen == _gen && _zoom > detailMinZoom && (version != _viewVersion || gen != _detailGen)) _scheduleDetail();
+          return;
+        }
+      }
       final ds = await app.sessions.detail(ph); // decodes lazily the first time (about a second)
       if (ds == null || gen != _detailGen || myGen != _gen) return;
       final frame = await ds.renderFrame(app.wireParams(ph), region: region, regionLongEdge: out, analysis: false, background: true);

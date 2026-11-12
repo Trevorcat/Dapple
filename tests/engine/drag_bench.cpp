@@ -146,6 +146,132 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (filter == "idlegap") {  // the first frames of a drag after a pause, without / with the touch hint (wave 8)
+    auto frame = [&](int i, double* ms) {
+      char js[200];
+      std::snprintf(js, sizeof js, "{\"film\":\"kodak_portra_400\",\"film_latitude\":%.3f}", 60.0 + double(i) * 1.0);
+      DappleFrameRequest rq{};
+      rq.size = sizeof rq;
+      rq.long_edge = le;
+      rq.flags = DAPPLE_FRAME_INTERACTIVE;
+      rq.active_param = "film_latitude";
+      DappleImage img{};
+      const auto t0 = Clk::now();
+      const bool ok = dapple_session_render_frame(s, js, nullptr, &rq, &img, nullptr) == DAPPLE_OK;
+      *ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+      dapple_free_image(&img);
+      return ok;
+    };
+    double ms = 0;
+    for (int i = 0; i < 40; ++i)
+      if (!frame(i % 30, &ms)) return 1;  // warm, and the newest interactive request for the hint
+    const int gaps[] = {1000, 3000, 10000};
+    for (int hint = 0; hint < 2; ++hint)
+      for (int gap : gaps) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(gap));
+        if (hint) {
+          if (gap == gaps[0]) { dapple_session_touch_hint(s, -1); std::this_thread::sleep_for(std::chrono::milliseconds(800)); }  // prepare: builds the burst-size plans once
+          dapple_session_touch_hint(s, std::getenv("DAPPLE_BENCH_HINT_MS") ? std::atoi(std::getenv("DAPPLE_BENCH_HINT_MS")) : 150);
+          std::this_thread::sleep_for(std::chrono::milliseconds(std::getenv("DAPPLE_BENCH_TOUCH_MS") ? std::atoi(std::getenv("DAPPLE_BENCH_TOUCH_MS")) : 60));  // touch-down -> first movement
+        }
+        std::vector<double> t;
+        for (int i = 0; i < 30; ++i) {
+          if (!frame(i, &ms)) return 1;
+          t.push_back(ms);
+        }
+        std::vector<double> rest(t.begin() + 10, t.end());
+        std::sort(rest.begin(), rest.end());
+        double sum10 = 0;
+        for (int i = 0; i < 10; ++i) sum10 += t[std::size_t(i)];
+        std::printf("  gap %5d ms, hint %s: first frame %5.1f ms, frames 1-10 mean %5.1f ms, frames 11-30 median %5.1f ms | first 10:", gap, hint ? "on " : "off", t[0], sum10 / 10.0, rest[rest.size() / 2]);
+        for (int i = 0; i < 10; ++i) std::printf(" %.0f", t[std::size_t(i)]);
+        std::printf("\n");
+      }
+    return 0;
+  }
+  if (filter == "visualcost") {  // interactive frames at the ladder sizes, upscaled to the screen, against the settled frame at screen size (wave 8)
+    const int screen = std::getenv("DAPPLE_BENCH_SCREEN") ? std::atoi(std::getenv("DAPPLE_BENCH_SCREEN")) : 1620;  // long edge of a 1080 wide panel (3:2 photo)
+    const char* js = "{\"film\":\"kodak_portra_400\",\"film_grain\":100,\"film_halation\":100,\"clarity\":20,\"sharpen\":30}";
+    auto render = [&](int edge, bool interactive, DappleImage* out) {
+      DappleFrameRequest rq{};
+      rq.size = sizeof rq;
+      rq.long_edge = edge;
+      rq.flags = interactive ? DAPPLE_FRAME_INTERACTIVE : 0;
+      return dapple_session_render_frame(s, js, nullptr, &rq, out, nullptr) == DAPPLE_OK;
+    };
+    auto lab = [](const uint8_t* p, double* L, double* a, double* b) {
+      auto lin = [](double c) { c /= 255.0; return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4); };
+      const double r = lin(p[0]), g = lin(p[1]), bl = lin(p[2]);
+      double x = (0.4124 * r + 0.3576 * g + 0.1805 * bl) / 0.95047, y = 0.2126 * r + 0.7152 * g + 0.0722 * bl, z = (0.0193 * r + 0.1192 * g + 0.9505 * bl) / 1.08883;
+      auto f = [](double t) { return t > 216.0 / 24389.0 ? std::cbrt(t) : (24389.0 / 27.0 * t + 16.0) / 116.0; };
+      x = f(x), y = f(y), z = f(z);
+      *L = 116.0 * y - 16.0, *a = 500.0 * (x - y), *b = 200.0 * (y - z);
+    };
+    auto de2000 = [](double L1, double a1, double b1, double L2, double a2, double b2) {
+      const double kPi = 3.14159265358979323846, rad = kPi / 180.0;
+      const double C1 = std::hypot(a1, b1), C2 = std::hypot(a2, b2), Cb = (C1 + C2) / 2, G = 0.5 * (1 - std::sqrt(std::pow(Cb, 7) / (std::pow(Cb, 7) + std::pow(25.0, 7))));
+      const double ap1 = (1 + G) * a1, ap2 = (1 + G) * a2, Cp1 = std::hypot(ap1, b1), Cp2 = std::hypot(ap2, b2);
+      double h1 = std::atan2(b1, ap1) / rad, h2 = std::atan2(b2, ap2) / rad;
+      if (h1 < 0) h1 += 360;
+      if (h2 < 0) h2 += 360;
+      const double dL = L2 - L1, dC = Cp2 - Cp1;
+      double dh = h2 - h1;
+      if (Cp1 * Cp2 == 0) dh = 0; else if (dh > 180) dh -= 360; else if (dh < -180) dh += 360;
+      const double dH = 2 * std::sqrt(Cp1 * Cp2) * std::sin(dh * rad / 2);
+      const double Lb = (L1 + L2) / 2, Cpb = (Cp1 + Cp2) / 2;
+      double hb = h1 + h2;
+      if (Cp1 * Cp2 == 0) hb = h1 + h2; else if (std::fabs(h1 - h2) <= 180) hb /= 2; else hb = (hb + (hb < 360 ? 360 : -360)) / 2;
+      const double T = 1 - 0.17 * std::cos((hb - 30) * rad) + 0.24 * std::cos(2 * hb * rad) + 0.32 * std::cos((3 * hb + 6) * rad) - 0.20 * std::cos((4 * hb - 63) * rad);
+      const double dTh = 30 * std::exp(-std::pow((hb - 275) / 25, 2)), Rc = 2 * std::sqrt(std::pow(Cpb, 7) / (std::pow(Cpb, 7) + std::pow(25.0, 7)));
+      const double Sl = 1 + 0.015 * std::pow(Lb - 50, 2) / std::sqrt(20 + std::pow(Lb - 50, 2)), Sc = 1 + 0.045 * Cpb, Sh = 1 + 0.015 * Cpb * T, Rt = -std::sin(2 * dTh * rad) * Rc;
+      return std::sqrt(std::pow(dL / Sl, 2) + std::pow(dC / Sc, 2) + std::pow(dH / Sh, 2) + Rt * (dC / Sc) * (dH / Sh));
+    };
+    DappleImage fin{};
+    if (!render(screen, false, &fin)) return 1;
+    auto sharp = [](const DappleImage& im) {  // mean |gradient| of the green channel, a stand-in for the sharpness / grain content of the picture
+      double sum = 0;
+      for (int y = 1; y < im.height - 1; ++y)
+        for (int x = 1; x < im.width - 1; ++x) {
+          const uint8_t* p = im.rgba + (std::size_t(y) * im.width + x) * 4;
+          sum += std::abs(int(p[4 + 1]) - int(p[-4 + 1])) + std::abs(int(p[std::size_t(im.width) * 4 + 1]) - int(p[-std::ptrdiff_t(im.width) * 4 + 1]));
+        }
+      return sum / (double(im.width) * im.height);
+    };
+    const double sFin = sharp(fin);
+    std::printf("  settled frame %dx%d, sharpness %.2f; interactive frame upscaled (bilinear) to it, dE2000 and sharpness against the settled frame:\n", fin.width, fin.height, sFin);
+    for (int edge : {360, 480, 640, 810, 1080}) {
+      DappleImage in{};
+      if (!render(edge, true, &in)) return 1;
+      std::vector<double> d;
+      d.reserve(std::size_t(fin.width) * fin.height);
+      std::vector<uint8_t> up(std::size_t(fin.width) * fin.height * 4);
+      for (int y = 0; y < fin.height; ++y)
+        for (int x = 0; x < fin.width; ++x) {
+          const double fx = (x + 0.5) * in.width / fin.width - 0.5, fy = (y + 0.5) * in.height / fin.height - 0.5;
+          const int x0 = std::clamp(int(std::floor(fx)), 0, in.width - 1), y0 = std::clamp(int(std::floor(fy)), 0, in.height - 1);
+          const int x1 = std::min(x0 + 1, in.width - 1), y1 = std::min(y0 + 1, in.height - 1);
+          const double tx = std::clamp(fx - x0, 0.0, 1.0), ty = std::clamp(fy - y0, 0.0, 1.0);
+          for (int c = 0; c < 4; ++c) {
+            auto px = [&](int xx, int yy) { return double(in.rgba[(std::size_t(yy) * in.width + xx) * 4 + c]); };
+            up[(std::size_t(y) * fin.width + x) * 4 + c] = uint8_t(std::lround((px(x0, y0) * (1 - tx) + px(x1, y0) * tx) * (1 - ty) + (px(x0, y1) * (1 - tx) + px(x1, y1) * tx) * ty));
+          }
+          double L1, a1, b1, L2, a2, b2;
+          lab(fin.rgba + (std::size_t(y) * fin.width + x) * 4, &L1, &a1, &b1);
+          lab(&up[(std::size_t(y) * fin.width + x) * 4], &L2, &a2, &b2);
+          d.push_back(de2000(L1, a1, b1, L2, a2, b2));
+        }
+      std::sort(d.begin(), d.end());
+      double mean = 0;
+      for (double v : d) mean += v;
+      mean /= double(d.size());
+      DappleImage upImg{fin.width, fin.height, up.data()};
+      std::printf("  interactive %4d px (%dx%d): dE2000 mean %.3f p95 %.3f p99 %.3f max %.2f; sharpness %.2f (%.0f %% of the settled frame)\n", edge, in.width, in.height, mean,
+                  d[std::size_t(double(d.size()) * 0.95)], d[std::size_t(double(d.size()) * 0.99)], d.back(), sharp(upImg), 100.0 * sharp(upImg) / sFin);
+      dapple_free_image(&in);
+    }
+    dapple_free_image(&fin);
+    return 0;
+  }
   if (filter == "stockslide") {  // the film map selects stocks live while the finger slides (wave 8): 10 stocks in 3 s, frame times and stock tap -> first frame
     const char* ids[] = {"kodak_portra_400", "kodak_ektar_100", "fujifilm_velvia_100", "kodak_vision3_500t", "kodak_portra_160",
                          "kodak_portra_800", "fujifilm_pro_400h", "kodak_gold_200", "kodak_ultramax_400", "fujifilm_provia_100f"};
