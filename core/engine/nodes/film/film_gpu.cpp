@@ -627,8 +627,15 @@ bool uploadGpuTables(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables&
 // raw / curve / decode resources and the LUT image stay, only its texels are replaced. Not for the split (enlarger diffusion) path or a different size.
 bool updateGpuPrintLut(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables& out, std::string& err) {
   const fd::FilmTables& pr = tb.print->t;
-  if (out.split || pr.split || out.lutN != pr.lutN || !out.lut.impl) return err = "print LUT update not applicable", false;
+  if (out.split || pr.split || !out.lut.impl) return err = "print LUT update not applicable", false;
   hal::Device& dev = core.dev();
+  if (out.lutN != pr.lutN) {  // the exact 33^3 table of the settled frame <-> the coarse 17^3 of a drag: only the LUT image is re-created
+    dev.waitIdle();
+    dev.destroy(out.lut);
+    out.lut = {};
+    if (dev.createImage({hal::Format::RGBA32F, std::uint32_t(pr.lutN), std::uint32_t(pr.lutN), std::uint32_t(pr.lutN)}, &out.lut) != hal::Status::Ok) return err = dev.lastError(), false;
+    out.lutN = pr.lutN;
+  }
   std::copy(pr.dmin, pr.dmin + 4, out.dmin);
   std::copy(pr.dscale, pr.dscale + 4, out.dscale);
   std::copy(pr.glareRgb, pr.glareRgb + 4, out.glareRgb);

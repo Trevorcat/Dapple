@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "../../../tests/deterministic.h"
 #include "dapple/camera.h"
 #include "dapple/dapple_c.h"
 #include "dapple/encode.h"

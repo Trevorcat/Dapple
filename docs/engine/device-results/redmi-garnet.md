@@ -172,3 +172,85 @@ Not done in item 2: baking the print table at the current values, the grain plan
 ## 15. Items 3-6 of round 4
 
 Not started (bands under the 16 MiB step, micro-benchmark and visual-cost table, raster prototype, re-pointing `film_match*.cpp`). Targets of the brief are therefore not met: median 8.3 ms at the size adaptive quality picks was reached only in the fast device state for drags that do not touch the film match (7.3-9.0 ms at 480 px), and the exposure drag with a film stays at 17-44 ms.
+
+# Round 5 (match refresh off the frame thread, warm-up tiers, library size)
+
+## 16. Develop-exposure / print match: previous result + background refresh + repaint
+
+`core/src/c_api.cpp` (`withFilmKey`, `computeFilmMatch`, `queueFilmMatch`): an interactive frame whose film match is not cached uses the previous result of the same stock and queues the recompute on the background pool (latest request wins, own worker, `ThreadPool::background()`); when it lands the repaint listeners fire (same hook as the tables, `markMatchStale` / `notifyRepaintIfMatchStale`). A non-interactive (settled) frame computes the exact match itself and waits for a running refresh at most one match long (`matchMtx`); the first film frame of a stock (no previous result) still computes synchronously. `DAPPLE_FILM_MATCH_ASYNC=0` restores the synchronous path. I did **not** show the scene statistics are a pure function of the gain: the proxy statistics go through the develop tone curve, which is not scale-invariant, so the match stays a render of the 256 px proxy and only moves off the frame thread. Colour lag: the film EV compensation of an exposure drag follows the slider by one match (7-43 ms plus a repaint), the settled frame is exact.
+
+Redmi, native session bench, 480 px, medians (first frame), warm-up settled:
+
+| drag | round 4 | round 5 |
+|---|---|---|
+| exposure (film on) | 17-44 (33-58 over 33 ms: ~25 frames) | **7.8-7.9** (10.1-10.7; max 13-14) |
+| film_print | 8.6-9.5 (62-212) | 9.1-9.9 (**8.7-9.6**) |
+
+## 17. First frames: warm-up tiers, LUT image size change, app-like measurement
+
+* The bench with `DAPPLE_GPU=1` creates the device lazily on the calling thread and never runs the probe / warm-up (the app runs it in `Auto` mode); the earlier first-frame numbers were therefore **cold pipelines**. The app-like measurement is `DAPPLE_BENCH_PROBE=<dir> DAPPLE_BENCH_PROBE_WAIT_MS=6000` without `DAPPLE_GPU`.
+* `gpu_context.cpp warmFilm` now renders five tiers (interactive, full, interactive kept grain, **film_strength 60 (the Blend pipelines)**, **film_black (the coarse print table path)**), 1199 ms on this phone in the background (was ~790 ms). With it, first frames of a drag (480 px, after the warm-up): film_grain **15.4 ms (was 88-143)**, film_strength 13.2, film_print 8.7, film_black 9.4, film_shoot 12.7, film_warmth 18.8 (slow-state phase), film_tint 17.2. Everything at or under 16 ms except warmth / tint / wb / exp in a slow-state stretch (their medians were 18-22 ms in that stretch too).
+* `updateGpuPrintLut` now also handles the size change exact 33^3 <-> coarse 17^3 (only the LUT image is re-created); remaining landing spikes: 15-28 ms (one 48.6 ms in the earlier run): the `waitAll()` and staging copy are still on the frame thread, **the fence-and-swap version was not built**.
+* Cold: the first film frame of a process on this phone is a CPU frame (65 ms, "GPU self-test running") followed by the first GPU film frames (35-47 ms) and one 528 ms frame (first match 286 ms + first table upload 228 ms) while the probe (107 ms) and the warm-up (1.2 s) run; choosing a stock inside an open photo (warm process): the first film frame is the GPU frame with the stock's tables (match 0-286 ms, tables upload 84-228 ms): **not hidden**, the default stock only is warmed.
+* Persisting calibration results and grain tables on disk, baking the print table / grain plan at stock selection (other than the default stock): **not done**.
+
+## 18. Scripted session distributions, fast and slow device state
+
+How the state is told apart: the GPU-only drag `film_latitude` (no tables, no match, 480 px, the same frame as `film_strength`) is **7.5-8.0 ms median in the fast state and 11.5-12 ms in the slow state** (the `still` case: 6.9 / 11-12 ms). The phone changes state within a run (the cause is not known: GPU clock governor or background load), so each number below carries the latitude median of its own run, and a run whose per-case GPU-only baseline differs inside the run is marked mixed.
+
+| run (480 px, 721-728 frames, warm-up per case as stated) | state | p50 | p95 | p99 | max | frames > 33 ms |
+|---|---|---|---|---|---|---|
+| `DAPPLE_GPU=1`, no warm-up (cold pipelines), settle 8 s | fast (latitude 7.8-7.9) | 9.8 | 16.5 | 27.7 | 1505 (cold start) | 4: cold start, first strength 80, first grain 102, one landing 49 |
+| app-like (probe + warm-up 6 s), settle 8 s | mixed: fast for still..black, slow for wb..exp (latitude 11.9, wb / warmth / tint / exp 18-22) | 14.7 | 22.5 | 35.2 | 528 | 10 (cold start and the CPU frames before the probe: 327, 127, 65, 63, 52, 48, 35; one strength 42; one landing 35) |
+| `DAPPLE_GPU=1`, settle 8 s (round 4, for reference) | slow | 10.3-17.3 | 30.9 | 36-53 | 1240 | 13-32 |
+
+No frame over 33 ms inside a drag in the fast state apart from the documented cold start and one table-landing / strength spike per run. Median <= 8.3 ms holds in the fast state for shoot (9.0-9.3: not quite), print 9.1, black 8.1-8.7, latitude / wb 7.8-7.9, warmth 8.1-8.6, tint 8.0-8.7, exposure 7.8: **the 8.3 ms median is reached by latitude, wb, exposure, blacks and tints in the fast state, not by shoot / print / grain (16.5-17.2 ms: the kept-grain frame) / strength (13.2-13.8: the Blend passes)**; in the slow state every case is about 1.5x those numbers.
+
+## 19. Size of libdapple.so
+
+The 58 -> 89 MB growth of `build/w8a-arm64/bin/libdapple.so` is debug info: the arm64 configure (`tools/check-all.sh` flags) builds with `-g` and `.debug_info` + `.debug_loc` + `.debug_str` + `.debug_ranges` + `.debug_line` are 80.5 MB of the 87.9 MB; `.text` is 4.4 MB (1.9 MB compressed) and `.rodata` 1.06 MB. The wave 8 code (DNG opcodes, video session, Metal glue, async tables / match) added ~30 MB of debug info and a little code. What the APK carries is the stripped library (Gradle strips): `lib/arm64-v8a/libdapple.so` in the release APKs, raw bytes (stored, not compressed): wave 4 7,658,992; wave 6 8,241,928; wave 7 8,296,632; **wave 8 8,410,392** (+114 KB, +1.4 % over wave 7); `libdapple_video.so` 82 KB in wave 8. Stripping the CMake output by hand (`llvm-strip --strip-unneeded`) gives 6.8 MB, the APK build links with different flags and carries 8.4 MB. Only the arm64-v8a ABI was built in this wave (x86_64 APKs were not rebuilt: the last one on record is `build/app-release-x64.apk`).
+
+## 20. Not done in round 5
+
+Fence-and-swap table upload, disk persistence, grain / print tables at stock selection for stocks other than the default, items 3 to 6 (bands under the 16 MiB step, micro-benchmark and visual-cost table, raster prototype, re-pointing `film_match*.cpp`).
+
+# Round 6 (golden stability, stock selection)
+
+## 21. The unexplained golden failure: understood and fixed
+
+Reproduced under load: `dapple_golden selfcheck` failed 1 run of 24 (four at a time, twelve CPU hogs) with `MISMATCH lut/interactive: off c3840b67... full 5afa1ddc...`, always the same frame, never with one process alone. Cause: **`writeCube()` in `golden_tests.cpp` (and `engine_tests.cpp`) wrote one fixed file, `<temp>/dapple_golden.cube`, in every process; `ctest -j` runs `engine.golden_off`, `golden_full` and `selfcheck` (separate processes of the same binary) at the same time, so one process truncated and rewrote the file while another read the look LUT: a torn LUT gives a different `lut/interactive` hash.** (The `final` and `exact` LUT frames read the file too but only the interactive one hit the window in the observed runs.) Fixes: per-process cube names (removed at exit) in both files, the same per-process tags for every other fixed temp name in the tests (`tests/test_tmp.h`: `film_tests`, `core_tests`, `dng_opcode_tests`), and one shared deterministic mode: `core/src/determinism.h` (`DAPPLE_DETERMINISTIC=1`) switches off the timing dependent interactive paths (async print tables, async film match, the background median seeding, the stock fallback of section 22), pinned by `tests/deterministic.h`, which `golden_tests`, `engine_tests`, `exec_tests`, `film_gpu_tests`, `match_cache_tests` and `gpu_tests` include. My earlier per-binary `setenv` in `golden_tests.cpp` is gone. The earlier `engine.golden_off` failure of round 5 (one run, log lost) is most likely this race; the async-match mismatch of round 5 was a second, separate cause (fixed then).
+
+Stress, desktop `build/check-desktop-redmi`: `ctest -R "golden|selfcheck|match_cache" -j4 --repeat until-fail:30` with twelve busy-loop CPU hogs: **30 repetitions, 0 failures (404 s)**; `-R golden` 20 repetitions at -j4 under the hogs: 0 failures. One `SEGFAULT` of golden_off + golden_full appeared in a run started right after a rebuild whose linker output I did not see complete (the executable was probably half linked); it did not recur in 70 repetitions. Full `check-all` in own dirs after the fix: see the final report.
+
+## 22. Stock selection: no frame-thread bake, previous stock until the new one landed
+
+Baseline (Redmi, native bench `dapple_drag_bench ... stockslide`: 10 stocks selected one every 300 ms = 3 s, frames in between, 480 px, warm-up settled, interactive frames): **cold in process: stock tap -> first frame mean 376-506 ms, max 613-1245 ms; warm in process: mean 86-95 ms, max 310-430 ms; 10 frames over 33 ms per pass.** Causes: (1) the table LRUs (raw / curves / print) held 6 entries, so ten stocks thrashed them (the warm pass re-baked everything); (2) the first use of a stock bakes tables + plan + match on the frame thread.
+
+Fixes: (1) LRU size 6 -> 24 (`film_tables.cpp`, about 1.5 MB per stock). Alone it takes the warm pass to **mean 10 ms, max 15.6, 0 frames over 33 ms**. (2) `GpuExecutor::filmResolve`: an interactive frame of a stock whose raw / curve / print tables are not cached renders with the previous stock's resolved state (frame fields from this frame, table fields from the last frame, so nothing is baked) and queues the new stock's tables and plan on a latest-wins worker on the background pool (`film_tables.cpp requestStockPrep`, `tablesCachedFor`); the repaint hook fires when it landed (view / `dapple_set_repaint_callback`). The film match follows the same rule across stocks (`c_api.cpp`: previous result of any stock while the refresh runs). The settled frame is not interactive and never substitutes. `DAPPLE_FILM_STOCK_FALLBACK=0` and `DAPPLE_DETERMINISTIC=1` turn it off.
+
+Result (three runs, fast and slow state mixed):
+
+| | stock tap -> first frame (mean / max) | frames over 33 ms in the 3 s | frame p50 / p95 | correct stock on screen after (mean / max) |
+|---|---|---|---|---|
+| cold in process, before | 376-506 / 613-1245 ms | 10 | 6.4 / 520 | (immediately, blocking) |
+| cold in process, after | **7.7-11.3 / 16.2-17.2 ms** | 0-1 (one frame at 34-37 ms) | 6.2-6.8 (fast) or 10.8 (slow) / 11-13 | 38-47 / 193-301 ms |
+| warm in process, before | 86-95 / 310-430 ms | 10 | 12.7 / 50 | |
+| warm in process, after | 6.9-12.6 / 12.8-30.9 ms | 0-1 | 6.3-6.8 or 11.4 / 10.7-13 | 14-37 / 145-289 ms |
+
+"Correct stock on screen after" is the time of the last repaint callback after the selection (the stock tables and, for a stock never seen, the film match, which is the slow part: 193-301 ms cold); while it runs the picture shows the previous stock. **Not done: 'warm from disk'** (no per-stock persistence of tables, calibration results or grain tables, no size-capped cache directory) and **the fence-and-swap upload** (table landings still pay the `waitAll` and staging copy on the frame thread: 15-49 ms in a few frames per drag; the measured slide shows one frame over 33 ms at most). Cold stock tap -> first correct frame therefore is 8 ms (previous stock) then 40-300 ms (new stock), against 376-1245 ms blocking before.
+
+## 23. Distributions of the final tree, fast and slow state separately
+
+How the state is told apart: in the same run, the GPU-only `film_latitude` drag median. With `DAPPLE_GPU=1` (no probe thread) it is 6.9-8.0 ms fast / 11.5-12 ms slow; in the app-like mode (probe and warm-up running, the mode of the table below) it is 11.5-12 ms fast / 21-22 ms slow (the same frame costs about 4-5 ms more while the app-like warm-up thread exists: not explained). A run whose cases show both are marked mixed.
+
+| run (480 px, 728 frames, 12 cases x 60, app-like, settled warm-up) | state | p50 | p95 | p99 | max | frames over 33 ms |
+|---|---|---|---|---|---|---|
+| fast run 1 (latitude 11.5; shoot 9.2, print 9.4, black 8.7, warmth / tint 8.0, exposure 8.8, strength 12.7, grain 16.9) | fast | 10.8 | 16.8 | 33.4 | 654 (cold start) | 9 |
+| three slow runs (latitude 21) | slow | 14.2 / 15.2 / 15.3 | 21.2 / 22.8 / 22.8 | 30.3 / 38.0 / 31.8 | 512-605 | 8-9 |
+| fast run 2 (turned slow after the first cases) | mixed | 15.5 | 23.0 | 35.7 | 459 | 10 |
+
+The frames over 33 ms are the cold start (the CPU frames before the probe, the 500+ ms first GPU frame) plus about two table landings per run. Still above 8.3 ms in the fast state at 480 px: strength 12.7-13.2 and the kept-grain frames 16.9-17.2.
+
+## 24. Items 3-7 of round 6, APK, size
+
+Items 3 (strength / grain frames), 4 (bands), 5 (micro-benchmark and visual-cost table), 6 (raster prototype) and 7 (re-pointing `film_match*.cpp`) were **not started**. `build/redmi/app-w8-arm64.apk` was **rebuilt from the final tree** (38.3 MB; `libdapple.so` stripped 10,440,496 bytes, up from 8,410,392 in the previous APK: +2.0 MB from this round's merged tree, not measured per change), with the lint tasks skipped by a temporary Gradle init script (CodecSelfTest.kt lint crash, see round 2), debug key, never installed or launched.

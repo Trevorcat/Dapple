@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "parallel.h"
+#include "determinism.h"
 #include "engine/nodes/film/film_async.h"
 
 #include "dapple/film_match.h"
@@ -348,7 +349,7 @@ std::shared_ptr<const T> cachedTable(TableLru<T>& c, const Hash128& key, Status 
   std::shared_ptr<const T> sp(payloadAs<T>(p), [](const T* q) { freePayload(const_cast<T*>(q)); });
   std::lock_guard<std::mutex> lock(c.m);
   c.l.emplace_front(key, sp);
-  while (c.l.size() > 6) c.l.pop_back();
+  while (c.l.size() > 24) c.l.pop_back();  // wave 8: 24 (was 6): the film map slides across ~10 stocks in a second and each needs its raw / curves / print tables (about 1.5 MB each)
   return sp;
 }
 template <class T>
@@ -377,6 +378,14 @@ namespace {
 // values it wanted. The worker runs on the background pool (own threads, same capability-chosen cores) and keeps only the latest request.
 // The settled frame is not coarse and bakes / fetches the exact table on the frame thread exactly as before (DAPPLE_FILM_ASYNC_TABLES=0
 // restores the synchronous path, the engine tests use it).
+TableLru<RawTable>& rawsLru() {
+  static TableLru<RawTable> t;
+  return t;
+}
+TableLru<CurvesTable>& curvesLru() {
+  static TableLru<CurvesTable> t;
+  return t;
+}
 TableLru<PrintTable>& printsExact() {
   static TableLru<PrintTable> t;
   return t;
@@ -478,15 +487,15 @@ PrintWorker& printWorker() {
 bool asyncTables() {
   static const bool on = [] {
     const char* e = std::getenv("DAPPLE_FILM_ASYNC_TABLES");
-    return !(e && e[0] == '0');
+    return !(e && e[0] == '0') && !dapple::deterministicMode();
   }();
   return on;
 }
 }  // namespace
 
 bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
-  static TableLru<RawTable> raws;
-  static TableLru<CurvesTable> curves;
+  TableLru<RawTable>& raws = rawsLru();
+  TableLru<CurvesTable>& curves = curvesLru();
   TableLru<PrintTable>& prints = printsExact();
   Hasher hs;
   hs.u64(std::uintptr_t(r.lib));
@@ -751,4 +760,115 @@ void removeTableLandedListener(TableLandedFn fn, void* user) {
   v.erase(std::remove(v.begin(), v.end(), std::make_pair(fn, user)), v.end());
 }
 bool filmTablesStale() { return g_staleOutstanding.load(); }
+}  // namespace dapple::engine::filmnode
+
+namespace dapple::engine::filmnode {
+namespace {
+std::atomic<bool> g_matchStale{false};
+}
+void markMatchStale() { g_matchStale.store(true); }
+void notifyRepaintIfMatchStale() {
+  if (g_matchStale.exchange(false)) notifyLanded();
+}
+}  // namespace dapple::engine::filmnode
+
+// ---- stock selection (wave 8): the film map selects stocks live while the finger slides ----------------------------------------------------------
+// An interactive frame of a stock whose tables are not cached renders with the previous stock (GpuExecutor::filmResolve substitutes the previous
+// FilmResolved) while one latest-wins worker on the background pool bakes the wanted stock's raw / curve / print tables and its plan; the repaint
+// listeners fire when it landed. Cancellation is "latest wins": a worker that is baking a stock the finger already left finishes it (the tables are
+// cached for a later selection) and then takes the newest request.
+namespace dapple::engine::filmnode {
+namespace {
+struct StockKeys {
+  Hash128 ks, hr, kp;
+};
+StockKeys stockKeys(const FilmResolved& r) {
+  Hasher hs;
+  hs.u64(std::uintptr_t(r.lib));
+  hs.u64(std::uintptr_t(r.stock));
+  hs.i32(r.quality == 0);
+  StockKeys k;
+  k.ks = hs.finish();
+  Hasher hb;
+  hb.hash(k.ks);
+  hb.u64(std::uintptr_t(r.paper));
+  hb.i32(r.scan);
+  hb.i32(r.quality == 0);
+  hb.i32(dapple::filmPaperMappingEnabled());
+  hb.i32(r.fx.enlargerFilter != 0 && r.quality != 0 && !r.scan);
+  Hasher hp;
+  hp.hash(hb.finish());
+  hp.f32(r.warmth);
+  hp.f32(r.tint);
+  hp.f32(r.printEv);
+  hp.f32(r.black);
+  k.kp = hp.finish();
+  Hasher hr;
+  hr.hash(k.ks);
+  if (r.adapt < 1.f && r.sceneX > 0.f) {
+    hr.f32(r.sceneX);
+    hr.f32(r.sceneY);
+    hr.f32(r.adapt);
+  }
+  k.hr = hr.finish();
+  return k;
+}
+std::atomic<bool> g_stockStale{false};
+struct StockWorker {
+  std::mutex m;
+  std::condition_variable cv;
+  bool have = false, started = false;
+  FilmResolved r{};
+  void request(const FilmResolved& rr) {
+    {
+      std::lock_guard<std::mutex> lock(m);
+      r = rr;
+      have = true;
+      if (!started) {
+        started = true;
+        std::thread([this] { loop(); }).detach();
+      }
+    }
+    cv.notify_one();
+  }
+  void loop() {
+    ThreadPool::tlUse() = &ThreadPool::background();
+    for (;;) {
+      FilmResolved rr;
+      {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] { return have; });
+        rr = r;
+        have = false;
+      }
+      try {
+        rr.coarse = 0;
+        FilmTablesHandle tb;
+        tablesFor(rr, tb);
+        planOf(rr);
+      } catch (...) {
+      }
+      bool newer;
+      {
+        std::lock_guard<std::mutex> lock(m);
+        newer = have;
+      }
+      if (!newer && g_stockStale.exchange(false)) notifyLanded();
+    }
+  }
+};
+StockWorker& stockWorker() {
+  static StockWorker* w = new StockWorker;
+  return *w;
+}
+}  // namespace
+
+bool tablesCachedFor(const FilmResolved& r) {
+  const StockKeys k = stockKeys(r);
+  return cachedPeek(rawsLru(), k.hr) && cachedPeek(curvesLru(), k.ks) && cachedPeek(printsExact(), k.kp);
+}
+void requestStockPrep(const FilmResolved& r) {
+  g_stockStale.store(true);
+  stockWorker().request(r);
+}
 }  // namespace dapple::engine::filmnode

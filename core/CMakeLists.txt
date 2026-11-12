@@ -47,6 +47,8 @@ add_library(dapple_core STATIC
   engine/exec/cpu_executor.cpp
   engine/plan/planner.cpp
   engine/nodes/main/cpu_nodes.cpp
+  engine/nodes/demosaic/demosaic_cpu.cpp
+  engine/nodes/demosaic/demosaic_session.cpp
   engine/video/video_frame_session.cpp
 )
 add_library(Dapple::core ALIAS dapple_core)

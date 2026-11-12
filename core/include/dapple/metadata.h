@@ -36,6 +36,7 @@ struct ShotMetadata {
   // Per-file exposure anchor (core/src/exposure_anchor.h): the EV that moves the linear data to the exposure the camera showed for this frame.
   // Tier 1 embedded preview, 2 DNG BaselineExposure, 3 scene statistics, 4 none (0 = not computed: not a camera RAW). Replaces the camera
   // profile's baselineExposureEv for this file (effectiveCamera in camera.h). Computed at decode, deterministic.
+  bool monochrome = false;  // single-channel sensor (Leica M Monochrom, Pentax K-3 III Monochrome): no colour matrix, luminance only
   int exposureAnchorTier = 0;
   float exposureAnchorEv = 0.f;
   float exposureAnchorConfidence = 0.f;

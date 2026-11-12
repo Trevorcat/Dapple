@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <future>
 #include <cmath>
 #include <vector>
 #include <cstdio>
@@ -19,6 +21,7 @@
 
 #include "dapple/illuminant.h"
 #include "dapple/decoder.h"
+#include "dapple/mosaic.h"
 #include "decoders/dng_illuminant.h"
 #include "decoders/dng_jxl.h"
 #include "decoders/dng_opcodes.h"
@@ -213,6 +216,7 @@ ShotMetadata readMetadata(const LibRaw& raw, const double* whiteXy = nullptr) {
   m.focalLengthMm = d.other.focal_len;
   m.timestamp = static_cast<long long>(d.other.timestamp);
 
+  m.monochrome = d.idata.colors == 1;
   const bool swap = (d.sizes.flip & 4) != 0;
   int sw = d.sizes.width, sh = d.sizes.height;
   {
@@ -426,12 +430,31 @@ class PathDatastream final : public LibRaw_abstract_datastream {
   INT64 size_ = 0;
 };
 
-// Deep-shadow chroma floor. LibRaw (like every converter that works in unsigned integers) clips the black-subtracted noise at zero, which gives
-// each channel a positive bias of about 0.4 sigma; the white balance multipliers (R x 2, B x 1.8) then turn that into a magenta cast in the
-// darkest pixels (a Galaxy Note10+ frame at 0.5 - 2 DN above black with sigma 7 DN came out R 0.0070 / G 0.0041 / B 0.0097). Below a linear luma
-// of kShadowFloor the chroma is faded out (luma kept), smoothly: a pixel that dark has no colour information, only noise.
+// Deep-shadow chroma floor for near-empty frames. LibRaw (like every converter that works in unsigned integers) clips the black-subtracted noise at
+// zero, which gives each channel a positive bias of about 0.4 sigma; the white balance multipliers (R x 2, B x 1.8) turn that into a magenta cast
+// in pixels that hold no signal (a Galaxy Note10+ frame at 0.5 - 2 DN above black with sigma 7 DN came out R 0.0070 / G 0.0041 / B 0.0097).
+// Rule: only a frame whose 99.5th percentile luminance is below kEmptyP995 (0.03 of white, 5 stops below it: a black / noise frame, nothing in it
+// that is a photograph) is touched; there, linear luma below kShadowFloor fades to neutral (luma kept, smoothstep). Measured on 14 dark frames of
+// the owner's A7R V library (daytime and dusk shots with 12 - 40 % of the pixels below L* 20) the unconditional version changed 12 - 40 % of the
+// pixels by dE > 0.5 and removed up to 26 C* from legitimately coloured shadows (dark fabric, dusk foliage), so it must not run on frames that have
+// a real exposure; none of those frames passes the gate (their gated renders are byte-identical to the floor-off ones).
 void suppressShadowChroma(ImageF& img) {
-  constexpr float kShadowFloor = 0.008f;
+  static const bool off = [] { const char* e = std::getenv("DAPPLE_SHADOW_CHROMA"); return e && (std::strcmp(e, "off") == 0 || std::strcmp(e, "0") == 0); }();
+  if (off) return;  // A/B switch
+  constexpr float kShadowFloor = 0.008f, kEmptyP995 = 0.03f;
+  {
+    // 99.5th percentile of the luma on a 1/16 subsample
+    std::vector<float> ls;
+    ls.reserve(std::size_t(img.width / 4 + 1) * std::size_t(img.height / 4 + 1));
+    for (int y = 0; y < img.height; y += 4) {
+      const float* p = img.row(y);
+      for (int x = 0; x < img.width; x += 4) ls.push_back(0.2880f * p[3 * x] + 0.7119f * p[3 * x + 1] + 0.0001f * p[3 * x + 2]);
+    }
+    if (ls.empty()) return;
+    const std::size_t k = std::min(ls.size() - 1, std::size_t(0.995 * double(ls.size())));
+    std::nth_element(ls.begin(), ls.begin() + std::ptrdiff_t(k), ls.end());
+    if (ls[k] >= kEmptyP995) return;  // a photograph: leave the shadows alone
+  }
   const int h = img.height, w = img.width;
   parallelRows(h, [&](int y) {
     float* p = img.row(y);
@@ -445,7 +468,7 @@ void suppressShadowChroma(ImageF& img) {
 }
 
 // the file's exposure anchor (core/src/exposure_anchor.h) into out.meta: an explicit reference first, else the embedded preview, else a sibling camera JPEG
-void attachExposureAnchor(SourceImage& out, const std::filesystem::path& path, const DecodeOptions& options, float dngBaselineEv) {
+void attachExposureAnchor(SourceImage& out, const std::filesystem::path& path, const DecodeOptions& options, float dngBaselineEv, std::future<Result<Image8>>* embeddedFuture = nullptr) {
   // camera RAW (not a Dapple linear merge): the file's own exposure anchor
   // reference of this frame: an explicit one first, else the embedded preview, else a sibling camera JPEG (RAW+JPEG)
   ExposureAnchor an;
@@ -453,7 +476,12 @@ void attachExposureAnchor(SourceImage& out, const std::filesystem::path& path, c
   if (!options.referenceImage.empty()) {
   if (auto r = loadReferenceJpeg(options.referenceImage)) ref = std::move(*r);
   }
-  an = computeExposureAnchor(path, out.linear, dngBaselineEv, ref ? &*ref : nullptr);
+  std::optional<Image8> emb;
+  if (embeddedFuture && embeddedFuture->valid()) {
+    auto r = embeddedFuture->get();  // extracted on a second thread while LibRaw decoded
+    if (r) emb = std::move(*r);
+  }
+  an = computeExposureAnchor(path, out.linear, dngBaselineEv, ref ? &*ref : nullptr, emb ? &*emb : nullptr, out.meta.monochrome);
   if (an.tier != 1 && !ref) {
   for (const char* ext : {".jpg", ".JPG", ".jpeg", ".JPEG"}) {
     std::filesystem::path sib = path;
@@ -462,7 +490,7 @@ void attachExposureAnchor(SourceImage& out, const std::filesystem::path& path, c
     if (!std::filesystem::is_regular_file(sib, ec)) continue;
     auto r = loadReferenceJpeg(sib);
     if (!r) continue;
-    const ExposureAnchor a2 = computeExposureAnchor(path, out.linear, dngBaselineEv, &*r);
+    const ExposureAnchor a2 = computeExposureAnchor(path, out.linear, dngBaselineEv, &*r, nullptr, out.meta.monochrome);
     if (a2.tier == 1) {
       an = a2;
       break;
@@ -586,6 +614,51 @@ Result<SourceImage> decodeJxlDngFile(LibRaw& raw, const std::filesystem::path& p
   return out;
 }
 
+// DAPPLE_DECODE_TIMING=1: one stderr line per RAW decode with the split of the time (file read + open, decompression, each LibRaw processing stage,
+// the copy to float, geometry / anchor). Measurement aid for the demosaic-on-GPU design (docs/engine/pipeline-architecture.md section 31).
+struct DecodeTimer {
+  using Clock = std::chrono::steady_clock;
+  bool on = false;
+  Clock::time_point last;
+  std::vector<std::pair<std::string, double>> marks;
+  std::string stage;  // LibRaw stage in progress
+  void start() { last = Clock::now(); }
+  void mark(const std::string& name) {
+    const auto n = Clock::now();
+    marks.emplace_back(name, std::chrono::duration<double, std::milli>(n - last).count());
+    last = n;
+  }
+  static int progress(void* d, enum LibRaw_progress p, int, int) {
+    auto* t = static_cast<DecodeTimer*>(d);
+    const char* nm = "other";
+    switch (p) {
+      case LIBRAW_PROGRESS_SCALE_COLORS: nm = "scale_colors (black / white / WB)"; break;
+      case LIBRAW_PROGRESS_PRE_INTERPOLATE: nm = "pre_interpolate"; break;
+      case LIBRAW_PROGRESS_INTERPOLATE: nm = "demosaic"; break;
+      case LIBRAW_PROGRESS_MIX_GREEN: nm = "mix_green"; break;
+      case LIBRAW_PROGRESS_MEDIAN_FILTER: nm = "median_filter"; break;
+      case LIBRAW_PROGRESS_HIGHLIGHTS: nm = "highlights"; break;
+      case LIBRAW_PROGRESS_FUJI_ROTATE: nm = "fuji_rotate"; break;
+      case LIBRAW_PROGRESS_FLIP: nm = "flip"; break;
+      case LIBRAW_PROGRESS_CONVERT_RGB: nm = "convert_rgb (colour matrix)"; break;
+      case LIBRAW_PROGRESS_STRETCH: nm = "stretch"; break;
+      case LIBRAW_PROGRESS_RAW2_IMAGE: nm = "raw2image"; break;
+      default: break;
+    }
+    if (!t->stage.empty()) t->mark(t->stage);
+    t->stage = nm;
+    return 0;
+  }
+  void print(const char* file) {
+    if (!on) return;
+    double total = 0;
+    for (auto& m : marks) total += m.second;
+    std::fprintf(stderr, "decode-timing %s total %.0f ms:", file, total);
+    for (auto& m : marks) std::fprintf(stderr, " | %s %.0f", m.first.c_str(), m.second);
+    std::fprintf(stderr, "\n");
+  }
+};
+
 class LibRawDecoder final : public ImageDecoder {
  public:
   const char* name() const override { return "libraw"; }
@@ -628,8 +701,15 @@ class LibRawDecoder final : public ImageDecoder {
     if (int rc = raw->open_datastream(&stream); rc != LIBRAW_SUCCESS)
       return fail("LibRaw open failed: " + std::string(libraw_strerror(rc)));
     if (dng::isJxlDng(path)) return decodeJxlDngFile(*raw, path, options);  // DNG 1.7 JPEG XL: LibRaw cannot unpack it
+    DecodeTimer timer;
+    timer.on = std::getenv("DAPPLE_DECODE_TIMING") != nullptr;
+    timer.start();
+    timer.mark("open (file read of headers, identify)");
+    std::future<Result<Image8>> embeddedPreview;  // for the exposure anchor: the full-size JPEG decode (0.25 - 0.8 s) overlaps the demosaic
+    if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embeddedPreview = std::async(std::launch::async, [&path] { return extractEmbeddedPreview(path, 0); });
     if (int rc = raw->unpack(); rc != LIBRAW_SUCCESS)
       return fail("LibRaw unpack failed: " + std::string(libraw_strerror(rc)));
+    timer.mark("unpack (file read + decompression)");
     double wxy[2] = {0, 0};
     ShotMetadata meta = readMetadata(*raw, readDngWhiteXy(path, wxy) ? wxy : nullptr);  // before processing alters sizes/filters
     if (meta.illuminantSource == "dng-whitexy")  // the file has no AsShotNeutral: use the multipliers of its white point
@@ -693,9 +773,13 @@ class LibRawDecoder final : public ImageDecoder {
                                         raw->imgdata.color.dng_levels.baseline_exposure < 16.f
                                     ? raw->imgdata.color.dng_levels.baseline_exposure + (std::isfinite(dngBaselineOffsetEv(path)) ? dngBaselineOffsetEv(path) : 0.f)
                                     : std::numeric_limits<float>::quiet_NaN();
+    if (timer.on) raw->set_progress_handler(&DecodeTimer::progress, &timer);
+    timer.mark("opcodes / metadata");
     if (int rc = raw->dcraw_process(); rc != LIBRAW_SUCCESS)
       return fail("LibRaw processing failed: " + std::string(libraw_strerror(rc)));
 
+    if (timer.on && !timer.stage.empty()) timer.mark(timer.stage);
+    timer.mark("process end");
     int rc = 0;
     libraw_processed_image_t* mem = raw->dcraw_make_mem_image(&rc);
     if (!mem || rc != LIBRAW_SUCCESS)
@@ -705,6 +789,7 @@ class LibRawDecoder final : public ImageDecoder {
     if (mem->type != LIBRAW_IMAGE_BITMAP || (mem->colors != 3 && mem->colors != 1) || mem->bits != 16)  // 1 = monochrome sensor (Leica M Monochrom, Pentax K-3 III Monochrome)
       return fail("Unexpected LibRaw output layout");
 
+    const int rawActiveWidth = int(raw->imgdata.sizes.raw_width);  // unchanged by half_size; before recycle() clears the sizes
     // Free LibRaw's own image buffers before allocating the float copy.
     raw->recycle();
 
@@ -727,11 +812,13 @@ class LibRawDecoder final : public ImageDecoder {
       for (int i = 0; i < w * 3; ++i) d[i] = s[i] * kScale;
     });
     guard.reset();  // release the 16-bit copy
+    timer.mark("make_mem_image + copy to float");
     if (geom) {
       try {
         dng::applyImage(l3, out.linear, corr);
         if (cropIt) {
-          const int k = options.quality == DecodeQuality::Preview ? 2 : 1;
+          // the preview decode halves the size of mosaic sensors only: a monochrome / linear file (filters 0) comes out at full size
+          const int k = (options.quality == DecodeQuality::Preview && rawActiveWidth >= 2 * out.linear.width - 2) ? 2 : 1;
           out.linear = dng::cropImage(out.linear, cropX / k, cropY / k, cropW / k, cropH / k);
           corr.applied.push_back("DefaultCrop");
         }
@@ -742,7 +829,10 @@ class LibRawDecoder final : public ImageDecoder {
     }
     out.meta.dngCorrections = corr.summary();
     if (dappleGain == 1.f) suppressShadowChroma(out.linear);  // not for Dapple merges (their values are not sensor data)
-    if (dappleGain == 1.f && anchorEnabled()) attachExposureAnchor(out, path, options, dngBaselineEv);
+    timer.mark("geometry / shadow floor");
+    if (dappleGain == 1.f && anchorEnabled()) attachExposureAnchor(out, path, options, dngBaselineEv, &embeddedPreview);
+    timer.mark("exposure anchor (preview decode + compare)");
+    timer.print(path.filename().string().c_str());
     return out;
   }
 };
@@ -804,6 +894,8 @@ Result<Image8> extractEmbeddedPreview(const std::filesystem::path& rawPath, int 
   }
   return img;
 }
+
+#include "decoders/libraw_mosaic.inc"  // decodeRawMosaic (Demosaic node input), docs/engine/pipeline-architecture.md section 32
 
 std::unique_ptr<ImageDecoder> makeLibRawDecoder() { return std::make_unique<LibRawDecoder>(); }
 

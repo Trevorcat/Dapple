@@ -13,6 +13,8 @@ import '../screens/editor/editor_page.dart';
 import '../native/dapple_bindings.dart';
 import '../state/app_state.dart';
 import '../services/ingest.dart';
+import '../native/dapple_session.dart';
+import '../services/gpu_view_backend.dart';
 import 'ios_autotest.dart' show kIosAutotest;
 import 'ios_services.dart';
 
@@ -67,6 +69,29 @@ class IosDebugOpen {
       if (stock is String && stock.isNotEmpty) app.applyEdit(photo.id, (e) => e.copyWith(film: stock));
       final g = EGroup.values.where((e) => e.name == _group).firstOrNull;
       openEditor(ctx, app, photo.id, initialGroup: g);
+      if (_cfg['probeView'] == true) {
+        Future<void>.delayed(const Duration(seconds: 8), () async {
+          final b = await GpuViewBackend.start(640, 480);
+          debugPrint('IosDebugOpen: probe GpuViewBackend.start -> ${b == null ? 'null' : 'texture ${b.textureId}'} supported=${GpuViewBackend.supported}');
+          if (b != null) {
+            // frames through the native view: a session on the sample, a few frames at 1080 long edge, counters from the view
+            final docs = (await getApplicationDocumentsDirectory()).path;
+            final sample = File('$docs/Photos/sample.jpg').existsSync() ? 'sample.jpg' : 'DAPPLE_sample_01.jpg';
+            final ses = await DappleSession.open('$docs/Photos/$sample', longEdge: 2048);
+            b.bindSession(ses.address);
+            for (var i = 0; i < 6; i++) {
+              b.submit({'look': 'std', 'lookStrength': 100, 'toneStrength': 60, 'exposure': -30.0 + i * 12}, longEdge: 1080, flags: 0);
+              await Future<void>.delayed(const Duration(milliseconds: 400));
+            }
+            await Future<void>.delayed(const Duration(seconds: 1));
+            debugPrint('IosDebugOpen: probe view info ${jsonEncode(b.info())}');
+            File('$docs/probe_log.txt').writeAsStringSync('${jsonEncode({'textureId': b.textureId, 'info': b.info(), 'gpu': jsonDecode(DappleSession.gpuStatusJson() ?? '{}')})}\n');
+            b.bindSession(0);
+            await ses.close();
+          }
+          b?.dispose();
+        });
+      }
     } catch (e) {
       debugPrint('IosDebugOpen: $e');
     }

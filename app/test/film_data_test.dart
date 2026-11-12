@@ -205,6 +205,22 @@ void main() {
       expect(find.textContaining('creativecommons.org/licenses/by-sa/4.0'), findsOneWidget);
     });
 
+    testWidgets('RAW decoding libraries are credited: LibRaw (CDDL-1.0), libjxl + Highway (BSD-3), libomp (Apache-2.0 with LLVM exception)', (t) async {
+      setView(t, phonePhys, phoneDpr);
+      await loadTestFonts();
+      final app = AppState.demo();
+      await t.pumpWidget(MaterialApp(theme: buildTheme(Brightness.light), home: LicensesPage(app: app)));
+      await settle(t, 3);
+      Future<String> body(String key) async {
+        await t.scrollUntilVisible(find.byKey(ValueKey(key)), 300, scrollable: find.byType(Scrollable).first);
+        return t.widget<SelectableText>(find.byKey(ValueKey(key))).data!;
+      }
+
+      expect(await body('licence-libraw'), allOf(contains('LibRaw'), contains('CDDL-1.0'), contains('0.23.0')));
+      expect(await body('licence-libjxl'), allOf(contains('libjxl'), contains('Highway'), contains('BSD 3-Clause'), contains('AS IS')));
+      expect(await body('licence-libomp'), allOf(contains('OpenMP'), contains('Apache License 2.0')));
+    });
+
     testWidgets('without a pack the page still carries the credit line', (t) async {
       setView(t, phonePhys, phoneDpr);
       await loadTestFonts();

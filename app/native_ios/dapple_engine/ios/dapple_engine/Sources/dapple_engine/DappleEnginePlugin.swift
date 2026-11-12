@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 
 @_silgen_name("dapple_gpu_configure") private func dapple_gpu_configure_c(_ dir: UnsafePointer<CChar>?, _ version: UnsafePointer<CChar>?, _ fingerprint: UnsafePointer<CChar>?)
 @_silgen_name("dapple_gpu_warmup") private func dapple_gpu_warmup_c()
+@_silgen_name("dapple_film_load_pack_memory") private func dapple_film_load_pack_memory_c(_ data: UnsafeRawPointer?, _ size: Int) -> Int32
 
 public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHandler, PHPhotoLibraryChangeObserver, PHPickerViewControllerDelegate {
     private var events: FlutterEventSink?
@@ -20,8 +21,11 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
     private var pickDest: String = ""
     private let io = DispatchQueue(label: "dapple.photos.io", qos: .userInitiated)
 
+    private static var viewPlugin: DappleViewPlugin?
+
     public static func register(with registrar: FlutterPluginRegistrar) {
         let p = DappleEnginePlugin()
+        viewPlugin = DappleViewPlugin(registrar: registrar)  // dapple/view (zero-copy display)
         startGpu()
         FlutterMethodChannel(name: "dapple/media", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handleMedia)
         FlutterMethodChannel(name: "dapple/photos", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handlePhotos)
@@ -42,6 +46,10 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let fp = "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion) \(machine)"
         let ver = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "0"
         dapple_gpu_configure_c(dir, ver, fp)
+        // The GPU verdict includes a film frame compared with the CPU (gpu_context.cpp "film check"): that needs the film pack, which Dart only loads
+        // later, so the pack bundled as a Flutter asset is read here before the probe starts (Dart installs the same bytes again, harmless).
+        let pack = Bundle.main.bundlePath + "/Frameworks/App.framework/flutter_assets/assets/film/dapple.dfp"
+        if let d = FileManager.default.contents(atPath: pack) { _ = d.withUnsafeBytes { dapple_film_load_pack_memory_c($0.baseAddress, d.count) } }
         dapple_gpu_warmup_c()
     }
 
@@ -197,9 +205,15 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let a = call.arguments as? [String: Any] ?? [:]
         switch call.method {
         case "authorizationStatus":
+            registerObserverIfAllowed()
             result(statusName(PHPhotoLibrary.authorizationStatus(for: .readWrite)))
         case "requestAuthorization":
-            PHPhotoLibrary.requestAuthorization(for: .readWrite) { s in DispatchQueue.main.async { result(self.statusName(s)) } }
+            // test runs (simulator / device scripts) drop Documents/DAPPLE_OPEN: no system prompt then, nobody can answer it
+            let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first ?? ""
+            if FileManager.default.fileExists(atPath: docs + "/DAPPLE_OPEN") || FileManager.default.fileExists(atPath: docs + "/autotest.json") {
+                return result(statusName(PHPhotoLibrary.authorizationStatus(for: .readWrite)))
+            }
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { s in DispatchQueue.main.async { self.registerObserverIfAllowed(); result(self.statusName(s)) } }
         case "presentLimitedLibraryPicker":
             if let vc = topViewController() { PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: vc) }
             result(nil)
@@ -257,12 +271,26 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
 
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         self.events = events
-        PHPhotoLibrary.shared().register(self)
+        wantObserver = true
+        registerObserverIfAllowed()
         return nil
     }
 
+    private var wantObserver = false, observing = false
+
+    /// Registering a PHPhotoLibraryChangeObserver while the access is undetermined makes Photos show the permission prompt on its own, so it waits
+    /// until the user has answered the app's own request (requestAuthorization).
+    private func registerObserverIfAllowed() {
+        guard wantObserver, !observing else { return }
+        let st = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard st == .authorized || st == .limited else { return }
+        PHPhotoLibrary.shared().register(self)
+        observing = true
+    }
+
     public func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        PHPhotoLibrary.shared().unregisterChangeObserver(self)
+        wantObserver = false
+        if observing { PHPhotoLibrary.shared().unregisterChangeObserver(self); observing = false }
         events = nil
         return nil
     }

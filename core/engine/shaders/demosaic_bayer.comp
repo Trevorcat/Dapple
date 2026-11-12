@@ -1,0 +1,70 @@
+#version 450
+// Bayer demosaic. MODE 0: green plane over the window (inset 2). MODE 1: red / blue by colour differences, matrix, output.
+// Gradient-weighted Hamilton-Adams green, diagonal-gradient chroma at the opposite colour, plain average at green.
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+#include "demosaic_common.glsl"
+#include "common.glsl"
+layout(binding = 1, std430) readonly buffer Sb { float S[]; };
+#if MODE == 0
+layout(binding = 2, std430) writeonly buffer Gb { float G[]; };
+#else
+layout(binding = 2, std430) readonly buffer Gb { float G[]; };
+layout(binding = 3, OUT_FMT) uniform writeonly image2D uOut;
+#endif
+const float kEps = 0.002;
+
+float bayerGreen(int k, int ww) {
+  const float C = S[k], l = S[k - 1], r = S[k + 1], l2 = S[k - 2], r2 = S[k + 2];
+  const float up = S[k - ww], d = S[k + ww], u2 = S[k - 2 * ww], d2 = S[k + 2 * ww];
+  float gh = 0.5 * (l + r) + 0.25 * (2.0 * C - l2 - r2);
+  float gv = 0.5 * (up + d) + 0.25 * (2.0 * C - u2 - d2);
+  gh = min(max(gh, min(l, r)), max(l, r));
+  gv = min(max(gv, min(up, d)), max(up, d));
+  const float dh = abs(l - r) + abs(2.0 * C - l2 - r2) + 0.5 * (abs(S[k - ww - 1] - S[k - ww + 1]) + abs(S[k + ww - 1] - S[k + ww + 1]));
+  const float dv = abs(up - d) + abs(2.0 * C - u2 - d2) + 0.5 * (abs(S[k - 1 - ww] - S[k - 1 + ww]) + abs(S[k + 1 - ww] - S[k + 1 + ww]));
+  const float wh = 1.0 / sq(kEps + dh), wv = 1.0 / sq(kEps + dv);
+  return (wh * gh + wv * gv) / (wh + wv);
+}
+
+void main() {
+  const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+  const int ww = u.dims.x, wh = u.dims.y, H = 4;
+#if MODE == 0
+  if (q.x >= ww || q.y >= wh) return;
+  const int i = q.x, j = q.y;
+  if (i < 2 || j < 2 || i >= ww - 2 || j >= wh - 2) { G[j * ww + i] = 0.0; return; }
+  const int k = j * ww + i;
+  G[k] = colAt(i, j, 2) == 1 ? S[k] : bayerGreen(k, ww);
+#else
+  if (q.x >= u.dims.z || q.y >= u.dims.w) return;
+  const int i = q.x + H, j = q.y + H;
+  const int k = j * ww + i;
+  const int c = colAt(i, j, 2);
+  const float g = G[k];
+  vec3 rgb;
+  if (c == 1) {
+    const int hc = colAt(i - 1, j, 2);
+    const float dh = 0.5 * ((S[k - 1] - G[k - 1]) + (S[k + 1] - G[k + 1]));
+    const float dv = 0.5 * ((S[k - ww] - G[k - ww]) + (S[k + ww] - G[k + ww]));
+    rgb.y = g;
+    rgb[hc] = g + dh;
+    rgb[2 - hc] = g + dv;
+  } else {
+    rgb.y = g;
+    rgb[c] = S[k];
+    const float d1 = 0.5 * ((S[k - ww + 1] - G[k - ww + 1]) + (S[k + ww - 1] - G[k + ww - 1]));
+    const float d2 = 0.5 * ((S[k - ww - 1] - G[k - ww - 1]) + (S[k + ww + 1] - G[k + ww + 1]));
+    const float g1 = abs(G[k - ww + 1] - g) + abs(G[k + ww - 1] - g);
+    const float g2 = abs(G[k - ww - 1] - g) + abs(G[k + ww + 1] - g);
+    const float w1 = 1.0 / sq(kEps + g1), w2 = 1.0 / sq(kEps + g2);
+    rgb[2 - c] = g + (w1 * d1 + w2 * d2) / (w1 + w2);
+  }
+  const vec3 o = finishRgb(rgb);
+#ifdef OUT16
+  imageStore(uOut, q + u.io.yz, h16v(vec4(o, 1.0)));
+#else
+  imageStore(uOut, q + u.io.yz, vec4(o, 1.0));
+#endif
+#endif
+}

@@ -70,7 +70,7 @@ class GpuViewBackend with WidgetsBindingObserver {
   int get boundSession => _boundSession;
 
   /// True when this platform can have a GPU view at all (cheap pre-check).
-  static bool get supported => kGpuView && !kIsWeb && Platform.isAndroid;
+  static bool get supported => kGpuView && !kIsWeb && (Platform.isAndroid || Platform.isIOS); // iOS: DappleViewPlugin.swift + core/engine/present/metal_presenter.mm
 
   /// Creates the native view + texture of [w] x [h] pixels and attaches them. Null when anything is unavailable (the caller keeps
   /// the readback path); the reason goes to the debug log.

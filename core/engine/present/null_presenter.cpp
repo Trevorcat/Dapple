@@ -74,7 +74,7 @@ class NullPresenter final : public Presenter {
 
 std::unique_ptr<Presenter> makeNullPresenter(bool external) { return std::make_unique<NullPresenter>(external); }
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(__APPLE__)  // Apple: metal_presenter.mm
 std::unique_ptr<Presenter> makeVulkanPresenter(std::string& err) {
   err = "Vulkan swapchain presenter is Android only";
   return nullptr;

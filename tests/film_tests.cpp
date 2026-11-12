@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 
+#include "test_tmp.h"
 #include "colour_metrics.h"
 #include "dapple/camera.h"
 #include "dapple/dapple_c.h"
@@ -24,6 +25,7 @@
 #include "dapple/film_match.h"
 #include "dapple/illuminant.h"
 #include "dapple/renderer.h"
+#include "render_f.h"
 #include "dapple/tone.h"
 #include "film_internal.h"
 #include "film_kernels.h"
@@ -133,7 +135,7 @@ void testProfiles() {
   CHECK(worstLayers == 0.0);  // grain sub-layers are stored as float32: pack and JSON libraries are identical
 
   // pack round trip through memory
-  const fs::path tmp = fs::temp_directory_path() / "dapple_film_test.dfp";
+  const fs::path tmp = fs::temp_directory_path() / (std::string("dapple_film_test_") + testUniqueTag() + ".dfp");
   CHECK(lib->writePack(tmp, &err));
   auto back = FilmLibrary::loadPack(tmp, &err);
   CHECK(back && back->names() == lib->names() && back->upsample().coef == lib->upsample().coef &&
@@ -1286,11 +1288,11 @@ void testFilmMatch() {
     FilmMatchInfo mi;
     const FilmExposure fe = matchFilmExposure(p, cam, nullptr, *s, &mi, &full);
     const float ev = fe.filmEv;
-    const float normal = medianLightness(Renderer(plain, cam, nullptr).renderFloat(*s, false));
+    const float normal = medianLightness(renderF(plain, cam, nullptr, *s, false));
     EditParams m = p;
     m.filmKeyEv = ev;
-    const float film = medianLightness(Renderer(m, cam, nullptr).renderFloat(*s, false));
-    const float film0 = medianLightness(Renderer(p, cam, nullptr).renderFloat(*s, false));
+    const float film = medianLightness(renderF(m, cam, nullptr, *s, false));
+    const float film0 = medianLightness(renderF(p, cam, nullptr, *s, false));
     std::printf("  film match (full, v2): ev %+.2f  L* develop %.1f  film unmatched %.1f  matched %.1f  (%d evals)\n", ev, normal, film0, film, mi.evals);
     CHECK(std::fabs(film - normal) < 2.0f);
     CHECK(std::fabs(film - normal) <= std::fabs(film0 - normal) + 0.01f);
@@ -1337,11 +1339,11 @@ void testFilmMatch() {
       EditParams m = p;
       m.filmKeyEv = ed.filmEv;
       m.filmPrintEv = ed.printEv;
-      const float L = medianLightness(Renderer(m, cam, nullptr).renderFloat(bright, false));
+      const float L = medianLightness(renderF(m, cam, nullptr, bright, false));
       std::printf("  dim scene, portra 400: film EV %+.2f print EV %+.2f -> median L* %.1f (develop %.1f)\n", ed.filmEv, ed.printEv, L, md.targetL);
       CHECK(std::fabs(L - md.targetL) < 1.5f);
       EditParams u = p;  // brighter than the unexposed film
-      CHECK(L > medianLightness(Renderer(u, cam, nullptr).renderFloat(bright, false)) + 1.f);
+      CHECK(L > medianLightness(renderF(u, cam, nullptr, bright, false)) + 1.f);
     }
   }
   // B on a synthetic print response: inside the range it hits the target, outside it clamps at the paper bounds
@@ -1422,7 +1424,7 @@ void testFilmMatch() {
     };
     auto srgbToLinear = [](float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); };
     auto lstats = [&](const EditParams& e, const SourceImage& s) {
-      const ImageF img = Renderer(e, cam, nullptr).renderFloat(s, false);
+      const ImageF img = renderF(e, cam, nullptr, s, false);
       std::vector<float> ls;
       ls.reserve(std::size_t(img.width) * img.height);
       std::size_t nb = 0, nw = 0;
@@ -1590,7 +1592,7 @@ void testFilmMatch() {
         auto greyCast = [&](const EditParams& e, double* hue) {
           SourceImage grey = src;
           for (float& v : grey.linear.data) v = 0.184f;
-          const ImageF out = Renderer(e, cam, nullptr).renderFloat(grey, false);
+          const ImageF out = renderF(e, cam, nullptr, grey, false);
           const float* r = out.row(out.height / 2) + 3 * (out.width / 2);
           auto dec = [](float v) { return double(v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f)); };
           const double R = dec(r[0]), G = dec(r[1]), B = dec(r[2]);
@@ -1613,12 +1615,12 @@ void testFilmMatch() {
           EditParams a = edit("kodak_portra_400", 3200, 0.f), b = edit("kodak_portra_400", 0, 0.f);
           a.temperature = b.temperature = temp;
           a.tint = b.tint = temp * 0.3f;
-          CHECK(sameBits(Renderer(a, cam, nullptr).renderFloat(src, false), Renderer(b, cam, nullptr).renderFloat(src, false)));
+          CHECK(sameBits(renderF(a, cam, nullptr, src, false), renderF(b, cam, nullptr, src, false)));
         }
         // an unknown scene light has no effect at any film_wb
         {
           EditParams a = edit("kodak_portra_400", 0, 1.f), b = edit("kodak_portra_400", 0, 0.f);
-          CHECK(sameBits(Renderer(a, cam, nullptr).renderFloat(src, false), Renderer(b, cam, nullptr).renderFloat(src, false)));
+          CHECK(sameBits(renderF(a, cam, nullptr, src, false), renderF(b, cam, nullptr, src, false)));
         }
         double hue = 0;
         const double cDay3200 = greyCast(edit("kodak_portra_400", 3200, 1.f), &hue);
@@ -1643,7 +1645,7 @@ void testFilmMatch() {
         {
           EditParams a = edit("kodak_portra_400", 3200, 1.f), b = a;
           b.temperature = 40.f;
-          CHECK(!sameBits(Renderer(a, cam, nullptr).renderFloat(src, false), Renderer(b, cam, nullptr).renderFloat(src, false)));
+          CHECK(!sameBits(renderF(a, cam, nullptr, src, false), renderF(b, cam, nullptr, src, false)));
           double x0, y0, d0, x1, y1, d1;
           filmInputAdaptation(a, &x0, &y0, &d0);
           filmInputAdaptation(b, &x1, &y1, &d1);
@@ -1800,10 +1802,10 @@ void testFilmMatch() {
   a.filmKeyEv = 1.f;
   b.filmKeyEv = 0.f;
   b.filmExposure = 1.f;
-  CHECK(meanAbsDiff(Renderer(a, cam, nullptr).renderFloat(src, false), Renderer(b, cam, nullptr).renderFloat(src, false)) < 1e-6);
+  CHECK(meanAbsDiff(renderF(a, cam, nullptr, src, false), renderF(b, cam, nullptr, src, false)) < 1e-6);
   EditParams c = p;
   c.filmPrintEv = 0.5f;
-  CHECK(meanAbsDiff(Renderer(c, cam, nullptr).renderFloat(src, false), Renderer(p, cam, nullptr).renderFloat(src, false)) > 1e-3);
+  CHECK(meanAbsDiff(renderF(c, cam, nullptr, src, false), renderF(p, cam, nullptr, src, false)) > 1e-3);
 }
 
 void testDevelopFilmIntegration() {
@@ -1819,8 +1821,8 @@ void testDevelopFilmIntegration() {
   const EditParams off;
   EditParams dangling = off;
   dangling.filmStock = "kodak_portra_400";  // no library installed: ignored
-  const ImageF refOff = Renderer(off, cam, nullptr).renderFloat(src);
-  CHECK(sameBits(refOff, Renderer(dangling, cam, nullptr).renderFloat(src)));
+  const ImageF refOff = renderF(off, cam, nullptr, src);
+  CHECK(sameBits(refOff, renderF(dangling, cam, nullptr, src)));
   const auto bakeOff = Renderer(off, cam, nullptr).bake(src, 33);
   FastOptions fo;
   const ImageF bakedOff = Renderer(off, cam, nullptr).renderBakedFloat(src, *bakeOff, fo);
@@ -1838,24 +1840,24 @@ void testDevelopFilmIntegration() {
   isPaper.filmStock = "kodak_portra_endura";  // a paper is not a camera film
   CHECK(!Renderer(isPaper, cam, nullptr).filmActive());
   // installed library, film off or strength 0: identical to the render without any film code involved
-  CHECK(sameBits(refOff, Renderer(off, cam, nullptr).renderFloat(src)));
+  CHECK(sameBits(refOff, renderF(off, cam, nullptr, src)));
   EditParams zero = filmEdit();
   zero.filmStrength = 0.f;
   {
     EditParams offLike = zero;
     offLike.filmStock.clear();
-    CHECK(sameBits(Renderer(offLike, cam, nullptr).renderFloat(src), Renderer(zero, cam, nullptr).renderFloat(src)));
+    CHECK(sameBits(renderF(offLike, cam, nullptr, src), renderF(zero, cam, nullptr, src)));
   }
 
   // ---- film on: differs from the normal render, is deterministic, direct == baked ----
   const EditParams fp = filmEdit();
-  const ImageF f1 = Renderer(fp, cam, nullptr).renderFloat(src);
-  const ImageF f2 = Renderer(fp, cam, nullptr).renderFloat(src);
+  const ImageF f1 = renderF(fp, cam, nullptr, src);
+  const ImageF f2 = renderF(fp, cam, nullptr, src);
   CHECK(sameBits(f1, f2));
-  CHECK(meanAbsDiff(f1, Renderer(filmEdit(), cam, nullptr).renderFloat(src)) == 0.0);
+  CHECK(meanAbsDiff(f1, renderF(filmEdit(), cam, nullptr, src)) == 0.0);
   EditParams plainP = fp;
   plainP.filmStock.clear();
-  const ImageF plain = Renderer(plainP, cam, nullptr).renderFloat(src);
+  const ImageF plain = renderF(plainP, cam, nullptr, src);
   CHECK(meanAbsDiff(f1, plain) > 0.02);
   const auto bk = Renderer(fp, cam, nullptr).bake(src, 33);
   const ImageF b1 = Renderer(fp, cam, nullptr).renderBakedFloat(src, *bk, fo);
@@ -1895,9 +1897,9 @@ void testDevelopFilmIntegration() {
   }
   // the pooled simulator (cached bake) renders the same as after other films were used in between
   {
-    const ImageF other = Renderer(filmEdit("kodak_ektar_100"), cam, nullptr).renderFloat(src);
+    const ImageF other = renderF(filmEdit("kodak_ektar_100"), cam, nullptr, src);
     CHECK(meanAbsDiff(f1, other) > 0.01);
-    CHECK(sameBits(f1, Renderer(fp, cam, nullptr).renderFloat(src)));
+    CHECK(sameBits(f1, renderF(fp, cam, nullptr, src)));
   }
   // threads do not matter: a second render on a differently chunked pool is identical (stateless grain)
   {
@@ -1970,7 +1972,7 @@ void testDevelopFilmIntegration() {
   {
     EditParams half = fp;
     half.filmStrength = 50.f;
-    const ImageF h = Renderer(half, cam, nullptr).renderFloat(src);
+    const ImageF h = renderF(half, cam, nullptr, src);
     const double d0 = meanAbsDiff(h, plain), d1 = meanAbsDiff(h, f1);
     CHECK(d0 > 0.005 && d1 > 0.005);
     const double full = meanAbsDiff(plain, f1);
@@ -1985,40 +1987,40 @@ void testDevelopFilmIntegration() {
     dim.sceneReferred = true;
     dim.linear = ImageF(64, 64);
     for (float& v : dim.linear.data) v = 0.015f;
-    const ImageF dimBase = Renderer(fp, cam, nullptr).renderFloat(dim);
+    const ImageF dimBase = renderF(fp, cam, nullptr, dim);
     EditParams bright = fp;
     bright.filmExposure = 1.f;
-    const ImageF brightImg = Renderer(bright, cam, nullptr).renderFloat(dim);
+    const ImageF brightImg = renderF(bright, cam, nullptr, dim);
     std::printf("  film exposure +1 EV on a dim frame: mean green %.4f -> %.4f\n", channelMean(dimBase, 1), channelMean(brightImg, 1));
     CHECK(channelMean(brightImg, 1) > channelMean(dimBase, 1) + 0.03);
     EditParams ev = fp;
     ev.exposure = 1.f;  // the develop exposure slider acts before the film, like the film exposure offset
-    CHECK(meanAbsDiff(Renderer(ev, cam, nullptr).renderFloat(dim), brightImg) < 0.005);
+    CHECK(meanAbsDiff(renderF(ev, cam, nullptr, dim), brightImg) < 0.005);
     EditParams warm = fp;
     warm.filmWarmth = 100.f;
     EditParams cool = fp;
     cool.filmWarmth = -100.f;
-    const ImageF w = Renderer(warm, cam, nullptr).renderFloat(src), c = Renderer(cool, cam, nullptr).renderFloat(src);
+    const ImageF w = renderF(warm, cam, nullptr, src), c = renderF(cool, cam, nullptr, src);
     CHECK(channelMean(w, 0) / channelMean(w, 2) > channelMean(c, 0) / channelMean(c, 2) * 1.05);
     EditParams mag = fp;
     mag.filmTint = 100.f;
     EditParams grn = fp;
     grn.filmTint = -100.f;
-    const ImageF m = Renderer(mag, cam, nullptr).renderFloat(src), g = Renderer(grn, cam, nullptr).renderFloat(src);
+    const ImageF m = renderF(mag, cam, nullptr, src), g = renderF(grn, cam, nullptr, src);
     CHECK(channelMean(m, 1) / channelMean(m, 0) < channelMean(g, 1) / channelMean(g, 0) * 0.97);  // magenta = less green
     // white balance slider still works before the film
     EditParams wb = fp;
     wb.temperature = 60.f;
-    const ImageF t = Renderer(wb, cam, nullptr).renderFloat(src);
+    const ImageF t = renderF(wb, cam, nullptr, src);
     CHECK(channelMean(t, 0) / channelMean(t, 2) > channelMean(f1, 0) / channelMean(f1, 2) * 1.03);
     // curves still apply after the film
     EditParams cv = fp;
     cv.parametricLights = 60.f;
-    CHECK(meanAbsDiff(Renderer(cv, cam, nullptr).renderFloat(src), f1) > 0.003);
+    CHECK(meanAbsDiff(renderF(cv, cam, nullptr, src), f1) > 0.003);
     // vignette follows
     EditParams vg = fp;
     vg.vignette = -80.f;
-    const ImageF v = Renderer(vg, cam, nullptr).renderFloat(src);
+    const ImageF v = renderF(vg, cam, nullptr, src);
     double sv = 0, sf = 0;
     for (int i = 0; i < 48; ++i) sv += v.data[i], sf += f1.data[i];
     CHECK(sv < sf * 0.9 + 1e-6);  // corner darkened (a black corner stays black)
@@ -2034,7 +2036,7 @@ void testDevelopFilmIntegration() {
       EditParams p = fp;
       p.filmGrain = grain;
       p.filmHalation = 0.f;
-      const ImageF o = Renderer(p, cam, nullptr).renderFloat(flat);
+      const ImageF o = renderF(p, cam, nullptr, flat);
       double m = 0, q = 0;
       int n = 0;
       for (int y = 64; y < 192; ++y)
@@ -2464,7 +2466,7 @@ void fixCrc(std::string& f) {
 
 void testPackFormat() {
   auto lib = library();
-  const fs::path tmp = fs::temp_directory_path() / "dapple_film_test2.dfp";
+  const fs::path tmp = fs::temp_directory_path() / (std::string("dapple_film_test2_") + testUniqueTag() + ".dfp");
   std::string err;
   CHECK(lib->writePack(tmp, &err));
   std::string file;

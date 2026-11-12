@@ -266,10 +266,15 @@ double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note, bool* wr
   struct Tier {
     SpatialQuality q;
     bool grain;
+    float strength = 100.f;       // < 100: the Blend pipelines of a film strength drag
+    const char* active = nullptr;  // a table-moving parameter: the coarse print table path
   };
-  for (const Tier t : {Tier{SpatialQuality::Interactive, false}, Tier{SpatialQuality::Full, false}, Tier{SpatialQuality::Interactive, true}}) {
+  for (const Tier t : {Tier{SpatialQuality::Interactive, false}, Tier{SpatialQuality::Full, false}, Tier{SpatialQuality::Interactive, true},
+                       Tier{SpatialQuality::Interactive, false, 60.f, "film_strength"}, Tier{SpatialQuality::Interactive, false, 100.f, "film_black"}}) {
     EditParams p;
     p.filmStock = stock;
+    p.filmStrength = t.strength;
+    if (t.active) p.filmBlack = 0.2f;
     Renderer r(p, cam, nullptr);
     FastOptions fo;
     fo.spatial = t.q;
@@ -278,7 +283,8 @@ double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note, bool* wr
     FrameJob job{p, r, src, nullptr, cam, nullptr, {}, {}, {}};
     job.request.bakeSize = 33;
     job.request.interactive = t.q == SpatialQuality::Interactive;
-    job.request.activeParam = t.grain ? "film_grain" : "";
+    job.request.activeParam = t.grain ? "film_grain" : (t.active ? t.active : "");
+    job.fastOptions.coarseFilm = t.active && std::string(t.active) != "film_strength";
     job.fastOptions = fo;
     job.store = &store;
     FrameResult res;

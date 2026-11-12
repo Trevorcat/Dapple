@@ -30,6 +30,7 @@
 #include "dapple/illuminant.h"
 #include "dapple/auto_adjust.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 #include "film_internal.h"
 
 namespace fs = std::filesystem;
@@ -358,9 +359,10 @@ int cmdFilm(const std::vector<std::string>& args) {
     full.linear = in.width > 1024 || in.height > 1024 ? resizeToLongEdge(in, 1024) : in;
     EditParams ep;
     ep += computeAutoAdjust(full, cam, AutoOptions{}).correction;
-    Renderer ref(ep, cam, nullptr);
-    ref.setToneProxy(&proxy);
-    const float target = medianLightness(ref.renderFloat(proxy, false));
+    // the proxy is also its own tone proxy (<= 256 px): the engine render of the proxy equals the old Renderer::renderFloat of it
+    ImageF refImg;
+    if (!engine::renderImageF(ep, cam, nullptr, proxy, false, refImg)) { std::fprintf(stderr, "film: reference render failed\n"); return 2; }
+    const float target = medianLightness(refImg);
     FilmParams q = p;
     q.disableSpatialAndStochastic();
     FilmSimulator probe(lib);
@@ -411,14 +413,14 @@ int cmdFilm(const std::vector<std::string>& args) {
       // v5: one exposure decision per image, shared by all stocks, per-stock usability rescue, print constant (film_match.h)
       EditParams ep0 = ep;
       ep0.exposure = 0.f;
-      Renderer ref0(ep0, cam, nullptr);
-      ref0.setToneProxy(&proxy);
+      ImageF ref0Img;
+      if (!engine::renderImageF(ep0, cam, nullptr, proxy, false, ref0Img)) { std::fprintf(stderr, "film: reference render failed\n"); return 2; }
       MeterInputs mi_in;
       mi_in.lib = lib;
       mi_in.film = p.film;
       mi_in.paper = p.paper;
       mi_in.st0 = mi_in.stFull = stats;
-      mi_in.keyL0 = medianLightness(ref0.renderFloat(proxy, false));
+      mi_in.keyL0 = medianLightness(ref0Img);
       mi_in.shoot = std::atof(a.get("--shoot", "0").c_str());
       mi_in.print = std::atof(a.get("--print", "0").c_str());
       mi_in.latitude = std::atof(a.get("--latitude", "0").c_str());

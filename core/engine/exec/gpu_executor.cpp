@@ -3,6 +3,8 @@
 // (on a ResultCache). Whole-frame runs record every stage into one command list; a tiled export records one job per tile and
 // sweep (docs/engine/pipeline-architecture.md 5.1 - 5.5).
 #include "engine/exec/gpu_executor.h"
+#include "determinism.h"
+#include "engine/nodes/film/film_async.h"
 
 #include <algorithm>
 #include <chrono>
@@ -416,6 +418,8 @@ class Executor final : public IGpuExecutor {
   ResultCache tables_;
   ResultCache solves_;  // DeviceSolve payloads by Dehaze / Detail node key (whole-frame runs)
   std::shared_ptr<DeviceFilm> film_;  // device copy of the film tables of the last film frame
+  filmnode::FilmResolved lastFilmR_{};  // the last film frame that rendered: the stand-in while another stock's tables are baked in the background
+  bool haveLastFilmR_ = false;
   std::vector<std::shared_ptr<DeviceDisplay>> display_;  // most recently used first (3)
 
   GpuFailure failure_ = GpuFailure::None;
@@ -615,6 +619,20 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
   // r.lib / r.stock point into the process-wide default library, which outlives the frame
   if (!filmnode::filmFrameResolved(a, r)) return fail(GpuFailure::Unsupported, "film stock / paper not available");
   r.clampOut = f.strength >= 1.f && f.displayPlain && in.frame.vignette == 0.f;
+  // stock selection (wave 8): an interactive frame of a stock whose tables are not cached shows the previous stock until the background bake landed
+  // (the repaint hook fires then); frame fields come from this frame, everything the tables depend on from the previous one, so nothing is baked here
+  if (r.quality == 1 && haveLastFilmR_ && (r.stock != lastFilmR_.stock || r.paper != lastFilmR_.paper) && !filmnode::tablesCachedFor(r) && !deterministicMode()) {
+    const char* off = std::getenv("DAPPLE_FILM_STOCK_FALLBACK");
+    if (!(off && off[0] == '0')) {
+      filmnode::requestStockPrep(r);
+      filmnode::FilmResolved fb = lastFilmR_;
+      for (int c = 0; c < 3; ++c) fb.gain[c] = r.gain[c];
+      fb.w = r.w, fb.h = r.h, fb.fullLongEdge = r.fullLongEdge, fb.seed = r.seed, fb.frameIndex = r.frameIndex;
+      fb.quality = r.quality, fb.keepGrain = r.keepGrain, fb.coarse = r.coarse, fb.clampOut = r.clampOut;
+      fb.formatScale = r.formatScale, fb.pitch = r.pitch, fb.grainPct = r.grainPct, fb.halationPct = r.halationPct, fb.fx = r.fx;
+      r = fb;
+    }
+  }
   std::string why;
   if (!filmnode::filmGpuSupported(r, why)) return fail(GpuFailure::Unsupported, why);
   return true;
@@ -651,6 +669,8 @@ std::shared_ptr<DeviceFilm> Executor::ensureFilm(const filmnode::FilmResolved& r
     if (!filmnode::uploadGpuPlan(core(), r, film_->pr, err)) return failStatus(hal::Status::OutOfMemory, "film grain tables upload: " + err), nullptr;
     film_->havePlan = true;
   }
+  lastFilmR_ = r;
+  haveLastFilmR_ = true;
   return film_;
 }
 

@@ -11,6 +11,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -27,6 +29,7 @@
 #include "dng_thumbnail.h"
 #include "dapple/tone.h"
 #include "parallel.h"
+#include "determinism.h"
 #include "sysperf.h"
 #include "dapple/xmp_preset.h"
 #include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
@@ -64,6 +67,17 @@ struct DappleSession {
     bool exact;
   };
   std::vector<FilmKeyEntry> filmKeys;
+  std::string lastMatchStock;  // stock of the newest filmKeys entry (keyMtx)
+  // background refresh of the match while a slider moves (queueFilmMatch)
+  std::mutex matchMtx;  // filmCache + keyProxy: the frame thread (exact solves) and the refresh worker
+  std::mutex asyncMtx;
+  dapple::EditParams asyncParams;
+  std::string asyncLut, asyncKey;
+  bool asyncHave = false, asyncRunning = false;
+  std::atomic<int> matchBusy{0};
+  ~DappleSession() {
+    for (int i = 0; i < 5000 && matchBusy.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   dapple::FilmMatchCache filmCache;  // image statistics + remembered medians of the match (film_match.h)
   // Where the executors read the full-resolution source from (the GPU keeps a device copy per store identity)
   std::once_flag storeOnce;
@@ -186,6 +200,84 @@ bool parseParams(const char* paramsJson, EditParams& params) {
   return true;
 }
 
+// Computes (and stores in the session's key list) the film match of `params`. The caller holds s->matchMtx (filmCache and the proxy belong to it).
+FilmExposure computeFilmMatch(DappleSession* s, const EditParams& params, const std::string& lutFile, const std::string& key, bool interactive, bool uncached) {
+  if (!s->keyProxy) {
+    auto kp = std::make_shared<SourceImage>();
+    kp->sceneReferred = s->source.sceneReferred;
+    kp->linear = resizeToLongEdge(s->source.linear, 256);
+    s->keyProxy = std::move(kp);
+  }
+  std::shared_ptr<const Lut3D> lut;
+  if (!lutFile.empty()) lut = loadLut(lutFile);
+  s->filmCache.proxyOwner = s->keyProxy;
+  s->filmCache.lutOwner = lut;
+  const FilmExposure ev = uncached ? matchFilmExposure(params, *s->camera, lut.get(), *s->keyProxy)
+                                   : matchFilmExposureCached(params, *s->camera, lut.get(), lutFile, *s->keyProxy, s->filmCache, !interactive);
+  const bool exact = uncached || !s->filmCache.lastApprox;
+  std::lock_guard<std::mutex> lock(s->keyMtx);
+  for (auto it = s->filmKeys.begin(); it != s->filmKeys.end(); ++it)
+    if (it->key == key) {
+      s->filmKeys.erase(it);
+      break;
+    }
+  if (s->filmKeys.size() >= 12) s->filmKeys.erase(s->filmKeys.begin());
+  s->filmKeys.push_back({key, ev, exact});
+  s->lastMatchStock = params.filmStock;
+  return ev;
+}
+
+// Latest-wins background refresh of the match while a slider moves (wave 8): an interactive frame whose match is not cached uses the previous result
+// of the same stock and queues the recompute; the repaint listeners are told when it lands. The settled frame is not interactive and computes the
+// exact match itself (it waits for a running refresh at most one match long).
+void queueFilmMatch(DappleSession* s, const EditParams& params, const std::string& lutFile, const std::string& key) {
+  {
+    std::lock_guard<std::mutex> lock(s->asyncMtx);
+    s->asyncParams = params;
+    s->asyncLut = lutFile;
+    s->asyncKey = key;
+    s->asyncHave = true;
+    if (s->asyncRunning) return;
+    s->asyncRunning = true;
+  }
+  s->matchBusy.fetch_add(1);
+  std::thread([s] {
+    dapple::ThreadPool::tlUse() = &dapple::ThreadPool::background();
+    for (;;) {
+      EditParams p;
+      std::string lf, k;
+      {
+        std::lock_guard<std::mutex> lock(s->asyncMtx);
+        if (!s->asyncHave) {
+          s->asyncRunning = false;
+          break;
+        }
+        p = s->asyncParams;
+        lf = s->asyncLut;
+        k = s->asyncKey;
+        s->asyncHave = false;
+      }
+      try {
+        std::lock_guard<std::mutex> ml(s->matchMtx);
+        bool hit = false;
+        {
+          std::lock_guard<std::mutex> kl(s->keyMtx);
+          for (auto& e : s->filmKeys) hit |= e.key == k;
+        }
+        if (!hit) computeFilmMatch(s, p, lf, k, true, false);
+      } catch (...) {
+      }
+      bool more;
+      {
+        std::lock_guard<std::mutex> lock(s->asyncMtx);
+        more = s->asyncHave;
+      }
+      if (!more) dapple::engine::filmnode::notifyRepaintIfMatchStale();
+    }
+    s->matchBusy.fetch_sub(1);
+  }).detach();
+}
+
 // `params` with EditParams::filmKeyEv set: the EV that puts the film render's median lightness where the normal develop
 // render of the same edit has it (film_match.h). A few film evaluations of the 256 px proxy, cached by key.
 EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath = nullptr, bool interactive = false) {
@@ -200,34 +292,32 @@ EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath 
   const bool uncached = ue && ue[0];
   const std::string key = (uncached ? filmMatchKey(params) : filmMatchKeyLean(params)) + "|" + lutFile + "|" + std::to_string(params.filmSceneX) + "," + std::to_string(params.filmSceneY);
   if (!uncached) prewarmFilmCalibration(params, [] { sys::setBackground(true); });
-  std::lock_guard<std::mutex> lock(s->keyMtx);
-  // A result that interpolated remembered medians (a print solve while a slider moves) serves interactive frames only; the frame after the
-  // drag solves for real (docs/engine/pipeline-architecture.md section 26).
-  for (auto& e : s->filmKeys)
-    if (e.key == key && (e.exact || interactive)) {
-      params.filmKeyEv = e.ev.filmEv;
-      params.filmPrintEv = e.ev.printEv;
+  static const bool asyncOn = [] {
+    const char* e = std::getenv("DAPPLE_FILM_MATCH_ASYNC");
+    return !(e && e[0] == '0') && !dapple::deterministicMode();
+  }();
+  {
+    std::lock_guard<std::mutex> lock(s->keyMtx);
+    // A result that interpolated remembered medians (a print solve while a slider moves) serves interactive frames only; the frame after the
+    // drag solves for real (docs/engine/pipeline-architecture.md section 26).
+    for (auto& e : s->filmKeys)
+      if (e.key == key && (e.exact || interactive)) {
+        params.filmKeyEv = e.ev.filmEv;
+        params.filmPrintEv = e.ev.printEv;
+        return params;
+      }
+    if (asyncOn && interactive && !uncached && !s->filmKeys.empty()) {  // any stock: while another stock is selected the frame shows the previous stock too
+      // previous result of the same stock now, the new one on the background pool
+      const FilmExposure& prev = s->filmKeys.back().ev;
+      params.filmKeyEv = prev.filmEv;
+      params.filmPrintEv = prev.printEv;
+      dapple::engine::filmnode::markMatchStale();
+      queueFilmMatch(s, params, lutFile, key);
       return params;
     }
-  if (!s->keyProxy) {
-    s->keyProxy = std::make_shared<SourceImage>();
-    s->keyProxy->sceneReferred = s->source.sceneReferred;
-    s->keyProxy->linear = resizeToLongEdge(s->source.linear, 256);
   }
-  std::shared_ptr<const Lut3D> lut;
-  if (!lutFile.empty()) lut = loadLut(lutFile);
-  s->filmCache.proxyOwner = s->keyProxy;
-  s->filmCache.lutOwner = lut;
-  const FilmExposure ev = uncached ? matchFilmExposure(params, *s->camera, lut.get(), *s->keyProxy)
-                                   : matchFilmExposureCached(params, *s->camera, lut.get(), lutFile, *s->keyProxy, s->filmCache, !interactive);
-  const bool exact = uncached || !s->filmCache.lastApprox;
-  for (auto it = s->filmKeys.begin(); it != s->filmKeys.end(); ++it)
-    if (it->key == key) {
-      s->filmKeys.erase(it);
-      break;
-    }
-  if (s->filmKeys.size() >= 12) s->filmKeys.erase(s->filmKeys.begin());
-  s->filmKeys.push_back({key, ev, exact});
+  std::lock_guard<std::mutex> ml(s->matchMtx);
+  const FilmExposure ev = computeFilmMatch(s, params, lutFile, key, interactive, uncached);
   params.filmKeyEv = ev.filmEv;
   params.filmPrintEv = ev.printEv;
   return params;

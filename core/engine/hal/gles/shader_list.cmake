@@ -36,3 +36,7 @@ if(EXISTS "${_gles_film_cmake}")
   include("${_gles_film_cmake}")
   list(APPEND DAPPLE_GPU_SHADERS ${DAPPLE_FILM_GPU_SHADERS})
 endif()
+
+# demosaic node (pipeline-architecture.md section 32)
+include("${CMAKE_CURRENT_LIST_DIR}/../../nodes/demosaic/demosaic_gpu.cmake")
+list(APPEND DAPPLE_GPU_SHADERS ${DAPPLE_DEMOSAIC_GPU_SHADERS})

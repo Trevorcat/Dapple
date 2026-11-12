@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 
+#include "../deterministic.h"
 #include "dapple/camera.h"
 #include "dapple/film.h"
 #include "dapple/film_match.h"

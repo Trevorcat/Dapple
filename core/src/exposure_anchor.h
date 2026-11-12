@@ -28,6 +28,12 @@ struct ExposureAnchor {
 
 // `linear`: scene-referred linear ProPhoto after white balance (the decoder output, any decode quality), `dngBaselineEv`: NaN = no tag.
 // `reference`: an upright 8-bit sRGB rendering of this frame to use instead of the embedded preview (paired camera JPEG / sidecar), or null.
-ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const ImageF& linear, float dngBaselineEv, const Image8* reference = nullptr);
+// `monochrome`: single-channel sensor. The camera's black-and-white rendering has a much steeper tone curve than sRGB (a Pentax K-3 III Monochrome
+// preview spans 0.018 .. 0.86 linear where the raw spans 0.46 .. 0.67), so the per-pixel mid-tone ratio of tier 1 is meaningless; the witness is the
+// ratio of the MEDIAN luminances of the two images (one number from the camera, the same on both sample files: -1.02 / -1.06 EV), accepted when
+// the two images are rank-correlated (Spearman >= 0.5, i.e. they show the same picture).
+// `embedded`: the embedded preview when the caller already extracted it (the decoder does this on a second thread while LibRaw works); null: extracted here.
+ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const ImageF& linear, float dngBaselineEv, const Image8* reference = nullptr, const Image8* embedded = nullptr,
+                                  bool monochrome = false);
 
 }  // namespace dapple

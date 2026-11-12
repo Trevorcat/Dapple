@@ -1,0 +1,22 @@
+#version 450
+// Demosaic pass 0: raw 16-bit samples -> scaled float plane: max(raw - black, 0) * multiplier / span, clipped to 1 (what LibRaw's
+// scale_colors feeds its own demosaic). Tables: [0..35] colour index incl. the second green, [37] black rows, [38] black columns, [40..] black table.
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+#include "demosaic_common.glsl"
+layout(binding = 1, std430) readonly buffer Mos { uint mos[]; };
+layout(binding = 2, std430) readonly buffer Tab { float tab[]; };
+layout(binding = 3, std430) writeonly buffer Sb { float S[]; };
+layout(constant_id = 0) const int PERIOD = 2;
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.dims.x || p.y >= u.dims.y) return;
+  const uint idx = uint(p.y * u.io.x + p.x);
+  const float raw = float((mos[idx >> 1] >> ((idx & 1u) * 16u)) & 0xFFFFu);
+  const int c4 = int(tab[((p.y + u.org.y) % PERIOD) * PERIOD + ((p.x + u.org.x) % PERIOD)]);
+  const int br = int(tab[37]), bc = int(tab[38]);
+  const float blk = tab[40 + ((p.y + u.org.w) % br) * bc + ((p.x + u.org.z) % bc)];
+  const float v = max(raw - blk, 0.0) * u.wb[c4] * u.sc.x;
+  S[p.y * u.dims.x + p.x] = min(v, 1.0);
+}

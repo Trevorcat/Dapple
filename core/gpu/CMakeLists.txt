@@ -63,6 +63,9 @@ set(DAPPLE_GPU_SHADERS
 # film nodes (engineer: film): shader variants + sources
 include("${PROJECT_SOURCE_DIR}/core/engine/nodes/film/film_gpu.cmake")
 list(APPEND DAPPLE_GPU_SHADERS ${DAPPLE_FILM_GPU_SHADERS})
+# demosaic node (pipeline-architecture.md section 32)
+include("${PROJECT_SOURCE_DIR}/core/engine/nodes/demosaic/demosaic_gpu.cmake")
+list(APPEND DAPPLE_GPU_SHADERS ${DAPPLE_DEMOSAIC_GPU_SHADERS})
 
 set(_gen "${CMAKE_CURRENT_BINARY_DIR}/gen")
 file(MAKE_DIRECTORY "${_gen}")
@@ -114,7 +117,7 @@ endif()
 add_library(dapple_gpu STATIC
   ${_E}/hal/hal.cpp ${_E}/hal/select.cpp ${_E}/hal/vk/vk_device.cpp ${_E}/exec/gpu_scheduler.cpp ${_E}/exec/gpu_executor.cpp ${_E}/exec/gpu_context.cpp
   ${_E}/nodes/gpu_common.cpp ${_E}/nodes/point/gpu.cpp ${_E}/nodes/nr/gpu.cpp ${_E}/nodes/dehaze/gpu.cpp ${_E}/nodes/detail/gpu.cpp
-  ${_E}/nodes/resize/gpu.cpp ${_E}/nodes/gpu_nodes.cpp ${DAPPLE_FILM_GPU_SOURCES}
+  ${_E}/nodes/resize/gpu.cpp ${_E}/nodes/gpu_nodes.cpp ${DAPPLE_FILM_GPU_SOURCES} ${DAPPLE_DEMOSAIC_GPU_SOURCES}
   src/parity.cpp src/gpu_bench.cpp ${_spv_headers})
 if(TARGET dapple_hal_gles)
   target_link_libraries(dapple_gpu PUBLIC dapple_hal_gles)

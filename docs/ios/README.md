@@ -1,101 +1,70 @@
 # Dapple on iOS
 
-Status 2026-11-13: the C++ core builds natively on Apple silicon (CPU and Metal), the Flutter app builds for the iOS simulator and for
-devices (arm64, iOS 16+), runs on the simulator, an iPhone XR (iOS 18.7.10) and an iPhone X (iOS 16.7.16). On the simulator a synthetic
-photo was developed by the engine and shown in the editor. **Not done**: everything native on the Swift side (see "Stubbed").
+Status 2026-11-13 (round 2): the app builds for the iOS simulator and for devices (arm64, iOS 16+) and runs on the simulator, an iPhone XR (A12, iOS 18.7.10) and an iPhone X (A11, iOS 16.7.16). The engine runs on **Metal on both phones**
+(317 GPU frames in a measurement run, 0 failures), RAW (ARW, RAF, DNG) is developed on the phones, the film pads / strength / map editor works on the iPhone X screenshot, the library has a PhotoKit implementation, the picture can be shown
+through a zero-copy Flutter texture. Not verified: PhotoKit end to end (needs a touch on the permission prompt), the editor's own use of the texture on screen, full-resolution export on the phones.
 
-Details: `metal-backend.md` (GPU, numbers), `platform-interface.md` (Dart seam for Android-only features).
+Details: `device-results.md` (numbers, A11 vs A12), `metal-backend.md` (HAL, timestamps, presenter, M1 profile, hunks for the executor files), `platform-interface.md` (Dart seam), `swift-designs.md` (capture, wireless transfer, codec layer),
+`neon-candidates.md` (CPU kernels).
 
-## What works
+## What the owner has to do by hand
 
-- Core, native macOS arm64: no source change was needed. `ctest` 59 / 59 (CPU build): engine, film, film_nodes, exec, selfcheck. Golden corpus
-  (recorded for x86 AVX2) is skipped by design ("corpus recorded on arch=x86_64"); `dapple_golden selfcheck off full`: 0 differences. NEON: there is
-  no hand written NEON or intrinsics anywhere (`film_kernels_base.cpp` is portable scalar code, the AVX2 kernels are x86 only and not built
-  here); the base kernels compile to NEON through the auto-vectoriser (about 1330 `.4s` vector instructions in `film_kernels_base.o`, 24 in `film_spatial.o`).
-  No NEON specific tuning or measurement was made.
-- Metal HAL + GPU suites on the M1: see `metal-backend.md`.
-- Engine for iOS: `dapple.framework` (dynamic framework, `cmake/apple_framework.cmake`), built for device and simulator and merged into
-  `dapple.xcframework` (arm64 device + arm64 simulator slice; no x86_64 simulator slice, so Intel Macs are not supported for simulator runs).
-- Flutter app: `app/ios` (Runner, Swift Package Manager integration, **no CocoaPods needed**), local plugin `app/native_ios/dapple_engine`
-  (pubspec path dependency, `Package.swift` with a binary target on the xcframework). FFI: `dapple_bindings.dart` uses `DynamicLibrary.process()` and falls
-  back to `DynamicLibrary.open('dapple.framework/dapple')`. The bundled film pack and assets come through Flutter assets. Deployment target 16.0.
-- Dart test suite on the Mac (`flutter test`, `DAPPLE_LIB` = host engine): 217 pass, 6 fail. All 6 are in `editor_film_test.dart` /
-  `editor_panel_test.dart`, the old editor UI that is being replaced in the working tree: missing golden PNGs (`test/goldens/editor_v2/*` are untracked) and text-overflow
-  differences with the Mac's fonts. Not iOS related.
-- Simulator: `build/ios/sim_editor.png` (editor on the sample photo, engine render), `build/ios/sim_style.png` (style panel). Devices: `build/ios/device_xr_1.png`,
-  `build/ios/device_x_1.png` (library screen after launch of the release build; no photo was opened on the phones).
+1. **Answer the Photos permission prompt on both iPhones** (a freshly installed app asks on first launch; nobody can tap it from the PC). 选择照片 / 限制访问 tests limited access, 允许完全访问 full access. Until then the library shows the "允许访问" banner; Files import and the
+   photo picker (`PHPicker`, needs no permission) work regardless. The prompt on the XR shows thumbnails of the real library (the screenshot taken with it on screen was deleted).
+2. **Re-sign and reinstall every 7 days** (free Apple ID: both profiles expire 2026-11-19, `docs` below: `scripts/ios/device-test.sh`), until the paid programme exists.
+3. **App Store / TestFlight needs a decision from the owner**: the paid Apple Developer Program, and a Mac on macOS 15.6 or later with Xcode 26 (this Mac is on 14.7.6 / Xcode 16.2): Apple requires uploads since 2026-04-28 to be built with Xcode 26 and the iOS 26 SDK
+   (https://developer.apple.com/news/upcoming-requirements/, read 2026-11-13; Xcode 26 needs macOS Sequoia 15.6+ per https://developer.apple.com/xcode/system-requirements/). An OS upgrade of the shared Mac is his call.
 
-## How to build (everything on the Mac under `~/dapple`, driven from this PC)
+## Build and run (everything on the Mac under `~/dapple`, driven from this PC)
 
 ```
-scripts/ios/bootstrap.sh            # on the Mac once: cmake, ninja, Flutter 3.47.8, LunarG SDK (glslc only), SPIRV-Cross / Vulkan headers sources  -> ~/dapple/tools, versions in tools/VERSIONS.txt
-scripts/ios/sync.sh                 # PC -> Mac: git archive HEAD (core.autocrlf=false) + the files listed in scripts/ios/overlay.txt
-scripts/ios/mac.sh '<cmd>'          # run a command on the Mac with the toolchain on PATH
-scripts/ios/build-engine.sh macos|ios-sim|ios-device [on|off]     # CMake builds (GPU on = Metal)
-scripts/ios/build-xcframework.sh    # device + simulator -> app/native_ios/dapple_engine/ios/dapple_engine/Frameworks/dapple.xcframework
-cd app && flutter build ios --simulator --debug --no-codesign     # simulator app
-cd app && flutter build ios --release --no-codesign               # device app, then scripts/ios/make-ipa.sh -> unsigned .ipa
-scripts/ios/sim-run.sh <prefix> [group]   # headless simulator (own device "dapple-iphone"), installs, opens the sample photo, screenshots in ~/dapple/out
+scripts/ios/bootstrap.sh              # on the Mac once: cmake, ninja, Flutter 3.47.8, LunarG SDK (glslc), SPIRV-Cross / Vulkan header sources (versions: ~/dapple/tools/VERSIONS.txt)
+scripts/ios/sync-worktree.sh          # PC -> Mac: the CURRENT working tree (tracked + untracked, ignored files excluded) + tools/shaderc, files extracted with fresh mtimes; sync.sh is the older HEAD-snapshot variant
+scripts/ios/mac.sh '<cmd>'            # run a command on the Mac with the toolchain on PATH
+scripts/ios/build-engine.sh macos|ios-sim|ios-device [on|off]    # CMake builds (GPU on = Metal); adds HWY_DISABLED_TARGETS (no SVE on Darwin)
+scripts/ios/build-xcframework.sh      # device + simulator -> app/native_ios/dapple_engine/ios/dapple_engine/Frameworks/dapple.xcframework
+cd app && flutter build ios --simulator --debug --no-codesign         # simulator app
+cd app && flutter build ios --release --no-codesign [--dart-define=DAPPLE_IOS_AUTOTEST=true]; scripts/ios/make-ipa.sh   # device ipa (unsigned)
+scripts/ios/sim-run.sh | device-run.sh <xr|x> <ipa> <prefix> | device-editor.sh <xr|x> <name> <stock>      # simulator / phone test cycles
 ```
-Mac tests: `build-engine.sh macos on` then `ctest` in `~/dapple/build/macos` (CPU + Metal suites, 69 / 69).
-The Apple build needs `-DDAPPLE_GLSLC=<glslc>` (the Android NDK one is Windows only); `build-engine.sh` passes the LunarG SDK's.
+Packaging: Swift Package Manager (no CocoaPods), the engine as a dynamic `dapple.xcframework` (arm64 device + arm64 simulator, no x86_64 simulator slice), the local plugin `app/native_ios/dapple_engine` (Swift: GPU start-up, PhotoKit, zero-copy view),
+FFI through `DynamicLibrary.process()` with a fallback to `dapple.framework/dapple`. Deployment target 16.0. Mac CPU suites passed 59/59 (engine, film, golden skipped by design, selfcheck 0 differences) and the Metal GPU suites 69/69 (round 1 tree);
+the round 2 tree could not be rebuilt on macOS because of an in-flight edit of the DNG engineer (`core/src/decoders/libraw_mosaic.inc`: `raw.COLOR()` on a const `LibRaw`, `S.fuji_width` missing from the pinned LibRaw snapshot) — see "Blockers".
+Dart tests on the Mac (current tree, `DAPPLE_LIB` = host engine): 216 pass, 1 skipped, 1 fails (`tools_test.dart` Motion Photo tool window, not iOS related).
 
-Why SPM + an xcframework of a dynamic framework: Xcode embeds and signs it for device builds, no force-load / strip tricks for `dlsym`, no CocoaPods
-installation, App Store accepts embedded dynamic frameworks. The simulator needs `EXCLUDED_ARCHS[sdk=iphonesimulator*] = x86_64` (set in `app/ios/Flutter/*.xcconfig`).
+## Device install (free Apple ID, testing only; owner's own signing)
 
-## Shared files touched (list)
+Build the unsigned ipa on the Mac, copy it to `build/ios/`, sign on the PC with the autotest framework's `plumesign` and its saved session (`APPDATA=%LOCALAPPDATA%\\autotest-framework\\ios\\plume`, `sign -p x.ipa --apple-id --custom-identifier <id> -o signed.ipa`), install with its
+`pymobiledevice3` (`apps install`; **uninstall first**: an install over an existing app hung the installd coordinator), launch with `developer dvt launch`, screenshot with `developer dvt screenshot`, push files with `apps push <bundle> <local> Documents/...`.
+Bundle ids `com.lumi.dapple.00008020` (XR) and `com.lumi.dapple.26d2a524` (X); free-account limits: profiles and device registrations expire after 7 days (2026-11-19), 10 App IDs per 7 days (**4 are in use** now: 2 for the autotest framework's WDA, 2 for Dapple), 3 sideloaded apps per device.
 
-New: `core/engine/hal/metal/*`, `cmake/apple_framework*.{cmake,plist.in}`, `scripts/ios/*`, `docs/ios/*`, `app/native_ios/dapple_engine/**`,
-`app/lib/platform/*`. Hunks in existing files: `core/engine/hal/hal.cpp` (Api::Metal case, `#if DAPPLE_HAL_METAL`), `core/engine/hal/select.cpp` (`DAPPLE_GPU_API=metal`),
-`core/gpu/CMakeLists.txt` (`if(APPLE) include(metal.cmake)`), `tools/shaderc/main.cpp` (MSL table output; untracked tool dir), `app/pubspec.yaml` (one dependency),
-`app/lib/main.dart` (one line), `app/lib/native/dapple_bindings.dart` (iOS library lookup), `app/ios/Runner/Info.plist` (usage strings, file sharing), `app/ios/Runner.xcodeproj` (deployment target 16.0), `app/ios/Flutter/*.xcconfig`.
+## Stubbed / missing
 
-## Stubbed / missing (graceful, see platform-interface.md)
+Capture (AVFoundation), wireless camera transfer, codec layer (VideoToolbox), Live Photo tools: designs with the API mapping in `swift-designs.md`. The Dart stubs (`app/lib/platform/ios_services.dart`) fail gracefully. Haptics go through Flutter.
 
-Photos library (PhotoKit), phone camera capture (ProRAW / Bayer RAW), wireless camera transfer, video / codec layer (Live Photo / Motion Photo tools), saving
-to Photos, `dapple/view` zero-copy texture (readback path is used), haptics through Flutter. Library on iOS: only the picker import (document picker) works in release
-builds; debug builds on the simulator can load `Documents/Photos` (`IosDebugOpen`). `app_state.dart` still gates the ingest on `Platform.isAndroid` (not edited: other engineers are in it).
+## Blockers and things not verified
 
-## Plan for the Swift side
+* macOS rebuild of the round 2 tree (above); the Mac Metal results of round 1 stand. The film-kernel test `film.develop_film` failed on arm64 in the round 2 tree (grain knob 150 / 200 saturates at the 100 value): probably the in-flight film work, not checked on x86.
+* `engine.gpu_external` is disabled on Apple (Vulkan swapchain handles); the Metal equivalents are `metal.external` and the `GpuViewBackend` probe.
+* Editor integration of the texture: `EditorEngine._maybeStartGpu` starts the view after its first readback frame; no `GpuViewBackend` log line appeared in the simulator editor session while the probe worked in the same app.
+* PhotoKit listing / copy / save / picker: compiled and the permission prompt is the real one; the listing could not be exercised because the simulator ignores `simctl privacy grant photos` for PhotoKit and the phones need a touch.
+* Thermal / sustained load on A11 / A12; 24 - 33 MP export on the phones; A11 / A12 `MTLBinaryArchive` warm start.
 
-1. Codec layer on VideoToolbox: `VTDecompressionSession` (HEVC / H.264 / 10-bit, P010-like `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`), `VTCompressionSession`
-   (HEVC Main10 when `VTIsHardwareDecodeSupported` / encoder list says so, else H.264), the same ladder + self-test + per-OS-build cache as `CodecLadder.kt`, reports through `dapple/live`.
-2. Capture on AVFoundation: `AVCapturePhotoOutput`, ProRAW where `isAppleProRAWSupported`, else Bayer RAW (`availableRawPhotoPixelFormatTypes`), DNG via
-   `fileDataRepresentation()`, camera permission flow, results as `CaptureResult` (jpeg + dng paths).
-3. Wireless transfer: Network.framework listener for FTP / PTP-IP while the app is foreground (iOS does not allow a long-lived background server), Sony / Fujifilm app hand-off via
-   the Photos library as on Android; tethered USB through ImageCaptureCore.
-4. Photos library: PhotoKit read (`PHFetchResult`, change observer = `changes` stream, limited library), export into album "Dapple" (`PHAssetCreationRequest`), Live Photo
-   pairing (`PHAssetResourceType.pairedVideo`).
-5. Present: `CAMetalLayer` / IOSurface-backed Flutter texture fed by `copyImageToExternal` (HAL side exists), `PresentExt` for the view API, then drop the readback path on iOS.
-6. Metal: per-pass timestamps (`MTLCounterSampleBuffer`, stage boundary), `MTLBinaryArchive` pipeline cache, tune for A11 / A12 (`readWriteTextureSupport` tier, threadgroup limits) on the phones.
+## Plan for the Swift side (remaining)
 
-## Device install (free Apple ID, testing only)
-
-Done here with the owner's existing practice (autotest framework): build the unsigned device `.ipa` on the Mac (`scripts/ios/make-ipa.sh`, minimum iOS 16.0, no entitlements),
-copy it to `build/ios/`, sign on the PC with the framework's `plumesign` and its saved Apple session, install with its `pymobiledevice3`:
-
-```
-set APPDATA=%LOCALAPPDATA%\autotest-framework\ios\plume                     (the tool's session / certificate store)
-plumesign-windows-x86_64.exe sign -p build\ios\Dapple-unsigned.ipa --apple-id --custom-identifier com.lumi.dapple.<udid first 8> -o build\ios\Dapple-<n>-signed.ipa
-python -m pymobiledevice3 apps install build\ios\Dapple-<n>-signed.ipa --udid <udid>          (autotest venv, read-only use)
-python -m pymobiledevice3 developer dvt launch com.lumi.dapple.<udid8> --udid <udid>
-python -m pymobiledevice3 developer dvt screenshot out.png --udid <udid>
-```
-Bundle ids `com.lumi.dapple.00008020` (XR) and `com.lumi.dapple.26d2a524` (X). Limits of a free account: provisioning profile and device registration expire after 7 days
-(the XR build above expires 2026-11-19, the X build 2026-11-19), 10 App IDs per 7 days (this used 2 more), 3 sideloaded apps per device. The iPhone X was not registered in the account any more
-(its registration had lapsed), so `plumesign account register-device` was run for it, as the framework does. **This route is for testing only and must be repeated every 7 days.**
-
-App Store / TestFlight needs the paid Apple Developer Program, and a newer toolchain than this Mac has: Apple's upcoming-requirements page
-(https://developer.apple.com/news/upcoming-requirements/, read 2026-11-13) says that since April 28, 2026 apps uploaded to App Store Connect must be built with Xcode 26 or later using the iOS 26 SDK; Xcode 26 needs
-macOS Sequoia 15.6 or later (https://developer.apple.com/xcode/system-requirements/), the Mac has macOS 14.7.6 and Xcode 16.2, so an OS upgrade (owner decision) is required first. The same page says uploads must target iOS 13 or later
-since September 9, 2026 (this app targets 16.0).
+1. Codec layer on VideoToolbox + AVFoundation (probe + report first, then Live Photo), 2. capture (ProRAW / Bayer RAW), 3. ImageCaptureCore (USB tethering) then a foreground FTP listener, 4. `PresentExt` polish (resize / trim under memory pressure, editor use),
+5. A11 / A12 tuning (`DAPPLE_FILM_V3_DIRECT=0` rule for Apple, half-precision accumulators behind a spec constant, binary archive), 6. NEON versions of the three hot CPU kernels (`neon-candidates.md`), 7. device build in CI (Mac) with the unsigned ipa as the artefact.
 
 ## Risks
 
-- A GPU that is 3x slower than the desktop card on film frames (M1) and an A11 / A12 (iPhone X / XR) that is slower again: interactive film frames need measuring on the phones; the CPU path stays as fallback.
-- iOS background limits (transfer server, long exports): needs `BGTaskScheduler` / foreground-only design.
-- Memory: jetsam limits (about half of RAM on 3 GB phones: iPhone X has 3 GB, XR 3 GB); the 512 MB transient pool and 24 MP source residency must be budgeted per device (`poolBudget`).
-- The `gpu_context.cpp` / `engine_session.cpp` strings still say "vulkan" for Metal (alias); the zero-readback present is not wired.
-- SPM plugin integration is newer than CocoaPods: plugins without SPM support (none among the current ones) would need CocoaPods.
-- Free-account signing breaks after 7 days; Apple may change the sign-in protocol (`plumesign` is third-party).
-- Flutter debug builds of the app run only from Xcode / flutter tooling on a device; simulator debug builds are fine.
+* A11 is 2.3x slower than A12 on film frames (235 ms final at 1600 px): the interactive tier must keep the A11 inside the frame budget with `AdaptiveQuality`; 3 GB RAM on both phones (peak 620 MB for a 33 MP RAW session, measured).
+* iOS background limits (no server in the background; exports must finish in the foreground or a `BGTaskScheduler` task). * Free-account signing breaks every 7 days and depends on a third-party tool (`plumesign`). * The `gpu_context.cpp` /
+  `engine_session.cpp` status strings are correct for Metal now; `Core::create` and the envMode default still need the hunks in `metal-backend.md`.
+* PhotoKit has no "date added": the 7-day first-run window applies to the creation date; older photos come in through the picker.
+
+## Shared files touched (list)
+
+New: `core/engine/hal/metal/*`, `core/engine/present/metal_presenter.mm`, `cmake/apple_framework*.{cmake,plist.in}`, `scripts/ios/*`, `docs/ios/*`, `app/native_ios/dapple_engine/**`, `app/lib/platform/*`.
+Hunks in existing files: `core/engine/hal/hal.cpp`, `select.cpp` (Metal first on Apple), `core/gpu/CMakeLists.txt` (`if(APPLE)`), `core/engine/present/null_presenter.cpp` (`!__APPLE__`), `present.cmake` (Apple presenter sources + frameworks), `tools/shaderc/main.cpp` (MSL table),
+`app/pubspec.yaml` (plugin dependency), `app/lib/main.dart` (two hook lines), `app/lib/native/dapple_bindings.dart` (iOS library lookup), `app/lib/services/ingest.dart`, `media_permission.dart`, `gpu_view_backend.dart` (iOS branches),
+`app/lib/state/app_state.dart` (three gates: `refreshPermission`, `requestPermission`, `scan`), `app/ios/Runner/Info.plist`, `Runner.xcodeproj` (deployment target), `app/ios/Flutter/*.xcconfig`.

@@ -8,6 +8,12 @@ target_sources(dapple PRIVATE
   ${_p}/view.cpp
   ${_p}/view_jni.cpp)
 target_include_directories(dapple PRIVATE ${_p})
+if(APPLE)
+  # Apple: the display presenter is Metal (metal_presenter.mm defines makeVulkanPresenter, the name view.cpp asks for)
+  target_sources(dapple PRIVATE ${_p}/metal_presenter.mm)
+  set_source_files_properties(${_p}/metal_presenter.mm PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
+  target_link_libraries(dapple PRIVATE "-framework Metal" "-framework Foundation")
+endif()
 if(ANDROID)
   target_link_libraries(dapple PRIVATE android)
 endif()
@@ -17,6 +23,11 @@ if(DAPPLE_BUILD_TESTS AND NOT ANDROID)
   add_executable(dapple_present_tests ${_p}/present_tests.cpp ${_p}/render_loop.cpp ${_p}/null_presenter.cpp ${_p}/view.cpp
                  ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp)
   target_link_libraries(dapple_present_tests PRIVATE dapple_core)
+  if(APPLE)
+    target_sources(dapple_present_tests PRIVATE ${_p}/metal_presenter.mm)
+    set_source_files_properties(${_p}/metal_presenter.mm PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
+    target_link_libraries(dapple_present_tests PRIVATE "-framework Metal" "-framework Foundation")
+  endif()
   target_include_directories(dapple_present_tests PRIVATE ${_p} ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core
                              ${PROJECT_SOURCE_DIR}/core/src)
   target_compile_definitions(dapple_present_tests PRIVATE DAPPLE_VERSION_STRING="test"

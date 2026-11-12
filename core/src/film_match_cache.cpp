@@ -15,6 +15,7 @@
 
 #include "dapple/film_match.h"
 #include "parallel.h"
+#include "determinism.h"
 #include "dapple/renderer.h"
 
 namespace dapple {
@@ -179,7 +180,7 @@ FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& c
   // First frame of a film_print drag: the first print solve renders the proxy several times. Once per (photo, edit, stock) a background thread renders the
   // medians on a 1 EV grid around the automatic print exposure, so the drag finds them (merged above on the next call).
   const film::FilmStock* st = lib->find(p.filmStock);
-  if (p.filmPrint == 0.f && st && !st->positive() && cache.proxyOwner && cache.seededCtx != ctx && !std::getenv("DAPPLE_FILM_SEED_OFF")) {
+  if (p.filmPrint == 0.f && st && !st->positive() && cache.proxyOwner && cache.seededCtx != ctx && !std::getenv("DAPPLE_FILM_SEED_OFF") && !deterministicMode()) {
     cache.seededCtx = ctx;
     auto seed = std::make_shared<FilmMatchCache::Seed>();
     seed->ctx = ctx;

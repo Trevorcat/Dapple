@@ -24,6 +24,21 @@ class LicensesPage extends StatefulWidget {
       'This software uses libraries from the FFmpeg project (https://ffmpeg.org) under the GNU Lesser General Public License version 2.1 or later: libavutil, libavcodec, libavformat, libswscale and libswresample, version 9.0.2, built with only the H.264 / HEVC decoders (software and Android MediaCodec), the PCM audio decoders, the MP4/MOV demuxer, the scaler and the resampler, and used as separate shared libraries that can be replaced. FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project. The source code of the version used, the build configuration and the build script are available from the Dapple project on request.';
   static const ffmpegLicenseUrl = 'https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html';
 
+  /// docs/legal/libraw.md: RAW decoding. LibRaw is dual licensed LGPL-2.1 / CDDL-1.0; Dapple uses it under CDDL-1.0 (statically linked, unmodified).
+  static const librawNotice =
+      'RAW decoding uses LibRaw 0.23.0 (snapshot 202611, unmodified), Copyright (C) 2008-2026 LibRaw LLC, with code derived from dcraw by Dave Coffin, used under the Common Development and Distribution License version 1.0 (CDDL-1.0). The source of the version used is available from https://github.com/LibRaw/LibRaw (commit a9a14b1970d188c25dade81f8326ff00a6e33649).';
+  static const librawLicenseUrl = 'https://opensource.org/license/cddl-1-0';
+
+  /// docs/legal/libjxl.md: JPEG XL decoder for DNG 1.7 raw files (Samsung Galaxy S22 and newer, Adobe DNG Converter).
+  static const libjxlNotice =
+      'JPEG XL decoding (DNG 1.7 raw files) uses libjxl 0.11.1, Copyright (c) the JPEG XL Project Authors, and Highway 1.2.0, Copyright Google LLC, both under the BSD 3-Clause License: redistribution and use in source and binary forms, with or without modification, are permitted provided that the copyright notice, the list of conditions and the following disclaimer are retained (in binary form: reproduced in the documentation); the names of the copyright holders may not be used to endorse or promote products derived from this software without specific prior written permission. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE.';
+  static const libjxlLicenseUrl = 'https://github.com/libjxl/libjxl/blob/main/LICENSE';
+
+  /// docs/legal/libomp.md: the parallel demosaic of the Android builds (statically linked OpenMP runtime).
+  static const libompNotice =
+      'The parallel RAW demosaic uses the LLVM OpenMP runtime (libomp), Copyright (c) the LLVM Project contributors, under the Apache License 2.0 with LLVM Exceptions.';
+  static const libompLicenseUrl = 'https://llvm.org/LICENSE.txt';
+
   @override
   State<LicensesPage> createState() => _LicensesPageState();
 }
@@ -78,6 +93,13 @@ class _LicensesPageState extends State<LicensesPage> {
             const SectionTitle('视频解码'),
             block('licence-ffmpeg', 'FFmpeg（动态照片，软件解码）', LicensesPage.ffmpegNotice),
             block('licence-ffmpeg-link', '许可证', 'LGPL 2.1  ${LicensesPage.ffmpegLicenseUrl}'),
+            const SectionTitle('RAW 解码'),
+            block('licence-libraw', 'LibRaw', LicensesPage.librawNotice),
+            block('licence-libraw-link', '许可证', 'CDDL-1.0  ${LicensesPage.librawLicenseUrl}'),
+            block('licence-libjxl', 'libjxl 与 Highway（JPEG XL）', LicensesPage.libjxlNotice),
+            block('licence-libjxl-link', '许可证', 'BSD 3-Clause  ${LicensesPage.libjxlLicenseUrl}'),
+            block('licence-libomp', 'LLVM OpenMP 运行库', LicensesPage.libompNotice),
+            block('licence-libomp-link', '许可证', 'Apache-2.0 with LLVM Exceptions  ${LicensesPage.libompLicenseUrl}'),
           ]),
         ),
       ]),

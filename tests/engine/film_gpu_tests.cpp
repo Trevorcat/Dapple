@@ -14,6 +14,7 @@
 #include <map>
 #include <vector>
 
+#include "../deterministic.h"
 #include "colour_metrics.h"
 #include "dapple/film.h"
 #include "engine/exec/gpu_executor.h"

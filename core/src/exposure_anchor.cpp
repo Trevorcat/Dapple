@@ -30,6 +30,32 @@ ImageF cropToAspect(const ImageF& in, double ar) {
   return out;
 }
 
+// Removes black bars (rows / columns whose pixels are all below 0.06 encoded) from the four edges, at most a quarter of the size per side.
+ImageF trimLetterbox(const ImageF& in) {
+  auto rowBlack = [&](int y) {
+    const float* r = in.row(y);
+    for (int x = 0; x < in.width * 3; ++x)
+      if (r[x] > 0.06f) return false;
+    return true;
+  };
+  auto colBlack = [&](int x) {
+    for (int y = 0; y < in.height; ++y) {
+      const float* r = in.row(y) + 3 * x;
+      if (r[0] > 0.06f || r[1] > 0.06f || r[2] > 0.06f) return false;
+    }
+    return true;
+  };
+  int t = 0, b = 0, l = 0, rr = 0;
+  while (t < in.height / 4 && rowBlack(t)) ++t;
+  while (b < in.height / 4 && rowBlack(in.height - 1 - b)) ++b;
+  while (l < in.width / 4 && colBlack(l)) ++l;
+  while (rr < in.width / 4 && colBlack(in.width - 1 - rr)) ++rr;
+  if (t + b + l + rr == 0) return in;
+  ImageF out(in.width - l - rr, in.height - t - b);
+  for (int y = 0; y < out.height; ++y) std::copy_n(in.row(y + t) + 3 * l, std::size_t(out.width) * 3, out.row(y));
+  return out;
+}
+
 float percentileOf(std::vector<float>& v, double q) {
   if (v.empty()) return 0.f;
   const std::size_t k = std::min(v.size() - 1, std::size_t(q * double(v.size())));
@@ -45,7 +71,7 @@ void midWindow(float& lo, float& hi) {
 
 }  // namespace
 
-ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const ImageF& linear, float dngBaselineEv, const Image8* reference) {
+ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const ImageF& linear, float dngBaselineEv, const Image8* reference, const Image8* embedded, bool monochrome) {
   ExposureAnchor a;
   if (linear.empty()) return a;
 
@@ -75,14 +101,28 @@ ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const Ima
 
   // ---- tier 1: the embedded preview ----
   bool tier1 = false;
-  Result<Image8> prev = reference ? Result<Image8>(*reference) : extractEmbeddedPreview(raw, 0);
+  Result<Image8> prev = reference ? Result<Image8>(*reference) : embedded ? Result<Image8>(*embedded) : extractEmbeddedPreview(raw, 0);
   if (!prev) {
     a.note = "no embedded preview";
   } else if (std::max(prev->width, prev->height) < kMinPreviewEdge) {
     a.note = "preview too small (" + std::to_string(prev->width) + "x" + std::to_string(prev->height) + ")";
   } else {
-    ImageF p(prev->width, prev->height);
-    for (std::size_t i = 0; i < p.data.size(); ++i) p.data[i] = prev->data[i] / 255.f;
+    // box-average the 8-bit preview by an integer factor first (a 45 MP preview as float would cost 540 MB and 0.3 s): the grid below is 192 px
+    const int k = std::max(1, std::max(prev->width, prev->height) / (4 * kEdge));
+    ImageF p(prev->width / k, prev->height / k);
+    for (int y = 0; y < p.height; ++y) {
+      float* d = p.row(y);
+      for (int x = 0; x < p.width; ++x) {
+        int s[3] = {0, 0, 0};
+        for (int dy = 0; dy < k; ++dy) {
+          const std::uint8_t* q = &prev->data[(std::size_t(y * k + dy) * prev->width + std::size_t(x) * k) * 3];
+          for (int dx = 0; dx < k; ++dx) s[0] += q[3 * dx], s[1] += q[3 * dx + 1], s[2] += q[3 * dx + 2];
+        }
+        const float inv = 1.f / (255.f * float(k * k));
+        d[3 * x] = s[0] * inv, d[3 * x + 1] = s[1] * inv, d[3 * x + 2] = s[2] * inv;
+      }
+    }
+    p = trimLetterbox(p);  // a 4:3 thumbnail of a 3:2 picture carries black bars (Leica M Monochrom: 160 x 120 with the picture in 160 x 107)
     const double arP = double(p.width) / p.height, arR = double(linear.width) / linear.height;
     const double ratio = std::max(arP, arR) / std::min(arP, arR);
     if (ratio > 1.25) {
@@ -91,6 +131,68 @@ ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const Ima
       const double arP2 = ratio > 1.02 ? std::min(arP, arR) : arP, arR2 = ratio > 1.02 ? std::min(arP, arR) : arR;
       const ImageF pc0 = resizeToLongEdge(cropToAspect(p, arP2), kEdge);
       const ImageF rc = resizeToLongEdge(cropToAspect(linear, arR2), kEdge);
+      if (monochrome) {
+        // luminance-only witness: ratio of the medians over the interior, accepted by rank correlation (see the header); the preview is tried as is and
+        // turned by 180 degrees (a thumbnail may follow the sensor or the display orientation) and the better correlated one is used
+        struct Mono { double rho = -2; float ev = 0; int n = 0; };
+        auto monoRun = [&](const ImageF& pcv) {
+          Mono mr;
+          const int W = std::min(pcv.width, rc.width), H = std::min(pcv.height, rc.height);
+          const int bx = int(W * kBorder), by = int(H * kBorder);
+          std::vector<float> yp, yo;
+          std::size_t total = 0;
+          for (int y = by; y < H - by; ++y)
+            for (int x = bx; x < W - bx; ++x) {
+              ++total;
+              const float* q = pcv.row(y) + 3 * x;
+              const float* r = rc.row(y) + 3 * x;
+              if (std::max({r[0], r[1], r[2]}) > 0.95f) continue;  // clipped raw
+              const float lp = 0.2126729f * color::srgbDecode(q[0]) + 0.7151522f * color::srgbDecode(q[1]) + 0.0721750f * color::srgbDecode(q[2]);
+              if (lp < 0.004f) continue;  // crushed blacks of the camera's contrasty rendering: ties, no information
+              yp.push_back(lp);
+              yo.push_back(color::proPhotoLuma(r));
+            }
+          mr.n = int(yp.size());
+          if (total == 0 || yp.size() < std::max<std::size_t>(300, total / 10)) return mr;
+          const std::size_t n = yp.size();
+          auto ranks = [&](const std::vector<float>& v) {
+            std::vector<std::size_t> idx(n);
+            for (std::size_t i = 0; i < n; ++i) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](std::size_t a2, std::size_t b2) { return v[a2] < v[b2]; });
+            std::vector<float> r(n);
+            for (std::size_t i = 0; i < n; ++i) r[idx[i]] = float(i);
+            return r;
+          };
+          const std::vector<float> rp = ranks(yp), ro = ranks(yo);
+          double mp = 0, mo = 0;
+          for (std::size_t i = 0; i < n; ++i) mp += rp[i], mo += ro[i];
+          mp /= double(n), mo /= double(n);
+          double sxy = 0, sxx = 0, syy = 0;
+          for (std::size_t i = 0; i < n; ++i) sxy += (rp[i] - mp) * (ro[i] - mo), sxx += (rp[i] - mp) * (rp[i] - mp), syy += (ro[i] - mo) * (ro[i] - mo);
+          mr.rho = sxx > 0 && syy > 0 ? sxy / std::sqrt(sxx * syy) : 0.0;
+          std::vector<float> a1 = yp, a2 = yo;
+          const float medP = percentileOf(a1, 0.5), medO = percentileOf(a2, 0.5);
+          mr.ev = medP > 1e-6f && medO > 1e-6f ? std::log2(medP / medO) : 0.f;
+          if (!(medP > 1e-6f && medO > 1e-6f)) mr.rho = -2;
+          return mr;
+        };
+        Mono best = monoRun(pc0);
+        {
+          ImageF rot(pc0.width, pc0.height);
+          for (int y = 0; y < pc0.height; ++y)
+            for (int x = 0; x < pc0.width; ++x) std::copy_n(pc0.row(pc0.height - 1 - y) + 3 * (pc0.width - 1 - x), 3, rot.row(y) + 3 * x);
+          const Mono alt = monoRun(rot);
+          if (alt.rho > best.rho) best = alt;
+        }
+        a.previewPixels = best.n;
+        a.previewSpread = 0.f;
+        a.previewConfidence = float(std::clamp(best.rho, 0.0, 1.0));
+        a.previewEv = best.ev;
+        if (best.rho >= 0.3) tier1 = true;  // wrong geometry gives -0.6 .. 0.05, the registered tiny Leica thumbnail 0.36, the K-3 III 1.00
+        char b[160];
+        std::snprintf(b, sizeof b, "monochrome: median luminance match, preview %dx%d, rank correlation %.2f", prev->width, prev->height, best.rho);
+        a.note = b;
+      } else {
       float midLo, midHi;
       midWindow(midLo, midHi);
       // log-ratios of the mid-tone pixels for one orientation of the preview
@@ -147,6 +249,7 @@ ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const Ima
       } else {
         a.note = "preview has too few mid-tone pixels";
       }
+      }  // !monochrome
     }
   }
 

@@ -188,7 +188,15 @@ class MetalDev final : public Device {
   const std::vector<PassTime>& passTimes(FenceH f) const override { return slots_[f.slot < kSlots ? f.slot : 0].times; }
   SubmitStats stats(FenceH f) const override { return slots_[f.slot < kSlots ? f.slot : 0].st; }
   double gpuAccumMs() const override { return gpuAccum_.load(); }
-  bool nativeHandles(NativeHandles*) const override { return false; }
+  // The device and queue behind this HAL device, for a presenter that shares them (Metal objects are retained by the device; the lease holds the context alive).
+  bool nativeHandles(NativeHandles* out) const override {
+    if (!out) return false;
+    *out = NativeHandles{};
+    out->device = (__bridge void*)dev_;
+    out->queue = (__bridge void*)queue_;
+    out->swapchainEnabled = true;  // "can present": the presenter draws into textures created on this device
+    return true;
+  }
   std::vector<std::uint8_t> pipelineCacheBlob() const override;
   void trim() override { waitIdle(); }
   double splitGroups() const override { return splitGroups_; }
@@ -326,6 +334,7 @@ bool MetalDev::init(const DeviceOptions& opt, std::string& err) {
     sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
     sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
     sampler_ = [dev_ newSamplerStateWithDescriptor:sd];
+#if !TARGET_OS_SIMULATOR  // the simulator's Metal cannot serialize a binary archive (MTLLoader sliceID assertion)
     if (@available(macOS 11.0, iOS 14.0, *)) {
       // persisted pipeline cache (MTLBinaryArchive): the file the caller keeps at opt.pipelineCachePath; a missing / stale / foreign file starts an empty archive
       archivePath_ = opt.pipelineCachePath;
@@ -339,6 +348,7 @@ bool MetalDev::init(const DeviceOptions& opt, std::string& err) {
         archive_ = [dev_ newBinaryArchiveWithDescriptor:ad error:&e];
       }
     }
+#endif
 
     budget_ = opt.poolBudgetBytes ? opt.poolBudgetBytes
                                   : std::size_t(std::min<std::uint64_t>(std::max<std::uint64_t>(caps_.deviceLocalBytes / 4, 256u << 20),

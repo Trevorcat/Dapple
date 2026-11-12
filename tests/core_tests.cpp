@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 
+#include "test_tmp.h"
 #include "color.h"
 #include "colour_metrics.h"
 #include "parallel.h"
@@ -24,6 +25,7 @@
 #include "dapple/look.h"
 #include "dapple/lut.h"
 #include "dapple/renderer.h"
+#include "render_f.h"
 #include "dapple/tone.h"
 #include "dapple/auto_adjust.h"
 #include "dapple/xmp_preset.h"
@@ -345,8 +347,8 @@ void testRenderer() {
     for (int c = 0; c < 3; ++c) src.linear.data[c] = 0.18f;
     EditParams up;
     up.exposure = 1.f;
-    const float a = Renderer(EditParams{}, cam, nullptr).renderFloat(src).data[1];
-    const float b = Renderer(up, cam, nullptr).renderFloat(src).data[1];
+    const float a = renderF(EditParams{}, cam, nullptr, src).data[1];
+    const float b = renderF(up, cam, nullptr, src).data[1];
     CHECK(b > a + 0.05f);
   }
   // Calibration lock: a neutral patch at 0.18 (scene-linear) renders like the Sony
@@ -356,7 +358,7 @@ void testRenderer() {
     src.sceneReferred = true;
     src.linear = ImageF(1, 1);
     for (int c = 0; c < 3; ++c) src.linear.data[c] = 0.18f;
-    const ImageF o = Renderer(EditParams{}, cam, nullptr).renderFloat(src);
+    const ImageF o = renderF(EditParams{}, cam, nullptr, src);
     CHECK_NEAR(o.data[1], 0.72, 0.05);
     // The fitted camera profile corrects the camera JPEG's slightly cooler neutral axis (a ProPhoto
     // grey is ~4 b* too yellow without it), so allow a small R/B offset.
@@ -368,8 +370,8 @@ void testRenderer() {
     SourceImage src = greyRamp(64, true, true);
     EditParams withLut;
     withLut.lutAmount = 100;
-    const ImageF a = Renderer(EditParams{}, cam, nullptr).renderFloat(src);
-    const ImageF b = Renderer(withLut, cam, &id).renderFloat(src);
+    const ImageF a = renderF(EditParams{}, cam, nullptr, src);
+    const ImageF b = renderF(withLut, cam, &id, src);
     double maxErr = 0;
     for (std::size_t i = 0; i < a.data.size(); ++i) maxErr = std::max(maxErr, std::fabs(double(a.data[i]) - b.data[i]));
     CHECK(maxErr < 1e-4);
@@ -432,7 +434,7 @@ void testTone() {
   src.linear = ImageF(64, 64);
   for (std::size_t i = 0; i < e.data.size(); ++i) src.linear.data[i] = color::srgbDecode(e.data[i]);
   auto meanOf = [&](const EditParams& p) {
-    const ImageF o = Renderer(p, cam, nullptr).renderFloat(src);
+    const ImageF o = renderF(p, cam, nullptr, src);
     double m = 0;
     for (float v : o.data) m += v;
     return m / double(o.data.size());
@@ -457,7 +459,7 @@ void testColorMatch() {
   src.sceneReferred = true;
   src.linear = ImageF(4, 4);
   for (float& v : src.linear.data) v = 0.18f;
-  const ImageF o = Renderer(EditParams{}, cam, nullptr).renderFloat(src);
+  const ImageF o = renderF(EditParams{}, cam, nullptr, src);
   CHECK(std::fabs(o.data[0] - o.data[1]) < 0.05f && std::fabs(o.data[1] - o.data[2]) < 0.05f);
 }
 
@@ -492,7 +494,7 @@ void testCameraRegistry() {
 }
 
 void testIngest() {
-  const fs::path dir = fs::temp_directory_path() / "dapple_ingest_test";
+  const fs::path dir = fs::temp_directory_path() / (std::string("dapple_ingest_test_") + testUniqueTag() + "");
   std::error_code ec;
   fs::remove_all(dir, ec);
   fs::create_directories(dir);
@@ -531,7 +533,7 @@ void testCApi() {
   CHECK(dapple_probe_json("nope.txt") == nullptr);
 
   // XMP -> JSON through the C API using a temp file.
-  const fs::path tmp = fs::temp_directory_path() / "dapple_capi_test";
+  const fs::path tmp = fs::temp_directory_path() / (std::string("dapple_capi_test_") + testUniqueTag() + "");
   std::error_code ec;
   fs::create_directories(tmp, ec);
   const fs::path xmp = tmp / "preset.xmp";
@@ -888,7 +890,7 @@ void testIdentityAtDefaults() {
   const CameraRegistry cams = CameraRegistry::withBuiltins();
   const CameraProfile& cam = cams.resolve("Sony", "ILCE-7RM5");
   const SourceImage disp = colourScene();
-  const ImageF ref = Renderer(EditParams{}, cam, nullptr).renderFloat(disp);
+  const ImageF ref = renderF(EditParams{}, cam, nullptr, disp);
 
   // Display-referred: all defaults (sharpen 40, nrColor 25 are the no-op level) change nothing,
   // whatever the style does at strength 0.
@@ -898,11 +900,11 @@ void testIdentityAtDefaults() {
   z.hasPalette = true;
   z.paletteX = 0.96f;
   z.paletteY = 0.04f;
-  CHECK(maxAbsDiff(ref, Renderer(z, cam, nullptr).renderFloat(disp)) == 0.0);
+  CHECK(maxAbsDiff(ref, renderF(z, cam, nullptr, disp)) == 0.0);
   EditParams neutralGeo;
   neutralGeo.crop = "orig";
   neutralGeo.rotate = 360;  // clamps to 0
-  CHECK(maxAbsDiff(ref, Renderer(neutralGeo, cam, nullptr).renderFloat(disp)) == 0.0);
+  CHECK(maxAbsDiff(ref, renderF(neutralGeo, cam, nullptr, disp)) == 0.0);
   CHECK(ref.width == disp.linear.width && ref.height == disp.linear.height);
 
   // Scene-referred: sharpen 0 / nrColor 0 is the previous untouched render; the style at
@@ -912,16 +914,16 @@ void testIdentityAtDefaults() {
   EditParams plain;
   plain.sharpen = 0;
   plain.nrColor = 0;
-  const ImageF a = Renderer(plain, cam, nullptr).renderFloat(scene);
+  const ImageF a = renderF(plain, cam, nullptr, scene);
   EditParams withStyleOff = plain;
   withStyleOff.look = "film";
   withStyleOff.lookStrength = 0;
-  CHECK(maxAbsDiff(a, Renderer(withStyleOff, cam, nullptr).renderFloat(scene)) == 0.0);
+  CHECK(maxAbsDiff(a, renderF(withStyleOff, cam, nullptr, scene)) == 0.0);
   // The default develop baseline (sharpen 40 + chroma NR 25) does act on RAW, but only slightly.
-  const ImageF b = Renderer(EditParams{}, cam, nullptr).renderFloat(scene);
+  const ImageF b = renderF(EditParams{}, cam, nullptr, scene);
   CHECK(maxAbsDiff(a, b) < 0.1);
   // deterministic
-  CHECK(maxAbsDiff(b, Renderer(EditParams{}, cam, nullptr).renderFloat(scene)) == 0.0);
+  CHECK(maxAbsDiff(b, renderF(EditParams{}, cam, nullptr, scene)) == 0.0);
 }
 
 void testSliderMonotonicity() {
@@ -932,7 +934,7 @@ void testSliderMonotonicity() {
   auto meanWith = [&](const char* key, double v, int ch = -1) {
     std::ostringstream in;
     in << "{\"" << key << "\": " << v << "}";
-    return meanOf(Renderer(*fromJson(in.str()), cam, nullptr).renderFloat(ramp), ch);
+    return meanOf(renderF(*fromJson(in.str()), cam, nullptr, ramp), ch);
   };
   // exposure, highlights, shadows, whites, blacks: brighter with a higher value
   for (const char* k : {"exposure", "highlights", "shadows", "whites", "blacks"}) {
@@ -941,7 +943,7 @@ void testSliderMonotonicity() {
     if (!(lo < mid && mid < hi)) std::fprintf(stderr, "  not monotone: %s %.4f %.4f %.4f\n", k, lo, mid, hi);
   }
   // identity at the default value
-  CHECK_NEAR(meanWith("exposure", 0), meanOf(Renderer(EditParams{}, cam, nullptr).renderFloat(ramp)), 0);
+  CHECK_NEAR(meanWith("exposure", 0), meanOf(renderF(EditParams{}, cam, nullptr, ramp)), 0);
   // temperature: red up / blue down
   CHECK(meanWith("temp", -60, 0) < meanWith("temp", 0, 0) && meanWith("temp", 0, 0) < meanWith("temp", 60, 0));
   CHECK(meanWith("temp", -60, 2) > meanWith("temp", 0, 2) && meanWith("temp", 0, 2) > meanWith("temp", 60, 2));
@@ -959,7 +961,7 @@ void testSliderMonotonicity() {
   auto chroma = [&](const char* key, double v) {
     std::ostringstream in;
     in << "{\"" << key << "\": " << v << "}";
-    return meanChroma(Renderer(*fromJson(in.str()), cam, nullptr).renderFloat(col));
+    return meanChroma(renderF(*fromJson(in.str()), cam, nullptr, col));
   };
   for (const char* k : {"saturation", "vibrance"}) CHECK(chroma(k, -60) < chroma(k, 0) && chroma(k, 0) < chroma(k, 60));
   CHECK(chroma("saturation", -100) < 0.01);
@@ -968,21 +970,21 @@ void testSliderMonotonicity() {
   auto corner = [&](double v) {
     std::ostringstream in;
     in << "{\"vignette\": " << v << "}";
-    const ImageF o = Renderer(*fromJson(in.str()), cam, nullptr).renderFloat(ramp);
+    const ImageF o = renderF(*fromJson(in.str()), cam, nullptr, ramp);
     return std::pair<double, double>{o.row(0)[0], o.row(4)[3 * 64]};
   };
   CHECK(corner(-80).first < corner(0).first && corner(80).first > corner(0).first);
   CHECK_NEAR(corner(-80).second, corner(0).second, 1e-3);
   // grading: a hue + saturation in the shadows tints dark pixels, global tints everything
   {
-    const ImageF base = Renderer(EditParams{}, cam, nullptr).renderFloat(ramp);
-    const ImageF sh = Renderer(*fromJson(R"({"gr_shadows_h": 240, "gr_shadows_s": 80})"), cam, nullptr).renderFloat(ramp);
-    const ImageF gl = Renderer(*fromJson(R"({"gr_global_h": 30, "gr_global_s": 80})"), cam, nullptr).renderFloat(ramp);
+    const ImageF base = renderF(EditParams{}, cam, nullptr, ramp);
+    const ImageF sh = renderF(*fromJson(R"({"gr_shadows_h": 240, "gr_shadows_s": 80})"), cam, nullptr, ramp);
+    const ImageF gl = renderF(*fromJson(R"({"gr_global_h": 30, "gr_global_s": 80})"), cam, nullptr, ramp);
     auto bMinusR = [](const ImageF& im, int x) { return double(im.row(0)[3 * x + 2] - im.row(0)[3 * x]); };
     CHECK(bMinusR(sh, 6) > bMinusR(base, 6) + 0.01);               // dark end turns blue
     CHECK_NEAR(bMinusR(sh, 120), bMinusR(base, 120), 0.01);        // bright end is left alone
     CHECK(bMinusR(gl, 120) < bMinusR(base, 120) - 0.01 && bMinusR(gl, 6) < bMinusR(base, 6));  // warm everywhere
-    const ImageF lum = Renderer(*fromJson(R"({"gr_global_l": 60})"), cam, nullptr).renderFloat(ramp);
+    const ImageF lum = renderF(*fromJson(R"({"gr_global_l": 60})"), cam, nullptr, ramp);
     CHECK(meanOf(lum) > meanOf(base));
   }
 }
@@ -1003,7 +1005,7 @@ void testLocalOperations() {
     });
   };
   auto render = [&](const SourceImage& s, const char* json) {
-    return Renderer(*fromJson(json), cam, nullptr).renderFloat(s);
+    return renderF(*fromJson(json), cam, nullptr, s);
   };
   // variance of luma in the left (flat-ish) half
   auto leftVariance = [&](const ImageF& im) {
@@ -1072,7 +1074,7 @@ void testLocalOperations() {
     a.sharpen = 0;
     b.nrColor = 80;
     b.sharpen = 0;
-    CHECK(meanChroma(Renderer(b, cam, nullptr).renderFloat(cs)) < meanChroma(Renderer(a, cam, nullptr).renderFloat(cs)) * 0.7);
+    CHECK(meanChroma(renderF(b, cam, nullptr, cs)) < meanChroma(renderF(a, cam, nullptr, cs)) * 0.7);
   }
   const SourceImage flat = textured(1e9f, 0.f, 0.f);
   const ImageF g1 = render(flat, R"({"grain": 60})"), g2 = render(flat, R"({"grain": 60})");
@@ -1099,7 +1101,7 @@ void testGeometry() {
     o[1] = 0.1f + 0.8f * float(y) / float(H - 1);
     o[2] = 0.3f;
   });
-  auto render = [&](const char* json) { return Renderer(*fromJson(json), cam, nullptr).renderFloat(src); };
+  auto render = [&](const char* json) { return renderF(*fromJson(json), cam, nullptr, src); };
   auto dims = [&](const char* json) {
     const ImageF o = render(json);
     return std::pair<int, int>{o.width, o.height};
@@ -1141,14 +1143,14 @@ void testGeometry() {
     });
     for (const char* json : {R"({"straighten": 15})", R"({"straighten": -30})", R"({"straighten": 45, "crop": "1:1"})",
                              R"({"straighten": 10, "rot": 90})", R"({"straighten": 12, "flip": true, "crop": "16:9"})"}) {
-      const ImageF o = Renderer(*fromJson(json), cam, nullptr).renderFloat(framed);
+      const ImageF o = renderF(*fromJson(json), cam, nullptr, framed);
       float mn = 1.f;
       for (float v : o.data) mn = std::min(mn, v);
       CHECK(mn > 0.35f);
       if (mn <= 0.35f) std::fprintf(stderr, "  border visible with %s (min %.3f)\n", json, mn);
       CHECK(o.width <= 200 && o.height <= 200 && o.width > 20 && o.height > 20);
     }
-    const ImageF o = Renderer(*fromJson(R"({"straighten": 15})"), cam, nullptr).renderFloat(framed);
+    const ImageF o = renderF(*fromJson(R"({"straighten": 15})"), cam, nullptr, framed);
     CHECK_NEAR(double(o.width) / o.height, 200.0 / 120.0, 0.05);
     // sign: opposite angles give mirrored results, 0 is the identity
     const ImageF a = render(R"({"straighten": 8})"), b = render(R"({"straighten": -8})");
@@ -1162,7 +1164,7 @@ void testStyles() {
   const CameraRegistry cams = CameraRegistry::withBuiltins();
   const CameraProfile& cam = cams.resolve("Sony", "ILCE-7RM5");
   const SourceImage col = colourScene();
-  auto render = [&](const std::string& json) { return Renderer(*fromJson(json), cam, nullptr).renderFloat(col); };
+  auto render = [&](const std::string& json) { return renderF(*fromJson(json), cam, nullptr, col); };
   const ImageF base = render("{}");
   CHECK(looks().size() == 9);
   const char* ids[] = {"std", "warm", "amber", "rose", "neutral", "cool", "teal", "film", "bw"};
@@ -1208,7 +1210,7 @@ void testStyles() {
   // film: lifted blacks (fade) and grain
   {
     const SourceImage dark = makeDisplay(64, 64, [](int, int, float* o) { o[0] = o[1] = o[2] = 0.f; });
-    const ImageF f = Renderer(*fromJson(R"({"look": "film"})"), cam, nullptr).renderFloat(dark);
+    const ImageF f = renderF(*fromJson(R"({"look": "film"})"), cam, nullptr, dark);
     CHECK(meanOf(f) > 0.02);
   }
 }

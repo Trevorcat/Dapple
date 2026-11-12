@@ -19,6 +19,7 @@
 #include <psapi.h>
 #endif
 
+#include "../deterministic.h"
 #include "colour_metrics.h"
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"

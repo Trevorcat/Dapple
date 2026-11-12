@@ -7,6 +7,7 @@
 //   DAPPLE_UPDATE_SNAPSHOTS=1     rewrites tests/engine/graph_snapshots.txt
 //
 // The C API is compiled into the executable (like dapple_film_tests): process singletons.
+#include "../deterministic.h"
 #include "../../core/src/c_api.cpp"
 
 #include <algorithm>
@@ -80,7 +81,14 @@ const CameraProfile& camA() { return cameras().resolve("SONY", "ILCE-7M4"); }
 const CameraProfile& camB() { return cameras().resolve("Canon", "EOS R5"); }
 
 std::string writeCube() {
-  const fs::path p = fs::temp_directory_path() / "dapple_engine_test.cube";
+  // one file per process: parallel test processes (ctest -j) used to rewrite the same path while another read it (torn LUT -> a lut/interactive hash mismatch under load)
+  static const fs::path p = fs::temp_directory_path() / ("dapple_engine_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" + std::to_string(reinterpret_cast<std::uintptr_t>(&p)) + ".cube");
+  static const struct Cleanup {
+    ~Cleanup() {
+      std::error_code ec;
+      fs::remove(p, ec);
+    }
+  } cleanup;
   std::ofstream f(p);
   f << "TITLE \"t\"\nLUT_3D_SIZE 4\n";
   for (int b = 0; b < 4; ++b)

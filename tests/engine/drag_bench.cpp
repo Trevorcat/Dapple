@@ -2,6 +2,7 @@
 //   dapple_drag_bench <image> <film pack .dfp> [long edge=360] [frames=14] [case substring]
 // Env: DAPPLE_GPU=1 (GPU executor), DAPPLE_ENGINE_LOG=1. Prints per case: first frame, median and max of the following frames (wall ms).
 #include <algorithm>
+#include <numeric>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include "dapple/dapple_c.h"
 
 namespace {
+int settleMsEnv() { return std::getenv("DAPPLE_BENCH_SETTLE_MS") ? std::atoi(std::getenv("DAPPLE_BENCH_SETTLE_MS")) : 0; }
 struct Case {
   const char* name;
   const char* key;
@@ -141,6 +143,62 @@ int main(int argc, char** argv) {
       dapple_free_image(&last);
       dapple_free_image(&a);
       dapple_free_image(&b);
+    }
+    return 0;
+  }
+  if (filter == "stockslide") {  // the film map selects stocks live while the finger slides (wave 8): 10 stocks in 3 s, frame times and stock tap -> first frame
+    const char* ids[] = {"kodak_portra_400", "kodak_ektar_100", "fujifilm_velvia_100", "kodak_vision3_500t", "kodak_portra_160",
+                         "kodak_portra_800", "fujifilm_pro_400h", "kodak_gold_200", "kodak_ultramax_400", "fujifilm_provia_100f"};
+    auto frame = [&](const char* stock, double* ms) {
+      char js[200];
+      std::snprintf(js, sizeof js, "{\"film\":\"%s\"}", stock);
+      DappleFrameRequest rq{};
+      rq.size = sizeof rq;
+      rq.long_edge = le;
+      rq.flags = DAPPLE_FRAME_INTERACTIVE;
+      rq.active_param = "film";
+      DappleImage img{};
+      const auto t0 = Clk::now();
+      const bool ok = dapple_session_render_frame(s, js, nullptr, &rq, &img, nullptr) == DAPPLE_OK;
+      *ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+      dapple_free_image(&img);
+      return ok;
+    };
+    static std::atomic<std::int64_t> landedUs{0};
+    dapple_set_repaint_callback([](void*) { landedUs.store(std::chrono::duration_cast<std::chrono::microseconds>(Clk::now().time_since_epoch()).count()); }, nullptr);
+    double ms = 0;
+    if (!frame(ids[0], &ms)) return 1;  // the photo is open on the default stock
+    std::this_thread::sleep_for(std::chrono::milliseconds(settleMsEnv()));
+    for (int pass = 0; pass < 2; ++pass) {  // pass 0: every stock for the first time in this process; pass 1: warm in process
+      std::vector<double> all, firsts, shownAfter;
+      const auto tStart = Clk::now();
+      for (int i = 1; i <= 10; ++i) {
+        const char* st = ids[i % 10];
+        const auto tSel = Clk::now();
+        const std::int64_t selUs = std::chrono::duration_cast<std::chrono::microseconds>(tSel.time_since_epoch()).count();
+        landedUs.store(0);
+        double first = 0;
+        if (!frame(st, &first)) return 1;
+        firsts.push_back(first);
+        all.push_back(first);
+        // frames until the next selection 300 ms later (3 s for 10 stocks)
+        while (std::chrono::duration<double, std::milli>(Clk::now() - tSel).count() < 300.0) {
+          double m = 0;
+          if (!frame(st, &m)) return 1;
+          all.push_back(m);
+        }
+        const std::int64_t lu = landedUs.load();
+        shownAfter.push_back(lu > selUs ? double(lu - selUs) / 1000.0 : 0.0);  // 0: nothing was stale (cached)
+      }
+      std::vector<double> s2 = all;
+      std::sort(s2.begin(), s2.end());
+      int over = 0;
+      for (double v : all) over += v > 33.0;
+      double fmax = 0, fsum = 0;
+      for (double v : firsts) fmax = std::max(fmax, v), fsum += v;
+      std::printf("  pass %d (%s): 10 stocks in %.1f s, %zu frames, p50 %.1f p95 %.1f max %.1f ms, over 33 ms: %d; stock tap -> first frame: mean %.1f ms, max %.1f ms; correct stock on screen after: mean %.0f ms, max %.0f ms (0 = was cached)\n", pass,
+                  pass == 0 ? "cold in process" : "warm in process", std::chrono::duration<double>(Clk::now() - tStart).count(), all.size(), s2[s2.size() / 2],
+                  s2[std::size_t(double(s2.size()) * 0.95)], s2.back(), over, fsum / double(firsts.size()), fmax, std::accumulate(shownAfter.begin(), shownAfter.end(), 0.0) / double(shownAfter.size()), *std::max_element(shownAfter.begin(), shownAfter.end()));
     }
     return 0;
   }

@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "test_tmp.h"
 #include "dapple/camera.h"
 #include "dapple/encode.h"
 #include "color.h"
@@ -459,7 +460,7 @@ static void writeDng(const fs::path& path, int W, int H, int orientation, bool c
 }
 
 static void testEndToEnd() {
-  const fs::path dir = fs::temp_directory_path() / "dapple_dng_work";
+  const fs::path dir = fs::temp_directory_path() / (std::string("dapple_dng_work_") + testUniqueTag() + "");
   fs::create_directories(dir);
   const int W = 256, H = 192;
   // smooth, clearly non-flat content so the gain maps and the warp have something to act on, no clipping after gain <= 1.6
@@ -590,7 +591,7 @@ static void testIlluminant() {
   }
   // through the decoder: a DNG carrying both matrices and an as-shot neutral made from 3300 K light
   {
-    const fs::path dir = fs::temp_directory_path() / "dapple_dng_work_ill";
+    const fs::path dir = fs::temp_directory_path() / (std::string("dapple_dng_work_ill_") + testUniqueTag() + "");
     fs::create_directories(dir);
     g_color.dual = true;
     std::memcpy(g_color.cm1, cmA, sizeof cmA);
@@ -632,7 +633,7 @@ static void testIlluminant() {
 
 // exposure anchor of a file without an embedded preview: tier 2 = the BaselineExposure tag, tier 3 = scene statistics (tag absent or the default 0)
 static void testAnchor() {
-  const fs::path dir = fs::temp_directory_path() / "dapple_dng_work_anchor";
+  const fs::path dir = fs::temp_directory_path() / (std::string("dapple_dng_work_anchor_") + testUniqueTag() + "");
   fs::create_directories(dir);
   auto decode = [&](const char* name) { return makeLibRawDecoder()->decode(dir / name, DecodeOptions{DecodeQuality::Full}); };
   std::vector<std::uint16_t> px(64 * 48, 800);  // flat: (800 - 64) / (4095 - 64) = 0.18 of white
@@ -743,6 +744,35 @@ static int testJxl() {
   return g_fail ? 1 : 0;
 }
 
+// FixBadPixelsConstant (OpcodeList1): pixels equal to the constant are replaced by the mean of their same-colour neighbours two pixels away
+static void testBadPixels() {
+  constexpr int W = 12, H = 12;
+  std::vector<std::uint16_t> px(std::size_t(W) * H);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) px[std::size_t(y) * W + x] = std::uint16_t(1000 + 10 * (x % 2) + 20 * (y % 2));  // a flat Bayer pattern: 4 plane values
+  const std::uint16_t kBad = 65535;
+  px[std::size_t(5) * W + 5] = kBad;  // interior
+  px[std::size_t(0) * W + 0] = kBad;  // corner: only two neighbours
+  px[std::size_t(5) * W + 7] = kBad;  // two bad pixels in a row of the same colour: the neighbour two to the left is bad, the others are used
+  px[std::size_t(5) * W + 5 + 2 * 0] = kBad;
+  std::vector<std::uint8_t> params = {0x00, 0x00, 0xFF, 0xFF, 0, 0, 0, 0};  // Constant 65535, BayerPhase 0 (big endian)
+  dng::OpcodeList list;
+  dng::Opcode op;
+  op.id = dng::kFixBadPixelsConstant, op.version = 0x01030000, op.flags = 1, op.params = params;
+  list.ops.push_back(op);
+  dng::MosaicView v;
+  v.px = px.data(), v.pitch = W, v.width = W, v.height = H;
+  dng::ApplyReport rep;
+  dng::applyMosaic(list, v, rep);
+  int bad = 0;
+  for (std::uint16_t s : px) bad += s == kBad;
+  CHECK(bad == 0, "%d bad pixels left", bad);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) CHECK(px[std::size_t(y) * W + x] == 1000 + 10 * (x % 2) + 20 * (y % 2), "pixel (%d,%d) = %u", x, y, unsigned(px[std::size_t(y) * W + x]));
+  CHECK(rep.summary().find("FixBadPixelsConstant (3 px)") != std::string::npos, "report '%s'", rep.summary().c_str());
+  std::printf("  FixBadPixelsConstant: 3 bad pixels restored to their plane value, report '%s'%s", rep.summary().c_str(), "\n");
+}
+
 int main(int argc, char** argv) {
   const std::string which = argc > 1 ? argv[1] : "all";
   auto want = [&](const char* n) { return which == "all" || which == n; };
@@ -753,6 +783,7 @@ int main(int argc, char** argv) {
   if (want("e2e")) testEndToEnd();
   if (want("illuminant")) testIlluminant();
   if (want("anchor")) testAnchor();
+  if (want("badpixels")) testBadPixels();
   if (which == "jxl") return testJxl();
   std::printf(g_fail ? "FAILED (%d)\n" : "OK\n", g_fail);
   return g_fail ? 1 : 0;
