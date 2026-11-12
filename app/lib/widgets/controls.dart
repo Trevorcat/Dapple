@@ -5,6 +5,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../services/edit_interaction.dart';
 import '../state/app_state.dart';
 import '../theme/tokens.dart';
 import 'icons.dart';
@@ -434,6 +435,26 @@ class DSlider extends StatefulWidget {
 
 class _DSliderState extends State<DSlider> {
   double? _lastHaptic;
+  bool _dragging = false;
+
+  // Tells the editor engine a drag is in progress (interactive-quality frames, see EditInteraction).
+  void _dragBegin() {
+    if (_dragging) return;
+    _dragging = true;
+    EditInteraction.begin();
+  }
+
+  void _dragEnd() {
+    if (!_dragging) return;
+    _dragging = false;
+    EditInteraction.end();
+  }
+
+  @override
+  void dispose() {
+    _dragEnd();
+    super.dispose();
+  }
 
   bool get _changed => (widget.value - widget.def).abs() > 1e-9;
 
@@ -510,7 +531,12 @@ class _DSliderState extends State<DSlider> {
             final w = cons.maxWidth;
             final usable = w - thumb;
             double x(double v) => thumb / 2 + pos(v) * usable;
-            return GestureDetector(
+            return Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerDown: (_) => _dragBegin(),
+              onPointerUp: (_) => _dragEnd(),
+              onPointerCancel: (_) => _dragEnd(),
+              child: GestureDetector(
               key: widget.keyPrefix == null ? null : ValueKey('${widget.keyPrefix}-slider'),
               behavior: HitTestBehavior.opaque,
               onTapDown: (d) => _setFromDx(d.localPosition.dx - thumb / 2, usable),
@@ -565,7 +591,7 @@ class _DSliderState extends State<DSlider> {
                   ),
                 ]),
               ),
-            );
+            ));
           }),
         ]),
       ),

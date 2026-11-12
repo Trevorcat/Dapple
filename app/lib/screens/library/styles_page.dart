@@ -146,7 +146,7 @@ class _StylesPageState extends State<StylesPage> {
         ),
         const SectionTitle('导入'),
         // TODO(look import): .xmp via dapple_xmp_to_json (lists unsupported items), .cube LUT, Fujifilm recipes.
-        for (final r in const [('Lightroom 预设（.xmp）', 'xmp'), ('LUT 滤镜（.cube）', 'cube'), ('富士胶片配方', 'fuji')])
+        for (final r in const [('Lightroom 预设（.xmp）', 'xmp'), ('LUT 滤镜（.cube）', 'cube'), ('相机胶片配方', 'fuji')])
           InkWell(
             key: ValueKey('import-${r.$2}'),
             onTap: () => app.showToast('待实现'),

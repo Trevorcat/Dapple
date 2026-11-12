@@ -410,7 +410,7 @@ void main() {
           case 'thumbs':
             return List<String?>.filled((call.arguments['timesMs'] as List).length, null);
           case 'frame':
-            return call.arguments['dest'];
+            return {'path': call.arguments['dest'], 'kind': 'sdr-jpeg'};
           case 'trim':
             return {'path': call.arguments['dest'], 'actualStartMs': 4000, 'durationMs': 3000, 'frames': 90, 'audio': false};
         }
@@ -452,6 +452,15 @@ void main() {
       expect(find.text('封面 0:09'), findsOneWidget, reason: 'window moved right by 2.8 s, cover with it');
       await tester.tap(find.byKey(const ValueKey('live-mute')));
       await tester.pump(_t);
+      // 源色彩: 自动 / 标准 / S-Log3 / HLG; the choice goes to the decoder with every call
+      await tester.ensureVisible(find.byKey(const ValueKey('live-source')));
+      await tester.pump(_t);
+      expect(find.text('源色彩'), findsOneWidget);
+      for (final l in ['自动', '标准', 'S-Log3', 'HLG']) {
+        expect(find.text(l), findsOneWidget);
+      }
+      await tester.tap(find.text('S-Log3'));
+      await tester.pump(const Duration(milliseconds: 600));
 
       await tester.tap(find.byKey(const ValueKey('tool-main')));
       await tester.pump();
@@ -460,6 +469,9 @@ void main() {
       final trim = calls.firstWhere((c) => c.method == 'trim');
       expect(trim.arguments['durationMs'], 3000);
       expect(trim.arguments['mute'], false);
+      expect(trim.arguments['source'], 2, reason: 'S-Log3 chosen');
+      expect(calls.where((c) => c.method == 'frame').last.arguments['source'], 2);
+      expect(trim.arguments['compat'], false);
       expect(trim.arguments['startMs'], greaterThan(5000));
       expect(eng.motion.single['out'].toString().endsWith('_MP.jpg'), isTrue);
       expect(eng.motion.single['cover'] as double, inInclusiveRange(0, 4));
@@ -467,6 +479,90 @@ void main() {
       expect(app.photos.first.kind, PhotoKind.live);
       expect(app.photos.first.badge, '动态照片');
       expect(find.text('动态照片已加入「今天」'), findsOneWidget);
+    });
+
+    testWidgets('software-decoded video (10-bit 4:2:2): hint shown, clip re-encoded by the platform, no stream-copy fallback', (tester) async {
+      final (app, eng) = await _open(tester);
+      final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      var trimFails = false;
+      messenger.setMockMethodCallHandler(const MethodChannel('dapple/live'), (call) async {
+        calls.add(call);
+        switch (call.method) {
+          case 'info':
+            return {'durationMs': 14000, 'width': 1920, 'height': 1080, 'rotation': 0, 'decodable': true, 'software': true, 'format': 'H.264 profile 122, chroma 4:2:2, 10-bit'};
+          case 'probe':
+            return {'decodable': true, 'hardware': false, 'software': true};
+          case 'thumbs':
+            return List<String?>.filled((call.arguments['timesMs'] as List).length, null);
+          case 'frame':
+            return {'path': call.arguments['dest'], 'kind': 'sdr-jpeg'};
+          case 'trim':
+            if (trimFails) throw PlatformException(code: 'live', message: 'encoder failed');
+            return {'path': call.arguments['dest'], 'actualStartMs': call.arguments['startMs'], 'durationMs': 3000, 'frames': 91, 'audio': false};
+        }
+        return null;
+      });
+      await tester.tap(find.byKey(const ValueKey('entry-video')));
+      await _settle(tester);
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(find.byKey(const ValueKey('live-software')), findsNothing, reason: 'no explanatory paragraph on the video tool page (owner rule: no technical copy)');
+      expect(find.textContaining('软件解码'), findsNothing);
+      expect(find.textContaining('10 位'), findsNothing);
+      expect(find.byKey(const ValueKey('live-undecodable')), findsNothing);
+
+      final job = await app.startLive(LiveDraft(video: _video(14)));
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(job.status, JobStatus.done);
+      expect(eng.motion.single.containsKey('mp4'), isTrue, reason: 'the platform clip is written, not the engine stream-copy cutter');
+      expect(app.photos.first.liveGen, Photo.liveGenCurrent);
+      expect(app.photos.first.liveSrc, isNotNull);
+      final back = Photo.fromJson(app.photos.first.toJson());
+      expect(back.liveGen, Photo.liveGenCurrent);
+      expect(back.liveStartMs, app.photos.first.liveStartMs);
+
+      // a failing software clip is a failure, never a stream copy of the undecodable stream
+      trimFails = true;
+      final before = app.photos.length;
+      final bad = await app.startLive(LiveDraft(video: _video(14)));
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(bad.status, JobStatus.failed);
+      expect(eng.motion.length, 1, reason: "no engine cutter after a failed software clip");
+      expect(app.photos.length, before);
+    });
+
+    testWidgets('undecodable video (e.g. 4:2:2 10-bit): no still is written, no Photo, clear error', (tester) async {
+      final (app, _) = await _open(tester);
+      final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(const MethodChannel('dapple/live'), (call) async {
+        calls.add(call);
+        switch (call.method) {
+          case 'info':
+            return {'durationMs': 14000, 'width': 1920, 'height': 1080, 'rotation': 0, 'decodable': false, 'format': 'H.264 profile 122, chroma 4:2:2, 10-bit'};
+          case 'thumbs':
+            return List<String?>.filled((call.arguments['timesMs'] as List).length, null);
+          case 'frame':
+            throw PlatformException(code: 'unsupported', message: 'unsupported video: H.264 profile 122, chroma 4:2:2, 10-bit');
+        }
+        return null;
+      });
+      final photosBefore = app.photos.length;
+      await tester.tap(find.byKey(const ValueKey('entry-video')));
+      await _settle(tester);
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(find.byKey(const ValueKey('live-undecodable')), findsOneWidget);
+      expect(find.textContaining('无法正确解码'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('tool-main')));
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(calls.where((c) => c.method == 'trim'), isEmpty, reason: 'generate is disabled');
+
+      // and the engine path itself refuses: job fails, nothing is written or listed
+      final job = await app.startLive(LiveDraft(video: _video(14)));
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(job.status, JobStatus.failed);
+      expect(job.error, contains('无法正确解码'));
+      expect(app.photos.length, photosBefore);
+      expect(calls.where((c) => c.method == 'trim'), isEmpty);
+      expect(calls.where((c) => c.method == 'saveToGallery'), isEmpty);
     });
 
     testWidgets('no video preselected: the tool lists the MediaStore videos and a pick sets the window', (tester) async {

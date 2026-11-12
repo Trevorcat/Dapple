@@ -38,6 +38,8 @@ class Photo {
     this.progress = 0,
     this.flag = false,
     this.ratio,
+    this.pxW,
+    this.pxH,
     this.exif,
     this.demo,
     this.place,
@@ -46,6 +48,13 @@ class Photo {
     this.nearest,
     this.takenMs,
     this.pairedJpeg,
+    this.liveSrc,
+    this.liveStartMs,
+    this.liveCoverMs,
+    this.liveMute = false,
+    this.liveGen = 0,
+    this.liveSource = 0,
+    this.liveInfo,
   });
 
   final String id;
@@ -75,6 +84,9 @@ class Photo {
 
   /// width / height; null until known.
   double? ratio;
+
+  /// Original pixel size (long side is the sensor / file resolution); null until probed.
+  int? pxW, pxH;
   String? exif;
 
   /// Index into `demoPhotos` (tests / screenshots only).
@@ -95,6 +107,19 @@ class Photo {
 
   /// RAW+JPEG pair: the camera JPEG that arrived with this RAW (kept, never listed on its own).
   String? pairedJpeg;
+
+  /// Motion Photo (kind == live) provenance, so it can be regenerated: source video (MediaStore URI, or a path),
+  /// clip start / cover time in ms, mute flag, and the generator revision that wrote the still and clip
+  /// ([liveGenCurrent]). 0 = written before this was recorded (the false-colour 4:2:2 era).
+  String? liveSrc;
+  int? liveStartMs, liveCoverMs;
+  bool liveMute;
+  int liveGen;
+
+  /// 源色彩 used (LiveSource index) and what the clip encode recorded (codec, profile, bit depth, audio, decoder).
+  int liveSource;
+  String? liveInfo;
+  static const int liveGenCurrent = 2;
 
   /// Capture time when known, else the time it reached the phone.
   int get sortMs => takenMs ?? addedMs;
@@ -128,10 +153,13 @@ class Photo {
         'exported': exported,
         'flag': flag,
         'ratio': ratio,
+        'pxW': pxW,
+        'pxH': pxH,
         'exif': exif,
         'nearest': nearest,
         'takenMs': takenMs,
         'pairedJpeg': pairedJpeg,
+        if (kind == PhotoKind.live) ...{'liveSrc': liveSrc, 'liveStartMs': liveStartMs, 'liveCoverMs': liveCoverMs, 'liveMute': liveMute, 'liveGen': liveGen, 'liveSource': liveSource, 'liveInfo': liveInfo},
         if (kind == PhotoKind.hdr || kind == PhotoKind.pano || kind == PhotoKind.live) ...{'kind': kind.name, 'badge': badge},
       };
 
@@ -150,10 +178,19 @@ class Photo {
         exported: (j['exported'] as bool?) ?? false,
         flag: (j['flag'] as bool?) ?? false,
         ratio: (j['ratio'] as num?)?.toDouble(),
+        pxW: (j['pxW'] as num?)?.toInt(),
+        pxH: (j['pxH'] as num?)?.toInt(),
         exif: j['exif'] as String?,
         nearest: j['nearest'] as String?,
         takenMs: (j['takenMs'] as num?)?.toInt(),
         pairedJpeg: j['pairedJpeg'] as String?,
+        liveSrc: j['liveSrc'] as String?,
+        liveStartMs: (j['liveStartMs'] as num?)?.toInt(),
+        liveCoverMs: (j['liveCoverMs'] as num?)?.toInt(),
+        liveMute: (j['liveMute'] as bool?) ?? false,
+        liveGen: (j['liveGen'] as num?)?.toInt() ?? 0,
+        liveSource: (j['liveSource'] as num?)?.toInt() ?? 0,
+        liveInfo: j['liveInfo'] as String?,
         kind: PhotoKind.values.firstWhere((k) => k.name == j['kind'], orElse: () => PhotoKind.photo),
         badge: j['badge'] as String?,
       );
@@ -165,21 +202,26 @@ class AppSettings {
     this.defaultLookId = 'std',
     this.toneStrength = 60,
     this.autoProcess = true,
-    this.exportLongEdge = 2560,
+    this.exportLongEdge = 0,
     this.stripLocation = true,
-    this.jpegQuality = 92,
+    this.jpegQuality = 95,
     this.watchGallery = true,
     this.onboarded = false,
     this.ftpEnabled = false,
     this.ftpUser = 'dapple',
     this.ftpPass = '',
     this.ftpPort = 2121,
+    this.handedness = 0,
+    this.haptics = true,
+    this.handSide = 1,
+    this.editorLayout = '',
   });
   String defaultLookId;
 
   /// 0..100, default 60.
   double toneStrength;
   bool autoProcess;
+  /// Long side in px for save / share; 0 = the photo's original size.
   int exportLongEdge;
   bool stripLocation;
   int jpegQuality;
@@ -191,6 +233,18 @@ class AppSettings {
   String ftpUser;
   String ftpPass;
   int ftpPort;
+
+  /// Editor handedness (requirements 4.15.12): 0 auto, 1 left, 2 right.
+  int handedness;
+
+  /// Landmark haptics in the editor (4.15.9).
+  bool haptics;
+
+  /// Last resolved dominant side (0 left, 1 right), kept across sessions.
+  int handSide;
+
+  /// Serialized floating window memory (WindowManager.toJsonString).
+  String editorLayout;
 }
 
 /// Camera connection card (requirements 4.2.2).

@@ -10,6 +10,7 @@ import '../../services/tool_models.dart';
 import '../publish/publish_page.dart';
 import '../tools/launcher.dart';
 import 'home_page.dart';
+import '../../services/perf_probe.dart';
 
 /// Window width at which the layout switches to rail + full-width grid (requirements 2.2).
 const double kWideBreakpoint = 600;
@@ -31,6 +32,7 @@ class DappleShell extends StatelessWidget {
     return ListenableBuilder(
       listenable: app,
       builder: (context, _) {
+        PerfProbe.count('shell');
         final c = context.c;
         final wide = MediaQuery.sizeOf(context).width >= kWideBreakpoint;
         final selecting = app.selectMode && app.tab == 0;

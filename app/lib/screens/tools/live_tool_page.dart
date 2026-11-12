@@ -30,6 +30,8 @@ class _LiveToolPageState extends State<LiveToolPage> {
   AppState get app => widget.app;
   LiveDraft? d;
   double _aspect = 3 / 4;
+  String? _undecodable; // format label when this device cannot decode the video correctly
+  String? _slogNote; // Sony metadata found in the file (S-Log3), shown under 源色彩
   List<String?> _thumbs = const [];
   String? _coverPath;
   int _coverRev = 0;
@@ -72,6 +74,8 @@ class _LiveToolPageState extends State<LiveToolPage> {
       _thumbs = const [];
       _coverPath = null;
       _playFrames = const [];
+      _undecodable = null;
+      _slogNote = null;
     });
     unawaited(_loadInfo(v));
     unawaited(_loadThumbs(v));
@@ -83,6 +87,12 @@ class _LiveToolPageState extends State<LiveToolPage> {
       final i = await LiveBridge.info(v.uri);
       final w = (i['width'] as num?)?.toDouble() ?? 0, h = (i['height'] as num?)?.toDouble() ?? 0;
       final rot = (i['rotation'] as num?)?.toInt() ?? 0;
+      if ((i['slogDetected'] as num?)?.toInt() == 1 || (i['slogDetected'] as num?)?.toInt() == 2) {
+        if (mounted && d?.video == v) setState(() => _slogNote = '${i['captureGamma']}');
+      }
+      if (i['decodable'] == false && mounted && d?.video == v) {
+        setState(() => _undecodable = '${i['format'] ?? v.name}');
+      }
       if (w > 0 && h > 0 && mounted && d?.video == v) {
         final a = (rot == 90 || rot == 270) ? h / w : w / h;
         setState(() => _aspect = a.clamp(0.4, 2.4).toDouble());
@@ -93,7 +103,7 @@ class _LiveToolPageState extends State<LiveToolPage> {
   Future<void> _loadThumbs(VideoItem v) async {
     try {
       final times = [for (var i = 0; i < _cells; i++) ((i + 0.5) / _cells * v.durationMs).round()];
-      final l = await LiveBridge.thumbs(v.uri, times, maxEdge: 200, destDir: app.scratchPath, prefix: 'film_${v.id}');
+      final l = await LiveBridge.thumbs(v.uri, times, maxEdge: 200, destDir: app.scratchPath, prefix: 'film_${v.id}', source: d?.source ?? LiveSource.auto);
       if (mounted && d?.video == v) setState(() => _thumbs = l);
     } catch (_) {}
   }
@@ -110,10 +120,12 @@ class _LiveToolPageState extends State<LiveToolPage> {
     setState(() => _coverBusy = true);
     try {
       final out = p.join(app.scratchPath, 'live_cover_preview_$rev.jpg');
-      await LiveBridge.frame(cur.video.uri, (cur.coverSec * 1000).round(), out, maxEdge: 900, quality: 85);
+      await LiveBridge.frame(cur.video.uri, (cur.coverSec * 1000).round(), out, maxEdge: 900, quality: 85, source: cur.source);
       if (!mounted || rev != _coverRev) return;
       imageCache.clear();
       setState(() => _coverPath = out);
+    } on UnsupportedVideoException catch (e) {
+      if (mounted && rev == _coverRev) setState(() => _undecodable = e.detail);
     } catch (_) {
       // keep the previous frame
     } finally {
@@ -161,16 +173,27 @@ class _LiveToolPageState extends State<LiveToolPage> {
     _scheduleCover();
   }
 
+  void _setSource(int i) {
+    final cur = d;
+    if (cur == null) return;
+    setState(() {
+      cur.source = LiveSource.values[i];
+      _playFrames = const [];
+    });
+    unawaited(_loadThumbs(cur.video));
+    _scheduleCover(immediate: true);
+  }
+
   // ---- hold to play
   Future<void> _holdStart() async {
     final cur = d;
     if (cur == null) return;
-    final key = '${cur.video.id}:${cur.startSec.toStringAsFixed(2)}';
+    final key = '${cur.video.id}:${cur.startSec.toStringAsFixed(2)}:${cur.source.code}';
     if (_playKey != key || _playFrames.isEmpty) {
       try {
         final times = [for (var i = 0; i < 12; i++) ((cur.startSec + cur.windowLen * i / 11) * 1000).round()];
         _playFrames = await LiveBridge.thumbs(cur.video.uri, times,
-            maxEdge: 480, destDir: app.scratchPath, prefix: 'play_${cur.video.id}');
+            maxEdge: 480, destDir: app.scratchPath, prefix: 'play_${cur.video.id}', source: cur.source);
         _playKey = key;
       } catch (_) {
         return;
@@ -229,7 +252,7 @@ class _LiveToolPageState extends State<LiveToolPage> {
       title: '视频转动态照片',
       onCancel: () => Navigator.of(context).pop(),
       mainLabel: cur == null ? '选择视频' : '生成动态照片',
-      onMain: cur == null ? _pickVideo : _start,
+      onMain: cur == null ? _pickVideo : (_undecodable != null ? null : _start),
       body: cur == null ? _empty(context) : _editor(context, cur, size, c),
     );
   }
@@ -252,7 +275,15 @@ class _LiveToolPageState extends State<LiveToolPage> {
     }
     final coverText = '封面 ${LiveDraft.clock(cur.coverSec)}';
     final shown = _playing && _playFrames.isNotEmpty ? _playFrames[_playIdx % _playFrames.length] : _coverPath;
+    final bad = _undecodable;
     return ListView(padding: const EdgeInsets.only(bottom: Sp.l), children: [
+      if (bad != null)
+        Padding(
+          key: const ValueKey('live-undecodable'),
+          padding: const EdgeInsets.fromLTRB(Sp.l, 0, Sp.l, Sp.m),
+          child: Text('这段视频的格式（$bad）在此设备上无法正确解码，无法生成动态照片。请换一段视频。',
+              style: T.body(c.text2)),
+        ),
       Center(
         child: GestureDetector(
           key: const ValueKey('live-preview'),
@@ -332,6 +363,22 @@ class _LiveToolPageState extends State<LiveToolPage> {
             label: '静音',
             value: cur.mute,
             onChanged: (v) => setState(() => cur.mute = v)),
+        const SizedBox(height: Sp.s),
+        Text('源色彩', style: T.body17(c.text)),
+        const SizedBox(height: Sp.s),
+        KeyedSubtree(
+          key: const ValueKey('live-source'),
+          child: DSegmented(
+            semanticsLabel: '源色彩',
+            labels: [for (final s in LiveSource.values) s.label],
+            index: cur.source.index,
+            onChanged: _setSource,
+          ),
+        ),
+        if (_slogNote != null && cur.source == LiveSource.auto) ...[
+          const SizedBox(height: Sp.s),
+          Text('检测到相机的 $_slogNote 标记，按 S-Log3 转成标准色彩', key: const ValueKey('live-slog-note'), style: T.small(c.text2)),
+        ],
       ]),
     ]);
   }

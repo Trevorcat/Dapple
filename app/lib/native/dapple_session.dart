@@ -3,10 +3,12 @@ import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:isolate';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:ffi/ffi.dart';
 
 import 'dapple_bindings.dart';
+import '../services/perf_probe.dart';
 
 class DappleException implements Exception {
   DappleException(this.message);
@@ -45,6 +47,130 @@ Map<String, dynamic>? _decodeObj(String? s) {
   return v is Map<String, dynamic> ? v : null;
 }
 
+/// One rendered interactive frame. The pixels stay in native memory (RGBA8888, stride width * 4)
+/// until [toImage] copies them once into an engine-owned buffer and releases them, or [dispose]
+/// drops them. Exactly one of the two must be called.
+class NativeFrame {
+  NativeFrame._(this.width, this.height, this._addr, this.analysisJson, [this.nativeMs = 0]);
+
+  /// Wall time of the native call (inside the worker isolate), ms.
+  final double nativeMs;
+  final int width;
+  final int height;
+  final int _addr;
+
+  /// Tonal analysis JSON of this very render (same schema as [DappleSession.analyze]), when asked for.
+  final String? analysisJson;
+  bool _released = false;
+
+  Map<String, dynamic>? get analysis => _decodeObj(analysisJson);
+
+  /// Zero-copy view of the native pixels (valid until [toImage]/[dispose]).
+  Uint8List get pixels => ffi.Pointer<ffi.Uint8>.fromAddress(_addr).asTypedList(width * height * 4);
+
+  void _release() {
+    if (_released) return;
+    _released = true;
+    final b = DappleBindings.instanceOrNull;
+    if (b == null || _addr == 0) return;
+    final img = calloc<DappleImageStruct>();
+    img.ref
+      ..width = width
+      ..height = height
+      ..rgba = ffi.Pointer<ffi.Uint8>.fromAddress(_addr);
+    b.freeImage(img);
+    calloc.free(img);
+  }
+
+  void dispose() => _release();
+
+  /// Native pixels -> GPU-ready [ui.Image] with a single copy (ImmutableBuffer), then frees them.
+  Future<ui.Image> toImage() async {
+    try {
+      final t0 = PerfProbe.begin();
+      final buf = await ui.ImmutableBuffer.fromUint8List(pixels);
+      PerfProbe.end('immbuf', t0);
+      _release();
+      final desc = ui.ImageDescriptor.raw(buf, width: width, height: height, pixelFormat: ui.PixelFormat.rgba8888);
+      try {
+        final codec = await desc.instantiateCodec();
+        final frame = await codec.getNextFrame();
+        codec.dispose();
+        return frame.image;
+      } finally {
+        desc.dispose();
+        buf.dispose();
+      }
+    } finally {
+      _release();
+    }
+  }
+}
+
+// ---- persistent frame worker (one isolate per session) -------------------------------------------
+
+/// Message: [replyPort, id, address, paramsJson, lutPath, longEdge, flags, bakeSize, rx0, ry0, rx1, ry1, regionLongEdge]
+/// or [replyPort, id, 'quit']. Reply: [id, 'ok', width, height, rgbaAddress, analysisJson?] or [id, 'err', message].
+void _frameWorkerMain(SendPort initPort) {
+  final rp = ReceivePort();
+  initPort.send(rp.sendPort);
+  rp.listen((dynamic m) {
+    final msg = m as List;
+    final reply = msg[0] as SendPort;
+    final id = msg[1] as int;
+    if (msg[2] == 'quit') {
+      rp.close();
+      return;
+    }
+    reply.send(_frameNative(id, msg));
+  });
+}
+
+List<Object?> _frameNative(int id, List msg) {
+  ffi.Pointer<Utf8>? pp, lp;
+  ffi.Pointer<DappleFrameRequestStruct>? rq;
+  ffi.Pointer<DappleImageStruct>? img;
+  ffi.Pointer<ffi.Pointer<Utf8>>? an;
+  try {
+    final b = _b();
+    final f = b.sessionRenderFrame;
+    if (f == null) return [id, 'err', '原生库缺少 dapple_session_render_frame'];
+    pp = (msg[3] as String).toNativeUtf8();
+    lp = ((msg[4] as String?) ?? '').toNativeUtf8();
+    rq = calloc<DappleFrameRequestStruct>();
+    rq.ref
+      ..size = ffi.sizeOf<DappleFrameRequestStruct>()
+      ..longEdge = msg[5] as int
+      ..flags = msg[6] as int
+      ..bakeSize = msg[7] as int
+      ..rx0 = msg[8] as double
+      ..ry0 = msg[9] as double
+      ..rx1 = msg[10] as double
+      ..ry1 = msg[11] as double
+      ..regionLongEdge = msg[12] as int;
+    img = calloc<DappleImageStruct>();
+    an = calloc<ffi.Pointer<Utf8>>();
+    final sw = Stopwatch()..start();
+    final rc = f(ffi.Pointer<DappleSessionStruct>.fromAddress(msg[2] as int), pp, lp, rq, img, an);
+    final nativeMs = sw.elapsedMicroseconds / 1000.0;
+    if (rc != dappleOk) return [id, 'err', _lastError(b)];
+    String? analysis;
+    if (an.value != ffi.nullptr) {
+      analysis = an.value.toDartString();
+      b.freeString(an.value);
+    }
+    return [id, 'ok', img.ref.width, img.ref.height, img.ref.rgba.address, analysis, nativeMs];
+  } catch (e) {
+    return [id, 'err', e.toString()];
+  } finally {
+    if (pp != null) malloc.free(pp);
+    if (lp != null) malloc.free(lp);
+    if (rq != null) calloc.free(rq);
+    if (img != null) calloc.free(img);
+    if (an != null) calloc.free(an);
+  }
+}
+
 /// Friendly wrapper around a native DappleSession.
 ///
 /// Every heavy call runs in a short-lived background isolate (Isolate.run);
@@ -56,19 +182,50 @@ class DappleSession {
   Future<void> _tail = Future.value();
   bool _closed = false;
 
+  // persistent frame worker (spawned on the first frame)
+  Isolate? _worker;
+  SendPort? _toWorker;
+  ReceivePort? _replies;
+  ReceivePort? _exits;
+  final Map<int, Completer<List>> _pendingFrames = {};
+  int _frameId = 0;
+
   static bool get isAvailable => DappleBindings.instanceOrNull != null;
+  /// Engine scheduling knobs: [threadLimit] threads per job (0 = all), ADPF [targetFrameMs] (0 = off).
+  static void configurePerf({int threadLimit = 0, int targetFrameMs = 0}) =>
+      DappleBindings.instanceOrNull?.perfConfigure?.call(threadLimit, targetFrameMs);
+
+  /// Thermal headroom forecast (0 cool .. 1 = throttling threshold); negative when the platform has none.
+  static double thermalHeadroom([int forecastSeconds = 10]) =>
+      DappleBindings.instanceOrNull?.thermalHeadroom?.call(forecastSeconds) ?? -1;
+
+  /// Core topology / ADPF availability reported by the engine.
+  static Map<String, dynamic>? perfInfo() {
+    final b = DappleBindings.instanceOrNull;
+    final f = b?.perfInfoJson;
+    if (b == null || f == null) return null;
+    final p = f();
+    try {
+      return _decodeObj(p.toDartString());
+    } finally {
+      b.freeString(p);
+    }
+  }
+
   static String get version => DappleBindings.instanceOrNull?.version().toDartString() ?? 'n/a';
 
   /// Decode [path]. [full] = full-resolution demosaic; [longEdge] > 0 downsizes once after decoding.
-  static Future<DappleSession> open(String path, {bool full = false, int longEdge = 2048}) async {
+  static Future<DappleSession> open(String path, {bool full = false, int longEdge = 2048, bool background = false}) async {
     final addr = await Isolate.run(() {
       final b = _b();
       final cp = path.toNativeUtf8();
+      if (background) b.threadBackground?.call(1);
       try {
         final s = b.sessionOpen(cp, full ? dappleQualityFull : dappleQualityPreview, longEdge);
         if (s == ffi.nullptr) throw DappleException(_lastError(b));
         return s.address;
       } finally {
+        if (background) b.threadBackground?.call(0);
         malloc.free(cp);
       }
     });
@@ -152,6 +309,7 @@ class DappleSession {
     if ((toneStrength == null ? look : tone) == null) return null;
     final pp = pj.toNativeUtf8();
     final out = calloc<DappleImageStruct>(9);
+    b.threadBackground?.call(1); // thumbnails never compete with interactive frames
     try {
       final s = ffi.Pointer<DappleSessionStruct>.fromAddress(addr);
       final rc = toneStrength == null ? look!(s, pp, longEdge, out) : tone!(s, pp, longEdge, toneStrength, out);
@@ -165,6 +323,7 @@ class DappleSession {
       }
       return res;
     } finally {
+      b.threadBackground?.call(0);
       malloc.free(pp);
       calloc.free(out);
     }
@@ -204,6 +363,42 @@ class DappleSession {
     return _decodeObj(_takeString(_b(), f()));
   }
 
+  /// Installs the film pack (core/data/film/dapple.dfp, read from the app's assets) process-wide; the engine
+  /// copies the bytes. False when the library has no film support or rejects the pack.
+  static bool loadFilmPack(Uint8List bytes) {
+    final f = DappleBindings.instanceOrNull?.filmLoadPackMemory;
+    if (f == null || bytes.isEmpty) return false;
+    final p = malloc<ffi.Uint8>(bytes.length);
+    try {
+      p.asTypedList(bytes.length).setAll(0, bytes);
+      return f(p.cast<ffi.Void>(), bytes.length) == dappleOk;
+    } finally {
+      malloc.free(p);
+    }
+  }
+
+  /// `{"loaded":bool,"stocks":[{"id","name","type":"negative|slide|paper"}]}` or null.
+  static String? filmListJson() {
+    final f = DappleBindings.instanceOrNull?.filmListJson;
+    return f == null ? null : _takeString(_b(), f());
+  }
+
+  /// `{"<stock id>":["rrggbb" x3]}` the engine's rendering of test patches per stock (a pure function of the pack; null
+  /// without native support). Takes a few seconds: call from a background isolate ([filmSwatchesJsonIsolate]).
+  static String? filmSwatchesJson() {
+    final f = DappleBindings.instanceOrNull?.filmSwatchesJson;
+    return f == null ? null : _takeString(_b(), f());
+  }
+
+  /// [filmSwatchesJson] without blocking the UI isolate (the film pack is process-wide, the worker sees it).
+  static Future<String?> filmSwatchesJsonIsolate() => Isolate.run(filmSwatchesJson);
+
+  /// The licence line the About screen must show ("" without a pack).
+  static String filmAttribution() {
+    final f = DappleBindings.instanceOrNull?.filmAttribution;
+    return f == null ? '' : (_takeString(_b(), f()) ?? '');
+  }
+
   static bool get hasAnalyze => DappleBindings.instanceOrNull?.sessionAnalyzeJson != null;
 
   Future<RenderedImage> render(Map<String, dynamic> params, {String? lutPath, int longEdge = 0}) {
@@ -230,6 +425,88 @@ class DappleSession {
         }
       });
 
+  static bool get hasFrames => DappleBindings.instanceOrNull?.sessionRenderFrame != null;
+
+  /// One interactive frame: pixels + tonal analysis of the same render in a single native call, run on
+  /// this session's persistent worker isolate (no isolate spawn per call, pixels are not copied across
+  /// isolates: the result holds a native pointer, see [NativeFrame]).
+  ///
+  /// [longEdge]: long edge of the whole picture (0 = session size). [interactive]: drag quality (cheaper
+  /// neighbourhood stages). [region]: normalised rect of the picture to render at [regionLongEdge]
+  /// pixels (zoom detail). [bakeSize] 0 = engine default.
+  Future<NativeFrame> renderFrame(Map<String, dynamic> params,
+      {String? lutPath,
+      int longEdge = 0,
+      bool interactive = false,
+      bool analysis = true,
+      ui.Rect? region,
+      int regionLongEdge = 0,
+      int bakeSize = 0,
+      bool background = false,
+      bool exact = false}) {
+    final pj = jsonEncode(params);
+    final flags = (interactive ? dappleFrameInteractive : 0) | (analysis ? dappleFrameAnalysis : 0) | (exact ? dappleFrameExact : 0) | (background ? dappleFrameBackground : 0);
+    return _serial(() => _frame(pj, lutPath, longEdge, flags, bakeSize, region, regionLongEdge));
+  }
+
+  Future<void> _ensureWorker() async {
+    if (_toWorker != null) return;
+    final replies = ReceivePort();
+    final exits = ReceivePort();
+    final init = ReceivePort();
+    _replies = replies;
+    _exits = exits;
+    replies.listen((dynamic m) {
+      final r = m as List;
+      _pendingFrames.remove(r[0] as int)?.complete(r);
+    });
+    exits.listen((_) {
+      for (final c in _pendingFrames.values) {
+        c.completeError(DappleException('渲染线程已退出'));
+      }
+      _pendingFrames.clear();
+      _toWorker = null;
+      _worker = null;
+    });
+    _worker = await Isolate.spawn(_frameWorkerMain, init.sendPort, onExit: exits.sendPort, errorsAreFatal: true);
+    _toWorker = await init.first as SendPort;
+  }
+
+  Future<NativeFrame> _frame(String pj, String? lutPath, int longEdge, int flags, int bakeSize, ui.Rect? region, int regionLongEdge) async {
+    await _ensureWorker();
+    final id = ++_frameId;
+    final c = Completer<List>();
+    _pendingFrames[id] = c;
+    _toWorker!.send([
+      _replies!.sendPort,
+      id,
+      _address,
+      pj,
+      lutPath,
+      longEdge,
+      flags,
+      bakeSize,
+      region?.left ?? 0.0,
+      region?.top ?? 0.0,
+      region?.right ?? 0.0,
+      region?.bottom ?? 0.0,
+      regionLongEdge,
+    ]);
+    final r = await c.future;
+    if (r[1] != 'ok') throw DappleException(r[2] as String);
+    return NativeFrame._(r[2] as int, r[3] as int, r[4] as int, r[5] as String?, (r[6] as num?)?.toDouble() ?? 0);
+  }
+
+  void _shutdownWorker() {
+    final to = _toWorker;
+    if (to != null && _replies != null) to.send([_replies!.sendPort, 0, 'quit']);
+    _worker?.kill(priority: Isolate.beforeNextEvent);
+    _replies?.close();
+    _exits?.close();
+    _toWorker = null;
+    _worker = null;
+  }
+
   Future<void> exportJpeg(Map<String, dynamic> params,
       {String? lutPath, int longEdge = 0, int quality = 92, required String outPath}) {
     final pj = jsonEncode(params);
@@ -242,6 +519,7 @@ class DappleSession {
   Future<void> close() => _serial(() async {
         if (_closed) return;
         _closed = true;
+        _shutdownWorker();
         await _closeIso(_address);
       });
 

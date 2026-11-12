@@ -64,6 +64,13 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  # Film simulation: the profile pack (a copy of core/data/film/dapple.dfp, CC BY-SA 4.0, spektrafilm by Andrea
+  # Volpato) and its notices. test/film_assets_test.dart keeps the copies identical to core/data/film.
+  assets:
+    - assets/film/dapple.dfp
+    - assets/film/NOTICE.md
+    - assets/film/SPEKTRAFILM_LICENSE.txt
+
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg

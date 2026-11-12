@@ -22,6 +22,14 @@ class SessionCache {
   final Map<String, String> _temp = {};
   final List<String> _lru = [];
 
+  // zoom detail: one higher resolution session, for the photo being edited only
+  String? _detailId;
+  Future<DappleSession?>? _detail;
+
+  /// Long edge of the detail session. The RAW is decoded once at its native half size (fast path, no
+  /// AHD demosaic) and capped here to bound memory (4096 x 2731 float RGB = 134 MB).
+  static const detailLongEdge = 4096;
+
   bool get available => !_app.isDemo && DappleSession.isAvailable;
 
   /// True when a session for [id] is open or opening.
@@ -29,11 +37,11 @@ class SessionCache {
 
   /// Session for [ph] at screen resolution (2048 px). Null when the engine is unavailable or the
   /// photo has no readable source (demo photos).
-  Future<DappleSession?> get(Photo ph) {
+  Future<DappleSession?> get(Photo ph, {bool background = false}) {
     if (!available || ph.demo != null) return Future.value(null);
     _lru.remove(ph.id);
     _lru.add(ph.id);
-    final f = _open.putIfAbsent(ph.id, () => _openNew(ph));
+    final f = _open.putIfAbsent(ph.id, () => _openNew(ph, background));
     while (_lru.length > _max) {
       final old = _lru.removeAt(0);
       unawaited(_close(old));
@@ -72,22 +80,55 @@ class SessionCache {
     for (final ph in photos) {
       if (!stillWanted()) return;
       if (_open.containsKey(ph.id)) continue;
-      await get(ph);
+      await get(ph, background: true); // neighbours decode on the efficiency cores, never against the open photo
     }
   }
 
-  Future<DappleSession?> _openNew(Photo ph) async {
+  Future<DappleSession?> _openNew(Photo ph, bool background) async {
     try {
       final src = await _resolve(ph);
       if (src == null) throw '没有源文件';
-      return await DappleSession.open(src.path, full: false, longEdge: 2048);
+      return await DappleSession.open(src.path, full: false, longEdge: 2048, background: background);
     } catch (_) {
       _open.remove(ph.id);
       return null;
     }
   }
 
+  /// Higher resolution session of [ph] (up to [detailLongEdge] px) used for pinch-zoom detail. Opened
+  /// lazily on first request (decode takes about a second) and cached for this photo; asking for another
+  /// photo closes the previous one. Null when unavailable.
+  Future<DappleSession?> detail(Photo ph) {
+    if (!available || ph.demo != null) return Future.value(null);
+    if (_detailId == ph.id && _detail != null) return _detail!;
+    closeDetail();
+    _detailId = ph.id;
+    return _detail = _openDetail(ph);
+  }
+
+  Future<DappleSession?> _openDetail(Photo ph) async {
+    try {
+      final src = await _resolve(ph);
+      if (src == null) throw '没有源文件';
+      return await DappleSession.open(src.path, full: false, longEdge: detailLongEdge, background: true);
+    } catch (_) {
+      if (_detailId == ph.id) {
+        _detail = null;
+        _detailId = null;
+      }
+      return null;
+    }
+  }
+
+  void closeDetail() {
+    final f = _detail;
+    _detail = null;
+    _detailId = null;
+    if (f != null) unawaited(f.then((s) => s?.close()));
+  }
+
   Future<void> _close(String id) async {
+    if (id == _detailId) closeDetail();
     final f = _open.remove(id);
     _src.remove(id);
     final s = await f;
@@ -101,13 +142,14 @@ class SessionCache {
   }
 
   void dispose() {
+    closeDetail();
     for (final id in _open.keys.toList()) {
       unawaited(_close(id));
     }
   }
 }
 
-/// Decodes RGBA8888 bytes into a [ui.Image].
+/// Decodes RGBA8888 bytes into a [ui.Image]. (Frames from the engine use [NativeFrame.toImage].)
 Future<ui.Image> imageFromRgba(RenderedImage r) {
   final c = Completer<ui.Image>();
   ui.decodeImageFromPixels(r.rgba, r.width, r.height, ui.PixelFormat.rgba8888, c.complete);

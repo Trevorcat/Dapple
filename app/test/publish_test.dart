@@ -88,12 +88,19 @@ void main() {
     await open(tester, app, idsOf(app, 2));
     expect(find.text('发布 2 张'), findsOneWidget);
     expect(valueOf(tester, 'row-ratio'), '原比例');
-    expect(valueOf(tester, 'row-size'), '长边 1440 px');
+    expect(valueOf(tester, 'row-size'), '适合社交平台');
     await shot(tester, 'publish_phone');
     await tester.tap(find.byKey(const ValueKey('preset-xhs')));
     await tester.pump();
     expect(valueOf(tester, 'row-ratio'), '3:4');
-    expect(valueOf(tester, 'row-size'), '长边 2048 px');
+    expect(valueOf(tester, 'row-size'), '适合社交平台');
+    await tester.tap(find.byKey(const ValueKey('row-size')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.byKey(const ValueKey('export-size-opt-0')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(valueOf(tester, 'row-size'), '原图大小');
     await tester.tap(find.byKey(const ValueKey('row-ratio')));
     await tester.pump();
     expect(valueOf(tester, 'row-ratio'), '原比例');
@@ -142,7 +149,7 @@ void main() {
     await step(tester);
     expect(fake.shared!.length, 9);
     expect(find.text('已交给微信'), findsNWidgets(2)); // title + step
-    expect(find.text('已导出 9 张 · 原比例 · 长边 1440 px'), findsOneWidget);
+    expect(find.text('已导出 9 张 · 原比例 · 适合社交平台'), findsOneWidget);
     expect(find.byKey(const ValueKey('done-open')), findsNothing);
     await shot(tester, 'publish_done_phone');
     await tester.tap(find.byKey(const ValueKey('done-next')));

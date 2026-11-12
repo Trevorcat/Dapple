@@ -9,7 +9,10 @@ import '../../models.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
+import '../../widgets/export_size.dart';
 import '../../widgets/icons.dart';
+import 'codec_diagnostics_page.dart';
+import 'licenses_page.dart';
 import 'page_bar.dart';
 
 /// 设置 tab (requirements 4.13). Android: no cards, accent section titles. Wide: categories + detail.
@@ -22,7 +25,10 @@ class SettingsPage extends StatefulWidget {
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
-const _cats = ['相机', '相机无线接收', '自动处理', '发布'];
+/// Shown on 关于 (keep in step with pubspec.yaml).
+const kAppVersion = '1.0.0';
+
+const _cats = ['相机', '相机无线接收', '自动处理', '发布', '编辑', '关于'];
 
 class _SettingsPageState extends State<SettingsPage> {
   int _cat = 0;
@@ -80,11 +86,12 @@ class _SettingsPageState extends State<SettingsPage> {
     ]);
   }
 
-  Widget _row(BuildContext context, String title, {String? sub, Widget? trailing, VoidCallback? onTap, Widget? leading, String? key}) {
+  Widget _row(BuildContext context, String title, {String? sub, Widget? trailing, VoidCallback? onTap, VoidCallback? onLongPress, Widget? leading, String? key}) {
     final c = context.c;
     return InkWell(
       key: key == null ? null : ValueKey(key),
       onTap: onTap,
+      onLongPress: onLongPress,
       child: Container(
         constraints: const BoxConstraints(minHeight: 56),
         padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
@@ -240,16 +247,67 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
         ];
+      case 4:
+        return [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('惯用手', style: T.body17(c.text)),
+              const SizedBox(height: 2),
+              Text('浮窗默认停靠在惯用手一侧；自动会根据你的拇指习惯判断', style: T.small(c.text2)),
+              const SizedBox(height: Sp.s),
+              DSegmented(
+                key: const ValueKey('seg-handedness'),
+                semanticsLabel: '惯用手',
+                labels: const ['自动', '左手', '右手'],
+                index: s.handedness,
+                onChanged: (i) => app.updateSettings((x) => x.handedness = i),
+              ),
+            ]),
+          ),
+          _row(context, '触感反馈',
+              sub: '仅在自动位、范围端点和档位处轻震；关闭后仍保留视觉提示',
+              onTap: () => app.updateSettings((x) => x.haptics = !x.haptics),
+              trailing: DSwitch(
+                  key: const ValueKey('sw-haptics'),
+                  label: '触感反馈',
+                  value: s.haptics,
+                  onChanged: (v) => app.updateSettings((x) => x.haptics = v))),
+          if (s.handedness == 0)
+            _row(context, '重置自动判断',
+                key: 'reset-hand',
+                onTap: () {
+                  app.updateSettings((x) {
+                    x.handSide = 1;
+                    x.editorLayout = '';
+                  });
+                  app.showToast('已重置自动判断');
+                }),
+        ];
+      case 5:
+        return [
+          // long-press: hidden codec diagnostics (no user-facing switches)
+          _row(context, '版本',
+              key: 'about-version',
+              onLongPress: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const CodecDiagnosticsPage())),
+              trailing: Text(kAppVersion, key: const ValueKey('about-version-value'), style: T.body17(c.text2, w: FontWeight.w400))),
+          _row(context, '开源许可',
+              key: 'licenses',
+              onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => LicensesPage(app: app))),
+              trailing: DIcon(DI.forward, size: 16, color: c.text2)),
+        ];
       default:
         return [
-          _row(context, '默认导出尺寸',
+          _row(context, '保存大小',
               key: 'export-size',
-              onTap: () {
-                final k = (exportSizes.indexOf(s.exportLongEdge) + 1) % exportSizes.length;
-                app.updateSettings((x) => x.exportLongEdge = exportSizes[k]);
+              sub: exportSizeDesc(s.exportLongEdge),
+              onTap: () async {
+                final v = await showExportSizeSheet(context, current: s.exportLongEdge);
+                if (v != null) app.updateSettings((x) => x.exportLongEdge = v);
               },
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                Text('长边 ${s.exportLongEdge} px', style: T.body17(c.text2, w: FontWeight.w400)),
+                Text(exportSizeName(s.exportLongEdge),
+                    key: const ValueKey('export-size-value'), style: T.body17(c.text2, w: FontWeight.w400)),
                 const SizedBox(width: 4),
                 DIcon(DI.forward, size: 16, color: c.text2),
               ])),
@@ -296,7 +354,7 @@ class PresetsPage extends StatelessWidget {
                 alignment: Alignment.centerLeft,
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
                   Text(p.name, style: T.body17(c.text)),
-                  Text('${p.spec.split(' · ').first} · 长边 ${p.longEdge ?? app.settings.exportLongEdge} px',
+                  Text('${p.spec.split(' · ').first} · ${exportSizeName(p.longEdge ?? app.settings.exportLongEdge)}',
                       style: T.small(c.text2, tabular: true)),
                 ]),
               ),

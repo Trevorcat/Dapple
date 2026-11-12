@@ -146,9 +146,15 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('sw-strip')));
     await tester.pump(_t);
     expect(app.settings.stripLocation, isFalse);
+    expect(app.settings.exportLongEdge, 0);
     await tester.tap(find.byKey(const ValueKey('export-size')));
     await tester.pump(_t);
-    expect(app.settings.exportLongEdge, 3840);
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.byKey(const ValueKey('export-size-opt-2048')));
+    await tester.pump(_t);
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(app.settings.exportLongEdge, 2048);
+    expect(find.text('适合社交平台'), findsWidgets);
     await tester.tap(find.byKey(const ValueKey('presets')));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 600));

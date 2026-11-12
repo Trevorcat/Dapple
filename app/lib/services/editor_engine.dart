@@ -1,13 +1,19 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
 
 import '../model/catalog.dart';
 import '../model/params.dart';
 import '../models.dart';
 import '../state/app_state.dart';
+import '../native/dapple_session.dart';
+import 'adaptive_quality.dart';
+import 'edit_interaction.dart';
+import 'perf_probe.dart';
 import 'session_cache.dart';
 
 /// Tonal analysis of a rendered photo: 64-bin histogram + percentiles + nearest class.
@@ -78,17 +84,181 @@ DemoLook demoLookFor(EditState e, {required double defaultToneStrength, required
   return DemoLook(b.clamp(0.4, 1.8), c.clamp(0.5, 1.8), s.clamp(0.0, 2.2), warm.clamp(-1.0, 1.0), l.gray * ls, l.sepia * ls);
 }
 
+/// Overlap the upload of drag frame N with the render of N+1 (A/B switch for measurements; default on).
+const bool _kPipeline = bool.fromEnvironment('DAPPLE_PIPELINE', defaultValue: true);
+
 double _pow(double a, double e) => a <= 0 ? 1 : math.pow(a, e).toDouble();
 
-/// Renders one photo for the editor: latest-wins (stale renders are dropped), debounced,
-/// off the UI thread (DappleSession runs each call in an isolate), session cached in [AppState].
+/// Renders one photo for the editor, off the UI thread.
+///
+/// Frame pipeline: every frame is ONE native call on the session's persistent worker isolate
+/// ([DappleSession.renderFrame]) that returns pixels + tonal analysis; the pixels are copied once
+/// into an engine image ([NativeFrame.toImage]). Point-wise stages run through a lattice baked once per
+/// parameter change in the engine, so a frame is one pass over the pixels plus the neighbourhood stages.
+///
+/// Interaction tiers (latest wins, no backlog: while a frame renders, newer edits only mark the state
+/// dirty and the newest one is rendered next; every finished frame is presented):
+///  * interactive: while a slider/pad is being dragged (explicit [beginInteraction]/[endInteraction],
+///    wired for [DSlider] through [EditInteraction], or inferred from a burst of [edited] calls) frames are
+///    rendered at [interactiveLongEdge] (<= 1080 px) with the cheaper neighbourhood pipeline, with no
+///    debounce;
+///  * final: [idleDelay] (150 ms) after the last edit / when the drag ends, one frame at
+///    [finalLongEdge] (default 1600 px) with everything on.
+///
+/// Zoom detail: see [setViewport].
 class EditorEngine extends ChangeNotifier {
-  EditorEngine(this.app);
+  EditorEngine(this.app) {
+    EditInteraction.depth.addListener(_onInteractionDepth);
+    PerfProbe.start();
+  }
   final AppState app;
 
   Photo? photo;
   ui.Image? image;
   ui.Image? original;
+
+  // ---- zoom detail ----------------------------------------------------------------------------------
+  /// High-resolution render of the visible region while zoomed in; null when not available. The UI
+  /// draws it over [image], stretched to [detailRect], and falls back to [image] where it is null.
+  /// Contract: it is only set when the zoom is above [detailMinZoom] and the view has been still for
+  /// [detailDelay]; it is cleared (null) on every edit, when the photo changes and when zooming out.
+  /// While panning/pinching the previous detail stays (it is positioned by [detailRect], not by the
+  /// viewport) until a fresh one replaces it.
+  ui.Image? detail;
+
+  /// Normalised (0..1, in the image's own orientation/crop space) rectangle [detail] covers. It is
+  /// the visible region inflated by 12% per side so a small pan does not uncover the base image.
+  ui.Rect? detailRect;
+
+  /// Zoom above which detail is rendered (displayed pixels per preview pixel).
+  static const double detailMinZoom = 1.3;
+
+  /// Idle time of the viewport before the detail render starts.
+  static const Duration detailDelay = Duration(milliseconds: 200);
+
+  /// Tells the engine what is on screen. [normalized]: the visible part of the picture as a 0..1 rect
+  /// (0,0 = top left of the picture); [zoom]: displayed (device) pixels per pixel of the current
+  /// [image]. Call it whenever the view changes (it is cheap; it only restarts a timer). When
+  /// zoom > [detailMinZoom] and the view is idle for [detailDelay], the visible region is rendered at
+  /// screen resolution from a higher-resolution session (decoded lazily in the background for this
+  /// photo, at most [SessionCache.detailLongEdge] px, then cached) and published as [detail].
+  void setViewport(ui.Rect normalized, double zoom) {
+    _view = normalized;
+    _zoom = zoom;
+    _viewVersion++;
+    final w = image?.width ?? 0;
+    if (w > 0) _fullWidthPx = zoom * w;
+    if (!live) return;
+    _detailTimer?.cancel();
+    if (zoom <= detailMinZoom) {
+      _clearDetail();
+      return;
+    }
+    _scheduleDetail();
+  }
+
+  ui.Rect _view = const ui.Rect.fromLTWH(0, 0, 1, 1);
+  double _zoom = 1;
+  double _fullWidthPx = 0; // displayed device pixels across the whole picture's width
+  Timer? _detailTimer;
+  int _detailGen = 0;
+  int _viewVersion = 0;
+  bool _detailBusy = false;
+
+  // ---- interaction ----------------------------------------------------------------------------------
+  /// Dynamic resolution of drag-time frames (see [AdaptiveQuality]): long edge <= 1080, stepping down when the
+  /// measured frame time exceeds the budget, back up when there is headroom.
+  final AdaptiveQuality quality = AdaptiveQuality();
+
+  /// Long edge of drag-time frames (current rung of [quality]).
+  int get interactiveLongEdge => quality.rung.longEdge;
+
+  /// Long edge of idle (full quality) frames.
+  int finalLongEdge = 1600;
+
+  /// Idle time after the last edit before the full-quality frame is rendered.
+  static const Duration idleDelay = Duration(milliseconds: 150);
+
+  /// Adapts the frame sizes to the picture's on-screen size in device pixels (long edge): drag frames
+  /// are capped at 1080 and never smaller than 640, idle frames sit between 1080 and the source's 2048.
+  void setDisplayLongEdge(int devicePx) {
+    quality.setDisplayLongEdge(devicePx);
+    finalLongEdge = devicePx.clamp(1080, 2048);
+  }
+
+  int _drag = 0;
+  int _lastDepth = 0;
+  Timer? _idle;
+  bool _burst = false; // edits arrive faster than idleDelay -> a drag, even without begin/endInteraction
+  bool _needFinal = false;
+  final Stopwatch _clock = Stopwatch()..start();
+  int _lastEditMs = -100000;
+  int _editUs = 0; // time of the newest edit (latency probe)
+  int _releaseMs = -1; // when the last drag ended (final-frame latency probe)
+  int _openMs = 0; // attach() time (time-to-first-render probe)
+  bool _perfConfigured = false;
+  bool _perfLogged = false;
+
+  /// A control is being dragged: render interactive frames until [endInteraction].
+  void beginInteraction() {
+    _drag++;
+    _idle?.cancel();
+    if (_drag == 1) PerfProbe.dragging = true;
+  }
+
+  // Thermal headroom (AThermal_getThermalHeadroom, a binder call that the platform rate-limits to ~1/s) is
+  // polled off the drag path: after a drag ends, at most every [_thermalEvery], and applied to the next drag
+  // so the interactive resolution steps down before the SoC throttles. No polling while the editor is idle.
+  static const int _thermalEvery = 5000;
+  int _thermalAtMs = -100000;
+  void _pollThermal() {
+    final now = _clock.elapsedMilliseconds;
+    if (now - _thermalAtMs < _thermalEvery) return;
+    _thermalAtMs = now;
+    final h = DappleSession.thermalHeadroom(10);
+    if (h >= 0) quality.setThermalHeadroom(h);
+  }
+
+  /// The drag ended: the full-quality frame follows after [idleDelay].
+  void endInteraction() {
+    if (_drag > 0) _drag--;
+    if (_drag == 0) {
+      _releaseMs = _clock.elapsedMilliseconds;
+      PerfProbe.dragging = false;
+      _scheduleFinal(delay: releaseDelay);
+      _schedulePrefetch();
+      _pollThermal();
+      if (kPerfProbe && !_perfLogged) {
+        _perfLogged = true; // after the first drag: is an ADPF session actually running?
+        PerfProbe.log('perfinfo2', DappleSession.perfInfo() ?? const {});
+      }
+    }
+  }
+
+  void _onInteractionDepth() {
+    final d = EditInteraction.depth.value;
+    if (d > 0 && _lastDepth == 0) beginInteraction();
+    if (d == 0 && _lastDepth > 0) endInteraction();
+    _lastDepth = d;
+  }
+
+  bool get _interactiveNow => _drag > 0 || (_burst && _clock.elapsedMilliseconds - _lastEditMs < idleDelay.inMilliseconds);
+
+  /// After an explicit finger-up ([endInteraction]) the full-quality frame starts sooner: the drag is known to be
+  /// over, the delay only absorbs an immediate re-grab. [idleDelay] stays for drags inferred from edit bursts.
+  static const Duration releaseDelay = Duration(milliseconds: 50);
+
+  void _scheduleFinal({Duration delay = idleDelay}) {
+    _idle?.cancel();
+    if (!_needFinal) return;
+    _idle = Timer(delay, () {
+      _burst = false;
+      if (_drag > 0 || !live) return;
+      _needFinal = false;
+      _dirty = true;
+      _kick();
+    });
+  }
 
   /// The camera's embedded JPEG, shown (labelled 预览) until the first RAW render is ready.
   ui.Image? placeholder;
@@ -99,7 +269,6 @@ class EditorEngine extends ChangeNotifier {
   bool rendering = false;
 
   int _gen = 0;
-  Timer? _debounce;
   bool _busy = false, _dirty = false;
   Timer? _tileDebounce;
   int _tileGen = 0;
@@ -114,6 +283,22 @@ class EditorEngine extends ChangeNotifier {
   void attach(Photo p, {List<Photo> neighbors = const []}) {
     _gen++;
     _tileGen++;
+    _detailGen++;
+    _detailTimer?.cancel();
+    _originalTimer?.cancel();
+    _prefetchTimer?.cancel();
+    _idle?.cancel();
+    _needFinal = false;
+    _burst = false;
+    _openMs = _clock.elapsedMilliseconds;
+    if (!_perfConfigured) {
+      _perfConfigured = true;
+      // ADPF target = the drag frame budget; threads: all performance cores (the engine picks them on big.LITTLE)
+      DappleSession.configurePerf(targetFrameMs: quality.budgetMs.round());
+      PerfProbe.log('perfinfo', DappleSession.perfInfo() ?? const {});
+    }
+    _pollThermal();
+    if (photo?.id != p.id) app.sessions.closeDetail(); // the high-resolution session belongs to one photo
     photo = p;
     _neighbors = neighbors;
     _disposeImages();
@@ -122,32 +307,81 @@ class EditorEngine extends ChangeNotifier {
     notifyListeners();
     if (!live) return;
     _dirty = true;
-    _kick();
+    _placeholderDone = Completer<void>();
     unawaited(_loadPlaceholder(p, _gen));
-    unawaited(_loadOriginal(p, _gen));
+    _kick();
   }
 
+  /// Completes when the placeholder is on screen (or given up); the first RAW decode waits for it at most
+  /// [placeholderHead], so on a slow phone the decode (all cores) does not starve the placeholder.
+  Completer<void>? _placeholderDone;
+  static const Duration placeholderHead = Duration(milliseconds: 800);
+
   Future<void> _loadPlaceholder(Photo ph, int gen) async {
-    final r = await app.sessions.preview(ph);
-    if (r == null || gen != _gen || image != null) return;
-    final img = await imageFromRgba(r);
+    final done = _placeholderDone;
+    try {
+      // 1. the photo's developed preview (the JPEG the library grid shows): a plain JPEG decode on the
+      //    engine's IO thread, no isolate, no RAW parsing; 2. else the camera's embedded JPEG.
+      ui.Image? img = await _developedPreview(ph);
+      if (img == null) {
+        final r = await app.sessions.preview(ph);
+        if (r == null || gen != _gen || image != null) return;
+        img = await imageFromRgba(r);
+      }
+      _showPlaceholder(img, gen);
+    } finally {
+      if (done != null && !done.isCompleted) done.complete();
+    }
+  }
+
+  Future<ui.Image?> _developedPreview(Photo ph) async {
+    final path = ph.previewPath;
+    if (path == null) return null;
+    try {
+      final bytes = await File(path).readAsBytes();
+      final buf = await ui.ImmutableBuffer.fromUint8List(bytes);
+      final desc = await ui.ImageDescriptor.encoded(buf);
+      // 1280 px long edge is plenty for a placeholder and halves the decode
+      final landscape = desc.width >= desc.height;
+      final codec = await desc.instantiateCodec(
+          targetWidth: landscape ? math.min(1280, desc.width) : null, targetHeight: landscape ? null : math.min(1280, desc.height));
+      final f = await codec.getNextFrame();
+      codec.dispose();
+      desc.dispose();
+      buf.dispose();
+      return f.image;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _showPlaceholder(ui.Image img, int gen) {
     if (gen != _gen || image != null) {
       img.dispose();
       return;
     }
     placeholder?.dispose();
     placeholder = img;
+    PerfProbe.log('open_placeholder', {'ms': _clock.elapsedMilliseconds - _openMs});
     notifyListeners();
   }
 
-  /// Call after the photo's edit state changed.
+  /// Call after the photo's edit state changed. Renders immediately (no debounce); a burst of calls
+  /// (or an explicit drag) switches to interactive frames, the full-quality frame follows when it stops.
   void edited() {
     if (!live) return;
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 40), () {
-      _dirty = true;
-      _kick();
-    });
+    final now = _clock.elapsedMilliseconds;
+    _burst = now - _lastEditMs < 200;
+    _lastEditMs = now;
+    _editUs = _clock.elapsedMicroseconds;
+    _detailTimer?.cancel();
+    _clearDetail();
+    _dirty = true;
+    if (_drag > 0 || _burst) _needFinal = true;
+    // a single discrete edit (tap, look change) is rendered at final quality straight away
+    if (!_interactiveNow) _needFinal = false;
+    _scheduleFinal();
+    _kick();
   }
 
   Future<void> _kick() async {
@@ -155,39 +389,50 @@ class EditorEngine extends ChangeNotifier {
     _busy = true;
     rendering = true;
     final myGen = _gen;
+    // Presentation (pixels -> GPU image -> on screen) of the previous interactive frame. It overlaps the native
+    // render of the next one, so a drag frame costs max(render, upload) instead of render + upload.
+    Future<void>? presenting;
     try {
+      // the first decode of a photo waits briefly for the placeholder: on a slow phone the decode takes every
+      // core and the placeholder (a JPEG decode) would otherwise show up seconds late
+      final ph0 = photo;
+      final pd = _placeholderDone;
+      if (ph0 != null && pd != null && !pd.isCompleted && !app.sessions.has(ph0.id)) {
+        await pd.future.timeout(placeholderHead, onTimeout: () {});
+      }
       while (_dirty && myGen == _gen) {
         _dirty = false;
         final ph = photo!;
         final s = await app.sessions.get(ph);
         if (s == null || myGen != _gen) break;
+        final interactive = _interactiveNow;
         final params = app.wireParams(ph);
-        final r = await s.render(params, longEdge: 1600);
-        final an = await s.analyze(params);
-        if (myGen != _gen) break;
-        if (_dirty) continue; // stale: a newer edit is waiting, skip presenting this frame
-        final img = await imageFromRgba(r);
+        final rung = quality.rung;
+        final editUs = _editUs; // newest edit this frame contains
+        final t0 = _clock.elapsedMicroseconds;
+        final frame = await s.renderFrame(params,
+            longEdge: interactive ? rung.longEdge : finalLongEdge,
+            interactive: interactive,
+            bakeSize: interactive ? rung.bake : 0);
+        final t1 = _clock.elapsedMicroseconds;
         if (myGen != _gen) {
-          img.dispose();
+          frame.dispose();
           break;
         }
-        final first = image == null;
-        image?.dispose();
-        image = img;
-        if (first) {
-          placeholder?.dispose();
-          placeholder = null;
-          if (_neighbors.isNotEmpty) {
-            final g = _gen;
-            unawaited(app.sessions.prefetch(_neighbors, () => g == _gen));
-          }
+        final prev = presenting;
+        final p = _present(frame, myGen, interactive, editUs, t0, t1, prev);
+        if (!interactive || !_kPipeline) {
+          await p; // final frames: in order, nothing to overlap with
+          presenting = null;
+          continue;
         }
-        if (an != null) {
-          analysis = Analysis.fromJson(an);
-          ph.nearest ??= analysis!.nearest;
-        }
-        notifyListeners();
+        presenting = p;
+        // pacing / latest wins: at most one frame uploading while the next renders, and the next render starts
+        // only once the frame before this one is on screen (never more frames than the display shows; every edit
+        // that arrives meanwhile is coalesced into the newest state)
+        if (prev != null && _dirty) await prev;
       }
+      if (presenting != null) await presenting;
     } catch (e) {
       debugPrint('render failed: $e');
     } finally {
@@ -195,16 +440,215 @@ class EditorEngine extends ChangeNotifier {
       rendering = false;
       notifyListeners();
     }
+    // edits that arrived while the last presentation finished
+    if (_dirty && myGen == _gen) {
+      unawaited(_kick());
+      return;
+    }
+    if (myGen == _gen && !_dirty && !_interactiveNow && _zoom > detailMinZoom) _scheduleDetail();
+    // the before/after picture is not needed to show or edit: render it once things are idle (it shares the
+    // session with the drag frames, so it must never start in the middle of a drag)
+    if (myGen == _gen && !_dirty && !_interactiveNow && original == null) {
+      _originalTimer?.cancel();
+      final g = _gen, ph = photo;
+      _originalTimer = Timer(const Duration(milliseconds: 600), () {
+        if (g == _gen && ph != null && original == null && !_busy && !_dirty && !_interactiveNow) unawaited(_loadOriginal(ph, g));
+      });
+    }
+  }
+
+  /// Uploads and shows one rendered frame, after [after] (the previous frame's presentation) so frames appear in
+  /// order. Interactive frames complete when the Flutter frame that shows them has been built.
+  Future<void> _present(NativeFrame frame, int myGen, bool interactive, int editUs, int t0, int t1, Future<void>? after) async {
+    try {
+      final img = await frame.toImage();
+      final tUp = _clock.elapsedMicroseconds; // upload done (before waiting for the previous frame to show)
+      if (after != null) await after;
+      if (myGen != _gen) {
+        img.dispose();
+        return;
+      }
+      final t2 = _clock.elapsedMicroseconds;
+      final first = image == null;
+      image?.dispose();
+      image = img;
+      if (first) {
+        placeholder?.dispose();
+        placeholder = null;
+        _schedulePrefetch();
+      }
+      final an = frame.analysis;
+      if (an != null) {
+        analysis = Analysis.fromJson(an);
+        photo?.nearest ??= analysis!.nearest;
+      }
+      notifyListeners();
+      if (kPerfProbe) {
+        final kind = interactive ? 'i' : 'f', after = _releaseMs;
+        final w = img.width, nat = frame.nativeMs;
+        SchedulerBinding.instance.addPostFrameCallback((_) {
+          final nowUs = _clock.elapsedMicroseconds;
+          PerfProbe.log('frame', {
+            'k': kind,
+            'e2p': editUs > 0 ? (nowUs - editUs) / 1000.0 : -1,
+            'wait': editUs > 0 ? (t0 - editUs) / 1000.0 : -1, // edit -> render start
+            'native': nat,
+            'dart': (t1 - t0) / 1000.0 - nat, // isolate hops + JSON + queueing
+            'toimg': (t2 - t1) / 1000.0, // upload (+ waiting for the previous frame to be shown)
+            'w': w,
+            'first': first,
+            if (!interactive && after >= 0) 'rel2final': _clock.elapsedMilliseconds - after,
+          });
+        });
+        if (!interactive && after >= 0) _releaseMs = -1;
+        if (first) PerfProbe.log('open_first_frame', {'ms': _clock.elapsedMilliseconds - _openMs});
+      }
+      if (interactive) {
+        // the drag frame rate is bounded by the slower of the two overlapped stages
+        final renderMs = (t1 - t0) / 1000.0, uploadMs = (tUp - t1) / 1000.0;
+        if (_skipRecord) {
+          _skipRecord = false; // first frame at a new size also builds the scaled source: not representative
+        } else if (quality.record(math.max(renderMs, uploadMs))) {
+          _skipRecord = true;
+          PerfProbe.log('rung', {'to': quality.rung.toString(), 'ema': quality.emaMs});
+        }
+        await SchedulerBinding.instance.endOfFrame;
+      }
+    } catch (e) {
+      frame.dispose();
+      debugPrint('present failed: $e');
+    }
+  }
+  bool _skipRecord = false;
+
+  // ---- neighbour prefetch ----------------------------------------------------------------------------
+  // Decoding the next / previous RAW takes ~10 s of CPU and ~350 MB transient memory on a Snapdragon 680 class
+  // phone. Started right after the first frame it ran under the user's first drags (no drag frame for 3 s, the
+  // guest swapping at 1.1 GB PSS). So it waits until the editor has been idle for [prefetchIdle], stops between
+  // photos as soon as a drag starts (resumed after it), and on devices with <= 5 GB of RAM only the next photo is
+  // decoded ahead.
+  static const Duration prefetchIdle = Duration(milliseconds: 2500);
+  Timer? _prefetchTimer;
+  bool _prefetching = false;
+
+  void _schedulePrefetch() {
+    if (_neighbors.isEmpty || !live) return;
+    _prefetchTimer?.cancel();
+    final g = _gen;
+    _prefetchTimer = Timer(prefetchIdle, () async {
+      if (g != _gen || _prefetching) return;
+      if (_drag > 0 || _interactiveNow || _busy || _dirty) {
+        _schedulePrefetch();
+        return;
+      }
+      final want = _lowRam ? _neighbors.take(1).toList() : _neighbors;
+      if (want.every((n) => app.sessions.has(n.id))) return;
+      _prefetching = true;
+      try {
+        await app.sessions.prefetch(want, () => g == _gen && _drag == 0);
+      } finally {
+        _prefetching = false;
+      }
+    });
+  }
+
+  static final bool _lowRam = () {
+    try {
+      final m = RegExp(r'MemTotal:\s+(\d+)').firstMatch(File('/proc/meminfo').readAsStringSync());
+      return m != null && int.parse(m.group(1)!) <= 5 * 1024 * 1024;
+    } catch (_) {
+      return false;
+    }
+  }();
+  Timer? _originalTimer;
+
+  // ---- zoom detail ----------------------------------------------------------------------------------
+  void _scheduleDetail() {
+    _detailTimer?.cancel();
+    _detailTimer = Timer(detailDelay, () => unawaited(_renderDetail()));
+  }
+
+  void _clearDetail() {
+    _detailGen++;
+    if (detail == null && detailRect == null) return;
+    detail?.dispose();
+    detail = null;
+    detailRect = null;
+    notifyListeners();
+  }
+
+  Future<void> _renderDetail() async {
+    final ph = photo;
+    final img = image;
+    if (ph == null || img == null || !live || _zoom <= detailMinZoom || _fullWidthPx <= 0) return;
+    if (_busy || _dirty || _interactiveNow) {
+      _scheduleDetail(); // edits in flight: try again once the view is still
+      return;
+    }
+    if (_detailBusy) return;
+    final vis = _view;
+    // inflate the visible region so a small pan keeps being covered
+    final dx = vis.width * 0.12, dy = vis.height * 0.12;
+    final region = ui.Rect.fromLTRB(
+        (vis.left - dx).clamp(0.0, 1.0), (vis.top - dy).clamp(0.0, 1.0), (vis.right + dx).clamp(0.0, 1.0), (vis.bottom + dy).clamp(0.0, 1.0));
+    if (region.width <= 0.01 || region.height <= 0.01) return;
+    final cur = detailRect;
+    if (cur != null && detail != null && cur.left <= vis.left && cur.top <= vis.top && cur.right >= vis.right && cur.bottom >= vis.bottom) {
+      // covers the view; sharp enough unless the user zoomed in much further since (pixels per picture width)
+      final have = detail!.width / cur.width;
+      final want = math.min(_fullWidthPx, SessionCache.detailLongEdge * 1.25);
+      if (have >= 0.85 * want) return;
+    }
+    // device pixels the region occupies on screen (capped: no point beyond the detail source resolution)
+    final aspect = img.height / img.width;
+    final wPx = region.width * _fullWidthPx, hPx = region.height * _fullWidthPx * aspect;
+    final longFrac = aspect > 1 ? region.height : region.width; // extent along the picture's long edge
+    final srcCap = longFrac * SessionCache.detailLongEdge * 1.25;
+    final out = math.min(math.max(wPx, hPx), math.min(2800.0, srcCap)).round().clamp(256, 2800);
+    final gen = ++_detailGen, myGen = _gen, version = _viewVersion;
+    _detailBusy = true;
+    try {
+      final ds = await app.sessions.detail(ph); // decodes lazily the first time (about a second)
+      if (ds == null || gen != _detailGen || myGen != _gen) return;
+      final frame = await ds.renderFrame(app.wireParams(ph), region: region, regionLongEdge: out, analysis: false, background: true);
+      if (gen != _detailGen || myGen != _gen) {
+        frame.dispose();
+        return;
+      }
+      final im = await frame.toImage();
+      if (gen != _detailGen || myGen != _gen) {
+        im.dispose();
+        return;
+      }
+      detail?.dispose();
+      detail = im;
+      detailRect = region;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('detail render failed: $e');
+    } finally {
+      _detailBusy = false;
+    }
+    // the view moved (or an edit cleared the detail) while rendering: look again once it is still
+    if (myGen == _gen && _zoom > detailMinZoom && (version != _viewVersion || gen != _detailGen)) _scheduleDetail();
   }
 
   Future<void> _loadOriginal(Photo ph, int gen) async {
     try {
       final s = await app.sessions.get(ph);
       if (s == null || gen != _gen) return;
-      final r = await s.render({'original': true}, longEdge: 1600);
-      final an = await s.analyze({'original': true});
-      if (gen != _gen) return;
-      original = await imageFromRgba(r);
+      final frame = await s.renderFrame({'original': true}, longEdge: 1600);
+      if (gen != _gen) {
+        frame.dispose();
+        return;
+      }
+      final an = frame.analysis;
+      final img = await frame.toImage();
+      if (gen != _gen) {
+        img.dispose();
+        return;
+      }
+      original = img;
       if (an != null) originalAnalysis = Analysis.fromJson(an);
       notifyListeners();
     } catch (e) {
@@ -254,6 +698,9 @@ class EditorEngine extends ChangeNotifier {
   void _disposeImages() {
     image?.dispose();
     original?.dispose();
+    detail?.dispose();
+    detail = null;
+    detailRect = null;
     for (final t in tiles.values) {
       t.dispose();
     }
@@ -268,7 +715,12 @@ class EditorEngine extends ChangeNotifier {
   void dispose() {
     _gen++;
     _tileGen++;
-    _debounce?.cancel();
+    _detailGen++;
+    EditInteraction.depth.removeListener(_onInteractionDepth);
+    _idle?.cancel();
+    _originalTimer?.cancel();
+    _prefetchTimer?.cancel();
+    _detailTimer?.cancel();
     _tileDebounce?.cancel();
     _disposeImages();
     super.dispose();

@@ -8,6 +8,7 @@ import '../../services/share_service.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
+import '../../widgets/export_size.dart';
 import '../../widgets/icons.dart';
 import '../../widgets/photo_art.dart';
 import 'publish_done_page.dart';
@@ -369,9 +370,16 @@ class _PublishPageState extends State<PublishPage> {
     );
   }
 
+  /// "6336 × 4224 · 2680 万像素" for a single photo whose size is known.
+  String? _sizeDims() {
+    if (_photos.length != 1 || _ratio != 'orig') return null;
+    final d = exportDims(_photos.first, _size);
+    return d == null ? null : exportDimsText(d);
+  }
+
   Widget _infoCard() {
     final c = context.c;
-    Widget row(String key, String label, String value, VoidCallback onTap, {bool last = false}) => GestureDetector(
+    Widget row(String key, String label, String value, VoidCallback onTap, {bool last = false, String? sub}) => GestureDetector(
           key: ValueKey(key),
           behavior: HitTestBehavior.opaque,
           onTap: onTap,
@@ -380,7 +388,11 @@ class _PublishPageState extends State<PublishPage> {
             padding: const EdgeInsets.symmetric(horizontal: 16),
             decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.sep))),
             child: Row(children: [
-              Expanded(child: Text(label, style: T.body17(c.text))),
+              Expanded(
+                  child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(label, style: T.body17(c.text)),
+                if (sub != null) Text(sub, key: ValueKey('$key-sub'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.small(c.text2)),
+              ])),
               Text(value, key: ValueKey('$key-value'), style: T.body17(c.text2, w: FontWeight.w400)),
               const SizedBox(width: 4),
               DIcon(DI.forward, size: 18, color: c.text2),
@@ -395,9 +407,10 @@ class _PublishPageState extends State<PublishPage> {
           final l = _preset.ratios;
           setState(() => _ratio = l[(l.indexOf(_ratio) + 1) % l.length]);
         }),
-        row('row-size', '尺寸', '长边 $_size px', () {
-          setState(() => _size = exportSizes[(exportSizes.indexOf(_size) + 1) % exportSizes.length]);
-        }),
+        row('row-size', '尺寸', exportSizeName(_size), () async {
+          final v = await showExportSizeSheet(context, current: _size, photo: _photos.length == 1 ? _photos.first : null);
+          if (v != null && mounted) setState(() => _size = v);
+        }, sub: _sizeDims()),
         row('row-loc', '位置信息', _strip ? '已去除' : '保留', () => setState(() => _strip = !_strip), last: true),
       ]),
     );

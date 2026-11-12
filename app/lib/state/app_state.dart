@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter/widgets.dart' show GlobalKey, NavigatorState;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -11,9 +12,12 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../model/catalog.dart';
+import '../model/film_catalog.dart';
+import '../model/film_names.dart' show parseFilmSwatches;
 import '../model/params.dart';
 import '../models.dart';
 import '../native/dapple_session.dart';
+import '../services/blank_check.dart';
 import '../services/detection.dart';
 import '../services/ftp_ingest.dart';
 import '../services/ingest.dart';
@@ -93,6 +97,60 @@ class AppState extends ChangeNotifier {
   Timer? _scanDebounce;
 
   late final SessionCache sessions = SessionCache(this);
+
+  /// Film stocks of the engine's pack (empty when the pack is missing or the library has no film support).
+  FilmCatalog film = FilmCatalog.empty;
+
+  /// Asset path of the film pack (a copy of core/data/film/dapple.dfp, see docs/film/README.md).
+  static const filmPackAsset = 'assets/film/dapple.dfp';
+
+  /// Reads the film pack asset into the engine (2 ms for the 1.2 MB pack) and lists its stocks.
+  Future<void> _loadFilm() async {
+    try {
+      final data = await rootBundle.load(filmPackAsset);
+      final bytes = data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+      if (!DappleSession.loadFilmPack(bytes)) {
+        debugPrint('film pack not loaded');
+        return;
+      }
+      film = FilmCatalog.fromJson(DappleSession.filmListJson(), attribution: DappleSession.filmAttribution());
+      if (!film.isEmpty) unawaited(_loadFilmSwatches(bytes.length));
+    } catch (e) {
+      debugPrint('film pack failed: $e');
+    }
+  }
+
+  /// Bump when the engine's swatch patches change (invalidates the cached swatches).
+  static const _swatchVersion = 1;
+
+  /// Swatches of the stocks, rendered by the engine from fixed test patches (a few seconds, once per pack): read from
+  /// the cache file when its key (version, pack size, stock ids) matches, else computed in a background isolate and cached.
+  Future<void> _loadFilmSwatches(int packBytes) async {
+    try {
+      final key = '$_swatchVersion|$packBytes|${film.stocks.map((s) => s.id).join(',')}';
+      final file = File(p.join(_docs.path, 'film_swatches.json'));
+      String? json;
+      try {
+        if (file.existsSync()) {
+          final j = jsonDecode(file.readAsStringSync());
+          if (j is Map && j['key'] == key) json = jsonEncode(j['swatches']);
+        }
+      } catch (_) {}
+      var fromCache = json != null;
+      json ??= await DappleSession.filmSwatchesJsonIsolate();
+      final sw = parseFilmSwatches(json);
+      if (sw.isEmpty) return;
+      if (!fromCache) {
+        try {
+          file.writeAsStringSync(jsonEncode({'key': key, 'swatches': jsonDecode(json!)}));
+        } catch (_) {}
+      }
+      film = film.withSwatches(sw);
+      notifyListeners();
+    } catch (e) {
+      debugPrint('film swatches failed: $e');
+    }
+  }
 
   bool ready = false;
   bool mediaPermitted = true;
@@ -359,17 +417,33 @@ class AppState extends ChangeNotifier {
 
   /// Applies [f] to the photo's edit state and records an undo point. Repeated calls with the same
   /// [coalesce] key within 800 ms (a slider drag) form one step.
-  void applyEdit(String id, EditState Function(EditState e) f, {String? coalesce}) {
+  ///
+  /// [gesture]: [coalesce] identifies one continuous finger gesture, which is a single undo step
+  /// however long the finger pauses (requirements 4.15.10).
+  void applyEdit(String id, EditState Function(EditState e) f, {String? coalesce, bool gesture = false}) {
     final ph = _photos[id];
     if (ph == null) return;
     final next = f(ph.edit);
     if (next.sameAs(ph.edit)) return;
-    _stack(id).record(ph.edit, coalesceKey: coalesce);
+    _stack(id).record(ph.edit, coalesceKey: coalesce, forceMerge: gesture);
     ph.edit = next;
+    final flipped = ph.exported;
     ph.exported = false;
     editRevision++;
+    if (gesture && !flipped) {
+      // A drag step changes nothing the library, the shell or the top bar show: rebuilding all of them
+      // (the whole library grid sits under the editor route) on every pointer move cost 10-25 ms per frame
+      // on a low-end phone. The editor listens to [editTick] instead.
+      _saveSoon();
+      editTick.value++;
+      return;
+    }
     changed();
+    editTick.value++;
   }
+
+  /// Bumped on every edit, including drag steps that do not notify [AppState] listeners.
+  final ValueNotifier<int> editTick = ValueNotifier(0);
 
   /// Bumped on every edit; the editor uses it to re-render.
   int editRevision = 0;
@@ -381,6 +455,7 @@ class AppState extends ChangeNotifier {
     ph.edit = prev;
     editRevision++;
     changed();
+    editTick.value++;
   }
 
   void redo(String id) {
@@ -390,6 +465,7 @@ class AppState extends ChangeNotifier {
     ph.edit = nxt;
     editRevision++;
     changed();
+    editTick.value++;
   }
 
   EditState? clipboard;
@@ -483,19 +559,24 @@ class AppState extends ChangeNotifier {
       defaultLookId: _prefs.getString('defaultLook2') ?? 'std',
       toneStrength: _prefs.getDouble('toneStrength') ?? 60,
       autoProcess: _prefs.getBool('autoProcess') ?? true,
-      exportLongEdge: _prefs.getInt('exportLongEdge2') ?? 2560,
+      exportLongEdge: _prefs.getInt('exportLongEdge3') ?? 0,
       stripLocation: _prefs.getBool('stripLocation') ?? true,
-      jpegQuality: _prefs.getInt('jpegQuality') ?? 92,
+      jpegQuality: _prefs.getInt('jpegQuality2') ?? 95,
       watchGallery: _prefs.getBool('watchGallery') ?? true,
       onboarded: _prefs.getBool('onboarded') ?? true,
       ftpEnabled: _prefs.getBool('ftpEnabled') ?? false,
       ftpUser: _prefs.getString('ftpUser') ?? 'dapple',
       ftpPass: _prefs.getString('ftpPass') ?? generateFtpPassword(),
       ftpPort: _prefs.getInt('ftpPort') ?? 2121,
+      handedness: _prefs.getInt('handedness') ?? 0,
+      haptics: _prefs.getBool('haptics') ?? true,
+      handSide: _prefs.getInt('handSide') ?? 1,
+      editorLayout: _prefs.getString('editorLayout') ?? '',
     );
     await _prefs.setString('ftpPass', settings.ftpPass);
     nativeOk = DappleSession.isAvailable;
     if (!nativeOk) nativeError = '原生库未加载';
+    await _loadFilm();
     await _loadLibrary();
     await _loadDetection();
     ready = true;
@@ -507,6 +588,8 @@ class AppState extends ChangeNotifier {
       if (ph.status == PhotoStatus.developing) ph.status = PhotoStatus.pending;
       if (ph.status == PhotoStatus.pending) _enqueue(ph.id);
     }
+    unawaited(_auditMerged());
+    unawaited(auditLive());
     unawaited(refreshVideos());
     unawaited(initFtp());
     _scheduleDetect();
@@ -549,15 +632,19 @@ class AppState extends ChangeNotifier {
     await _prefs.setString('defaultLook2', settings.defaultLookId);
     await _prefs.setDouble('toneStrength', settings.toneStrength);
     await _prefs.setBool('autoProcess', settings.autoProcess);
-    await _prefs.setInt('exportLongEdge2', settings.exportLongEdge);
+    await _prefs.setInt('exportLongEdge3', settings.exportLongEdge);
     await _prefs.setBool('stripLocation', settings.stripLocation);
-    await _prefs.setInt('jpegQuality', settings.jpegQuality);
+    await _prefs.setInt('jpegQuality2', settings.jpegQuality);
     await _prefs.setBool('watchGallery', settings.watchGallery);
     await _prefs.setBool('onboarded', settings.onboarded);
     await _prefs.setBool('ftpEnabled', settings.ftpEnabled);
     await _prefs.setString('ftpUser', settings.ftpUser);
     await _prefs.setString('ftpPass', settings.ftpPass);
     await _prefs.setInt('ftpPort', settings.ftpPort);
+    await _prefs.setInt('handedness', settings.handedness);
+    await _prefs.setBool('haptics', settings.haptics);
+    await _prefs.setInt('handSide', settings.handSide);
+    await _prefs.setString('editorLayout', settings.editorLayout);
     _applyWatch();
   }
 
@@ -762,7 +849,11 @@ class AppState extends ChangeNotifier {
       final info = await s.info();
       ph.camera = ((info['camera'] as Map?)?['displayName'] ?? info['model'])?.toString();
       final w = (info['width'] as num?)?.toDouble(), h = (info['height'] as num?)?.toDouble();
-      if (w != null && h != null && h > 0) ph.ratio = w / h;
+      if (w != null && h != null && h > 0) {
+        ph.ratio = w / h;
+        ph.pxW = w.round();
+        ph.pxH = h.round();
+      }
       final ts = (info['timestamp'] as num?)?.toInt() ?? 0;
       if (ts > 0 && ph.takenMs == null) ph.takenMs = ts * 1000;
       final auto = await s.auto(settings.toneStrength / 100);
@@ -773,6 +864,10 @@ class AppState extends ChangeNotifier {
       await s.exportJpeg(wireParams(ph), longEdge: 2048, quality: 88, outPath: out);
       ph.previewPath = out;
       _dropImageCache();
+      if ((ph.kind == PhotoKind.hdr || ph.kind == PhotoKind.pano) && await isBlankImageFile(out)) {
+        _removeBlankMerge(ph);
+        return;
+      }
       ph.status = PhotoStatus.done;
       ph.error = null;
       if (ph.camera != null && cameraSource) cameraName = ph.camera!;
@@ -788,6 +883,23 @@ class AppState extends ChangeNotifier {
       }
     }
     changed();
+  }
+
+  /// A merge result that renders completely black is useless (old builds could save one); drop it instead of showing a black tile.
+  void _removeBlankMerge(Photo ph) {
+    _photos.remove(ph.id);
+    _tryDelete(ph.path);
+    _tryDelete(ph.previewPath);
+    showToast('已移除一张空白的合成结果，请重新合成');
+    changed();
+  }
+
+  /// One-off startup audit of already-saved HDR/panorama results.
+  Future<void> _auditMerged() async {
+    if (isDemo) return;
+    for (final ph in _photos.values.where((e) => (e.kind == PhotoKind.hdr || e.kind == PhotoKind.pano) && e.status == PhotoStatus.done && e.previewPath != null).toList()) {
+      if (await isBlankImageFile(ph.previewPath!)) _removeBlankMerge(ph);
+    }
   }
 
   /// Preview files are rewritten in place; evict decoded copies.
@@ -817,7 +929,7 @@ class AppState extends ChangeNotifier {
   /// Renders a full-quality JPEG of [ph] into the exports cache. [cropOverride] applies a
   /// destination aspect ratio at export time only (requirements 4.11.2).
   Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride}) async {
-    final le = longEdge ?? settings.exportLongEdge;
+    final le = longEdge ?? settings.exportLongEdge; // 0 = original size
     final extra = <String, dynamic>{if (cropOverride != null && cropOverride != 'orig') 'crop': cropOverride};
     final params = wireParams(ph, override: extra);
     final tag = jsonEncode([params, le, settings.jpegQuality]).hashCode.toRadixString(16);
@@ -835,6 +947,27 @@ class AppState extends ChangeNotifier {
       }
     }
     return out;
+  }
+
+  final Set<String> _saving = {};
+
+  /// True while [saveOneToAlbum] is exporting [id].
+  bool isSaving(String id) => _saving.contains(id);
+
+  /// One-tap "save to album" at the user's save size (original by default): toast while working, toast
+  /// when done, and the photo's `exported` flag drives the check mark.
+  Future<bool> saveOneToAlbum(Photo ph) async {
+    if (!_saving.add(ph.id)) return false;
+    showToast('正在保存…');
+    var ok = false;
+    try {
+      ok = await saveToGallery([ph]) > 0;
+    } finally {
+      _saving.remove(ph.id);
+    }
+    if (ok) showToast('已存入相册「Dapple」');
+    notifyListeners();
+    return ok;
   }
 
   Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride}) async {
@@ -1165,29 +1298,37 @@ class AppState extends ChangeNotifier {
     return j;
   }
 
-  Future<void> _runLive(ToolJob j) async {
+  Future<void> _runLive(ToolJob j, {Photo? redo}) async {
     final d = j.live!;
     final stamp = _stamp();
     final tmp = isDemo ? Directory.systemTemp.path : _cache.path;
     final cover = p.join(tmp, 'live_cover_$stamp.jpg');
     final clip = p.join(tmp, 'live_clip_$stamp.mp4');
     final name = '${d.video.stem}_MP.jpg';
-    final out = p.join(isDemo ? tmp : liveDir.path, '${stamp}_$name');
+    final finalOut = redo?.path ?? p.join(isDemo ? tmp : liveDir.path, '${stamp}_$name');
+    final out = redo == null ? finalOut : '$finalOut.new'; // a regeneration replaces the file only when it succeeded
     String? videoTemp;
     try {
       final startMs = (d.startSec * 1000).round();
       final durMs = (d.windowLen * 1000).round();
       final coverMs = (d.coverSec * 1000).round();
       j.update(fraction: 0.05);
-      await LiveBridge.frame(d.video.uri, coverMs, cover, quality: 94);
+      final still = await LiveBridge.frame(d.video.uri, coverMs, cover, quality: 94, source: d.source);
+      debugPrint('live still: ${still.kind}');
       if (j.status == JobStatus.cancelled) return;
       j.update(fraction: 0.3);
       var clipStartMs = startMs;
       var engineDone = false;
+      String? liveInfo;
       try {
-        final t = await LiveBridge.trim(d.video.uri, startMs: startMs, durationMs: durMs, dest: clip, mute: d.mute);
+        final t = await LiveBridge.trim(d.video.uri, startMs: startMs, durationMs: durMs, dest: clip, mute: d.mute, source: d.source);
         clipStartMs = t.actualStartMs;
+        liveInfo = t.info?.summary;
+        debugPrint('live clip: $liveInfo');
       } catch (e) {
+        // A video that needed the software decoder was re-encoded there: the stream-copy cutter below would put the
+        // undecodable (10-bit / 4:2:2) stream into the file, so a failure is a failure.
+        if (await _needsSoftware(d.video.uri)) rethrow;
         // Platform trim failed (a codec / container the muxer cannot copy): use the engine's stream-copy cutter.
         debugPrint('platform trim failed ($e), engine cutter');
         final src = await resolveVideo(d.video);
@@ -1209,17 +1350,34 @@ class AppState extends ChangeNotifier {
         await engine.writeMotionPhoto(jpeg: cover, mp4: clip, out: out, coverSec: rel);
       }
       j.update(fraction: 0.85);
-      await MediaBridge.saveToGallery(out, name);
-      final ph = Photo(
-        id: 'live:$stamp',
-        name: '${stamp}_$name',
-        addedMs: now.millisecondsSinceEpoch,
-        path: out,
-        status: isDemo ? PhotoStatus.done : PhotoStatus.pending,
-        kind: PhotoKind.live,
-        badge: '动态照片',
-        takenMs: now.millisecondsSinceEpoch,
-      );
+      if (redo != null) File(out).renameSync(finalOut);
+      await MediaBridge.saveToGallery(finalOut, name, replace: redo != null);
+      final Photo ph;
+      if (redo != null) {
+        ph = redo
+          ..previewPath = null
+          ..status = isDemo ? PhotoStatus.done : PhotoStatus.pending
+          ..error = null;
+      } else {
+        ph = Photo(
+          id: 'live:$stamp',
+          name: '${stamp}_$name',
+          addedMs: now.millisecondsSinceEpoch,
+          path: finalOut,
+          status: isDemo ? PhotoStatus.done : PhotoStatus.pending,
+          kind: PhotoKind.live,
+          badge: '动态照片',
+          takenMs: now.millisecondsSinceEpoch,
+        );
+      }
+      ph
+        ..liveSrc = d.video.uri
+        ..liveStartMs = clipStartMs
+        ..liveCoverMs = coverMs
+        ..liveMute = d.mute
+        ..liveSource = d.source.code
+        ..liveInfo = liveInfo
+        ..liveGen = Photo.liveGenCurrent;
       _photos[ph.id] = ph;
       changed();
       if (!isDemo) _enqueue(ph.id);
@@ -1228,13 +1386,104 @@ class AppState extends ChangeNotifier {
       _jobFinished(j);
     } catch (e) {
       _tryDelete(out);
-      if (j.status != JobStatus.cancelled) j.update(status: JobStatus.failed, error: '$e');
+      if (j.status != JobStatus.cancelled) {
+        j.update(status: JobStatus.failed, error: e is UnsupportedVideoException ? e.userMessage : '$e');
+      }
       _jobFinished(j);
     } finally {
       _tryDelete(cover);
       _tryDelete(clip);
       _tryDelete(videoTemp);
       if (isDemo && j.status != JobStatus.done) _tryDelete(out);
+    }
+  }
+
+  Future<bool> _needsSoftware(String uri) async {
+    try {
+      return (await LiveBridge.probe(uri))['software'] == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 兼容版 of a Motion Photo for sharing targets that cannot play a 10-bit HEVC clip or an Ultra HDR still:
+  /// plain SDR JPEG + 8-bit H.264 clip (same window and cover, HDR / S-Log3 sources converted to SDR), written to the
+  /// cache as `compat_<name>`; the saved master stays 10-bit. Returns null for items that were not made from a video.
+  /// Plug-in point for the publish flow: call this instead of the master path for a target that needs it (the publish
+  /// page does not offer Motion Photos yet).
+  Future<String?> exportLiveCompat(Photo ph) async {
+    final src = ph.liveSrc, startMs = ph.liveStartMs, coverMs = ph.liveCoverMs;
+    if (src == null || startMs == null || coverMs == null) return null;
+    final stamp = _stamp();
+    final tmp = isDemo ? Directory.systemTemp.path : _cache.path;
+    final cover = p.join(tmp, 'compat_cover_$stamp.jpg');
+    final clip = p.join(tmp, 'compat_clip_$stamp.mp4');
+    final out = p.join(tmp, 'compat_${ph.name}');
+    try {
+      final source = LiveSource.fromCode(ph.liveSource);
+      await LiveBridge.frame(src, coverMs, cover, quality: 94, source: source, compat: true);
+      final t = await LiveBridge.trim(src,
+          startMs: startMs, durationMs: (LiveDraft.windowSec * 1000).round(), dest: clip, mute: ph.liveMute, source: source, compat: true);
+      final rel = ((coverMs - t.actualStartMs) / 1000.0).clamp(0.0, LiveDraft.windowSec + 1.0).toDouble();
+      await engine.writeMotionPhoto(jpeg: cover, mp4: clip, out: out, coverSec: rel);
+      return out;
+    } finally {
+      _tryDelete(cover);
+      _tryDelete(clip);
+    }
+  }
+
+  static final RegExp _liveNameRe = RegExp(r'^\d{8}_\d{6}_(.+)_MP\.jpg$');
+
+  /// Startup audit of Motion Photos written before the software decoder existed ([Photo.liveGen] < current).
+  /// For each, the clip inside the file is probed: a stream no platform decoder can play (10-bit / 4:2:2, stream-copied
+  /// by the old code, with a false-colour or unreadable still) means the item is bad. Bad items are rebuilt from their
+  /// source video (found by file name in MediaStore) with the default centred window; when the source is gone the item is
+  /// removed with a message. Items whose clip is fine are only stamped with the current revision.
+  Future<void> auditLive() async {
+    if (isDemo || !Platform.isAndroid) return;
+    final stale = [for (final e in _photos.values) if (e.kind == PhotoKind.live && e.liveGen < Photo.liveGenCurrent) e];
+    var rebuilt = 0;
+    final removed = <String>[];
+    for (final ph in stale) {
+      try {
+        final path = ph.path;
+        if (path == null || !File(path).existsSync()) continue;
+        final clip = await LiveBridge.probeEmbedded(path);
+        if (clip['software'] != true) {
+          ph.liveGen = Photo.liveGenCurrent;
+          changed();
+          continue;
+        }
+        final stem = _liveNameRe.firstMatch(ph.name)?.group(1);
+        final v = stem == null ? null : await LiveBridge.findVideo(stem);
+        if (v == null) {
+          _photos.remove(ph.id);
+          _tryDelete(path);
+          _tryDelete(ph.previewPath);
+          removed.add(stem ?? ph.name);
+          changed();
+          continue;
+        }
+        final d = LiveDraft(video: v);
+        d.setStart(((v.seconds - d.windowLen) / 2).clamp(0.0, d.maxStart));
+        d.coverSec = d.startSec + d.windowLen / 2;
+        _tryDelete(ph.previewPath);
+        final j = ToolJob(kind: ToolKind.live, live: d);
+        await _runLive(j, redo: ph);
+        if (j.status == JobStatus.done) {
+          rebuilt++;
+        } else {
+          debugPrint('live regenerate failed for ${ph.name}: ${j.error}');
+        }
+      } catch (e) {
+        debugPrint('live audit failed for ${ph.name}: $e');
+      }
+    }
+    if (removed.isNotEmpty) {
+      showToast('已移除 ${removed.length} 张动态照片（${removed.join('、')}）：原视频已不在，无法按新方式重新生成');
+    } else if (rebuilt > 0) {
+      showToast('已用新的解码方式重新生成 $rebuilt 张动态照片');
     }
   }
 

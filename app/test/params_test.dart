@@ -4,7 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test('spec table has the 74 numeric keys of chapter 6', () {
-    expect(sliderSpecs.length, 74);
+    expect(sliderSpecs.length, 80);
     expect(specByKey['sharpen']!.def, 40);
     expect(specByKey['nrColor']!.def, 25);
     expect(specByKey['gr_blend']!.def, 50);

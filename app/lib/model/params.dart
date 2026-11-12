@@ -76,6 +76,13 @@ List<SliderSpec> _buildSpecs() {
     const SliderSpec('gr_blend', '混合', 0, 100, 50, Fmt.plain, EGroup.grade),
     const SliderSpec('gr_balance', '平衡', -100, 100, 0, Fmt.signed, EGroup.grade),
     const SliderSpec('straighten', '拉直', -45, 45, 0, Fmt.deg, EGroup.crop),
+    // Film simulation (docs/film/README.md). Strength / grain / halation 100 = the full effect of the stock.
+    const SliderSpec('film_strength', '胶片强度', 0, 100, 100, Fmt.pct, EGroup.style),
+    const SliderSpec('film_grain', '颗粒', 0, 100, 100, Fmt.pct, EGroup.style),
+    const SliderSpec('film_halation', '光晕', 0, 100, 100, Fmt.pct, EGroup.style),
+    const SliderSpec('film_warmth', '冲印冷暖', -100, 100, 0, Fmt.signed, EGroup.style),
+    const SliderSpec('film_tint', '冲印色调', -100, 100, 0, Fmt.signed, EGroup.style),
+    const SliderSpec('film_exp', '胶片曝光', -60, 60, 0, Fmt.ev, EGroup.style),
   ];
   for (var b = 0; b < 8; b++) {
     out.add(SliderSpec(hslKey(b, 'h'), '${hslBandNames[b]} · 色相', -100, 100, 0, Fmt.signed, EGroup.color,
@@ -151,6 +158,9 @@ String tonePro(String id) {
 
 // ---------------------------------------------------------------- sync categories
 
+/// Keys of the film simulation (numeric ones; the stock and the paper are [EditState.film] / [EditState.filmPaper]).
+const filmValueKeys = ['film_strength', 'film_grain', 'film_halation', 'film_warmth', 'film_tint', 'film_exp'];
+
 enum SyncCat { style, tone, light, color, detail, crop }
 
 const syncCatLabels = {
@@ -179,7 +189,7 @@ SyncCat? syncCatOfKey(String key) {
     case EGroup.crop:
       return SyncCat.crop;
     case EGroup.style:
-      return null;
+      return SyncCat.style;
   }
 }
 
@@ -194,6 +204,8 @@ class EditState {
     this.palette,
     this.toneTarget,
     this.toneStrength,
+    this.film,
+    this.filmPaper,
     this.values = const {},
     this.crop = 'orig',
     this.rot = 0,
@@ -213,6 +225,12 @@ class EditState {
   /// null = the global default tone strength.
   final double? toneStrength;
 
+  /// Film stock id (the `film` key); null = no film simulation.
+  final String? film;
+
+  /// Print paper override (`film_paper`: paper id or 'none'); null = the stock's default paper.
+  final String? filmPaper;
+
   /// Only non-default slider values (including `straighten`).
   final Map<String, double> values;
   final String crop;
@@ -229,6 +247,8 @@ class EditState {
     Object? palette = _keep,
     Object? toneTarget = _keep,
     Object? toneStrength = _keep,
+    Object? film = _keep,
+    Object? filmPaper = _keep,
     Map<String, double>? values,
     String? crop,
     int? rot,
@@ -240,6 +260,8 @@ class EditState {
         palette: identical(palette, _keep) ? this.palette : palette as Offset?,
         toneTarget: identical(toneTarget, _keep) ? this.toneTarget : toneTarget as String?,
         toneStrength: identical(toneStrength, _keep) ? this.toneStrength : toneStrength as double?,
+        film: identical(film, _keep) ? this.film : film as String?,
+        filmPaper: identical(filmPaper, _keep) ? this.filmPaper : filmPaper as String?,
         values: values ?? this.values,
         crop: crop ?? this.crop,
         rot: rot ?? this.rot,
@@ -259,13 +281,13 @@ class EditState {
     return copyWith(values: m);
   }
 
-  bool get styleAdjusted => look != null || lookStrength != 100 || palette != null;
+  bool get styleAdjusted => look != null || lookStrength != 100 || palette != null || film != null;
   bool get toneAdjusted => toneTarget != null || toneStrength != null;
 
   bool groupAdjusted(EGroup g) {
     switch (g) {
       case EGroup.style:
-        return styleAdjusted || toneAdjusted;
+        return styleAdjusted || toneAdjusted || values.keys.any(filmValueKeys.contains);
       case EGroup.crop:
         return crop != 'orig' || rot != 0 || flip || values.containsKey('straighten');
       default:
@@ -281,6 +303,8 @@ class EditState {
       palette == o.palette &&
       toneTarget == o.toneTarget &&
       toneStrength == o.toneStrength &&
+      film == o.film &&
+      filmPaper == o.filmPaper &&
       crop == o.crop &&
       rot == o.rot &&
       flip == o.flip &&
@@ -296,6 +320,8 @@ class EditState {
         palette: palette,
         toneTarget: toneTarget,
         toneStrength: toneStrength,
+        film: film,
+        filmPaper: filmPaper,
         values: m);
   }
 
@@ -309,6 +335,8 @@ class EditState {
         palette: clip.palette,
         toneTarget: clip.toneTarget,
         toneStrength: clip.toneStrength,
+        film: clip.film,
+        filmPaper: clip.filmPaper,
         values: m,
         crop: crop,
         rot: rot,
@@ -321,6 +349,9 @@ class EditState {
     var out = this;
     if (cats.contains(SyncCat.style) && src.styleAdjusted) {
       out = out.copyWith(look: src.look, lookStrength: src.lookStrength, palette: src.palette);
+    }
+    if (cats.contains(SyncCat.style) && src.film != null) {
+      out = out.copyWith(film: src.film, filmPaper: src.filmPaper);
     }
     if (cats.contains(SyncCat.tone) && src.toneAdjusted) {
       out = out.copyWith(toneTarget: src.toneTarget, toneStrength: src.toneStrength);
@@ -349,7 +380,14 @@ class EditState {
     };
     if (palette != null) m['palette'] = {'x': palette!.dx, 'y': palette!.dy};
     if (toneTarget != null) m['toneTarget'] = toneTarget;
-    values.forEach((k, v) => m[k] = v);
+    if (film != null) {
+      m['film'] = film;
+      if (filmPaper != null) m['film_paper'] = filmPaper;
+    }
+    values.forEach((k, v) {
+      if (film == null && filmValueKeys.contains(k)) return; // film knobs act only with a stock
+      m[k] = v;
+    });
     if (crop != 'orig') m['crop'] = crop;
     if (rot != 0) m['rot'] = rot;
     if (flip) m['flip'] = true;
@@ -362,6 +400,8 @@ class EditState {
         if (palette != null) 'palette': [palette!.dx, palette!.dy],
         if (toneTarget != null) 'toneTarget': toneTarget,
         if (toneStrength != null) 'toneStrength': toneStrength,
+        if (film != null) 'film': film,
+        if (filmPaper != null) 'filmPaper': filmPaper,
         'values': values,
         'crop': crop,
         'rot': rot,
@@ -376,6 +416,8 @@ class EditState {
       palette: pal is List && pal.length == 2 ? Offset((pal[0] as num).toDouble(), (pal[1] as num).toDouble()) : null,
       toneTarget: j['toneTarget'] as String?,
       toneStrength: (j['toneStrength'] as num?)?.toDouble(),
+      film: j['film'] as String?,
+      filmPaper: j['filmPaper'] as String?,
       values: ((j['values'] as Map?) ?? {})
           .map((k, v) => MapEntry(k as String, (v as num).toDouble()))
         ..removeWhere((k, v) => !specByKey.containsKey(k)),
@@ -397,9 +439,9 @@ class UndoStack {
   bool get canRedo => _future.isNotEmpty;
 
   /// Records [before] as an undo point unless [coalesceKey] repeats within 800 ms.
-  void record(EditState before, {String? coalesceKey, int? nowMs}) {
+  void record(EditState before, {String? coalesceKey, int? nowMs, bool forceMerge = false}) {
     final now = nowMs ?? DateTime.now().millisecondsSinceEpoch;
-    final merge = coalesceKey != null && coalesceKey == _lastKey && now - _lastMs < 800 && _past.isNotEmpty;
+    final merge = coalesceKey != null && coalesceKey == _lastKey && (forceMerge || now - _lastMs < 800) && _past.isNotEmpty;
     _lastKey = coalesceKey;
     _lastMs = now;
     _future.clear();

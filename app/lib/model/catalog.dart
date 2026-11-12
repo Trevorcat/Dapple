@@ -77,8 +77,6 @@ const presets = <Preset>[
   Preset('other', '其他 App', '系统分享', null, 'orig', ['orig'], null, null),
 ];
 
-const exportSizes = [1440, 2048, 2560, 3840];
-
 // ---------------------------------------------------------------- demo scenes
 
 /// A procedurally drawn stand-in for a photo, used when no real image file exists.

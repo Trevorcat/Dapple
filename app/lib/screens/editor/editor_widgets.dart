@@ -1,14 +1,9 @@
-// Editor building blocks: histogram card, 3x3 tone grid, palette pad, curve chart.
+// Painters shared by the editor overlays: histogram, palette backdrop, curve chart.
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
-import '../../model/params.dart';
-import '../../models.dart';
 import '../../services/editor_engine.dart';
-import '../../theme/tokens.dart';
-import '../../widgets/photo_art.dart';
 
 // ------------------------------------------------------------------ histogram
 
@@ -69,212 +64,10 @@ class HistPainter extends CustomPainter {
   bool shouldRepaint(HistPainter o) => o.a != a || o.fill != fill;
 }
 
-/// Histogram card (requirements 4.6.1). [mini] = the 40-high variant of the 光线 group.
-class HistogramCard extends StatelessWidget {
-  const HistogramCard({super.key, required this.analysis, this.target, this.large = false});
-  final Analysis analysis;
+// ------------------------------------------------------------------ palette backdrop
 
-  /// Chosen tone target (shows "→ target" when it differs from the nearest class).
-  final String? target;
-  final bool large;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = context.c;
-    final nearest = analysis.nearest;
-    return Semantics(
-      image: true,
-      label: '直方图，${tonePlain(nearest)}',
-      child: Container(
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(Rd.card)),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-          Row(children: [
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-              decoration: BoxDecoration(color: c.chip, borderRadius: BorderRadius.circular(8)),
-              child: Text(tonePlain(nearest), key: const ValueKey('hist-nearest'), style: T.small(c.text, w: FontWeight.w500)),
-            ),
-            if (target != null && target != nearest) ...[
-              const SizedBox(width: 8),
-              Text('→ ${tonePlain(target!)}', key: const ValueKey('hist-target'), style: T.small(c.accent, w: FontWeight.w500)),
-            ],
-          ]),
-          const SizedBox(height: 8),
-          SizedBox(
-            height: large ? 50 : 56,
-            width: double.infinity,
-            child: CustomPaint(painter: HistPainter(analysis, c.histFill, c.text, c.zoneA, c.accent)),
-          ),
-          const SizedBox(height: 8),
-          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-            Text('暗部', style: T.mini(c.text2)),
-            Text('中间调', style: T.mini(c.text2)),
-            Text('亮部', style: T.mini(c.text2)),
-          ]),
-        ]),
-      ),
-    );
-  }
-}
-
-/// Mini histogram (光线 group): 40 high, radius 8, no zone bars, with the class text on the right.
-class MiniHistogram extends StatelessWidget {
-  const MiniHistogram({super.key, required this.analysis});
-  final Analysis analysis;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = context.c;
-    return Semantics(
-      image: true,
-      label: '直方图，${tonePlain(analysis.nearest)}',
-      child: Row(children: [
-        Expanded(
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: Container(
-              height: 40,
-              color: c.bg,
-              child: CustomPaint(
-                  size: Size.infinite,
-                  painter: HistPainter(analysis, c.histFill, c.text, c.zoneA, c.accent, zones: false)),
-            ),
-          ),
-        ),
-        const SizedBox(width: 12),
-        Text(tonePlain(analysis.nearest), style: T.small(c.text2)),
-      ]),
-    );
-  }
-}
-
-// ------------------------------------------------------------------ tone grid
-
-class ToneGrid extends StatelessWidget {
-  const ToneGrid({
-    super.key,
-    required this.photo,
-    required this.engine,
-    required this.demoEdit,
-    required this.nearest,
-    required this.selected,
-    required this.onSelect,
-    this.large = false,
-  });
-  final Photo photo;
-  final EditorEngine engine;
-  final DemoEdit demoEdit;
-  final String nearest;
-  final String selected;
-  final ValueChanged<String> onSelect;
-  final bool large;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = context.c;
-    return Semantics(
-      container: true,
-      label: '明暗目标',
-      child: LayoutBuilder(builder: (context, cons) {
-        const gap = 8.0;
-        final cw = (cons.maxWidth - gap * 2) / 3;
-        final ch = large ? cw / 1.5 : cw * 0.66;
-        final ts = math.max(60.0, demoEdit.edit.toneStrength ?? demoEdit.defaultTone);
-        return Column(children: [
-          for (final k in toneKeys)
-            Padding(
-              padding: EdgeInsets.only(bottom: k == 'low' ? 0 : gap),
-              child: Row(children: [
-                for (final r in toneRanges) ...[
-                  if (r != 'short') const SizedBox(width: gap),
-                  Builder(builder: (context) {
-                    final id = toneClassId(k, r);
-                    final sel = id == selected;
-                    final tile = engine.tiles[id];
-                    Widget art;
-                    if (tile != null) {
-                      art = RawImage(image: tile, fit: BoxFit.cover);
-                    } else if (engine.live) {
-                      art = PhotoArt(photo, cacheWidth: 200);
-                    } else {
-                      final e = DemoEdit(demoEdit.edit.copyWith(toneTarget: id, toneStrength: ts), demoEdit.defaultLook,
-                          demoEdit.defaultTone);
-                      art = PhotoArt(photo, demoEdit: e);
-                    }
-                    return Semantics(
-                      checked: sel,
-                      inMutuallyExclusiveGroup: true,
-                      label: '${tonePlain(id)}，${tonePro(id)}${id == nearest ? '，与这张最接近' : ''}',
-                      excludeSemantics: true,
-                      child: GestureDetector(
-                        key: ValueKey('tone-$id'),
-                        behavior: HitTestBehavior.opaque,
-                        onTap: () => onSelect(id),
-                        child: SizedBox(
-                          width: cw,
-                          height: ch,
-                          child: Stack(fit: StackFit.expand, children: [
-                            ClipRRect(borderRadius: BorderRadius.circular(large ? 8 : Rd.tile), child: art),
-                            Positioned(
-                              left: 4,
-                              bottom: 4,
-                              child: Container(
-                                padding: EdgeInsets.symmetric(horizontal: 6, vertical: large ? 2 : 1),
-                                decoration: BoxDecoration(color: const Color(0x80000000), borderRadius: BorderRadius.circular(8)),
-                                child: large
-                                    ? Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-                                        Text(tonePlain(id), style: T.cap(Colors.white, w: FontWeight.w500)),
-                                        Text(tonePro(id), style: T.mini(const Color(0xBFFFFFFF))),
-                                      ])
-                                    : Text(tonePro(id), style: T.mini(Colors.white)),
-                              ),
-                            ),
-                            if (id == nearest)
-                              Positioned(
-                                right: 6,
-                                top: 6,
-                                child: Container(
-                                  width: 10,
-                                  height: 10,
-                                  decoration: BoxDecoration(
-                                      color: Colors.white,
-                                      shape: BoxShape.circle,
-                                      border: Border.all(color: const Color(0x73000000), width: 1.5)),
-                                ),
-                              ),
-                            if (sel)
-                              IgnorePointer(
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                      borderRadius: BorderRadius.circular(large ? 8 : Rd.tile),
-                                      border: Border.all(color: c.accentBtn, width: 2)),
-                                ),
-                              ),
-                          ]),
-                        ),
-                      ),
-                    );
-                  }),
-                ],
-              ]),
-            ),
-        ]);
-      }),
-    );
-  }
-}
-
-// ------------------------------------------------------------------ palette pad
-
-String paletteText(Offset p) {
-  final n = ((p.dy - 0.5).abs() * 200).round();
-  final m = ((p.dx - 0.5).abs() * 200).round();
-  return '${p.dy <= 0.5 ? '偏暖' : '偏冷'} $n，${p.dx >= 0.5 ? '偏浓' : '偏淡'} $m';
-}
-
-class _PalettePainter extends CustomPainter {
-  _PalettePainter(this.top, this.mid, this.bot, this.dot, this.gray);
+class PaletteBackdropPainter extends CustomPainter {
+  PaletteBackdropPainter(this.top, this.mid, this.bot, this.dot, this.gray);
   final Color top, mid, bot, dot, gray;
   @override
   void paint(Canvas canvas, Size s) {
@@ -289,88 +82,15 @@ class _PalettePainter extends CustomPainter {
         Paint()
           ..shader = LinearGradient(colors: [gray, gray.withValues(alpha: 0)]).createShader(r));
     final p = Paint()..color = dot;
-    for (double y = 9; y < s.height; y += 18.5) {
-      for (double x = 9; x < s.width; x += 18.5) {
+    for (double y = s.height / 16; y < s.height; y += s.height / 8) {
+      for (double x = s.width / 16; x < s.width; x += s.width / 8) {
         canvas.drawCircle(Offset(x, y), 1.5, p);
       }
     }
   }
 
   @override
-  bool shouldRepaint(_PalettePainter o) => o.top != top || o.dot != dot;
-}
-
-class PalettePad extends StatelessWidget {
-  const PalettePad({super.key, required this.value, required this.onChanged, this.size = 148});
-  final Offset value;
-  final ValueChanged<Offset> onChanged;
-  final double size;
-
-  Offset _clamp(Offset o) => Offset(o.dx.clamp(0.04, 0.96), o.dy.clamp(0.04, 0.96));
-
-  @override
-  Widget build(BuildContext context) {
-    final c = context.c;
-    void at(Offset local) => onChanged(_clamp(Offset(local.dx / size, local.dy / size)));
-    return Focus(
-      onKeyEvent: (n, e) {
-        if (e is KeyUpEvent) return KeyEventResult.ignored;
-        const st = 0.05;
-        final k = e.logicalKey;
-        if (k == LogicalKeyboardKey.arrowLeft) {
-          onChanged(_clamp(value + const Offset(-st, 0)));
-        } else if (k == LogicalKeyboardKey.arrowRight) {
-          onChanged(_clamp(value + const Offset(st, 0)));
-        } else if (k == LogicalKeyboardKey.arrowUp) {
-          onChanged(_clamp(value + const Offset(0, -st)));
-        } else if (k == LogicalKeyboardKey.arrowDown) {
-          onChanged(_clamp(value + const Offset(0, st)));
-        } else {
-          return KeyEventResult.ignored;
-        }
-        return KeyEventResult.handled;
-      },
-      child: Semantics(
-        slider: true,
-        label: '调色盘',
-        value: paletteText(value),
-        child: GestureDetector(
-          key: const ValueKey('palette-pad'),
-          onPanStart: (d) => at(d.localPosition),
-          onPanUpdate: (d) => at(d.localPosition),
-          onTapDown: (d) => at(d.localPosition),
-          child: Container(
-            width: size,
-            height: size,
-            decoration: BoxDecoration(borderRadius: BorderRadius.circular(Rd.cardLg), border: Border.all(color: c.sep)),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(Rd.cardLg),
-              child: Stack(children: [
-                Positioned.fill(
-                    child: CustomPaint(
-                        painter: _PalettePainter(c.paletteTop, c.paletteMid, c.paletteBot, c.text2.withValues(alpha: .25),
-                            c.dark ? const Color(0x66888888) : const Color(0x55A0A0A0)))),
-                Positioned(
-                  left: value.dx * size - 12,
-                  top: value.dy * size - 12,
-                  child: Container(
-                    width: 24,
-                    height: 24,
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      shape: BoxShape.circle,
-                      border: Border.all(color: c.accentBtn, width: 3),
-                      boxShadow: const [BoxShadow(color: Color(0x4D000000), blurRadius: 6, offset: Offset(0, 2))],
-                    ),
-                  ),
-                ),
-              ]),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
+  bool shouldRepaint(PaletteBackdropPainter o) => o.top != top || o.dot != dot;
 }
 
 // ------------------------------------------------------------------ curve chart
@@ -382,10 +102,15 @@ double curveY(double x, double h, double l, double d, double s) {
 }
 
 class CurvePainter extends CustomPainter {
-  CurvePainter(this.a, this.h, this.l, this.d, this.s, this.stroke, this.fill, this.grid, this.dash);
+  CurvePainter(this.a, this.h, this.l, this.d, this.s, this.stroke, this.fill, this.grid, this.dash,
+      {this.sel = -1, this.dot = Colors.white, this.showPoints = false});
   final Analysis a;
   final double h, l, d, s;
-  final Color stroke, fill, grid, dash;
+  final Color stroke, fill, grid, dash, dot;
+
+  /// Index (0 = highlights .. 3 = shadows) of the selected point, -1 = none.
+  final int sel;
+  final bool showPoints;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -434,6 +159,21 @@ class CurvePainter extends CustomPainter {
           ..strokeWidth = 2.5
           ..strokeCap = StrokeCap.round
           ..strokeJoin = StrokeJoin.round);
+    if (showPoints) {
+      const xs = [0.88, 0.62, 0.37, 0.12];
+      for (var i = 0; i < 4; i++) {
+        final p = Offset(xs[i] * w, ht - curveY(xs[i], h, l, d, s) * (ht - 6) - 3);
+        final big = i == sel;
+        canvas.drawCircle(p, big ? 7 : 4, Paint()..color = dot);
+        canvas.drawCircle(
+            p,
+            big ? 7 : 4,
+            Paint()
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 2
+              ..color = stroke);
+      }
+    }
   }
 
   @override

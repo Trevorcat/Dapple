@@ -7,6 +7,7 @@ import '../../services/share_service.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
+import '../../widgets/export_size.dart';
 import '../../widgets/icons.dart';
 
 enum DoneResult { finish, next, again }
@@ -65,7 +66,7 @@ class _PublishDonePageState extends State<PublishDonePage> {
     final title = widget.fallback ? '已存入相册' : '已交给$_appName';
     final ratio = widget.ratio == 'orig' ? '原比例' : widget.ratio;
     final steps = <String>[
-      '已导出 ${widget.count} 张 · $ratio · 长边 ${widget.size} px',
+      '已导出 ${widget.count} 张 · $ratio · ${exportSizeName(widget.size)}',
       if (widget.fallback) '已存入相册「Dapple」' else '已交给$_appName',
       if (_opened) '已打开$_appName',
     ];

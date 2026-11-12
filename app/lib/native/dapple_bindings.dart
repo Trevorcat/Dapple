@@ -17,6 +17,33 @@ final class DappleImageStruct extends ffi.Struct {
   external ffi.Pointer<ffi.Uint8> rgba;
 }
 
+/// `DappleFrameRequest` (dapple_c.h): one interactive frame / zoom region.
+final class DappleFrameRequestStruct extends ffi.Struct {
+  @ffi.Int32()
+  external int size;
+  @ffi.Int32()
+  external int longEdge;
+  @ffi.Int32()
+  external int flags;
+  @ffi.Int32()
+  external int bakeSize;
+  @ffi.Float()
+  external double rx0;
+  @ffi.Float()
+  external double ry0;
+  @ffi.Float()
+  external double rx1;
+  @ffi.Float()
+  external double ry1;
+  @ffi.Int32()
+  external int regionLongEdge;
+}
+
+const int dappleFrameInteractive = 1;
+const int dappleFrameAnalysis = 2;
+const int dappleFrameExact = 4;
+const int dappleFrameBackground = 8;
+
 const int dappleOk = 0;
 const int dappleError = 1;
 const int dappleQualityPreview = 0;
@@ -25,6 +52,14 @@ const int dappleQualityFull = 1;
 typedef _CStrFn = ffi.Pointer<Utf8> Function();
 typedef _CStrFnD = ffi.Pointer<Utf8> Function();
 typedef _CStrArg = ffi.Pointer<Utf8> Function(ffi.Pointer<Utf8>);
+typedef _PerfConf1 = ffi.Void Function(ffi.Int32);
+typedef _PerfConf1D = void Function(int);
+typedef _Info0 = ffi.Pointer<Utf8> Function();
+typedef _Info0D = ffi.Pointer<Utf8> Function();
+typedef _PerfConf = ffi.Void Function(ffi.Int32, ffi.Int32);
+typedef _PerfConfD = void Function(int, int);
+typedef _ThermalFn = ffi.Float Function(ffi.Int32);
+typedef _ThermalFnD = double Function(int);
 typedef _FreeStr = ffi.Void Function(ffi.Pointer<Utf8>);
 typedef _FreeStrD = void Function(ffi.Pointer<Utf8>);
 typedef _FreeImg = ffi.Void Function(ffi.Pointer<DappleImageStruct>);
@@ -46,6 +81,11 @@ typedef _Export = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Point
     ffi.Int32, ffi.Int32, ffi.Pointer<Utf8>);
 typedef _ExportD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int, int,
     ffi.Pointer<Utf8>);
+
+typedef _RenderFrame = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+    ffi.Pointer<DappleFrameRequestStruct>, ffi.Pointer<DappleImageStruct>, ffi.Pointer<ffi.Pointer<Utf8>>);
+typedef _RenderFrameD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+    ffi.Pointer<DappleFrameRequestStruct>, ffi.Pointer<DappleImageStruct>, ffi.Pointer<ffi.Pointer<Utf8>>);
 
 typedef _AnalyzeP = ffi.Pointer<Utf8> Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>);
 typedef _AnalyzePD = ffi.Pointer<Utf8> Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>);
@@ -116,6 +156,9 @@ typedef _MotionFromVideo = ffi.Int32 Function(
 typedef _MotionFromVideoD = int Function(
     ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<ffi.Pointer<Utf8>>);
 
+typedef _LoadMem = ffi.Int32 Function(ffi.Pointer<ffi.Void>, ffi.Size);
+typedef _LoadMemD = int Function(ffi.Pointer<ffi.Void>, int);
+
 class DappleBindings {
   DappleBindings(ffi.DynamicLibrary lib)
       : version = lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_version'),
@@ -131,7 +174,23 @@ class DappleBindings {
         sessionAutoJson = lib.lookupFunction<_Auto, _AutoD>('dapple_session_auto_json'),
         sessionRender = lib.lookupFunction<_Render, _RenderD>('dapple_session_render'),
         sessionExportJpeg = lib.lookupFunction<_Export, _ExportD>('dapple_session_export_jpeg'),
+        // Interactive frames (image + analysis in one call, baked lattice, regions); null on older libraries.
+        sessionRenderFrame = lib.providesSymbol('dapple_session_render_frame')
+            ? lib.lookupFunction<_RenderFrame, _RenderFrameD>('dapple_session_render_frame')
+            : null,
         // Added by the engine work running in parallel: guard against older libraries.
+        perfConfigure = lib.providesSymbol('dapple_perf_configure')
+            ? lib.lookupFunction<_PerfConf, _PerfConfD>('dapple_perf_configure')
+            : null,
+        threadBackground = lib.providesSymbol('dapple_thread_background')
+            ? lib.lookupFunction<_PerfConf1, _PerfConf1D>('dapple_thread_background')
+            : null,
+        thermalHeadroom = lib.providesSymbol('dapple_thermal_headroom')
+            ? lib.lookupFunction<_ThermalFn, _ThermalFnD>('dapple_thermal_headroom')
+            : null,
+        perfInfoJson = lib.providesSymbol('dapple_perf_info_json')
+            ? lib.lookupFunction<_Info0, _Info0D>('dapple_perf_info_json')
+            : null,
         sessionAnalyzeJson = lib.providesSymbol('dapple_session_analyze_json')
             ? lib.lookupFunction<_Info, _Info>('dapple_session_analyze_json')
             : null,
@@ -175,6 +234,14 @@ class DappleBindings {
         motionPhotoValidate = lib.providesSymbol('dapple_motion_photo_validate_json')
             ? lib.lookupFunction<_CStrArg, _CStrArg>('dapple_motion_photo_validate_json')
             : null,
+        filmLoadPackMemory = lib.providesSymbol('dapple_film_load_pack_memory')
+            ? lib.lookupFunction<_LoadMem, _LoadMemD>('dapple_film_load_pack_memory')
+            : null,
+        filmListJson = lib.providesSymbol('dapple_film_list_json') ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_list_json') : null,
+        filmAttribution =
+            lib.providesSymbol('dapple_film_attribution') ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_attribution') : null,
+        filmSwatchesJson =
+            lib.providesSymbol('dapple_film_swatches_json') ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_swatches_json') : null,
         progressToCell = lib.providesSymbol('dapple_progress_to_cell')
             ? lib.lookup<ffi.NativeFunction<DappleProgressNative>>('dapple_progress_to_cell')
             : null;
@@ -192,6 +259,11 @@ class DappleBindings {
   final _AutoD sessionAutoJson;
   final _RenderD sessionRender;
   final _ExportD sessionExportJpeg;
+  final _RenderFrameD? sessionRenderFrame;
+  final _PerfConfD? perfConfigure;
+  final _PerfConf1D? threadBackground;
+  final _ThermalFnD? thermalHeadroom;
+  final _Info0D? perfInfoJson;
   final _Info? sessionAnalyzeJson;
   final _AnalyzePD? sessionAnalyzeParamsJson;
   final _CStrFnD? looksJson;
@@ -207,6 +279,10 @@ class DappleBindings {
   final _MotionWriteD? motionPhotoWrite;
   final _MotionFromVideoD? motionPhotoFromVideo;
   final _CStrArg? motionPhotoValidate;
+  final _LoadMemD? filmLoadPackMemory;
+  final _CStrFnD? filmListJson;
+  final _CStrFnD? filmAttribution;
+  final _CStrFnD? filmSwatchesJson;
   final ffi.Pointer<ffi.NativeFunction<DappleProgressNative>>? progressToCell;
 
   /// Opens the native library for the current platform. Throws if missing.

@@ -54,8 +54,9 @@ class MediaBridge {
       (await _media.invokeMethod<String>('copyToFile', {'uri': uri, 'dest': dest}))!;
 
   /// Inserts the JPEG into MediaStore Pictures/Dapple. Returns the new URI / path.
-  static Future<String> saveToGallery(String path, String name) async =>
-      (await _media.invokeMethod<String>('saveToGallery', {'path': path, 'name': name}))!;
+  /// [replace] first removes this app's earlier gallery item with the same name (regenerated Motion Photos).
+  static Future<String> saveToGallery(String path, String name, {bool replace = false}) async =>
+      (await _media.invokeMethod<String>('saveToGallery', {'path': path, 'name': name, 'replace': replace}))!;
 }
 
 /// Android: MediaStore.Files (images + RAW by extension) with a ContentObserver.

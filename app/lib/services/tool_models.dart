@@ -136,7 +136,7 @@ class ToolJob extends ChangeNotifier {
 
 /// Parameters of the Motion Photo tool.
 class LiveDraft {
-  LiveDraft({required this.video, this.startSec = 0, this.coverSec = 1.5, this.mute = true});
+  LiveDraft({required this.video, this.startSec = 0, this.coverSec = 1.5, this.mute = true, this.source = LiveSource.auto});
   final VideoItem video;
 
   /// Window start within the video; the window is [windowSec] long.
@@ -145,6 +145,9 @@ class LiveDraft {
   /// Absolute time of the still within the video (kept inside the window).
   double coverSec;
   bool mute;
+
+  /// 源色彩 (自动 / 标准 / S-Log3 / HLG).
+  LiveSource source;
 
   static const double windowSec = 3.0;
 
