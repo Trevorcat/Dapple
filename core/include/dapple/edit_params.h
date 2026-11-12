@@ -136,6 +136,8 @@ struct EditParams {
   // between a dark and a light median, filmBlack the paper black (-1 matte, 0 true Dmax, +1 display black), filmLatitude the
   // in-range fraction the stock is rescued to (0.55 .. 0.80 .. 0.98).
   float filmShoot = 0.f, filmPrint = 0.f, filmBlack = 0.f, filmLatitude = 0.f;
+  // film_cast: partial neutralisation of the print filter pack (-1 = every stock fully neutral, 0 = default, +1 = most native cast)
+  float filmCast = 0.f;
 
   // Optional creative look (3D LUT, .cube); applied in sRGB at the end.
   std::string lutPath;

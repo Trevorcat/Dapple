@@ -597,6 +597,7 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
   a.filmExposure = f.filmEv;
   a.printEv = f.printEv;
   a.black = f.black;
+  a.cast = f.cast;
   a.warmth = f.warmth;
   a.tint = f.tint;
   a.grainPct = f.grainPct;

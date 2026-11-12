@@ -211,6 +211,7 @@ void resolveFilm(const ParamSet& ps, const FrameGeom& geom, FilmResolved& out) {
   for (int c = 0; c < 3; ++c) out.gain[c] = g[c] * evGain;
   out.printEv = e.filmPrintEv;
   out.black = e.filmBlack;
+  out.cast = e.filmCast;
   out.warmth = e.filmWarmth;
   out.tint = e.filmTint;
   out.grainPct = e.filmGrain;
@@ -274,6 +275,15 @@ Status bakePrintScan(const void* resolved, std::span<const void* const>, void** 
   {
     const dapple::film::FilmParams fp = makeParams(r, r.quality == 0 ? 0 : 2);
     std::lock_guard<std::mutex> lock(m->m);
+    {  // partial neutralisation: the pack of this stock moved towards the reference pack of its paper (resets to the solved pack at 0)
+      double rm = 0, ry = 0;
+      const float k = dapple::filmCastMix(r.cast);
+      const auto dl = dapple::film::defaultLibrary();
+      if (k > 0.f && !r.scan && r.paper && dl.get() == r.lib && dapple::filmCastReferencePack(dl, r.stock->stock, r.paper->stock, &rm, &ry))
+        m->model->setCast(rm, ry, k);
+      else
+        m->model->setCast(0, 0, 0);
+    }
     m->model->setBlackMix(fp.scanner.blackMix);
     m->model->rebalance(fp.enlarger.mFilterShift, fp.enlarger.yFilterShift);
     m->model->setPrintExposure(std::exp2(-double(std::clamp(r.printEv, -9.f, 9.f))));
@@ -352,6 +362,7 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
   hp.f32(r.tint);
   hp.f32(r.printEv);
   hp.f32(r.black);
+  hp.f32(dapple::filmCastMix(r.cast));
   hp.i32(dapple::filmPaperMappingEnabled());
   hp.i32(r.fx.enlargerFilter != 0 && r.quality != 0 && !r.scan);  // split-path tables
   out.raw = cachedTable(raws, ks, bakeRaw, r);

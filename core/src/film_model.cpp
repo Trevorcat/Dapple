@@ -375,6 +375,13 @@ void FilmModel::init() {
   }
   if (!scanFilm_) {
     if (p_.settings.neutralPrintFilters) solveNeutral();
+    mSolved_ = p_.enlarger.mFilterNeutral;
+    ySolved_ = p_.enlarger.yFilterNeutral;
+    castKnown_ = p_.settings.neutralPrintFilters;
+    if (castKnown_ && p_.enlarger.neutralMix != 0) {  // partial neutralisation (EditParams::filmCast)
+      p_.enlarger.mFilterNeutral = mSolved_ + (p_.enlarger.refMNeutral - mSolved_) * p_.enlarger.neutralMix;
+      p_.enlarger.yFilterNeutral = ySolved_ + (p_.enlarger.refYNeutral - ySolved_) * p_.enlarger.neutralMix;
+    }
     buildEnlarger(p_.enlarger.cFilterNeutral, p_.enlarger.mFilterNeutral + p_.enlarger.mFilterShift,
                   p_.enlarger.yFilterNeutral + p_.enlarger.yFilterShift);
     buildBlackWhite();

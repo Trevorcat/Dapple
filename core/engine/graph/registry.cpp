@@ -147,7 +147,7 @@ NodeRegistry::NodeRegistry() {
   {
     ParamMask m = FRAME;
     m.add(WB).add(P.mask({"exposure", "filmStock", "filmPaper", "film_exp", "film_warmth", "film_tint", "film_grain",
-                          "film_halation", "ctx.filmKeyEv", "ctx.filmPrintEv", "film_black", "ctx.camera", "ctx.source", "ctx.filmLib", "ctx.quality", "ctx.filmActive"}));
+                          "film_halation", "ctx.filmKeyEv", "ctx.filmPrintEv", "film_black", "film_cast", "ctx.camera", "ctx.source", "ctx.filmLib", "ctx.quality", "ctx.filmActive"}));
     NodeDesc& d = def(NodeType::FilmSim, "FilmSim", Domain::Image, Footprint::Super, 1, 1, m);
     d.usesGeometry = true;
     d.haloNote = "spectral film simulator incl. halation / DIR / grain / scan";
@@ -171,7 +171,7 @@ NodeRegistry::NodeRegistry() {
   {
     // dragging print warmth / tint re-bakes only this table
     NodeDesc& d = def(NodeType::FilmTablePrintScan, "FilmTablePrintScan", Domain::Table, Footprint::Global, 0, 0,
-                      P.mask({"filmStock", "filmPaper", "film_warmth", "film_tint", "ctx.filmPrintEv", "film_black", "ctx.filmLib"}));
+                      P.mask({"filmStock", "filmPaper", "film_warmth", "film_tint", "ctx.filmPrintEv", "film_black", "film_cast", "ctx.filmLib"}));
     d.cache = CacheHint::Keep;
     d.haloNote = "33^3 film density -> display sRGB LUT, glare white, sRGB decode";
   }

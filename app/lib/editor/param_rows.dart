@@ -7,6 +7,7 @@ import 'dart:ui' show Offset;
 import '../model/catalog.dart';
 import '../model/film_catalog.dart';
 import '../model/film_names.dart';
+import '../model/film_pad.dart';
 import '../model/params.dart';
 import 'gesture_arbiter.dart' show ActiveKind;
 
@@ -30,6 +31,7 @@ class RowContext {
     required this.nearestTone,
     required this.sel,
     this.film = FilmCatalog.empty,
+    this.filmRanges = FilmPadRanges.all,
   });
   final EditState edit;
   final String defaultLookId;
@@ -39,6 +41,9 @@ class RowContext {
 
   /// The film library of the engine (empty = no pack, the film rows are not offered).
   final FilmCatalog film;
+
+  /// Which ends of the film pad axes change the render for this photo and stock (engine answer; all effective when unknown).
+  final FilmPadRanges filmRanges;
 }
 
 class ParamRow {
@@ -67,6 +72,7 @@ class ParamRow {
     this.padX,
     this.padY,
     this.padLabels = const [],
+    this.padEff = const [true, true, true, true],
   });
 
   final String id, label;
@@ -105,6 +111,10 @@ class ParamRow {
   /// edge labels: left, right, bottom, top.
   final String? padX, padY;
   final List<String> padLabels;
+
+  /// [TwoD.offset]: whether the X axis' -1 and +1 ends and the Y axis' -1 (bottom) and +1 (top) ends change the render.
+  /// An ineffective end is unreachable: the cursor stops at the centre line and the dead half is drawn hatched.
+  final List<bool> padEff;
 
   /// Resets this row to its auto position.
   final EditState Function(EditState, RowContext)? reset;
@@ -305,6 +315,7 @@ ParamRow _custom({
   String? padX,
   String? padY,
   List<String> padLabels = const [],
+  List<bool> padEff = const [true, true, true, true],
 }) =>
     ParamRow._(
       id: id,
@@ -330,6 +341,7 @@ ParamRow _custom({
       padX: padX,
       padY: padY,
       padLabels: padLabels,
+      padEff: padEff,
     );
 
 /// Rows of category [g] for the current selections (requirements 4.15.5, top to bottom).
@@ -546,14 +558,20 @@ List<ParamRow> _filmRows(RowContext c) {
   }
   rows.addAll([
     ParamRow.spec('film_strength', hint: '胶片效果与原图的混合比例'),
-    _offsetPad(
-      id: 'film_expo',
-      label: '曝光',
-      x: 'film_shoot',
-      y: 'film_print',
-      labels: const ['欠曝', '过曝', '深', '浅'],
-      hint: '横向：拍摄时欠曝或过曝；纵向：冲印的深浅。中心为自动',
-    ),
+    ?_filmPadRow(c,
+        id: 'film_expo',
+        label: '曝光',
+        x: 'film_shoot',
+        y: 'film_print',
+        labels: const ['欠曝', '过曝', '深', '浅'],
+        hint: '横向：拍摄时欠曝或过曝；纵向：冲印的深浅。中心为自动'),
+    ?_filmPadRow(c,
+        id: 'film_texture',
+        label: '质感',
+        x: 'film_cast',
+        y: 'film_black',
+        labels: const ['中性', '本色', '抬黑', '压黑'],
+        hint: '横向：中性（校正过的冲印）到本色（保留胶片色偏）；纵向：黑位，抬黑到压黑。中心为自动'),
     _custom(
       id: 'film_latitude',
       label: '宽容度',
@@ -567,19 +585,6 @@ List<ParamRow> _filmRows(RowContext c) {
       write: (e, v) => e.withValue('film_latitude', latitudeFromPercent(v)),
       fmt: (v) => '${v.round()}%',
     ),
-    _custom(
-      id: 'film_black',
-      label: '黑位',
-      kind: RowKind.oneD,
-      group: g,
-      min: -100,
-      max: 100,
-      auto: 0,
-      hint: '0 为纸的真黑；负值抬黑（哑光），正值压黑',
-      read: (e) => (e.values['film_black'] ?? 0) * 100,
-      write: (e, v) => e.withValue('film_black', v / 100),
-      fmt: (v) => fmtValue(Fmt.signed, v),
-    ),
     ParamRow.spec('film_grain', hint: '颗粒量，100 为该胶片的标准颗粒'),
     ParamRow.spec('film_halation', hint: '高光向周围的红色渗光'),
     if (stock.printed && !scanned) ...[
@@ -590,8 +595,41 @@ List<ParamRow> _filmRows(RowContext c) {
   return rows;
 }
 
+/// A film pad row for the current photo and stock: a 2D pad when both axes change the render, a one-axis ruler for the
+/// live axis when the other is dead, nothing when both are dead. A half-dead axis keeps the pad but makes that end unreachable.
+ParamRow? _filmPadRow(RowContext c,
+    {required String id, required String label, required String x, required String y, required List<String> labels, String? hint}) {
+  final r = c.filmRanges;
+  final xDead = r.dead(x), yDead = r.dead(y);
+  if (xDead && yDead) return null;
+  if (xDead || yDead) {
+    final key = xDead ? y : x;
+    return _custom(
+      id: id,
+      label: label,
+      kind: RowKind.oneD,
+      group: EGroup.style,
+      min: r.lo(key) ? -100 : 0,
+      max: r.hi(key) ? 100 : 0,
+      auto: 0,
+      hint: hint,
+      read: (e) => (e.values[key] ?? 0) * 100,
+      write: (e, v) => e.withValue(key, v / 100),
+      fmt: (v) => fmtValue(Fmt.signed, v),
+    );
+  }
+  return _offsetPad(id: id, label: label, x: x, y: y, labels: labels, hint: hint, eff: [r.lo(x), r.hi(x), r.lo(y), r.hi(y)]);
+}
+
 /// A film offset pad: two params-map keys, both normalised offsets in [-1, +1], 0 = automatic (the pad's centre).
-ParamRow _offsetPad({required String id, required String label, required String x, required String y, required List<String> labels, String? hint}) =>
+ParamRow _offsetPad(
+        {required String id,
+        required String label,
+        required String x,
+        required String y,
+        required List<String> labels,
+        String? hint,
+        List<bool> eff = const [true, true, true, true]}) =>
     _custom(
       id: id,
       label: label,
@@ -601,6 +639,7 @@ ParamRow _offsetPad({required String id, required String label, required String 
       padX: x,
       padY: y,
       padLabels: labels,
+      padEff: eff,
       hint: hint,
       reset: (e, c) => e.withValue(x, 0).withValue(y, 0),
     );

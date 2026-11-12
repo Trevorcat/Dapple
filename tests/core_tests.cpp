@@ -719,7 +719,7 @@ double jsonNumber(const std::string& json, const std::string& key) {
 
 void testAllKeys() {
   const auto entries = schemaEntries();
-  CHECK(entries.size() == 87);  // 74 contract keys + lookStrength, toneStrength, lutAmount + 10 film keys (6 + film_shoot, film_print, film_black, film_latitude)
+  CHECK(entries.size() == 88);  // 74 contract keys + lookStrength, toneStrength, lutAmount + 10 film keys (6 + film_shoot, film_print, film_black, film_latitude, film_cast)
   for (const std::string& k : contractKeys()) {
     const bool found = std::any_of(entries.begin(), entries.end(), [&](const SchemaEntry& e) { return e.key == k; });
     CHECK(found);

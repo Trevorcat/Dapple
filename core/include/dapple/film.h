@@ -170,6 +170,9 @@ struct EnlargerParams {
   bool printExposureCompensation = true, normalizePrintExposure = true;
   double yFilterShift = 0, mFilterShift = 0;
   double yFilterNeutral = 55, mFilterNeutral = 65, cFilterNeutral = 0;  // replaced by the solved balance
+  // Partial neutralisation (EditParams::filmCast): the solved neutral M / Y pack of this stock is moved `neutralMix` (0..1) of the way
+  // to the reference pack (refMNeutral / refYNeutral: the solved pack of the reference stock of this paper); 0 = fully neutralised.
+  double neutralMix = 0, refMNeutral = 0, refYNeutral = 0;
   DiffusionFilterParams diffusionFilter;
   double preflashExposure = 0, preflashYFilterShift = 0, preflashMFilterShift = 0;
 };

@@ -295,11 +295,17 @@ class DetentStepper {
 
 /// 2D relative mapper for the colour palette (0.04..0.96 on both axes, 300 dp = full range).
 class PaletteMapper {
-  PaletteMapper({required this.defX, required this.defY, this.lo = 0.04, this.hi = 0.96});
+  PaletteMapper({required this.defX, required this.defY, this.lo = 0.04, this.hi = 0.96, double? loX, double? hiX, double? loY, double? hiY})
+      : loX = loX ?? lo,
+        hiX = hiX ?? hi,
+        loY = loY ?? lo,
+        hiY = hiY ?? hi;
   final double defX, defY;
 
-  /// Reachable range on both axes (0.04..0.96 for the colour palette, 0..1 for the film offset pads).
+  /// Reachable range on both axes (0.04..0.96 for the colour palette, 0..1 for the film offset pads) and, when an
+  /// axis end is unreachable (an ineffective half of a film pad), per axis: the cursor stops there.
   final double lo, hi;
+  final double loX, hiX, loY, hiY;
 
   double x = 0.5, y = 0.5;
   bool snapped = false;
@@ -311,8 +317,8 @@ class PaletteMapper {
   Landmark landmark = Landmark.none;
 
   void begin(double sx, double sy) {
-    _rx = x = sx.clamp(lo, hi).toDouble();
-    _ry = y = sy.clamp(lo, hi).toDouble();
+    _rx = x = sx.clamp(loX, hiX).toDouble();
+    _ry = y = sy.clamp(loY, hiY).toDouble();
     snapped = false;
     _snapTravel = 0;
     _noCapture = _dist(x, y) <= 0.03 * 2;
@@ -341,22 +347,22 @@ class PaletteMapper {
       _ry += dy * k;
     }
     var hitEnd = false;
-    if (_rx > hi || _rx < lo) {
-      _rx = _rx.clamp(lo, hi).toDouble();
+    if (_rx > hiX || _rx < loX) {
+      _rx = _rx.clamp(loX, hiX).toDouble();
       if (_endX) {
         hitEnd = true;
         _endX = false;
       }
-    } else if (_rx > lo + 0.05 && _rx < hi - 0.05) {
+    } else if (_rx > loX + 0.05 && _rx < hiX - 0.05) {
       _endX = true;
     }
-    if (_ry > hi || _ry < lo) {
-      _ry = _ry.clamp(lo, hi).toDouble();
+    if (_ry > hiY || _ry < loY) {
+      _ry = _ry.clamp(loY, hiY).toDouble();
       if (_endY) {
         hitEnd = true;
         _endY = false;
       }
-    } else if (_ry > lo + 0.05 && _ry < hi - 0.05) {
+    } else if (_ry > loY + 0.05 && _ry < hiY - 0.05) {
       _endY = true;
     }
     if (!snapped) {

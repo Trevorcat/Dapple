@@ -1072,7 +1072,7 @@ char* dapple_session_film_pad_json(DappleSession* session, const char* params_js
           if (!lutFile.empty()) lut = loadLut(lutFile);
           pad = filmPadFor(params, *session->camera, lut.get(), *session->keyProxy);
         }
-        char buf[900];
+        char buf[1800];
         if (!pad.ok) return dupString("{\"ok\":false}");
         std::snprintf(buf, sizeof buf,
                       "{\"ok\":true,\"shared_ev\":%.4f,\"final_ev\":%.4f,\"fraction\":%.4f,\"shoot_ev\":[%.4f,%.4f,%.4f],"
@@ -1081,7 +1081,19 @@ char* dapple_session_film_pad_json(DappleSession* session, const char* params_js
                       double(pad.shootEv[2]), double(pad.printL[0]), double(pad.printL[1]), double(pad.printL[2]), double(pad.blackL[0]),
                       double(pad.blackL[1]), double(pad.blackL[2]), double(pad.latitude[0]), double(pad.latitude[1]), double(pad.latitude[2]),
                       double(pad.whiteL));
-        return dupString(buf);
+        std::string js = buf;
+        js.pop_back();  // the closing brace: more axes follow
+        char b2[900];
+        auto tf = [](bool v) { return v ? "true" : "false"; };
+        std::snprintf(b2, sizeof b2,
+                      ",\"cast_k\":[%.3f,%.3f,%.3f],\"cast_grey_c\":[%.2f,%.2f,%.2f],\"cast_grey_worst\":[%.2f,%.2f,%.2f],\"cast_grey_mean\":[%.2f,%.2f,%.2f],"
+                      "\"effective_lo\":{\"film_shoot\":%s,\"film_print\":%s,\"film_black\":%s,\"film_cast\":%s},\"effective_hi\":{\"film_shoot\":%s,\"film_print\":%s,\"film_black\":%s,\"film_cast\":%s}}",
+                      double(pad.castK[0]), double(pad.castK[1]), double(pad.castK[2]), double(pad.castGreyC[0]), double(pad.castGreyC[1]),
+                      double(pad.castGreyC[2]), double(pad.castGreyWorst[0]), double(pad.castGreyWorst[1]), double(pad.castGreyWorst[2]),
+                      double(pad.castGreyMean[0]), double(pad.castGreyMean[1]), double(pad.castGreyMean[2]), tf(pad.effectiveLo[0]),
+                      tf(pad.effectiveLo[1]), tf(pad.effectiveLo[2]), tf(pad.effectiveLo[3]), tf(pad.effectiveHi[0]), tf(pad.effectiveHi[1]),
+                      tf(pad.effectiveHi[2]), tf(pad.effectiveHi[3]));
+        return dupString(js + b2);
       },
       static_cast<char*>(nullptr));
 }

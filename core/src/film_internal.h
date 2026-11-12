@@ -241,6 +241,21 @@ class FilmModel {
   // next bake*(); the match solver (film_match.h) drives it as 2^-printEv.
   void setPrintExposure(double pe) { pe_ = pe; }
   // Paper black mix (scanner.blackMix) for the next bake*(); rebuilds the paper-to-screen mapping.
+  // Partial neutralisation: the print pack becomes lerp(solved pack, reference pack, k) for the next rebalance() / bake*().
+  void setCast(double refM, double refY, double k) {
+    if (scanFilm_ || !castKnown_) return;
+    p_.enlarger.neutralMix = k;
+    p_.enlarger.refMNeutral = refM;
+    p_.enlarger.refYNeutral = refY;
+    p_.enlarger.mFilterNeutral = mSolved_ + (refM - mSolved_) * k;
+    p_.enlarger.yFilterNeutral = ySolved_ + (refY - ySolved_) * k;
+  }
+  // The solved (fully neutralised) pack, whatever setCast() did since.
+  bool solvedNeutral(double& m, double& y) const {
+    m = mSolved_;
+    y = ySolved_;
+    return castKnown_;
+  }
   void setBlackMix(double mix) {
     p_.scanner.blackMix = mix;
     buildBlackWhite();
@@ -297,6 +312,8 @@ class FilmModel {
   void buildPostMap();
   Vec3 rawPre_{};
   std::vector<double> paperAxis_, paperCurve_[3];
+  double mSolved_ = 0, ySolved_ = 0;
+  bool castKnown_ = false;
   Vec3 dMidDir_{};
   Vec3 dMinFilm_{}, dMaxFilm_{};
   Vec3 dMinScan_{}, dMaxScan_{};

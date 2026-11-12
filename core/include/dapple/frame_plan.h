@@ -44,6 +44,7 @@ struct FramePlan {
     float filmEv = 0.f;             // film_exp + the film exposure of the automatic match
     float printEv = 0.f;            // print exposure (EditParams::filmPrintEv)
     float black = 0.f;              // paper black (EditParams::filmBlack)
+    float cast = 0.f;               // partial neutralisation (EditParams::filmCast)
     float warmth = 0.f, tint = 0.f, grainPct = 100.f, halationPct = 100.f;
     float formatScale = 1.f;
     int quality = 2;                // 0 off, 1 interactive, 2 full

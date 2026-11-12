@@ -56,6 +56,7 @@ double extraHeight(ParamRow r) {
     case 'toneTarget':
       return 92;
     case 'film_expo':
+    case 'film_texture':
     case 'palette':
       return 148; // a pad of about 172 x 132 dp: big enough to steer with a thumb
     case 'wheel':

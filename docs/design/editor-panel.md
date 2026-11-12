@@ -57,21 +57,38 @@
 - 尺子和垫板不经过仲裁器，而是自己用一个 `ClaimPanRecognizer` 立即占住指针，超过 3 dp 后调用 `EditorController.beginOn(row, axis, …)`，再喂 `adjustMove`；`beginOn` 先把该行设为分类的活动行并聚焦，然后走 `adjustBegin`。一次手势 = 一个撤销步。
 - 性能：面板只在结构性变化（选择、一次拖动的第一步、撤销）时重建；拖动中，尺子、垫板、被选芯片的数值各自监听 `readout` / `edits` 通知重绘，外层有 `RepaintBoundary`；刻度标签的 `TextPainter` 按“文字 + 颜色”缓存；拖动期间面板不整体重建。
 
-## 5. 胶片的曝光垫板、黑位与宽容度（v0.3）
+## 5. 胶片的两块垫板与宽容度（v0.4）
 
 风格里选了胶片后，芯片条里 `胶片强度` 之后是：
 
 | 芯片 | 控件 | 参数键（params 表，归一化，范围 [-1, +1]，0 = 自动） |
 |---|---|---|
 | 曝光 | 2D 垫板：X 拍摄曝光（左欠曝 ↔ 右过曝），Y 冲印深浅（下深 ↔ 上浅） | `film_shoot`（X，+1 = 过曝）、`film_print`（Y，+1 = 浅） |
+| 质感 | 2D 垫板：X 本色（左 中性 ↔ 右 本色），Y 黑位（下 抬黑 ↔ 上 压黑） | `film_cast`（X，-1 = 中性：完全校色的冲印；0 = 默认的部分校色；+1 = 本色：保留胶片的大部分色偏）、`film_black`（Y，+1 = 压黑，-1 = 抬黑，0 = 纸的真黑） |
 | 宽容度 | 尺子，按百分比显示：-1 / 0 / +1 = 55 / 80 / 98 %（分段线性，80 % 为自动） | `film_latitude` |
-| 黑位 | 尺子，显示 ×100：-1 = 抬黑（哑光黑），0 = 纸的真黑（自动），+1 = 压黑（拉到显示黑） | `film_black` |
 
-最初的“质感”垫板（X 相纸反差 `film_grade`，Y 黑位）已去掉：引擎没有 `film_grade`（没有物理上有意义的相纸反差把手），X 轴是死的；黑位改为独立尺子。**待负责人确认**：曝光垫板的第二根轴（冲印深浅）是否真的值得一块 2D 垫板，还是拆成两条尺子（拍摄曝光 / 冲印深浅）更直接；现在两个量互相独立，垫板的价值只在“一指同时调两个”。
+垫板中心是“自动”：圆环和“自动”字样，磁吸（沿用调色盘的映射，0..1 范围），双击复位两轴；读数（`+18 +11`，中心为“自动”）在芯片里；四个边缘有方向字（欠曝 / 过曝 / 深 / 浅；中性 / 本色 / 抬黑 / 压黑）。选中垫板时胶片色块条隐藏（垫板需要空间），选胶片 / 相纸 / 尺子类行时仍显示。旧的 `胶片曝光`（`film_exp`）滑杆从界面移除，字段和规格保留，旧编辑仍会下发。`无` 清胶片时一并清掉这五个键（`filmValueKeys`）。浮动窗口里（大屏）同样出现这两块垫板（`extraHeight` 148）。
 
-旧的 `胶片曝光`（`film_exp`）滑杆从界面移除；字段和规格保留，旧编辑仍会下发。垫板中心是“自动”：圆环和“自动”字样，磁吸（沿用调色盘的映射，0..1 范围），双击复位两轴；读数（`+18 +11`，中心为“自动”）在芯片里；四个边缘有方向字（欠曝 / 过曝 / 深 / 浅）。选中垫板时胶片色块条隐藏（垫板需要空间），选胶片 / 相纸 / 尺子类行时仍显示。`无` 清胶片时一并清掉这四个键（`filmValueKeys`）。浮动窗口里（大屏）同样出现曝光垫板（`extraHeight` 148）。
+### 有效范围（引擎的 `dapple_session_film_pad_json`）
 
-**原生接入**（`app/lib/native/**` 未改）：引擎从编辑 JSON 里把 `film_shoot`、`film_print`、`film_black`、`film_latitude` 读成普通浮点，缺省 = 0；它们随 `EditState.toWire` 和其他 `film_*` 键一起下发（有胶片时才下发，0 时不下发），Dart 侧不需要新的绑定函数或字段。垫板的写入点只有 `EditorController._moveTwoD` 的 `TwoD.offset` 分支（`NATIVE BINDING` 注释）；规格在 `model/params.dart`。拖动时 `engine.beginInteraction(activeParam: ...)` 对曝光垫板传 `film_shoot`，对尺子传各自的键。
+一个轴的某一端如果对当前照片和胶片不改变渲染（例如反转片没有冲印：`film_print` +1 与 `film_cast` 无效），那一端**不可达**：
+
+- 半边失效：垫板保留，失效的那一半画成斜线阴影并变暗，光标停在中线，进不去（映射器 `PaletteMapper` 的单轴上下限）。
+- 一整根轴失效：垫板变成剩下那根轴的单轴尺子（尺子范围同样不含失效端，例如只剩 0..+100）。
+- 两根轴都失效：隐藏该芯片。
+- 刷新：照片、胶片（含相纸）或 `film_shoot` 变化后去抖 300 ms，在后台 isolate 里查询，拖动期间不查（抬手后再查）；引擎答不上来、没有该符号或答非所问时一律当作“全部有效”。
+
+期望的引擎 JSON（所有字段可缺省，缺省 = 有效；`ok:false` 也当作全部有效）：
+
+```json
+{"ok":true, "...现有字段...",
+ "effective_lo": {"film_shoot":true, "film_print":true, "film_black":true, "film_cast":true},
+ "effective_hi": {"film_shoot":true, "film_print":false, "film_black":true, "film_cast":false}}
+```
+
+`effective_lo` 是该键取 -1 时渲染是否有变化，`effective_hi` 是取 +1。也接受逐键对象形式 `{"film_print":{"effective_lo":true,"effective_hi":false}}`。Dart 侧：`lib/model/film_pad.dart`（`FilmPadRanges.parse`，容错），`DappleSession.filmPadJson`（可选符号 `dapple_session_film_pad_json(session, params_json)`，参数是当前照片的编辑 JSON），`EditorController.filmRanges`（可注入假实现做测试）。
+
+**原生接入**：引擎从编辑 JSON 里把 `film_shoot`、`film_print`、`film_black`、`film_cast`、`film_latitude` 读成普通浮点，缺省 = 0；它们随 `EditState.toWire` 和其他 `film_*` 键一起下发（有胶片时才下发，0 时不下发）。垫板的写入点只有 `EditorController._moveTwoD` 的 `TwoD.offset` 分支（`NATIVE BINDING` 注释）；规格在 `model/params.dart`。拖动时 `engine.beginInteraction(activeParam: ...)` 对垫板传 X 键（`film_shoot` / `film_cast`），对尺子传各自的键。
 
 ## 6. 大屏后续（本次未做）
 

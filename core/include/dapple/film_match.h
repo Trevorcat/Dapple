@@ -70,6 +70,14 @@ constexpr float kFilmGreyCard = 0.184f;
 // Nominal slope of the film + print system around mid-grey (display light grows as scene light ^ gamma; 1.25-1.5 per EV measured on the
 // eight showcase stocks between -1 and +1 EV, less towards the shoulder): the compensation is the display key divided by it.
 constexpr float kFilmSystemGamma = 1.15f;
+// Owner decision (option C): only this share of the scene-key compensation is applied (the film chain keeps depth, the highlights
+// of a high-key scene roll off in the paper). DAPPLE_FILM_SCENE_EV_SCALE=1 reproduces the previous default.
+constexpr float kFilmSceneKeyScale = 0.5f;
+// film_cast (partial neutralisation of the print filter pack): film_cast 0 -> k0, +1 -> kmax, -1 -> 0 (every stock fully neutralised).
+constexpr float kFilmCastK0 = 0.25f;
+constexpr float kFilmCastKMax = 0.6f;
+// Print film (cine) papers have no "Endura" reference stock: this is the reference negative of 2383 / 2393.
+constexpr const char* kFilmCastCineReference = "kodak_vision3_250d";
 constexpr float kFilmShadowFloorY = 0.004f;  // floor of a pixel's luminance in the metering average
 // Per-stock usability guarantee: the share of scene pixels that must fall inside the stock's [toe, shoulder]; a stock whose range
 // fits keeps the shared exposure, a narrow one is moved just enough (docs section 18). The user's film_latitude moves it.
@@ -180,11 +188,27 @@ void scenePlacement(const FilmLatitude& lat, const SceneStats& st, float ev, flo
 // v5 stage 3: the print exposure (EV, positive = brighter) at which an 18.4 % grey card exposed at box speed + the type convention
 // prints to L* 50 relative to the paper white (paper "none": scan lamp). Calibrated once per (stock, paper), cached, image independent.
 float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper,
-                        float deltaEv = 0.f);
+                        float deltaEv = 0.f, float castK = 0.f);
 // The same for a negative whose film EV was moved by `deltaEv` from the shared exposure: the lab prints a denser / thinner
 // negative down / up (calibrated on a 0.5 EV grid and interpolated).
 float filmPrintConstantAt(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper,
-                          float deltaEv);
+                          float deltaEv, float castK = 0.f);
+
+// ---- film_cast: partial neutralisation of the print filter pack ('本色') ------------------------------------------------------
+// Mix k (0..1) from the slider -1..1: -1 -> 0, 0 -> kFilmCastK0, +1 -> kFilmCastKMax. 0 outside mode Meter / with the paper mapping off.
+float filmCastMixOf(float slider);
+float filmCastMix(float slider);
+// The reference stock whose solved pack is the reference of `paper` (the reference stock itself never changes).
+std::string filmCastReferenceStock(const film::FilmLibrary& lib, const std::string& paper);
+// Solved neutral M / Y pack of the reference stock of `paper`; false when there is no pack to mix with (slide / scan, unknown paper, or
+// `film` is the reference itself). Cached.
+bool filmCastReferencePack(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper,
+                           double* m, double* y);
+// Sets FilmParams::enlarger.neutralMix / refMNeutral / refYNeutral for mix k (fp.film and fp.paper must be set).
+void applyFilmCastMix(film::FilmParams& fp, const std::shared_ptr<const film::FilmLibrary>& lib, float k);
+inline void applyFilmCast(film::FilmParams& fp, const std::shared_ptr<const film::FilmLibrary>& lib, float slider) {
+  applyFilmCastMix(fp, lib, filmCastMix(slider));
+}
 
 // Share of the scene's pixels inside the stock's [toe, shoulder] at film EV `ev` (on top of the stats' own gain).
 float inRangeFraction(const SceneStats& st, const FilmLatitude& lat, float ev);
@@ -198,6 +222,7 @@ struct MeterInputs {
   SceneStats st0, stFull;   // before / after the develop exposure (the diagnostics and the range use stFull)
   float keyL0 = 0.f;        // median L* of the develop render at exposure 0
   float shoot = 0.f, print = 0.f, latitude = 0.f;  // EditParams::filmShoot / filmPrint / filmLatitude
+  float castK = 0.f;       // partial neutralisation mix in use (filmCastMix(EditParams::filmCast))
   float negativeBiasEv = kFilmNegativeBiasEv;
   // median L* of the film render at (film EV, print EV); only needed for film_print != 0
   std::function<float(float, float)> medianL;
@@ -216,6 +241,12 @@ struct FilmPadInfo {
   float latitude[3] = {0, 0, 0};      // in-range fraction at film_latitude -1, 0, +1
   float sharedEv = 0.f, finalEv = 0.f, fractionAtFinal = 0.f;
   float whiteL = 0.f;
+  // film_cast: mix k at -1 / 0 / +1 and the grey-card chroma C* of this stock at those mixes (mid grey, and worst / mean over the four neutral
+  // patches of a ColorChecker-like chart)
+  float castK[3] = {0, 0, 0}, castGreyC[3] = {0, 0, 0};
+  float castGreyWorst[3] = {0, 0, 0}, castGreyMean[3] = {0, 0, 0};
+  // does -1 / +1 of each axis change the render for this image and stock (index: shoot, print, black, cast)
+  bool effectiveLo[4] = {false, false, false, false}, effectiveHi[4] = {false, false, false, false};
 };
 FilmPadInfo filmPadInfo(const MeterInputs& in);
 // The same for an edit (develop pipeline + 256 px proxy); `ok` false without an active film or in a legacy mode.

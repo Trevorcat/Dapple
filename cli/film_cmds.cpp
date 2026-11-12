@@ -303,6 +303,18 @@ int cmdFilm(const std::vector<std::string>& args) {
   }
   // the develop pipeline's paper-to-screen mapping (white / black correction) goes with the automatic exposure
   if (a.get("--auto-exposure", "match") == "match") applyFilmPaperMapping(p, std::strtof(a.get("--black", "0").c_str(), nullptr));
+  // film_cast: partial neutralisation of the print pack. --cast s (slider -1..1, default 0 in match mode) or --cast-k k (raw mix)
+  float castK = 0.f;
+  {
+    float k = -1.f;
+    if (a.has("--cast-k")) k = std::strtof(a.get("--cast-k").c_str(), nullptr);
+    else if (a.has("--cast")) k = filmCastMix(std::strtof(a.get("--cast").c_str(), nullptr));
+    else if (a.get("--auto-exposure", "match") == "match") k = filmCastMix(0.f);
+    if (k >= 0.f) {
+      applyFilmCastMix(p, lib, k);
+      castK = k;
+    }
+  }
   FilmSimulator sim(lib);
   FilmTimings bt;
   if (!sim.setParams(p, &err, &bt)) {
@@ -403,6 +415,7 @@ int cmdFilm(const std::vector<std::string>& args) {
       mi_in.shoot = std::atof(a.get("--shoot", "0").c_str());
       mi_in.print = std::atof(a.get("--print", "0").c_str());
       mi_in.latitude = std::atof(a.get("--latitude", "0").c_str());
+      mi_in.castK = castK;
       mi_in.negativeBiasEv = mopt.negativeBiasEv;
       mi_in.medianL = [&](float fev, float pev) {
         FilmParams qq = q;

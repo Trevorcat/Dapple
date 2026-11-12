@@ -662,9 +662,13 @@ class FilmPaperStrip extends StatelessWidget {
 /// ring and 自动. Edge labels name the four directions (left, right, bottom, top). Display only; the
 /// [ControlPad] around it owns the drag.
 class OffsetPadView extends StatelessWidget {
-  const OffsetPadView({super.key, required this.x, required this.y, required this.labels, required this.width, required this.height});
+  const OffsetPadView(
+      {super.key, required this.x, required this.y, required this.labels, required this.width, required this.height, this.eff = const [true, true, true, true]});
   final double x, y;
   final List<String> labels;
+
+  /// X -1 / X +1 / Y -1 (bottom) / Y +1 (top) change the render; an ineffective half is drawn hatched and unreachable.
+  final List<bool> eff;
   final double width, height;
 
   @override
@@ -680,7 +684,7 @@ class OffsetPadView extends StatelessWidget {
           height: height,
           child: CustomPaint(
             key: const ValueKey('offset-pad-paint'),
-            painter: _OffsetPadPainter(x, y, labels, c.chip, c.sep, c.text2, c.accentBtn, DefaultTextStyle.of(context).style),
+            painter: _OffsetPadPainter(x, y, labels, c.chip, c.sep, c.text2, c.accentBtn, DefaultTextStyle.of(context).style, eff),
           ),
         ),
       ),
@@ -689,9 +693,10 @@ class OffsetPadView extends StatelessWidget {
 }
 
 class _OffsetPadPainter extends CustomPainter {
-  _OffsetPadPainter(this.x, this.y, this.labels, this.bg, this.grid, this.text, this.accent, this.base);
+  _OffsetPadPainter(this.x, this.y, this.labels, this.bg, this.grid, this.text, this.accent, this.base, this.eff);
   final double x, y;
   final List<String> labels;
+  final List<bool> eff;
   final Color bg, grid, text, accent;
   final TextStyle base;
 
@@ -708,6 +713,25 @@ class _OffsetPadPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size s) {
     canvas.drawRect(Offset.zero & s, Paint()..color = bg);
+    // ineffective halves: dimmed and hatched, the cursor cannot enter them
+    final dead = <Rect>[
+      if (!eff[0]) Rect.fromLTWH(0, 0, s.width / 2, s.height),
+      if (!eff[1]) Rect.fromLTWH(s.width / 2, 0, s.width / 2, s.height),
+      if (!eff[2]) Rect.fromLTWH(0, s.height / 2, s.width, s.height / 2),
+      if (!eff[3]) Rect.fromLTWH(0, 0, s.width, s.height / 2),
+    ];
+    for (final r in dead) {
+      canvas.save();
+      canvas.clipRect(r);
+      canvas.drawRect(r, Paint()..color = text.withValues(alpha: 0.10));
+      final h = Paint()
+        ..color = text.withValues(alpha: 0.28)
+        ..strokeWidth = 1;
+      for (var d = -s.height; d < s.width; d += 9) {
+        canvas.drawLine(Offset(d, s.height), Offset(d + s.height, 0), h);
+      }
+      canvas.restore();
+    }
     final g = Paint()
       ..color = grid
       ..strokeWidth = 1;
@@ -755,5 +779,5 @@ class _OffsetPadPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_OffsetPadPainter o) => o.x != x || o.y != y || o.bg != bg || o.text != text || o.labels != labels;
+  bool shouldRepaint(_OffsetPadPainter o) => o.x != x || o.y != y || o.bg != bg || o.text != text || o.labels != labels || o.eff.toString() != eff.toString();
 }

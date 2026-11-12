@@ -1,8 +1,11 @@
 // Film simulation in the editor's 风格 window: stock strip, paper row only for negatives, relative-drag
 // rows, undo / redo, the licences page, and goldens at phone and Find N5 inner-screen size.
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:dapple/editor/param_rows.dart' show latitudeFromPercent, latitudePercent;
+import 'package:dapple/model/film_pad.dart';
+import 'package:dapple/screens/editor/mini_maps.dart' show OffsetPadView;
 import 'package:dapple/model/film_catalog.dart';
 import 'package:dapple/model/film_names.dart';
 import 'package:dapple/model/params.dart';
@@ -20,7 +23,7 @@ import 'editor_v2_test.dart' show Finger, dump, n5Dpr, n5Phys, phoneDpr, phonePh
 import 'support/film_fixture.dart';
 import 'support/harness.dart';
 
-Future<(AppState, String)> openFilm(WidgetTester t, {Size phys = phonePhys, double dpr = phoneDpr, bool pack = true, String title = '外滩夕阳'}) async {
+Future<(AppState, String)> openFilm(WidgetTester t, {Size phys = phonePhys, double dpr = phoneDpr, bool pack = true, String title = '外滩夕阳', Future<String?> Function(Map<String, dynamic>)? fetch}) async {
   setView(t, phys, dpr);
   await loadTestFonts();
   final app = AppState.demo();
@@ -33,7 +36,7 @@ Future<(AppState, String)> openFilm(WidgetTester t, {Size phys = phonePhys, doub
       theme: buildTheme(Brightness.light),
       darkTheme: buildTheme(Brightness.dark),
       themeMode: ThemeMode.light,
-      home: EditorPage(app: app, photoId: id, resamplePointers: false),
+      home: EditorPage(app: app, photoId: id, resamplePointers: false, filmPadFetcher: fetch),
     ),
   ));
   await settle(t);
@@ -157,11 +160,11 @@ void main() {
       final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75);
       await openFilmRow(t);
       await pickStock(t, 'kodak_portra_400');
-      for (final k in ['film_expo', 'film_black', 'film_latitude']) {
+      for (final k in ['film_expo', 'film_texture', 'film_latitude']) {
         expect(hasRow(k), isTrue, reason: k);
       }
       expect(hasRow('film_exp'), isFalse);
-      expect(hasRow('film_texture'), isFalse, reason: 'the engine has no film_grade: no 质感 pad');
+      expect(hasRow('film_black'), isFalse, reason: 'the black point lives in the 质感 pad');
       await selectStyleRow(t, 'film_expo');
       final pad = find.byKey(const ValueKey('pad-film_expo'));
       expect(pad, findsOneWidget);
@@ -208,28 +211,33 @@ void main() {
       expect(app.editOf(id).values.containsKey('film_print'), isFalse);
     });
 
-    testWidgets('黑位 is a ruler: right = 压黑 (+), left = 抬黑 (-), stored normalised, shown x100; 无 clears it', (t) async {
+    testWidgets('质感 pad: right = 本色 (+), up = 压黑 (+); left = 中性 (-), down = 抬黑 (-); on the wire; 无 clears them', (t) async {
       final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75);
       await openFilmRow(t);
       await pickStock(t, 'kodak_portra_400');
-      await selectStyleRow(t, 'film_black');
-      expect(find.byKey(const ValueKey('panel-ruler')), findsOneWidget);
-      final r = t.getRect(find.byKey(const ValueKey('panel-ruler')));
+      await selectStyleRow(t, 'film_texture');
+      final pad = find.byKey(const ValueKey('pad-film_texture'));
+      expect(pad, findsOneWidget);
+      expect(hasRow('film_black'), isFalse, reason: 'the black point lives in the pad now');
+      final r = t.getRect(pad);
       var f = await Finger.down(t, r.center);
-      await f.drag(const Offset(80, 2));
+      await f.drag(const Offset(70, -60), step: 6);
       await f.up();
       await settle(t);
-      final up = app.editOf(id).value('film_black');
-      expect(up, inInclusiveRange(0.05, 1.0), reason: '+ = stretched to display black');
-      expect(find.byKey(const ValueKey('value-film_black')), findsOneWidget);
-      app.applyEdit(id, (e) => e.withValue('film_black', 0));
+      var e = app.editOf(id);
+      expect(e.value('film_cast'), greaterThan(0), reason: 'right = 本色');
+      expect(e.value('film_black'), greaterThan(0), reason: 'up = 压黑');
+      expect(app.wireParams(app.photos.firstWhere((p) => p.id == id))['film_cast'], e.value('film_cast'));
+      expect(app.wireParams(app.photos.firstWhere((p) => p.id == id))['film_black'], e.value('film_black'));
+      app.applyEdit(id, (e) => e.withValue('film_cast', 0).withValue('film_black', 0));
       await settle(t, 3);
       f = await Finger.down(t, r.center);
-      await f.drag(const Offset(-80, 2));
+      await f.drag(const Offset(-70, 60), step: 6);
       await f.up();
       await settle(t);
-      expect(app.editOf(id).value('film_black'), inInclusiveRange(-1.0, -0.05), reason: '- = lifted, matte black');
-      expect(app.wireParams(app.photos.firstWhere((p) => p.id == id))['film_black'], app.editOf(id).value('film_black'));
+      e = app.editOf(id);
+      expect(e.value('film_cast'), inInclusiveRange(-1.0, -0.02), reason: 'left = 中性');
+      expect(e.value('film_black'), inInclusiveRange(-1.0, -0.02), reason: 'down = 抬黑');
       await selectStyleRow(t, 'film');
       await t.ensureVisible(find.byKey(const ValueKey('film-none')));
       await t.tap(find.byKey(const ValueKey('film-none')));
@@ -286,6 +294,171 @@ void main() {
       await f.up();
       await settle(t, 3);
       expect(app.editOf(id).value('film_shoot'), greaterThan(0));
+    });
+  });
+
+  group('effective ranges of the film pads', () {
+    String json(Map<String, dynamic> m) => jsonEncode({'ok': true, ...m});
+
+    test('the parser is tolerant: missing fields, wrong types, garbage and an old engine all mean effective', () {
+      for (final s in [null, '', 'nonsense', '[]', '{}', '{"ok":false}', '{"ok":true}', '{"effective_lo":3,"effective_hi":"no"}']) {
+        final r = FilmPadRanges.parse(s);
+        for (final k in filmPadKeys) {
+          expect(r.lo(k) && r.hi(k), isTrue, reason: '$s $k');
+        }
+        expect(r, FilmPadRanges.all);
+      }
+      final r = FilmPadRanges.parse(json({
+        'effective_lo': {'film_cast': false},
+        'effective_hi': {'film_print': false, 'film_cast': false, 'film_shoot': 'x'},
+      }));
+      expect(r.hi('film_print'), isFalse);
+      expect(r.lo('film_print'), isTrue, reason: 'a missing field is effective');
+      expect(r.dead('film_cast'), isTrue);
+      expect(r.dead('film_print'), isFalse);
+      expect(r.hi('film_shoot'), isTrue, reason: 'a non-bool is ignored');
+      // the per-key object form
+      final p = FilmPadRanges.parse(json({'film_black': {'effective_lo': false, 'effective_hi': false}}));
+      expect(p.dead('film_black'), isTrue);
+      expect(p.dead('film_shoot'), isFalse);
+    });
+
+    testWidgets('a dead half is not reachable: the cursor stops at the centre line and the half is drawn hatched', (t) async {
+      final calls = <Map<String, dynamic>>[];
+      final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75, fetch: (p) async {
+        calls.add(p);
+        return json({'effective_hi': {'film_print': false}}); // film_print +1 (up) does nothing
+      });
+      await openFilmRow(t);
+      await pickStock(t, 'kodak_portra_400');
+      await settle(t, 8);
+      expect(calls, isNotEmpty);
+      expect(calls.last['film'], 'kodak_portra_400');
+      await selectStyleRow(t, 'film_expo');
+      expect(t.widget<OffsetPadView>(find.byType(OffsetPadView)).eff, [true, true, true, false]);
+      final r = t.getRect(find.byKey(const ValueKey('pad-film_expo')));
+      var f = await Finger.down(t, r.center);
+      await f.drag(const Offset(60, -120), step: 6); // right and far up: into the dead half
+      await f.up();
+      await settle(t);
+      expect(app.editOf(id).value('film_shoot'), greaterThan(0), reason: 'the live axis moves');
+      expect(app.editOf(id).value('film_print'), 0, reason: 'the dead half cannot be entered');
+      app.applyEdit(id, (e) => e.withValue('film_shoot', 0));
+      await settle(t, 3);
+      f = await Finger.down(t, r.center);
+      await f.drag(const Offset(0, 90), step: 6); // down: the live half of film_print
+      await f.up();
+      await settle(t);
+      expect(app.editOf(id).value('film_print'), lessThan(0));
+    });
+
+    testWidgets('a dead axis turns the pad into a ruler for the live axis; no dead end on that ruler', (t) async {
+      final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75, fetch: (p) async {
+        return json({'effective_lo': {'film_cast': false}, 'effective_hi': {'film_cast': false, 'film_black': false}});
+      });
+      await openFilmRow(t);
+      await pickStock(t, 'kodak_portra_400');
+      await settle(t, 8);
+      expect(hasRow('film_texture'), isTrue, reason: 'film_black still has its lower half');
+      await selectStyleRow(t, 'film_texture');
+      expect(find.byKey(const ValueKey('pad-film_texture')), findsNothing);
+      expect(find.byKey(const ValueKey('panel-ruler')), findsOneWidget, reason: 'a single-axis ruler for film_black');
+      final r = t.getRect(find.byKey(const ValueKey('panel-ruler')));
+      var f = await Finger.down(t, r.center);
+      await f.drag(const Offset(120, 2));
+      await f.up();
+      await settle(t);
+      expect(app.editOf(id).value('film_black'), 0, reason: '+ (压黑) is dead: the ruler cannot go there');
+      f = await Finger.down(t, r.center);
+      await f.drag(const Offset(-80, 2));
+      await f.up();
+      await settle(t);
+      expect(app.editOf(id).value('film_black'), lessThan(0));
+      expect(app.editOf(id).values.containsKey('film_cast'), isFalse);
+    });
+
+    testWidgets('both axes dead hides the chip; a slide (R100B) keeps a usable pad where only half is dead', (t) async {
+      final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75, fetch: (p) async {
+        return json({
+          'effective_lo': {'film_shoot': false, 'film_print': false},
+          'effective_hi': {'film_shoot': false, 'film_print': false, 'film_cast': false},
+        });
+      });
+      await openFilmRow(t);
+      await pickStock(t, 'fujifilm_velvia_100');
+      await settle(t, 8);
+      expect(app.editOf(id).film, 'fujifilm_velvia_100');
+      expect(hasRow('film_expo'), isFalse, reason: 'film_shoot and film_print both dead: no chip');
+      expect(hasRow('film_texture'), isTrue, reason: 'film_black is alive, film_cast only half dead');
+      expect(hasRow('film_latitude'), isTrue);
+    });
+
+    testWidgets('the ranges refresh when the stock changes and never during a drag', (t) async {
+      var n = 0;
+      final (app, id) = await openFilm(t, phys: const Size(1140, 2616), dpr: 2.75, fetch: (p) async {
+        n++;
+        return json({});
+      });
+      await openFilmRow(t);
+      await pickStock(t, 'kodak_portra_400');
+      await settle(t, 8);
+      final afterStock = n;
+      expect(afterStock, greaterThanOrEqualTo(1));
+      await selectStyleRow(t, 'film_expo');
+      final r = t.getRect(find.byKey(const ValueKey('pad-film_expo')));
+      final f = await Finger.down(t, r.center);
+      await f.drag(const Offset(60, 0), step: 6);
+      await t.pump(const Duration(milliseconds: 900)); // longer than the debounce, finger still down
+      expect(n, afterStock, reason: 'no query while a finger is down');
+      await f.up();
+      await settle(t, 10);
+      expect(n, afterStock + 1, reason: 'film_shoot moved: one refresh after the drag');
+      expect(app.editOf(id).value('film_shoot'), greaterThan(0));
+    });
+  });
+
+  group('review renders (written to ../build/emu/panel_4x_*.png)', () {
+    Future<void> shot(WidgetTester t, String name) async {
+      await dump(t, name);
+      File('test/goldens/editor_v2/$name.png').copySync('../build/emu/$name.png');
+    }
+
+    testWidgets('a negative: the 质感 pad with a drag; a slide: the 曝光 pad with its dead half and 质感 as a ruler', (t) async {
+      final (app, id) = await openFilm(t, title: '街角咖啡', phys: const Size(1140, 2616), dpr: 2.75);
+      await openFilmRow(t);
+      await pickStock(t, 'kodak_portra_400');
+      await selectStyleRow(t, 'film_texture');
+      final r = t.getRect(find.byKey(const ValueKey('pad-film_texture')));
+      final f = await Finger.down(t, r.center);
+      await f.drag(const Offset(-60, 50), step: 6);
+      await f.up();
+      await settle(t, 3);
+      await shot(t, 'panel_4x_negative_texture');
+      expect(app.editOf(id).value('film_cast'), lessThan(0));
+    });
+
+    testWidgets('a slide (R100B), the engine reports film_print +1 and film_cast as ineffective', (t) async {
+      final (app, id) = await openFilm(t, title: '街角咖啡', phys: const Size(1140, 2616), dpr: 2.75, fetch: (p) async {
+        return jsonEncode({
+          'ok': true,
+          'effective_hi': {'film_print': false, 'film_cast': false},
+          'effective_lo': {'film_cast': false},
+        });
+      });
+      await openFilmRow(t);
+      await pickStock(t, 'fujifilm_velvia_100');
+      await settle(t, 8);
+      await selectStyleRow(t, 'film_expo');
+      final r = t.getRect(find.byKey(const ValueKey('pad-film_expo')));
+      final f = await Finger.down(t, r.center);
+      await f.drag(const Offset(60, -150), step: 6);
+      await f.up();
+      await settle(t, 3);
+      await shot(t, 'panel_4x_slide_expo');
+      expect(app.editOf(id).value('film_print'), 0);
+      await selectStyleRow(t, 'film_texture');
+      await settle(t, 6);
+      await shot(t, 'panel_4x_slide_texture_ruler');
     });
   });
 
@@ -349,7 +522,7 @@ void main() {
       }
       expect(app.editOf(id).film, isNull);
       // before a stock is chosen only the stock row exists
-      for (final k in ['filmPaper', 'film_strength', 'film_expo', 'film_latitude', 'film_black', 'film_grain', 'film_halation', 'film_warmth', 'film_tint']) {
+      for (final k in ['filmPaper', 'film_strength', 'film_expo', 'film_texture', 'film_latitude', 'film_grain', 'film_halation', 'film_warmth', 'film_tint']) {
         expect(hasRow(k), isFalse, reason: k);
       }
 
@@ -358,7 +531,7 @@ void main() {
       expect(app.editOf(id).film, 'kodak_portra_400');
       expect(app.editOf(id).filmPaper, isNull, reason: 'the default paper is the engine default, not an override');
       expect(app.wireParams(app.photos.firstWhere((p) => p.id == id))['film'], 'kodak_portra_400');
-      for (final k in ['filmPaper', 'film_strength', 'film_expo', 'film_latitude', 'film_black', 'film_grain', 'film_halation', 'film_warmth', 'film_tint']) {
+      for (final k in ['filmPaper', 'film_strength', 'film_expo', 'film_texture', 'film_latitude', 'film_grain', 'film_halation', 'film_warmth', 'film_tint']) {
         expect(hasRow(k), isTrue, reason: k);
       }
       expect(find.text(kFilmDisplayNames['kodak_portra_endura']!), findsWidgets, reason: 'the row / chip shows the default paper');

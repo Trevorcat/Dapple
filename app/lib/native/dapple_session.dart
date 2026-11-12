@@ -316,6 +316,26 @@ class DappleSession {
         }
       });
 
+  /// The film pads' labels and effective ranges for this photo with [params] (dapple_session_film_pad_json); null when the
+  /// library predates the symbol. Parse with `FilmPadRanges.parse`.
+  Future<String?> filmPadJson(Map<String, dynamic> params) {
+    final pj = jsonEncode(params);
+    return _serial(() => _filmPadIso(_address, pj));
+  }
+
+  static Future<String?> _filmPadIso(int a, String pj) => Isolate.run(() {
+        final b = _b();
+        final f = b.sessionFilmPadJson;
+        if (f == null) return null;
+        final ptr = ffi.Pointer<DappleSessionStruct>.fromAddress(a);
+        final pp = pj.toNativeUtf8();
+        try {
+          return _takeString(b, f(ptr, pp));
+        } finally {
+          malloc.free(pp);
+        }
+      });
+
   /// The nine style previews (order of [looksCatalog]) rendered on top of [params]. Null if unsupported.
   Future<List<RenderedImage>?> lookPreviews(Map<String, dynamic> params, {int longEdge = 256}) {
     final pj = jsonEncode(params);

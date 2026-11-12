@@ -742,6 +742,7 @@ film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, Spatial
   fp.camera.autoExposure = false;  // the develop pipeline's own exposure slider is the exposure control
   fp.enlarger.printExposure = std::exp2(-double(std::clamp(p.filmPrintEv, -9.f, 9.f)));  // print exposure (film_match.h)
   applyFilmPaperMapping(fp, p.filmBlack);  // paper white / black -> display white / black (stage C)
+  applyFilmCast(fp, run.lib, p.filmCast);  // partial neutralisation of the print pack
   // (the exposure offset is folded into the input gain in runFilmStage: it then costs no re-bake while dragging)
   fp.camera.filmFormatMm *= formatScale;
   // print filtration: more yellow / magenta filtration = less of that dye = cooler / greener print
@@ -782,6 +783,7 @@ bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], 
     a.filmExposure = p.filmExposure + p.filmKeyEv;
     a.printEv = p.filmPrintEv;
     a.black = p.filmBlack;
+    a.cast = p.filmCast;
     a.warmth = p.filmWarmth;
     a.tint = p.filmTint;
     a.grainPct = p.filmGrain;
@@ -1551,6 +1553,7 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
     f.filmEv = p_.filmExposure + p_.filmKeyEv;
     f.printEv = p_.filmPrintEv;
     f.black = p_.filmBlack;
+    f.cast = p_.filmCast;
     f.warmth = p_.filmWarmth;
     f.tint = p_.filmTint;
     f.grainPct = p_.filmGrain;

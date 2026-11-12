@@ -251,7 +251,7 @@ class ControlPad extends StatelessWidget {
         final sel = ['H', 'L', 'D', 'S'].indexWhere((r) => cvKey(ctl.sel.curveCh, r) == row.id);
         return CurveMini(analysis: ctl.analysis(), edit: e, channel: ctl.sel.curveCh, selected: sel, width: w, height: h);
       case TwoD.offset:
-        return OffsetPadView(x: e.value(row.padX!), y: e.value(row.padY!), labels: row.padLabels, width: w, height: h);
+        return OffsetPadView(x: e.value(row.padX!), y: e.value(row.padY!), labels: row.padLabels, width: w, height: h, eff: row.padEff);
       case TwoD.tone:
         return const SizedBox.shrink();
     }

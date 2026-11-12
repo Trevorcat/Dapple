@@ -13,6 +13,7 @@ import '../../editor/param_rows.dart';
 import '../../editor/value_mapping.dart';
 import '../../editor/window_manager.dart';
 import '../../model/catalog.dart';
+import '../../model/film_pad.dart';
 import '../../model/params.dart';
 import '../../services/editor_engine.dart';
 import '../../state/app_state.dart';
@@ -72,7 +73,10 @@ class EditorController extends ChangeNotifier implements GestureSink {
     required this.analysis,
     required this.onSwipe,
     required this.onToggleImmersive,
-  });
+    this.filmPadFetcher,
+  }) {
+    edits.addListener(_maybeRefreshRanges);
+  }
 
   final AppState app;
   final String Function() photoId;
@@ -85,7 +89,67 @@ class EditorController extends ChangeNotifier implements GestureSink {
   final ValueChanged<int> onSwipe;
   final VoidCallback onToggleImmersive;
 
+  /// Asks the engine for the film pads' effective ranges (dapple_session_film_pad_json); null = the live session.
+  /// Tests inject a fake.
+  final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
+
   final PanelSel sel = PanelSel();
+
+  /// Which ends of the film pad axes change the render for the current photo and stock. Everything is effective until
+  /// the engine answers (or when it cannot). Refreshed, debounced and off the UI thread, when the photo, the stock or
+  /// film_shoot changes; never while a finger is down.
+  final ValueNotifier<FilmPadRanges> filmRanges = ValueNotifier(FilmPadRanges.all);
+  Timer? _rangesTimer;
+  String _rangesSig = '';
+  int _rangesGen = 0;
+
+  void _maybeRefreshRanges() {
+    final e = edit;
+    final sig = '$id|${e.film}|${e.filmPaper}|${e.value('film_shoot')}';
+    if (sig == _rangesSig) return;
+    _rangesSig = sig;
+    _rangesTimer?.cancel();
+    if (e.film == null) {
+      _rangesGen++;
+      if (filmRanges.value != FilmPadRanges.all) {
+        filmRanges.value = FilmPadRanges.all;
+        _bump();
+      }
+      return;
+    }
+    _rangesTimer = Timer(const Duration(milliseconds: 300), _fetchRanges);
+  }
+
+  Future<void> _fetchRanges() async {
+    if (dragging.value) {
+      _rangesTimer = Timer(const Duration(milliseconds: 300), _fetchRanges); // never during a drag
+      return;
+    }
+    final gen = ++_rangesGen;
+    final p = app.photoById(id);
+    if (p == null) return;
+    String? json;
+    try {
+      json = await (filmPadFetcher ?? _liveFetch)(app.wireParams(p));
+    } catch (_) {
+      json = null;
+    }
+    if (gen != _rangesGen) return; // a newer request supersedes this answer
+    final r = FilmPadRanges.parse(json);
+    if (r != filmRanges.value) {
+      filmRanges.value = r;
+      _bump();
+    }
+  }
+
+  Future<String?> _liveFetch(Map<String, dynamic> params) async {
+    if (!app.sessions.available) return null;
+    final p = app.photoById(id);
+    if (p == null) return null;
+    final s = await app.sessions.get(p);
+    return s?.filmPadJson(params);
+  }
+
   final ReadoutModel readout = ReadoutModel();
 
   /// Bumped whenever window contents must refresh (edits, selections, undo).
@@ -137,6 +201,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
         nearestTone: analysis().nearest,
         sel: sel,
         film: app.film,
+        filmRanges: filmRanges.value,
       );
 
   List<ParamRow> rowsOf(EGroup g) => rowsFor(g, ctx());
@@ -266,7 +331,17 @@ class EditorController extends ChangeNotifier implements GestureSink {
           _wheel = WheelMapper()..begin(c.edit.value(grKey(z, 'h')), c.edit.value(grKey(z, 's')));
         case TwoD.offset:
           // pad coordinates: x right = +1; y up = +1; the mapper works on 0..1 screen coordinates (y down)
-          _pal = PaletteMapper(defX: 0.5, defY: 0.5, lo: 0, hi: 1)
+          // an ineffective end of an axis is unreachable: the mapper stops at the centre line there
+          final eff = row.padEff;
+          _pal = PaletteMapper(
+              defX: 0.5,
+              defY: 0.5,
+              lo: 0,
+              hi: 1,
+              loX: eff[0] ? 0 : 0.5,
+              hiX: eff[1] ? 1 : 0.5,
+              loY: eff[3] ? 0 : 0.5,
+              hiY: eff[2] ? 1 : 0.5)
             ..begin((c.edit.value(row.padX!) + 1) / 2, (1 - c.edit.value(row.padY!)) / 2);
       }
     }
@@ -728,6 +803,9 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   @override
   void dispose() {
+    edits.removeListener(_maybeRefreshRanges);
+    _rangesTimer?.cancel();
+    filmRanges.dispose();
     _idleTimer?.cancel();
     _undragTimer?.cancel();
     readout.dispose();

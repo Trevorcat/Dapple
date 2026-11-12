@@ -85,11 +85,12 @@ List<SliderSpec> _buildSpecs() {
     // Old edits only: the 胶片曝光 slider left the UI (replaced by the 曝光 pad: film_shoot / film_print); the field stays.
     const SliderSpec('film_exp', '胶片曝光', -60, 60, 0, Fmt.ev, EGroup.style),
     // Film exposure pad and the black-point / latitude rulers (docs/design/editor-panel.md §5): normalised offsets in [-1, +1], 0 = automatic.
-    // NATIVE BINDING: the engine reads these four keys from the edit JSON as plain floats, missing = 0 (they travel in
-    // EditState.toWire like the other film_* keys; nothing else on the Dart side is needed). The engine has no film_grade.
+    // NATIVE BINDING: the engine reads these five keys (film_cast included) from the edit JSON as plain floats, missing = 0 (they travel in
+    // EditState.toWire like the other film_* keys; nothing else on the Dart side is needed). Their effective ranges per photo and stock come from dapple_session_film_pad_json (model/film_pad.dart).
     const SliderSpec('film_shoot', '拍摄曝光', -1, 1, 0, Fmt.signed, EGroup.style), // X of 曝光: 欠曝 -1 .. 过曝 +1
     const SliderSpec('film_print', '冲印深浅', -1, 1, 0, Fmt.signed, EGroup.style), // Y of 曝光: 深 -1 .. 浅 +1
-    const SliderSpec('film_black', '黑位', -1, 1, 0, Fmt.signed, EGroup.style), // ruler 黑位: -1 抬黑 (matte), 0 paper black, +1 压黑 (shown x100)
+    const SliderSpec('film_cast', '本色', -1, 1, 0, Fmt.signed, EGroup.style), // X of 质感: -1 中性 (colour-corrected print) .. 0 default .. +1 本色 (stock cast kept)
+    const SliderSpec('film_black', '黑位', -1, 1, 0, Fmt.signed, EGroup.style), // Y of 质感: -1 抬黑 (matte lifted black), 0 paper black, +1 压黑 (deeper)
     const SliderSpec('film_latitude', '宽容度', -1, 1, 0, Fmt.signed, EGroup.style), // ruler 宽容度: -1..+1 = 55..98 % (0 = 80 %)
   ];
   for (var b = 0; b < 8; b++) {
@@ -169,7 +170,7 @@ String tonePro(String id) {
 /// Keys of the film simulation (numeric ones; the stock and the paper are [EditState.film] / [EditState.filmPaper]).
 const filmValueKeys = [
   'film_strength', 'film_grain', 'film_halation', 'film_warmth', 'film_tint', 'film_exp', //
-  'film_shoot', 'film_print', 'film_black', 'film_latitude',
+  'film_shoot', 'film_print', 'film_black', 'film_cast', 'film_latitude',
 ];
 
 enum SyncCat { style, tone, light, color, detail, crop }

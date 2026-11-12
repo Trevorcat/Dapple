@@ -200,6 +200,9 @@ class DappleBindings {
         sessionAnalyzeJson = lib.providesSymbol('dapple_session_analyze_json')
             ? lib.lookupFunction<_Info, _Info>('dapple_session_analyze_json')
             : null,
+        sessionFilmPadJson = lib.providesSymbol('dapple_session_film_pad_json')
+            ? lib.lookupFunction<_AnalyzeP, _AnalyzePD>('dapple_session_film_pad_json')
+            : null,
         sessionAnalyzeParamsJson = lib.providesSymbol('dapple_session_analyze_params_json')
             ? lib.lookupFunction<_AnalyzeP, _AnalyzePD>('dapple_session_analyze_params_json')
             : null,
@@ -278,6 +281,9 @@ class DappleBindings {
   final _Info0D? perfInfoJson;
   final _Info? sessionAnalyzeJson;
   final _AnalyzePD? sessionAnalyzeParamsJson;
+
+  /// dapple_session_film_pad_json(session, params_json): the film pads' labels and effective ranges (optional symbol).
+  final _AnalyzePD? sessionFilmPadJson;
   final _CStrFnD? looksJson;
   final _CStrFnD? paramsSchemaJson;
   final _PreviewsD? sessionLookPreviews;

@@ -262,6 +262,7 @@ bool filmFrameResolved(const FilmFrameArgs& a, FilmResolved& r) {
   r.tint = a.tint;
   r.printEv = a.printEv;
   r.black = a.black;
+  r.cast = a.cast;
   r.grainPct = a.grainPct;
   r.halationPct = a.halationPct;
   r.formatScale = a.formatScale;

@@ -39,12 +39,15 @@ void openEditor(BuildContext context, AppState app, String photoId) {
 }
 
 class EditorPage extends StatefulWidget {
-  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true});
+  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher});
   final AppState app;
   final String photoId;
 
   /// Merge pointer events per frame (requirements 4.15.16). Tests switch it off.
   final bool resamplePointers;
+
+  /// Test hook: replaces the engine query for the film pads' effective ranges.
+  final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
   @override
   State<EditorPage> createState() => _EditorPageState();
 }
@@ -90,6 +93,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
       analysis: () => _analysis(ph, false),
       onSwipe: _go,
       onToggleImmersive: () => ctl.immersive.value = !ctl.immersive.value,
+      filmPadFetcher: widget.filmPadFetcher,
     );
     lastRev = app.editRevision;
     app.addListener(_onApp);

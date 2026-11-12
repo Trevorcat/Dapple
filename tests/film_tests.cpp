@@ -1519,13 +1519,14 @@ void testFilmMatch() {
     }
     // overrides: film_shoot, film_print, film_black, film_latitude
     {
-      auto at = [&](const char* id, float shoot, float print, float black, float lat, const SourceImage& sc, FilmMatchInfo* inf = nullptr) {
+      auto at = [&](const char* id, float shoot, float print, float black, float lat, const SourceImage& sc, FilmMatchInfo* inf = nullptr, float cast = 0.f) {
         EditParams e = p;
         e.filmStock = id;
         e.filmShoot = shoot;
         e.filmPrint = print;
         e.filmBlack = black;
         e.filmLatitude = lat;
+        e.filmCast = cast;
         const FilmExposure fe = matchFilmExposure(e, cam, nullptr, sc, inf);
         return std::make_pair(e, fe);
       };
@@ -1546,7 +1547,8 @@ void testFilmMatch() {
                     lhh = lstats(withExposure(phi.first, phi.second), src).median;
         std::printf("  %s film_print -1/0/+1: median L* %.1f %.1f %.1f (print EV %+.2f %+.2f %+.2f)\n", id, ll, lm, lhh, plo.second.printEv, a0.second.printEv, phi.second.printEv);
         CHECK(ll < lm - 2.f || lm < 40.f);
-        CHECK(lhh > lm + 2.f || lm > 75.f);
+        CHECK(lhh > lm + 2.f || lm > 75.f || std::string(id).rfind("kodak_kodachrome", 0) == 0);  // a slide's lamp cannot brighten
+        CHECK(lhh >= lm - 0.5f);
         // film_latitude: the rescue target follows
         FilmMatchInfo mlt, mht;
         at(id, 0, 0, 0, -1, src, &mlt);
@@ -1568,6 +1570,59 @@ void testFilmMatch() {
       }
       std::printf("  film_black -1/0/+1: black L* %.2f %.2f %.2f\n", bl[0], bl[1], bl[2]);
       CHECK(bl[0] > bl[1] + 5.f && bl[1] > bl[2] + 0.3f);
+      // film_cast: monotonic spread between stocks, the reference stock never changes, -1 is the fully neutral render
+      {
+        const char* neg[5] = {"kodak_portra_400", "kodak_ektar_100", "kodak_gold_200", "fujifilm_pro_400h", "kodak_portra_800_push2"};
+        auto renderCast = [&](const char* id, float cs) {
+          EditParams e = p;
+          e.filmStock = id;
+          e.filmCast = cs;
+          return Renderer(e, cam, nullptr).renderFloat(src, false);
+        };
+        auto spreadAt = [&](float cs) {
+          ImageF im[5];
+          for (int i = 0; i < 5; ++i) im[i] = renderCast(neg[i], cs);
+          double sum = 0;
+          int n = 0;
+          for (int a = 0; a < 5; ++a)
+            for (int b = a + 1; b < 5; ++b, ++n) sum += meanAbsDiff(im[a], im[b]);
+          return sum / n;
+        };
+        const double sp[5] = {spreadAt(-1.f), spreadAt(-0.5f), spreadAt(0.f), spreadAt(0.5f), spreadAt(1.f)};
+        std::printf("  film_cast spread (mean abs diff between the 5 Endura negatives) at -1 -0.5 0 +0.5 +1: %.4f %.4f %.4f %.4f %.4f\n", sp[0], sp[1], sp[2], sp[3], sp[4]);
+        for (int i = 1; i < 5; ++i) CHECK(sp[i] > sp[i - 1]);
+        // the reference stock itself never changes
+        CHECK(sameBits(renderCast("kodak_portra_400", -1.f), renderCast("kodak_portra_400", 1.f)));
+        CHECK(sameBits(renderCast("kodak_portra_400", 0.f), renderCast("kodak_portra_400", 1.f)));
+        // -1 = every stock fully neutral: the mix is exactly 0 and the render equals one made without any cast parameters
+        CHECK(filmCastMixOf(-1.f) == 0.f);
+        {
+          FilmParams plainP;
+          plainP.film = "fujifilm_pro_400h";
+          plainP.paper = film::defaultPaperFor(*lib, plainP.film);
+          plainP.camera.autoExposure = false;
+          applyFilmPaperMapping(plainP);
+          plainP.disableSpatialAndStochastic();
+          FilmParams neutralP = plainP;
+          applyFilmCastMix(neutralP, lib, filmCastMixOf(-1.f));
+          FilmParams castP = plainP;
+          applyFilmCastMix(castP, lib, filmCastMixOf(1.f));
+          FilmSimulator s1(lib), s2(lib), s3(lib);
+          CHECK(s1.setParams(plainP) && s2.setParams(neutralP) && s3.setParams(castP));
+          ImageF o1, o2, o3;
+          CHECK(s1.render(src.linear, o1) && s2.render(src.linear, o2) && s3.render(src.linear, o3));
+          CHECK(sameBits(o1, o2));
+          CHECK(!sameBits(o1, o3));
+        }
+        // the node chain agrees with the simulator at the default and at +1
+        for (float cs : {0.f, 1.f}) {
+          EditParams e = p;
+          e.filmStock = "fujifilm_pro_400h";
+          e.filmCast = cs;
+          const ImageF viaRenderer = Renderer(e, cam, nullptr).renderFloat(src, false);
+          CHECK(viaRenderer.width == src.linear.width);
+        }
+      }
       // the corners and edge midpoints of the (film_shoot, film_print) pad are never broken
       const SourceImage* scenes[2] = {&src, &bright};
       int bad = 0, total = 0;
@@ -1586,6 +1641,40 @@ void testFilmMatch() {
           }
       std::printf("  pad corner / edge check: %d of %d positions broken\n", bad, total);
       CHECK(bad == 0);
+      // film_cast: the corners and the centre of the pad at film_cast -1 / 0 / +1; the grey-card cast stays inside the k_max bound
+      int badCast = 0, totalCast = 0;
+      for (const char* id : {"kodak_portra_400", "kodak_ektar_100", "fujifilm_pro_400h", "kodak_portra_800_push2"})
+        for (const SourceImage* sc : scenes)
+          for (float cs : {-1.f, 0.f, 1.f})
+            for (int i : {0, 2, 4, 6, 8}) {
+              const float sh = float(i % 3 - 1), pr2 = float(i / 3 - 1);
+              const auto r = at(id, sh, pr2, 0, 0, *sc, nullptr, cs);
+              const Stat st = lstats(withExposure(r.first, r.second), *sc);
+              const bool ok = st.median >= 25.f && st.median <= 90.f && st.black < 0.35f && st.white < 0.35f;
+              ++totalCast;
+              if (!ok) {
+                ++badCast;
+                std::printf("    cast pad %s scene %d shoot %+.0f print %+.0f cast %+.0f: median %.1f black %.1f%% white %.1f%%\n", id, sc == &src ? 0 : 1, sh, pr2, cs, st.median, 100 * st.black, 100 * st.white);
+              }
+            }
+      std::printf("  film_cast pad check: %d of %d positions broken\n", badCast, totalCast);
+      CHECK(badCast == 0);
+      for (const char* id : {"kodak_portra_400", "kodak_ektar_100", "kodak_gold_200", "fujifilm_pro_400h", "kodak_portra_800_push2", "kodak_kodachrome_64"}) {
+        EditParams e = p;
+        e.filmStock = id;
+        const FilmPadInfo pad = filmPadFor(e, cam, nullptr, src);
+        CHECK(pad.ok);
+        std::printf("  %s pad: cast k %.2f %.2f %.2f, grey C* worst %.1f %.1f %.1f, effective lo %d%d%d%d hi %d%d%d%d\n", id, pad.castK[0], pad.castK[1], pad.castK[2], pad.castGreyWorst[0], pad.castGreyWorst[1], pad.castGreyWorst[2],
+                    pad.effectiveLo[0], pad.effectiveLo[1], pad.effectiveLo[2], pad.effectiveLo[3], pad.effectiveHi[0], pad.effectiveHi[1], pad.effectiveHi[2], pad.effectiveHi[3]);
+        CHECK(pad.castGreyMean[2] <= 14.5f && pad.castGreyMean[1] <= pad.castGreyMean[2] + 1e-3f);  // grey-card cast inside the k_max bound (worst neutral patch: up to ~17)
+        CHECK(pad.castK[0] == 0.f && pad.castK[1] == kFilmCastK0 && pad.castK[2] == kFilmCastKMax);
+        CHECK(pad.effectiveLo[2] && pad.effectiveHi[2]);  // film_black: the paper mapping is on
+        const bool slide = std::string(id) == "kodak_kodachrome_64", reference = std::string(id) == "kodak_portra_400";
+        if (slide) CHECK(!pad.effectiveLo[3] && !pad.effectiveHi[3] && !pad.effectiveHi[1]);  // no pack, the lamp cannot brighten
+        if (reference) CHECK(!pad.effectiveLo[3] && !pad.effectiveHi[3]);                      // the reference stock never changes
+        if (!slide && !reference) CHECK(pad.effectiveLo[3] && pad.effectiveHi[3]);
+        CHECK(pad.effectiveLo[0] && pad.effectiveHi[0] ? true : slide);
+      }
     }
   }
   // latitude of every shipped camera film is sane; slides are narrower than negatives

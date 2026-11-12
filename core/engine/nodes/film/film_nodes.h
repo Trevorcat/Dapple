@@ -58,6 +58,7 @@ struct FilmResolved {
   float warmth = 0, tint = 0;    // percent, -100..100
   float printEv = 0;             // EditParams::filmPrintEv: print exposure (paper) / scan lamp gain, stops
   float black = 0;               // EditParams::filmBlack, -1..1
+  float cast = 0;                // EditParams::filmCast, -1..1
   float grainPct = 100, halationPct = 100;
   float pitch = 1;               // output pixel size in source pixels (1 = plain frame)
   float formatScale = 1;         // pitch * max(w,h) / max(srcW,srcH): scales the film frame in mm
@@ -121,6 +122,7 @@ struct FilmFrameArgs {
   float filmExposure = 0;          // EV on top
   float printEv = 0;               // print exposure / scan lamp gain in stops (EditParams::filmPrintEv)
   float black = 0;                 // paper black, -1..1 (EditParams::filmBlack)
+  float cast = 0;                  // partial neutralisation, -1..1 (EditParams::filmCast)
   float warmth = 0, tint = 0, grainPct = 100, halationPct = 100;
   float formatScale = 1;
   int w = 0, h = 0;

@@ -164,6 +164,7 @@ Key bakeKey(const FilmParams& p) {
   for (double v : d.gammaInterlayerGToRb) keyNum(k, v);
   for (double v : d.gammaInterlayerBToRg) keyNum(k, v);
   const auto& e = p.enlarger;
+  for (double v : {e.neutralMix, e.refMNeutral, e.refYNeutral}) keyNum(k, v);
   for (double v : {e.printExposure, double(e.printExposureCompensation), double(e.normalizePrintExposure), e.yFilterShift,
                    e.mFilterShift, e.yFilterNeutral, e.mFilterNeutral, e.cFilterNeutral, e.preflashExposure,
                    e.preflashYFilterShift, e.preflashMFilterShift})
