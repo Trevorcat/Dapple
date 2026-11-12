@@ -7,7 +7,7 @@
 //   MODE 3  base    dst = w0 * src + [Catmull-Rom 2x upsample of up; dim.zw = its size, 0 = none] (levelCombine's accumulator initialisation)
 //   MODE 4  firh    tmp = horizontal FIR with scipy 'reflect' boundary (half taps, unit sum)
 //   MODE 5  firv    dst += vertical FIR of tmp, taps premultiplied by the component weight (read-modify-write)
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
 #ifndef MODE
 #define MODE 0
 #endif

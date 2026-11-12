@@ -225,6 +225,11 @@ ParamRegistry::ParamRegistry() {
         in.ctx.fullLongEdge = v ? 6000 : 4000;
         return true;
       });
+  add("ctx.filmKeyEv", C, [](const ParamInputs& in, Hasher& h) { h.f32(in.edit.filmKeyEv); },
+      [](ParamInputs& in, int v) {
+        in.edit.filmKeyEv = v ? 0.75f : -0.5f;
+        return true;
+      });
   add("ctx.keepGrain", D, [](const ParamInputs& in, Hasher& h) { h.boolean(in.keepGrain); }, nullptr);
   add("ctx.activeParam", C, [](const ParamInputs& in, Hasher& h) { h.str(in.frame.activeParam); },
       [](ParamInputs& in, int v) { return perturbString(in.frame.activeParam, v, {"", "grain", "exposure"}); });

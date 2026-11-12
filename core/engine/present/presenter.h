@@ -22,6 +22,15 @@ struct PresentTiming {
   double uploadMs = 0;   // memcpy to staging
   double acquireMs = 0;  // waiting for a free swapchain image (consumer back-pressure)
   double submitMs = 0;   // record + submit + queue present
+  double fenceMs = 0;    // zero-readback frames: waiting for the frame image slot (GPU completion of the frame two before)
+};
+
+// Where the GPU executor writes the next frame when pixels are not read back: an image on the engine's own device (the
+// presenter adopted that device), at least w x h texels. Vulkan values; layouts are VkImageLayout.
+struct ExternalTarget {
+  void* image = nullptr;
+  std::uint32_t w = 0, h = 0;               // capacity of the image
+  std::uint32_t layoutIn = 0, layoutOut = 0;
 };
 
 class Presenter {
@@ -33,6 +42,12 @@ class Presenter {
   virtual bool hasWindow() const = 0;
   // Draw an RGBA8 frame (tightly packed rows) scaled to the surface. False = this frame was not shown (error set).
   virtual bool present(const std::uint8_t* rgba, int w, int h, PresentTiming* t, std::string& err) = 0;
+  // Zero-readback input (needs the adopted-device mode, see vk_presenter.cpp). beginExternal hands out the image of the next frame
+  // slot (grown to hold w x h); after the engine rendered into it, presentExternal(w, h) blits it to the swapchain and presents.
+  // beginExternal false = not available now (no window, device not shared with the engine, GLES...): use present(rgba).
+  // Nothing has to be undone when a frame was begun and then not presented.
+  virtual bool beginExternal(int w, int h, ExternalTarget* out, std::string& err) { (void)w; (void)h; (void)out; err = "not supported"; return false; }
+  virtual bool presentExternal(int w, int h, PresentTiming* t, std::string& err) { (void)w; (void)h; (void)t; err = "not supported"; return false; }
   // 0 = drop transient memory (staging, frame image); 1 = also the swapchain; 2 = everything including the device.
   virtual void trim(int level) = 0;
   virtual std::string info() const = 0;  // JSON object fragment (no braces needed by callers: full object)
@@ -42,6 +57,6 @@ class Presenter {
 // Vulkan swapchain presenter (Android). Null where Vulkan / Android are not available; `err` says why.
 std::unique_ptr<Presenter> makeVulkanPresenter(std::string& err);
 // Counts frames, remembers the last one (tests, desktop, and "no GPU": the view then reports the fallback).
-std::unique_ptr<Presenter> makeNullPresenter();
+std::unique_ptr<Presenter> makeNullPresenter(bool external = false);  // external: pretends to take zero-readback frames (tests)
 
 }  // namespace dapple::present

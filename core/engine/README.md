@@ -28,6 +28,13 @@ Edge `keyed=false` = scheduling edge only (producer key does not enter the consu
 - `nodes/main/cpu_nodes.cpp`: `cpuImpl(NodeType)`: `block` fragments (3-float RGB, n <= 256) for point nodes, `tile` fns (additive `CpuImpl::tile`) for window nodes.
 - `DAPPLE_ENGINE=full` runs every frame and export through them; `dapple_golden verify corpus.txt full`, `dapple_exec_tests <whole|tiles|plan|cancel|analysis|bench>`.
 
+## GPU executor (GPU engineer, docs/engine/pipeline-architecture.md section 19)
+
+- `exec/gpu_iface.h`: `IGpuExecutor::run(GpuRun&, GpuOut&)` consumes the same `Plan` as the CPU executor; `GpuProvider` is the process-wide device selection (installed by `gpu::installProvider()`). `EngineSession::renderFull / exportGpu` pick the executor per frame (Vulkan -> GLES 3.1 -> CPU, failure semantics of 5.9).
+- A node gets a GPU implementation by registering `GpuImpl::recordPorts` in `nodes/gpu_nodes.cpp` (`gpuImplFor`), a `Walk::sweep` case in `exec/gpu_executor.cpp` that builds its resolved block, and its type in `headNodeOk` / `windowNodeOk`. A plan that contains any other node is `Unsupported` and runs on the CPU executor.
+- Kernels declare the workgroup shape as spec constants 16 / 17 (2D) and 18 / 19 (reduce); group counts come from `GpuRecorder::gx / gy` (`docs/engine/gles-shader-patches.md`).
+- Tests: `dapple_gpu_tests`, `dapple_gpu_engine_tests` (`hal box sched select external`), `dapple_film_gpu_tests`; bench `dapple gpu-bench`.
+
 ## Film nodes (core/engine/nodes/film)
 Three table nodes (`FilmTableRaw`, `FilmTableCurves`, `FilmTablePrintScan`) and eight image nodes (`FilmExposure` ... `FilmScan`), each with
 its own minimal mask; `GraphDetail::FullFilm` builds them. CPU impls: `filmnode::cpuImpl(type)` / `behaviour(type)` (`film_nodes.h`); the

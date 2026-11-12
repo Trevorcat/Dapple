@@ -3,6 +3,7 @@
 
 #include <chrono>
 
+#include "dapple/film_match.h"
 #include "dapple/renderer.h"
 
 namespace dapple {
@@ -42,6 +43,12 @@ Result<DevelopResult> Developer::develop(const DevelopRequest& req) const {
     result.timings.analyzeMs = msSince(t0);
   }
 
+  if (!result.applied.filmStock.empty()) {  // film exposure that keeps the photo's key (film_match.h)
+    SourceImage proxy;
+    proxy.sceneReferred = source->sceneReferred;
+    proxy.linear = resizeToLongEdge(source->linear, 256);
+    result.applied.filmKeyEv = matchFilmExposure(result.applied, *result.camera, req.lut, proxy);
+  }
   t0 = std::chrono::steady_clock::now();
   Renderer renderer(result.applied, *result.camera, req.lut);
   result.image = renderer.render(*source);

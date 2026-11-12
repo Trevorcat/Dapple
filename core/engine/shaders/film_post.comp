@@ -6,7 +6,16 @@
 //   MODE 3  fir4 h      horizontal FIR of a 3-channel image, 'reflect' boundary (scanner lens blur / unsharp mask / glare field)
 //   MODE 4  fir4 v      vertical FIR
 //   MODE 5  encode      linear (+ unsharp: lin + amount * (lin - blurred)) -> display sRGB, unclamped
-layout(local_size_x = 16, local_size_y = 16) in;
+//   MODE 6  fir v + encode   the vertical half of the unsharp blur of MODE 4 fused with MODE 5 (uA = horizontally blurred, uB = lin)
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
+// h16: round a float to the nearest half exactly (common.glsl), so the stored planes do not depend on the driver's rounding mode
+float h16(float x) {
+  uint u = floatBitsToUint(x);
+  u += 0xFFFu + ((u >> 13) & 1u);
+  return uintBitsToFloat(u & ~0x1FFFu);
+}
+vec4 h16v(vec4 v) { return vec4(h16(v.x), h16(v.y), h16(v.z), v.w); }
+
 #ifndef MODE
 #define MODE 0
 #endif
@@ -23,20 +32,24 @@ layout(std140, binding = 0) uniform P {
 #if MODE == 0
 layout(binding = 1) uniform sampler2D uA;
 layout(binding = 2, std430) readonly buffer Dec { float dec[]; };
-layout(binding = 3, rgba32f) uniform writeonly image2D uOut;
+layout(binding = 3, rgba16f) uniform writeonly image2D uOut;
 #elif MODE == 1
 layout(binding = 1, r32f) uniform writeonly image2D uOut;
 #elif MODE == 2
 layout(binding = 1) uniform sampler2D uA;   // lin
 layout(binding = 2) uniform sampler2D uB;   // field (with margin)
-layout(binding = 3, rgba32f) uniform writeonly image2D uOut;
+layout(binding = 3, rgba16f) uniform writeonly image2D uOut;
 #elif MODE == 3 || MODE == 4
 layout(binding = 1) uniform sampler2D uA;
-layout(binding = 2, rgba32f) uniform writeonly image2D uOut;
+layout(binding = 2, rgba16f) uniform writeonly image2D uOut;
+#elif MODE == 6
+layout(binding = 1) uniform sampler2D uA;   // horizontally blurred lin
+layout(binding = 2) uniform sampler2D uB;   // lin
+layout(binding = 3, rgba16f) uniform writeonly image2D uOut;
 #else
 layout(binding = 1) uniform sampler2D uA;   // lin
 layout(binding = 2) uniform sampler2D uB;   // blurred lin (unsharp) or lin again
-layout(binding = 3, rgba32f) uniform writeonly image2D uOut;
+layout(binding = 3, rgba16f) uniform writeonly image2D uOut;
 #endif
 
 int reflectIdx(int i, int n) {
@@ -116,7 +129,7 @@ void main() {
       l[c] = dec[idx] + f * (dec[idx + 1] - dec[idx]);
     }
   }
-  imageStore(uOut, p, vec4(l, 1.0));
+  imageStore(uOut, p, h16v(vec4(l, 1.0)));
 #elif MODE == 1
   uint w0 = uint(p.x + u.org.x), w1 = uint(p.y + u.org.y), w2 = u.stream.x;
   pcg3d(w0, w1, w2);
@@ -124,22 +137,30 @@ void main() {
 #elif MODE == 2
   const float g = texelFetch(uB, p + ivec2(u.org.zw), 0).r;
   const vec3 l = texelFetch(uA, p, 0).rgb;
-  imageStore(uOut, p, vec4(l + (g * 0.01 - u.glare.z) * u.white.xyz, 1.0));
+  imageStore(uOut, p, h16v(vec4(l + (g * 0.01 - u.glare.z) * u.white.xyz, 1.0)));
 #elif MODE == 3
   const int r = u.dim.z, w = u.dim.x;
   vec3 acc = tap(0) * texelFetch(uA, p, 0).rgb;
   for (int k = 1; k <= r; ++k)
     acc += tap(k) * (texelFetch(uA, ivec2(reflectIdx(p.x - k, w), p.y), 0).rgb + texelFetch(uA, ivec2(reflectIdx(p.x + k, w), p.y), 0).rgb);
-  imageStore(uOut, p, vec4(acc, 1.0));
+  imageStore(uOut, p, h16v(vec4(acc, 1.0)));
 #elif MODE == 4
   const int r = u.dim.z, h = u.dim.y;
   vec3 acc = tap(0) * texelFetch(uA, p, 0).rgb;
   for (int k = 1; k <= r; ++k)
     acc += tap(k) * (texelFetch(uA, ivec2(p.x, reflectIdx(p.y - k, h)), 0).rgb + texelFetch(uA, ivec2(p.x, reflectIdx(p.y + k, h)), 0).rgb);
-  imageStore(uOut, p, vec4(acc, 1.0));
+  imageStore(uOut, p, h16v(vec4(acc, 1.0)));
+#elif MODE == 6
+  const int r = u.dim.z, h = u.dim.y;
+  vec3 b = tap(0) * texelFetch(uA, p, 0).rgb;
+  for (int k = 1; k <= r; ++k)
+    b += tap(k) * (texelFetch(uA, ivec2(p.x, reflectIdx(p.y - k, h)), 0).rgb + texelFetch(uA, ivec2(p.x, reflectIdx(p.y + k, h)), 0).rgb);
+  vec3 l = texelFetch(uB, p, 0).rgb;
+  l += u.glare.w * (l - b);
+  imageStore(uOut, p, h16v(vec4(encode(l.r), encode(l.g), encode(l.b), 1.0)));
 #else
   vec3 l = texelFetch(uA, p, 0).rgb;
   if (u.dim.w != 0) l += u.glare.w * (l - texelFetch(uB, p, 0).rgb);
-  imageStore(uOut, p, vec4(encode(l.r), encode(l.g), encode(l.b), 1.0));
+  imageStore(uOut, p, h16v(vec4(encode(l.r), encode(l.g), encode(l.b), 1.0)));
 #endif
 }

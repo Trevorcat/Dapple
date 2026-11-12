@@ -11,16 +11,20 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "engine/exec/gpu_iface.h"
 #include "presenter.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "dapple_present", __VA_ARGS__)
 
 namespace dapple::present {
+using engine::GpuProvider;
+using engine::gpuProvider;
 namespace {
 
 struct Fn {
@@ -49,6 +53,9 @@ double msSince(std::chrono::steady_clock::time_point t) {
 constexpr int kRing = 2;
 
 class VkPresenter final : public Presenter {
+  struct Ring;
+  struct ExtImage;
+
  public:
   ~VkPresenter() override {
     std::lock_guard<std::mutex> l(m_);
@@ -61,6 +68,8 @@ class VkPresenter final : public Presenter {
     if (!lib_) return err = "libvulkan.so not found", false;
     f_.gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib_, "vkGetInstanceProcAddr"));
     if (!f_.gipa) return err = "vkGetInstanceProcAddr missing", false;
+    ownGipa_ = f_.gipa;
+    if (const char* e = std::getenv("DAPPLE_PRESENT_ADOPT")) noAdopt_ = e[0] == '0';
     f_.vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(f_.gipa(nullptr, "vkCreateInstance"));
     if (!f_.vkCreateInstance) return err = "vkCreateInstance missing", false;
     return true;
@@ -110,6 +119,64 @@ class VkPresenter final : public Presenter {
       f_.vkFlushMappedMemoryRanges(dev_, 1, &mr);
     }
     const double upMs = msSince(t0);
+    ++hostFrames_;
+    hostBytes_ += std::uint64_t(w) * std::uint64_t(h) * 4;
+    auto pre = [&](VkCommandBuffer cb) {
+      barrier(cb, fimg_, fimgLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+      VkBufferImageCopy bc{};
+      bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      bc.imageExtent = {std::uint32_t(w), std::uint32_t(h), 1};
+      f_.vkCmdCopyBufferToImage(cb, r.stage, fimg_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+      barrier(cb, fimg_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+      fimgLayout_ = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    };
+    return blitPresent(r, fimg_, w, h, pre, upMs, tm, err);
+  }
+
+  // ---- zero readback: the engine renders into ext_[cur_] on the shared device ------------------------------------------------
+  bool beginExternal(int w, int h, ExternalTarget* out, std::string& err) override {
+    std::lock_guard<std::mutex> l(m_);
+    if (!win_) return err = "no window", false;
+    if (w <= 0 || h <= 0 || !out) return err = "empty frame", false;
+    if (!ensureDevice(err) || !ensureSwapchain(err)) return false;
+    if (!adopted_) return err = "device not shared with the engine", false;
+    const auto t0 = std::chrono::steady_clock::now();
+    Ring& r = ring_[cur_];
+    f_.vkWaitForFences(dev_, 1, &r.fence, VK_TRUE, UINT64_C(2000000000));  // the blit that read this slot's image two frames ago
+    fenceMs_ = msSince(t0);
+    if (!ensureExtImage(cur_, w, h, err)) return false;
+    out->image = reinterpret_cast<void*>(ext_[cur_].img);
+    out->w = ext_[cur_].w;
+    out->h = ext_[cur_].h;
+    out->layoutIn = VK_IMAGE_LAYOUT_UNDEFINED;  // the whole content is replaced
+    out->layoutOut = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    return true;
+  }
+
+  bool presentExternal(int w, int h, PresentTiming* tm, std::string& err) override {
+    std::lock_guard<std::mutex> l(m_);
+    if (!win_) return err = "no window", false;
+    if (!adopted_ || !dev_) return err = "device not shared with the engine", false;
+    ExtImage& e = ext_[cur_];
+    if (!e.img || w <= 0 || h <= 0 || std::uint32_t(w) > e.w || std::uint32_t(h) > e.h) return err = "external image missing or too small", false;
+    if (!ensureSwapchain(err)) return false;
+    ++extFrames_;
+    const VkImage src = e.img;
+    auto pre = [&](VkCommandBuffer cb) {  // order the blit after the engine's copy (same queue, earlier submission)
+      barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    };
+    PresentTiming local;
+    const bool ok = blitPresent(ring_[cur_], src, w, h, pre, 0, tm ? tm : &local, err);
+    if (ok && tm) tm->fenceMs = fenceMs_;
+    return ok;
+  }
+
+  // Acquire a swapchain image, record `pre` (fills `src` with the frame) + the scaled blit + the present transition, submit, present.
+  template <class Pre>
+  bool blitPresent(Ring& r, VkImage src, int w, int h, Pre&& pre, double upMs, PresentTiming* tm, std::string& err) {
     const auto t1 = std::chrono::steady_clock::now();
     std::uint32_t idx = 0;
     VkResult ar = f_.vkAcquireNextImageKHR(dev_, sc_, UINT64_C(100000000), r.acquire, VK_NULL_HANDLE, &idx);
@@ -133,24 +200,16 @@ class VkPresenter final : public Presenter {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     f_.vkBeginCommandBuffer(r.cb, &bi);
-    barrier(r.cb, fimg_, fimgLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-    VkBufferImageCopy bc{};
-    bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    bc.imageExtent = {std::uint32_t(w), std::uint32_t(h), 1};
-    f_.vkCmdCopyBufferToImage(r.cb, r.stage, fimg_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
-    barrier(r.cb, fimg_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    fimgLayout_ = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    pre(r.cb);
     barrier(r.cb, imgs_[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
     VkImageBlit bl{};
     bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     bl.srcOffsets[1] = {w, h, 1};
     bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    bl.dstOffsets[1] = {std::int32_t(ext_.width), std::int32_t(ext_.height), 1};
-    const bool same = std::uint32_t(w) == ext_.width && std::uint32_t(h) == ext_.height;
-    f_.vkCmdBlitImage(r.cb, fimg_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imgs_[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl,
+    bl.dstOffsets[1] = {std::int32_t(extent_.width), std::int32_t(extent_.height), 1};
+    const bool same = std::uint32_t(w) == extent_.width && std::uint32_t(h) == extent_.height;
+    f_.vkCmdBlitImage(r.cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imgs_[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl,
                       same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     barrier(r.cb, imgs_[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
@@ -165,19 +224,23 @@ class VkPresenter final : public Presenter {
     si.pCommandBuffers = &r.cb;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &done_[idx];
-    VkResult sr = f_.vkQueueSubmit(q_, 1, &si, r.fence);
-    if (sr == VK_ERROR_DEVICE_LOST) {
-      loseDevice();
-      return err = "device lost", false;
-    }
-    if (sr != VK_SUCCESS) return fail(err, "vkQueueSubmit", sr);
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &done_[idx];
     pi.swapchainCount = 1;
     pi.pSwapchains = &sc_;
     pi.pImageIndices = &idx;
-    VkResult pr = f_.vkQueuePresentKHR(q_, &pi);
+    VkResult sr, pr = VK_SUCCESS;
+    {
+      auto ql = qlock();  // adopted device: the queue is shared with the engine
+      sr = f_.vkQueueSubmit(q_, 1, &si, r.fence);
+      if (sr == VK_SUCCESS) pr = f_.vkQueuePresentKHR(q_, &pi);
+    }
+    if (sr == VK_ERROR_DEVICE_LOST) {
+      loseDevice();
+      return err = "device lost", false;
+    }
+    if (sr != VK_SUCCESS) return fail(err, "vkQueueSubmit", sr);
     cur_ = (cur_ + 1) % kRing;
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
       stale_ = true;  // recreate on the next frame (this one was queued)
@@ -203,7 +266,7 @@ class VkPresenter final : public Presenter {
   void trim(int level) override {
     std::lock_guard<std::mutex> l(m_);
     if (!dev_) return;
-    f_.vkDeviceWaitIdle(dev_);
+    idle();
     destroyStagingAndFrame();
     if (level >= 1) destroySwapchain();
     if (level >= 2) {
@@ -216,9 +279,11 @@ class VkPresenter final : public Presenter {
     std::lock_guard<std::mutex> l(m_);
     return "{\"variant\":\"vk-swapchain\",\"device\":\"" + devName_ + "\",\"deviceType\":" + std::to_string(devType_) +
            ",\"api\":" + std::to_string(api_) + ",\"format\":" + std::to_string(int(fmt_)) + ",\"extent\":[" +
-           std::to_string(ext_.width) + "," + std::to_string(ext_.height) + "],\"images\":" + std::to_string(imgs_.size()) +
+           std::to_string(extent_.width) + "," + std::to_string(extent_.height) + "],\"images\":" + std::to_string(imgs_.size()) +
            ",\"presentMode\":" + std::to_string(int(mode_)) + ",\"presented\":" + std::to_string(n_.load()) +
-           ",\"preTransform\":" + std::to_string(preTransform_) + "}";
+           ",\"preTransform\":" + std::to_string(preTransform_) + ",\"adopted\":" + (adopted_ ? "true" : "false") +
+           ",\"externalFrames\":" + std::to_string(extFrames_) + ",\"hostFrames\":" + std::to_string(hostFrames_) +
+           ",\"hostUploadBytes\":" + std::to_string(hostBytes_) + "}";
   }
   std::uint64_t presented() const override { return n_.load(); }
 
@@ -262,6 +327,18 @@ class VkPresenter final : public Presenter {
   // ---- instance / surface / device ---------------------------------------------------------------------------
   bool ensureInstance(std::string& err) {
     if (inst_) return true;
+    if (wantAdopt_) {  // the engine's VkInstance (it enabled VK_KHR_surface + the platform surface extension)
+      f_.gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(lease_.handles.getInstanceProcAddr);
+      inst_ = static_cast<VkInstance>(lease_.handles.instance);
+      adopted_ = true;
+      loadInstanceFns();
+      if (!f_.vkCreateAndroidSurfaceKHR || !f_.vkGetPhysicalDeviceSurfaceSupportKHR) {
+        teardownBackend();
+        return err = "engine instance lacks the surface entry points", false;
+      }
+      return true;
+    }
+    f_.gipa = ownGipa_;
     const char* exts[] = {"VK_KHR_surface", "VK_KHR_android_surface"};
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.pApplicationName = "dapple";
@@ -275,6 +352,11 @@ class VkPresenter final : public Presenter {
       inst_ = VK_NULL_HANDLE;
       return fail(err, "vkCreateInstance(surface exts)", r);
     }
+    loadInstanceFns();
+    return true;
+  }
+
+  void loadInstanceFns() {
 #define L(n) f_.n = reinterpret_cast<PFN_##n>(f_.gipa(inst_, #n))
     L(vkDestroyInstance); L(vkEnumeratePhysicalDevices); L(vkGetPhysicalDeviceProperties);
     L(vkGetPhysicalDeviceQueueFamilyProperties); L(vkGetPhysicalDeviceMemoryProperties); L(vkGetPhysicalDeviceFormatProperties);
@@ -282,7 +364,54 @@ class VkPresenter final : public Presenter {
     L(vkDestroySurfaceKHR); L(vkGetPhysicalDeviceSurfaceSupportKHR); L(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
     L(vkGetPhysicalDeviceSurfaceFormatsKHR); L(vkGetPhysicalDeviceSurfacePresentModesKHR);
 #undef L
-    return true;
+  }
+
+  // The engine's GPU device (stage d, zero readback) is shared when it was created with the present extensions: one instance, one
+  // device, one queue (serialised by lease_.queueMutex), so the executor can copy its frame into an image this presenter blits.
+  // Followed on every frame: the engine rebuilding or giving up its device (loss, Vulkan -> GLES) drops everything built on the old
+  // one (kept alive by the lease) and the next ensureDevice() builds again, on the new device or on a private one.
+  void syncLease() {
+    if (noAdopt_) return;
+    GpuProvider* pv = gpuProvider();
+    GpuProvider::DeviceLease l;
+    bool ok = pv && pv->lease(&l);
+    if (ok && l.generation == blockedGen_ && l.handles.device == blockedDev_) ok = false;  // this device cannot present here: private one
+    if (adopted_) {
+      if (ok && l.generation == lease_.generation && l.handles.device == lease_.handles.device) return;
+      LOGI("engine device changed: leaving adopted mode (new device %d)", ok ? 1 : 0);
+      teardownBackend();
+    } else if (inst_) {
+      if (!ok) return;  // private device stays
+      LOGI("engine device available: adopting it");
+      teardownBackend();
+    }
+    if (ok) {
+      lease_ = std::move(l);
+      wantAdopt_ = true;
+    } else {
+      wantAdopt_ = false;
+    }
+  }
+
+  // Everything that belongs to the current instance / device goes (the window reference stays).
+  void teardownBackend() {
+    destroyDevice();
+    destroySurface();
+    if (inst_ && !adopted_ && f_.vkDestroyInstance) f_.vkDestroyInstance(inst_, nullptr);
+    inst_ = VK_NULL_HANDLE;
+    phys_ = VK_NULL_HANDLE;
+    adopted_ = false;
+    wantAdopt_ = false;
+    lease_ = GpuProvider::DeviceLease{};
+  }
+
+  std::unique_lock<std::mutex> qlock() {
+    return adopted_ && lease_.queueMutex ? std::unique_lock<std::mutex>(*lease_.queueMutex) : std::unique_lock<std::mutex>();
+  }
+  void idle() {
+    if (!dev_) return;
+    auto ql = qlock();
+    f_.vkDeviceWaitIdle(dev_);
   }
 
   bool ensureSurface(std::string& err) {
@@ -300,8 +429,10 @@ class VkPresenter final : public Presenter {
   }
 
   bool ensureDevice(std::string& err) {
+    syncLease();
     if (!ensureSurface(err)) return false;
     if (dev_) return true;
+    if (adopted_) return adoptDevice(err);
     std::uint32_t n = 0;
     f_.vkEnumeratePhysicalDevices(inst_, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
@@ -360,6 +491,36 @@ class VkPresenter final : public Presenter {
       dev_ = VK_NULL_HANDLE;
       return fail(err, "vkCreateDevice", r);
     }
+    return finishDevice(err);
+  }
+
+  // The engine's device: no vkCreateDevice, the queue belongs to the engine.
+  bool adoptDevice(std::string& err) {
+    const hal::NativeHandles& h = lease_.handles;
+    phys_ = static_cast<VkPhysicalDevice>(h.physicalDevice);
+    dev_ = static_cast<VkDevice>(h.device);
+    family_ = h.queueFamily;
+    VkBool32 sup = VK_FALSE;
+    f_.vkGetPhysicalDeviceSurfaceSupportKHR(phys_, family_, surf_, &sup);
+    if (!sup) {  // keep to a private device for this engine device
+      LOGI("the engine's queue family cannot present to this surface: private device");
+      blockedGen_ = lease_.generation;
+      blockedDev_ = lease_.handles.device;
+      dev_ = VK_NULL_HANDLE;
+      teardownBackend();
+      return ensureDevice(err);
+    }
+    VkPhysicalDeviceProperties pp;
+    f_.vkGetPhysicalDeviceProperties(phys_, &pp);
+    devName_ = pp.deviceName;
+    devType_ = int(pp.deviceType);
+    api_ = pp.apiVersion;
+    f_.vkGetPhysicalDeviceMemoryProperties(phys_, &mem_);
+    return finishDevice(err);
+  }
+
+  bool finishDevice(std::string& err) {
+    (void)err;
 #define D(n) f_.n = reinterpret_cast<PFN_##n>(f_.vkGetDeviceProcAddr(dev_, #n))
     D(vkDestroyDevice); D(vkGetDeviceQueue); D(vkCreateSwapchainKHR); D(vkDestroySwapchainKHR); D(vkGetSwapchainImagesKHR);
     D(vkAcquireNextImageKHR); D(vkQueuePresentKHR); D(vkCreateCommandPool); D(vkDestroyCommandPool); D(vkAllocateCommandBuffers);
@@ -370,7 +531,8 @@ class VkPresenter final : public Presenter {
     D(vkUnmapMemory); D(vkFlushMappedMemoryRanges); D(vkCreateImage); D(vkDestroyImage); D(vkGetImageMemoryRequirements);
     D(vkBindImageMemory);
 #undef D
-    f_.vkGetDeviceQueue(dev_, family_, 0, &q_);
+    q_ = adopted_ ? static_cast<VkQueue>(lease_.handles.queue) : VK_NULL_HANDLE;
+    if (!adopted_) f_.vkGetDeviceQueue(dev_, family_, 0, &q_);
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pi.queueFamilyIndex = family_;
@@ -387,7 +549,7 @@ class VkPresenter final : public Presenter {
       VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
       f_.vkCreateSemaphore(dev_, &sci, nullptr, &rg.acquire);
     }
-    LOGI("device %s type %d api %u family %u", devName_.c_str(), devType_, api_, family_);
+    LOGI("device %s type %d api %u family %u%s", devName_.c_str(), devType_, api_, family_, adopted_ ? " (shared with the engine)" : "");
     return true;
   }
 
@@ -445,7 +607,7 @@ class VkPresenter final : public Presenter {
       sc_ = VK_NULL_HANDLE;
       return fail(err, "vkCreateSwapchainKHR", r);
     }
-    ext_ = ex;
+    extent_ = ex;
     std::uint32_t in = 0;
     f_.vkGetSwapchainImagesKHR(dev_, sc_, &in, nullptr);
     imgs_.resize(in);
@@ -461,7 +623,7 @@ class VkPresenter final : public Presenter {
 
   void destroySwapchain() {
     if (!dev_) return;
-    f_.vkDeviceWaitIdle(dev_);
+    idle();
     for (auto s : done_) f_.vkDestroySemaphore(dev_, s, nullptr);
     done_.clear();
     imgs_.clear();
@@ -483,7 +645,7 @@ class VkPresenter final : public Presenter {
   // ---- staging / frame image ----------------------------------------------------------------------------------
   bool ensureStaging(Ring& rg, VkDeviceSize bytes, std::string& err) {
     if (rg.stageSize >= bytes) return true;
-    f_.vkDeviceWaitIdle(dev_);
+    idle();
     freeStaging(rg);
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = bytes + bytes / 4;  // headroom: frame sizes vary with the quality rung
@@ -523,7 +685,7 @@ class VkPresenter final : public Presenter {
 
   bool ensureFrameImage(int w, int h, std::string& err) {
     if (fimg_ && fw_ == w && fh_ == h) return true;
-    f_.vkDeviceWaitIdle(dev_);
+    idle();
     freeFrameImage();
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
@@ -568,15 +730,61 @@ class VkPresenter final : public Presenter {
     fw_ = fh_ = 0;
   }
 
+  bool ensureExtImage(int i, int w, int h, std::string& err) {
+    ExtImage& e = ext_[i];
+    if (e.img && e.w >= std::uint32_t(w) && e.h >= std::uint32_t(h)) return true;
+    freeExtImage(e);  // the slot's fence was waited by the caller: its last blit is done
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ii.extent = {std::uint32_t(w), std::uint32_t(h), 1};
+    ii.mipLevels = ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkResult r = f_.vkCreateImage(dev_, &ii, nullptr, &e.img);
+    if (r != VK_SUCCESS) {
+      e.img = VK_NULL_HANDLE;
+      return fail(err, "external image", r);
+    }
+    VkMemoryRequirements mr;
+    f_.vkGetImageMemoryRequirements(dev_, e.img, &mr);
+    int t = findMem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (t < 0) t = findMem(mr.memoryTypeBits, 0);
+    if (t < 0) return freeExtImage(e), err = "no memory for the external image", false;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex = std::uint32_t(t);
+    r = f_.vkAllocateMemory(dev_, &ai, nullptr, &e.mem);
+    if (r != VK_SUCCESS) {
+      e.mem = VK_NULL_HANDLE;
+      freeExtImage(e);
+      return fail(err, "external image memory", r);
+    }
+    f_.vkBindImageMemory(dev_, e.img, e.mem, 0);
+    e.w = std::uint32_t(w);
+    e.h = std::uint32_t(h);
+    return true;
+  }
+
+  void freeExtImage(ExtImage& e) {
+    if (e.img) f_.vkDestroyImage(dev_, e.img, nullptr);
+    if (e.mem) f_.vkFreeMemory(dev_, e.mem, nullptr);
+    e = ExtImage{};
+  }
+
   void destroyStagingAndFrame() {
     for (Ring& rg : ring_) freeStaging(rg);
+    for (ExtImage& e : ext_) freeExtImage(e);
     freeFrameImage();
   }
 
   // ---- teardown ------------------------------------------------------------------------------------------------
   void destroyDevice() {
     if (!dev_) return;
-    f_.vkDeviceWaitIdle(dev_);
+    idle();
     destroyStagingAndFrame();
     destroySwapchain();
     for (Ring& rg : ring_) {
@@ -586,7 +794,7 @@ class VkPresenter final : public Presenter {
     }
     if (pool_) f_.vkDestroyCommandPool(dev_, pool_, nullptr);
     pool_ = VK_NULL_HANDLE;
-    f_.vkDestroyDevice(dev_, nullptr);
+    if (!adopted_) f_.vkDestroyDevice(dev_, nullptr);  // the engine's device is the engine's
     dev_ = VK_NULL_HANDLE;
     q_ = VK_NULL_HANDLE;
   }
@@ -609,10 +817,7 @@ class VkPresenter final : public Presenter {
   }
 
   void destroyAll() {
-    destroyDevice();
-    destroySurface();
-    if (inst_ && f_.vkDestroyInstance) f_.vkDestroyInstance(inst_, nullptr);
-    inst_ = VK_NULL_HANDLE;
+    teardownBackend();
     if (win_) ANativeWindow_release(win_);
     win_ = nullptr;
   }
@@ -620,6 +825,19 @@ class VkPresenter final : public Presenter {
   mutable std::mutex m_;
   void* lib_ = nullptr;
   Fn f_;
+  PFN_vkGetInstanceProcAddr ownGipa_ = nullptr;
+  bool adopted_ = false, wantAdopt_ = false, noAdopt_ = false;
+  std::uint64_t blockedGen_ = 0;
+  void* blockedDev_ = nullptr;
+  GpuProvider::DeviceLease lease_;
+  struct ExtImage {
+    VkImage img = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    std::uint32_t w = 0, h = 0;
+  };
+  ExtImage ext_[kRing];
+  double fenceMs_ = 0;
+  std::uint64_t extFrames_ = 0, hostFrames_ = 0, hostBytes_ = 0;
   VkInstance inst_ = VK_NULL_HANDLE;
   VkSurfaceKHR surf_ = VK_NULL_HANDLE;
   VkPhysicalDevice phys_ = VK_NULL_HANDLE;
@@ -636,7 +854,7 @@ class VkPresenter final : public Presenter {
   VkSwapchainKHR sc_ = VK_NULL_HANDLE;
   std::vector<VkImage> imgs_;
   std::vector<VkSemaphore> done_;
-  VkExtent2D ext_{};
+  VkExtent2D extent_{};
   VkFormat fmt_ = VK_FORMAT_UNDEFINED;
   VkPresentModeKHR mode_ = VK_PRESENT_MODE_FIFO_KHR;
   int preTransform_ = 0;

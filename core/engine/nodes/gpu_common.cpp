@@ -33,10 +33,29 @@ int scanMinRadius() {
 }
 }  // namespace
 
+// 16 x (inv / 16) with inv = min(256, maxComputeWorkGroupInvocations); env DAPPLE_GPU_WG=<n> forces the budget (tests of the 128 path).
+void workgroupShape(const hal::DeviceCaps& c, int& lx, int& ly, int& rwg) {
+  int inv = 256;
+  if (const char* e = std::getenv("DAPPLE_GPU_WG")) inv = std::max(16, std::min(256, std::atoi(e)));
+  if (c.maxWorkgroupInvocations > 0) inv = std::min<int>(inv, int(c.maxWorkgroupInvocations));
+  int p2 = 16;
+  while (p2 * 2 <= inv) p2 *= 2;  // power of two for the reduction tree
+  lx = 16;
+  ly = std::max(1, p2 / 16);
+  rwg = p2;
+}
+
+GpuRecorder::GpuRecorder(hal::Device& d, GpuGraph& gr, std::string& e) : dev(d), g(gr), err(e) { workgroupShape(d.caps(), lx, ly, rwg); }
+
 hal::PipelineH GpuRecorder::pl(const char* shader, std::initializer_list<hal::SpecConst> spec) {
   hal::PipelineDesc d;
   d.shader = shader;
   d.spec.assign(spec.begin(), spec.end());
+  // ids 16 / 17 / 18: workgroup shape of the kernels that declare them (a spec constant a shader does not declare is ignored)
+  d.spec.push_back({16, lx});
+  d.spec.push_back({17, ly});
+  d.spec.push_back({18, rwg});
+  d.spec.push_back({19, rwg});  // reduce.comp: the group size as a value
   hal::PipelineH p;
   if (dev.createPipeline(d, &p) != hal::Status::Ok) {
     err = dev.lastError();
@@ -105,7 +124,8 @@ H GpuRecorder::sep(int kind, H in, int w, int h, int dir, int op, const std::arr
   const bool small = rmax <= 8;
   const bool bigV = !small && dir == 1 && kind != 2;
   const int variant = small ? 1 : bigV ? 2 : 0;
-  const int lx = (small || bigV) ? 16 : 64, ly = (small || bigV) ? 16 : 4;
+  // (128-invocation devices: the 16 x 16 groups become 16 x 8, the 64 x 4 ones 32 x 4)
+  const int lx = (small || bigV) ? 16 : std::min(64, this->rwg / 4), ly = (small || bigV) ? this->ly : 4;
   const int outsAlong = bigV ? 64 : lx;  // outputs along the axis per group
   const int perp = ly;                  // lines per group
   const hal::PipelineH p = pl(names[variant][kind], {{0, dir}, {1, lx}, {2, ly}, {3, op}});
@@ -147,7 +167,7 @@ H GpuRecorder::down(H D, int f, int mode, H dst, const WRect& win, int offX, int
   u.b[2] = offX;
   u.b[3] = offY;
   u.c[0] = f;
-  g.dispatch("down", p, {GpuGraph::R(D), GpuGraph::RW(dst)}, std::uint32_t(cdiv(cntX, 16)), std::uint32_t(cdiv(cntY, 16)), &u, sizeof u);
+  g.dispatch("down", p, {GpuGraph::R(D), GpuGraph::RW(dst)}, gx(cntX), gy(cntY), &u, sizeof u);
   return dst;
 }
 

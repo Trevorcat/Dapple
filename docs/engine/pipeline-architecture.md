@@ -872,15 +872,25 @@ Status: `hal/gles/**` and `shader_list.cmake` were started by another engineer; 
 
 ---
 
-### 10.7 What remains before the old paths can be deleted (integrator, 2026-11-12)
+### 10.7 What remains before the old paths can be deleted (integrator, 2026-11-12, wave 3)
 
-**`core/src/renderer.cpp` render path (`renderBakedImpl`, `renderFloat`, `Renderer::render`).** Still the kernels: `FrameKernels` wraps their per-pixel loops, and `Renderer::render` is the byte-identity oracle and the fallback when a CPU node has no impl or film `setParams` fails. Needed first: (1) `DAPPLE_ENGINE=full` default on (golden_full is green, but app and edit-bench A/B on a phone not run); (2) look previews, tone previews, HDR and pano paths moved onto the engine; (3) `scaledSource` moved into the Resize node (a4); (4) table nodes baked through `CpuImpl::bake` instead of `EngineSession::bakeTables`; (5) kernels physically moved out of `renderer.cpp` and the oracle role taken by the golden corpus; (6) `FullFilm` graph adopted by the planner.
+**Status.** `DAPPLE_ENGINE` now defaults to `full` (`engine_session.cpp` `envMode`). Override for A/B: env `DAPPLE_ENGINE=off|0|legacy|tables`, or on Android `setprop debug.dapple.engine off|legacy|tables|full` (read when the env var is unset; takes effect at the next process start). Golden corpus re-recorded for the film changes (9 film lines; off, legacy, tables and full agree, 148 frames, 0 mismatches). `check-all` desktop: all steps pass. Android core builds needed `dapple_core` to link `log` publicly (fixed in `core/CMakeLists.txt`).
 
-**`core/gpu` (`gpu_frame.cpp`, `session.cpp`, `hook.cpp`, `parity.cpp`).** Needed: (1) a `GpuExecutor` that consumes `Plan` stages and calls `gpuImplFor(...).recordPorts` (recipe selection, epilogue); (2) the lattice cache and resident source on `ResultCache`/`SourceStore`; (3) selection logic in `EngineSession` replacing `gpuHook`; (4) `dapple_gpu_tests` and `gpu_bench` ported to the engine API; (5) on-device pass on the Pixel 5 (box-scan threshold, vertical scan on Adreno, 24 MP submission splitting, export tile 1024).
+**A/B on the Android x86_64 emulator (CPU engine, GPU flag off).** Same photo, same drag (+5.00 EV), `full` vs `off`: exported JPEGs are byte-identical (128820 bytes, `cmp` clean); screenshots match. Not covered: film + grain drag, crop, a RAW source, 24 MP, frame timings (no perf-probe build was made).
 
-**Film scheduler (`FilmSimulator::render`, `film_spatial` plans).** Needed: (1) planner uses the node chain (`FullFilm`) and tiles it (film frames are Whole only, 36 B/px at 26 MP); (2) GPU film wired into the executor and made faster than the CPU (dispatch-count bound: batch mixture components, fuse channels); (3) `SessionCtx::gainFn`, `FastOptions::{keepGrain,fullLongEdge,frameIndex}` set by the C layer so previews are scale-aware; (4) highlight boost and enlarger diffusion paths ported or dropped.
+**Checklist before deleting the old paths** (every item is code or tests, not a device):
+1. `renderer.cpp`: `Renderer::render` is still the fallback when a CPU node has no impl or film `setParams` fails; remove the fallback by giving those nodes impls (film boost `boostEv` and enlarger diffusion are not ported: either port or drop them from the product).
+2. Look previews, tone previews, HDR and pano paths still call the Renderer directly; move them onto the engine.
+3. `scaledSource` into the Resize node (a4).
+4. Table nodes baked through `CpuImpl::bake` instead of `EngineSession::bakeTables` / `bakeLegacy`; then delete the legacy bake keys (`#f`/`#x`) and `Mode::LegacyBakes` / `Mode::Tables`.
+5. Move the kernels out of `renderer.cpp` (FrameKernels owns them) and make the golden corpus the oracle; keep `Mode::Off` only until then, as the A/B switch.
+6. `NodeDesc::gpuImpl` in the registry is stale (the executor asks `gpuImplFor`): remove the field.
+7. GPU: ToneColourExact, Blend (film strength < 100), display curves / look LUT after film and tiled film export have no GPU impl (the CPU fallback stays, so these keep the CPU kernels alive).
+8. No device cache of the dehaze/guided solves, no PlanCache; device-tables cache is FIFO(2).
+9. Golden tests need a hash re-record per platform: the corpus is skipped on machines with a different `arch/avx2/film` signature, so the Android and NEON engines are not checked against it. Add a per-arch corpus or a cross-mode self-check (off vs full on the same machine) that runs on the emulator.
+10. Dart: `dapple_view_submit` ignores `active_param` (GPU view loop); no Dart test for the cancel binding.
 
-**Display.** Zero-readback requires the HAL to enable `VK_KHR_swapchain`/`VK_KHR_android_surface` or hand device handles to the presenter, and the executor to render into the presenter's image.
+**Are the device checks the only blockers? No.** Items 1 to 6 and 9 are software work that does not need a phone. The device checks are additional gates for deleting the *GPU-related old code and defaults*, not the CPU kernels: Pixel 5 and Find N5 measurements (box-scan threshold, vertical scan on Adreno, 24 MP submission splitting, export tile 1024, DeviceLost on a real driver, present-queue family, 120 Hz film budget, `tooSmall` misses), arm64 and armv7 runs of the new film kernels, and on-device A/B of film frames. Until those run, `Mode::Off` and `DAPPLE_GPU_VIEW=0` must stay as switches.
 
 ## 11. Rejected alternatives
 
@@ -1062,3 +1072,121 @@ ExecEnv env{fk, g, cache, CancelToken, out, channels};  Status s = CpuExecutor::
 * Film frames: Whole only, FilmSim is the existing super-node; an exact frame whose film `setParams` fails falls back to `Renderer::render`.
 * Not run: Android / NEON builds of the new files, the throttle profiles, the Pixel 5, the app (the Dart binding of `dapple_session_cancel` is not added). Look previews, tone previews and the HDR / pano paths still call the renderer directly.
 * The cached `Detail` / `Dehaze` solves are keyed by node key; for baked frames the key includes the LUT pointer identity like the lattice cache does (same pre-existing limitation). Exports use a private per-call cache.
+
+---
+
+## 18. Film on the planner, scale-aware grain from the C layer, key-preserving exposure (film engineer, 2026-11-12)
+
+* **Planner on `FullFilm`.** `EngineSession::renderFull` / `renderExact` build `GraphDetail::FullFilm`; the planner recognises the eight film image nodes (`FilmExposure` .. `FilmScan`) and plans them as one `FilmFrame` group (the three `FilmTable*` nodes sit in the `HostTable` stage with the other tables). The executor still runs the chain as one whole-frame stage (`FrameKernels::runFilm` -> `filmnode::renderFilmFrame`, internally tiled 256 x 64); film frames stay `Whole`. Golden corpus: byte-identical in off / legacy / tables / full with `DAPPLE_FILM_MATCH_OFF=1 DAPPLE_GRAIN_SCALE_OFF=1` (checked against the tree with the `#f` / `#x` bake-key change of another engineer reverted; with that change the 9 non-film entries move on their own).
+* **C layer.** `SessionCtx::gainFn` = `Renderer::inputGain` (new static; the constructor shares `whiteBalanceGain`). `FastOptions {keepGrain, fullLongEdge, frameIndex}` are set in `renderFrame`: `keepGrain` when `INTERACTIVE` and `active_param` is `grain` / `film_grain`; `fullLongEdge` = source long edge when the frame is smaller than the source and has no region. Additive `DappleFrameRequest::active_param` (`const char*`, last field; the struct is copied by `min(size, sizeof)` now, older callers leave it NULL). With `keepGrain` the main `Grain` node also stays on in interactive frames. Frames that need scale-aware / kept grain skip the streaming simulator path (node chain only). Dart: `DappleFrameRequestStruct.activeParam`, `DappleSession.renderFrame(activeParam:)`, `EditorEngine.beginInteraction(activeParam:)` (the editor controller passes the row id). Not wired: the GPU view loop (`dapple_view_submit` ignores `active_param`).
+* **Film exposure keeps the photo's key (owner bug: film made photos much darker).** The film model puts 18 % grey at a fixed lightness, so high-key scenes lost 25-35 L*. `matchFilmExposure` (`core/include/dapple/film_match.h`) renders the normal develop pipeline (same edit, film off, spatial off) and the film (strength 100, spatial off) on the 256 px proxy and solves, with 2-7 evaluations (secant, tolerance 0.35 L*, |EV| <= 4, either slope sign: slides get darker with exposure), for the EV that makes the median L* equal. The EV is `EditParams::filmKeyEv` (internal, not serialised), added to `exposure + filmExposure` in every film gain site and hashed through the new context key `ctx.filmKeyEv` (FilmSim / FilmExposure masks). The user's `film_exp` stays an offset on top. The C layer caches the EV per `filmMatchKey` (the edit minus film_exp / strength / grain / halation / spatial stages, plus LUT) in the session (12 entries); `Developer::develop` computes it as well. `DAPPLE_FILM_MATCH_OFF=1` disables it, `DAPPLE_GRAIN_SCALE_OFF=1` disables the scale-aware grain (diagnostics). CLI: `dapple film --auto-exposure match` (default; `on` = the model's metering, `off` = the harness contract) renders with the develop pipeline's automatic correction as the target and applies the EV as an input gain (the model's `exposureCompensationEv` is compensated again by the print exposure, so it cannot be used). Limit: a target above the paper white (~87 L*) is unreachable (the EV clamps at +4).
+* **Not ported to the node chain (frames fall back to the simulator):** highlight boost (`boostEv`) and the enlarger diffusion split print path; the app never sets either.
+
+## 19. GPU executor on the Plan, selection in the session, GLES workgroups, external-image seam (GPU executor engineer, 2026-11-12)
+
+Status: **landed** (desktop: RTX 4060 Ti Vulkan, SwiftShader Vulkan, GLES 3.1 on ANGLE over Vulkan and over SwiftShader; Android x86_64 NDK build compiles). `core/gpu` no longer has a renderer of its own: the GPU path is `Planner::plan` -> `GpuExecutor::run` -> `gpuImplFor(type)->recordPorts`.
+
+### 19.1 What landed
+
+| Piece | Where |
+|---|---|
+| `gpu::Executor` (`IGpuExecutor`): walks `Plan::stages`. `HostTable` = device tables from the session's bake; `TileSweep` = fused PointChain (one `recordPoint` for `[Resize|Geometry] Gain ToneColour Vignette`) + cumulative Window groups (`NRLuma NRChroma Dehaze Detail`, `Grain` = epilogue of the last pass, `Pack8` = the RGBA8 output); `GlobalSolve` = dehaze / clarity solves recorded into the same graph (Whole) or into their own graph over the 1/4 grids the tile sweeps accumulated (TiledExport). A single-tile run keeps `D` between sweeps and records only the groups a sweep adds (`ran`). Anything else (`ToneColourExact`, `DisplayStages`, `Blend`, `FilmFrame`, `Source` as a head) makes the plan `Unsupported` | `core/engine/exec/gpu_executor.{h,cpp}` |
+| `gpu::Context`: Vulkan -> GLES 3.1 device selection (`hal::selectDevice`), start-up self-test that runs the whole engine (Planner + executor through an `EngineSession`) against the CPU reference plus the box self-test, device rebuild (epoch, retired devices kept alive), `GpuProvider` | `exec/gpu_context.cpp`, `exec/gpu_iface.h`, `exec/gpu_runtime.h` |
+| Executor selection per frame in `EngineSession` (replaces `FrameJob::gpuHook`, `core/gpu/src/hook.cpp`, `gpu.h`, `gpu_hook.h`, `exec/gpu_frame.{h,cpp}`): `renderFull` -> `renderGpu` -> `runOnGpu` | `exec/engine_session.{h,cpp}` |
+| Source residency on `SourceStore` (`MemorySourceStore` now; the store is `window(x, y, w, h, pitch)` so a file backed store can stream tiles): the device copy (RGBA16F + resized variants) is shared by every executor of a context that reads the same store identity, so a frame session and its export session upload a 24 MP source once | `exec/source_store.h`, `ResidentSource` in `gpu_executor.cpp` |
+| Device tables (lattice + overflow lattice + tone table) on a `ResultCache` (`ColourLattice` slot, key = hash of `BakedLut::key`, limit 2, payload destroyed on eviction after a `waitIdle`); the overflow lattice is a `HostTable` payload now (`LatticeOverflow` node, requested through `FrameRequest::wantOverflow` whenever a GPU executor is in play) instead of being recomputed from the source in the executor | `gpu_executor.cpp`, `engine_session.cpp` |
+| GPU frame / export entry points on the engine API: `FrameJob::{store, resizeSharpen, srcLongEdge, gpuTarget}`, `FrameResult::{executor, external, gpu}`, `EngineSession::{exportGpu, useGpuExecutor, injectGpuFailure}`, `engineInUse()`, `gpuCounters()`; `FramePlan::resizeSharpen` (additive; makes the graph contain the `Detail` node for the output sharpening of a downscaled export) | `engine_session.h`, `dapple/frame_plan.h`, `graph/builder.cpp` |
+| C API: frames and exports go through the engine whenever `dapple_gpu_set_enabled` / `DAPPLE_GPU` is on (a GPU session always runs the Full engine, whatever `DAPPLE_ENGINE` says); `gpuExport` = `EngineSession::exportGpu` on the export session | `core/src/c_api.cpp` |
+| GLES workgroup patch (`docs/engine/gles-shader-patches.md` section 2): spec constants 16 / 17 (2D kernels), 18 / 19 (reduce), group counts from the recorder | shaders, `nodes/gpu_common.*`, `nodes/*/gpu.cpp`, `film_gpu.cpp` |
+| GLES 3.1 is a production fallback: `dapple_gpu` links `dapple_hal_gles` (`-DDAPPLE_GLES=ON`) and `hal/select.cpp`; the test shim (`gles_as_vulkan.cpp`, `dapple_gpu_gles`, `dapple_gles`) is gone, the GLES ctest entries run `dapple_gpu_tests` / `dapple_gpu_engine_tests` with `DAPPLE_GPU_API=gles` | `core/gpu/CMakeLists.txt`, `hal/gles/gles_gpu.cmake` |
+| Zero-readback seam: `hal::NativeHandles`, `hal::ExternalImage`, `CommandList::copyImageToExternal`, `DeviceOptions::presentExtensions` (VK_KHR_surface / android_surface / swapchain, universal queue family), `GpuTarget::external` / `FrameJob::gpuTarget`; API and limits in `docs/engine/present.md` | `hal/hal.h`, `hal/vk/vk_device.cpp`, `exec/gpu_scheduler.*` |
+| Tests / bench ported to the engine API (`core/gpu/src/gpu_rig.h` = one photo on an `EngineSession` with a forced executor): same parity cases, same numbers | `core/gpu/tests/gpu_tests.cpp`, `tests/engine/gpu/gpu_engine_tests.cpp`, `core/gpu/src/gpu_bench.cpp` |
+
+Selection (5.9) as implemented in `EngineSession::runOnGpu`:
+
+| Result of `IGpuExecutor::run` | Session behaviour |
+|---|---|
+| Ok | frame is the GPU's; `FrameResult::executor` = `vulkan` / `gles31` |
+| Unsupported (node without a GPU impl, film frame, image larger than the device, source too large to be resident) | this frame on the CPU executor, GPU stays; `gpuUnsupported` / `fallbacks` counted. No per-`(structureHash, caps)` result cache: planning is 20-90 us, so the check is redone |
+| Transient | `release()` the executor's device copies, retry once on the GPU, else this frame on the CPU; `transients` counted |
+| DeviceLost | `GpuProvider::recover`: rebuild the device once (executors re-create the source and tables from `SourceStore` + HostTable payloads after the epoch changed); this frame on the CPU. A failed rebuild or a second loss gives the API up and the **next** API (Vulkan -> GLES 3.1) takes over, then the CPU for the rest of the process; `deviceLost` / `demotions` counted |
+| Cancelled | `dapple_last_error() == "cancelled"`, nothing stored |
+
+### 19.2 Gates (measured on the desktop with the RTX 4060 Ti, llvm-mingw clang -O3; other engineers' builds and test runs were using the machine)
+
+| Gate | Result |
+|---|---|
+| GPU-vs-CPU parity, `dapple_gpu_tests` (22 stages x 2 sizes, downscale, error budget, tiled seams, streamed source, C API, steady state, blocklist) on **Vulkan RTX 4060 Ti** | every row identical to the phase-1 numbers (diff of the two outputs: only the banner, wall times and the status line differ): stage mean dE2000 0.035 - 0.073, max <= 1.9; Lanczos downscale mean 0.040 - 0.043; the same pass counts (e.g. 4608 passes for the 1500x1000 picture at tile 128) |
+| same on **SwiftShader Vulkan** | identical rows |
+| same on **GLES 3.1** (ANGLE over Vulkan RTX, ANGLE over SwiftShader), `DAPPLE_GPU_API=gles` | passes (self-test `point+geometry mean dE 0.040, spatial 0.076, box scan ok`); with `DAPPLE_GPU_WG=128` (16 x 8 / reduce 128) the stage run passes on both |
+| tiled export seams (tile 128 / 256 / 400 / 1024 / 512 / 1000 / 2048, resident and streamed source, 1500x1000 and 4000x2667, crop + straighten + rot90 + downscale 900) | **0 differing pixels** in every row (Vulkan, SwiftShader) |
+| zero-readback seam (`engine.gpu_external`, Vulkan RTX and SwiftShader) | external image bit-identical to the readback frame (0 of 307200 bytes) |
+| selection with injected failures (`engine.gpu_select`) | unsupported / transient (retry once) / device lost (real rebuild, `rebuilds:1`) / second loss -> next backend or CPU, as the table above |
+| `gpu-bench` steady-state frame wall ms (source resident; phase-1 build / this build; 1600 px, median of 3 alternating runs of 41 frames) | point only 2.14 / 2.07, interactive 2.69 / 2.70, full quality 3.02 / 3.06 |
+| `gpu-bench` 26.2 MP full resolution (9 frames) | point only 35.8 / 34.1, interactive 45.2 / 44.9, full quality 50.7 / 50.2; preview 1600 px from the resident source 2.59 / 2.60 |
+| `gpu-bench` tiled export of the 26.2 MP picture (tile 2048) | streamed 573 / 584 ms wall (GPU 175 / 176 ms), resident 55 / 56 ms (GPU 46 / 46), 576 passes, 564 barriers both; tiled vs single frame 0 differing pixels; tiled GPU vs CPU full frame dE2000 mean 0.0904, max 3.17 both |
+| ctest (82 tests, `build/gx`: GPU + GLES on) | 78 pass. The 4 failures are `engine.golden_{off,legacy,tables,full}`: all four modes mismatch the same 9 `film/*` entries (`full_*`, `blend50_*`, `exact_blend`), i.e. the film engineer's uncommitted key-preserving exposure change (section 18) without a re-baseline; the 139 non-film frames match in all four modes, and `off` (which does not touch the engine) fails identically |
+
+Not slower: all steady-state numbers are within +-2 % between the builds. The first frame of a photo is not comparable (the bench's `first` now includes the engine's table bake, which used to be timed outside). The plan + graph per frame (20-90 us on the CPU side, 17-29 us in the CPU engineer's measurement) is not part of the executor's `wallMs`.
+
+### 19.3 Differences from phase 1 (intentional)
+
+1. A GPU session runs the Full engine: the lattice is baked by the table nodes (golden-equal to `Renderer::bake`), not by the C layer; with `DAPPLE_GPU` on and `DAPPLE_ENGINE` unset, CPU fallback frames are `CpuExecutor` frames (byte-identical to `renderBakedRgba` by gate B), and the first frame of a photo includes the bake.
+2. The lattice cache is the executor's `ResultCache` (FIFO of 2, was LRU of 2); the overflow lattice comes from the session's `LatticeOverflow` payload.
+3. A transient failure is retried once on the GPU (5.9) instead of going straight to the CPU; the device-lost semantics are unchanged for the first loss, the second loss now tries GLES 3.1 before giving up.
+4. `ToneColourExact` (the exact graph) has no GPU implementation: `renderExact` stays on the CPU executor, only the baked pipeline runs on the GPU (as in phase 1).
+
+### 19.4 Not done / not verified
+
+* **Film frames** were `Unsupported` on the GPU in this period; since section 20 they run on the GPU executor (whole frames; film export tiles, `Blend` and display curves stay on the CPU).
+* No on-device measurement in this period: Pixel 5 / N5 / the phones were not touched (box-scan threshold, vertical scan on Adreno, 24 MP submission splitting, export tile 1024, DeviceLost on a real driver, a real GLES 3.1 device that reports 128 invocations). The Android x86_64 NDK build of `dapple_gpu` (+ GLES, + the tests) compiles; arm64 / armv7 were not built here.
+* The external-image seam is verified with a stand-in image and raw semaphores, not with a swapchain; see `docs/engine/present.md` for what a presenter must still do (surface, swapchain, queue-family ownership if the presenting family differs).
+* `PlanCache`: none. The GPU plan is made without the session `ResultCache` (cached solves are CPU payloads); a device-side cache of the dehaze / guided solves keyed by the node keys (so a pure exposure drag skips the analysis sweep on the GPU, as on the CPU) is not implemented: every GPU frame redoes the 1/4-grid analysis passes.
+* Mixed execution (GPU nodes with a CPU node in the middle) is still deferred (5.9).
+* `NodeDesc::gpuImpl` in the registry is not updated (the executor asks `gpuImplFor`).
+
+## 20. Film frames on the GPU executor, batched mixtures, half-precision planes (film GPU engineer, 2026-11-12)
+
+### 20.1 Wiring
+
+* `Renderer::framePlan` no longer rejects a film frame: for a film at strength 100 (and `DAPPLE_FILM_NODES` on) it fills `FramePlan::film` (stock, paper, `film_exp + filmKeyEv`, warmth, tint, grain / halation percent, `formatScale`, tier, `keepGrain`, `fullLongEdge`, `frameIndex`, and whether DisplayStages are the identity) and resolves the neighbourhood stages the way `FrameKernels` does (a film at full strength brings its own grain: look `std`). Strength < 100 (needs the normal branch for `Blend`) is still `supported = false`. `exportGpu` returns 1 for a film frame (no tiled film yet).
+* `gpu::Executor`: `validate` accepts a plan with a `FilmFrame` stage when `FramePlan::film.active`, the display stages are the identity, the plan is Whole and there is no tile sink. The film arguments are resolved from the FramePlan (`filmFrameResolved`). A film chain with an effect the GPU nodes do not port (`filmGpuSupported`: highlight boost, enlarger diffusion, wide dye-cloud blur, grain micro-structure) is `Unsupported` before anything is recorded (CPU for that frame, the GPU stays). A frame larger than 288 B/px x 45 % of the device-local heap is `Unsupported` too.
+* The walk: `FilmFrame` -> `Walk::filmStage` (film input = the resident source, or the new `film_src` pass for geometry / region frames; then `recordFilmFrame`). The following `TileSweep`'s point chain (DisplayStages + Vignette) is one `film_fin` pass (vignette, clamp, grain epilogue, RGBA16F working image or RGBA8). Window nodes (NR, dehaze, detail, grain) are unchanged. The device copy of the film tables (raw LUT, print LUT, curves, sRGB decode, grain sampler tables) is cached per executor (`DeviceFilm`) while the CPU bake's payload objects stay the same, and dropped on release / device rebuild. The colour lattice is not uploaded for a film frame.
+* New shared-header fields (additive): `FramePlan::film`, `SlotRes::taps`, `GpuRecorder::taps / tapNext`.
+
+### 20.2 Pass count and speed work
+
+| Change | Where |
+|---|---|
+| **Batched mixtures.** The three channels go through one RGBA plane; a pass filters up to four component slots of all three channels (`film_h3`: one source read, four outputs; `film_v3`: sums them with the accumulator and folds in `levelCombine`'s base pass and the Catmull-Rom upsample). The channel split / merge passes are gone. Tap tables live in a per-slot host-visible buffer (`taps`; the parameter block is limited to 256 B) | `film_mix3.comp`, `Mix3` in `film_gpu.cpp` |
+| **Shared-memory vertical pass**: a 16-column tile of each component plane (rows + 2 r) is staged in shared memory (13.8 KB, inside the 16 KB GLES 3.1 minimum); the 2 r + 1 taps cost shared reads instead of texture fetches | `film_v3` |
+| **Fusions**: FilmPrintScan + sRGB decode + glare add are one pass (`film_pd`; the glare field is computed first). The vertical unsharp blur and the encode are one pass (`film_f4ve`) | `film_point.comp` (`FUSED_POST`), `film_post.comp` MODE 6 |
+| **Half-precision planes**: every intermediate plane of the film (E, E2, q, D, grain, linear light, mixture temporaries) is RGBA16F instead of RGBA32F, stored through the exact round-to-nearest-even `h16v` (the passes are bandwidth bound). The raw LUT, print LUT, curves and the glare field stay 32-bit | all `film_*.comp` |
+
+Not done: the develop pass is not folded into the grain pass (the 256 B parameter block and duplicate curve code made it a separate step), the DIR half-resolution input path and the glare-field blur still use the older single-plane passes.
+
+### 20.3 Measurements (desktop, RTX 4060 Ti, Vulkan, `dapple_film_gpu_tests bench`, GPU timestamps; the bench also copies the display image back: 27 MB before, 13.6 MB after, shown separately)
+
+| Case (Portra 400) | Before (ms) | After (ms) | After without the readback copy |
+|---|---|---|---|
+| 1600 px final tier, all effects | 12.33 (readback 2.14), 10.2 compute | 3.83 (readback 1.12) | **2.7** |
+| 1600 px interactive | 8.00 | 2.65 | 1.5 |
+| 1600 px interactive, grain drag | 8.66 | 2.92 | 1.8 |
+| 1080 px interactive | 3.01 | 1.33 | 0.9 |
+| 3600 x 2400 final tier | 59.83 | 19.48 | about 17 |
+
+Passes of a 1536 x 1024 film frame through `EngineSession` + `GpuExecutor` (film chain, finish, windows): 109 -> 36 (Portra, all effects), 29 for a slide without grain, 14 interactive. Executor frame GPU time (`film_gpu.frames`, 8-bit readback copy included): Portra all effects 3.3 ms, slide without grain 3.0, interactive 2.4. The target (1600 px film all effects <= 3 ms GPU time on the desktop) is met for the film chain (2.7 ms); the whole executor frame is 3.3-3.5 ms. The largest remaining cost is `film_v3` (about 1.1 ms of the 2.7).
+
+### 20.4 Parity (all pass)
+
+* `film_gpu.parity` (per node against the CPU nodes, 960 x 640): point chain mean 0.015-0.017 / p99 <= 0.055 (budget 0.1 / 1.0); spatial, grain off: mean 0.018-0.036 / p99 <= 0.11 / max <= 0.33 (budget 0.15 / 1.5); grain after a 4x box downscale: mean 0.007-0.009 (budget 0.3); grain per pixel: mean 0.033 / p99 0.10 (0.1 / 1.0); scale-aware grain drag: 0.026 / 0.08. Mixtures against the CPU engine: max abs difference 0.044-0.093 % of the dynamic range (budget 0.5 %).
+* `film_gpu.frames` (whole frames through the session against the CPU engine render of the same job, 8-bit output, dE2000): Portra all effects 0.071 mean / 0.87 p99 / 1.85 max at 1536 x 1024; slide without grain 0.061 / 0.84; geometry + vignette 0.071 / 0.85; NR + clarity + sharpen 0.074 / 0.86; interactive 0.050 / 0.83; interactive grain drag 0.070 / 0.84. 12-17 % of the bytes differ by one level (8-bit rounding).
+* The half-precision planes cost 0.01-0.04 mean dE2000 against the 32-bit version of the same passes (before: 0.0000-0.012 in `film_gpu.parity`, after: 0.007-0.036).
+* `gpu_parity`, `gpu_parity_swiftshader`, `engine.gpu_*`, `film_gpu.parity`, `film_gpu.frames`, `engine.exec_*`, `engine.keys`, `engine.conformance`: pass. The graph snapshot `film_strength_100` gained `NRChroma` and `Detail` (the film frame plan now carries the neighbourhood stages of the edit, like the CPU `FrameKernels` plan): snapshot file updated.
+
+### 20.5 Not done / not verified
+
+* No tiled export of a film frame on the GPU (film planes are Whole). Strength < 100 (`Blend`), display curves and the look LUT after a film are CPU.
+* GLES 3.1: `film_gpu.frames` passes on the GLES 3.1 backend (ANGLE over Vulkan on the RTX, `DAPPLE_GPU_API=gles`) with the same numbers as Vulkan, also with `DAPPLE_GPU_WG=128` (16 x 8 groups). The vertical pass needs the workgroup shape from the parameter block (GLES translation cannot constant-fold `gl_WorkGroupSize`). Not run on a real ES device or on SwiftShader-GLES.
+* No device measurement (Find N5, Pixel 5, phones). The N5 GPU is expected to be about 10x slower on these kernels (find-n5.md); the bandwidth work helps there most, but the 120 Hz budget is not shown. No Android build of the new kernels.
+* `film_v3` is still about 40 % of the film time; the develop pass is not fused into the grain pass.

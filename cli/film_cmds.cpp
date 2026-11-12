@@ -26,6 +26,8 @@
 #include "dapple/developer.h"
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
+#include "dapple/film_match.h"
+#include "dapple/auto_adjust.h"
 #include "dapple/renderer.h"
 #include "film_internal.h"
 
@@ -194,7 +196,7 @@ std::shared_ptr<FilmLibrary> loadLibrary(const std::string& pack, std::string& e
   return FilmLibrary::loadPack(P(path), &err);
 }
 
-bool loadInput(const std::string& path, ImageF& img, int maxEdge, std::string& err) {
+bool loadInput(const std::string& path, ImageF& img, int maxEdge, std::string& err, std::string* make, std::string* model) {
   const fs::path p = P(path);
   std::string ext = p.extension().string();
   std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
@@ -213,6 +215,8 @@ bool loadInput(const std::string& path, ImageF& img, int maxEdge, std::string& e
       return false;
     }
     img = std::move(src->linear);
+    if (make) *make = src->meta.make;
+    if (model) *model = src->meta.model;
   }
   if (maxEdge > 0) img = resizeToLongEdge(img, maxEdge);
   return true;
@@ -233,7 +237,7 @@ FilmParams paramsFromArgs(const Args& a, std::string& err) {
   if (a.has("--film")) p.film = a.get("--film");
   if (a.has("--paper")) p.paper = a.get("--paper");
   if (a.has("--exposure-ev")) p.camera.exposureCompensationEv = std::atof(a.get("--exposure-ev").c_str());
-  if (a.has("--auto-exposure")) p.camera.autoExposure = a.get("--auto-exposure") == "on";
+  if (a.has("--auto-exposure")) p.camera.autoExposure = a.get("--auto-exposure") == "on";  // "match" is applied in cmdFilm
   if (a.has("--no-spatial")) p.disableSpatialAndStochastic();
   if (a.has("--seed")) p.settings.seed = std::uint32_t(std::strtoul(a.get("--seed").c_str(), nullptr, 0));
   if (a.has("--json-params")) {
@@ -294,13 +298,54 @@ int cmdFilm(const std::vector<std::string>& args) {
   }
   ImageF in, out;
   const auto tl = Clock::now();
-  if (!loadInput(a.get("--in"), in, std::atoi(a.get("--max-edge", "0").c_str()), err)) {
+  std::string metaMake, metaModel;
+  if (!loadInput(a.get("--in"), in, std::atoi(a.get("--max-edge", "0").c_str()), err, &metaMake, &metaModel)) {
     std::fprintf(stderr, "film: %s\n", err.c_str());
     return 1;
   }
   const double loadMs = msSince(tl);
+  const std::string aeMode = a.get("--auto-exposure", "match");
+  float matchEv = 0.f;
+  float matchGain[3] = {1.f, 1.f, 1.f};
+  FilmMatchInfo mi;
+  if (aeMode == "match") {
+    // Film exposure that keeps the photo's key (film_match.h): the develop pipeline's render (automatic correction, as
+    // `dapple develop`) of the 256 px proxy sets the target median L*, the film is exposed until its median equals it.
+    const Developer dev;
+    const CameraProfile& cam = dev.cameras().resolve(metaMake, metaModel);
+    SourceImage proxy;
+    proxy.sceneReferred = true;
+    proxy.linear = resizeToLongEdge(in, 256);
+    SourceImage full;
+    full.sceneReferred = true;
+    full.linear = in.width > 1024 || in.height > 1024 ? resizeToLongEdge(in, 1024) : in;
+    EditParams ep;
+    ep += computeAutoAdjust(full, cam, AutoOptions{}).correction;
+    Renderer ref(ep, cam, nullptr);
+    ref.setToneProxy(&proxy);
+    const float target = medianLightness(ref.renderFloat(proxy, false));
+    FilmParams q = p;
+    q.disableSpatialAndStochastic();
+    FilmSimulator probe(lib);
+    std::string e2;
+    if (!probe.setParams(q, &e2)) {
+      std::fprintf(stderr, "film: %s\n", e2.c_str());
+      return 2;
+    }
+    ImageF po;
+    auto filmL = [&](float ev) {
+      // the exposure goes in as an input gain, as the app does: the model's exposureCompensationEv is compensated again by
+      // the print exposure (printExposureCompensation) and would leave the print lightness unchanged
+      const float g = std::exp2(ev);
+      const float gain3[3] = {g, g, g};
+      if (!probe.render(proxy.linear, po, nullptr, gain3)) return 0.f;
+      return medianLightness(po);
+    };
+    matchEv = solveFilmKeyEv(filmL, target, &mi);
+    matchGain[0] = matchGain[1] = matchGain[2] = std::exp2(matchEv);
+  }
   FilmTimings rt;
-  if (!sim.render(in, out, &rt)) {
+  if (!sim.render(in, out, &rt, aeMode == "match" ? matchGain : nullptr)) {
     std::fputs("film: render failed\n", stderr);
     return 1;
   }
@@ -318,6 +363,9 @@ int cmdFilm(const std::vector<std::string>& args) {
   std::printf("%s -> %s (%dx%d)  %s + %s  neutral C/M/Y %.2f/%.2f/%.2f  auto-EV %+.2f  kernel %s\n", a.get("--in").c_str(),
               a.get("--out").c_str(), in.width, in.height, p.film.c_str(), p.paper.c_str(), e.enlarger.cFilterNeutral,
               e.enlarger.mFilterNeutral, e.enlarger.yFilterNeutral, rt.autoExposureEv, sim.kernelName());
+  if (aeMode == "match")
+    std::printf("match: key EV %+.2f  median L* develop %.1f  film at 0 EV %.1f -> matched %.1f  (%d evals)\n", matchEv, mi.targetL,
+                mi.filmL0, mi.filmL, mi.evals);
   if (a.has("--timings"))
     std::printf("timings ms: bake %.1f (raw %.1f curves %.1f neutral %.1f lut %.1f)  auto-exp %.1f  run %.1f  load %.0f  write %.0f\n",
                 bt.bakeMs, bt.rawLutMs, bt.curvesMs, bt.neutralMs, bt.lutMs, rt.autoExposureMs, rt.runMs, loadMs, writeMs);

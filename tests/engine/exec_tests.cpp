@@ -335,22 +335,19 @@ void testCancel() {
   p.rotate = 0;
   EngineSession es;
   Image8 out;
-  bool ok = true;
-  double returnedAfterMs = 0;
-  const auto t0 = Clock::now();
-  std::thread worker([&] {
-    ok = exactRender(es, p, src, ExecMode::TiledExport, 512, out);
-    returnedAfterMs = msSince(t0);
-  });
-  std::this_thread::sleep_for(std::chrono::milliseconds(150));
-  const double cancelAt = msSince(t0);
-  es.cancel();
-  worker.join();
-  const double latency = returnedAfterMs - cancelAt;
-  std::printf("  cancel at %.0f ms: render returned %s after %.0f ms (latency %.0f ms)\n", cancelAt, ok ? "OK (finished first)" : "cancelled",
-              returnedAfterMs, latency);
-  CHECK(!ok || returnedAfterMs < cancelAt + 1.0);  // either it finished before the cancel, or it was cancelled
-  if (!ok) CHECK(latency < 800.0);
+  // Deterministic: the cancel lands after the request took its ticket and before the first tile (no wall-clock involved).
+  {
+    const Renderer r(p, cam(), nullptr);
+    EngineSession::ExactOptions o;
+    o.mode = ExecMode::TiledExport;
+    o.tile = 512;
+    o.beforeExec = [&] { es.cancel(); };
+    std::string err;
+    CHECK(!es.renderExact(p, r, src, o, out, &err));
+    CHECK(err == "cancelled");
+    CHECK(es.stats().cancelled == 1);
+  }
+  // a request submitted after the cancel is unaffected (latest wins)
   // the session still renders, and the result equals a render that was never cancelled
   Image8 a, b;
   CHECK(exactRender(es, p, src, ExecMode::TiledExport, 512, a));

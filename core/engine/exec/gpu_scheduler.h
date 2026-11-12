@@ -80,6 +80,8 @@ class GpuGraph {
   void copyBufferToBuffer(const BufferH& src, H dst, std::uint64_t bytes, std::uint64_t srcOffset = 0);
   void copyImageToBuffer(H src, const BufferH& dst, std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h);
   void copyImage(H src, H dst, std::uint32_t w, std::uint32_t h);
+  // Final copy into an image owned by the presenter (HAL ExternalImage): no readback. The caller keeps `ext` alive until submit.
+  void copyImageToExternal(H src, const hal::ExternalImage& ext, std::uint32_t w, std::uint32_t h);
   std::size_t passCount() const { return nodes_.size(); }
 
  private:
@@ -94,7 +96,8 @@ class GpuGraph {
     int last = -1;
   };
   struct Node {
-    enum Kind { Dispatch, BufToImg, BufToBuf, ImgToBuf, ImgToImg } kind = Dispatch;
+    enum Kind { Dispatch, BufToImg, BufToBuf, ImgToBuf, ImgToImg, ImgToExternal } kind = Dispatch;
+    hal::ExternalImage ext;
     std::string name;
     PipelineH pl;
     std::vector<Use> uses;

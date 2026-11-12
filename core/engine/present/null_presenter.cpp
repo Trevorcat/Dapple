@@ -9,6 +9,7 @@ namespace dapple::present {
 namespace {
 class NullPresenter final : public Presenter {
  public:
+  explicit NullPresenter(bool external) : external_(external) {}
   bool setWindow(void* window, int w, int h, std::string&) override {
     std::lock_guard<std::mutex> l(m_);
     win_ = window;
@@ -33,6 +34,25 @@ class NullPresenter final : public Presenter {
     ++n_;
     return true;
   }
+  // test double of the zero-readback input: hands out a dummy image so the view takes the external path (the frame has to come
+  // back as pixels from a CPU session, which is exactly the fallback the tests look at)
+  bool beginExternal(int w, int h, ExternalTarget* out, std::string& err) override {
+    if (!external_) return err = "not supported", false;
+    std::lock_guard<std::mutex> l(m_);
+    if (!win_) return err = "no window", false;
+    out->image = &dummy_;
+    out->w = std::uint32_t(w);
+    out->h = std::uint32_t(h);
+    return true;
+  }
+  bool presentExternal(int w, int h, PresentTiming*, std::string& err) override {
+    std::lock_guard<std::mutex> l(m_);
+    if (!win_) return err = "no window", false;
+    lw_ = w;
+    lh_ = h;
+    ++n_;
+    return true;
+  }
   void trim(int) override {
     std::lock_guard<std::mutex> l(m_);
     last_.clear();
@@ -44,13 +64,15 @@ class NullPresenter final : public Presenter {
  private:
   mutable std::mutex m_;
   void* win_ = nullptr;
+  const bool external_;
+  int dummy_ = 0;
   int w_ = 0, h_ = 0, lw_ = 0, lh_ = 0;
   std::vector<std::uint8_t> last_;
   std::atomic<std::uint64_t> n_{0};
 };
 }  // namespace
 
-std::unique_ptr<Presenter> makeNullPresenter() { return std::make_unique<NullPresenter>(); }
+std::unique_ptr<Presenter> makeNullPresenter(bool external) { return std::make_unique<NullPresenter>(external); }
 
 #if !defined(__ANDROID__)
 std::unique_ptr<Presenter> makeVulkanPresenter(std::string& err) {

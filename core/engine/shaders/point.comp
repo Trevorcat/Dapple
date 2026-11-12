@@ -5,7 +5,7 @@
 // takes its exact path) -> vignette -> RGBA16F working image (and RGBA8 + grain when it is the last pass).
 // Mirrors Renderer::renderBakedImpl + LutSampler (core/src/renderer.cpp).
 #extension GL_GOOGLE_include_directive : enable
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
 #include "common.glsl"
 layout(constant_id = 0) const int GEO = 0;  // 0 identity (output pixel = source pixel), 1 exact index mapping, 2 Catmull-Rom
 

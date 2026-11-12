@@ -30,11 +30,19 @@ class MainActivity : FlutterActivity() {
     private val liveIo = Executors.newFixedThreadPool(2)
     private val live by lazy { LiveBridge(applicationContext) }
     private var viewPlugin: DappleViewPlugin? = null
+    private var capturePlugin: CapturePlugin? = null
 
     private val extensions = listOf("arw", "raf", "dng", "jpg", "jpeg")
 
     // Only camera-ish locations (DCIM / Pictures) are ingested; chat apps and screenshots are skipped.
     private val excluded = listOf("%/Screenshots/%", "%/WeiXin/%", "%/WeChat/%", "%/Tencent/%", "%/MicroMsg/%", "%/Download/%")
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (capturePlugin?.onActivityResult(requestCode, resultCode, data) == true) return
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -42,6 +50,9 @@ class MainActivity : FlutterActivity() {
 
         // Zero-copy display (stage d): SurfaceProducer textures drawn by the native view (DappleViewPlugin.kt)
         viewPlugin = DappleViewPlugin(applicationContext, messenger, flutterEngine.renderer)
+
+        // In-app camera capture (CaptureActivity.kt): testing convenience
+        capturePlugin = CapturePlugin(this, messenger)
 
         // Editor landmark haptics (requirements 4.15.9): View.performHapticFeedback with the
         // finest constant the OS offers. Numeric values so this compiles against any compileSdk.

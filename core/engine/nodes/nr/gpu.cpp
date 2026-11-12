@@ -35,7 +35,7 @@ bool recordNrLuma(GpuRecorder& r, const NrLumaNode& n, H D) {
   u.nr[2] = n.ep.amp;
   u.nr[3] = n.ep.period;
   r.g.dispatch("nr_luma", p, {GpuGraph::RW(D), GpuGraph::R(Yb), n.ep.last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8))},
-               std::uint32_t(cdiv(n.W, 16)), std::uint32_t(cdiv(n.Hh, 16)), &u, sizeof u);
+               r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
   return true;
 }
 
@@ -62,7 +62,7 @@ bool recordNrChroma(GpuRecorder& r, const NrChromaNode& n, H D) {
   u.nr[2] = n.ep.amp;
   u.nr[3] = n.ep.period;
   r.g.dispatch("nr_chroma", p, {GpuGraph::RW(D), GpuGraph::R(bl), n.ep.last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8))},
-               std::uint32_t(cdiv(n.W, 16)), std::uint32_t(cdiv(n.Hh, 16)), &u, sizeof u);
+               r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
   return true;
 }
 

@@ -26,6 +26,10 @@ struct GpuFilmTables {
 bool uploadGpuTables(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTables& out, std::string& err);
 void releaseGpuTables(gpu::Core& core, GpuFilmTables& t);
 
+// False (with `why`) when the film chain of `res` has an effect the GPU nodes do not port (highlight boost, enlarger diffusion,
+// a wide dye-cloud blur, grain micro-structure): the executor then leaves the frame to the CPU. Same checks as recordFilmFrame.
+bool filmGpuSupported(const FilmResolved& res, std::string& why);
+
 // Per-frame resources derived from the plan (grain sampler tables): uploaded when the grain parameters change.
 struct GpuFilmPlanRes {
   hal::BufferH grainTab;  // per channel: inverse table + merged-sampler table
@@ -38,6 +42,9 @@ void releaseGpuPlan(gpu::Core& core, GpuFilmPlanRes& t);
 // RGBA32F display image (sRGB encoded, unclamped) or -1 (unsupported effect / error in `r.err`).
 gpu::H recordFilmFrame(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pr, gpu::H src,
                        int w, int h);
+
+// IEEE half -> float (the film planes are RGBA16F; tests read them back)
+float halfToFloat(std::uint16_t h);
 
 // Test hook: a Gaussian mixture of one plane (w x h floats) on the GPU, `half` = the input is the half-resolution plane.
 bool gpuMixtureForTest(gpu::Core& core, const float* plane, int w, int h, const void* mixture, bool half, std::vector<float>& out,

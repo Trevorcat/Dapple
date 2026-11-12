@@ -79,5 +79,12 @@ flutter {
 }
 
 dependencies {
+    // In-app capture (CaptureActivity): CameraX, Apache-2.0. 1.5 adds ImageCapture RAW / RAW_JPEG output.
+    val cameraX = "1.5.1"
+    implementation("androidx.camera:camera-core:$cameraX")
+    implementation("androidx.camera:camera-camera2:$cameraX")
+    implementation("androidx.camera:camera-lifecycle:$cameraX")
+    implementation("androidx.camera:camera-view:$cameraX")
+    implementation("androidx.activity:activity:1.10.1")
     testImplementation("junit:junit:4.13.2")
 }

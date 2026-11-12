@@ -7,6 +7,7 @@ import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
 import '../../widgets/icons.dart';
 import '../../widgets/photo_art.dart';
+import 'capture_flow.dart';
 import 'conn_card.dart';
 import '../tools/launcher.dart';
 import 'photo_tile.dart';
@@ -153,6 +154,11 @@ class _TopBar extends StatelessWidget {
               style: T.body(c.text2, tabular: true)),
           const SizedBox(width: 8),
         ],
+        if (app.isDemo || app.captureBackend.available)
+          KeyedSubtree(
+            key: const ValueKey('capture-button'),
+            child: DIconButton(DI.camera, label: '拍照', onPressed: () => captureAndEdit(context, app)),
+          ),
         if (!app.isEmpty)
           KeyedSubtree(
             key: const ValueKey('select-toggle'),

@@ -109,7 +109,7 @@ class NativeFrame {
 
 // ---- persistent frame worker (one isolate per session) -------------------------------------------
 
-/// Message: [replyPort, id, address, paramsJson, lutPath, longEdge, flags, bakeSize, rx0, ry0, rx1, ry1, regionLongEdge]
+/// Message: [replyPort, id, address, paramsJson, lutPath, longEdge, flags, bakeSize, rx0, ry0, rx1, ry1, regionLongEdge, activeParam?]
 /// or [replyPort, id, 'quit']. Reply: [id, 'ok', width, height, rgbaAddress, analysisJson?] or [id, 'err', message].
 void _frameWorkerMain(SendPort initPort) {
   final rp = ReceivePort();
@@ -127,7 +127,7 @@ void _frameWorkerMain(SendPort initPort) {
 }
 
 List<Object?> _frameNative(int id, List msg) {
-  ffi.Pointer<Utf8>? pp, lp;
+  ffi.Pointer<Utf8>? pp, lp, ap;
   ffi.Pointer<DappleFrameRequestStruct>? rq;
   ffi.Pointer<DappleImageStruct>? img;
   ffi.Pointer<ffi.Pointer<Utf8>>? an;
@@ -148,6 +148,11 @@ List<Object?> _frameNative(int id, List msg) {
       ..rx1 = msg[10] as double
       ..ry1 = msg[11] as double
       ..regionLongEdge = msg[12] as int;
+    final act = msg.length > 13 ? msg[13] as String? : null;
+    if (act != null && act.isNotEmpty) {
+      ap = act.toNativeUtf8();
+      rq.ref.activeParam = ap;
+    }
     img = calloc<DappleImageStruct>();
     an = calloc<ffi.Pointer<Utf8>>();
     final sw = Stopwatch()..start();
@@ -165,6 +170,7 @@ List<Object?> _frameNative(int id, List msg) {
   } finally {
     if (pp != null) malloc.free(pp);
     if (lp != null) malloc.free(lp);
+    if (ap != null) malloc.free(ap);
     if (rq != null) calloc.free(rq);
     if (img != null) calloc.free(img);
     if (an != null) calloc.free(an);
@@ -462,10 +468,11 @@ class DappleSession {
       int regionLongEdge = 0,
       int bakeSize = 0,
       bool background = false,
-      bool exact = false}) {
+      bool exact = false,
+      String? activeParam}) {
     final pj = jsonEncode(params);
     final flags = (interactive ? dappleFrameInteractive : 0) | (analysis ? dappleFrameAnalysis : 0) | (exact ? dappleFrameExact : 0) | (background ? dappleFrameBackground : 0);
-    return _serial(() => _frame(pj, lutPath, longEdge, flags, bakeSize, region, regionLongEdge));
+    return _serial(() => _frame(pj, lutPath, longEdge, flags, bakeSize, region, regionLongEdge, activeParam));
   }
 
   Future<void> _ensureWorker() async {
@@ -491,7 +498,7 @@ class DappleSession {
     _toWorker = await init.first as SendPort;
   }
 
-  Future<NativeFrame> _frame(String pj, String? lutPath, int longEdge, int flags, int bakeSize, ui.Rect? region, int regionLongEdge) async {
+  Future<NativeFrame> _frame(String pj, String? lutPath, int longEdge, int flags, int bakeSize, ui.Rect? region, int regionLongEdge, String? activeParam) async {
     await _ensureWorker();
     final id = ++_frameId;
     final c = Completer<List>();
@@ -510,6 +517,7 @@ class DappleSession {
       region?.right ?? 0.0,
       region?.bottom ?? 0.0,
       regionLongEdge,
+      activeParam,
     ]);
     final r = await c.future;
     if (r[1] != 'ok') throw DappleException(r[2] as String);
@@ -534,6 +542,15 @@ class DappleSession {
 
   static Future<void> _exportIso(int a, String pj, String? lut, int longEdge, int quality, String outPath) =>
       Isolate.run(() => _exportNative(a, pj, lut, longEdge, quality, outPath));
+
+  /// Latest-wins cancellation (`dapple_session_cancel`): the render in flight on this session (any isolate) returns early
+  /// with a "cancelled" error; renders submitted afterwards are unaffected. Synchronous and lock-free. False when the
+  /// session is closed or the library predates the call.
+  bool cancel() {
+    final f = DappleBindings.instanceOrNull?.sessionCancel;
+    if (f == null || _closed) return false;
+    return f(ffi.Pointer.fromAddress(_address)) == dappleOk;
+  }
 
   Future<void> close() => _serial(() async {
         if (_closed) return;

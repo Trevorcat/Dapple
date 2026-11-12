@@ -24,6 +24,7 @@ add_library(dapple_core STATIC
   src/film_color.cpp
   src/film_model.cpp
   src/film_params.cpp
+  src/film_match.cpp
   src/film_profile.cpp
   src/film_upsample.cpp
   src/film_kernels_base.cpp
@@ -91,6 +92,7 @@ else()
   target_compile_options(dapple PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 if(ANDROID)
+  target_link_libraries(dapple_core PUBLIC log)  # engine_session.cpp logs via __android_log_print (static consumers: tests, cli)
   target_link_libraries(dapple PRIVATE log)
   # 16 KB page size support for Android 15+ devices
   target_link_options(dapple PRIVATE -Wl,-z,max-page-size=16384)

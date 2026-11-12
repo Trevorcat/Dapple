@@ -51,6 +51,7 @@ struct DeviceCaps {
   std::uint32_t subgroupSize = 0, subgroupOps = 0;
   bool linearFilterRgba32f = false;
   bool externalMemoryImport = false, surfacePresent = false;
+  bool externalImageWrite = false;  // CommandList::copyImageToExternal works (Vulkan)
   // vendor:device:driver (blocklist / self-test cache key)
   std::string key() const;
   std::string text() const;
@@ -95,6 +96,33 @@ struct PipelineDesc {
 
 struct Rect2 { std::uint32_t x = 0, y = 0, w = 0, h = 0; };
 
+// ---- zero-readback seam (stage d, docs/engine/present.md) ------------------------------------------------------------------
+// An image created and owned by someone else (the presenter's swapchain image) that the final pass of a frame is copied into.
+// Vulkan: `handle` is a VkImage of format R8G8B8A8_UNORM (or any 32 bit format with the same texel size) created with
+// TRANSFER_DST usage on THIS device (see Device::nativeHandles) and a queue family sharing; the commands bring it from
+// `layoutIn` to TRANSFER_DST_OPTIMAL for the copy and to `layoutOut` afterwards (values of VkImageLayout; 0 = UNDEFINED /
+// 1000001002 = PRESENT_SRC_KHR for a swapchain image). `waitSemaphore` (a VkSemaphore, e.g. the acquire semaphore; 0 = none) is
+// waited for before the copy, `signalSemaphore` (the render-finished semaphore the present waits on; 0 = none) is signalled
+// after it, both by the submission that ends the frame. Unsupported on backends without caps.externalImageWrite (GLES).
+struct ExternalImage {
+  void* handle = nullptr;
+  Format fmt = Format::RGBA8;
+  std::uint32_t w = 0, h = 0;
+  std::uint32_t layoutIn = 0, layoutOut = 0;
+  std::uint64_t waitSemaphore = 0, signalSemaphore = 0;
+};
+// The handles of the device behind a Device, so a presenter can adopt it instead of creating a second one (adopted-device
+// mode): the swapchain, the semaphores and the external images must live on the same VkDevice.
+struct NativeHandles {
+  void* instance = nullptr;          // VkInstance
+  void* physicalDevice = nullptr;    // VkPhysicalDevice
+  void* device = nullptr;            // VkDevice
+  void* queue = nullptr;             // VkQueue (graphics + compute + transfer family used by the HAL; serialise with the device)
+  std::uint32_t queueFamily = 0;
+  void* getInstanceProcAddr = nullptr;  // PFN_vkGetInstanceProcAddr of the loader the device was created through
+  bool swapchainEnabled = false;     // VK_KHR_swapchain (+ VK_KHR_surface / VK_KHR_android_surface) were enabled at creation
+};
+
 // Barrier classes, derived by the scheduler from RAW / WAR / WAW analysis (consumer oriented).
 enum Barrier : std::uint32_t {
   kImgStoreToImgLoad = 1, kImgStoreToSampled = 2, kBufWriteToBufRead = 4, kComputeToTransfer = 8, kTransferToCompute = 16,
@@ -126,6 +154,9 @@ class CommandList {
   virtual void copyImage(ImageH, ImageH, std::uint32_t w, std::uint32_t h) = 0;
   virtual void timestamp(const char* label) = 0;  // no-op unless profiling is on and caps.timestamps
   // Submit what has been recorded and continue in a fresh buffer of the same slot (no fence).
+  // Copies the top-left w x h of `src` (an RGBA8 image) into an externally owned image (see ExternalImage) and attaches its
+  // semaphores to the submission that ends the command list. Unsupported where caps.externalImageWrite is false.
+  virtual Status copyImageToExternal(ImageH src, const ExternalImage& dst, std::uint32_t w, std::uint32_t h) { (void)src; (void)dst; (void)w; (void)h; return Status::Unsupported; }
   virtual Status flushPart() = 0;
   virtual Status status() const = 0;  // first error of the recording (sticky)
 };
@@ -137,6 +168,9 @@ struct DeviceOptions {
   std::string blocklist;
   std::string pipelineCachePath;
   std::size_t poolBudgetBytes = 0;
+  // Enable VK_KHR_surface + VK_KHR_android_surface (win32 on the desktop) at instance creation and VK_KHR_swapchain at device
+  // creation when the implementation offers them, so a presenter can adopt the device (Device::nativeHandles).
+  bool presentExtensions = false;
   // Weighted workgroups per submission before the scheduler splits a frame (0 = device default, env
   // DAPPLE_GPU_SPLIT_GROUPS overrides, "0" there = never split).
   double splitGroups = 0;
@@ -174,6 +208,10 @@ class Device {
   virtual SubmitStats stats(FenceH) const = 0;
   virtual double gpuAccumMs() const = 0;
 
+  // Handles of the underlying device for the presenter (adopted-device mode). False where there is no such thing (GLES).
+  virtual bool nativeHandles(NativeHandles* out) const { (void)out; return false; }
+  // The VkImage behind an image this device created (tests of the external-image seam; a presenter normally owns its images).
+  virtual bool nativeImage(const ImageH& im, void** vkImage) const { (void)im; (void)vkImage; return false; }
   virtual std::vector<std::uint8_t> pipelineCacheBlob() const = 0;
   virtual void trim() = 0;  // release descriptor caches etc.
   virtual double splitGroups() const = 0;

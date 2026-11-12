@@ -53,7 +53,7 @@ bool recordPoint(GpuRecorder& r, const PointNode& n, H D) {
   r.g.dispatch("point", p,
                {GpuGraph::R(n.src.img), GpuGraph::R(n.lut.tone), GpuGraph::R(n.lut.lat), GpuGraph::R(n.lut.lat2), GpuGraph::W(D),
                 n.ep.last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8))},
-               std::uint32_t(cdiv(n.W, 16)), std::uint32_t(cdiv(n.Hh, 16)), &u, sizeof u);
+               r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
   return true;
 }
 

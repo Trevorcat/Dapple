@@ -39,7 +39,7 @@ NodeRegistry::NodeRegistry() {
   const ParamMask FILMCTX = P.mask({"ctx.filmActive", "ctx.filmOnly"});
 
   ParamMask ANALYSIS = P.mask({"exposure", "toneTarget", "toneStrength", "ctx.camera", "ctx.source", "ctx.proxy",
-                               "ctx.toneReach", "ctx.lutIdentity"});
+                               "ctx.toneReach", "ctx.lutIdentity", "ctx.fastAnalysis"});
   // The tonal analysis is the histogram of the cropped / straightened / vignetted proxy render: it depends on the frame
   // geometry and the vignette (the legacy keys masked them, so a crop change returned a stale analysis; fixed in a4b).
   ANALYSIS.add(WB).add(TONE).add(COLOUR).add(FILMCTX).add(P.mask({"crop", "straighten", "rotate", "flip", "vignette"}));
@@ -97,7 +97,7 @@ NodeRegistry::NodeRegistry() {
   }
   {
     ParamMask m = TONE;
-    m.add(P.mask({"toneStrength", "ctx.camera", "ctx.source"}));
+    m.add(P.mask({"toneStrength", "ctx.camera", "ctx.source", "ctx.fastAnalysis"}));
     NodeDesc& d = def(NodeType::ToneTable, "ToneTable", Domain::Table, Footprint::Global, 0, 1, m);
     d.inputDomain[0] = Domain::Table;  // ToneAnalysisPre when toneStrength > 0
     d.cache = CacheHint::Keep;
@@ -148,7 +148,7 @@ NodeRegistry::NodeRegistry() {
   {
     ParamMask m = FRAME;
     m.add(WB).add(P.mask({"exposure", "filmStock", "filmPaper", "film_exp", "film_warmth", "film_tint", "film_grain",
-                          "film_halation", "ctx.camera", "ctx.source", "ctx.filmLib", "ctx.quality", "ctx.filmActive"}));
+                          "film_halation", "ctx.filmKeyEv", "ctx.camera", "ctx.source", "ctx.filmLib", "ctx.quality", "ctx.filmActive"}));
     NodeDesc& d = def(NodeType::FilmSim, "FilmSim", Domain::Image, Footprint::Super, 1, 1, m);
     d.usesGeometry = true;
     d.haloNote = "spectral film simulator incl. halation / DIR / grain / scan";
@@ -179,7 +179,7 @@ NodeRegistry::NodeRegistry() {
   {
     // gain (white balance x exposure x film exposure) is folded into the input matrix
     ParamMask m = WB;
-    m.add(P.mask({"exposure", "film_exp", "ctx.camera", "ctx.source", "ctx.filmLib"}));
+    m.add(P.mask({"exposure", "film_exp", "ctx.filmKeyEv", "ctx.camera", "ctx.source", "ctx.filmLib"}));
     NodeDesc& d = def(NodeType::FilmExposure, "FilmExposure", Domain::Image, Footprint::Point, 2, 2, m);
     d.inputDomain[0] = Domain::Image;
     d.inputDomain[1] = Domain::Table;  // FilmTableRaw

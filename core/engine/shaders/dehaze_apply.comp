@@ -3,7 +3,7 @@
 // four neighbouring low-resolution samples and interpolated, then J = (I - A) / t + A. MODE 1 is the negative
 // amount: a veil of light grey. The dark channel grid and the airlight are global (see the tiled export).
 #extension GL_GOOGLE_include_directive : enable
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
 #include "common.glsl"
 layout(constant_id = 0) const int MODE = 0;
 

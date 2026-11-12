@@ -42,7 +42,7 @@ endif()
 # list cannot silently drift from the executable).
 set(DAPPLE_FILM_TEST_IDS profiles colorimetry upsample grey spec_vectors baked_vs_direct dir_params render_paths
     smoke_all gauss_mixture spatial_plans grain_stats spatial_render glare_enlarger spatial_extras editparams_json
-    develop_film c_api validation strong_guarantee robust_render render_rows pack_format cache_keys concurrency
+    develop_film film_match c_api validation strong_guarantee robust_render render_rows pack_format cache_keys concurrency
     pool_exceptions kernel_exp library_errors)
 foreach(id IN LISTS DAPPLE_FILM_TEST_IDS)
   add_test(NAME film.${id} COMMAND dapple_film_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -79,12 +79,12 @@ if(TARGET dapple_gpu)
   if(NOT MSVC)
     target_compile_options(dapple_gpu_engine_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
-  foreach(_t hal box sched select)
+  foreach(_t hal box sched select external)
     add_test(NAME engine.gpu_${_t} COMMAND dapple_gpu_engine_tests ${_t})
     set_tests_properties(engine.gpu_${_t} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
   endforeach()
   if(EXISTS "${DAPPLE_SWIFTSHADER_LIB}")
-    foreach(_t hal box sched select)
+    foreach(_t hal box sched select external)
       add_test(NAME engine.gpu_${_t}_swiftshader COMMAND dapple_gpu_engine_tests ${_t})
       set_tests_properties(engine.gpu_${_t}_swiftshader PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77
         ENVIRONMENT "VK_DRIVER_FILES=${_ss_icd};VK_ICD_FILENAMES=${_ss_icd};DAPPLE_GPU_SOFTWARE=1")
@@ -162,7 +162,7 @@ endforeach()
 if(TARGET dapple_gpu)
   add_executable(dapple_film_gpu_tests engine/film_gpu_tests.cpp)
   target_link_libraries(dapple_film_gpu_tests PRIVATE dapple_gpu dapple_core)
-  target_include_directories(dapple_film_gpu_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include
+  target_include_directories(dapple_film_gpu_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/gpu/src ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include
                              ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/cli)
   target_compile_definitions(dapple_film_gpu_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
   if(NOT MSVC)
@@ -170,4 +170,7 @@ if(TARGET dapple_gpu)
   endif()
   add_test(NAME film_gpu.parity COMMAND dapple_film_gpu_tests WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(film_gpu.parity PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+  # whole film frames through EngineSession + GpuExecutor against the CPU engine (section 20)
+  add_test(NAME film_gpu.frames COMMAND dapple_film_gpu_tests frames WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(film_gpu.frames PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
 endif()

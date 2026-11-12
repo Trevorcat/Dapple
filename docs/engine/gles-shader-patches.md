@@ -34,25 +34,36 @@ layout(binding = 1, rgba16f) uniform image2D uD;
 The Vulkan engineer's files were not touched. The shaders had not changed for > 15 minutes when this was applied (nr_*, dehaze_apply,
 detail last written 10:57; the only newer shader at that time was the new `boxscan.comp`, which already complies).
 
-## 2. NOT applied: workgroup size via spec constants (<= 128 invocations)
+## 2. Applied (GPU executor engineer, 2026-11-12): workgroup size via spec constants (<= 128 invocations)
 
-Every shader but boxscan/sepconv uses `local_size 16x16 = 256` (`reduce`: 256 threads): `esViolations` = "workgroup 256 invocations > 128
-guaranteed". The device refuses such a program (`Status::Unsupported`) when `GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS < 256`; every
-device measured so far reports >= 256: ANGLE Vulkan 1024, ANGLE SwiftShader 256, Android emulator (host GPU translator) 1024.
-
-Why it is left for the integrator: a smaller group changes the dispatch geometry, and the group counts (`cdiv(W, 16)`) are hard-coded in
-the node record functions (`core/engine/nodes/*/gpu.cpp`, `film_gpu.cpp`) and `reduce` partial sums in `exec/gpu_executor.cpp`, all of which
-belong to the Vulkan / film engineers. The shader side is mechanical:
+Every 2D kernel used `local_size 16x16 = 256` (`reduce`: 256), which ES 3.1 does not guarantee (128). Now the shape is a specialisation
+constant pair and the node record functions compute the group counts from it:
 
 ```glsl
-layout(local_size_x_id = 16, local_size_y_id = 17) in;         // default 16, 16
-layout(constant_id = 16) const uint LX = 16u;  layout(constant_id = 17) const uint LY = 16u;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;   // convert dehaze_apply detail down gf_ab
+                                                                                              // nr_chroma nr_luma point resize film_{grain,mix,point,post}
+layout(local_size_x = 256, local_size_x_id = 18) in;                                          // reduce
+layout(constant_id = 19) const int WG = 256;                                                  // reduce: the same number as a value
 ```
 
-and replace the literal `16` in index math by `LX/LY` (`gl_WorkGroupSize.xy` also works). The node side then asks the device for the
-group size (`caps().maxWorkgroupInvocations`) and divides by it; `reduce.comp` is sized for 256 threads and needs the same treatment.
-GLES: the HAL already turns `PipelineDesc::spec` into `#define SPIRV_CROSS_CONSTANT_ID_n` and `localSpec` entries are honoured.
-Pick 16x8 = 128 for devices below 256.
+* Defaults are the old shapes, so a caller that passes nothing (the GLES self-test, tools) gets 16 x 16 / 256 and the Vulkan SPIR-V behaves as
+  before. The generated ESSL carries `SPIRV_CROSS_CONSTANT_ID_16/17/18/19` macros with those defaults and the HAL splices the caller's values.
+  (`gl_WorkGroupSize` cannot be used for `WG`: SPIRV-Cross emits the constant before the layout line, which ESSL rejects. Hence the second
+  constant, id 19.)
+* `GpuRecorder` (`nodes/gpu_common.{h,cpp}`) owns the shape: `workgroupShape(caps)` = 16 x (inv/16) with `inv` = min(256,
+  `maxWorkgroupInvocations`) rounded down to a power of two (16 x 16 on every device measured, 16 x 8 for 128; 16 x 4 for 64 by construction, not run);
+  `pl()` adds spec ids 16 / 17 / 18 / 19 to every pipeline (a shader that does not declare an id ignores it); record functions use
+  `r.gx(w)` / `r.gy(h)` instead of `cdiv(w, 16)`, `recordDehazeAnalysis` sizes the reduction as `cdiv(n, rwg * 16)` groups. `sepconv`
+  keeps its own spec constants: 16 x 16 becomes 16 x `ly`, the 64 x 4 variant `min(64, rwg / 4)` x 4 (the shared tile is sized for the
+  worst case). `boxscan` is 64 x 2 / 32 x 4 = 128 already.
+* Film shaders (`film_grain/mix/point/post`, `film_gpu.cpp` dispatches) got the same mechanical change.
+* Env `DAPPLE_GPU_WG=<n>` forces the invocation budget (tests: `DAPPLE_GPU_WG=128` runs the 16 x 8 / reduce 128 shapes on any device);
+  the device text of `dapple_gpu_status_json` / `dapple_gpu_tests` prints `workgroup 16x8 (reduce 128)`.
+* Verified (desktop): Vulkan RTX 4060 Ti and SwiftShader unchanged vs the 16 x 16 build (every row of the parity table and every pass count
+  identical; tiled seams 0 differing pixels); GLES on ANGLE (Vulkan and SwiftShader backends) full `dapple_gpu_tests` and the
+  `DAPPLE_GPU_WG=128` stage run (`gles_gpu_parity_angle_*_wg128`) pass with the same dE2000 budgets (mean <= 0.073). Not verified: a real
+  device that reports 128 (none measured so far: ANGLE 1024 / 256, emulator 1024).
+* `reduce` with a smaller group sums the colour in a different order: the airlight of a 128-group run can differ from the 256 run in the last float bits.
 
 ## 3. Other findings of the first GLES runs (device-side fixes already in `gles_device.cpp`)
 

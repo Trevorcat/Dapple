@@ -102,13 +102,24 @@ file(GENERATE OUTPUT "${_gen}/shader_table.inc"
   CONTENT "${_inc_headers}\nconst ShaderBin kShaders[] = {\n${_inc_table}};\nconst std::size_t kShaderCount = sizeof(kShaders) / sizeof(kShaders[0]);\n")
 
 set(_E "${PROJECT_SOURCE_DIR}/core/engine")
+# GLES 3.1 backend (hal/gles): a fallback device behind Vulkan when -DDAPPLE_GLES=ON (selected by hal/select.cpp, 5.9 / 6.6)
+# (in a function: gles.cmake sets variables of its own, e.g. _gen, that this file still uses)
+function(dapple_add_gles_backend)
+  unset(DAPPLE_GPU_SHADERS)  # the GLES list (hal/gles/shader_list.cmake) has the ES_PINGPONG variants; the Vulkan list is already embedded
+  include("${_E}/hal/gles/gles.cmake")
+endfunction()
+if(DAPPLE_GLES)
+  dapple_add_gles_backend()
+endif()
 add_library(dapple_gpu STATIC
-  ${_E}/hal/hal.cpp ${_E}/hal/vk/vk_device.cpp ${_E}/exec/gpu_scheduler.cpp ${_E}/exec/gpu_executor.cpp ${_E}/exec/gpu_frame.cpp
+  ${_E}/hal/hal.cpp ${_E}/hal/select.cpp ${_E}/hal/vk/vk_device.cpp ${_E}/exec/gpu_scheduler.cpp ${_E}/exec/gpu_executor.cpp ${_E}/exec/gpu_context.cpp
   ${_E}/nodes/gpu_common.cpp ${_E}/nodes/point/gpu.cpp ${_E}/nodes/nr/gpu.cpp ${_E}/nodes/dehaze/gpu.cpp ${_E}/nodes/detail/gpu.cpp
   ${_E}/nodes/resize/gpu.cpp ${_E}/nodes/gpu_nodes.cpp ${DAPPLE_FILM_GPU_SOURCES}
-  src/hook.cpp src/parity.cpp src/gpu_bench.cpp ${_spv_headers})
+  src/parity.cpp src/gpu_bench.cpp ${_spv_headers})
+if(TARGET dapple_hal_gles)
+  target_link_libraries(dapple_gpu PUBLIC dapple_hal_gles)
+endif()
 target_include_directories(dapple_gpu
-  PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE "${_hdr}/include" "${_volk}" "${_gen}" "${PROJECT_SOURCE_DIR}/cli" "${PROJECT_SOURCE_DIR}/core" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(dapple_gpu PRIVATE "${PROJECT_SOURCE_DIR}/core/src")  # film nodes read the film tables
 target_compile_definitions(dapple_gpu PUBLIC DAPPLE_HAVE_GPU=1 PRIVATE VK_NO_PROTOTYPES)
@@ -130,7 +141,7 @@ if(NOT MSVC)
 endif()
 
 # The C API library (libdapple.so / dapple.dll) carries the backend behind the runtime flag (default off), see
-# core/gpu/include/dapple/gpu_hook.h. A build without DAPPLE_GPU does not contain any of it.
+# core/engine/exec/gpu_runtime.h (frames and exports go through EngineSession). A build without DAPPLE_GPU does not contain any of it.
 if(TARGET dapple)
   target_link_libraries(dapple PRIVATE dapple_gpu)
 endif()

@@ -29,6 +29,10 @@ constexpr Format kU8 = Format::RGBA8;
 inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 // Radii of the spatial stages, shared by the builder and the tile halo computation.
+// Workgroup shape of the 2D kernels on a device: 16 x (inv/16), inv = min(256, maxComputeWorkGroupInvocations) as a power of two.
+void workgroupShape(const hal::DeviceCaps& c, int& lx, int& ly, int& rwg);
+
+// Radii of the spatial stages, shared by the builder and the tile halo computation.
 struct SpatialRadii {
   int nrLumaR = 0;  // box radius (2 iterations)
   int nrChromaF = 2, nrChromaRl = 0;
@@ -76,13 +80,22 @@ struct GpuRecorder {
   GpuGraph& g;
   std::string& err;
   hal::BufferH weights;       // host-visible filter weight table of the frame slot
+  hal::BufferH taps;          // host-visible tap tables of the film mixtures (vec4 units: tapNext)
+  std::uint32_t tapNext = 0;
   hal::BufferH gBuf, partBuf; // dehaze statistics + reduction partials
   int W = 0, H_ = 0;          // size of the working images of this job
   int allocW = 0, allocH = 0; // allocation size of the working images (a tiled export uses one size for all tiles)
   int boxScanMin = -1;        // radius from which the running-sum box is used (-1: DAPPLE_GPU_BOX_SCAN_MIN or 12; 0: never)
 
-  GpuRecorder(hal::Device& d, GpuGraph& gr, std::string& e) : dev(d), g(gr), err(e) {}
+  // Workgroup shape of the 2D kernels (spec constants 16 / 17) and of the reduction (spec constant 18). 16 x 16 and 256 where the
+  // device allows 256 invocations; GLES 3.1 only guarantees 128 (16 x 8, reduce 128), docs/engine/gles-shader-patches.md.
+  int lx = 16, ly = 16, rwg = 256;
+  std::uint32_t gx(int w) const { return std::uint32_t(cdiv(w, lx)); }
+  std::uint32_t gy(int h) const { return std::uint32_t(cdiv(h, ly)); }
 
+  GpuRecorder(hal::Device& d, GpuGraph& gr, std::string& e);
+
+  // Adds the workgroup spec constants of the kernels that have them (see lx / ly / rwg).
   hal::PipelineH pl(const char* shader, std::initializer_list<hal::SpecConst> spec);
   H dummy(Format f);
   H weightsH();

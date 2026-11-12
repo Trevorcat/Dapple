@@ -174,6 +174,16 @@ enum {
   DAPPLE_FRAME_BACKGROUND = 8,  /* low priority: calling thread on efficiency cores, nice 10, never uses the pool */
 };
 
+/* Zero-readback display (docs/engine/present.md): an image on the GPU device the engine renders with (see the view API), into which
+ * the final 8-bit picture is copied instead of being read back. Vulkan: image = VkImage (R8G8B8A8_UNORM, TRANSFER_DST), layouts are
+ * VkImageLayout values, semaphores VkSemaphore handles (0 = none). width/height = the capacity of the image. */
+typedef struct DappleExternalImage {
+  void* image;
+  uint32_t width, height;
+  uint32_t layout_in, layout_out;
+  uint64_t wait_semaphore, signal_semaphore;
+} DappleExternalImage;
+
 typedef struct DappleFrameRequest {
   int32_t size;             /* sizeof(DappleFrameRequest) (versioning) */
   int32_t long_edge;        /* long edge of the whole picture, 0 = session source size */
@@ -181,6 +191,13 @@ typedef struct DappleFrameRequest {
   int32_t bake_size;        /* lattice size 17..65; 0 = 57 interactive / 65 otherwise (a cached finer lattice of the same colour stage is reused) */
   float region[4];          /* x0,y0,x1,y1 normalised in the output picture; all 0 = whole picture */
   int32_t region_long_edge; /* long edge of the region image (only with a region) */
+  /* ---- additive: honoured only when `size` covers it (older callers pass a shorter struct) ---- */
+  const char* active_param; /* key of the slider being dragged ("grain", "film_grain", "exposure"...), NULL / "" = none. With
+                               DAPPLE_FRAME_INTERACTIVE, grain stays on while a grain-family slider is dragged
+                               (docs/engine/pipeline-architecture.md 14, Q8) */
+  const DappleExternalImage* external; /* NULL = pixels come back in *out (default). Set: when the GPU executor takes the frame the
+                               picture is in this image and *out has width/height with rgba == NULL (DAPPLE_OK); when it does not
+                               (CPU frame, image too small, GLES) *out holds the pixels as usual. */
 } DappleFrameRequest;
 
 /* Fills *out (release with dapple_free_image). *analysis_json (may be NULL) receives a string to
@@ -207,7 +224,7 @@ DAPPLE_API float dapple_thermal_headroom(int32_t forecast_seconds);
 /* {"cpus":N,"perf":N,"efficient":N,"pool":N,"adpf":bool,"thermal_status":N}; free with dapple_free_string. */
 DAPPLE_API char* dapple_perf_info_json(void);
 
-/* Frame engine diagnostics (DAPPLE_ENGINE=1|legacy, default off): {"engine":"off|legacy|tables","frames":N,
+/* Frame engine diagnostics (DAPPLE_ENGINE: default full; off|legacy|tables for A/B): {"engine":"off|legacy|tables","frames":N,
  * "fullHits":N,"latticeReuse":N,"latticeBake":N,...}; free with dapple_free_string. Additive. */
 DAPPLE_API char* dapple_engine_info_json(void);
 

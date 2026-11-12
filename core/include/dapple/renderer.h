@@ -89,6 +89,10 @@ class Renderer {
 
   Image8 render(const SourceImage& source) const;
 
+  // White balance x exposure gain of the Gain node (what the film folds into its input matrix; engine SessionCtx::gainFn).
+  static void inputGain(const EditParams& params, const CameraProfile& camera, bool sceneReferred, float out[3]);
+  static void whiteBalanceGain(const EditParams& clamped, float out[3]);
+
   // Optional tiny (<= 256 px) copy of the source used for the tonal analysis; saves re-scaling the
   // whole source on every call. Must outlive the renderer.
   void setToneProxy(const SourceImage* proxy) { toneProxy_ = proxy; }

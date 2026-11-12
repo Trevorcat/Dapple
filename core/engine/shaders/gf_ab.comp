@@ -1,7 +1,7 @@
 #version 450
 // Guided filter coefficients (spatial.cpp guidedBase): a = var / (var + eps), b = mean - a * mean, from the boxed
 // (mean, mean of squares) low-resolution grid.
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
 layout(std140, binding = 0) uniform P { ivec4 s; vec4 eps; } u;
 layout(binding = 1) uniform sampler2D uIn;
 layout(binding = 2, rgba32f) uniform writeonly image2D uOut;

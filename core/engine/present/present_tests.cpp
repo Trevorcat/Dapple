@@ -284,6 +284,47 @@ static void testView() {
   std::filesystem::remove(jpg);
 }
 
+// The zero-readback path with a session that cannot use it (CPU executor): the presenter offers an image, the pixels come back, the
+// view must show them through the host path and count the refusal.
+static void testExternalFallback() {
+  const std::string jpg = makeJpeg();
+  DappleSession* sess = dapple_session_open(jpg.c_str(), DAPPLE_QUALITY_PREVIEW, 512);
+  CHECK(sess != nullptr);
+  if (!sess) return;
+  DappleViewOptions o{int32_t(sizeof o), DAPPLE_VIEW_TIMER_LOOP | DAPPLE_VIEW_NULL_PRESENTER | DAPPLE_VIEW_NULL_EXTERNAL};
+  DappleView* v = dapple_view_create(&o);
+  CHECK(v != nullptr);
+  Events ev;
+  dapple_view_set_callback(v, onFrame, &ev);
+  dapple_view_bind_session(v, sess);
+  int fakeWindow = 0;
+  CHECK(dapple_view_attach_window(v, &fakeWindow, 640, 480) == DAPPLE_OK);
+  DappleFrameRequest rq{};
+  rq.size = sizeof rq;
+  rq.long_edge = 256;
+  rq.flags = DAPPLE_FRAME_INTERACTIVE;
+  for (int i = 0; i < 6; ++i) {
+    const int before = count(ev, DAPPLE_VIEW_SHOWN);
+    dapple_view_submit(v, i & 1 ? "{\"exposure\":0.3}" : "{\"exposure\":0.1}", nullptr, &rq);
+    CHECK(waitFor([&] { return count(ev, DAPPLE_VIEW_SHOWN) > before; }, 3000));
+  }
+  CHECK(count(ev, DAPPLE_VIEW_RENDER_FAILED) == 0 && count(ev, DAPPLE_VIEW_PRESENT_FAILED) == 0);
+  char* info = dapple_view_info_json(v);
+  CHECK(info != nullptr);
+  if (info) {
+    const std::string j = info;
+    std::printf("  external fallback info: %s\n", j.c_str());
+    CHECK(j.find("\"externalFrames\":0") != std::string::npos);  // the CPU executor never writes the image
+    CHECK(j.find("\"hostFrames\":6") != std::string::npos);
+    CHECK(j.find("\"tooSmall\":5") != std::string::npos);        // the first frame has no size history: no image was offered
+  }
+  dapple_free_string(info);
+  dapple_view_bind_session(v, nullptr);
+  dapple_session_close(sess);
+  dapple_view_destroy(v);
+  std::filesystem::remove(jpg);
+}
+
 int main() {
   std::printf("render loop\n");
   testLatestWins();
@@ -291,6 +332,8 @@ int main() {
   testPauseQuiesce();
   std::printf("view\n");
   testView();
+  std::printf("zero-readback fallback\n");
+  testExternalFallback();
   std::printf(g_fail ? "FAILED (%d)\n" : "OK\n", g_fail);
   return g_fail ? 1 : 0;
 }

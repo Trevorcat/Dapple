@@ -23,7 +23,7 @@ H recordDehazeAnalysis(GpuRecorder& r, const SpatialRadii& R, H col, int lw, int
   const H dc = r.blur(3, 3, t, lw, lh, {rb, 0, 0, 0}, 2, 0, kR32);
   if (dc < 0) return -1;
   const H gH = r.g.externalBuf(r.gBuf), partH = r.g.externalBuf(r.partBuf);
-  const int groups = cdiv(lw * lh, 4096);
+  const int groups = cdiv(lw * lh, r.rwg * 16);  // 16 samples per thread
   ReduceU u{};
   u.s[0] = lw;
   u.s[1] = lh;
@@ -57,7 +57,7 @@ bool recordDehazeApply(GpuRecorder& r, const DehazeNode& n, H D) {
   u.grain[1] = n.ep.period;
   r.g.dispatch("dehaze_apply", p,
                {GpuGraph::RW(D), GpuGraph::R(n.dc >= 0 ? n.dc : r.dummy(kR32)), GpuGraph::R(gH), n.ep.last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8))},
-               std::uint32_t(cdiv(n.W, 16)), std::uint32_t(cdiv(n.Hh, 16)), &u, sizeof u);
+               r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
   return true;
 }
 

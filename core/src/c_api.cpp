@@ -20,6 +20,7 @@
 #include "dapple/edit_params.h"
 #include "dapple/encode.h"
 #include "dapple/film.h"
+#include "dapple/film_match.h"
 #include "dapple/look.h"
 #include "dapple/lut.h"
 #include "dapple/renderer.h"
@@ -30,7 +31,7 @@
 #include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
 #include "color.h"
 #ifdef DAPPLE_HAVE_GPU
-#include "dapple/gpu_hook.h"  // optional GPU backend (core/gpu), runtime flag, default off
+#include "engine/exec/gpu_runtime.h"  // optional GPU executor (core/gpu): runtime flag, status; frames go through EngineSession
 #endif
 
 #ifndef DAPPLE_VERSION_STRING
@@ -59,9 +60,13 @@ struct DappleSession {
   dapple::engine::EngineSession engine;  // used only when DAPPLE_ENGINE is set (docs/engine/pipeline-architecture.md)
   dapple::engine::EngineSession exportEngine;  // DAPPLE_ENGINE=full: export / reference renders (serialised by exportMtx)
   std::mutex exportMtx;
-#ifdef DAPPLE_HAVE_GPU
-  dapple::gpu::SessionSlot gpu;  // resident GPU copy of the source (created on first GPU frame)
-#endif
+  // film exposure that keeps the photo's key (film_match.h): own 256 px proxy, results cached by filmMatchKey()
+  std::mutex keyMtx;
+  std::shared_ptr<dapple::SourceImage> keyProxy;
+  std::vector<std::pair<std::string, float>> filmKeys;
+  // Where the executors read the full-resolution source from (the GPU keeps a device copy per store identity)
+  std::once_flag storeOnce;
+  std::unique_ptr<dapple::engine::MemorySourceStore> store;
 };
 
 namespace {
@@ -180,6 +185,33 @@ bool parseParams(const char* paramsJson, EditParams& params) {
   return true;
 }
 
+// `params` with EditParams::filmKeyEv set: the EV that puts the film render's median lightness where the normal develop
+// render of the same edit has it (film_match.h). A few film evaluations of the 256 px proxy, cached by key.
+EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath = nullptr) {
+  params.filmKeyEv = 0.f;
+  if (params.filmStock.empty() || std::getenv("DAPPLE_FILM_MATCH_OFF")) return params;
+  const std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
+  const std::string key = filmMatchKey(params) + "|" + lutFile;
+  std::lock_guard<std::mutex> lock(s->keyMtx);
+  for (auto& e : s->filmKeys)
+    if (e.first == key) {
+      params.filmKeyEv = e.second;
+      return params;
+    }
+  if (!s->keyProxy) {
+    s->keyProxy = std::make_shared<SourceImage>();
+    s->keyProxy->sceneReferred = s->source.sceneReferred;
+    s->keyProxy->linear = resizeToLongEdge(s->source.linear, 256);
+  }
+  std::shared_ptr<const Lut3D> lut;
+  if (!lutFile.empty()) lut = loadLut(lutFile);
+  const float ev = matchFilmExposure(params, *s->camera, lut.get(), *s->keyProxy);
+  if (s->filmKeys.size() >= 12) s->filmKeys.erase(s->filmKeys.begin());
+  s->filmKeys.emplace_back(key, ev);
+  params.filmKeyEv = ev;
+  return params;
+}
+
 // Renders the session with already parsed params. Returns false (with last error set) on failure.
 bool renderSessionParams(DappleSession* s, const EditParams& params, const char* lutPath, int32_t outLongEdge,
                          Image8& out, float toneReach = 1.f);
@@ -228,6 +260,40 @@ bool engineRenderExact(DappleSession* s, const EditParams& params, const Rendere
   return true;
 }
 
+[[maybe_unused]] dapple::engine::SourceStore* sourceStoreOf(DappleSession* s) {
+  std::call_once(s->storeOnce, [s] { s->store = std::make_unique<dapple::engine::MemorySourceStore>(s->source); });
+  return s->store.get();
+}
+
+#ifdef DAPPLE_HAVE_GPU
+// Full-picture export on the GPU executor (tiled; lattice 65, Lanczos + a little sharpening when downscaled). False = the CPU renders it.
+bool gpuExport(DappleSession* s, const EditParams& params, Renderer& renderer, const Lut3D* lut, int32_t outLongEdge, Image8& out) {
+  std::lock_guard<std::mutex> lock(s->exportMtx);
+  dapple::engine::EngineSession::GpuExport e{params, renderer, s->source, *sourceStoreOf(s), *s->camera, lut};
+  e.outLongEdge = outLongEdge;
+  int w = 0;
+  e.onSize = [&](int ow, int oh) {
+    w = ow;
+    out.width = ow;
+    out.height = oh;
+    out.data.assign(std::size_t(ow) * oh * 3, 0);
+  };
+  e.target.sink = [&](int x, int y, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
+    for (int j = 0; j < th; ++j) {
+      const std::uint8_t* src = rgba + std::size_t(j) * stride;
+      std::uint8_t* dst = out.data.data() + (std::size_t(y + j) * w + x) * 3;
+      for (int i = 0; i < tw; ++i) {
+        dst[3 * i] = src[4 * i];
+        dst[3 * i + 1] = src[4 * i + 1];
+        dst[3 * i + 2] = src[4 * i + 2];
+      }
+    }
+    return true;
+  };
+  return s->exportEngine.exportGpu(e, nullptr, nullptr) == 0;
+}
+#endif
+
 // Renders the session into 8-bit RGB. Returns false (with last error set) on failure.
 bool renderSession(DappleSession* s, const char* paramsJson, const char* lutPath, int32_t outLongEdge, Image8& out) {
   if (!s) {
@@ -239,8 +305,9 @@ bool renderSession(DappleSession* s, const char* paramsJson, const char* lutPath
   return renderSessionParams(s, params, lutPath, outLongEdge, out);
 }
 
-bool renderSessionParams(DappleSession* s, const EditParams& params, const char* lutPath, int32_t outLongEdge,
+bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const char* lutPath, int32_t outLongEdge,
                          Image8& out, float toneReach) {
+  const EditParams params = withFilmKey(s, paramsIn, lutPath);
   std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
   std::shared_ptr<const Lut3D> lut;
   if (!lutFile.empty()) {
@@ -250,7 +317,8 @@ bool renderSessionParams(DappleSession* s, const EditParams& params, const char*
   Renderer renderer(params, *s->camera, lut.get());
   renderer.setToneReach(toneReach);
 #ifdef DAPPLE_HAVE_GPU
-  if (dapple::gpu::runtimeEnabled() && toneReach == 1.f && (outLongEdge <= 0 || outLongEdge >= 1500) && dapple::gpu::hookExport(s->gpu, s->source, renderer, outLongEdge, out)) return true;
+  dapple::engine::gpu::installProvider();
+  if (dapple::engine::gpu::runtimeEnabled() && toneReach == 1.f && (outLongEdge <= 0 || outLongEdge >= 1500) && gpuExport(s, params, renderer, lut.get(), outLongEdge, out)) return true;
 #endif
   if (outLongEdge > 0 && std::max(s->source.linear.width, s->source.linear.height) > outLongEdge) {
     SourceImage scaled;
@@ -368,8 +436,9 @@ void dapple_free_string(char* s) { std::free(s); }
 // ---- optional GPU backend (core/gpu): runtime flag + status ----
 int32_t dapple_gpu_set_enabled(int32_t mode) {
 #ifdef DAPPLE_HAVE_GPU
-  dapple::gpu::setRuntimeEnabled(mode);
-  return dapple::gpu::runtimeEnabled() ? 1 : 0;
+  dapple::engine::gpu::installProvider();
+  dapple::engine::gpu::setRuntimeEnabled(mode);
+  return dapple::engine::gpu::runtimeEnabled() ? 1 : 0;
 #else
   (void)mode;
   return 0;
@@ -378,7 +447,8 @@ int32_t dapple_gpu_set_enabled(int32_t mode) {
 
 char* dapple_gpu_status_json(void) {
 #ifdef DAPPLE_HAVE_GPU
-  return dupString(dapple::gpu::statusJson());
+  dapple::engine::gpu::installProvider();
+  return dupString(dapple::engine::gpu::statusJson());
 #else
   return dupString("{\"compiled\":false,\"enabled\":false,\"available\":false}");
 #endif
@@ -608,6 +678,7 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   std::lock_guard<std::mutex> lock(s->mtx);
   EditParams params;
   if (!parseParams(paramsJson, params)) return false;
+  params = withFilmKey(s, params, lutPath);
   std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
   std::shared_ptr<const Lut3D> lut;
   if (!lutFile.empty()) {
@@ -640,6 +711,11 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   }
   Renderer renderer(params, *s->camera, lut.get());
   renderer.setToneProxy(s->proxy.get());
+  // Grain (14 Q8): a drag of a grain-family slider keeps grain in interactive frames; a frame smaller than the full
+  // render previews it with grain statistically matched to the downscaled full-resolution grain.
+  const std::string activeParam = rq.active_param ? rq.active_param : "";
+  const bool keepGrain = interactive && (activeParam == "grain" || activeParam == "film_grain");
+  const int fullLongEdge = (!hasRegion && srcLong < own && !std::getenv("DAPPLE_GRAIN_SCALE_OFF")) ? own : 0;  // diagnostics switch
 
   if (rq.flags & DAPPLE_FRAME_EXACT) {
     // reference pipeline (no region)
@@ -661,11 +737,15 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
 
   // 57^3: smallest lattice within mean dE2000 0.5 of the exact path on colour drags (edit-bench); 65^3 for finals
   const int n = rq.bake_size > 0 ? rq.bake_size : (interactive ? 57 : 65);
-  if (dapple::engine::mode() != dapple::engine::Mode::Off) {
+#ifdef DAPPLE_HAVE_GPU
+  dapple::engine::gpu::installProvider();
+#endif
+  if (dapple::engine::engineInUse()) {
     // Frame engine: graph + table nodes + ResultCache replace the bakes[3] lookup (stage a2/a3). Same inputs, same outputs.
     dapple::engine::FrameJob job{params, renderer, src, s->proxy.get(), *s->camera, lut.get(), {}, {}, {}};
     job.request.longEdge = rq.long_edge;
     job.request.interactive = interactive;
+    job.request.activeParam = rq.active_param ? rq.active_param : "";
     job.request.wantAnalysis = analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS);
     job.request.bakeSize = n;
     job.request.fastAnalysis = interactive && !std::getenv("DAPPLE_EXACT_ANALYSIS");
@@ -674,16 +754,26 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     job.fastOptions.spatial = interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
     job.fastOptions.noise = job.request.noise;
     job.fastOptions.region = region;
+    job.fastOptions.keepGrain = keepGrain;
+    job.fastOptions.fullLongEdge = fullLongEdge;
     s->lutKeep = lut;
     s->lastParams = params;
     s->haveLast = true;
 #ifdef DAPPLE_HAVE_GPU
-    if (dapple::gpu::runtimeEnabled()) {
-      job.gpuHook = [&](const BakedLut& bk, int& gw, int& gh) {
-        return dapple::gpu::hookRenderFrame(s->gpu, s->source, renderer, bk, job.fastOptions, srcLong, gw, gh);
-      };
-    }
+    if (dapple::engine::gpu::runtimeEnabled()) job.store = sourceStoreOf(s);  // the GPU executor reads the full-resolution source
 #endif
+    dapple::hal::ExternalImage ext;
+    if (rq.external && rq.external->image) {  // zero readback: the presenter's image on the GPU device (honoured by the GPU executor only)
+      ext.handle = rq.external->image;
+      ext.fmt = dapple::hal::Format::RGBA8;
+      ext.w = rq.external->width;
+      ext.h = rq.external->height;
+      ext.layoutIn = rq.external->layout_in;
+      ext.layoutOut = rq.external->layout_out;
+      ext.waitSemaphore = rq.external->wait_semaphore;
+      ext.signalSemaphore = rq.external->signal_semaphore;
+      job.gpuTarget = &ext;
+    }
     dapple::engine::FrameResult res;
     if (!s->engine.renderFrame(job, res)) {
       setError(res.error.empty() ? "engine failure" : res.error);
@@ -694,17 +784,23 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     out->rgba = res.rgba;
     if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS)) {
       ToneAnalysis a = res.analysis;
-      if (renderer.filmActive()) applyFrameHistogram(a, res.rgba, res.w, res.h);
+      if (renderer.filmActive() && res.rgba) applyFrameHistogram(a, res.rgba, res.w, res.h);
       *analysisOut = dupString(toneJson(a));
     }
     return true;
   }
-  const std::string pk = renderer.pointKey() + "#";
+  const bool fastAn = interactive && !std::getenv("DAPPLE_EXACT_ANALYSIS");
+  const std::string pk = renderer.pointKey() + (fastAn ? "#f" : "#x");
   std::shared_ptr<const BakedLut> bake;
   for (auto& b : s->bakes)  // same parameters, at least as fine a lattice as asked for
     if (b->n >= std::clamp(n, 17, 65) && b->key.size() > pk.size() && b->key.compare(0, pk.size(), pk) == 0 &&
         (!bake || b->n > bake->n))
       bake = b;
+  if (bake) {  // the finest lattice of this colour stage wins (as in the engine's table path)
+    const std::string ck0 = renderer.colourKey();
+    for (auto& b : s->bakes)
+      if (b->colourKey == ck0 && b->n >= std::clamp(n, 17, 65) && b->n > bake->n) bake = nullptr;
+  }
   if (!bake) {
     // A lattice with the same colour stage (only tone / white balance moved: every 光线 drag) is reused, the
     // largest one available (the final frame's 65^3 is the most accurate): just the 1D tone table is rebuilt.
@@ -712,7 +808,7 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     const BakedLut* from = nullptr;
     for (auto& b : s->bakes)
       if (b->colourKey == ck && b->n >= std::clamp(n, 17, 65) && (!from || b->n > from->n)) from = b.get();
-    bake = renderer.bake(src, n, from, interactive && !std::getenv("DAPPLE_EXACT_ANALYSIS"));
+    bake = renderer.bake(src, n, from, fastAn);
     s->bakes.push_back(bake);
     if (s->bakes.size() > 3) s->bakes.erase(s->bakes.begin());
     s->lutKeep = lut;
@@ -723,14 +819,13 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   fo.noise = !interactive || !s->haveLast || !nearEq(s->lastParams.nrLuma, params.nrLuma) ||
              !nearEq(s->lastParams.nrColor, params.nrColor);
   fo.region = region;
+  fo.keepGrain = keepGrain;
+  fo.fullLongEdge = fullLongEdge;
   s->lastParams = params;
   s->haveLast = true;
 
   int w = 0, h = 0;
   std::uint8_t* rgba = nullptr;
-#ifdef DAPPLE_HAVE_GPU
-  if (dapple::gpu::runtimeEnabled()) rgba = dapple::gpu::hookRenderFrame(s->gpu, s->source, renderer, *bake, fo, srcLong, w, h);
-#endif
   if (!rgba) rgba = renderer.renderBakedRgba(src, *bake, fo, w, h);
   if (!rgba) {
     setError("out of memory");
@@ -759,6 +854,7 @@ char* dapple_session_analyze_params_json(DappleSession* session, const char* par
         }
         EditParams params;
         if (!parseParams(params_json, params)) return nullptr;
+        params = withFilmKey(session, params);
         ToneAnalysis a = analyzeTone(session->source, *session->camera, params);
         applyFilmHistogram(a, session->source, *session->camera, params);
         return dupString(toneJson(a));
@@ -799,7 +895,11 @@ int32_t dapple_session_render_frame(DappleSession* session, const char* params_j
           return DAPPLE_ERROR;
         }
         DappleFrameRequest rq{};
-        if (request) rq = *request;
+        if (request) {  // size-versioned: a shorter (older) struct leaves the newer fields zero
+          const std::size_t n = request->size > 0 ? std::min<std::size_t>(std::size_t(request->size), sizeof rq) : sizeof rq;
+          std::memcpy(&rq, request, n);
+          rq.size = std::int32_t(sizeof rq);
+        }
         bool ok = false;
         if (rq.flags & DAPPLE_FRAME_BACKGROUND) {
           // low priority work (detail session...): this thread, efficiency cores, never the shared pool

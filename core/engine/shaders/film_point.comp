@@ -8,7 +8,15 @@
 //   MODE 3  src -> display sRGB, the three above fused (no spatial effect between them)
 //   MODE 4  E2 -> inhibitor field q, 2x2 box averaged to half resolution (smooth DIR diffusion path)
 //   MODE 5  E2 -> inhibitor field q at full resolution
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
+// h16: round a float to the nearest half exactly (common.glsl), so the stored planes do not depend on the driver's rounding mode
+float h16(float x) {
+  uint u = floatBitsToUint(x);
+  u += 0xFFFu + ((u >> 13) & 1u);
+  return uintBitsToFloat(u & ~0x1FFFu);
+}
+vec4 h16v(vec4 v) { return vec4(h16(v.x), h16(v.y), h16(v.z), v.w); }
+
 layout(constant_id = 0) const int MODE = 3;
 layout(constant_id = 1) const bool HAS_Q = false;  // MODE 1: the inhibitor field comes from FilmDirField instead of the pixel
 
@@ -28,7 +36,30 @@ layout(binding = 1) uniform sampler2D uSrc;
 layout(binding = 2) uniform sampler2D uAux;   // MODE 0/3: raw LUT; MODE 1: q field
 layout(binding = 3) uniform sampler3D uLut;   // print LUT
 layout(binding = 4, std430) readonly buffer Curves { float tab[]; };  // dn then d0, each [3][curveN] (value, slope)
-layout(binding = 5, rgba32f) uniform writeonly image2D uOut;
+layout(binding = 5, rgba16f) uniform writeonly image2D uOut;
+#ifdef FUSED_POST
+// MODE 2 + FilmGlare's decode and glare add (film_post.comp MODE 0 / 2): the output is linear light, not display sRGB.
+// Parameters in the unused fields of the DIR matrix: dq0.xyz = linear display white, dq0.w = glare mean; src.xy = offset of the glare
+// field (its blur margin), src.z != 0: add the glare field.
+layout(binding = 6) uniform sampler2D uField;
+layout(binding = 7, std430) readonly buffer Dec { float dec[]; };
+vec3 decodeLin(vec3 e) {
+  vec3 l;
+  for (int c = 0; c < 3; ++c) {
+    if (e[c] <= 0.0) {
+      l[c] = e[c] * (1.0 / 12.92);
+    } else if (e[c] >= 1.0) {
+      l[c] = 1.0 + (e[c] - 1.0) * 2.2749;
+    } else {
+      const float xx = e[c] * 4096.0;
+      const int idx = min(int(xx), 4095);
+      const float f = xx - float(idx);
+      l[c] = dec[idx] + f * (dec[idx + 1] - dec[idx]);
+    }
+  }
+  return l;
+}
+#endif
 
 float mitK0(float t) { return ((7.0 * t - 12.0) * t * t + 16.0 / 3.0) * (1.0 / 6.0); }
 float mitK1(float t) { return (((-7.0 / 3.0 * t + 12.0) * t - 20.0) * t + 32.0 / 3.0) * (1.0 / 6.0); }
@@ -136,11 +167,11 @@ void main() {
       q = 0.25 * (qOf(ivec2(2 * p.x, ya)) + qOf(ivec2(2 * p.x + 1, ya)) + qOf(ivec2(2 * p.x, yb)) + qOf(ivec2(2 * p.x + 1, yb)));
     else
       q = 0.5 * (qOf(ivec2(2 * p.x, ya)) + qOf(ivec2(2 * p.x, yb)));
-    imageStore(uOut, p, vec4(q, 1.0));
+    imageStore(uOut, p, h16v(vec4(q, 1.0)));
     return;
   }
   if (MODE == 5) {
-    imageStore(uOut, p, vec4(qOf(p), 1.0));
+    imageStore(uOut, p, h16v(vec4(qOf(p), 1.0)));
     return;
   }
   const vec3 s = texelFetch(uSrc, p + u.lutN.yz, 0).rgb;
@@ -153,11 +184,15 @@ void main() {
     o = pxCurves(6 * u.dim.w, x - q);
   } else if (MODE == 2) {
     o = tetra(s - u.dsub.xyz);
+#ifdef FUSED_POST
+    o = decodeLin(o);
+    if (u.src.z != 0) o += (texelFetch(uField, p + u.src.xy, 0).r * 0.01 - u.dq0.w) * u.dq0.xyz;
+#endif
   } else {
     const vec3 x = pxLogE(pxExposure(s));
     const vec3 d1 = pxCurves(0, x);
     const vec3 q = pxQ(d1);
     o = tetra(pxCurves(6 * u.dim.w, x - q));
   }
-  imageStore(uOut, p, vec4(o, 1.0));
+  imageStore(uOut, p, h16v(vec4(o, 1.0)));
 }

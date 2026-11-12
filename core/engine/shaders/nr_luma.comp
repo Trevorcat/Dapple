@@ -1,7 +1,7 @@
 #version 450
 // Luminance noise reduction, apply step: edge-stopped blend towards the blurred luminance (spatial.cpp denoiseLuma).
 #extension GL_GOOGLE_include_directive : enable
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
 #include "common.glsl"
 
 layout(std140, binding = 0) uniform P {

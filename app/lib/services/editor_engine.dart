@@ -202,7 +202,12 @@ class EditorEngine extends ChangeNotifier {
   bool _perfLogged = false;
 
   /// A control is being dragged: render interactive frames until [endInteraction].
-  void beginInteraction() {
+  /// Key of the slider under the finger (e.g. 'film_grain'): the engine keeps grain in interactive frames while a
+  /// grain-family slider is dragged (14 Q8). Cleared when the last gesture ends.
+  String? _activeParam;
+
+  void beginInteraction({String? activeParam}) {
+    if (activeParam != null) _activeParam = activeParam;
     _drag++;
     _idle?.cancel();
     if (_drag == 1) PerfProbe.dragging = true;
@@ -225,6 +230,7 @@ class EditorEngine extends ChangeNotifier {
   void endInteraction() {
     if (_drag > 0) _drag--;
     if (_drag == 0) {
+      _activeParam = null;
       _releaseMs = _clock.elapsedMilliseconds;
       PerfProbe.dragging = false;
       _scheduleFinal(delay: releaseDelay);
@@ -272,6 +278,8 @@ class EditorEngine extends ChangeNotifier {
 
   int _gen = 0;
   bool _busy = false, _dirty = false;
+  DappleSession? _finalSession; // set while a non-interactive (final) render is in flight: edited() may cancel it
+  bool _finalCancelled = false;
   Timer? _tileDebounce;
   int _tileGen = 0;
 
@@ -381,6 +389,8 @@ class EditorEngine extends ChangeNotifier {
     _detailTimer?.cancel();
     _clearDetail();
     _dirty = true;
+    // a newer request supersedes a long full-quality render in flight: stop it instead of waiting it out
+    if (_finalSession != null && _finalSession!.cancel()) _finalCancelled = true;
     if (_drag > 0 || _burst) _needFinal = true;
     // a single discrete edit (tap, look change) is rendered at final quality straight away
     if (!_interactiveNow) _needFinal = false;
@@ -418,10 +428,24 @@ class EditorEngine extends ChangeNotifier {
           continue;
         }
         final t0 = _clock.elapsedMicroseconds;
-        final frame = await s.renderFrame(params,
-            longEdge: interactive ? rung.longEdge : finalLongEdge,
-            interactive: interactive,
-            bakeSize: interactive ? rung.bake : 0);
+        NativeFrame frame;
+        _finalCancelled = false;
+        if (!interactive) _finalSession = s;
+        try {
+          frame = await s.renderFrame(params,
+              longEdge: interactive ? rung.longEdge : finalLongEdge,
+              interactive: interactive,
+              activeParam: interactive ? _activeParam : null,
+              bakeSize: interactive ? rung.bake : 0);
+        } catch (e) {
+          if (_finalCancelled) {
+            _dirty = true; // superseded by the newer edit that cancelled it: render that one
+            continue;
+          }
+          rethrow;
+        } finally {
+          _finalSession = null;
+        }
         final t1 = _clock.elapsedMicroseconds;
         if (myGen != _gen) {
           frame.dispose();

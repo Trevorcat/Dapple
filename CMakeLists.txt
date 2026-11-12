@@ -45,8 +45,11 @@ if(ANDROID)
   add_subdirectory(core/video)
 endif()
 
-# GPU compute backend spike (docs/engine/gpu-backend.md). Off by default; adds the `dapple gpu-bench` command.
-option(DAPPLE_GPU "Build the Vulkan compute backend spike (core/gpu)" OFF)
+# GPU compute backend (docs/engine/gpu-backend.md). Off by default; adds the `dapple gpu-bench` command.
+option(DAPPLE_GPU "Build the GPU executor (Vulkan, + GLES 3.1 with DAPPLE_GLES) (core/gpu)" OFF)
+# GLES 3.1 compute backend (docs/engine/pipeline-architecture.md 6.3): linked into dapple_gpu as the fallback behind Vulkan, plus
+# dapple_gles_check and the ctest gles_* entries (skipped when ANGLE is absent).
+option(DAPPLE_GLES "Build the GLES 3.1 HAL backend, its check tool and GLES ctest entries" OFF)
 if(DAPPLE_GPU)
   add_subdirectory(core/gpu)
 endif()
@@ -60,8 +63,6 @@ if(DAPPLE_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-# GLES 3.1 compute backend (docs/engine/pipeline-architecture.md 6.3): dapple_gles_check, ctest gles_* (skip when ANGLE is absent).
-option(DAPPLE_GLES "Build the GLES 3.1 HAL backend, its check tool and GLES ctest entries" OFF)
 if(DAPPLE_GLES)
   include(core/engine/hal/gles/gles_gpu.cmake)
 endif()

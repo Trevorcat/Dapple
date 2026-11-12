@@ -1,99 +1,60 @@
-// GpuExecutor: device core, Backend + Session (resident sources, lattice cache, whole-frame render, tiled export, self-test,
-// runtime flag) on top of the HAL, the scheduler and the node record functions. Ported from phase-1 core/gpu/src/session.cpp.
+// GpuExecutor: Core (device, pool, slot buffers) and Executor (IGpuExecutor): walks the stages of a Plan and appends the passes
+// of its nodes through gpuImplFor(type)->recordPorts, keeps the resident source (fed by a SourceStore) and the device tables
+// (on a ResultCache). Whole-frame runs record every stage into one command list; a tiled export records one job per tile and
+// sweep (docs/engine/pipeline-architecture.md 5.1 - 5.5).
 #include "engine/exec/gpu_executor.h"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"
-#include "dapple/gpu.h"
-#include "engine/exec/gpu_frame.h"
-#include "parity.h"
+#include "engine/exec/big_core.h"
+#include "engine/exec/result_cache.h"
+#include "dapple/film.h"
+#include "engine/nodes/film/film_gpu.h"
+#include "engine/nodes/film/film_node_internal.h"
+#include "engine/nodes/gpu_common.h"
+#include "engine/nodes/gpu_nodes.h"
 
-#if defined(__ANDROID__)
-#include <sys/system_properties.h>
-// While a frame is in flight the calling thread sleeps in the fence wait and wakes on whatever core the scheduler picks:
-// usually a little core at a low clock, where reading the mapped readback buffer took 49 ms instead of 7-13 ms (Pixel 5,
-// 1.7 MP). The thread is pinned to the fastest cores for the duration of render() and restored afterwards.
-#include <sched.h>
-namespace {
-cpu_set_t bigCoreSet(bool& ok) {
-  static cpu_set_t set;
-  static bool have = false, valid = false;
-  if (!have) {
-    have = true;
-    CPU_ZERO(&set);
-    long maxf[64] = {0}, top = 0;
-    for (int c = 0; c < 64; ++c) {
-      char path[96];
-      std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
-      if (FILE* f = std::fopen(path, "r")) {
-        if (std::fscanf(f, "%ld", &maxf[c]) != 1) maxf[c] = 0;
-        std::fclose(f);
-        top = std::max(top, maxf[c]);
-      }
-    }
-    int n = 0;
-    for (int c = 0; c < 64; ++c)
-      if (maxf[c] > 0 && maxf[c] * 10 >= top * 8) {
-        CPU_SET(c, &set);
-        ++n;
-      }
-    valid = n > 0;
-  }
-  ok = valid;
-  return set;
-}
-struct BigCoreScope {
-  cpu_set_t prev;
-  bool active = false;
-  BigCoreScope() {
-    if (std::getenv("DAPPLE_GPU_NO_PIN")) return;
-    bool ok = false;
-    const cpu_set_t big = bigCoreSet(ok);
-    if (!ok || sched_getaffinity(0, sizeof prev, &prev) != 0) return;
-    cpu_set_t both;
-    CPU_AND(&both, &prev, &big);
-    if (CPU_COUNT(&both) == 0) return;
-    active = sched_setaffinity(0, sizeof both, &both) == 0;
-  }
-  ~BigCoreScope() {
-    if (active) sched_setaffinity(0, sizeof prev, &prev);
-  }
-};
-}  // namespace
-#else
-namespace {
-struct BigCoreScope {};
-}  // namespace
-#endif
-
-namespace eg = dapple::engine::gpu;
-
-// ============================================================================================ Core ===
 namespace dapple::engine::gpu {
 
+// ============================================================================================ Core ===
 std::unique_ptr<Core> Core::create(const hal::DeviceOptions& opt, std::string& err) {
   std::unique_ptr<Core> c(new Core);
-  c->dev_ = hal::createDevice(hal::Api::Vulkan, opt, err);
-  if (!c->dev_) return nullptr;
-  c->pool_ = std::make_unique<GpuPool>(*c->dev_);
+  c->own_ = hal::createDevice(hal::Api::Vulkan, opt, err);
+  if (!c->own_) return nullptr;
+  c->dev_ = c->own_.get();
+  return c->init(err) ? std::move(c) : nullptr;
+}
+std::unique_ptr<Core> Core::adopt(std::unique_ptr<hal::Device> dev, std::string& err) {
+  std::unique_ptr<Core> c(new Core);
+  c->own_ = std::move(dev);
+  c->dev_ = c->own_.get();
+  return c->init(err) ? std::move(c) : nullptr;
+}
+std::unique_ptr<Core> Core::view(hal::Device& dev, std::string& err) {
+  std::unique_ptr<Core> c(new Core);
+  c->dev_ = &dev;
+  return c->init(err) ? std::move(c) : nullptr;
+}
+
+bool Core::init(std::string& err) {
+  pool_ = std::make_unique<GpuPool>(*dev_);
   for (int i = 0; i < hal::Device::kSlots; ++i) {
-    if (c->dev_->createBuffer({16384, hal::MemKind::Upload, true}, &c->slots_[i].weights) != hal::Status::Ok ||
-        c->dev_->createBuffer({8u << 20, hal::MemKind::Upload, true}, &c->slots_[i].staging) != hal::Status::Ok)
-      return err = c->dev_->lastError(), nullptr;
+    if (dev_->createBuffer({16384, hal::MemKind::Upload, true}, &slots_[i].weights) != hal::Status::Ok ||
+        dev_->createBuffer({256u << 10, hal::MemKind::Upload, true}, &slots_[i].taps) != hal::Status::Ok ||
+        dev_->createBuffer({8u << 20, hal::MemKind::Upload, true}, &slots_[i].staging) != hal::Status::Ok)
+      return err = dev_->lastError(), false;
   }
-  if (c->dev_->createBuffer({256, hal::MemKind::DeviceLocal, true}, &c->gBuf) != hal::Status::Ok ||
-      c->dev_->createBuffer({256 * 1024, hal::MemKind::DeviceLocal, true}, &c->partBuf) != hal::Status::Ok)
-    return err = c->dev_->lastError(), nullptr;
-  return c;
+  if (dev_->createBuffer({256, hal::MemKind::DeviceLocal, true}, &gBuf) != hal::Status::Ok ||
+      dev_->createBuffer({256 * 1024, hal::MemKind::DeviceLocal, true}, &partBuf) != hal::Status::Ok)
+    return err = dev_->lastError(), false;
+  return true;
 }
 
 Core::~Core() {
@@ -104,6 +65,7 @@ Core::~Core() {
     dev_->destroy(s.staging);
     dev_->destroy(s.readback);
     dev_->destroy(s.weights);
+    dev_->destroy(s.taps);
   }
   dev_->destroy(gBuf);
   dev_->destroy(partBuf);
@@ -130,6 +92,7 @@ Core::Stats Core::statsOf(hal::FenceH f) {
   const auto st = dev_->stats(f);
   s.passes = st.passes;
   s.barriers = st.barriers;
+  s.parts = st.parts;
   s.times = dev_->passTimes(f);
   for (const auto& t : s.times) s.gpuMs += t.ms;
   return s;
@@ -163,35 +126,19 @@ bool Core::uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h,
   return true;
 }
 
-}  // namespace dapple::engine::gpu
-
-// ============================================================================================ gpu API ===
-namespace dapple::gpu {
-using namespace engine::gpu;
-
+// ============================================================================================ Executor ===
 namespace {
 
 using Clock = std::chrono::steady_clock;
 double msSince(Clock::time_point t0) { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
+constexpr std::uint64_t kWaitNs = 30ull * 1000 * 1000 * 1000;
 
-// must match core/src/renderer.cpp (kBakeMax, kToneOctLo/Hi); the self-test notices a drift
+// must match core/src/renderer.cpp (kBakeMax, kToneOctLo/Hi); the start-up self-test notices a drift
 constexpr float kBakeMax = 1.5f;
 constexpr int kToneBase = (127 - 24) << 8;
 constexpr std::size_t kToneN = ((6 + 24) << 8) + 2;
 constexpr int kLat2N = 33;
 constexpr float kLat2Max = 8.f;
-
-void resizedDims(int w, int h, int longEdge, int& rw, int& rh) {  // image.cpp resizeToLongEdge
-  const int srcLong = std::max(w, h);
-  if (longEdge <= 0 || srcLong <= longEdge) {
-    rw = w;
-    rh = h;
-    return;
-  }
-  const double scale = double(longEdge) / srcLong;
-  rw = std::max(1, int(std::lround(w * scale)));
-  rh = std::max(1, int(std::lround(h * scale)));
-}
 
 // Geometry::mapF of the CPU renderer for the footprint of a rectangle.
 void mapPlan(const FramePlan& P, float px, float py, float& sx, float& sy) {
@@ -231,282 +178,137 @@ WRect footprint(const FramePlan& P, const WRect& work) {
   return r;
 }
 
-hal::DeviceOptions toDeviceOptions(const BackendOptions& o) {
-  hal::DeviceOptions d;
-  d.allowSoftware = o.allowSoftware;
-  d.deviceIndex = o.deviceIndex;
-  d.profile = o.profile;
-  d.blocklist = o.blocklist;
-  d.pipelineCachePath = o.pipelineCachePath;
-  d.poolBudgetBytes = o.poolBudgetBytes;
-  return d;
-}
-
-DeviceInfo toInfo(const hal::DeviceCaps& c) {
-  DeviceInfo i;
-  i.name = c.name;
-  i.driver = c.driver;
-  i.memoryTypes = c.memoryTypes;
-  i.apiVersion = c.apiVersion;
-  i.driverVersion = c.driverVersion;
-  i.vendorId = c.vendorId;
-  i.deviceId = c.deviceId;
-  i.deviceType = c.deviceType;
-  i.maxImageDim2D = c.maxImage2D;
-  i.maxImageDim3D = c.maxImage3D;
-  i.maxSharedMem = c.maxSharedBytes;
-  i.maxInvocations = c.maxWorkgroupInvocations;
-  i.subgroupSize = c.subgroupSize;
-  i.subgroupOps = c.subgroupOps;
-  i.fp16Arith = c.fp16Arithmetic;
-  i.storage16 = c.storage16;
-  i.linearFilterRgba32f = c.linearFilterRgba32f;
-  i.timestamps = c.timestamps;
-  i.unifiedMemory = c.unifiedMemory;
-  i.deviceLocalBytes = c.deviceLocalBytes;
-  i.maxAllocation = c.maxBufferBytes;
-  return i;
-}
-
-Session::Failure classify(hal::Status s) {
+GpuFailure classify(hal::Status s) {
   switch (s) {
-    case hal::Status::DeviceLost: return Session::Failure::DeviceLost;
+    case hal::Status::DeviceLost: return GpuFailure::DeviceLost;
     case hal::Status::Unsupported:
-    case hal::Status::InvalidArgument: return Session::Failure::Unsupported;
-    default: return Session::Failure::Transient;
+    case hal::Status::InvalidArgument: return GpuFailure::Unsupported;
+    default: return GpuFailure::Transient;
   }
 }
 
-}  // namespace
-
-// ============================================================================================ Backend ===
-struct Backend::Impl {
-  std::unique_ptr<Core> core;
-  std::vector<std::unique_ptr<Core>> retired;  // lost devices: kept alive so stale handles never meet a destroyed device
-  BackendOptions opt;
-  DeviceInfo info;
-  std::string selfTest;
-  std::mutex mtx;
-  std::atomic<std::uint64_t> epoch{1};
-  int rebuilds = 0;
+// What a device copy of the HostTable payloads is (ResultCache payload, destroyed on eviction).
+struct DeviceTables {
+  std::shared_ptr<Context> ctx;
+  std::uint64_t epoch = 0;
+  hal::ImageH lat, lat2;
+  hal::BufferH tone;
+  int n = 0, n2 = 0;
 };
 
-namespace {
-bool runSelfTest(Backend& b, std::string& report);
-}
-
-Backend::Backend() : d_(new Impl) {}
-Backend::~Backend() = default;
-
-namespace {
-// Start-up check of the running-sum box (boxscan.comp) against the direct sum on this device. A driver that miscompiles it
-// (Adreno 620 did so for shared arrays sized from specialisation constants) must not take the whole GPU path down: the scan
-// is switched off and the direct sum used. Both horizontal and vertical variants, a small and a large radius.
-bool boxSelfTest(Core& core, std::string& report) {
-  const int w = 211, h = 157;
-  std::vector<float> rgb(std::size_t(w) * h * 3);
-  unsigned s = 12345u;
-  for (std::size_t i = 0; i < rgb.size(); ++i) {
-    s = s * 1664525u + 1013904223u;
-    rgb[i] = 0.6f * (0.5f + 0.5f * std::sin(float(i % 997) * 0.01f)) + 0.4f * float((s >> 8) & 0xFFFF) / 65535.f;
-  }
-  hal::Device& dev = core.dev();
-  hal::ImageH in;
-  std::string err;
-  if (dev.createImage({hal::Format::RGBA16F, std::uint32_t(w), std::uint32_t(h), 1}, &in) != hal::Status::Ok || !core.uploadRgbF32(rgb.data(), std::size_t(w) * 3, w, h, in, 0, 0, err)) {
-    report = "box: upload failed";
-    return false;
-  }
-  auto run = [&](int R, int scanMin, std::vector<float>& out) -> bool {
-    auto cl = dev.begin();
-    if (!cl || !core.ensureReadback(cl->slot(), std::size_t(w) * h * 4, err)) return false;
-    GpuGraph g(dev, core.pool());
-    GpuRecorder rec(dev, g, err);
-    rec.weights = core.slot(cl->slot()).weights;
-    rec.boxScanMin = scanMin;
-    rec.W = w;
-    rec.H_ = h;
-    const H hin = g.external(in);
-    const H t = rec.sep(0, hin, w, h, 0, 0, {R, 0, 0, 0}, kR32);
-    const H o = t < 0 ? -1 : rec.sep(3, t, w, h, 1, 0, {R, 0, 0, 0}, kR32);
-    if (o < 0) return false;
-    g.copyImageToBuffer(o, core.slot(cl->slot()).readback, 0, 0, std::uint32_t(w), std::uint32_t(h));
-    hal::FenceH f;
-    if (runGraph(dev, g, *cl, &f, err) != hal::Status::Ok || dev.wait(f, 30ull * 1000 * 1000 * 1000) != hal::Status::Ok) return false;
-    out.resize(std::size_t(w) * h);
-    std::memcpy(out.data(), core.slot(cl->slot()).readback.mapped, out.size() * 4);
-    return true;
-  };
-  bool ok = true;
-  double worst = 0;
-  for (int R : {9, 40}) {
-    std::vector<float> a, b;
-    if (!run(R, 1, a) || !run(R, 0, b)) {
-      ok = false;
-      break;
-    }
-    for (std::size_t i = 0; i < a.size(); ++i) {
-      const double d = std::fabs(double(a[i]) - double(b[i]));
-      worst = std::max(worst, d);
-      if (!(d <= 3e-5)) ok = false;  // also catches NaN
-    }
-  }
-  dev.waitIdle();
-  dev.destroy(in);
-  char line[120];
-  std::snprintf(line, sizeof line, "box scan vs direct: max diff %.2g %s", worst, ok ? "ok" : "FAIL (running-sum box disabled)");
-  report = line;
-  return ok;
-}
-}  // namespace
-
-std::shared_ptr<Backend> Backend::create(const BackendOptions& opt, std::string& err) {
-  std::shared_ptr<Backend> b(new Backend);
-  b->d_->opt = opt;
-  b->d_->core = Core::create(toDeviceOptions(opt), err);
-  if (!b->d_->core) return nullptr;
-  b->d_->info = toInfo(b->d_->core->dev().caps());
-  if (opt.selfTest) {
-    std::string report, boxReport;
-    b->d_->core->boxScanOk = boxSelfTest(*b->d_->core, boxReport);
-    const bool ok = runSelfTest(*b, report);
-    b->d_->selfTest = report + "; " + boxReport;
-    if (!ok) {
-      err = "GPU self-test failed on " + b->d_->info.name + " (" + b->d_->info.key() + "): " + report;
-      return nullptr;
-    }
-  }
-  return b;
-}
-
-const DeviceInfo& Backend::info() const { return d_->info; }
-const std::string& Backend::selfTestReport() const { return d_->selfTest; }
-std::size_t Backend::pooledBytes() const { return d_->core->pool().pooledBytes(); }
-std::unique_ptr<Session> Backend::createSession() { return std::unique_ptr<Session>(new Session(shared_from_this())); }
-int Backend::rebuilds() const { return d_->rebuilds; }
-bool Backend::deviceLost() const { return d_->core->dev().state() == hal::DeviceState::Lost; }
-
-bool Backend::rebuild(std::string& err) {
-  {
-    std::lock_guard<std::mutex> lk(d_->mtx);
-    if (d_->rebuilds >= 1) return err = "device already rebuilt once in this process", false;
-    ++d_->rebuilds;
-    auto fresh = Core::create(toDeviceOptions(d_->opt), err);
-    if (!fresh) return false;
-    d_->retired.push_back(std::move(d_->core));
-    d_->core = std::move(fresh);
-    d_->info = toInfo(d_->core->dev().caps());
-    d_->epoch.fetch_add(1);
-  }
-  if (d_->opt.selfTest) {
-    std::string report, boxReport;
-    d_->core->boxScanOk = boxSelfTest(*d_->core, boxReport);
-    if (!runSelfTest(*this, report)) return err = "self-test failed after the device rebuild: " + report, false;
-    d_->selfTest = report + "; " + boxReport;
-  }
-  return true;
-}
-
-std::string DeviceInfo::text() const {
-  hal::DeviceCaps c;
-  c.name = name;
-  c.driver = driver;
-  c.apiVersion = apiVersion;
-  c.vendorId = vendorId;
-  c.deviceType = deviceType;
-  c.maxImage2D = maxImageDim2D;
-  c.maxImage3D = maxImageDim3D;
-  c.maxSharedBytes = maxSharedMem;
-  c.maxWorkgroupInvocations = maxInvocations;
-  c.subgroupSize = subgroupSize;
-  c.subgroupOps = subgroupOps;
-  c.fp16Arithmetic = fp16Arith;
-  c.storage16 = storage16;
-  c.linearFilterRgba32f = linearFilterRgba32f;
-  c.timestamps = timestamps;
-  c.deviceLocalBytes = deviceLocalBytes;
-  c.unifiedMemory = unifiedMemory;
-  return c.text();
-}
-std::string DeviceInfo::key() const {
-  char b[96];
-  std::snprintf(b, sizeof b, "%04x:%04x:%08x", vendorId, deviceId, driverVersion);
-  return b;
-}
-
-// ============================================================================================ Session ===
-struct Session::Impl {
-  std::shared_ptr<Backend> be;
-  Backend::Impl& bi() { return *be->d_; }
-  Core& core() { return *be->d_->core; }
-  hal::Device& dev() { return be->d_->core->dev(); }
-
-  const SourceImage* cpu = nullptr;
-  std::uint64_t stamp = 0;
-  int W = 0, H = 0;
+// The device copy of one SourceStore (RGBA16F), plus its Lanczos-resized variants. Shared by every executor of a context that
+// reads the same store (a frame session and its export session do not upload the 24 MP twice); lives while one of them uses it.
+struct ResidentSource {
+  std::shared_ptr<Context> ctx;
   std::uint64_t epoch = 0;
-  hal::ImageH resident;  // the source as RGBA16F, uploaded on first use
-  bool haveResident = false;
-  Failure failure = Failure::None;
-  Failure injected = Failure::None;
-  int injectCount = 0;
-  bool takeInjected(std::string& err) {
-    if (injectCount <= 0) return false;
-    --injectCount;
-    failure = injected;
-    err = "injected failure (test)";
-    return true;
-  }
-
+  hal::ImageH img;  // the source at its natural size
+  bool have = false;
   struct Resized {
     int w = 0, h = 0;
     hal::ImageH img;
     std::uint64_t used = 0;
   };
   std::vector<std::unique_ptr<Resized>> resized;
-
-  struct Lut {
-    std::string key;
-    hal::ImageH lat, lat2;
-    hal::BufferH tone;
-    int n = 0, n2 = 0;
-    std::uint64_t used = 0;
-  };
-  std::unique_ptr<Lut> luts[2];
   std::uint64_t tick = 0;
+  ~ResidentSource() {
+    if (!ctx || epoch != ctx->epoch()) return;  // a rebuilt device: the old handles died with it
+    hal::Device& d = ctx->core().dev();
+    d.waitIdle();
+    if (have) d.destroy(img);
+    for (auto& r : resized) d.destroy(r->img);
+  }
+};
 
-  // A rebuilt device invalidates every handle: forget them (the lost device is kept alive by the Backend).
+// The device copy of the film tables of one frame (raw LUT, print + scan LUT, curves, sRGB decode) and of its grain sampler tables.
+// Kept by the executor while the table payloads of the CPU bake (process-wide film table cache) stay the same objects.
+struct DeviceFilm {
+  std::shared_ptr<Context> ctx;
+  std::uint64_t epoch = 0;
+  filmnode::FilmTablesHandle tb;
+  filmnode::GpuFilmTables gt;
+  bool haveTables = false;
+  std::shared_ptr<const filmnode::FilmPlanData> planKeep;
+  filmnode::GpuFilmPlanRes pr;
+  bool havePlan = false;
+  ~DeviceFilm() {
+    if (!ctx || epoch != ctx->epoch()) return;  // a rebuilt device: the old handles died with it
+    if (havePlan) filmnode::releaseGpuPlan(ctx->core(), pr);
+    if (haveTables) filmnode::releaseGpuTables(ctx->core(), gt);
+  }
+};
+
+// Node types a GPU plan may contain (everything else makes the plan Unsupported, 5.9).
+bool headNodeOk(NodeType t) {
+  return t == NodeType::Resize || t == NodeType::Geometry || t == NodeType::Gain || t == NodeType::ToneColour || t == NodeType::Vignette;
+}
+bool windowNodeOk(NodeType t) {
+  return t == NodeType::NRLuma || t == NodeType::NRChroma || t == NodeType::Dehaze || t == NodeType::Detail || t == NodeType::Grain;
+}
+
+// The graph handles and resolved blocks of one job (a frame, or one tile of one sweep).
+union ResolvedStorage {
+  PointNode point;
+  NrLumaNode nrl;
+  NrChromaNode nrc;
+  DehazeNode dz;
+  DetailNode dt;
+  ResolvedStorage() {}
+};
+
+}  // namespace
+
+class Executor final : public IGpuExecutor {
+ public:
+  explicit Executor(std::shared_ptr<Context> c) : ctx_(std::move(c)) {
+    epoch_ = ctx_->epoch();
+    tables_.setLimit(NodeType::ColourLattice, 2);  // the two lattices of an interactive and a final frame
+  }
+  ~Executor() override {
+    std::lock_guard<std::mutex> lk(ctx_->mutex());
+    releaseLocked();
+  }
+  hal::Api api() const override { return ctx_->api(); }
+  const hal::DeviceCaps& caps() const override { return ctx_->caps(); }
+  Status run(const GpuRun& in, GpuOut& out) override;
+  void injectFailure(GpuFailure f, int count) override {
+    injected_ = f;
+    injectCount_ = count;
+  }
+  void release() override {
+    std::lock_guard<std::mutex> lk(ctx_->mutex());
+    releaseLocked();
+  }
+
+ private:
+  struct Walk;
+  Core& core() { return ctx_->core(); }
+  hal::Device& dev() { return ctx_->core().dev(); }
+
+  // Drops this executor's device copies (the shared source goes when the last executor using it lets go).
+  void releaseLocked() {
+    if (epoch_ == ctx_->epoch()) dev().waitIdle();
+    rs_.reset();
+    store_ = nullptr;
+    film_.reset();
+    tables_.clear();  // payload deleters destroy the tables, or only forget them after a device rebuild
+  }
+  // A rebuilt device invalidates every handle: forget them (the lost device is kept alive by the Context).
   void checkEpoch() {
-    const std::uint64_t e = bi().epoch.load();
-    if (e == epoch) return;
-    epoch = e;
-    resident = {};
-    haveResident = false;
-    resized.clear();
-    for (auto& l : luts) l.reset();
+    const std::uint64_t e = ctx_->epoch();
+    if (e == epoch_) return;
+    tables_.clear();
+    film_.reset();
+    rs_.reset();
+    store_ = nullptr;
+    epoch_ = e;
   }
 
-  void dropResident() {
-    if (haveResident) dev().destroy(resident);
-    haveResident = false;
-    for (auto& r : resized) dev().destroy(r->img);
-    resized.clear();
+  bool fail(GpuFailure f, const std::string& msg) {
+    failure_ = f;
+    err_ = msg;
+    return false;
   }
-  void dropLut(std::unique_ptr<Lut>& l) {
-    if (!l) return;
-    dev().destroy(l->lat);
-    dev().destroy(l->lat2);
-    dev().destroy(l->tone);
-    l.reset();
-  }
-  ~Impl() {
-    if (!be) return;
-    if (epoch == bi().epoch.load()) {
-      dev().waitIdle();
-      dropResident();
-      for (auto& l : luts) dropLut(l);
-    }
-  }
+  bool failStatus(hal::Status s, const std::string& msg) { return fail(classify(s), msg.empty() ? dev().lastError() : msg); }
 
   std::uint64_t residentLimit() { return std::min<std::uint64_t>(std::uint64_t(double(dev().caps().deviceLocalBytes) * 0.35), 1536ull << 20); }
   bool canResident(int w, int h) {
@@ -514,323 +316,696 @@ struct Session::Impl {
     return w > 0 && h > 0 && std::uint32_t(w) <= c.maxImage2D && std::uint32_t(h) <= c.maxImage2D && std::uint64_t(w) * h * 8 <= residentLimit();
   }
 
-  bool fail(Failure f, std::string& err, const std::string& msg) {
-    failure = f;
-    err = msg;
-    return false;
+  void bindSource(SourceStore& s) {
+    if (store_ == &s && rs_ && srcId_ == s.identity() && W_ == s.width() && H_ == s.height()) return;
+    store_ = &s;
+    srcId_ = s.identity();
+    W_ = s.width();
+    H_ = s.height();
+    std::shared_ptr<Context> c = ctx_;
+    const std::uint64_t ep = epoch_;
+    rs_ = std::static_pointer_cast<ResidentSource>(ctx_->residentFor(srcId_, [c, ep]() -> std::shared_ptr<void> {
+      auto r = std::make_shared<ResidentSource>();
+      r->ctx = c;
+      r->epoch = ep;
+      return r;
+    }));
   }
-  bool failStatus(hal::Status s, std::string& err, const std::string& msg) { return fail(classify(s), err, msg.empty() ? dev().lastError() : msg); }
+  bool ensureResident();
+  hal::ImageH* resizedSource(int w, int h);
+  std::shared_ptr<DeviceTables> ensureTables(const GpuRun& in);
+  LutBind lutBind(GpuGraph& g, const DeviceTables& t);
+  // Film frames (section 20): arguments of the film nodes from the FramePlan, device tables of their bake
+  bool filmResolve(const GpuRun& in, filmnode::FilmResolved& r);
+  std::shared_ptr<DeviceFilm> ensureFilm(const filmnode::FilmResolved& r);
 
-  bool ensureResident(std::string& err) {
-    if (haveResident) return true;
-    if (!cpu) return fail(Failure::Unsupported, err, "no source");
-    if (!canResident(W, H)) return fail(Failure::Unsupported, err, "source too large for a resident GPU copy");
-    hal::Status s = dev().createImage({hal::Format::RGBA16F, std::uint32_t(W), std::uint32_t(H), 1}, &resident);
-    if (s != hal::Status::Ok) return failStatus(s, err, "");
-    if (!core().uploadRgbF32(cpu->linear.data.data(), std::size_t(W) * 3, W, H, resident, 0, 0, err)) {
-      dev().destroy(resident);
-      return fail(dev().state() == hal::DeviceState::Lost ? Failure::DeviceLost : Failure::Transient, err, err);
+  Status runWhole(const GpuRun& in, GpuOut& out);
+  Status runTiled(const GpuRun& in, GpuOut& out);
+  Status finish(const GpuRun& in, GpuOut& out, Status s);
+  bool validate(const GpuRun& in);
+
+  std::shared_ptr<Context> ctx_;
+  std::uint64_t epoch_ = 0;
+
+  // source residency (SourceStore -> shared device copy)
+  SourceStore* store_ = nullptr;
+  std::uint64_t srcId_ = 0;
+  int W_ = 0, H_ = 0;
+  std::shared_ptr<ResidentSource> rs_;
+
+  // device tables on a ResultCache (ColourLattice slot: lattice + overflow lattice + tone table of one bake key)
+  ResultCache tables_;
+  std::shared_ptr<DeviceFilm> film_;  // device copy of the film tables of the last film frame
+
+  GpuFailure failure_ = GpuFailure::None;
+  std::string err_;
+  GpuFailure injected_ = GpuFailure::None;
+  int injectCount_ = 0;
+};
+
+// ---- source -------------------------------------------------------------------------------------------------------------------
+bool Executor::ensureResident() {
+  if (!rs_ || !store_) return fail(GpuFailure::Unsupported, "no source");
+  if (rs_->have) return true;
+  if (!canResident(W_, H_)) return fail(GpuFailure::Unsupported, "source too large for a resident GPU copy");
+  hal::Status s = dev().createImage({hal::Format::RGBA16F, std::uint32_t(W_), std::uint32_t(H_), 1}, &rs_->img);
+  if (s != hal::Status::Ok) return failStatus(s, "");
+  std::size_t pitch = 0;
+  const float* px = store_->window(0, 0, W_, H_, pitch);
+  std::string err;
+  if (!px || !core().uploadRgbF32(px, pitch, W_, H_, rs_->img, 0, 0, err)) {
+    dev().destroy(rs_->img);
+    return fail(!px ? GpuFailure::Transient : dev().state() == hal::DeviceState::Lost ? GpuFailure::DeviceLost : GpuFailure::Transient, px ? err : "source store cannot be read");
+  }
+  rs_->have = true;
+  return true;
+}
+
+// The resident source resized (Lanczos-3) to w x h; cached (two sizes).
+hal::ImageH* Executor::resizedSource(int w, int h) {
+  if (w == W_ && h == H_) return &rs_->img;
+  for (auto& r : rs_->resized)
+    if (r->w == w && r->h == h) {
+      r->used = ++rs_->tick;
+      return &r->img;
     }
-    haveResident = true;
+  if (!canResident(w, h)) return fail(GpuFailure::Unsupported, "resized source too large"), nullptr;
+  auto r = std::make_unique<ResidentSource::Resized>();
+  r->w = w;
+  r->h = h;
+  hal::Status s = dev().createImage({hal::Format::RGBA16F, std::uint32_t(w), std::uint32_t(h), 1}, &r->img);
+  if (s != hal::Status::Ok) return failStatus(s, ""), nullptr;
+  auto cl = dev().begin();
+  if (!cl) {
+    dev().destroy(r->img);
+    return failStatus(hal::Status::Timeout, ""), nullptr;
+  }
+  GpuGraph g(dev(), core().pool());
+  std::string err;
+  GpuRecorder rec(dev(), g, err);
+  rec.weights = core().slot(cl->slot()).weights;
+  rec.taps = core().slot(cl->slot()).taps;
+  rec.boxScanMin = core().boxScanOk ? -1 : 0;
+  const H src = g.external(rs_->img);
+  const SrcWin full{0, 0, W_, H_};
+  const H out = recordResize(rec, src, full, W_, H_, w, h, WRect{0, 0, w, h});
+  if (out < 0) {
+    dev().destroy(r->img);
+    return fail(GpuFailure::Transient, err), nullptr;
+  }
+  g.copyImage(out, g.external(r->img), std::uint32_t(w), std::uint32_t(h));
+  hal::FenceH f;
+  s = runGraph(dev(), g, *cl, &f, err);
+  if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
+  if (s != hal::Status::Ok) {
+    dev().destroy(r->img);
+    return failStatus(s, err), nullptr;
+  }
+  r->used = ++rs_->tick;
+  if (rs_->resized.size() >= 2) {
+    auto victim = std::min_element(rs_->resized.begin(), rs_->resized.end(), [](auto& a, auto& b) { return a->used < b->used; });
+    dev().waitIdle();  // a frame of the other executor sharing this source may still read it
+    dev().destroy((*victim)->img);
+    rs_->resized.erase(victim);
+  }
+  rs_->resized.push_back(std::move(r));
+  return &rs_->resized.back()->img;
+}
+
+// ---- tables (HostTable payloads on the device) ------------------------------------------------------------------------------------
+std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
+  const BakedLut& lut = in.bake;
+  Hasher hk;
+  hk.str(lut.key);
+  const Hash128 key = hk.finish();
+  if (ResultCache::Entry* e = tables_.find(NodeType::ColourLattice, key)) return std::static_pointer_cast<DeviceTables>(e->payload);
+
+  if (lut.n < 2 || lut.rgb.size() != std::size_t(lut.n) * lut.n * lut.n * 3) return fail(GpuFailure::Unsupported, "lattice not usable (film only bake?)"), nullptr;
+  if (lut.tone.size() != kToneN) return fail(GpuFailure::Unsupported, "tone table size differs from the GPU backend's"), nullptr;
+  std::vector<float> overOwned;
+  const std::vector<float>* over = in.overflow;
+  if (!over) {
+    const SourceImage* img = in.store.image();
+    if (!img || !in.renderer) return fail(GpuFailure::Unsupported, "overflow lattice unavailable (no CPU source)"), nullptr;
+    overOwned = in.renderer->bakeOverflow(*img, lut, kLat2N, kLat2Max);
+    over = &overOwned;
+  }
+  if (over->size() != std::size_t(kLat2N) * kLat2N * kLat2N * 3) return fail(GpuFailure::Unsupported, "overflow lattice unavailable"), nullptr;
+
+  std::shared_ptr<Context> ctx = ctx_;
+  auto t = std::shared_ptr<DeviceTables>(new DeviceTables, [](DeviceTables* p) {
+    if (p->ctx && p->epoch == p->ctx->epoch()) {
+      hal::Device& d = p->ctx->core().dev();
+      d.waitIdle();  // a frame in flight may still read the tables
+      d.destroy(p->lat);
+      d.destroy(p->lat2);
+      d.destroy(p->tone);
+    }
+    delete p;
+  });
+  t->ctx = ctx;
+  t->epoch = epoch_;
+  t->n = lut.n;
+  t->n2 = kLat2N;
+  hal::Status s = dev().createImage({hal::Format::RGBA32F, std::uint32_t(lut.n), std::uint32_t(lut.n), std::uint32_t(lut.n)}, &t->lat);
+  if (s == hal::Status::Ok) s = dev().createImage({hal::Format::RGBA32F, kLat2N, kLat2N, kLat2N}, &t->lat2);
+  if (s == hal::Status::Ok) s = dev().createBuffer({kToneN * 4, hal::MemKind::DeviceLocal, true}, &t->tone);
+  if (s != hal::Status::Ok) return failStatus(s, ""), nullptr;
+
+  const std::size_t latBytes = std::size_t(lut.n) * lut.n * lut.n * 16, lat2Bytes = std::size_t(kLat2N) * kLat2N * kLat2N * 16;
+  const std::size_t toneBytes = (kToneN * 4 + 255) / 256 * 256;
+  auto cl = dev().begin();
+  if (!cl) return failStatus(hal::Status::Timeout, ""), nullptr;
+  std::string err;
+  if (!core().ensureStaging(cl->slot(), toneBytes + latBytes + lat2Bytes, err)) return fail(GpuFailure::Transient, err), nullptr;
+  auto& sr = core().slot(cl->slot());
+  auto* base = static_cast<std::uint8_t*>(sr.staging.mapped);
+  std::memcpy(base, lut.tone.data(), kToneN * 4);
+  auto texels = [](const std::vector<float>& rgb, float* o) {
+    const std::size_t n = rgb.size() / 3;
+    for (std::size_t i = 0; i < n; ++i) {
+      o[4 * i] = rgb[3 * i];
+      o[4 * i + 1] = rgb[3 * i + 1];
+      o[4 * i + 2] = rgb[3 * i + 2];
+      o[4 * i + 3] = 1.f;
+    }
+  };
+  texels(lut.rgb, reinterpret_cast<float*>(base + toneBytes));
+  texels(*over, reinterpret_cast<float*>(base + toneBytes + latBytes));
+  GpuGraph g(dev(), core().pool());
+  g.copyBufferToBuffer(sr.staging, g.externalBuf(t->tone), kToneN * 4, 0);
+  g.copyBufferToImage(sr.staging, g.external(t->lat), std::uint32_t(lut.n), std::uint32_t(lut.n), std::uint32_t(lut.n), toneBytes);
+  g.copyBufferToImage(sr.staging, g.external(t->lat2), kLat2N, kLat2N, kLat2N, toneBytes + latBytes);
+  hal::FenceH f;
+  s = runGraph(dev(), g, *cl, &f, err);
+  if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
+  if (s != hal::Status::Ok) return failStatus(s, err), nullptr;
+
+  ResultCache::Entry e;
+  e.key = e.family = key;
+  e.order = lut.n;
+  e.payload = t;
+  e.bytes = latBytes + lat2Bytes + kToneN * 4;
+  tables_.put(NodeType::ColourLattice, std::move(e));
+  return t;
+}
+
+LutBind Executor::lutBind(GpuGraph& g, const DeviceTables& t) {
+  LutBind b;
+  b.tone = g.externalBuf(t.tone);
+  b.lat = g.external(t.lat);
+  b.lat2 = g.external(t.lat2);
+  b.n = t.n;
+  b.n2 = t.n2;
+  b.toneN = int(kToneN);
+  b.toneBase = kToneBase;
+  b.max1 = kBakeMax;
+  b.max2 = kLat2Max;
+  return b;
+}
+
+bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
+  const FramePlan::Film& f = in.frame.film;
+  const std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
+  if (!lib) return fail(GpuFailure::Unsupported, "film library not available");
+  filmnode::FilmFrameArgs a;
+  a.lib = lib.get();
+  a.stock = f.stock.c_str();
+  a.paper = f.paper.c_str();
+  for (int c = 0; c < 3; ++c) a.gain[c] = in.frame.gain[c];
+  a.filmExposure = f.filmEv;
+  a.warmth = f.warmth;
+  a.tint = f.tint;
+  a.grainPct = f.grainPct;
+  a.halationPct = f.halationPct;
+  a.formatScale = f.formatScale;
+  a.w = in.frame.outW;
+  a.h = in.frame.outH;
+  a.quality = f.quality;
+  a.keepGrain = f.keepGrain;
+  a.fullLongEdge = f.fullLongEdge;
+  a.frameIndex = f.frameIndex;
+  // r.lib / r.stock point into the process-wide default library, which outlives the frame
+  if (!filmnode::filmFrameResolved(a, r)) return fail(GpuFailure::Unsupported, "film stock / paper not available");
+  std::string why;
+  if (!filmnode::filmGpuSupported(r, why)) return fail(GpuFailure::Unsupported, why);
+  return true;
+}
+
+std::shared_ptr<DeviceFilm> Executor::ensureFilm(const filmnode::FilmResolved& r) {
+  filmnode::FilmTablesHandle tb;
+  std::string err;
+  if (!filmnode::bakeFilmTables(r, tb, &err)) return fail(GpuFailure::Unsupported, "film tables: " + err), nullptr;
+  const auto pd = filmnode::planOf(r);
+  if (!film_ || film_->epoch != epoch_ || film_->tb.raw != tb.raw || film_->tb.curves != tb.curves || film_->tb.print != tb.print) {
+    film_.reset();
+    auto f = std::make_shared<DeviceFilm>();
+    f->ctx = ctx_;
+    f->epoch = epoch_;
+    f->tb = tb;
+    if (!filmnode::uploadGpuTables(core(), tb, f->gt, err)) return failStatus(hal::Status::OutOfMemory, "film tables upload: " + err), nullptr;
+    f->haveTables = true;
+    film_ = std::move(f);
+  }
+  if (!film_->havePlan || film_->planKeep != pd) {
+    if (film_->havePlan) filmnode::releaseGpuPlan(core(), film_->pr);
+    film_->havePlan = false;
+    film_->planKeep = pd;
+    if (!filmnode::uploadGpuPlan(core(), r, film_->pr, err)) return failStatus(hal::Status::OutOfMemory, "film grain tables upload: " + err), nullptr;
+    film_->havePlan = true;
+  }
+  return film_;
+}
+
+bool Executor::validate(const GpuRun& in) {
+  const Plan& pl = in.plan;
+  if (pl.unsupported) return fail(GpuFailure::Unsupported, std::string("plan unsupported: ") + pl.why);
+  if (!in.frame.supported) return fail(GpuFailure::Unsupported, "unsupported on the GPU: " + in.frame.why);
+  const bool film = pl.hasFilm;
+  if (film) {  // a whole film frame (section 20): film chain -> DisplayStages (identity) + Vignette -> window nodes
+    if (!in.frame.film.active) return fail(GpuFailure::Unsupported, "film frame without film arguments");
+    if (!in.frame.film.displayPlain) return fail(GpuFailure::Unsupported, "film frame with display curves / look LUT");
+    if (pl.mode == ExecMode::TiledExport || in.target.sink) return fail(GpuFailure::Unsupported, "film frames run whole (no tiled export yet)");
+    filmnode::FilmResolved fr;
+    if (!filmResolve(in, fr)) return false;
+  }
+  bool sweep = false;
+  for (const Stage& st : pl.stages) {
+    if (st.kind == StageKind::FilmFrame) {
+      if (!film) return fail(GpuFailure::Unsupported, "FilmFrame stage");
+      continue;
+    }
+    if (st.kind != StageKind::TileSweep) continue;
+    sweep = true;
+    for (const Group& g : st.groups) {
+      for (NodeId id : g.nodes) {
+        if (id >= in.graph.nodes().size()) return fail(GpuFailure::Unsupported, "plan refers to an unknown node");
+        const NodeType t = in.graph.nodes()[id].type;
+        if (film && g.kind == GroupKind::PointChain) {
+          if (t == NodeType::DisplayStages || t == NodeType::Vignette) continue;
+          return fail(GpuFailure::Unsupported, std::string("node ") + NodeRegistry::instance().desc(t).name + " after a film frame");
+        }
+        const bool ok = g.kind == GroupKind::PointChain ? headNodeOk(t) : g.kind == GroupKind::Window ? windowNodeOk(t) : false;
+        if (!ok || !gpuImplFor(t)) return fail(GpuFailure::Unsupported, std::string("node ") + NodeRegistry::instance().desc(t).name + " has no GPU implementation");
+      }
+    }
+  }
+  if (!sweep) return fail(GpuFailure::Unsupported, "plan without a pixel sweep");
+  return true;
+}
+
+// ---- the stage walk -------------------------------------------------------------------------------------------------------------
+// One job = a frame, or one tile of one sweep. `ran` counts the groups of the stage list already recorded for the image `D`
+// (a single-tile run keeps D across sweeps and records only what the next sweep adds).
+struct Executor::Walk {
+  GpuRecorder& r;
+  const GpuRun& in;
+  const FramePlan& P;
+  SpatialRadii R;
+  bool whole;
+  WRect interior, work;
+  SourceBind src;
+  LutBind lut;
+  GlobalRes* glob = nullptr;
+
+  H D = -1, o8 = -1;
+  int ran = 0;
+  H col = -1, yy = -1, dc = -1, ab = -1;  // whole mode: the 1/4 grids and the solves
+  Epilogue ep;
+  // film frame (section 20)
+  H filmH = -1;
+  const filmnode::FilmResolved* fres = nullptr;
+  const filmnode::GpuFilmTables* ftab = nullptr;
+  const filmnode::GpuFilmPlanRes* fplan = nullptr;
+
+  Walk(GpuRecorder& rec, const GpuRun& run, float resizeSharpen, bool wholeFrame)
+      : r(rec), in(run), P(run.frame), R(spatialRadii(run.frame, resizeSharpen)), whole(wholeFrame) {
+    grainArgs(P, ep.amp, ep.period);
+    ep.grain = P.grain > 0;
+  }
+
+  int gridW() const { return glob && !whole ? glob->lw : cdiv(work.w(), 4); }
+  int gridH() const { return glob && !whole ? glob->lh : cdiv(work.h(), 4); }
+  WRect interiorWin() const { return WRect{interior.x0 - work.x0, interior.y0 - work.y0, interior.x1 - work.x0, interior.y1 - work.y0}; }
+  NodeType typeOf(NodeId id) const { return in.graph.nodes()[id].type; }
+
+  // index (in st.groups) of the last group that ends with a real pass (the grain group is only an epilogue)
+  int lastPassGroup(const Stage& st) const {
+    int last = 0;
+    for (int i = 0; i < int(st.groups.size()); ++i) {
+      bool pass = filmH >= 0 && st.groups[std::size_t(i)].kind == GroupKind::PointChain;
+      for (NodeId id : st.groups[std::size_t(i)].nodes) {
+        const GpuImpl* gi = gpuImplFor(typeOf(id));
+        if (gi && !gi->epilogue) pass = true;
+      }
+      if (pass) last = i;
+    }
+    return last;
+  }
+
+  // FilmFrame stage: the film input (geometry gather of the resident source when the frame is a resampling of it), then the film
+  // chain (recordFilmFrame) -> the display image (RGBA32F, sRGB encoded, unclamped) that the following sweep finishes
+  bool filmStage() {
+    H in = src.img;
+    if (P.useGeo) {
+      struct U {
+        std::int32_t a[4], b[4];
+        float geoA[4], geoB[4], geoC[4];
+        std::int32_t c[4];
+      } u{};
+      u.a[0] = P.srcW;
+      u.a[1] = P.srcH;
+      u.a[2] = P.outW;
+      u.a[3] = P.outH;
+      u.geoA[0] = P.cs;
+      u.geoA[1] = P.sn;
+      u.geoA[2] = P.fw;
+      u.geoA[3] = P.fh;
+      u.geoB[0] = P.ox0;
+      u.geoB[1] = P.oy0;
+      u.geoB[2] = P.stepX;
+      u.geoB[3] = P.stepY;
+      u.geoC[0] = P.fullW;
+      u.geoC[1] = P.fullH;
+      u.c[0] = P.rot;
+      u.c[1] = P.flip ? 1 : 0;
+      const hal::PipelineH p = r.pl("film_src", {{0, P.exact ? 1 : 2}});
+      if (!p) return false;
+      const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.outW), std::uint32_t(P.outH));
+      r.g.dispatch("film_src", p, {GpuGraph::R(src.img), GpuGraph::W(g)}, r.gx(P.outW), r.gy(P.outH), &u, sizeof u);
+      in = g;
+    }
+    filmH = filmnode::recordFilmFrame(r, *fres, *ftab, *fplan, in, P.outW, P.outH);
+    return filmH >= 0;
+  }
+  // the film plane -> vignette -> clamp -> D (or the grain epilogue + RGBA8 when it is the last pass)
+  bool filmFinish(const Epilogue& e, H Dst, int W, int Hh, int ox, int oy) {
+    struct U {
+      std::int32_t a[4];
+      float geoB[4], geoC[4], e[4];
+    } u{};
+    u.a[0] = W;
+    u.a[1] = Hh;
+    u.a[2] = ox;
+    u.a[3] = oy;
+    u.geoB[0] = P.ox0;
+    u.geoB[1] = P.oy0;
+    u.geoB[2] = P.stepX;
+    u.geoB[3] = P.stepY;
+    u.geoC[0] = P.fullW;
+    u.geoC[1] = P.fullH;
+    u.geoC[2] = P.vignette;
+    u.e[0] = e.amp;
+    u.e[1] = e.period;
+    const hal::PipelineH p = r.pl("film_fin", {{10, e.last ? 1 : 0}, {11, e.last && e.grain ? 1 : 0}});
+    if (!p) return false;
+    r.g.dispatch("film_fin", p, {GpuGraph::R(filmH), GpuGraph::W(Dst), e.last ? GpuGraph::W(e.out8) : GpuGraph::R(r.dummy(kU8))},
+                 r.gx(W), r.gy(Hh), &u, sizeof u);
     return true;
   }
 
-  // The resident source resized (Lanczos-3) to w x h; cached (two sizes).
-  hal::ImageH* resizedSource(int w, int h, std::string& err) {
-    if (w == W && h == H) return &resident;
-    for (auto& r : resized)
-      if (r->w == w && r->h == h) {
-        r->used = ++tick;
-        return &r->img;
-      }
-    if (!canResident(w, h)) return fail(Failure::Unsupported, err, "resized source too large"), nullptr;
-    auto r = std::make_unique<Resized>();
-    r->w = w;
-    r->h = h;
-    hal::Status s = dev().createImage({hal::Format::RGBA16F, std::uint32_t(w), std::uint32_t(h), 1}, &r->img);
-    if (s != hal::Status::Ok) return failStatus(s, err, ""), nullptr;
-    auto cl = dev().begin();
-    if (!cl) return failStatus(hal::Status::Timeout, err, ""), nullptr;
-    GpuGraph g(dev(), core().pool());
-    GpuRecorder rec(dev(), g, err);
-    rec.weights = core().slot(cl->slot()).weights;
-    rec.boxScanMin = core().boxScanOk ? -1 : 0;
-    const eg::H src = g.external(resident);
-    const SrcWin full{0, 0, W, H};
-    const eg::H out = recordResize(rec, src, full, W, H, w, h, WRect{0, 0, w, h});
-    if (out < 0) return fail(Failure::Transient, err, err), nullptr;
-    g.copyImage(out, g.external(r->img), std::uint32_t(w), std::uint32_t(h));
-    hal::FenceH f;
-    s = runGraph(dev(), g, *cl, &f, err);
-    if (s == hal::Status::Ok) s = dev().wait(f, 30ull * 1000 * 1000 * 1000);
-    if (s != hal::Status::Ok) return failStatus(s, err, err), nullptr;
-    r->used = ++tick;
-    if (resized.size() >= 2) {
-      auto victim = std::min_element(resized.begin(), resized.end(), [](auto& a, auto& b) { return a->used < b->used; });
-      dev().destroy((*victim)->img);
-      resized.erase(victim);
+  bool sweep(const Stage& st) {
+    const bool finalMode = st.output;
+    const int lastG = lastPassGroup(st);
+    r.W = work.w();
+    r.H_ = work.h();
+    if (D < 0) {
+      D = r.tr(kF16, r.W, r.H_);
+      if (finalMode) o8 = r.tr(kU8, r.W, r.H_);
+    } else if (finalMode && o8 < 0) {
+      o8 = r.tr(kU8, r.W, r.H_);
     }
-    resized.push_back(std::move(r));
-    return &resized.back()->img;
+    const int ox = work.x0, oy = work.y0, W = r.W, Hh = r.H_;
+    for (int gi = ran; gi < int(st.groups.size()); ++gi) {
+      const Group& g = st.groups[std::size_t(gi)];
+      Epilogue e = ep;
+      e.last = finalMode && gi == lastG;
+      e.out8 = e.last ? o8 : -1;
+      e.grain = ep.grain && finalMode;
+      // a group's nodes are one recipe (point chain) or one window node
+      const NodeType t0 = typeOf(g.nodes.front());
+      if (t0 == NodeType::Grain) continue;  // epilogue slot of the last pass
+      ResolvedStorage rs;
+      const GpuImpl* impl = gpuImplFor(t0);
+      GpuPorts ports;
+      const void* res = nullptr;
+      if (filmH >= 0 && g.kind == GroupKind::PointChain) {  // DisplayStages (identity) + Vignette of a film frame
+        if (!filmFinish(e, D, W, Hh, ox, oy)) return false;
+        continue;
+      }
+      switch (t0) {
+        case NodeType::Resize:
+        case NodeType::Geometry:
+        case NodeType::Gain:
+        case NodeType::ToneColour:
+        case NodeType::Vignette:
+          new (&rs.point) PointNode{&P, src, lut, W, Hh, ox, oy, e};
+          res = &rs.point;
+          ports.out[0] = D;
+          impl = gpuImplFor(NodeType::ToneColour);  // the point recipe, whichever node of the chain comes first (Resize has no record function of its own)
+          break;
+        case NodeType::NRLuma:
+          new (&rs.nrl) NrLumaNode{&P, &R, W, Hh, ox, oy, e};
+          res = &rs.nrl;
+          ports.in[0] = D;
+          break;
+        case NodeType::NRChroma:
+          new (&rs.nrc) NrChromaNode{&P, &R, W, Hh, ox, oy, e};
+          res = &rs.nrc;
+          ports.in[0] = D;
+          break;
+        case NodeType::Dehaze: {
+          const H dcH = P.dehaze > 0 ? (whole ? dc : (glob ? glob->dc : -1)) : -1;
+          if (P.dehaze > 0 && dcH < 0) return r.err = "dehaze solve missing from the plan", false;
+          new (&rs.dz) DehazeNode{&P, W, Hh, ox, oy, gridW(), gridH(), dcH, e};
+          res = &rs.dz;
+          ports.in[0] = D;
+          break;
+        }
+        case NodeType::Detail: {
+          const H abH = P.clarity != 0 ? (whole ? ab : (glob ? glob->ab : -1)) : -1;
+          if (P.clarity != 0 && abH < 0) return r.err = "clarity solve missing from the plan", false;
+          new (&rs.dt) DetailNode{&P, &R, W, Hh, ox, oy, gridW(), gridH(), abH, e};
+          res = &rs.dt;
+          ports.in[0] = D;
+          break;
+        }
+        default: return r.err = "node without a record function", false;
+      }
+      if (!impl || !impl->recordPorts || !impl->recordPorts(r, res, ports)) return false;
+    }
+    ran = int(st.groups.size());
+    return true;
   }
 
-  // Lattice + tone table on the device (cached per bake key).
-  Lut* ensureLut(const Renderer& r, const BakedLut& lut, std::string& err) {
-    for (auto& l : luts)
-      if (l && l->key == lut.key) {
-        l->used = ++tick;
-        return l.get();
-      }
-    if (lut.n < 2 || lut.rgb.size() != std::size_t(lut.n) * lut.n * lut.n * 3) return fail(Failure::Unsupported, err, "lattice not usable (film only bake?)"), nullptr;
-    if (lut.tone.size() != kToneN) return fail(Failure::Unsupported, err, "tone table size differs from the GPU backend's"), nullptr;
-    std::vector<float> over = r.bakeOverflow(*cpu, lut, kLat2N, kLat2Max);
-    if (over.size() != std::size_t(kLat2N) * kLat2N * kLat2N * 3) return fail(Failure::Unsupported, err, "overflow lattice unavailable"), nullptr;
-    int slotIdx = 0;
-    if (luts[0] && (!luts[1] || luts[0]->used > luts[1]->used)) slotIdx = 1;
-    if (luts[slotIdx]) {
-      dev().waitIdle();
-      dropLut(luts[slotIdx]);
+  // the end of a sweep: the 1/4 grid the following GlobalSolve needs
+  bool accumulate(const Stage& st) {
+    if (st.accum == Accum::None) return true;
+    const int mode = st.accum == Accum::DehazeGrid ? 0 : 1;
+    if (whole) {
+      H& grid = mode == 0 ? col : yy;
+      grid = r.tr(kF32, gridW(), gridH());
+      return r.down(D, 4, mode, grid, WRect{0, 0, work.w(), work.h()}, 0, 0, gridW(), gridH()) >= 0;
     }
-    auto l = std::make_unique<Lut>();
-    l->key = lut.key;
-    l->n = lut.n;
-    l->n2 = kLat2N;
-    hal::Status s = dev().createImage({hal::Format::RGBA32F, std::uint32_t(lut.n), std::uint32_t(lut.n), std::uint32_t(lut.n)}, &l->lat);
-    if (s == hal::Status::Ok) s = dev().createImage({hal::Format::RGBA32F, kLat2N, kLat2N, kLat2N}, &l->lat2);
-    if (s == hal::Status::Ok) s = dev().createBuffer({kToneN * 4, hal::MemKind::DeviceLocal, true}, &l->tone);
-    if (s != hal::Status::Ok) {
-      dev().destroy(l->lat);
-      dev().destroy(l->lat2);
-      return failStatus(s, err, ""), nullptr;
-    }
-    const std::size_t latBytes = std::size_t(lut.n) * lut.n * lut.n * 16, lat2Bytes = std::size_t(kLat2N) * kLat2N * kLat2N * 16;
-    const std::size_t toneBytes = (kToneN * 4 + 255) / 256 * 256;
-    auto cl = dev().begin();
-    if (!cl) return failStatus(hal::Status::Timeout, err, ""), nullptr;
-    if (!core().ensureStaging(cl->slot(), toneBytes + latBytes + lat2Bytes, err)) return fail(Failure::Transient, err, err), nullptr;
-    auto& sr = core().slot(cl->slot());
-    auto* base = static_cast<std::uint8_t*>(sr.staging.mapped);
-    std::memcpy(base, lut.tone.data(), kToneN * 4);
-    auto texels = [](const std::vector<float>& rgb, float* o) {
-      const std::size_t n = rgb.size() / 3;
-      for (std::size_t i = 0; i < n; ++i) {
-        o[4 * i] = rgb[3 * i];
-        o[4 * i + 1] = rgb[3 * i + 1];
-        o[4 * i + 2] = rgb[3 * i + 2];
-        o[4 * i + 3] = 1.f;
-      }
-    };
-    texels(lut.rgb, reinterpret_cast<float*>(base + toneBytes));
-    texels(over, reinterpret_cast<float*>(base + toneBytes + latBytes));
-    GpuGraph g(dev(), core().pool());
-    g.copyBufferToBuffer(sr.staging, g.externalBuf(l->tone), kToneN * 4, 0);
-    g.copyBufferToImage(sr.staging, g.external(l->lat), std::uint32_t(lut.n), std::uint32_t(lut.n), std::uint32_t(lut.n), toneBytes);
-    g.copyBufferToImage(sr.staging, g.external(l->lat2), kLat2N, kLat2N, kLat2N, toneBytes + latBytes);
-    hal::FenceH f;
-    s = runGraph(dev(), g, *cl, &f, err);
-    if (s == hal::Status::Ok) s = dev().wait(f, 30ull * 1000 * 1000 * 1000);
-    if (s != hal::Status::Ok) {
-      dropLut(l);
-      return failStatus(s, err, err), nullptr;
-    }
-    l->used = ++tick;
-    luts[slotIdx] = std::move(l);
-    return luts[slotIdx].get();
+    const H dst = mode == 0 ? glob->color : glob->yy;
+    return r.down(D, 4, mode, dst, interiorWin(), interior.x0 / 4, interior.y0 / 4, cdiv(interior.w(), 4), cdiv(interior.h(), 4)) >= 0;
   }
 
-  LutBind lutBind(GpuGraph& g, Lut& l) {
-    LutBind b;
-    b.tone = g.externalBuf(l.tone);
-    b.lat = g.external(l.lat);
-    b.lat2 = g.external(l.lat2);
-    b.n = l.n;
-    b.n2 = l.n2;
-    b.toneN = int(kToneN);
-    b.toneBase = kToneBase;
-    b.max1 = kBakeMax;
-    b.max2 = kLat2Max;
-    return b;
-  }
-
-  void finishFrame(FrameStats* st, const Core::Stats& s, double wall) {
-    if (!st) return;
-    st->wallMs = wall;
-    st->gpuMs = s.gpuMs;
-    st->passes = s.passes;
-    st->barriers = s.barriers;
-    st->passTimes.clear();
-    for (const auto& t : s.times) st->passTimes.push_back({t.name, t.ms});
+  // whole mode: solves recorded into the same graph
+  bool solve(const Stage& st) {
+    const NodeType t = typeOf(st.solveNode);
+    if (t == NodeType::Dehaze) {
+      dc = recordDehazeAnalysis(r, R, col, gridW(), gridH());
+      return dc >= 0;
+    }
+    ab = recordClarityAnalysis(r, R, yy, gridW(), gridH());
+    return ab >= 0;
   }
 };
 
-Session::Session(std::shared_ptr<Backend> b) : d_(new Impl) {
-  d_->be = std::move(b);
-  d_->epoch = d_->bi().epoch.load();
+Status Executor::finish(const GpuRun& in, GpuOut& out, Status s) {
+  (void)in;
+  out.failure = failure_;
+  out.error = err_;
+  return s;
 }
-Session::~Session() {
-  if (d_ && d_->be) {
-    const std::shared_ptr<Backend> be = d_->be;  // keeps the backend (and its mutex) alive while the session is torn down
-    std::lock_guard<std::mutex> lk(be->d_->mtx);
-    d_.reset();
+
+Status Executor::run(const GpuRun& in, GpuOut& out) {
+  std::lock_guard<std::mutex> lk(ctx_->mutex());
+  [[maybe_unused]] detail::BigCoreScope pin;
+  checkEpoch();
+  failure_ = GpuFailure::None;
+  err_.clear();
+  out.failure = GpuFailure::None;
+  if (injectCount_ > 0) {
+    --injectCount_;
+    failure_ = injected_;
+    err_ = "injected failure (test)";
+    return finish(in, out, failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal);
   }
-}
-Session::Failure Session::lastFailure() const { return d_->failure; }
-void Session::injectFailure(Failure f, int count) {
-  d_->injected = f;
-  d_->injectCount = count;
-}
-
-bool Session::setSource(const SourceImage& src, std::uint64_t stamp, std::string& err) {
-  std::lock_guard<std::mutex> lk(d_->bi().mtx);
-  d_->checkEpoch();
-  if (src.linear.empty()) return err = "empty source", false;
-  if (d_->cpu == &src && d_->stamp == stamp && d_->W == src.linear.width && d_->H == src.linear.height) return true;
-  d_->dropResident();
-  d_->cpu = &src;
-  d_->stamp = stamp;
-  d_->W = src.linear.width;
-  d_->H = src.linear.height;
-  return true;
-}
-bool Session::hasSource() const { return d_->cpu != nullptr; }
-bool Session::canRenderResident(int w, int h) const { return d_->canResident(w, h); }
-
-bool Session::frameSize(const Renderer& r, const FastOptions& opt, const FrameOptions& fo, int& w, int& h) const {
-  if (!d_->cpu) return false;
-  int rw, rh;
-  resizedDims(d_->W, d_->H, fo.srcLongEdge, rw, rh);
-  const FramePlan p = r.framePlan(rw, rh, d_->cpu->sceneReferred, opt);
-  if (!p.supported) return false;
-  w = p.outW;
-  h = p.outH;
-  return true;
+  if (dev().state() == hal::DeviceState::Lost) return fail(GpuFailure::DeviceLost, "device lost"), finish(in, out, Status::Internal);
+  if (!validate(in)) return finish(in, out, Status::Unsupported);
+  if (in.cancel.cancelled()) return fail(GpuFailure::None, "cancelled"), finish(in, out, Status::Cancelled);
+  bindSource(in.store);
+  const Status s = in.plan.mode == ExecMode::TiledExport ? runTiled(in, out) : runWhole(in, out);
+  if (s != Status::Ok && s != Status::Cancelled && failure_ == GpuFailure::None) failure_ = GpuFailure::Transient;
+  return finish(in, out, s);
 }
 
-std::uint8_t* Session::render(const Renderer& r, const BakedLut& lut, const FastOptions& opt, const FrameOptions& fo, int& w, int& h, FrameStats* stats,
-                              std::string& err) {
-  std::lock_guard<std::mutex> lk(d_->bi().mtx);
-  BigCoreScope pin;
+// ---- whole frame ----------------------------------------------------------------------------------------------------------------------
+Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   const auto t0 = Clock::now();
-  Impl& d = *d_;
-  d.checkEpoch();
-  d.failure = Failure::None;
-  hal::Device& dev = d.dev();
-  if (d.takeInjected(err)) return nullptr;
-  if (dev.state() == hal::DeviceState::Lost) return d.fail(Failure::DeviceLost, err, "device lost"), nullptr;
-  if (!d.cpu) return d.fail(Failure::Unsupported, err, "no source"), nullptr;
-  int rw, rh;
-  resizedDims(d.W, d.H, fo.srcLongEdge, rw, rh);
-  const FramePlan plan = r.framePlan(rw, rh, d.cpu->sceneReferred, opt);
-  if (!plan.supported) return d.fail(Failure::Unsupported, err, "unsupported on the GPU: " + plan.why), nullptr;
-  const auto& caps = dev.caps();
-  if (plan.outW <= 0 || plan.outH <= 0 || std::uint32_t(plan.outW) > caps.maxImage2D || std::uint32_t(plan.outH) > caps.maxImage2D)
-    return d.fail(Failure::Unsupported, err, "frame size outside the device limits"), nullptr;
-  if (!d.ensureResident(err)) return nullptr;
-  hal::ImageH* S = d.resizedSource(rw, rh, err);
-  if (!S) return nullptr;
-  Impl::Lut* L = d.ensureLut(r, lut, err);
-  if (!L) return nullptr;
+  hal::Device& d = dev();
+  const FramePlan& P = in.frame;
+  const hal::DeviceCaps& caps = d.caps();
+  const int fw = P.outW, fh = P.outH;
+  if (fw <= 0 || fh <= 0 || std::uint32_t(fw) > caps.maxImage2D || std::uint32_t(fh) > caps.maxImage2D)
+    return fail(GpuFailure::Unsupported, "frame size outside the device limits"), Status::Unsupported;
+  if (!canResident(W_, H_)) return fail(GpuFailure::Unsupported, "source too large for a resident GPU copy"), Status::Unsupported;
+  if (!ensureResident()) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
+  hal::ImageH* S = resizedSource(P.srcW, P.srcH);
+  if (!S) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
+  const bool filmFrame = in.plan.hasFilm;
+  std::shared_ptr<DeviceTables> L;
+  std::shared_ptr<DeviceFilm> DF;
+  filmnode::FilmResolved fres;
+  if (filmFrame) {  // the film replaces tone + colour: no colour lattice, the film tables instead
+    // all intermediates of the film (E, E2, q, D, grain, linear light, ...) are RGBA32F frames: bounded by the device memory
+    if (std::uint64_t(fw) * fh * 288 > std::uint64_t(double(caps.deviceLocalBytes) * 0.45))
+      return fail(GpuFailure::Unsupported, "film frame too large for the device memory"), Status::Unsupported;
+    if (!filmResolve(in, fres)) return Status::Unsupported;
+    DF = ensureFilm(fres);
+    if (!DF) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
+  } else {
+    L = ensureTables(in);
+    if (!L) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
+  }
   const double uploadMs = msSince(t0);
+  if (in.cancel.cancelled()) return fail(GpuFailure::None, "cancelled"), Status::Cancelled;
 
-  auto cl = dev.begin();
-  if (!cl) return d.failStatus(hal::Status::Timeout, err, ""), nullptr;
+  auto cl = d.begin();
+  if (!cl) return failStatus(hal::Status::Timeout, ""), Status::Internal;
   const int slot = cl->slot();
-  const std::size_t bytes = std::size_t(plan.outW) * plan.outH * 4;
-  if (!d.core().ensureReadback(slot, bytes, err)) return d.fail(Failure::Transient, err, err), nullptr;
-  GpuGraph g(dev, d.core().pool());
-  GpuRecorder rec(dev, g, err);
-  rec.weights = d.core().slot(slot).weights;
-  rec.boxScanMin = d.core().boxScanOk ? -1 : 0;
-  rec.gBuf = d.core().gBuf;
-  rec.partBuf = d.core().partBuf;
-  FrameJob job;
-  job.plan = &plan;
-  job.resizeSharpen = (rw < d.W || rh < d.H) ? fo.resizeSharpen : 0.f;
-  job.mode = Mode::Whole;
-  job.interior = job.work = WRect{0, 0, plan.outW, plan.outH};
-  job.src.img = g.external(*S);
-  job.lut = d.lutBind(g, *L);
-  H out8 = -1;
-  if (!buildFrame(rec, job, &out8)) return d.fail(Failure::Transient, err, err), nullptr;
+  // zero readback only when the device can write the presenter's image and the frame fits it; otherwise the frame is read back as
+  // usual (the caller sees rgba != null and grows its image for the next frame)
+  const hal::ExternalImage* ext = in.target.external;
+  const bool external = ext && caps.externalImageWrite && ext->handle && std::uint32_t(fw) <= ext->w && std::uint32_t(fh) <= ext->h;
+  const std::size_t bytes = std::size_t(fw) * fh * 4;
+  std::string err;
+  if (!external && !core().ensureReadback(slot, bytes, err)) return fail(GpuFailure::Transient, err), Status::Internal;
+  GpuGraph g(d, core().pool());
+  GpuRecorder rec(d, g, err);
+  rec.weights = core().slot(slot).weights;
+  rec.taps = core().slot(slot).taps;
+  rec.boxScanMin = core().boxScanOk ? -1 : 0;
+  rec.gBuf = core().gBuf;
+  rec.partBuf = core().partBuf;
 
-  g.copyImageToBuffer(out8, d.core().slot(slot).readback, 0, 0, std::uint32_t(plan.outW), std::uint32_t(plan.outH));
+  const bool down = P.srcW < W_ || P.srcH < H_;
+  Walk w(rec, in, down ? in.resizeSharpen : 0.f, true);
+  w.interior = w.work = WRect{0, 0, fw, fh};
+  w.src.img = g.external(*S);
+  if (L) w.lut = lutBind(g, *L);
+  if (DF) {
+    w.fres = &fres;
+    w.ftab = &DF->gt;
+    w.fplan = &DF->pr;
+  }
+  for (const Stage& st : in.plan.stages) {
+    if (st.kind == StageKind::FilmFrame) {
+      if (!w.filmStage()) {  // an effect the GPU film does not port (error text "film GPU: ..."): the CPU renders the frame
+        const bool unsup = err.rfind("film GPU:", 0) == 0;
+        return fail(unsup ? GpuFailure::Unsupported : GpuFailure::Transient, err), unsup ? Status::Unsupported : Status::Internal;
+      }
+    } else if (st.kind == StageKind::TileSweep) {
+      if (!w.sweep(st) || !w.accumulate(st)) return fail(GpuFailure::Transient, err), Status::Internal;
+    } else if (st.kind == StageKind::GlobalSolve) {
+      if (!w.solve(st)) return fail(GpuFailure::Transient, err), Status::Internal;
+    }
+  }
+  if (w.o8 < 0) return fail(GpuFailure::Unsupported, "plan has no output sweep"), Status::Unsupported;
+  if (external) g.copyImageToExternal(w.o8, *ext, std::uint32_t(fw), std::uint32_t(fh));
+  else g.copyImageToBuffer(w.o8, core().slot(slot).readback, 0, 0, std::uint32_t(fw), std::uint32_t(fh));
+
   const auto tSub = Clock::now();
   hal::FenceH fence;
-  hal::Status s = runGraph(dev, g, *cl, &fence, err);
-  if (s != hal::Status::Ok) return d.failStatus(s, err, err), nullptr;
+  hal::Status s = runGraph(d, g, *cl, &fence, err);
+  if (s != hal::Status::Ok) return failStatus(s, err), Status::Internal;
   const auto tWait = Clock::now();
-  s = dev.wait(fence, 30ull * 1000 * 1000 * 1000);
-  if (s != hal::Status::Ok) return d.failStatus(s, err, ""), nullptr;
-  const auto t1 = Clock::now();
-  auto* out = static_cast<std::uint8_t*>(std::malloc(bytes));
-  if (!out) return d.fail(Failure::Transient, err, "out of memory"), nullptr;
-  std::memcpy(out, d.core().slot(slot).readback.mapped, bytes);
-  const double copyMs = msSince(t1);
-  w = plan.outW;
-  h = plan.outH;
-  const auto t2 = Clock::now();
-  GpuPool& pool = d.core().pool();
-  if (pool.freeBytes() > dev.poolBudget()) pool.trim(dev.poolBudget());
-  const double trimMs = msSince(t2);
-  d.finishFrame(stats, d.core().statsOf(fence), msSince(t0));
-  if (stats) {
-    stats->uploadMs = uploadMs;
-    stats->readbackMs = copyMs;
-    stats->trimMs = trimMs;
-    stats->recordMs = std::chrono::duration<double, std::milli>(tSub - t0).count() - uploadMs;
-    stats->submitMs = std::chrono::duration<double, std::milli>(tWait - tSub).count();
-    stats->waitMs = std::chrono::duration<double, std::milli>(t1 - tWait).count();
+  Clock::time_point t1 = tWait;
+  double copyMs = 0;
+  if (!external) {
+    s = d.wait(fence, kWaitNs);
+    if (s != hal::Status::Ok) return failStatus(s, ""), Status::Internal;
+    t1 = Clock::now();
+    auto* px = static_cast<std::uint8_t*>(std::malloc(bytes));
+    if (!px) return fail(GpuFailure::Transient, "out of memory"), Status::OutOfMemory;
+    std::memcpy(px, core().slot(slot).readback.mapped, bytes);
+    copyMs = msSince(t1);
+    out.rgba = px;
   }
-  return out;
+  out.w = fw;
+  out.h = fh;
+  const auto t2 = Clock::now();
+  GpuPool& pool = core().pool();
+  if (pool.freeBytes() > d.poolBudget()) pool.trim(d.poolBudget());
+  const double trimMs = msSince(t2);
+  GpuStats& st = out.stats;
+  const Core::Stats cs = core().statsOf(fence);
+  st.wallMs = msSince(t0);
+  st.gpuMs = cs.gpuMs;
+  st.passes = cs.passes;
+  st.barriers = cs.barriers;
+  st.parts = cs.parts;
+  st.tiles = 1;
+  st.sweeps = in.plan.sweeps();
+  st.passTimes.clear();
+  for (const auto& t : cs.times) st.passTimes.push_back({t.name, t.ms});
+  st.uploadMs = uploadMs;
+  st.readbackMs = copyMs;
+  st.trimMs = trimMs;
+  st.recordMs = std::chrono::duration<double, std::milli>(tSub - t0).count() - uploadMs;
+  st.submitMs = std::chrono::duration<double, std::milli>(tWait - tSub).count();
+  st.waitMs = std::chrono::duration<double, std::milli>(t1 - tWait).count();
+  return Status::Ok;
 }
 
-// ============================================================================================ export ===
-bool Session::exportTiled(const Renderer& r, const SourceImage& src, const BakedLut& lut, const FastOptions& opt, const ExportOptions& eo, FrameStats* stats,
-                          std::string& err) {
-  std::lock_guard<std::mutex> lk(d_->bi().mtx);
+// ---- tiled export -------------------------------------------------------------------------------------------------------------------------
+Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   const auto t0 = Clock::now();
-  Impl& d = *d_;
-  d.checkEpoch();
-  d.failure = Failure::None;
-  hal::Device& dev = d.dev();
-  GpuPool& pool = d.core().pool();
-  const double gpu0 = dev.gpuAccumMs();
-  if (d.takeInjected(err)) return false;
-  if (dev.state() == hal::DeviceState::Lost) return d.fail(Failure::DeviceLost, err, "device lost");
-  if (!eo.sink) return d.fail(Failure::Unsupported, err, "no tile sink");
-  if (!d.cpu || d.cpu != &src) {
-    d.dropResident();
-    d.cpu = &src;
-    d.W = src.linear.width;
-    d.H = src.linear.height;
-  }
-  int rw, rh;
-  resizedDims(d.W, d.H, eo.frame.srcLongEdge, rw, rh);
-  if (opt.region.active()) return d.fail(Failure::Unsupported, err, "tiled export renders the whole picture");
-  const FramePlan plan = r.framePlan(rw, rh, src.sceneReferred, opt);
-  if (!plan.supported) return d.fail(Failure::Unsupported, err, "unsupported on the GPU: " + plan.why);
-  const bool down = rw < d.W || rh < d.H;
-  const float rsharp = down ? eo.frame.resizeSharpen : 0.f;
-  const SpatialRadii R = spatialRadii(plan, rsharp);
-  const int maxDim = int(dev.caps().maxImage2D);
-  int tile = std::max(64, eo.tile / 4 * 4);
+  hal::Device& d = dev();
+  GpuPool& pool = core().pool();
+  const double gpu0 = d.gpuAccumMs();
+  const FramePlan& P = in.frame;
+  auto bad = [&](Status s) { return failure_ == GpuFailure::Unsupported ? Status::Unsupported : s; };
+  if (!in.target.sink) return fail(GpuFailure::Unsupported, "no tile sink"), Status::Unsupported;
+  const int rw = P.srcW, rh = P.srcH;
+  const bool down = rw < W_ || rh < H_;
+  const float rsharp = down ? in.resizeSharpen : 0.f;
+  const SpatialRadii R = spatialRadii(P, rsharp);
+  const int maxDim = int(d.caps().maxImage2D);
+  int tile = std::max(64, in.plan.grid.tile / 4 * 4);
   while (tile + 2 * R.halo > maxDim && tile > 64) tile = std::max(64, (tile / 2) / 4 * 4);
-  if (tile + 2 * R.halo > maxDim) return d.fail(Failure::Unsupported, err, "device image limit too small for the halo");
+  if (tile + 2 * R.halo > maxDim) return fail(GpuFailure::Unsupported, "device image limit too small for the halo"), Status::Unsupported;
 
-  Impl::Lut* L = d.ensureLut(r, lut, err);
-  if (!L) return false;
+  std::shared_ptr<DeviceTables> L = ensureTables(in);
+  if (!L) return bad(Status::Internal);
 
   // the source: resident (small enough) or streamed per tile
-  const bool resident = !eo.forceStream && d.canResident(d.W, d.H) && d.canResident(rw, rh) && std::uint64_t(d.W) * d.H <= 40000000ull;
+  const bool resident = !in.forceStream && canResident(W_, H_) && canResident(rw, rh) && std::uint64_t(W_) * H_ <= 40000000ull;
   hal::ImageH* S = nullptr;
   if (resident) {
-    if (!d.ensureResident(err)) return false;
-    S = d.resizedSource(rw, rh, err);
-    if (!S) return false;
+    if (!ensureResident()) return bad(Status::Internal);
+    S = resizedSource(rw, rh);
+    if (!S) return bad(Status::Internal);
   }
 
-  const bool wantDz = plan.dehaze > 0, wantClar = plan.clarity != 0;
-  const int glw = cdiv(plan.outW, 4), glh = cdiv(plan.outH, 4);
+  bool wantDz = false, wantClar = false;
+  for (const Stage& st : in.plan.stages) {
+    wantDz |= st.kind == StageKind::TileSweep && st.accum == Accum::DehazeGrid;
+    wantClar |= st.kind == StageKind::TileSweep && st.accum == Accum::LumaGrid;
+  }
+  const int glw = cdiv(P.outW, 4), glh = cdiv(P.outH, 4);
   hal::ImageH gColor, gDc, gYy, gAb;
   struct Free {
     hal::Device& dev;
@@ -839,17 +1014,17 @@ bool Session::exportTiled(const Renderer& r, const SourceImage& src, const Baked
       dev.waitIdle();
       for (hal::ImageH* i : im) dev.destroy(*i);
     }
-  } freer{dev, {&gColor, &gDc, &gYy, &gAb}};
+  } freer{d, {&gColor, &gDc, &gYy, &gAb}};
   auto mk = [&](hal::ImageH& im, hal::Format f) {
-    const hal::Status s = dev.createImage({f, std::uint32_t(glw), std::uint32_t(glh), 1}, &im);
-    return s == hal::Status::Ok || (d.failStatus(s, err, ""), false);
+    const hal::Status s = d.createImage({f, std::uint32_t(glw), std::uint32_t(glh), 1}, &im);
+    return s == hal::Status::Ok || (failStatus(s, ""), false);
   };
-  if (wantDz && (!mk(gColor, hal::Format::RGBA32F) || !mk(gDc, hal::Format::R32F))) return false;
-  if (wantClar && (!mk(gYy, hal::Format::RGBA32F) || !mk(gAb, hal::Format::RGBA32F))) return false;
+  if (wantDz && (!mk(gColor, hal::Format::RGBA32F) || !mk(gDc, hal::Format::R32F))) return Status::Internal;
+  if (wantClar && (!mk(gYy, hal::Format::RGBA32F) || !mk(gAb, hal::Format::RGBA32F))) return Status::Internal;
 
   std::vector<WRect> tiles;
-  for (int y = 0; y < plan.outH; y += tile)
-    for (int x = 0; x < plan.outW; x += tile) tiles.push_back({x, y, std::min(plan.outW, x + tile), std::min(plan.outH, y + tile)});
+  for (int y = 0; y < P.outH; y += tile)
+    for (int x = 0; x < P.outW; x += tile) tiles.push_back({x, y, std::min(P.outW, x + tile), std::min(P.outH, y + tile)});
 
   struct Pending {
     int slot = -1;
@@ -857,59 +1032,21 @@ bool Session::exportTiled(const Renderer& r, const SourceImage& src, const Baked
     WRect interior;
   };
   Pending pend;
-  int passes = 0, barriers = 0;
+  int passes = 0, barriers = 0, parts = 0;
+  std::string err;
   auto flush = [&]() -> bool {
     if (pend.slot < 0) return true;
-    const hal::Status ws = dev.wait(pend.fence, 30ull * 1000 * 1000 * 1000);
-    if (ws != hal::Status::Ok) return d.failStatus(ws, err, "");
-    const bool ok = eo.sink(pend.interior.x0, pend.interior.y0, pend.interior.w(), pend.interior.h(),
-                            static_cast<const std::uint8_t*>(d.core().slot(pend.slot).readback.mapped), std::size_t(pend.interior.w()) * 4);
+    const hal::Status ws = d.wait(pend.fence, kWaitNs);
+    if (ws != hal::Status::Ok) return failStatus(ws, "");
+    const bool ok = in.target.sink(pend.interior.x0, pend.interior.y0, pend.interior.w(), pend.interior.h(),
+                                   static_cast<const std::uint8_t*>(core().slot(pend.slot).readback.mapped), std::size_t(pend.interior.w()) * 4);
     pend.slot = -1;
-    dev.pinSlot(-1);
-    if (!ok) err = "export aborted by the sink", d.failure = Failure::Unsupported;
+    d.pinSlot(-1);
+    if (!ok) fail(GpuFailure::Unsupported, "export aborted by the sink");
     return ok;
   };
 
-  auto runTile = [&](const WRect& in, Mode mode, bool readback) -> bool {
-    WRect work{std::max(0, in.x0 - R.halo), std::max(0, in.y0 - R.halo), std::min(plan.outW, in.x1 + R.halo), std::min(plan.outH, in.y1 + R.halo)};
-    // 1. the source window of a streamed export is uploaded first (the upload takes frame slots of its own)
-    hal::ImageH acquired;
-    bool haveAcq = false;
-    const WRect fp = footprint(plan, work);
-    SrcWin win{fp.x0, fp.y0, fp.x1, fp.y1};
-    if (!resident) {
-      if (down) win = lanczosWindow(d.W, d.H, rw, rh, fp);
-      const hal::Status as = pool.acquire(hal::Format::RGBA16F, std::uint32_t(win.w()), std::uint32_t(win.h()), &acquired);
-      if (as != hal::Status::Ok) return d.failStatus(as, err, "");
-      haveAcq = true;
-      const float* base = d.cpu->linear.data.data() + (std::size_t(win.y0) * d.W + win.x0) * 3;
-      if (!d.core().uploadRgbF32(base, std::size_t(d.W) * 3, win.w(), win.h(), acquired, 0, 0, err)) {
-        pool.release(acquired);
-        return d.fail(dev.state() == hal::DeviceState::Lost ? Failure::DeviceLost : Failure::Transient, err, err);
-      }
-    }
-    auto cl = dev.begin();
-    if (!cl) {
-      if (haveAcq) pool.release(acquired);
-      return d.failStatus(hal::Status::Timeout, err, "");
-    }
-    const int slot = cl->slot();
-    GpuGraph g(dev, pool);
-    GpuRecorder rec(dev, g, err);
-    rec.weights = d.core().slot(slot).weights;
-    rec.boxScanMin = d.core().boxScanOk ? -1 : 0;
-    rec.gBuf = d.core().gBuf;
-    rec.partBuf = d.core().partBuf;
-    rec.allocW = int(pool.bucket(std::uint32_t(std::min(plan.outW, tile + 2 * R.halo))));
-    rec.allocH = int(pool.bucket(std::uint32_t(std::min(plan.outH, tile + 2 * R.halo))));
-    FrameJob job;
-    job.plan = &plan;
-    job.resizeSharpen = rsharp;
-    job.mode = mode;
-    job.interior = in;
-    job.work = work;
-    job.lut = d.lutBind(g, *L);
-    GlobalRes gl;
+  auto bindGlobals = [&](GpuGraph& g, GlobalRes& gl) {
     gl.lw = glw;
     gl.lh = glh;
     if (wantDz) {
@@ -920,201 +1057,157 @@ bool Session::exportTiled(const Renderer& r, const SourceImage& src, const Baked
       gl.yy = g.external(gYy);
       gl.ab = g.external(gAb);
     }
-    job.glob = &gl;
+  };
+
+  // one sweep over one tile
+  auto runTile = [&](const Stage& st, const WRect& interior) -> bool {
+    const WRect work{std::max(0, interior.x0 - R.halo), std::max(0, interior.y0 - R.halo), std::min(P.outW, interior.x1 + R.halo),
+                     std::min(P.outH, interior.y1 + R.halo)};
+    const bool readback = st.output;
+    // 1. the source window of a streamed export is uploaded first (the upload takes frame slots of its own)
+    hal::ImageH acquired;
+    bool haveAcq = false;
+    const WRect fp = footprint(P, work);
+    SrcWin win{fp.x0, fp.y0, fp.x1, fp.y1};
+    if (!resident) {
+      if (down) win = lanczosWindow(W_, H_, rw, rh, fp);
+      const hal::Status as = pool.acquire(hal::Format::RGBA16F, std::uint32_t(win.w()), std::uint32_t(win.h()), &acquired);
+      if (as != hal::Status::Ok) return failStatus(as, "");
+      haveAcq = true;
+      std::size_t pitch = 0;
+      const float* base = store_->window(win.x0, win.y0, win.w(), win.h(), pitch);
+      if (!base || !core().uploadRgbF32(base, pitch, win.w(), win.h(), acquired, 0, 0, err)) {
+        pool.release(acquired);
+        return fail(!base ? GpuFailure::Transient : d.state() == hal::DeviceState::Lost ? GpuFailure::DeviceLost : GpuFailure::Transient, base ? err : "source store cannot be read");
+      }
+    }
+    auto cl = d.begin();
+    if (!cl) {
+      if (haveAcq) pool.release(acquired);
+      return failStatus(hal::Status::Timeout, "");
+    }
+    const int slot = cl->slot();
+    GpuGraph g(d, pool);
+    GpuRecorder rec(d, g, err);
+    rec.weights = core().slot(slot).weights;
+    rec.taps = core().slot(slot).taps;
+    rec.boxScanMin = core().boxScanOk ? -1 : 0;
+    rec.gBuf = core().gBuf;
+    rec.partBuf = core().partBuf;
+    rec.allocW = int(pool.bucket(std::uint32_t(std::min(P.outW, tile + 2 * R.halo))));
+    rec.allocH = int(pool.bucket(std::uint32_t(std::min(P.outH, tile + 2 * R.halo))));
+    Walk w(rec, in, rsharp, false);
+    w.interior = interior;
+    w.work = work;
+    w.lut = lutBind(g, *L);
+    GlobalRes gl;
+    bindGlobals(g, gl);
+    w.glob = &gl;
     bool ok = true;
     if (resident) {
-      job.src.img = g.external(*S);
+      w.src.img = g.external(*S);
     } else {
       const H a = g.external(acquired);
       if (down) {
-        const H s2 = recordResize(rec, a, win, d.W, d.H, rw, rh, fp);
+        const H s2 = recordResize(rec, a, win, W_, H_, rw, rh, fp);
         if (s2 < 0) ok = false;
-        job.src.img = s2;
-        job.src.ox = fp.x0;
-        job.src.oy = fp.y0;
+        w.src.img = s2;
+        w.src.ox = fp.x0;
+        w.src.oy = fp.y0;
       } else {
-        job.src.img = a;
-        job.src.ox = win.x0;
-        job.src.oy = win.y0;
+        w.src.img = a;
+        w.src.ox = win.x0;
+        w.src.oy = win.y0;
       }
     }
-    H out8 = -1;
-    if (ok) ok = buildFrame(rec, job, &out8);
+    if (ok) ok = w.sweep(st) && w.accumulate(st);
     if (ok && readback) {
-      const std::size_t bytes = std::size_t(in.w()) * in.h() * 4;
-      if (!d.core().ensureReadback(slot, bytes, err)) ok = false;
-      else g.copyImageToBuffer(out8, d.core().slot(slot).readback, std::uint32_t(in.x0 - work.x0), std::uint32_t(in.y0 - work.y0), std::uint32_t(in.w()), std::uint32_t(in.h()));
+      if (w.o8 < 0) ok = false;
+      const std::size_t bytes = std::size_t(interior.w()) * interior.h() * 4;
+      if (ok && !core().ensureReadback(slot, bytes, err)) ok = false;
+      else if (ok) g.copyImageToBuffer(w.o8, core().slot(slot).readback, std::uint32_t(interior.x0 - work.x0), std::uint32_t(interior.y0 - work.y0), std::uint32_t(interior.w()), std::uint32_t(interior.h()));
     }
     if (!ok) {
       if (haveAcq) pool.release(acquired);
-      return d.fail(Failure::Transient, err, err);
+      return fail(GpuFailure::Transient, err);
     }
     hal::FenceH fence;
-    const hal::Status s = runGraph(dev, g, *cl, &fence, err);
+    const hal::Status s = runGraph(d, g, *cl, &fence, err);
     if (haveAcq) pool.release(acquired);
-    if (s != hal::Status::Ok) return d.failStatus(s, err, err);
+    if (s != hal::Status::Ok) return failStatus(s, err);
     {
-      const auto st = dev.stats(fence);
-      passes += st.passes;
-      barriers += st.barriers;
+      const auto sst = d.stats(fence);
+      passes += sst.passes;
+      barriers += sst.barriers;
+      parts += sst.parts;
     }
     if (readback) {
       if (!flush()) return false;  // previous tile: its GPU work ran while this one was recorded
       pend.slot = slot;
       pend.fence = fence;
-      pend.interior = in;
-      dev.pinSlot(slot);
+      pend.interior = interior;
+      d.pinSlot(slot);
     }
     return true;
   };
 
-  auto globalPass = [&](bool dehaze) -> bool {
-    auto cl = dev.begin();
-    if (!cl) return d.failStatus(hal::Status::Timeout, err, "");
+  // the GlobalSolve stage of a tiled run: its own small graph over the accumulated 1/4 grid
+  auto globalPass = [&](const Stage& st) -> bool {
+    const bool dehaze = in.graph.nodes()[st.solveNode].type == NodeType::Dehaze;
+    auto cl = d.begin();
+    if (!cl) return failStatus(hal::Status::Timeout, "");
     const int slot = cl->slot();
-    GpuGraph g(dev, pool);
-    GpuRecorder rec(dev, g, err);
-    rec.weights = d.core().slot(slot).weights;
-    rec.boxScanMin = d.core().boxScanOk ? -1 : 0;
-    rec.gBuf = d.core().gBuf;
-    rec.partBuf = d.core().partBuf;
-    FrameJob job;
-    job.plan = &plan;
-    job.resizeSharpen = rsharp;
+    GpuGraph g(d, pool);
+    GpuRecorder rec(d, g, err);
+    rec.weights = core().slot(slot).weights;
+    rec.taps = core().slot(slot).taps;
+    rec.boxScanMin = core().boxScanOk ? -1 : 0;
+    rec.gBuf = core().gBuf;
+    rec.partBuf = core().partBuf;
     GlobalRes gl;
-    gl.lw = glw;
-    gl.lh = glh;
-    gl.color = wantDz ? g.external(gColor) : -1;
-    gl.dc = wantDz ? g.external(gDc) : -1;
-    gl.yy = wantClar ? g.external(gYy) : -1;
-    gl.ab = wantClar ? g.external(gAb) : -1;
-    job.glob = &gl;
-    job.work = WRect{0, 0, glw, glh};
-    if (!buildGlobalAnalysis(rec, job, dehaze)) return d.fail(Failure::Transient, err, err);
-    const hal::Status s = runGraph(dev, g, *cl, nullptr, err);
-    return s == hal::Status::Ok || d.failStatus(s, err, err);
-  };
-
-  if (wantDz) {
-    for (const WRect& t : tiles)
-      if (!runTile(t, Mode::AnalyzeDehaze, false)) return false;
-    if (!globalPass(true)) return false;
-  }
-  if (wantClar) {
-    for (const WRect& t : tiles)
-      if (!runTile(t, Mode::AnalyzeClarity, false)) return false;
-    if (!globalPass(false)) return false;
-  }
-  for (const WRect& t : tiles)
-    if (!runTile(t, Mode::Final, true)) return false;
-  if (!flush()) return false;
-  if (dev.waitAll() != hal::Status::Ok) return d.failStatus(hal::Status::Timeout, err, "");
-  if (pool.freeBytes() > dev.poolBudget()) pool.trim(dev.poolBudget());
-  if (stats) {
-    stats->wallMs = msSince(t0);
-    stats->gpuMs = dev.gpuAccumMs() - gpu0;
-    stats->passes = passes;
-    stats->barriers = barriers;
-  }
-  return true;
-}
-
-// ============================================================================================ self-test ===
-namespace {
-
-bool runSelfTest(Backend& b, std::string& report) {
-  // A known pattern through the whole pipeline against the CPU reference: point stages (geometry, lattice incl. the
-  // overflow lattice, vignette) and every spatial stage. The thresholds are loose enough for fp16 working images and
-  // different float rounding, and tight enough to catch a broken driver (wrong results, garbage, zeros).
-  const SourceImage src = makeTestImage(192, 128);
-  const auto cams = CameraRegistry::withBuiltins();
-  const CameraProfile& cam = cams.resolve("", "");
-  struct Case {
-    const char* name;
-    void (*set)(EditParams&);
-  };
-  static const Case cases[] = {
-      {"point+geometry", [](EditParams& p) { p.exposure = 0.4f; p.contrast = 20; p.saturation = 15; p.straighten = 3.f; p.vignette = -30; }},
-      {"spatial", [](EditParams& p) { p.exposure = 0.2f; p.nrLuma = 40; p.nrColor = 40; p.dehaze = 30; p.clarity = 30; p.texture = 25; p.sharpen = 60; p.grain = 20; }},
-  };
-  std::string err;
-  auto sess = b.createSession();
-  if (!sess->setSource(src, 1, err)) return report = err, false;
-  bool ok = true;
-  char line[200];
-  report.clear();
-  for (const Case& c : cases) {
-    EditParams p;
-    c.set(p);
-    Renderer r(p, cam, nullptr);
-    const auto lut = r.bake(src, 33);
-    FastOptions fo;
-    fo.spatial = SpatialQuality::Full;
-    int w = 0, h = 0, gw = 0, gh = 0;
-    std::uint8_t* cpu = r.renderBakedRgba(src, *lut, fo, w, h);
-    std::uint8_t* gpu = sess->render(r, *lut, fo, FrameOptions{}, gw, gh, nullptr, err);
-    if (!cpu || !gpu || w != gw || h != gh) {
-      std::free(cpu);
-      std::free(gpu);
-      report += std::string(report.empty() ? "" : "; ") + c.name + ": " + (err.empty() ? "size mismatch" : err);
-      return false;
+    bindGlobals(g, gl);
+    rec.W = glw;
+    rec.H_ = glh;
+    if (dehaze) {
+      const H dc = recordDehazeAnalysis(rec, R, gl.color, glw, glh);
+      if (dc < 0) return fail(GpuFailure::Transient, err);
+      g.copyImage(dc, gl.dc, std::uint32_t(glw), std::uint32_t(glh));
+    } else {
+      const H ab = recordClarityAnalysis(rec, R, gl.yy, glw, glh);
+      if (ab < 0) return fail(GpuFailure::Transient, err);
+      g.copyImage(ab, gl.ab, std::uint32_t(glw), std::uint32_t(glh));
     }
-    const DeStats s = compareRgba8(gpu, cpu, std::size_t(w) * h);
-    std::free(cpu);
-    std::free(gpu);
-    const bool pass = s.mean <= 1.0 && s.p99 <= 5.0 && s.max <= 25.0;
-    std::snprintf(line, sizeof line, "%s%s: mean dE %.3f p99 %.2f max %.2f %s", report.empty() ? "" : "; ", c.name, s.mean, s.p99, s.max, pass ? "ok" : "FAIL");
-    report += line;
-    ok &= pass;
+    const hal::Status s = runGraph(d, g, *cl, nullptr, err);
+    return s == hal::Status::Ok || failStatus(s, err);
+  };
+
+  int sweeps = 0;
+  for (const Stage& st : in.plan.stages) {
+    if (st.kind == StageKind::TileSweep) {
+      ++sweeps;
+      for (const WRect& t : tiles) {
+        if (in.cancel.cancelled()) return fail(GpuFailure::None, "cancelled"), Status::Cancelled;
+        if (!runTile(st, t)) return bad(Status::Internal);
+      }
+      if (st.output && !flush()) return bad(Status::Internal);
+    } else if (st.kind == StageKind::GlobalSolve) {
+      if (!globalPass(st)) return bad(Status::Internal);
+    }
   }
-  return ok;
+  if (d.waitAll() != hal::Status::Ok) return failStatus(hal::Status::Timeout, ""), Status::Internal;
+  if (pool.freeBytes() > d.poolBudget()) pool.trim(d.poolBudget());
+  out.w = P.outW;
+  out.h = P.outH;
+  out.stats.wallMs = msSince(t0);
+  out.stats.gpuMs = d.gpuAccumMs() - gpu0;
+  out.stats.passes = passes;
+  out.stats.barriers = barriers;
+  out.stats.parts = parts;
+  out.stats.tiles = int(tiles.size());
+  out.stats.sweeps = sweeps;
+  return Status::Ok;
 }
 
-}  // namespace
+std::unique_ptr<IGpuExecutor> Context::createExecutor() { return std::make_unique<Executor>(shared_from_this()); }
 
-// ============================================================================================ runtime flag ===
-namespace {
-std::atomic<int> g_override{-1};
-std::once_flag g_once;
-// Leaked on purpose: tearing the device down from a static destructor runs after the Vulkan loader / driver have been
-// unloaded (crashes on Android); the OS reclaims everything at process exit.
-std::shared_ptr<Backend>& backendRef() {
-  static auto* b = new std::shared_ptr<Backend>;
-  return *b;
-}
-std::string g_why;
-std::mutex g_mtx;
-
-bool envEnabled() {
-  if (const char* v = std::getenv("DAPPLE_GPU")) return v[0] == '1';
-#if defined(__ANDROID__)
-  char buf[PROP_VALUE_MAX] = {0};
-  if (__system_property_get("debug.dapple.gpu", buf) > 0) return buf[0] == '1';
-#endif
-  return false;
-}
-}  // namespace
-
-bool runtimeEnabled() {
-  const int o = g_override.load();
-  return o >= 0 ? o != 0 : envEnabled();
-}
-void setRuntimeEnabled(int enabled) { g_override.store(enabled); }
-
-std::shared_ptr<Backend> sharedBackend(std::string* why) {
-  if (!runtimeEnabled()) {
-    if (why) *why = "GPU backend disabled";
-    return nullptr;
-  }
-  std::lock_guard<std::mutex> lk(g_mtx);
-  std::call_once(g_once, [] {
-    BackendOptions o;
-    if (const char* v = std::getenv("DAPPLE_GPU_SOFTWARE")) o.allowSoftware = v[0] == '1';
-    if (const char* v = std::getenv("DAPPLE_GPU_PIPELINE_CACHE")) o.pipelineCachePath = v;  // persisted VkPipelineCache
-    backendRef() = Backend::create(o, g_why);
-  });
-  if (!backendRef() && why) *why = g_why;
-  return backendRef();
-}
-
-}  // namespace dapple::gpu
+}  // namespace dapple::engine::gpu

@@ -143,11 +143,11 @@ if(NOT MSVC)
   target_compile_options(dapple_hal_gles PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
-# backend independent selection logic (Vulkan -> GLES -> CPU); compiled here until the Vulkan side includes it too
-target_sources(dapple_hal_gles PRIVATE "${_gles_dir}/../select.cpp")
+# backend independent selection logic (hal/select.cpp, Vulkan -> GLES -> CPU) is compiled into dapple_gpu (core/gpu) and, for the
+# standalone check tool, below
 target_compile_definitions(dapple_hal_gles PUBLIC DAPPLE_HAL_GLES=1)
 
 # smoke / self-test tool; links hal.cpp itself and stubs the Vulkan factory (so it builds without the Vulkan backend)
-add_executable(dapple_gles_check "${_gles_dir}/gles_check.cpp" "${_gles_dir}/../hal.cpp")
+add_executable(dapple_gles_check "${_gles_dir}/gles_check.cpp" "${_gles_dir}/../hal.cpp" "${_gles_dir}/../select.cpp")
 target_compile_definitions(dapple_gles_check PRIVATE DAPPLE_GLES_CHECK_STUB_VK=1)
 target_link_libraries(dapple_gles_check PRIVATE dapple_hal_gles)

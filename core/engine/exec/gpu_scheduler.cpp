@@ -165,6 +165,17 @@ void GpuGraph::copyImage(H src, H dst, std::uint32_t w, std::uint32_t h) {
   nodes_.push_back(std::move(n));
 }
 
+void GpuGraph::copyImageToExternal(H src, const hal::ExternalImage& ext, std::uint32_t w, std::uint32_t h) {
+  Node n;
+  n.kind = Node::ImgToExternal;
+  n.name = "present-copy";
+  n.a = src;
+  n.ext = ext;
+  n.w = w;
+  n.h = h;
+  nodes_.push_back(std::move(n));
+}
+
 // -------------------------------------------------------------------------------------------------- scheduler ---
 namespace {
 struct Acc {
@@ -198,7 +209,7 @@ Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err) {
         const char b = n.pl.bindings && i < std::strlen(n.pl.bindings) ? n.pl.bindings[i] : 'I';
         acc.push_back({n.uses[i].res, n.uses[i].read, n.uses[i].write, b});
       }
-    } else if (n.kind == GpuGraph::Node::ImgToBuf) {
+    } else if (n.kind == GpuGraph::Node::ImgToBuf || n.kind == GpuGraph::Node::ImgToExternal) {
       acc.push_back({n.a, true, false, 'T'});
     } else if (n.kind == GpuGraph::Node::ImgToImg) {
       acc.push_back({n.a, true, false, 'T'});
@@ -338,6 +349,11 @@ Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err) {
       case GpuGraph::Node::BufToBuf: cl.copyBufferToBuffer(n.buf, bufOf(n.b), n.bytes, n.off); break;
       case GpuGraph::Node::ImgToImg: cl.copyImage(img(n.a), img(n.b), n.w, n.h); break;
       case GpuGraph::Node::ImgToBuf: cl.copyImageToBuffer(img(n.a), n.buf, hal::Rect2{n.x, n.y, n.w, n.h}, 0); break;
+      case GpuGraph::Node::ImgToExternal: {
+        const Status s = cl.copyImageToExternal(img(n.a), n.ext, n.w, n.h);
+        if (s != Status::Ok) return err = dev.lastError().empty() ? "copy into the external image failed" : dev.lastError(), s;
+        break;
+      }
     }
     if (prof) cl.timestamp(n.name.c_str());
     // Long frames are cut into several submissions (Adreno kgsl hang detection, pixel-architecture.md 16 rule 1).

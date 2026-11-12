@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -18,6 +19,8 @@ class Lut3D {
 
   int size() const { return size_; }
   const std::string& title() const { return title_; }
+  // 64-bit content hash (size, domain, table): the cache identity of this LUT (equal content => equal id; never a pointer).
+  std::uint64_t contentId() const { return contentId_; }
 
   // Tetrahedral interpolation; rgb in/out, values clamped to the domain.
   void apply(const float in[3], float out[3]) const;
@@ -27,6 +30,8 @@ class Lut3D {
   std::string title_;
   float domainMin_[3] = {0, 0, 0};
   float domainMax_[3] = {1, 1, 1};
+  std::uint64_t contentId_ = 0;
+  void finalize();
   std::vector<float> table_;  // r fastest, then g, then b (cube convention)
   const float* at(int r, int g, int b) const {
     return &table_[3 * (std::size_t(b) * size_ * size_ + std::size_t(g) * size_ + r)];

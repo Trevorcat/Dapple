@@ -18,6 +18,7 @@ import '../model/params.dart';
 import '../models.dart';
 import '../native/dapple_session.dart';
 import '../services/blank_check.dart';
+import '../services/capture.dart';
 import '../services/detection.dart';
 import '../services/ftp_ingest.dart';
 import '../services/ingest.dart';
@@ -83,6 +84,10 @@ class AppState extends ChangeNotifier {
 
   final MediaStoreIngestSource mediaSource = MediaStoreIngestSource();
   late final PickerIngestSource pickerSource;
+
+  /// Phone-camera capture (testing convenience, requirements 4.2.6); tests substitute a fake.
+  CaptureBackend captureBackend = ChannelCaptureBackend();
+  Directory? captureInboxOverride; // tests
 
   /// Engine entry points of the HDR / panorama / Motion Photo tools (tests substitute a fake).
   MergeEngine engine = const NativeMergeEngine();
@@ -737,6 +742,56 @@ class AppState extends ChangeNotifier {
     for (final ph in _photos.values) {
       if (ph.status == PhotoStatus.pending) _enqueue(ph.id);
     }
+  }
+
+  /// A phone-camera shot becomes a library photo like a camera arrival: the DNG is the source when the lens gave
+  /// one (the JPEG is kept as its instant preview and the gallery copy), else the JPEG is. Both files also go to
+  /// the gallery (Pictures/Dapple). Returns the new photo; development starts right away.
+  Future<Photo> ingestCapture(CaptureResult r) async {
+    final dir = captureInboxOverride ?? inbox;
+    await dir.create(recursive: true);
+    final stem = p.basenameWithoutExtension(r.jpegPath);
+    final dng = r.dngPath;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final jpg = await _moveInto(r.jpegPath, p.join(dir.path, '$stem.jpg'));
+    final raw = dng == null ? null : await _moveInto(dng, p.join(dir.path, '$stem.dng'));
+    final src = raw ?? jpg;
+    final id = 'cap:$stem';
+    final ph = Photo(
+      id: id,
+      name: p.basename(src),
+      addedMs: nowMs,
+      path: src,
+      pairedJpeg: raw == null ? null : jpg,
+      previewPath: jpg,
+      takenMs: nowMs,
+    );
+    _photos[id] = ph;
+    changed();
+    _enqueue(id);
+    _scheduleDetect();
+    unawaited(() async {
+      try {
+        await captureBackend.saveToGallery(jpg, '$stem.jpg', 'image/jpeg');
+        if (raw != null) await captureBackend.saveToGallery(raw, '$stem.dng', 'image/x-adobe-dng');
+      } catch (e) {
+        debugPrint('capture gallery save failed: $e');
+      }
+    }());
+    return ph;
+  }
+
+  Future<String> _moveInto(String from, String to) async {
+    final f = File(from);
+    try {
+      await f.rename(to);
+    } on FileSystemException {
+      await f.copy(to);
+      try {
+        await f.delete();
+      } catch (_) {}
+    }
+    return to;
   }
 
   Future<void> importFromPicker() async {

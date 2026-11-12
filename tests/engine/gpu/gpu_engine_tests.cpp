@@ -13,10 +13,11 @@
 
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"
-#include "dapple/gpu.h"
-#include "dapple/gpu_hook.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
+#include "engine/hal/select.h"
+#include "gpu_rig.h"
 #include "engine/nodes/gpu_common.h"
 #include "engine/nodes/gpu_nodes.h"
 #include "parity.h"
@@ -57,7 +58,13 @@ float h16(float x) {  // round to the nearest fp16 value (RNE), as common.glsl h
 std::unique_ptr<eg::Core> makeCore(const hal::DeviceOptions& o0, std::string& err) {
   hal::DeviceOptions o = o0;
   if (const char* v = std::getenv("DAPPLE_GPU_SOFTWARE")) o.allowSoftware = v[0] == '1';
-  return eg::Core::create(o, err);
+  hal::Selection sel = hal::selectDevice(o);  // Vulkan -> GLES 3.1, or DAPPLE_GPU_API=vk|gles
+  if (!sel.device) {
+    for (const hal::Attempt& a : sel.attempts) err += (err.empty() ? "" : "; ") + a.detail;
+    if (err.empty()) err = "no device";
+    return nullptr;
+  }
+  return eg::Core::adopt(std::move(sel.device), err);
 }
 
 std::vector<float> randomRgb(int w, int h, unsigned seed) {
@@ -332,13 +339,15 @@ int testSched() {
   return 0;
 }
 
-// Selection policy of the hook (docs 5.9) with injected failures, including a real device rebuild. Runs last: it ends in
+// Selection policy of EngineSession (docs 5.9) with injected failures, including a real device rebuild. Runs last: it ends in
 // the sticky-CPU state of the process.
 int testSelect() {
-  std::printf("== engine selection: unsupported / transient / device lost (rebuild once) / second loss (sticky CPU) ==\n");
-  gpu::setRuntimeEnabled(1);
-  if (!gpu::sharedBackend()) {
-    std::printf("  no GPU backend\n");
+  std::printf("== engine selection: unsupported / transient (retry once) / device lost (rebuild once) / second loss (next backend, then CPU) ==\n");
+  eg::installProvider();
+  eg::setRuntimeEnabled(1);
+  std::string why;
+  if (!eg::sharedContext(&why)) {
+    std::printf("  no GPU backend: %s\n", why.c_str());
     return 77;
   }
   const SourceImage src = gpu::makeTestImage(320, 240);
@@ -347,44 +356,182 @@ int testSelect() {
   p.exposure = 0.3f;
   p.nrLuma = 20;
   Renderer r(p, cams.resolve("", ""), nullptr);
-  const auto lut = r.bake(src, 33);
   FastOptions fo;
   fo.spatial = SpatialQuality::Full;
-  gpu::SessionSlot slot;
-  int w = 0, h = 0;
-  auto call = [&] { return gpu::hookRenderFrame(slot, src, r, *lut, fo, 0, w, h); };
-  auto json = [] { return gpu::statusJson(); };
-  std::uint8_t* ok0 = call();
-  CHECK(ok0 != nullptr, "first frame on the GPU");
-  std::free(ok0);
-  auto expectFail = [&](gpu::Session::Failure f, const char* what) {
-    slot->injectFailure(f);
-    std::uint8_t* o = call();
-    CHECK(o == nullptr, "%s: the frame must go to the CPU", what);
-    std::free(o);
+  engine::MemorySourceStore store(src);
+  engine::EngineSession es;
+  std::string exec;
+  auto call = [&]() -> bool {
+    engine::FrameJob job{p, r, src, nullptr, cams.resolve("", ""), nullptr, {}, {}, {}};
+    job.request.bakeSize = 33;
+    job.fastOptions = fo;
+    job.store = &store;
+    engine::FrameResult res;
+    const bool ok = es.renderFrame(job, res);
+    exec = res.executor;
+    std::free(res.rgba);
+    return ok;
+  };
+  auto json = [] { return eg::statusJson(); };
+  CHECK(call() && exec != "cpu" && !exec.empty(), "first frame on the GPU (ran on '%s')", exec.c_str());
+  std::printf("  first frame: %s\n", exec.c_str());
+  auto expectCpu = [&](engine::GpuFailure f, int count, const char* what) {
+    es.injectGpuFailure(f, count);
+    CHECK(call(), "%s: the frame must still be rendered", what);
+    CHECK(exec == "cpu", "%s: the frame must go to the CPU (ran on '%s')", what, exec.c_str());
     const std::string j = json();
-    const auto k = j.find("\"fallbacks\"");
+    const auto k = j.find("\"frames\"");
     std::printf("  %-12s -> CPU for this frame; %s\n", what, k == std::string::npos ? j.c_str() : j.c_str() + k);
   };
-  expectFail(gpu::Session::Failure::Unsupported, "unsupported");
-  std::uint8_t* o1 = call();
-  CHECK(o1 != nullptr, "GPU still used after an unsupported plan");
-  std::free(o1);
-  expectFail(gpu::Session::Failure::Transient, "transient");
-  std::uint8_t* o2 = call();
-  CHECK(o2 != nullptr, "GPU still used after a transient error");
-  std::free(o2);
-  expectFail(gpu::Session::Failure::DeviceLost, "device lost");
+  expectCpu(engine::GpuFailure::Unsupported, 1, "unsupported");
+  CHECK(call() && exec != "cpu", "GPU still used after an unsupported plan (ran on '%s')", exec.c_str());
+  // a transient failure is retried once on the GPU (device copies released first): one failure is invisible, two go to the CPU
+  es.injectGpuFailure(engine::GpuFailure::Transient, 1);
+  CHECK(call() && exec != "cpu", "one transient failure: the retry runs on the GPU (ran on '%s')", exec.c_str());
+  expectCpu(engine::GpuFailure::Transient, 2, "transient x2");
+  CHECK(call() && exec != "cpu", "GPU still used after a transient error (ran on '%s')", exec.c_str());
+  expectCpu(engine::GpuFailure::DeviceLost, 1, "device lost");
   CHECK(json().find("\"rebuilds\":1") != std::string::npos, "device rebuilt once: %s", json().c_str());
-  std::uint8_t* o3 = call();
-  CHECK(o3 != nullptr, "GPU in use again after the rebuild (resident data re-uploaded)");
-  std::free(o3);
-  expectFail(gpu::Session::Failure::DeviceLost, "second loss");
-  std::uint8_t* o4 = call();
-  CHECK(o4 == nullptr, "after the second loss the process stays on the CPU");
-  std::free(o4);
-  CHECK(json().find("\"available\":false") != std::string::npos, "status: %s", json().c_str());
+  CHECK(call() && exec != "cpu", "GPU in use again after the rebuild (resident data re-uploaded; ran on '%s')", exec.c_str());
+  expectCpu(engine::GpuFailure::DeviceLost, 1, "second loss");
+  // second loss: this API is given up. With another backend available (GLES 3.1 behind Vulkan) it takes over, else the process
+  // stays on the CPU.
+  const bool another = call() && exec != "cpu";
+  std::printf("  after the second loss: %s\n", another ? exec.c_str() : "cpu");
+  if (!another) CHECK(json().find("\"available\":false") != std::string::npos, "status: %s", json().c_str());
   std::printf("  final status: %s\n", json().c_str());
+  return 0;
+}
+
+// Zero-readback seam (docs/engine/present.md): a frame is rendered into an image that belongs to someone else, with the
+// acquire / render-finished semaphores the presenter hands over. The "presenter" here is the test: an RGBA8 image of the same
+// device (stand-in for a swapchain image: same format, TRANSFER_DST usage), raw Vulkan semaphores created through the
+// native handles, and a read back of the external image compared with the normal readback path (0 differing bytes).
+int testExternal() {
+  std::printf("== zero-readback seam: native handles, frame into an externally owned image, semaphores ==\n");
+  eg::ContextOptions o;
+  o.device.presentExtensions = true;
+  o.api = "vulkan";
+  o.selfTest = false;
+  if (const char* v = std::getenv("DAPPLE_GPU_SOFTWARE")) o.device.allowSoftware = v[0] == '1';
+  std::string err;
+  std::shared_ptr<eg::Context> ctx = eg::Context::create(o, err);
+  if (!ctx) {
+    std::printf("  no Vulkan device: %s\n", err.c_str());
+    return 77;
+  }
+  hal::NativeHandles nh;
+  CHECK(ctx->nativeHandles(&nh), "native handles");
+  std::printf("  device %s, queue family %u, VK_KHR_swapchain enabled: %s, caps.surfacePresent %d, caps.externalImageWrite %d\n", ctx->caps().name.c_str(),
+              nh.queueFamily, nh.swapchainEnabled ? "yes" : "no (extension not offered by this implementation)", int(ctx->caps().surfacePresent),
+              int(ctx->caps().externalImageWrite));
+  CHECK(nh.device && nh.queue && nh.instance && nh.getInstanceProcAddr, "handles are filled");
+  const SourceImage src = gpu::makeTestImage(320, 240);
+  const auto cams = CameraRegistry::withBuiltins();
+  EditParams p;
+  p.exposure = 0.3f;
+  p.nrLuma = 30;
+  p.dehaze = 20;
+  p.clarity = 25;
+  p.sharpen = 50;
+  p.grain = 20;
+  Renderer r(p, cams.resolve("", ""), nullptr);
+  FastOptions fo;
+  fo.spatial = SpatialQuality::Full;
+  gpu::Rig rig(ctx, src, cams.resolve("", ""));
+  int w = 0, h = 0;
+  std::uint8_t* ref = rig.render(p, r, src, fo, 33, w, h, nullptr, err);
+  CHECK(ref != nullptr, "readback frame: %s", err.c_str());
+  if (!ref) return 0;
+  hal::Device& dev = ctx->core().dev();
+  hal::ImageH ext, blank;
+  CHECK(dev.createImage({hal::Format::RGBA8, std::uint32_t(w), std::uint32_t(h), 1}, &ext) == hal::Status::Ok, "external image");
+  CHECK(dev.createImage({hal::Format::RGBA8, 4, 4, 1}, &blank) == hal::Status::Ok, "blank image");
+  void* vkImage = nullptr;
+  CHECK(dev.nativeImage(ext, &vkImage) && vkImage, "VkImage of the stand-in");
+  {  // bring the stand-in into GENERAL (what the HAL tracks) before the presenter-style use
+    auto cl = dev.begin();
+    eg::GpuGraph g(dev, ctx->core().pool());
+    g.copyImage(g.external(blank), g.external(ext), 4, 4);
+    std::string e;
+    CHECK(eg::runGraph(dev, g, *cl, nullptr, e) == hal::Status::Ok, "init: %s", e.c_str());
+    dev.waitAll();
+  }
+
+  // raw Vulkan through the native handles: two binary semaphores, signalled / waited by empty submissions on the shared queue
+  using GetProc = void* (*)(void*, const char*);
+  auto gipa = reinterpret_cast<GetProc>(nh.getInstanceProcAddr);
+  auto gdpa = reinterpret_cast<GetProc>(gipa(nh.instance, "vkGetDeviceProcAddr"));
+  struct SemInfo {
+    int sType;
+    const void* pNext;
+    unsigned flags;
+  };
+  struct SubInfo {
+    int sType;
+    const void* pNext;
+    unsigned nWait;
+    const unsigned long long* pWait;
+    const unsigned* pStage;
+    unsigned nCmd;
+    const void* pCmd;
+    unsigned nSig;
+    const unsigned long long* pSig;
+  };
+  using CreateSem = int (*)(void*, const SemInfo*, const void*, unsigned long long*);
+  using DestroySem = void (*)(void*, unsigned long long, const void*);
+  using Submit = int (*)(void*, unsigned, const SubInfo*, unsigned long long);
+  using Idle = int (*)(void*);
+  auto createSem = reinterpret_cast<CreateSem>(gdpa(nh.device, "vkCreateSemaphore"));
+  auto destroySem = reinterpret_cast<DestroySem>(gdpa(nh.device, "vkDestroySemaphore"));
+  auto submit = reinterpret_cast<Submit>(gdpa(nh.device, "vkQueueSubmit"));
+  auto idle = reinterpret_cast<Idle>(gdpa(nh.device, "vkQueueWaitIdle"));
+  CHECK(createSem && destroySem && submit && idle, "device functions through the native handles");
+  unsigned long long acquire = 0, finished = 0;
+  const SemInfo si{9, nullptr, 0};
+  CHECK(createSem(nh.device, &si, nullptr, &acquire) == 0 && createSem(nh.device, &si, nullptr, &finished) == 0, "semaphores");
+  const SubInfo sigAcquire{4, nullptr, 0, nullptr, nullptr, 0, nullptr, 1, &acquire};
+  CHECK(submit(nh.queue, 1, &sigAcquire, 0) == 0, "signal the acquire semaphore");
+
+  hal::ExternalImage ei;
+  ei.handle = vkImage;
+  ei.fmt = hal::Format::RGBA8;
+  ei.w = std::uint32_t(w);
+  ei.h = std::uint32_t(h);
+  ei.layoutIn = 1;   // VK_IMAGE_LAYOUT_GENERAL
+  ei.layoutOut = 1;  // (a swapchain image would leave in PRESENT_SRC_KHR = 1000001002)
+  ei.waitSemaphore = acquire;
+  ei.signalSemaphore = finished;
+  int w2 = 0, h2 = 0;
+  const bool did = rig.renderTo(ei, p, r, src, fo, 33, w2, h2, err);
+  CHECK(did, "frame into the external image: %s", err.c_str());
+  const unsigned stage = 0x1000;  // TRANSFER
+  const SubInfo waitFinished{4, nullptr, 1, &finished, &stage, 0, nullptr, 0, nullptr};
+  CHECK(submit(nh.queue, 1, &waitFinished, 0) == 0, "wait for the render-finished semaphore");
+  CHECK(idle(nh.queue) == 0, "queue idle (the chain acquire -> copy -> finished completed)");
+  dev.waitAll();
+
+  // read the stand-in back through the HAL and compare with the readback path
+  std::vector<std::uint8_t> got(std::size_t(w) * h * 4, 0);
+  {
+    auto cl = dev.begin();
+    if (!ctx->core().ensureReadback(cl->slot(), got.size(), err)) CHECK(false, "readback buffer: %s", err.c_str());
+    eg::GpuGraph g(dev, ctx->core().pool());
+    g.copyImageToBuffer(g.external(ext), ctx->core().slot(cl->slot()).readback, 0, 0, std::uint32_t(w), std::uint32_t(h));
+    hal::FenceH f;
+    CHECK(eg::runGraph(dev, g, *cl, &f, err) == hal::Status::Ok && dev.wait(f, 30ull * 1000 * 1000 * 1000) == hal::Status::Ok, "read back: %s", err.c_str());
+    std::memcpy(got.data(), ctx->core().slot(cl->slot()).readback.mapped, got.size());
+  }
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < got.size(); ++i) diff += got[i] != ref[i];
+  std::printf("  external image vs readback frame: %dx%d, %zu differing bytes of %zu\n", w, h, diff, got.size());
+  CHECK(diff == 0 && w2 == w && h2 == h, "the external image must be bit-identical to the readback frame");
+  std::free(ref);
+  dev.waitIdle();
+  destroySem(nh.device, acquire, nullptr);
+  destroySem(nh.device, finished, nullptr);
+  dev.destroy(ext);
+  dev.destroy(blank);
   return 0;
 }
 
@@ -429,6 +576,7 @@ int main(int argc, char** argv) {
   run("box", testBox);
   run("sched", testSched);
   run("bench-box", benchBox);
+  run("external", testExternal);
   run("select", testSelect);
   if (g_fail) {
     std::printf("\nFAILED (%d failures)\n", g_fail);

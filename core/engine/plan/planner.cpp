@@ -65,6 +65,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
   const NodeInstance *nResize = nullptr, *nGeo = nullptr, *nGain = nullptr, *nTone = nullptr, *nFilm = nullptr,
                      *nDisp = nullptr, *nBlend = nullptr, *nVig = nullptr, *nPack = nullptr;
   std::vector<const NodeInstance*> windows;
+  std::vector<NodeId> filmChain;
   for (const NodeInstance& n : g.nodes()) {
     if (isTable(n.type)) {
       tables.nodes.push_back(n.id);
@@ -77,6 +78,17 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
       case NodeType::ToneColour:
       case NodeType::ToneColourExact: nTone = &n; break;
       case NodeType::FilmSim: nFilm = &n; break;
+      case NodeType::FilmExposure:  // FullFilm: the decomposed chain, executed as one whole-frame film stage (runFilmFrame)
+      case NodeType::FilmBlurExposure:
+      case NodeType::FilmDirField:
+      case NodeType::FilmDevelop:
+      case NodeType::FilmGrain:
+      case NodeType::FilmPrintScan:
+      case NodeType::FilmGlare:
+      case NodeType::FilmScan:
+        if (!nFilm) nFilm = &n;
+        filmChain.push_back(n.id);
+        break;
       case NodeType::DisplayStages: nDisp = &n; break;
       case NodeType::Blend: nBlend = &n; break;
       case NodeType::Vignette: nVig = &n; break;
@@ -127,7 +139,8 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
     Group gf{GroupKind::Film, {}, {}};
     if (nResize) gf.nodes.push_back(nResize->id);
     if (nGeo) gf.nodes.push_back(nGeo->id);
-    gf.nodes.push_back(nFilm->id);
+    if (filmChain.empty()) gf.nodes.push_back(nFilm->id);
+    else gf.nodes.insert(gf.nodes.end(), filmChain.begin(), filmChain.end());
     st.groups.push_back(std::move(gf));
     p.stages.push_back(std::move(st));
   }

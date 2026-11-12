@@ -29,7 +29,7 @@ H recordClarityAnalysis(GpuRecorder& r, const SpatialRadii& R, H yy, int lw, int
   u.s[0] = lw;
   u.s[1] = lh;
   u.eps[0] = 0.045f * 0.045f;
-  r.g.dispatch("gf_ab", pa, {GpuGraph::R(m), GpuGraph::W(ab0)}, std::uint32_t(cdiv(lw, 16)), std::uint32_t(cdiv(lh, 16)), &u, sizeof u);
+  r.g.dispatch("gf_ab", pa, {GpuGraph::R(m), GpuGraph::W(ab0)}, r.gx(lw), r.gy(lh), &u, sizeof u);
   return r.blur(2, 2, ab0, lw, lh, {rad, rad, rad, rad}, 1, 0, kF32);
 }
 
@@ -77,7 +77,7 @@ bool recordDetail(GpuRecorder& r, const DetailNode& n, H D) {
   r.g.dispatch("detail", p,
                {GpuGraph::RW(D), GpuGraph::R(texH >= 0 ? texH : r.dummy(kR32)), GpuGraph::R(shH >= 0 ? shH : r.dummy(kR32)),
                 GpuGraph::R(n.ab >= 0 ? n.ab : r.dummy(kF32)), n.ep.last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8))},
-               std::uint32_t(cdiv(n.W, 16)), std::uint32_t(cdiv(n.Hh, 16)), &u, sizeof u);
+               r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
   return true;
 }
 

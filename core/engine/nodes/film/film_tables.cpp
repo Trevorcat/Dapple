@@ -182,7 +182,7 @@ void resolveFilm(const ParamSet& ps, const FrameGeom& geom, FilmResolved& out) {
   }
   float g[3] = {1.f, 1.f, 1.f};
   if (ctx.gainFn) ctx.gainFn(ctx.gainUser, e, g);
-  const float evGain = std::exp2(e.filmExposure);
+  const float evGain = std::exp2(e.filmExposure + e.filmKeyEv);
   for (int c = 0; c < 3; ++c) out.gain[c] = g[c] * evGain;
   out.warmth = e.filmWarmth;
   out.tint = e.filmTint;

@@ -4,7 +4,15 @@
 // particle count of 4, Cornish-Fisher above, merged-layer sampler when the three sub-layers together are large).
 // The hash coordinates are the ABSOLUTE frame coordinates (u.org + pixel, possibly negative: the halo of the grain blur), so tiles,
 // previews and the video frame index (folded into the stream words) agree. The density is fetched with scipy 'reflect'.
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
+// h16: round a float to the nearest half exactly (common.glsl), so the stored planes do not depend on the driver's rounding mode
+float h16(float x) {
+  uint u = floatBitsToUint(x);
+  u += 0xFFFu + ((u >> 13) & 1u);
+  return uintBitsToFloat(u & ~0x1FFFu);
+}
+vec4 h16v(vec4 v) { return vec4(h16(v.x), h16(v.y), h16(v.z), v.w); }
+
 
 layout(std140, binding = 0) uniform P {
   ivec4 dim;       // output (extended) w, h; frame w, h
@@ -18,7 +26,7 @@ layout(std140, binding = 0) uniform P {
 
 layout(binding = 1) uniform sampler2D uD;  // developed density (frame size)
 layout(binding = 2, std430) readonly buffer Tab { float tab[]; };  // per channel: inv ((N+2) x 4), merged ((N+2) x 4)
-layout(binding = 3, rgba32f) uniform writeonly image2D uOut;
+layout(binding = 3, rgba16f) uniform writeonly image2D uOut;
 
 void pcg3d(inout uint x, inout uint y, inout uint z) {
   x = x * 1664525u + 1013904223u;
@@ -139,5 +147,5 @@ void main() {
     }
     res[ch] = sum;
   }
-  imageStore(uOut, p, vec4(res, 1.0));
+  imageStore(uOut, p, h16v(vec4(res, 1.0)));
 }

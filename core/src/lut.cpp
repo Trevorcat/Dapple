@@ -60,7 +60,21 @@ Result<Lut3D> Lut3D::parseCube(const std::string& text) {
   if (lut.size_ == 0) return fail("missing LUT_3D_SIZE");
   if (lut.table_.size() != expected * 3)
     return fail("expected " + std::to_string(expected) + " entries, got " + std::to_string(lut.table_.size() / 3));
+  lut.finalize();
   return lut;
+}
+
+void Lut3D::finalize() {
+  std::uint64_t h = 1469598103934665603ull;  // FNV-1a over the bytes of size, domain and table
+  auto mix = [&](const void* p, std::size_t n) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (std::size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+  };
+  mix(&size_, sizeof size_);
+  mix(domainMin_, sizeof domainMin_);
+  mix(domainMax_, sizeof domainMax_);
+  mix(table_.data(), table_.size() * sizeof(float));
+  contentId_ = h ? h : 1;  // 0 is "no LUT"
 }
 
 Lut3D Lut3D::identity(int size) {
@@ -72,6 +86,7 @@ Lut3D Lut3D::identity(int size) {
     for (int g = 0; g < size; ++g)
       for (int r = 0; r < size; ++r)
         lut.table_.insert(lut.table_.end(), {r / float(size - 1), g / float(size - 1), b / float(size - 1)});
+  lut.finalize();
   return lut;
 }
 

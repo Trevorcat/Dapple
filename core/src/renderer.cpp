@@ -238,15 +238,28 @@ float Renderer::Curve1D::operator()(float x) const {
   return table[i] + t * (table[i + 1] - table[i]);
 }
 
+void Renderer::whiteBalanceGain(const EditParams& p, float out[3]) {
+  constexpr float kTemp = 0.006f, kTint = 0.004f;
+  out[0] = std::exp2(kTemp * p.temperature);
+  out[1] = std::exp2(-kTint * p.tint);
+  out[2] = std::exp2(-kTemp * p.temperature);
+  const float norm = proPhotoLuma(out);
+  for (int c = 0; c < 3; ++c) out[c] /= norm;
+}
+
+void Renderer::inputGain(const EditParams& params, const CameraProfile& camera, bool sceneReferred, float out[3]) {
+  EditParams p = params;
+  p.clamp();
+  float wb[3];
+  whiteBalanceGain(p, wb);
+  const float expo = std::exp2(p.exposure + (sceneReferred ? camera.baselineExposureEv : 0.f));
+  for (int c = 0; c < 3; ++c) out[c] = wb[c] * expo;
+}
+
 Renderer::Renderer(const EditParams& params, const CameraProfile& camera, const Lut3D* lut)
     : p_(params), camera_(camera), lut_(lut) {
   p_.clamp();
-  constexpr float kTemp = 0.006f, kTint = 0.004f;
-  wbGain_[0] = std::exp2(kTemp * p_.temperature);
-  wbGain_[1] = std::exp2(-kTint * p_.tint);
-  wbGain_[2] = std::exp2(-kTemp * p_.temperature);
-  const float norm = proPhotoLuma(wbGain_);
-  for (float& g : wbGain_) g /= norm;
+  whiteBalanceGain(p_, wbGain_);
 
   // Each curve = parametric (four regions) followed by the point curve.
   auto build = [&](Curve1D& c, const float amt[4], const std::vector<CurvePoint>& pts) {
@@ -754,7 +767,7 @@ bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], 
                   int h, float pitch, SpatialQuality q, Fetch&& fetch, ImageF& out, const FastOptions* fo = nullptr) {
   if (!run.stock) return false;
   const float formatScale = pitch * float(std::max(w, h)) / float(std::max(src.width, src.height));
-  const float evGain = std::exp2(p.filmExposure);
+  const float evGain = std::exp2(p.filmExposure + p.filmKeyEv);
   const float gainEv[3] = {gain[0] * evGain, gain[1] * evGain, gain[2] * evGain};
   if (engine::filmnode::enabled()) {
     // the film as engine nodes (core/engine/nodes/film): byte-identical with the FilmSimulator below
@@ -763,7 +776,7 @@ bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], 
     a.stock = p.filmStock.c_str();
     a.paper = run.paper.c_str();
     for (int c = 0; c < 3; ++c) a.gain[c] = gain[c];
-    a.filmExposure = p.filmExposure;
+    a.filmExposure = p.filmExposure + p.filmKeyEv;
     a.warmth = p.filmWarmth;
     a.tint = p.filmTint;
     a.grainPct = p.filmGrain;
@@ -1073,7 +1086,7 @@ std::shared_ptr<const BakedLut> Renderer::bake(const SourceImage& source, int n,
   n = colourFrom ? colourFrom->n : std::clamp(n, 17, 65);
   auto lut = std::make_shared<BakedLut>();
   lut->n = n;
-  lut->key = pointKey() + "#" + std::to_string(n);
+  lut->key = pointKey() + (fastAnalysis ? "#f" : "#x") + std::to_string(n);  // fast (lattice) and exact analysis are different bakes
   lut->colourKey = ck;
   const FilmRun fr = resolveFilm(p_);
   const bool filmOnly = fr.stock && fr.strength >= 1.f;  // the lattice is only needed to blend against the normal render
@@ -1251,7 +1264,7 @@ std::uint8_t* Renderer::renderBakedImpl(const SourceImage& source, const BakedLu
   if (opt.spatial == SpatialQuality::Off) {
     sp = SpatialParams{};
   } else if (opt.spatial == SpatialQuality::Interactive) {
-    sp.grain = 0.f;
+    if (!opt.keepGrain) sp.grain = 0.f;  // kept while a grain slider is dragged (14 Q8)
     if (!opt.noise) sp.nrLuma = sp.nrColor = 0.f;
   }
   if (region) sp.scale = std::max(float(w) / (d.fx1 - d.fx0), float(h) / (d.fy1 - d.fy0)) / 2048.f;
@@ -1281,10 +1294,11 @@ std::uint8_t* Renderer::renderBakedImpl(const SourceImage& source, const BakedLu
   // Streaming film path (full-strength film, 8-bit target, no neighbourhood stage, no resampling): the film chain
   // runs in row bands through a thread-local tile and the display stages + 8-bit encode consume the hot tile. The
   // 312 MB (26 MP) float frame, its page faults and two more passes over it never exist.
-  if (fr.stock && fr.strength >= 1.f && rgba && !sp.any()) {
+  // (scale-aware / kept grain exists in the node chain only: those frames take the float path below)
+  if (fr.stock && fr.strength >= 1.f && rgba && !sp.any() && !opt.keepGrain && !(opt.fullLongEdge > 0 && opt.spatial == SpatialQuality::Full)) {
     film::SimulatorLease lease = film::acquireSimulator(fr.lib, p_.filmStock, fr.paper);
     std::string err;
-    const float evGain = std::exp2(p_.filmExposure);
+    const float evGain = std::exp2(p_.filmExposure + p_.filmKeyEv);
     const float gainEv[3] = {gain0[0] * evGain, gain0[1] * evGain, gain0[2] * evGain};
     if (lease && lease->setParams(makeFilmParams(p_, fr, opt.spatial, region ? std::max(d.stepX, d.stepY) : 1.f), &err)) {
       const float vigS = p_.vignette / 100.f;
@@ -1451,9 +1465,10 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
   FramePlan fp;
   fp.srcW = srcW;
   fp.srcH = srcH;
-  if (resolveFilm(p_).stock) {
+  const FilmRun filmRun = resolveFilm(p_);
+  if (filmRun.stock && !(filmRun.strength >= 1.f && engine::filmnode::enabled())) {
     fp.supported = false;
-    fp.why = "film simulation";
+    fp.why = "film simulation (blend with the normal branch)";
     return fp;
   }
   Geometry geo;
@@ -1480,11 +1495,13 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
   const float expo = std::exp2(p_.exposure + (sceneReferred ? camera_.baselineExposureEv : 0.f));
   for (int c = 0; c < 3; ++c) fp.gain[c] = wbGain_[c] * expo;
   fp.vignette = p_.vignette / 100.f;
-  SpatialParams sp = makeSpatial(p_, sceneReferred, makeStyle(p_));
+  EditParams pStyle = p_;
+  if (filmRun.stock) pStyle.look = "std";  // a film at full strength brings its own grain (FrameKernels::Impl)
+  SpatialParams sp = makeSpatial(p_, sceneReferred, makeStyle(pStyle));
   if (opt.spatial == SpatialQuality::Off) {
     sp = SpatialParams{};
   } else if (opt.spatial == SpatialQuality::Interactive) {
-    sp.grain = 0.f;
+    if (!opt.keepGrain) sp.grain = 0.f;  // kept while a grain slider is dragged (14 Q8)
     if (!opt.noise) sp.nrLuma = sp.nrColor = 0.f;
   }
   if (region) sp.scale = std::max(float(d.w) / (d.fx1 - d.fx0), float(d.h) / (d.fy1 - d.fy0)) / 2048.f;
@@ -1497,6 +1514,24 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
   fp.sharpRadius = sp.sharpRadius;
   fp.grain = sp.grain;
   fp.spatialScale = sp.scale > 0.f ? sp.scale : float(std::max(d.w, d.h)) / 2048.f;
+  if (filmRun.stock) {  // the film stage's arguments (FrameKernels::runFilm / runFilmStage)
+    FramePlan::Film& f = fp.film;
+    f.active = true;
+    f.displayPlain = master_.identity && red_.identity && green_.identity && blue_.identity && !(lut_ && p_.lutAmount > 0);
+    f.stock = p_.filmStock;
+    f.paper = filmRun.paper;
+    f.filmEv = p_.filmExposure + p_.filmKeyEv;
+    f.warmth = p_.filmWarmth;
+    f.tint = p_.filmTint;
+    f.grainPct = p_.filmGrain;
+    f.halationPct = p_.filmHalation;
+    const float pitch = region ? std::max(d.stepX, d.stepY) : 1.f;
+    f.formatScale = pitch * float(std::max(d.w, d.h)) / float(std::max(srcW, srcH));
+    f.quality = opt.spatial == SpatialQuality::Off ? 0 : (opt.spatial == SpatialQuality::Interactive ? 1 : 2);
+    f.keepGrain = opt.keepGrain;
+    f.fullLongEdge = opt.fullLongEdge;
+    f.frameIndex = opt.frameIndex;
+  }
   return fp;
 }
 
@@ -1562,7 +1597,7 @@ struct FrameKernels::Impl {
       if (opt.spatial == SpatialQuality::Off) {
         sp = SpatialParams{};
       } else if (opt.spatial == SpatialQuality::Interactive) {
-        sp.grain = 0.f;
+        if (!opt.keepGrain) sp.grain = 0.f;
         if (!opt.noise) sp.nrLuma = sp.nrColor = 0.f;
       }
       if (region) sp.scale = std::max(float(d.w) / (d.fx1 - d.fx0), float(d.h) / (d.fy1 - d.fy0)) / 2048.f;
@@ -1740,11 +1775,12 @@ void FrameKernels::vignette(float* px, int n, int x0, int y) const {
 bool FrameKernels::streamFilm(std::uint8_t* rgba) {
   Impl& m = *impl_;
   if (m.exact || !(m.fr.stock && m.fr.strength >= 1.f) || !rgba || m.sp.any()) return false;
+  if (m.opt.keepGrain || (m.opt.fullLongEdge > 0 && m.opt.spatial == SpatialQuality::Full)) return false;  // scale-aware / kept grain: node chain only
   const Renderer& rr = m.r;
   const int w = m.d.w, h = m.d.h;
   film::SimulatorLease lease = film::acquireSimulator(m.fr.lib, rr.p_.filmStock, m.fr.paper);
   std::string err;
-  const float evGain = std::exp2(rr.p_.filmExposure);
+  const float evGain = std::exp2(rr.p_.filmExposure + rr.p_.filmKeyEv);
   const float gainEv[3] = {m.gain[0] * evGain, m.gain[1] * evGain, m.gain[2] * evGain};
   if (!(lease && lease->setParams(makeFilmParams(rr.p_, m.fr, m.opt.spatial, m.pitch), &err))) return false;
   const bool plain = rr.master_.identity && rr.red_.identity && rr.green_.identity && rr.blue_.identity &&

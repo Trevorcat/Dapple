@@ -37,6 +37,9 @@ final class DappleFrameRequestStruct extends ffi.Struct {
   external double ry1;
   @ffi.Int32()
   external int regionLongEdge;
+  /// Additive (honoured when [size] covers it): key of the slider being dragged; grain stays on in interactive frames while a
+  /// grain-family slider moves (pipeline-architecture.md 14, Q8). nullptr = none.
+  external ffi.Pointer<Utf8> activeParam;
 }
 
 const int dappleFrameInteractive = 1;
@@ -70,6 +73,8 @@ typedef _Open = ffi.Pointer<DappleSessionStruct> Function(ffi.Pointer<Utf8>, ffi
 typedef _OpenD = ffi.Pointer<DappleSessionStruct> Function(ffi.Pointer<Utf8>, int, int);
 typedef _Close = ffi.Void Function(ffi.Pointer<DappleSessionStruct>);
 typedef _CloseD = void Function(ffi.Pointer<DappleSessionStruct>);
+typedef _Cancel = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>);
+typedef _CancelD = int Function(ffi.Pointer<DappleSessionStruct>);
 typedef _Info = ffi.Pointer<Utf8> Function(ffi.Pointer<DappleSessionStruct>);
 typedef _Auto = ffi.Pointer<Utf8> Function(ffi.Pointer<DappleSessionStruct>, ffi.Float);
 typedef _AutoD = ffi.Pointer<Utf8> Function(ffi.Pointer<DappleSessionStruct>, double);
@@ -170,6 +175,7 @@ class DappleBindings {
         isSupportedFile = lib.lookupFunction<_IsSupported, _IsSupportedD>('dapple_is_supported_file'),
         sessionOpen = lib.lookupFunction<_Open, _OpenD>('dapple_session_open'),
         sessionClose = lib.lookupFunction<_Close, _CloseD>('dapple_session_close'),
+        sessionCancel = lib.providesSymbol('dapple_session_cancel') ? lib.lookupFunction<_Cancel, _CancelD>('dapple_session_cancel') : null,
         sessionInfoJson = lib.lookupFunction<_Info, _Info>('dapple_session_info_json'),
         sessionAutoJson = lib.lookupFunction<_Auto, _AutoD>('dapple_session_auto_json'),
         sessionRender = lib.lookupFunction<_Render, _RenderD>('dapple_session_render'),
@@ -258,6 +264,7 @@ class DappleBindings {
   final _IsSupportedD isSupportedFile;
   final _OpenD sessionOpen;
   final _CloseD sessionClose;
+  final _CancelD? sessionCancel; // lock-free, safe from any thread while a render is in flight
   final _Info sessionInfoJson;
   final _AutoD sessionAutoJson;
   final _RenderD sessionRender;

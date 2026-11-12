@@ -5,7 +5,8 @@
 //   MODE 1: one group, maximum of the partials             -> g[0]
 //   MODE 2: per-group colour sums of the bright pixels     -> part[4 * group + 0..3] (r, g, b, count)
 //   MODE 3: one group, airlight = clamp(mean, 0.7, 1)      -> g[4..6], g[7] = min of them
-layout(local_size_x = 256) in;
+layout(local_size_x = 256, local_size_x_id = 18) in;  // spec constant 18: 256 where the device allows it, 128 / 64 on GLES 3.1 class devices (power of two)
+layout(constant_id = 19) const int WG = 256;  // the same number as spec constant 18 (gl_WorkGroupSize cannot be used in a constant expression after the ESSL translation)
 layout(constant_id = 0) const int MODE = 0;
 const int PER_THREAD = 16;
 
@@ -21,10 +22,10 @@ void main() {
   const int n = u.s.x * u.s.y;
   vec4 acc = vec4(0.0);
   if (MODE == 0 || MODE == 2) {
-    const int base = int(gl_WorkGroupID.x) * 256 * PER_THREAD;
+    const int base = int(gl_WorkGroupID.x) * int(WG) * PER_THREAD;
     const float thr = 0.96 * g[0];
     for (int k = 0; k < PER_THREAD; ++k) {
-      const int i = base + k * 256 + int(t);
+      const int i = base + k * int(WG) + int(t);
       if (i >= n) break;
       const ivec2 p = ivec2(i % u.s.x, i / u.s.x);
       const float dc = texelFetch(uDc, p, 0).r;
@@ -32,13 +33,13 @@ void main() {
       else if (dc >= thr) acc += vec4(texelFetch(uCol, p, 0).rgb, 1.0);
     }
   } else if (MODE == 1) {
-    for (int i = int(t); i < u.s.z; i += 256) acc.x = max(acc.x, part[i]);
+    for (int i = int(t); i < u.s.z; i += int(WG)) acc.x = max(acc.x, part[i]);
   } else {
-    for (int i = int(t); i < u.s.z; i += 256) acc += vec4(part[4 * i], part[4 * i + 1], part[4 * i + 2], part[4 * i + 3]);
+    for (int i = int(t); i < u.s.z; i += int(WG)) acc += vec4(part[4 * i], part[4 * i + 1], part[4 * i + 2], part[4 * i + 3]);
   }
   sh[t] = acc;
   barrier();
-  for (uint s = 128; s > 0; s >>= 1) {
+  for (uint s = uint(WG) / 2u; s > 0u; s >>= 1) {
     if (t < s) sh[t] = (MODE <= 1) ? vec4(max(sh[t].x, sh[t + s].x), 0.0, 0.0, 0.0) : sh[t] + sh[t + s];
     barrier();
   }

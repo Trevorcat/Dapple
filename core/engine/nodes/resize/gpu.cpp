@@ -50,7 +50,7 @@ H recordResize(GpuRecorder& r, H src, const SrcWin& win, int srcW, int srcH, int
   u.out_[2] = win.y0;
   u.sc[0] = sx;
   u.sc[1] = std::max(1.f, sx);
-  r.g.dispatch("resize_h", ph, {GpuGraph::R(src), GpuGraph::W(tmp)}, std::uint32_t(cdiv(bw, 16)), std::uint32_t(cdiv(win.h(), 16)), &u, sizeof u);
+  r.g.dispatch("resize_h", ph, {GpuGraph::R(src), GpuGraph::W(tmp)}, r.gx(bw), r.gy(win.h()), &u, sizeof u);
   ResizeU v = u;
   v.src[2] = 0;
   v.out_[0] = bw;
@@ -58,7 +58,7 @@ H recordResize(GpuRecorder& r, H src, const SrcWin& win, int srcW, int srcH, int
   v.out_[2] = 0;
   v.sc[0] = sy;
   v.sc[1] = std::max(1.f, sy);
-  r.g.dispatch("resize_v", pv, {GpuGraph::R(tmp), GpuGraph::W(out)}, std::uint32_t(cdiv(bw, 16)), std::uint32_t(cdiv(bh, 16)), &v, sizeof v);
+  r.g.dispatch("resize_v", pv, {GpuGraph::R(tmp), GpuGraph::W(out)}, r.gx(bw), r.gy(bh), &v, sizeof v);
   return out;
 }
 
@@ -67,7 +67,7 @@ bool recordConvert(GpuRecorder& r, hal::BufferH staging, H dst, int w, int h, in
   if (!p) return false;
   const H in = r.g.externalBuf(staging);
   const std::int32_t u[4] = {w, h, dx, dy};
-  r.g.dispatch("convert", p, {GpuGraph::R(in), GpuGraph::W(dst)}, std::uint32_t(cdiv(w, 16)), std::uint32_t(cdiv(h, 16)), u, sizeof u);
+  r.g.dispatch("convert", p, {GpuGraph::R(in), GpuGraph::W(dst)}, r.gx(w), r.gy(h), u, sizeof u);
   return true;
 }
 

@@ -1,0 +1,68 @@
+#version 450
+// FilmExposure input of a geometry / region frame: the Catmull-Rom (or exact index) gather of point.comp without gain, tone or
+// colour. Output RGBA32F linear ProPhoto, ungained, clamped at 0 (what FrameKernels::fetchPixel hands to the film).
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+layout(constant_id = 0) const int GEO = 2;  // 1 exact index mapping, 2 Catmull-Rom
+
+layout(std140, binding = 0) uniform P {
+  ivec4 a;      // srcW, srcH (full source space), dW, dH
+  ivec4 b;      // bound source image origin x, y; origin of this image in the picture x, y
+  vec4 geoA;    // cs, sn, fw, fh
+  vec4 geoB;    // ox0, oy0, stepX, stepY
+  vec4 geoC;    // fullW, fullH, 0, 0
+  ivec4 c;      // rot, flip, 0, 0
+} u;
+
+layout(binding = 1) uniform sampler2D uSrc;
+layout(binding = 2, rgba32f) uniform writeonly image2D uOut;
+
+vec3 srcAt(int x, int y) {
+  return texelFetch(uSrc, ivec2(clamp(x, 0, u.a.x - 1), clamp(y, 0, u.a.y - 1)) - u.b.xy, 0).rgb;
+}
+void cubicW(float t, out float w[4]) {
+  const float t2 = t * t, t3 = t2 * t;
+  w[0] = -0.5 * t3 + t2 - 0.5 * t;
+  w[1] = 1.5 * t3 - 2.5 * t2 + 1.0;
+  w[2] = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
+  w[3] = 0.5 * t3 - 0.5 * t2;
+}
+vec3 sampleCubic(float x, float y) {
+  x -= 0.5;
+  y -= 0.5;
+  const float fxl = floor(x), fyl = floor(y);
+  const int ix = int(fxl), iy = int(fyl);
+  float wx[4], wy[4];
+  cubicW(x - fxl, wx);
+  cubicW(y - fyl, wy);
+  vec3 o = vec3(0.0);
+  for (int j = 0; j < 4; ++j) {
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < 4; ++i) acc += wx[i] * srcAt(ix - 1 + i, iy - 1 + j);
+    o += wy[j] * acc;
+  }
+  return max(o, vec3(0.0));
+}
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.a.z || p.y >= u.a.w) return;
+  const ivec2 q = p + u.b.zw;
+  const float pxf = u.geoB.x + (float(q.x) + 0.5) * u.geoB.z;
+  const float pyf = u.geoB.y + (float(q.y) + 0.5) * u.geoB.w;
+  float uu = pxf - u.geoC.x * 0.5;
+  const float vv = pyf - u.geoC.y * 0.5;
+  if (u.c.y != 0) uu = -uu;
+  const float fx = uu * u.geoA.x + vv * u.geoA.y + u.geoA.z * 0.5;
+  const float fy = -uu * u.geoA.y + vv * u.geoA.x + u.geoA.w * 0.5;
+  float sx, sy;
+  const float sW = float(u.a.x), sH = float(u.a.y);
+  if (u.c.x == 0) { sx = fx; sy = fy; }
+  else if (u.c.x == 1) { sx = fy; sy = sH - fx; }
+  else if (u.c.x == 2) { sx = sW - fx; sy = sH - fy; }
+  else { sx = sW - fy; sy = fx; }
+  vec3 v;
+  if (GEO == 1) v = srcAt(int(floor(sx)), int(floor(sy)));
+  else v = sampleCubic(sx, sy);
+  imageStore(uOut, p, vec4(v, 1.0));
+}

@@ -23,7 +23,8 @@ typedef struct DappleView DappleView;
 
 enum {
   DAPPLE_VIEW_TIMER_LOOP = 1,    /* frame pacing by a fixed-rate timer grid instead of Choreographer (tests / desktop) */
-  DAPPLE_VIEW_NULL_PRESENTER = 2 /* count frames instead of drawing them (tests / desktop) */
+  DAPPLE_VIEW_NULL_PRESENTER = 2,/* count frames instead of drawing them (tests / desktop) */
+  DAPPLE_VIEW_NULL_EXTERNAL = 4  /* with NULL_PRESENTER: pretend to offer zero-readback images (tests of the fallback) */
 };
 
 typedef struct DappleViewOptions {

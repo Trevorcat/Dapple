@@ -27,6 +27,23 @@ struct FramePlan {
   float nrLuma = 0.f, nrColor = 0.f, dehaze = 0.f, clarity = 0.f, texture = 0.f, sharpen = 0.f, sharpRadius = 1.f,
         grain = 0.f;
   float spatialScale = 1.f;   // radii scale (full-picture long edge / 2048), resolved
+  // GPU export of a downscaled picture: extra output sharpening (same radius as `sharpen`) after the Lanczos resize. Set by the
+  // GPU path only (EngineSession::exportGpu); the CPU executors never see it. Makes the graph contain a Detail node.
+  float resizeSharpen = 0.f;
+  // Film simulation (GPU film frames, docs/engine/pipeline-architecture.md section 20): set when the frame is a film frame the GPU can
+  // run (full strength; `gain` above is then the film's input gain). The executor builds the film node arguments from these.
+  struct Film {
+    bool active = false;
+    bool displayPlain = true;       // DisplayStages (master / RGB curves, look LUT) are the identity
+    std::string stock, paper;
+    float filmEv = 0.f;             // film_exp + the key-preserving match EV
+    float warmth = 0.f, tint = 0.f, grainPct = 100.f, halationPct = 100.f;
+    float formatScale = 1.f;
+    int quality = 2;                // 0 off, 1 interactive, 2 full
+    bool keepGrain = false;
+    int fullLongEdge = 0;
+    unsigned frameIndex = 0;
+  } film;
   bool anySpatial() const {
     return nrLuma > 0 || nrColor > 0 || dehaze != 0 || clarity != 0 || texture != 0 || sharpen > 0 || grain > 0;
   }

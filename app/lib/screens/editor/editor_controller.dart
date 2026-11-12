@@ -243,7 +243,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
     readout.dimmed = false;
     readout.cancelHide();
     wm.setInteracting(true);
-    engine.beginInteraction();
+    engine.beginInteraction(activeParam: row.id);
     _undragTimer?.cancel();
     dragging.value = true;
     _publish(row, c, PrecisionBand.standard);
@@ -490,6 +490,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
   void tap(double x, double y) {
     if (editingRow.value != null) {
       editingRow.value = null; // the entry widget commits on losing focus
+      _bump(); // the cached window card must rebuild to drop the field
       return;
     }
     if (wm.adjustMode) {
@@ -620,6 +621,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
     if (!row.typeable) return;
     editingRow.value = row.id;
     wm.setInteracting(true);
+    _bump();
   }
 
   /// Commits typed [text] for [row]; empty / invalid = cancel. Returns true when the value was changed.
@@ -639,6 +641,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
     if (editingRow.value == null) return;
     editingRow.value = null;
     wm.setInteracting(false);
+    _bump();
   }
 
   // ------------------------------------------------------------ back

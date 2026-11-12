@@ -19,14 +19,16 @@
 #include "dapple/camera.h"
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
-#include "dapple/gpu.h"
 #include "dapple/renderer.h"
+#include "engine/exec/gpu_executor.h"
+#include "gpu_rig.h"
 #include "parity.h"
 
 namespace fs = std::filesystem;
 using namespace dapple;
 
 namespace dapple::gpu {
+using engine::GpuStats;
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -43,8 +45,8 @@ void report(const char* what, const DeStats& s) {
 
 struct PassAgg {
   std::map<std::string, double> ms;
-  void add(const FrameStats& st) {
-    for (const auto& p : st.passTimes) ms[p.name] += p.ms;
+  void add(const GpuStats& st) {
+    for (const auto& p : st.passTimes) ms[p.first] += p.second;
   }
   void print(int div) const {
     std::vector<std::pair<std::string, double>> v(ms.begin(), ms.end());
@@ -85,17 +87,17 @@ int gpuBench(const std::vector<std::string>& args) {
     else path = args[i];
   }
   std::string err;
-  BackendOptions bo;
-  bo.profile = true;
+  engine::gpu::ContextOptions bo;
+  bo.device.profile = true;
   bo.selfTest = selfTest;
-  bo.allowSoftware = std::getenv("DAPPLE_GPU_SOFTWARE") && std::getenv("DAPPLE_GPU_SOFTWARE")[0] == '1';
-  auto be = Backend::create(bo, err);
+  bo.device.allowSoftware = std::getenv("DAPPLE_GPU_SOFTWARE") && std::getenv("DAPPLE_GPU_SOFTWARE")[0] == '1';
+  auto be = engine::gpu::Context::create(bo, err);
   if (!be) {
     std::fprintf(stderr, "gpu-bench: no usable GPU backend: %s\n", err.c_str());
     return 3;
   }
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
-  std::printf("GPU: %s\n%sself-test: %s\n", be->info().text().c_str(), be->info().memoryTypes.c_str(), be->selfTestReport().c_str());
+  std::printf("GPU: %s\n%sself-test: %s\n", be->deviceText().c_str(), be->caps().memoryTypes.c_str(), be->selfTestReport().c_str());
   if (infoOnly) return 0;
   if (path.empty()) {
     std::fputs("usage: dapple gpu-bench <raw> [--synth W H] [--repeat N] [--no-full] [--no-tiled] [--tile N] [--lut N] [--info]\n", stderr);
@@ -190,11 +192,7 @@ int gpuBench(const std::vector<std::string>& args) {
     const int W = cs.src.linear.width, H = cs.src.linear.height;
     const std::size_t npx = std::size_t(W) * H;
     std::printf("\n================ %s: %dx%d (%.1f MP) ================\n", cs.name.c_str(), W, H, double(npx) / 1e6);
-    auto sess = be->createSession();
-    if (!sess->setSource(cs.src, 1, err)) {
-      std::printf("  setSource: %s\n", err.c_str());
-      continue;
-    }
+    Rig rig(be, cs.src, cam);  // the engine session of this photo: Planner -> GpuExecutor
     for (std::size_t vi = variantFrom; vi < 3; ++vi) {
       const Variant& v = variants[vi];
       Renderer r(v.spatialParams ? prmSp : prm, cam, nullptr);
@@ -217,9 +215,9 @@ int gpuBench(const std::vector<std::string>& args) {
       std::printf("  --- %s ---\n      CPU baked path (all cores): %.1f ms/frame (lattice bake %.1f ms)\n", v.name, median(cpuT), bakeMs);
       // first frame: resident upload + lattice upload + pipeline creation
       int gw = 0, gh = 0;
-      FrameStats st0;
+      GpuStats st0;
       t0 = Clock::now();
-      std::uint8_t* g0 = sess->render(r, *lut, fo, FrameOptions{}, gw, gh, &st0, err);
+      std::uint8_t* g0 = rig.render(v.spatialParams ? prmSp : prm, r, cs.src, fo, latticeN, gw, gh, &st0, err);
       const double first = msSince(t0);
       if (!g0) {
         std::printf("      GPU render failed: %s\n", err.c_str());
@@ -232,8 +230,8 @@ int gpuBench(const std::vector<std::string>& args) {
       std::uint8_t* g = nullptr;
       for (int i = 0; i < repeat; ++i) {
         std::free(g);
-        FrameStats st;
-        g = sess->render(r, *lut, fo, FrameOptions{}, gw, gh, &st, err);
+        GpuStats st;
+        g = rig.render(v.spatialParams ? prmSp : prm, r, cs.src, fo, latticeN, gw, gh, &st, err);
         if (!g) break;
         wall.push_back(st.wallMs - st.uploadMs);
         gpuT.push_back(st.gpuMs);
@@ -260,10 +258,10 @@ int gpuBench(const std::vector<std::string>& args) {
       }
       std::printf("      host: record %.2f ms, submit %.2f ms, fence wait %.2f ms, copy-out %.2f ms, pool trim %.2f ms\n", median(recT), median(subT), median(waT), median(rb), median(trT));
       if (std::getenv("DAPPLE_BENCH_PASSES")) {
-        FrameStats stp;
-        std::free(sess->render(r, *lut, fo, FrameOptions{}, gw, gh, &stp, err));
+        GpuStats stp;
+        std::free(rig.render(v.spatialParams ? prmSp : prm, r, cs.src, fo, latticeN, gw, gh, &stp, err));
         std::printf("      pass list (one frame):");
-        for (const PassTime& pt : stp.passTimes) std::printf(" %s=%.2f", pt.name.c_str(), pt.ms);
+        for (const auto& pt : stp.passTimes) std::printf(" %s=%.2f", pt.first.c_str(), pt.second);
         std::printf(" ");
         std::printf(" ");
         std::putchar(10);
@@ -281,18 +279,15 @@ int gpuBench(const std::vector<std::string>& args) {
         FastOptions fo;
         fo.spatial = SpatialQuality::Interactive;
         fo.noise = false;
-        FrameOptions fro;
-        fro.srcLongEdge = 1600;
-        const auto lut = r.bake(cs.src, latticeN);
         int gw = 0, gh = 0;
         std::vector<double> wall;
-        FrameStats st;
+        GpuStats st;
         t0 = Clock::now();
-        std::uint8_t* o = sess->render(r, *lut, fo, fro, gw, gh, &st, err);
+        std::uint8_t* o = rig.render(prmSp, r, cs.src, fo, latticeN, gw, gh, &st, err, 1600);
         const double firstMs = msSince(t0);
         std::free(o);
         for (int i = 0; i < repeat && o; ++i) {
-          o = sess->render(r, *lut, fo, fro, gw, gh, &st, err);
+          o = rig.render(prmSp, r, cs.src, fo, latticeN, gw, gh, &st, err, 1600);
           wall.push_back(st.wallMs - st.uploadMs);
           std::free(o);
         }
@@ -315,29 +310,26 @@ int gpuBench(const std::vector<std::string>& args) {
     }
     const int W = src->linear.width, H = src->linear.height;
     std::printf("\n================ tiled export: %dx%d (%.1f MP), tile %d + halo ================\n", W, H, double(W) * H / 1e6, tile);
-    auto sess = be->createSession();
+    Rig rig(be, *src, cam);
     Renderer r(prmSp, cam, nullptr);
     FastOptions fo;
     const auto lut = r.bake(*src, latticeN);
     for (const bool stream : {true, false}) {
       if (!stream && std::uint64_t(W) * H > 40000000ull) continue;
-      ExportOptions eo;
-      eo.tile = tile;
-      eo.forceStream = stream;
       std::uint64_t sum = 0;
       std::size_t covered = 0;
       std::vector<std::uint8_t> kept;  // --seam: the whole tiled result, compared with a single-frame render
       if (seam && stream) kept.resize(std::size_t(W) * H * 4);
-      eo.sink = [&](int x, int y, int w, int h, const std::uint8_t* rgba, std::size_t stride) {
+      auto sink = [&](int x, int y, int w, int h, const std::uint8_t* rgba, std::size_t stride) {
         for (int j = 0; j < h; j += 61) sum += rgba[std::size_t(j) * stride];
         if (!kept.empty())
           for (int j = 0; j < h; ++j) std::memcpy(kept.data() + (std::size_t(y + j) * W + x) * 4, rgba + std::size_t(j) * stride, std::size_t(w) * 4);
         covered += std::size_t(w) * h;
         return true;
       };
-      FrameStats st;
+      GpuStats st;
       t0 = Clock::now();
-      const bool ok = sess->exportTiled(r, *src, *lut, fo, eo, &st, err);
+      const bool ok = rig.exportTiled(prmSp, r, *src, 0, latticeN, tile, stream, 0.f, nullptr, sink, &st, err);
       std::printf("  %s source: %s  %.0f ms wall, GPU %.0f ms, %d passes, %d barriers, pool %.0f MB, %.1f MP/s (%zu px)\n",
                   stream ? "streamed" : "resident", ok ? "ok" : err.c_str(), msSince(t0), st.gpuMs, st.passes, st.barriers, double(be->pooledBytes()) / 1048576.0,
                   double(covered) / 1e3 / std::max(msSince(t0), 1.0), covered);
@@ -345,9 +337,9 @@ int gpuBench(const std::vector<std::string>& args) {
       if (!kept.empty() && ok) {
         // the same picture in one piece (resident source, whole-frame working images): the tiles must not show
         int gw = 0, gh = 0;
-        FrameStats st1;
+        GpuStats st1;
         t0 = Clock::now();
-        std::uint8_t* whole = sess->render(r, *lut, fo, FrameOptions{}, gw, gh, &st1, err);
+        std::uint8_t* whole = rig.render(prmSp, r, *src, fo, latticeN, gw, gh, &st1, err);
         if (whole && gw == W && gh == H) {
           std::printf("  single frame render (%.0f ms, pool %.0f MB):\n", msSince(t0), double(be->pooledBytes()) / 1048576.0);
           report("tiled vs single frame", compareRgba8(kept.data(), whole, std::size_t(W) * H));
@@ -364,14 +356,12 @@ int gpuBench(const std::vector<std::string>& args) {
       std::uint8_t* cpu = r.renderBakedRgba(*src, *lut, fo, cw, ch);
       std::printf("  CPU full-frame reference: %.0f ms\n", msSince(t0));
       std::vector<std::uint8_t> img(std::size_t(cw) * ch * 4);
-      ExportOptions eo;
-      eo.tile = tile;
-      eo.sink = [&](int x, int y, int w, int h, const std::uint8_t* rgba, std::size_t stride) {
+      auto sink2 = [&](int x, int y, int w, int h, const std::uint8_t* rgba, std::size_t stride) {
         for (int j = 0; j < h; ++j) std::memcpy(img.data() + (std::size_t(y + j) * cw + x) * 4, rgba + std::size_t(j) * stride, std::size_t(w) * 4);
         return true;
       };
-      FrameStats st;
-      if (cpu && sess->exportTiled(r, *src, *lut, fo, eo, &st, err)) report("tiled GPU vs CPU full frame", compareRgba8(img.data(), cpu, std::size_t(cw) * ch));
+      GpuStats st;
+      if (cpu && rig.exportTiled(prmSp, r, *src, 0, latticeN, tile, false, 0.f, nullptr, sink2, &st, err)) report("tiled GPU vs CPU full frame", compareRgba8(img.data(), cpu, std::size_t(cw) * ch));
       std::free(cpu);
     }
   }

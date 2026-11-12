@@ -522,7 +522,7 @@ struct TableRun {
 TableRun runTables(const ParamInputs& in0, const NodeRegistry& reg, const SourceImage& srcScene, const SourceImage& srcJpeg,
                    const Lut3D* lut, const CameraProfile& cam) {
   ParamInputs in = in0;
-  in.ctx.lutIdentity = std::uintptr_t(lut);
+  in.ctx.lutIdentity = lut ? std::uintptr_t(lut->contentId()) : 0;
   in.ctx.cameraId = cam.id;
   const ParamSet ps = ParamSet::make(in);
   Graph g = GraphBuilder::build(ps, GraphDetail::Legacy);
@@ -654,10 +654,9 @@ void testConformance() {
   //    geometry and vignette, and the old pointKey()/colourKey() masked them, so a crop change returned a stale analysis /
   //    tone-class move. The Analysis / ToneAnalysisPre nodes now declare crop, straighten, rotate, flip and vignette and
   //    pointKey() keeps them (colourKey() still masks them: the lattice does not care). They are no longer allowed here.
-  //  - ctx.fastAnalysis: interactive frames analyse through the lattice, final frames exactly; both belong to the same
-  //    bake (old semantics: same bake => same analysis), edit-bench measures them within the same dE. Not part of the key.
-  const std::set<std::pair<std::string, std::string>> known = {
-      {"ctx.fastAnalysis", "ToneAnalysisPre"}, {"ctx.fastAnalysis", "ToneTable"}, {"ctx.fastAnalysis", "Analysis"}};
+  //  - ctx.fastAnalysis (interactive lattice analysis vs exact final) is keyed by ToneAnalysisPre / ToneTable / Analysis, so
+  //    it is no longer a deviation.
+  const std::set<std::pair<std::string, std::string>> known = {};
   std::set<std::pair<std::string, std::string>> seenKnown;
   int knownCount = 0;
   for (const auto& v : st.violations) {

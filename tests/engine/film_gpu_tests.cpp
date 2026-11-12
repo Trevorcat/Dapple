@@ -10,12 +10,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <vector>
 
 #include "colour_metrics.h"
 #include "dapple/film.h"
 #include "engine/exec/gpu_executor.h"
+#include "dapple/camera.h"
+#include "dapple/renderer.h"
+#include "gpu_rig.h"
+#include "parity.h"
 #include "engine/nodes/film/film_gpu.h"
 #include "engine/nodes/film/film_node_internal.h"
 
@@ -110,6 +115,7 @@ bool gpuFilm(eg::Core& core, const ef::FilmResolved& r, const ef::GpuFilmTables&
     eg::GpuGraph g(dev, core.pool());
     eg::GpuRecorder rec(dev, g, err);
     rec.weights = core.slot(cl->slot()).weights;
+    rec.taps = core.slot(cl->slot()).taps;
     rec.W = w;
     rec.H_ = h;
     const eg::H sh = g.external(src);
@@ -121,13 +127,13 @@ bool gpuFilm(eg::Core& core, const ef::FilmResolved& r, const ef::GpuFilmTables&
     if (eg::runGraph(dev, g, *cl, &f, err) != hal::Status::Ok || dev.wait(f, 30ull * 1000 * 1000 * 1000) != hal::Status::Ok) return err = dev.lastError(), false;
     if (gpuMs) *gpuMs = core.statsOf(f).gpuMs > 0 ? core.statsOf(f).gpuMs : msSince(t0);
     g_lastPasses = core.statsOf(f).times;
-    dev.invalidate(core.slot(cl->slot()).readback, 0, std::size_t(w) * h * 16);
+    dev.invalidate(core.slot(cl->slot()).readback, 0, std::size_t(w) * h * 8);
     out = ImageF(w, h);
-    const float* sp = static_cast<const float*>(core.slot(cl->slot()).readback.mapped);
+    const std::uint16_t* sp = static_cast<const std::uint16_t*>(core.slot(cl->slot()).readback.mapped);  // RGBA16F
     for (std::size_t i = 0; i < std::size_t(w) * h; ++i) {
-      out.data[3 * i] = sp[4 * i];
-      out.data[3 * i + 1] = sp[4 * i + 1];
-      out.data[3 * i + 2] = sp[4 * i + 2];
+      out.data[3 * i] = ef::halfToFloat(sp[4 * i]);
+      out.data[3 * i + 1] = ef::halfToFloat(sp[4 * i + 1]);
+      out.data[3 * i + 2] = ef::halfToFloat(sp[4 * i + 2]);
     }
   }
   return true;
@@ -431,7 +437,7 @@ void testBench(GpuCtx& G) {
       for (auto& kv : agg) v.push_back({kv.second.first, kv.first + " x" + std::to_string(kv.second.second)});
       std::sort(v.rbegin(), v.rend());
       std::printf("      passes (last frame):");
-      for (std::size_t i = 0; i < std::min<std::size_t>(v.size(), 8); ++i) std::printf(" %s %.2f ms;", v[i].second.c_str(), v[i].first);
+      for (std::size_t i = 0; i < std::min<std::size_t>(v.size(), 24); ++i) std::printf(" %s %.2f ms;", v[i].second.c_str(), v[i].first);
       std::printf("\n");
     }
     if (!gpuMs.empty()) {
@@ -446,6 +452,70 @@ void testBench(GpuCtx& G) {
   }
 }
 
+
+// Whole film frames through EngineSession -> Planner -> GpuExecutor (forced) against the CPU engine render of the same job.
+// Budget: mean dE2000 <= 0.5 (the rig's stage criterion), grain cases are per-pixel (same hash).
+void testFrames() {
+  std::string err;
+  eg::ContextOptions co;
+  co.device.allowSoftware = std::getenv("DAPPLE_GPU_SOFTWARE") != nullptr;
+  co.device.profile = std::getenv("DAPPLE_GPU_PROFILE") != nullptr;
+  auto ctx = eg::Context::create(co, err);
+  if (!ctx) {
+    std::printf("no usable GPU context: %s\n", err.c_str());
+    std::exit(77);
+  }
+  if (!library()) std::exit(77);
+  film::setLibrary(library());  // the engine reads the default library
+  CameraRegistry cams = CameraRegistry::withBuiltins();
+  const CameraProfile& cam = cams.resolve("", "");
+  struct Case {
+    const char* name;
+    std::function<void(EditParams&)> set;
+    std::function<void(FastOptions&)> opt;
+  };
+  const std::vector<Case> cases = {
+      {"film portra400, all effects", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }, nullptr},
+      {"film velvia (slide), no grain", [](EditParams& p) { p.filmStock = "fujifilm_velvia_100"; p.filmGrain = 0; }, nullptr},
+      {"film + geometry + vignette", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.straighten = 3.f; p.crop = "4:5"; p.vignette = -30; }, nullptr},
+      {"film + NR, clarity, sharpen", [](EditParams& p) { p.filmStock = "kodak_ektar_100"; p.nrLuma = 30; p.clarity = 30; p.sharpen = 50; }, nullptr},
+      {"film interactive", [](EditParams& p) { p.filmStock = "kodak_portra_400"; },
+       [](FastOptions& o) { o.spatial = SpatialQuality::Interactive; o.noise = false; }},
+      {"film interactive, grain drag", [](EditParams& p) { p.filmStock = "kodak_portra_400"; },
+       [](FastOptions& o) { o.spatial = SpatialQuality::Interactive; o.noise = false; o.keepGrain = true; o.fullLongEdge = 3000; }},
+  };
+  for (const std::pair<int, int>& sz : {std::pair<int, int>{640, 448}, std::pair<int, int>{1536, 1024}}) {
+    const SourceImage src = dapple::gpu::makeTestImage(sz.first, sz.second);
+    dapple::gpu::Rig rig(ctx, src, cam);
+    for (const Case& c : cases) {
+      EditParams p;
+      p.exposure = 0.3f;
+      p.contrast = 15;
+      c.set(p);
+      Renderer r(p, cam, nullptr);
+      FastOptions fo;
+      fo.spatial = SpatialQuality::Full;
+      if (c.opt) c.opt(fo);
+      const auto lut = r.bake(src, 41);
+      int w = 0, h = 0, gw = 0, gh = 0;
+      std::uint8_t* cpu = r.renderBakedRgba(src, *lut, fo, w, h);
+      engine::GpuStats st;
+      std::uint8_t* gpu = rig.render(p, r, src, fo, 41, gw, gh, &st, err);
+      if (!cpu || !gpu || w != gw || h != gh) {
+        std::printf("  %-34s %dx%d: render failed: %s\n", c.name, sz.first, sz.second, err.c_str());
+        ++g_failures;
+      } else {
+        const dapple::gpu::DeStats d = dapple::gpu::compareRgba8(gpu, cpu, std::size_t(w) * h);
+        std::printf("  %-34s %4dx%-4d mean %.4f p99 %.3f max %.2f  differing %.1f%%   gpu %.2f ms (%d passes)\n", c.name, w, h, d.mean, d.p99, d.max,
+                    d.differing * 100, st.gpuMs, st.passes);
+        CHECK(d.mean <= 0.5);
+      }
+      std::free(cpu);
+      std::free(gpu);
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -454,6 +524,11 @@ int main(int argc, char** argv) {
   opt.allowSoftware = std::getenv("DAPPLE_GPU_SOFTWARE") != nullptr;
   opt.profile = std::getenv("DAPPLE_GPU_PROFILE") != nullptr;
   std::string err;
+  if (argc >= 2 && std::string(argv[1]) == "frames") {
+    testFrames();
+    std::printf(g_failures ? "FAILED: %d check(s)\n" : "ok\n", g_failures);
+    return g_failures ? 1 : 0;
+  }
   GpuCtx G;
   G.core = eg::Core::create(opt, err);
   if (!G.core) {

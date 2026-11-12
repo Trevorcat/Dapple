@@ -21,6 +21,7 @@
 #include "dapple/dapple_c.h"
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
+#include "dapple/film_match.h"
 #include "dapple/renderer.h"
 #include "dapple/tone.h"
 #include "film_internal.h"
@@ -1239,6 +1240,55 @@ void testEditParamsFilmJson() {
     CHECK(schema.find(std::string("\"") + k + "\"") != std::string::npos);
 }
 
+void testFilmMatch() {
+  auto lib = library();
+  CHECK(lib != nullptr);
+  if (!lib) return;
+  const CameraRegistry cams = CameraRegistry::withBuiltins();
+  const CameraProfile& cam = cams.resolve("Sony", "ILCE-7RM5");
+  const SourceImage src = devSource(192, 128);
+  // a dim frame (the develop render of src is bright, 85 L*; the paper white of the print is ~87 L*, so a brighter target is out of reach)
+  film::setLibrary(lib);
+  SourceImage bright = src;
+  for (float& v : bright.linear.data) v *= 0.3f;
+  EditParams p;
+  p.filmStock = "kodak_portra_400";
+  EditParams plain = p;
+  plain.filmStock.clear();
+  CHECK(filmMatchKey(plain).empty());
+  CHECK(!filmMatchKey(p).empty());
+  EditParams p2 = p;  // the user's offset, strength, grain and halation are not part of the key
+  p2.filmExposure = 1.f;
+  p2.filmStrength = 40.f;
+  p2.filmGrain = 10.f;
+  p2.filmHalation = 0.f;
+  CHECK(filmMatchKey(p) == filmMatchKey(p2));
+  EditParams p3 = p;
+  p3.contrast = 20.f;
+  CHECK(filmMatchKey(p) != filmMatchKey(p3));
+  for (const SourceImage* s : {&src, static_cast<const SourceImage*>(&bright)}) {
+    FilmMatchInfo mi;
+    const float ev = matchFilmExposure(p, cam, nullptr, *s, &mi);
+    const float normal = medianLightness(Renderer(plain, cam, nullptr).renderFloat(*s, false));
+    EditParams m = p;
+    m.filmKeyEv = ev;
+    const float film = medianLightness(Renderer(m, cam, nullptr).renderFloat(*s, false));
+    const float film0 = medianLightness(Renderer(p, cam, nullptr).renderFloat(*s, false));
+    std::printf("  film match: ev %+.2f  L* develop %.1f  film unmatched %.1f  matched %.1f  (%d evals)\n", ev, normal, film0, film, mi.evals);
+    CHECK(std::fabs(film - normal) < 2.0f);
+    CHECK(std::fabs(film - normal) <= std::fabs(film0 - normal) + 0.01f);
+    CHECK(std::fabs(ev) <= 4.0f);
+  }
+  // no film: nothing to match
+  CHECK(matchFilmExposure(plain, cam, nullptr, src) == 0.f);
+  // the user's film exposure stays an offset on top of the matched exposure
+  EditParams a = p, b = p;
+  a.filmKeyEv = 1.f;
+  b.filmKeyEv = 0.f;
+  b.filmExposure = 1.f;
+  CHECK(meanAbsDiff(Renderer(a, cam, nullptr).renderFloat(src, false), Renderer(b, cam, nullptr).renderFloat(src, false)) < 1e-6);
+}
+
 void testDevelopFilmIntegration() {
   auto lib = library();
   CHECK(lib != nullptr);
@@ -2216,6 +2266,7 @@ int main(int argc, char** argv) {
                      {"spatial_extras", "half-res mixture, boost, single-layer grain, micro-structure", testSpatialExtras},
                      {"editparams_json", "EditParams film keys (JSON, combine, schema)", testEditParamsFilmJson},
                      {"develop_film", "develop pipeline with film (renderer)", testDevelopFilmIntegration},
+                     {"film_match", "film exposure keeps the photo's key (film_match.h)", testFilmMatch},
                      {"c_api", "film C API", testFilmCApi},
                      {"validation", "parameter validation + extreme values", testParamValidation},
                      {"strong_guarantee", "setParams strong exception guarantee", testSetParamsStrongGuarantee},

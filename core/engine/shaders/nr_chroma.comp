@@ -3,7 +3,7 @@
 // is sampled bilinearly and blended in where the pixel's luminance agrees with the smoothed one. The grid is local
 // to the working image; its origin is a multiple of the factor, so tiles see the same grid as the whole picture.
 #extension GL_GOOGLE_include_directive : enable
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
 #include "common.glsl"
 
 layout(std140, binding = 0) uniform P {

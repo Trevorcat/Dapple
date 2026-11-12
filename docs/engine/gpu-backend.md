@@ -1,5 +1,7 @@
 # Dapple GPU 计算后端设计（含 spike 与阶段 1 生产后端）
 
+> 更新（2026-11-12，GPU 执行器工程师）：本文的 `Backend` / `Session` / `hookRenderFrame` / `hookExport` / `gpu_frame` 已被引擎 API 取代：GPU 路径现在是 `Planner::plan` -> `GpuExecutor::run` -> `gpuImplFor(...).recordPorts`，执行器选择（Vulkan -> GLES 3.1 -> CPU）在 `EngineSession`。新的结构、测试与数字见 `docs/engine/pipeline-architecture.md` 第 19 节；下面第 10 节起的文件表是阶段 1 的历史记录。
+
 状态：**阶段 1 已完成**（生产 Vulkan 后端，见第 10 节；`core/gpu/`，`-DDAPPLE_GPU=ON`，运行时开关默认关闭）。第 0-9 节是设计与 spike 阶段的依据，第 7 节的 spike 代码已被生产后端取代（结果保留作历史记录）。本文给出决策与依据；凡标注「实测」的数字来自本机 spike，标注「待实机」的需要在真机上验证（spike 期间不得触碰车主的真机，只跑了 x86_64 模拟器）。
 
 ## 0. 结论速览

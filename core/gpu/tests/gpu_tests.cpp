@@ -16,12 +16,14 @@
 #include "dapple/dapple_c.h"
 #include "dapple/encode.h"
 #include "dapple/edit_params.h"
-#include "dapple/gpu.h"
 #include "dapple/renderer.h"
+#include "engine/exec/gpu_executor.h"
+#include "gpu_rig.h"
 #include "parity.h"
 
 using namespace dapple;
 using namespace dapple::gpu;
+namespace eg = dapple::engine::gpu;
 
 namespace {
 
@@ -37,7 +39,7 @@ int g_fail = 0;
   } while (0)
 
 struct Env {
-  std::shared_ptr<Backend> be;
+  std::shared_ptr<eg::Context> be;
   CameraRegistry cams = CameraRegistry::withBuiltins();
 };
 
@@ -126,6 +128,15 @@ const std::vector<Stage>& stages() {
        [](FastOptions& o) { o.spatial = SpatialQuality::Interactive; o.noise = false; }},
       {"zoom region 1:1", [](EditParams& p) { p.clarity = 20; p.sharpen = 40; },
        [](FastOptions& o) { o.region = RenderRegion{0.3f, 0.35f, 0.6f, 0.65f, 400}; }},
+      // film frames on the GPU (pipeline-architecture.md section 20): the film chain, then vignette + window nodes
+      {"film portra400, all effects", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }},
+      {"film velvia (slide), no grain", [](EditParams& p) { p.filmStock = "fujifilm_velvia_100"; p.filmGrain = 0; }},
+      {"film + geometry + vignette", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.straighten = 3.f; p.crop = "4:5"; p.vignette = -30; }},
+      {"film + NR, clarity, sharpen", [](EditParams& p) { p.filmStock = "kodak_ektar_100"; p.nrLuma = 30; p.clarity = 30; p.sharpen = 50; }},
+      {"film interactive", [](EditParams& p) { p.filmStock = "kodak_portra_400"; },
+       [](FastOptions& o) { o.spatial = SpatialQuality::Interactive; o.noise = false; }},
+      {"film interactive, grain drag", [](EditParams& p) { p.filmStock = "kodak_portra_400"; },
+       [](FastOptions& o) { o.spatial = SpatialQuality::Interactive; o.noise = false; o.keepGrain = true; o.fullLongEdge = 3000; }},
   };
   return s;
 }
@@ -136,7 +147,7 @@ struct Row {
 };
 
 // one parity run: GPU vs CPU reference on `src`
-bool runStage(Env& env, Session& sess, const SourceImage& src, const Stage& st, Row& row, const char* tag, bool quiet = false) {
+bool runStage(Env& env, Rig& rig, const SourceImage& src, const Stage& st, Row& row, const char* tag, bool quiet = false) {
   EditParams p = baseParams();
   st.set(p);
   const CameraProfile& cam = env.cams.resolve("", "");
@@ -159,7 +170,7 @@ bool runStage(Env& env, Session& sess, const SourceImage& src, const Stage& st, 
   }
   std::uint8_t* cpu = r.renderBakedRgba(*refSrc, *lut, fo, w, h);
   std::string err;
-  std::uint8_t* gpu = sess.render(r, *lut, fo, FrameOptions{}, gw, gh, nullptr, err);
+  std::uint8_t* gpu = rig.render(p, r, src, fo, 41, gw, gh, nullptr, err);
   if (!cpu || !gpu || w != gw || h != gh) {
     std::printf("  %-38s %s: render failed: %s (cpu %dx%d gpu %dx%d)\n", st.name, tag, err.c_str(), w, h, gw, gh);
     std::free(cpu);
@@ -195,14 +206,12 @@ void testStages(Env& env) {
   };
   for (Sz z : {Sz{640, 448}, Sz{1536, 1024}}) {
     const SourceImage src = makeTestImage(z.w, z.h);
-    auto sess = env.be->createSession();
-    std::string err;
-    CHECK(sess->setSource(src, 1, err), "%s", err.c_str());
+    Rig rig(env.be, src, env.cams.resolve("", ""));
     char tag[32];
     std::snprintf(tag, sizeof tag, "%dx%d", z.w, z.h);
     for (const Stage& st : stages()) {
       Row row;
-      if (!runStage(env, *sess, src, st, row, tag)) {
+      if (!runStage(env, rig, src, st, row, tag)) {
         ++g_fail;
         continue;
       }
@@ -258,12 +267,9 @@ void testDownscale(Env& env) {
     FastOptions fo;
     int w = 0, h = 0, gw = 0, gh = 0;
     std::uint8_t* cpu = r.renderBakedRgba(small, *lut, fo, w, h);
-    auto sess = env.be->createSession();
+    Rig rig(env.be, src, cam);
     std::string err;
-    CHECK(sess->setSource(src, 1, err), "%s", err.c_str());
-    FrameOptions frame;
-    frame.srcLongEdge = longEdge;
-    std::uint8_t* gpu = sess->render(r, *lut, fo, frame, gw, gh, nullptr, err);
+    std::uint8_t* gpu = rig.render(p, r, small, fo, 41, gw, gh, nullptr, err);  // tables and frame size from the CPU Lanczos copy; the GPU resizes the full source itself
     CHECK(cpu && gpu && w == gw && h == gh, "size %dx%d vs %dx%d: %s", w, h, gw, gh, err.c_str());
     if (cpu && gpu && w == gw && h == gh) {
       const DeStats s = compareRgba8(gpu, cpu, std::size_t(w) * h);
@@ -296,31 +302,23 @@ void testTiling(Env& env, bool stream, int pw = 1500, int ph = 1000, std::vector
     c.set(p);
     Renderer r(p, cam, nullptr);
     FastOptions fo;
-    const auto lut = r.bake(src, 41);
-    auto sess = env.be->createSession();
+    Rig rig(env.be, src, cam);
     std::string err;
-    CHECK(sess->setSource(src, 1, err), "%s", err.c_str());
-    FrameOptions frame;
-    frame.srcLongEdge = c.longEdge;
-    frame.resizeSharpen = c.longEdge ? 0.2f : 0.f;
+    const float rsharp = c.longEdge ? 0.2f : 0.f;
     int w = 0, h = 0;
-    std::uint8_t* whole = sess->render(r, *lut, fo, frame, w, h, nullptr, err);
+    std::uint8_t* whole = rig.render(p, r, src, fo, 41, w, h, nullptr, err, c.longEdge, rsharp);
     CHECK(whole != nullptr, "%s", err.c_str());
     if (!whole) continue;
     for (int tile : tiles) {
       std::vector<std::uint8_t> img(std::size_t(w) * h * 4, 0);
       std::size_t covered = 0;
-      ExportOptions eo;
-      eo.tile = tile;
-      eo.frame = frame;
-      eo.forceStream = stream;
-      eo.sink = [&](int x, int y, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
+      auto sink = [&](int x, int y, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
         for (int j = 0; j < th; ++j) std::memcpy(img.data() + (std::size_t(y + j) * w + x) * 4, rgba + std::size_t(j) * stride, std::size_t(tw) * 4);
         covered += std::size_t(tw) * th;
         return true;
       };
-      FrameStats st;
-      const bool ok = sess->exportTiled(r, src, *lut, fo, eo, &st, err);
+      engine::GpuStats st;
+      const bool ok = rig.exportTiled(p, r, src, c.longEdge, 41, tile, stream, rsharp, nullptr, sink, &st, err);
       CHECK(ok, "export: %s", err.c_str());
       if (!ok) continue;
       CHECK(covered == std::size_t(w) * h, "covered %zu of %zu", covered, std::size_t(w) * h);
@@ -348,17 +346,15 @@ void testSteadyState(Env& env) {
   p.sharpen = 50;
   p.dehaze = 20;
   const CameraProfile& cam = env.cams.resolve("", "");
-  auto sess = env.be->createSession();
+  Rig rig(env.be, src, cam);
   std::string err;
-  sess->setSource(src, 1, err);
   std::size_t pooled = 0;
   for (int i = 0; i < 12; ++i) {
     p.exposure = 0.1f * float(i % 5);  // parameters change every frame: new bake, new lattice, same sizes
     Renderer r(p, cam, nullptr);
-    const auto lut = r.bake(src, 41);
     int w, h;
-    FrameStats st;
-    std::uint8_t* o = sess->render(r, *lut, FastOptions{}, FrameOptions{}, w, h, &st, err);
+    engine::GpuStats st;
+    std::uint8_t* o = rig.render(p, r, src, FastOptions{}, 41, w, h, &st, err);
     CHECK(o != nullptr, "%s", err.c_str());
     std::free(o);
     if (i == 3) pooled = env.be->pooledBytes();
@@ -452,25 +448,25 @@ void testCApiHook(Env& env) {
 
 void testBlocklist() {
   std::printf("== blocklist ==\n");
-  BackendOptions o;
-  o.allowSoftware = true;
+  eg::ContextOptions o;
+  o.device.allowSoftware = true;
   o.selfTest = false;
   // rule matching every device
-  o.blocklist = "name=;reason=test rule";
+  o.device.blocklist = "name=;reason=test rule";
   std::string err;
-  auto b = Backend::create(o, err);
+  auto b = eg::Context::create(o, err);
   CHECK(b == nullptr, "a match-all rule must block the device");
   std::printf("  match-all rule  -> %s\n", err.c_str());
   CHECK(err.find("test rule") != std::string::npos, "reason missing: %s", err.c_str());
-  o.blocklist = "vendor=0xdead;reason=other vendor|name=NoSuchDevice;reason=other name";
-  b = Backend::create(o, err);
+  o.device.blocklist = "vendor=0xdead;reason=other vendor|name=NoSuchDevice;reason=other name";
+  b = eg::Context::create(o, err);
   CHECK(b != nullptr, "non matching rules must not block: %s", err.c_str());
   // software devices are refused unless allowed
-  BackendOptions o2;
+  eg::ContextOptions o2;
   o2.selfTest = false;
-  auto b2 = Backend::create(o2, err);
+  auto b2 = eg::Context::create(o2, err);
   if (b2) {
-    const bool soft = b2->info().deviceType == 4;
+    const bool soft = b2->caps().software;
     CHECK(!soft, "a CPU device was accepted without allowSoftware");
   } else {
     std::printf("  software device refused by default: %s\n", err.c_str());
@@ -482,24 +478,24 @@ void testBlocklist() {
 int main(int argc, char** argv) {
   bool quick = argc > 1 && std::string(argv[1]) == "--quick";
   Env env;
-  BackendOptions o;
-  o.allowSoftware = std::getenv("DAPPLE_GPU_SOFTWARE") && std::getenv("DAPPLE_GPU_SOFTWARE")[0] == '1';
+  eg::ContextOptions o;
+  o.device.allowSoftware = std::getenv("DAPPLE_GPU_SOFTWARE") && std::getenv("DAPPLE_GPU_SOFTWARE")[0] == '1';
   std::string err;
   o.selfTest = !(std::getenv("DAPPLE_GPU_TEST_NOSELF"));
-  env.be = Backend::create(o, err);
+  env.be = eg::Context::create(o, err);
   if (!env.be) {
     std::printf("SKIP/FAIL: no GPU backend: %s\n", err.c_str());
     // No Vulkan device at all is not a failure of the backend (CI machines): report as skipped (ctest SKIP_RETURN_CODE 77).
     return err.find("no Vulkan") != std::string::npos || err.find("no usable Vulkan device") != std::string::npos ? 77 : 1;
   }
-  std::printf("%s\nself-test: %s\n\n", env.be->info().text().c_str(), env.be->selfTestReport().c_str());
+  std::printf("%s\nself-test: %s\n\n", env.be->deviceText().c_str(), env.be->selfTestReport().c_str());
   testStages(env);
   if (!quick) {
     testHalfBudget(env);
     testDownscale(env);
     testTiling(env, false);
     testTiling(env, true);
-    if (env.be->info().deviceType != 4) testTiling(env, true, 4000, 2667, {512, 1000, 2048});  // radii ~2x: larger halos
+    if (!env.be->caps().software) testTiling(env, true, 4000, 2667, {512, 1000, 2048});  // radii ~2x: larger halos
     testSteadyState(env);
     testCApiHook(env);
     testBlocklist();

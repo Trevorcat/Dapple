@@ -1,0 +1,168 @@
+#version 450
+// Gaussian-mixture engine of the film nodes on all three channels at once (RGBA32F planes, alpha unused): the batched form of
+// film_mix.comp (docs/engine/pipeline-architecture.md section 20.3). One component slot j = one Gaussian of every channel (a channel
+// without a j-th component has zero taps), so a pass filters up to four components x three channels while it reads the source once.
+//   MODE 0  down   2x2 box average, last column / row replicated for odd sizes (down2Row)
+//   MODE 1  fir h  up to four components: horizontal FIR (scipy 'reflect', half taps unit sum) of the source -> four RGBA16F planes
+//                  (half precision: the planes are one filter stage from the result, relative error 5e-4; the bandwidth is the limit of these passes)
+//   MODE 2  fir v  vertical FIR of those planes, taps premultiplied by the component weight, summed, plus the accumulator:
+//                  BASE = 1: w0 * A + [Catmull-Rom 2x upsample of B]  (levelCombine's accumulator initialisation)
+//                  BASE = 0: A (the partial result of an earlier chunk of components)
+//   MODE 3  base   w0 * A + [Catmull-Rom 2x upsample of B]   (no component at this level)
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+#ifndef MODE
+#define MODE 0
+#endif
+layout(constant_id = 0) const int NJ = 4;          // components in this pass (1..4)
+layout(constant_id = 1) const bool BASE = true;    // MODE 2
+layout(constant_id = 2) const bool HAS_UP = false; // MODE 2 / 3: an upsampled lower level is added
+
+layout(std140, binding = 0) uniform P {
+  ivec4 dim;     // w, h (of the output), r (largest radius of the pass), offset of the pass's tap table in `tv` (vec4 units)
+  ivec4 sz;      // MODE 0: size of the source; MODE 2 / 3: size of the low-resolution plane B (the allocation is larger); MODE 2: zw = workgroup shape
+  vec4 w0;       // per channel weight of A
+} u;
+
+// component j, tap k of the pass: tv[dim.w + j * 20 + k].rgb = tap of channel r, g, b (host written while recording)
+#if MODE == 0
+layout(binding = 1) uniform sampler2D uA;
+layout(binding = 2, rgba16f) uniform writeonly image2D uOut;
+#elif MODE == 1
+layout(binding = 1) uniform sampler2D uA;
+layout(binding = 2, rgba16f) uniform writeonly image2D uT0;
+layout(binding = 3, rgba16f) uniform writeonly image2D uT1;
+layout(binding = 4, rgba16f) uniform writeonly image2D uT2;
+layout(binding = 5, rgba16f) uniform writeonly image2D uT3;
+layout(binding = 6, std430) readonly buffer Taps { vec4 tv[]; };
+#elif MODE == 2
+layout(binding = 1) uniform sampler2D uT0;
+layout(binding = 2) uniform sampler2D uT1;
+layout(binding = 3) uniform sampler2D uT2;
+layout(binding = 4) uniform sampler2D uT3;
+layout(binding = 5) uniform sampler2D uA;
+layout(binding = 6) uniform sampler2D uB;
+layout(binding = 7, rgba16f) uniform writeonly image2D uOut;
+layout(binding = 8, std430) readonly buffer Taps { vec4 tv[]; };
+#else
+layout(binding = 1) uniform sampler2D uA;
+layout(binding = 2) uniform sampler2D uB;
+layout(binding = 3, rgba16f) uniform writeonly image2D uOut;
+#endif
+
+// h16: round a float to the nearest half exactly (common.glsl), so the intermediate planes do not depend on the driver's rounding mode
+float h16(float x) {
+  uint u = floatBitsToUint(x);
+  u += 0xFFFu + ((u >> 13) & 1u);
+  return uintBitsToFloat(u & ~0x1FFFu);
+}
+vec4 h16v(vec4 v) { return vec4(h16(v.x), h16(v.y), h16(v.z), v.w); }
+
+// w * a without turning a zero weight times a non-finite value into NaN (levelCombine skips a zero w0)
+vec3 scaledBy(vec3 w, vec3 a) {
+  return vec3(w.x != 0.0 ? w.x * a.x : 0.0, w.y != 0.0 ? w.y * a.y : 0.0, w.z != 0.0 ? w.z * a.z : 0.0);
+}
+
+int reflectIdx(int i, int n) {
+  if (n == 1) return 0;
+  const int period = 2 * n;
+  // floor modulo without the GLSL '%' on negative operands (undefined in the specification)
+  const int q = i >= 0 ? i / period : -((-i + period - 1) / period);
+  i -= q * period;
+  return i < n ? i : period - 1 - i;
+}
+
+#if MODE == 2 || MODE == 3
+vec3 upsampled(ivec2 p) {
+  // levelCombine up path: even / odd output column and row use the two Catmull-Rom phases (t = 0.75 / 0.25)
+  const ivec2 lsz = u.sz.xy;
+  const float wE[4] = float[4](-0.0234375, 0.2265625, 0.8671875, -0.0703125);
+  const float wO[4] = float[4](-0.0703125, 0.8671875, 0.2265625, -0.0234375);
+  const int jy = p.y >> 1, ix = p.x >> 1;
+  const int byy = (p.y & 1) != 0 ? jy - 1 : jy - 2;
+  const int bxx = (p.x & 1) != 0 ? ix - 1 : ix - 2;
+  vec3 acc = vec3(0.0);
+  for (int t = 0; t < 4; ++t) {
+    const int row = reflectIdx(byy + t, lsz.y);
+    vec3 rowAcc = vec3(0.0);
+    for (int k = 0; k < 4; ++k)
+      rowAcc += ((p.x & 1) != 0 ? wO[k] : wE[k]) * texelFetch(uB, ivec2(reflectIdx(bxx + k, lsz.x), row), 0).rgb;
+    acc += ((p.y & 1) != 0 ? wO[t] : wE[t]) * rowAcc;
+  }
+  return acc;
+}
+#endif
+
+#if MODE == 2
+// The vertical pass stages a column tile of every component plane in shared memory (rows + 2 r, 16 columns): the 2 r + 1 taps then
+// cost shared-memory reads instead of texture fetches (the texture unit was the limit of this pass).
+shared vec4 sm[54 * 16];  // (16 rows + 2 * 19) x 16 columns
+
+vec4 fetchT(int j, ivec2 q) {
+  if (j == 0) return texelFetch(uT0, q, 0);
+  if (j == 1) return texelFetch(uT1, q, 0);
+  if (j == 2) return texelFetch(uT2, q, 0);
+  return texelFetch(uT3, q, 0);
+}
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  const ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+  const int LX = u.sz.z, LY = u.sz.w;  // workgroup shape (spec constants 16 / 17), passed in because GLES translation cannot constant-fold gl_WorkGroupSize
+  const ivec2 org = ivec2(gl_WorkGroupID.xy) * ivec2(LX, LY);
+  const int r = u.dim.z, w = u.dim.x, h = u.dim.y;
+  const int rows = LY + 2 * r;
+  vec3 acc = vec3(0.0);
+  for (int j = 0; j < NJ; ++j) {
+    barrier();
+    for (int i = lid.y * LX + lid.x; i < rows * LX; i += LX * LY) {
+      const int rr = i / LX, cc = i - (i / LX) * LX;
+      sm[i] = fetchT(j, ivec2(min(org.x + cc, w - 1), reflectIdx(org.y - r + rr, h)));
+    }
+    barrier();
+    const int c0 = (lid.y + r) * LX + lid.x;
+    vec3 a = tv[u.dim.w + j * 20].rgb * sm[c0].rgb;
+    for (int k = 1; k <= r; ++k) a += tv[u.dim.w + j * 20 + k].rgb * (sm[c0 - k * LX].rgb + sm[c0 + k * LX].rgb);
+    acc += a;
+  }
+  if (p.x >= w || p.y >= h) return;
+  vec3 base = texelFetch(uA, p, 0).rgb;
+  if (BASE) {
+    base = scaledBy(u.w0.rgb, base);
+    if (HAS_UP) base += upsampled(p);
+  }
+  imageStore(uOut, p, h16v(vec4(base + acc, 1.0)));
+}
+#else
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.dim.x || p.y >= u.dim.y) return;
+#if MODE == 0
+  const int sw = u.sz.x, sh = u.sz.y;
+  const int ya = min(2 * p.y, sh - 1), yb = min(2 * p.y + 1, sh - 1);
+  vec4 v;
+  if (2 * p.x + 1 < sw)
+    v = 0.25 * (texelFetch(uA, ivec2(2 * p.x, ya), 0) + texelFetch(uA, ivec2(2 * p.x + 1, ya), 0) +
+                texelFetch(uA, ivec2(2 * p.x, yb), 0) + texelFetch(uA, ivec2(2 * p.x + 1, yb), 0));
+  else
+    v = 0.5 * (texelFetch(uA, ivec2(2 * p.x, ya), 0) + texelFetch(uA, ivec2(2 * p.x, yb), 0));
+  imageStore(uOut, p, h16v(vec4(v.rgb, 1.0)));
+#elif MODE == 1
+  const int r = u.dim.z, w = u.dim.x;
+  const vec3 c0 = texelFetch(uA, p, 0).rgb;
+  vec3 acc[4];
+  for (int j = 0; j < NJ; ++j) acc[j] = tv[u.dim.w + j * 20].rgb * c0;
+  for (int k = 1; k <= r; ++k) {
+    const vec3 s = texelFetch(uA, ivec2(reflectIdx(p.x - k, w), p.y), 0).rgb + texelFetch(uA, ivec2(reflectIdx(p.x + k, w), p.y), 0).rgb;
+    for (int j = 0; j < NJ; ++j) acc[j] += tv[u.dim.w + j * 20 + k].rgb * s;
+  }
+  imageStore(uT0, p, h16v(vec4(acc[0], 1.0)));
+  if (NJ > 1) imageStore(uT1, p, h16v(vec4(acc[1], 1.0)));
+  if (NJ > 2) imageStore(uT2, p, h16v(vec4(acc[2], 1.0)));
+  if (NJ > 3) imageStore(uT3, p, h16v(vec4(acc[3], 1.0)));
+#else
+  vec3 v = scaledBy(u.w0.rgb, texelFetch(uA, p, 0).rgb);
+  if (HAS_UP) v += upsampled(p);
+  imageStore(uOut, p, h16v(vec4(v, 1.0)));
+#endif
+}
+#endif

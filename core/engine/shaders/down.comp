@@ -3,7 +3,7 @@
 // stored as is (MODE 0), as (Y, Y^2) for the guided filter (MODE 1) or as (R-Y, B-Y, Y) for the chroma noise
 // reduction (MODE 2). A source window (interior of a tile) can be written at an offset of a larger low-resolution
 // grid, so the global analysis of a tiled export is assembled tile by tile.
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
 layout(constant_id = 0) const int MODE = 0;
 
 layout(std140, binding = 0) uniform P {

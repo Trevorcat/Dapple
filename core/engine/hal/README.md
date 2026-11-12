@@ -9,8 +9,8 @@ Plan of record: docs/engine/pipeline-architecture.md (5.2, 5.9, 6, 16). This is 
 | HAL | `hal/hal.h`, `hal/hal.cpp`, `hal/vk/vk_device.cpp` | Compute-only device: buffers, images, pipelines (SPIR-V table generated at build time), `CommandList` (bind / setParams / dispatch / barrier masks / copies / `flushPart`), fences, blocklist, caps. Vulkan 1.0 backend; GLES 3.1 maps onto the same interface. |
 | Scheduler | `exec/gpu_scheduler.{h,cpp}` | `GpuGraph` (passes with resource uses), dependency layering, barrier class masks from real RAW/WAR/WAW only, `GpuPool` of transient images (acquire at first use, release after last use), submission splitting by estimated workgroups. |
 | Node records | `nodes/gpu_common.*`, `nodes/{point,nr,dehaze,detail,resize}/gpu.cpp`, `nodes/gpu_nodes.*` | One record function per main node; `gpuImplFor(NodeType)` is the `GpuImpl` table (shader names, typed `recordPorts`, recipe / epilogue flags). |
-| Executor | `exec/gpu_executor.*`, `exec/gpu_frame.*` | `Core` (device, pool, per-slot staging / readback / weights buffers), `gpu::Backend` / `gpu::Session` (public API in `core/gpu/include/dapple/gpu.h`): resident source, lattice cache, whole-frame render, tiled export, self-test, device rebuild. `buildFrame` is the fixed-order stand-in for the Planner's stage list. |
-| Selection | `core/gpu/src/hook.cpp` | unsupported -> CPU frame; transient -> CPU frame, GPU stays; device lost -> rebuild once, second loss / failed rebuild -> CPU for the process. Counters in `dapple_gpu_status_json`. |
+| Executor | `exec/gpu_executor.{h,cpp}`, `exec/gpu_context.cpp`, `exec/gpu_iface.h`, `exec/source_store.h` | `gpu::Core` (device, pool, per-slot staging / readback / weights buffers), `gpu::Context` (process-wide: Vulkan -> GLES 3.1 selection through `hal/select.cpp`, start-up self-test through the whole engine, device rebuild, epoch), `gpu::Executor` (`IGpuExecutor`, one per `EngineSession`): walks the stages of a `Plan` (HostTable, TileSweep with fused PointChain + cumulative Window groups, GlobalSolve) and calls `gpuImplFor(type)->recordPorts`; device copies of the source live on a `SourceStore` (shared per context), device tables on a `ResultCache`. |
+| Selection | `exec/engine_session.cpp` (`runOnGpu`) | unsupported -> CPU frame; transient -> release the device copies, retry once, else CPU frame (GPU stays); device lost -> `GpuProvider::recover`: rebuild once; a failed rebuild or a second loss gives the API up and the next one takes over (Vulkan -> GLES 3.1 -> CPU). Counters in `dapple_gpu_status_json`. |
 | Shaders | `engine/shaders/*.comp` | GLSL 450 compute; variants are listed in `core/gpu/CMakeLists.txt` (name, source, defines, binding signature). |
 
 ## Mobile GPU rules kept (docs 16)
@@ -34,8 +34,8 @@ overrides (0 = never).
 
 ## Tests
 
-- `dapple_gpu_tests` (ctest `gpu_parity`, `gpu_parity_swiftshader`): per-stage parity (per node) vs the CPU reference, tile seams (0 differing pixels), streamed source, C API.
-- `dapple_gpu_engine_tests` (ctest `engine.gpu_{hal,box,sched,select}` and `_swiftshader`): HAL, box accuracy / tile invariance, barrier layering, steady-state pool, split submissions, selection policy with injected failures and a real device rebuild. `bench-box` prints the direct vs scan table.
+- `dapple_gpu_tests` (ctest `gpu_parity`, `gpu_parity_swiftshader`, `gles_gpu_parity_angle_*`): per-stage parity (per node) vs the CPU reference through `EngineSession` (Planner -> GpuExecutor, `core/gpu/src/gpu_rig.h`), tile seams (0 differing pixels), streamed source, C API. `DAPPLE_GPU_API=gles` forces the GLES 3.1 device, `DAPPLE_GPU_WG=128` the 128-invocation workgroup shape.
+- `dapple_gpu_engine_tests` (ctest `engine.gpu_{hal,box,sched,select,external}` and `_swiftshader`, `gles_engine_*`): HAL, box accuracy / tile invariance, barrier layering, steady-state pool, split submissions, selection policy through `EngineSession` with injected failures and a real device rebuild, and the zero-readback seam (native handles, frame into an externally owned image with semaphores). `bench-box` prints the direct vs scan table.
 
 ## On-device checklist (Pixel 5 and others, not run in this period)
 

@@ -112,6 +112,7 @@ class VkCmd final : public CommandList {
   void copyBufferToBuffer(BufferH, BufferH, std::uint64_t bytes, std::uint64_t off) override;
   void copyImageToBuffer(ImageH, BufferH, const Rect2&, std::uint64_t off) override;
   void copyImage(ImageH, ImageH, std::uint32_t w, std::uint32_t h) override;
+  Status copyImageToExternal(ImageH src, const ExternalImage& dst, std::uint32_t w, std::uint32_t h) override;
   void timestamp(const char* label) override;
   Status flushPart() override;
   Status status() const override { return err_; }
@@ -139,6 +140,8 @@ class VkCmd final : public CommandList {
   bool haveParams_ = false;
   std::size_t extraUsed_ = 0;
   int tsIdx_ = 0;
+  // semaphores of an ExternalImage copy: attached to the submission that contains the copy (this part or the last)
+  VkSemaphore extWait_ = VK_NULL_HANDLE, extSignal_ = VK_NULL_HANDLE;
   Status err_ = Status::Ok;
 };
 
@@ -168,6 +171,12 @@ class VkDev final : public Device {
   const std::vector<PassTime>& passTimes(FenceH f) const override { return slots_[f.slot < kSlots ? f.slot : 0].times; }
   SubmitStats stats(FenceH f) const override { return slots_[f.slot < kSlots ? f.slot : 0].st; }
   double gpuAccumMs() const override { return gpuAccum_; }
+  bool nativeHandles(NativeHandles* out) const override;
+  bool nativeImage(const ImageH& im, void** vkImage) const override {
+    if (!im.impl || !vkImage) return false;
+    *vkImage = (void*)(std::uintptr_t)static_cast<VImage*>(im.impl)->img;
+    return true;
+  }
   std::vector<std::uint8_t> pipelineCacheBlob() const override;
   void trim() override;
   double splitGroups() const override { return splitGroups_; }
@@ -214,7 +223,7 @@ class VkDev final : public Device {
   Slot slots_[kSlots];
   int nextSlot_ = 0, pinned_ = -1;
   std::uint64_t nextId_ = 1;
-  bool lost_ = false;
+  bool lost_ = false, swapchain_ = false;
   double gpuAccum_ = 0;
   double splitGroups_ = 250000;
   std::size_t budget_ = 0;
@@ -232,6 +241,29 @@ bool VkDev::init(const DeviceOptions& opt, std::string& err) {
   app.apiVersion = instVer >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
   VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
   ici.pApplicationInfo = &app;
+  // Presenter extensions (stage d): offered to an adopting presenter, never required.
+  std::vector<const char*> instExt;
+  if (opt.presentExtensions) {
+    std::uint32_t en = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &en, nullptr);
+    std::vector<VkExtensionProperties> ex(en);
+    if (en) vkEnumerateInstanceExtensionProperties(nullptr, &en, ex.data());
+    auto has = [&](const char* nm) {
+      for (auto& x : ex)
+        if (!std::strcmp(x.extensionName, nm)) return true;
+      return false;
+    };
+    if (has("VK_KHR_surface")) {
+      instExt.push_back("VK_KHR_surface");
+#if defined(__ANDROID__)
+      if (has("VK_KHR_android_surface")) instExt.push_back("VK_KHR_android_surface");
+#elif defined(_WIN32)
+      if (has("VK_KHR_win32_surface")) instExt.push_back("VK_KHR_win32_surface");
+#endif
+    }
+  }
+  ici.enabledExtensionCount = std::uint32_t(instExt.size());
+  ici.ppEnabledExtensionNames = instExt.data();
   VkResult r = vkCreateInstance(&ici, nullptr, &inst_);
   if (r != VK_SUCCESS) return err = vkErr("vkCreateInstance", r), false;
   volkLoadInstance(inst_);
@@ -265,7 +297,13 @@ bool VkDev::init(const DeviceOptions& opt, std::string& err) {
     int fam = -1;
     for (std::uint32_t q = 0; q < qn; ++q)
       if (qf[q].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-        if (fam < 0 || (!(qf[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && qf[q].timestampValidBits > 0)) fam = int(q);
+        // a presenter adopting the device needs a family that can present (the universal graphics + compute one); otherwise the
+        // dedicated compute family is preferred (async compute friendly, timestamps)
+        if (opt.presentExtensions) {
+          if (fam < 0 || ((qf[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && !(qf[std::size_t(fam)].queueFlags & VK_QUEUE_GRAPHICS_BIT))) fam = int(q);
+        } else if (fam < 0 || (!(qf[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && qf[q].timestampValidBits > 0)) {
+          fam = int(q);
+        }
       }
     if (fam < 0) continue;
     DeviceCaps di;
@@ -384,6 +422,20 @@ bool VkDev::init(const DeviceOptions& opt, std::string& err) {
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
+  std::vector<const char*> devExt;
+  if (opt.presentExtensions && !instExt.empty()) {
+    std::uint32_t en = 0;
+    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &en, nullptr);
+    std::vector<VkExtensionProperties> ex(en);
+    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &en, ex.data());
+    for (auto& x : ex)
+      if (!std::strcmp(x.extensionName, "VK_KHR_swapchain")) devExt.push_back("VK_KHR_swapchain");
+    swapchain_ = !devExt.empty();
+    caps_.surfacePresent = swapchain_;
+  }
+  caps_.externalImageWrite = true;
+  dci.enabledExtensionCount = std::uint32_t(devExt.size());
+  dci.ppEnabledExtensionNames = devExt.data();
   r = vkCreateDevice(phys_, &dci, nullptr, &dev_);
   if (r != VK_SUCCESS) return err = vkErr("vkCreateDevice", r), false;
   volkLoadDevice(dev_);
@@ -891,6 +943,47 @@ void VkCmd::copyImage(ImageH src, ImageH dst, std::uint32_t w, std::uint32_t h) 
   ++s_.st.passes;
 }
 
+
+bool VkDev::nativeHandles(NativeHandles* out) const {
+  if (!out || !dev_) return false;
+  out->instance = inst_;
+  out->physicalDevice = phys_;
+  out->device = dev_;
+  out->queue = queue_;
+  out->queueFamily = family_;
+  out->getInstanceProcAddr = reinterpret_cast<void*>(vkGetInstanceProcAddr);
+  out->swapchainEnabled = swapchain_;
+  return true;
+}
+
+Status VkCmd::copyImageToExternal(ImageH src, const ExternalImage& dst, std::uint32_t w, std::uint32_t h) {
+  auto* a = static_cast<VImage*>(src.impl);
+  if (!a || !dst.handle || dst.fmt != Format::RGBA8 || w > dst.w || h > dst.h) return d_.fail("invalid external image", Status::InvalidArgument), fail(Status::InvalidArgument), Status::InvalidArgument;
+  init(a);
+  VkImage ext = (VkImage)dst.handle;
+  VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  b.srcAccessMask = 0;
+  b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  b.oldLayout = VkImageLayout(dst.layoutIn);
+  b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.image = ext;
+  b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+  VkImageCopy c{};
+  c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  c.extent = {w, h, 1};
+  vkCmdCopyImage(cb_, a->img, VK_IMAGE_LAYOUT_GENERAL, ext, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+  b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  b.dstAccessMask = 0;
+  b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  b.newLayout = VkImageLayout(dst.layoutOut);
+  vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+  extWait_ = (VkSemaphore)dst.waitSemaphore;
+  extSignal_ = (VkSemaphore)dst.signalSemaphore;
+  ++s_.st.passes;
+  return Status::Ok;
+}
 void VkCmd::timestamp(const char* label) {
   if (!s_.qp || tsIdx_ >= 511) return;
   s_.passNames.push_back(label ? label : "");
@@ -903,7 +996,18 @@ Status VkCmd::flushPart() {
   VkSubmitInfo sp{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   sp.commandBufferCount = 1;
   sp.pCommandBuffers = &cb_;
+  const VkPipelineStageFlags xferStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  if (extWait_ != VK_NULL_HANDLE) {
+    sp.waitSemaphoreCount = 1;
+    sp.pWaitSemaphores = &extWait_;
+    sp.pWaitDstStageMask = &xferStage;
+  }
+  if (extSignal_ != VK_NULL_HANDLE) {
+    sp.signalSemaphoreCount = 1;
+    sp.pSignalSemaphores = &extSignal_;
+  }
   const VkResult rr = vkQueueSubmit(d_.queue_, 1, &sp, VK_NULL_HANDLE);
+  extWait_ = extSignal_ = VK_NULL_HANDLE;  // consumed by this part
   if (rr != VK_SUCCESS) {
     const Status st = rr == VK_ERROR_DEVICE_LOST ? Status::DeviceLost : Status::Internal;
     d_.fail(vkErr("vkQueueSubmit (split)", rr), st);
@@ -1011,6 +1115,16 @@ Status VkDev::submit(CommandList& cl, FenceH* signal) {
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &c.cb_;
+  const VkPipelineStageFlags xferStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  if (c.extWait_ != VK_NULL_HANDLE) {
+    si.waitSemaphoreCount = 1;
+    si.pWaitSemaphores = &c.extWait_;
+    si.pWaitDstStageMask = &xferStage;
+  }
+  if (c.extSignal_ != VK_NULL_HANDLE) {
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &c.extSignal_;
+  }
   const VkResult r = vkQueueSubmit(queue_, 1, &si, s.fence);
   if (r != VK_SUCCESS) {
     const Status st = r == VK_ERROR_DEVICE_LOST ? Status::DeviceLost : Status::Internal;

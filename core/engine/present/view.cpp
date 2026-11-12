@@ -8,7 +8,13 @@
 #include <mutex>
 #include <string>
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include "dapple/dapple_view.h"
+#ifdef DAPPLE_HAVE_GPU
+#include "engine/exec/gpu_runtime.h"
+#endif
 #include "presenter.h"
 #include "render_loop.h"
 #include "src/sysperf.h"
@@ -41,6 +47,12 @@ struct DappleView {
 
   // stats (loop thread writes, info reads)
   std::atomic<std::uint64_t> shown{0}, failedRender{0}, failedPresent{0}, noTarget{0};
+  // zero readback accounting (loop thread writes): frames the engine wrote straight into the presenter's image vs frames that came
+  // back as host pixels (CPU executor, GLES, film, image too small, device change) and were uploaded
+  std::atomic<std::uint64_t> extFrames{0}, hostFrames{0}, hostBytes{0}, extTooSmall{0}, extRefused{0};
+  std::atomic<double> emaFenceMs{0};
+  // size history of the last frame (mu): capacity of the next external image is estimated from it
+  int histReqLong = 0, histW = 0, histH = 0;
   std::atomic<double> lastRenderMs{0}, lastPresentMs{0}, lastLatencyMs{0}, emaRenderMs{0}, emaPresentMs{0};
   std::atomic<std::int64_t> thermalPollNs{0};
   std::atomic<float> headroom{-1.f};
@@ -80,12 +92,33 @@ struct DappleView {
         rq.bake_size = s.bakeSize;
         DappleImage img{};
         char* an = nullptr;
+        // zero readback: ask the presenter for an image on the engine's device when the size of the frame can be estimated
+        ExternalTarget et;
+        DappleExternalImage ei{};
+        bool ext = false;
+        if (histW > 0 && histH > 0) {
+          const double k = (s.longEdge > 0 && histReqLong > 0) ? double(s.longEdge) / double(histReqLong) : 1.0;
+          const int cw = int(histW * k * 1.03) + 8, ch = int(histH * k * 1.03) + 8;  // headroom: crops / straighten change the size a little
+          std::string berr;
+          ext = presenter->beginExternal(cw, ch, &et, berr);
+          if (ext) {
+            ei.image = et.image;
+            ei.width = et.w;
+            ei.height = et.h;
+            ei.layout_in = et.layoutIn;
+            ei.layout_out = et.layoutOut;
+            rq.external = &ei;
+          } else {
+            ++extRefused;
+          }
+        }
         const std::int64_t t0 = steadyNowNs();
         const int rc = dapple_session_render_frame(session, s.payload.c_str(), s.lutPath.empty() ? nullptr : s.lutPath.c_str(), &rq, &img,
                                                    (s.flags & DAPPLE_FRAME_ANALYSIS) ? &an : nullptr);
         const std::int64_t t1 = steadyNowNs();
         renderMs = msBetween(t0, t1);
-        if (rc != DAPPLE_OK || !img.rgba) {
+        const bool onGpu = rc == DAPPLE_OK && !img.rgba && img.width > 0 && img.height > 0;  // the picture is in the external image
+        if (rc != DAPPLE_OK || (!img.rgba && !onGpu)) {
           status = DAPPLE_VIEW_RENDER_FAILED;
           setErr(std::string("render: ") + dapple_last_error());
         } else {
@@ -93,11 +126,28 @@ struct DappleView {
           h = img.height;
           std::string err;
           PresentTiming pt;
-          const bool ok = presenter->present(img.rgba, w, h, &pt, err);
+          bool ok;
+          if (onGpu) {
+            ok = ext && presenter->presentExternal(w, h, &pt, err);
+            if (!ext) err = "engine returned an external frame that was not asked for";
+          } else {
+            if (ext) ++extTooSmall;  // CPU frame / GLES / image too small: pixels came back
+            ok = presenter->present(img.rgba, w, h, &pt, err);
+          }
           presentMs = msBetween(t1, steadyNowNs());
           if (ok) {
             status = DAPPLE_VIEW_SHOWN;
             lastPending = false;
+            histReqLong = s.longEdge;
+            histW = w;
+            histH = h;
+            if (onGpu) {
+              ++extFrames;
+              emaFenceMs = emaFenceMs.load() == 0 ? pt.fenceMs : emaFenceMs.load() * 0.8 + pt.fenceMs * 0.2;
+            } else {
+              ++hostFrames;
+              hostBytes += std::uint64_t(w) * std::uint64_t(h) * 4;
+            }
           } else {
             status = DAPPLE_VIEW_PRESENT_FAILED;
             setErr("present: " + err);
@@ -127,6 +177,16 @@ struct DappleView {
       emaPresentMs = emaPresentMs.load() == 0 ? presentMs : emaPresentMs.load() * 0.8 + presentMs * 0.2;
     }
     polThermal(steadyNowNs());
+#if defined(__ANDROID__)
+    // diagnostics: one line per 30 shown frames (zero-readback counters + the split of the last frame), logcat tag dapple_view
+    if (status == DAPPLE_VIEW_SHOWN && (shown.load() % 30) == 0)
+      __android_log_print(ANDROID_LOG_INFO, "dapple_view",
+                          "shown %llu ext %llu host %llu hostBytes %llu tooSmall %llu refused %llu | last %dx%d render %.2f ms present %.2f ms "
+                          "latency %.2f ms | ema render %.2f present %.2f fenceWait %.2f",
+                          (unsigned long long)shown.load(), (unsigned long long)extFrames.load(), (unsigned long long)hostFrames.load(),
+                          (unsigned long long)hostBytes.load(), (unsigned long long)extTooSmall.load(), (unsigned long long)extRefused.load(), w, h,
+                          renderMs, presentMs, lat, emaRenderMs.load(), emaPresentMs.load(), emaFenceMs.load());
+#endif
     fire(std::int64_t(s.seq), status, w, h, renderMs, presentMs, lat);
   }
 };
@@ -138,7 +198,7 @@ DappleView* dapple_view_create(const DappleViewOptions* o) {
   const int flags = o ? o->flags : 0;
   std::string err;
   if (flags & DAPPLE_VIEW_NULL_PRESENTER) {
-    v->presenter = makeNullPresenter();
+    v->presenter = makeNullPresenter((flags & DAPPLE_VIEW_NULL_EXTERNAL) != 0);
   } else {
     v->presenter = makeVulkanPresenter(err);
     if (!v->presenter) {
@@ -146,6 +206,9 @@ DappleView* dapple_view_create(const DappleViewOptions* o) {
       return nullptr;
     }
   }
+#ifdef DAPPLE_HAVE_GPU
+  dapple::engine::gpu::installProvider();
+#endif
   DappleView* raw = v.get();
   v->loop = std::make_unique<RenderLoop>([raw](Snapshot&& s, std::int64_t t) { raw->renderFrame(std::move(s), t); },
                                           (flags & DAPPLE_VIEW_TIMER_LOOP) == 0);
@@ -209,6 +272,7 @@ void dapple_view_bind_session(DappleView* v, DappleSession* s) {
   if (!s) v->loop->quiesce(true);
   std::lock_guard<std::mutex> l(v->mu);  // waits for the frame in flight
   v->session = s;
+  v->histW = v->histH = v->histReqLong = 0;  // another photo: sizes unknown
   if (!s) {
     v->last = Snapshot{};
     v->lastPending = false;
@@ -280,18 +344,21 @@ char* dapple_view_info_json(DappleView* v) {
   }
   for (char& c : errCopy)
     if (c == '"' || c == '\\' || c < 32) c = ' ';
-  char buf[960];
+  char buf[1400];
   std::snprintf(buf, sizeof buf,
                 "{\"presenter\":%s,\"loop\":{\"submits\":%llu,\"renders\":%llu,\"dropped\":%llu,\"wakeups\":%llu,\"vsyncs\":%llu,"
                 "\"skippedByCap\":%llu},\"shown\":%llu,\"renderFailed\":%llu,\"presentFailed\":%llu,\"noTarget\":%llu,"
                 "\"renderMs\":%.2f,\"presentMs\":%.2f,\"latencyMs\":%.2f,\"emaRenderMs\":%.2f,\"emaPresentMs\":%.2f,"
-                "\"headroom\":%.3f,\"divisor\":%d,\"adpf\":%s,\"lastError\":\"%s\"}",
+                "\"headroom\":%.3f,\"divisor\":%d,\"adpf\":%s,\"zeroReadback\":{\"externalFrames\":%llu,\"hostFrames\":%llu,"
+                "\"hostBytes\":%llu,\"tooSmall\":%llu,\"refused\":%llu,\"emaFenceMs\":%.2f},\"lastError\":\"%s\"}",
                 pi.c_str(), (unsigned long long)st.submits, (unsigned long long)st.renders, (unsigned long long)st.dropped,
                 (unsigned long long)st.wakeups, (unsigned long long)st.vsyncs, (unsigned long long)st.skippedByCap,
                 (unsigned long long)v->shown.load(), (unsigned long long)v->failedRender.load(),
                 (unsigned long long)v->failedPresent.load(), (unsigned long long)v->noTarget.load(), v->lastRenderMs.load(),
                 v->lastPresentMs.load(), v->lastLatencyMs.load(), v->emaRenderMs.load(), v->emaPresentMs.load(), double(v->headroom.load()),
-                v->userDivisor, dapple::sys::adpf().hintAvailable() ? "true" : "false", errCopy.c_str());
+                v->userDivisor, dapple::sys::adpf().hintAvailable() ? "true" : "false", (unsigned long long)v->extFrames.load(),
+                (unsigned long long)v->hostFrames.load(), (unsigned long long)v->hostBytes.load(), (unsigned long long)v->extTooSmall.load(),
+                (unsigned long long)v->extRefused.load(), v->emaFenceMs.load(), errCopy.c_str());
   char* out = static_cast<char*>(std::malloc(std::strlen(buf) + 1));
   if (out) std::memcpy(out, buf, std::strlen(buf) + 1);
   return out;

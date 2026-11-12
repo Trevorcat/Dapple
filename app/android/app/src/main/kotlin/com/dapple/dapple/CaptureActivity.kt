@@ -221,16 +221,17 @@ class CaptureActivity : ComponentActivity() {
         val dng = File(dir, "DAP_$stamp.dng")
         val ex = ContextCompat.getMainExecutor(this)
         var left = if (raw) 2 else 1
+        var errored = false
         val cb = object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(r: ImageCapture.OutputFileResults) {
-                if (--left == 0) finishCapture(jpg, if (raw) dng else null)
+                if (--left == 0) finishCapture(jpg, if (raw && !errored) dng else null)
             }
 
             override fun onError(e: ImageCaptureException) {
                 Log.w(TAG, "capture failed: $e")
-                // a lost RAW still leaves the JPEG usable
-                if (--left == 0 || (raw && jpg.length() > 0)) finishCapture(jpg, null)
-                else if (jpg.length() == 0L && left <= 0) fail(e.message ?: "capture")
+                // a lost RAW still leaves the JPEG usable; a lost JPEG fails the shot
+                errored = true
+                if (--left == 0) finishCapture(jpg, null)
             }
         }
         try {
