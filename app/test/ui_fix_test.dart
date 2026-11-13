@@ -1,5 +1,7 @@
+import 'dart:io';
+
 import 'package:dapple/editor/panel_layout.dart';
-import 'package:dapple/models.dart';
+import 'package:dapple/platform/test_trigger.dart';
 import 'package:dapple/services/media_permission.dart';
 import 'package:dapple/screens/library/settings_page.dart';
 import 'package:dapple/state/app_state.dart';
@@ -107,6 +109,7 @@ void main() {
     await tester.pump(_t);
     expect(find.textContaining('预览为示例画面'), findsOneWidget);
     expect(find.byKey(const ValueKey('look-warm')), findsOneWidget);
+    expect(find.byType(Image), findsWidgets); // the bundled sample scene, not a flat placeholder
     expect(find.descendant(of: find.byKey(const ValueKey('look-warm')), matching: find.byType(ColorFiltered)), findsOneWidget);
     await shot(tester, 'styles_no_photo');
   });
@@ -136,6 +139,30 @@ void main() {
       await open(const Size(400, 500));
       expect(find.byKey(const ValueKey('seg-handedness')), findsNothing);
       expect(find.byKey(const ValueKey('reset-hand')), findsNothing);
+    });
+  });
+
+  group('test-run trigger files are one-shot', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('trig'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    test('fresh file: consumed once and deleted', () {
+      final f = File('${dir.path}/DAPPLE_OPEN')..writeAsStringSync('style');
+      expect(TestTrigger.consume(f), 'style');
+      expect(f.existsSync(), isFalse);
+      expect(TestTrigger.consume(f), isNull);
+    });
+
+    test('stale file from an earlier session: ignored and removed, the launch stays a normal one', () {
+      final f = File('${dir.path}/autotest.json')..writeAsStringSync('{}');
+      f.setLastModifiedSync(DateTime.now().subtract(const Duration(hours: 5)));
+      expect(TestTrigger.consume(f), isNull);
+      expect(f.existsSync(), isFalse);
+    });
+
+    test('absent file: nothing', () {
+      expect(TestTrigger.consume(File('${dir.path}/none')), isNull);
     });
   });
 }

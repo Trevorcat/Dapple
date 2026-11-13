@@ -17,6 +17,8 @@ import UniformTypeIdentifiers
 
 public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHandler, PHPhotoLibraryChangeObserver, PHPickerViewControllerDelegate {
     private var events: FlutterEventSink?
+    /// Set by the Dart test-run code (ios_autotest / ios_debug_open) for the lifetime of one test launch; never persisted.
+    private static var testRunActive = false
     private var pickResult: FlutterResult?
     private var pickDest: String = ""
     private var pickKnown: Set<String> = []
@@ -227,10 +229,13 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         case "authorizationStatus":
             registerObserverIfAllowed()
             result(statusName(PHPhotoLibrary.authorizationStatus(for: .readWrite)))
+        case "testRun":
+            Self.testRunActive = (a["active"] as? Bool) ?? false
+            result(nil)
         case "requestAuthorization":
-            // test runs (simulator / device scripts) drop Documents/DAPPLE_OPEN: no system prompt then, nobody can answer it
-            let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first ?? ""
-            if FileManager.default.fileExists(atPath: docs + "/DAPPLE_OPEN") || FileManager.default.fileExists(atPath: docs + "/autotest.json") {
+            // only while this launch is a test run (the Dart side consumed a one-shot trigger and said so): nobody can answer the prompt then.
+            // A trigger file in Documents never matters by itself: a normal launch always shows the system prompt.
+            if Self.testRunActive {
                 return result(statusName(PHPhotoLibrary.authorizationStatus(for: .readWrite)))
             }
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { s in DispatchQueue.main.async { self.registerObserverIfAllowed(); result(self.statusName(s)) } }

@@ -26,7 +26,7 @@ class _StylesPageState extends State<StylesPage> {
 
   AppState get app => widget.app;
 
-  /// Preview picture: the first processed photo, else a built-in synthetic scene (a new install has no photo yet: grey tiles told nothing).
+  /// Preview picture: the first processed photo, else a bundled synthetic scene with skin tones, foliage, sky, a grey ramp and saturated accents, on which the looks are distinguishable (a new install has no photo yet).
   static final Photo _sample = Photo(id: 'style-sample', name: 'sample', addedMs: 0, demo: 0, status: PhotoStatus.done);
 
   Photo get _example {
@@ -53,7 +53,9 @@ class _StylesPageState extends State<StylesPage> {
           gray: l.gray * s,
           sepia: l.sepia * s,
           warm: (0.5 - l.py) * 0.8 * s),
-      child: PhotoArt(ph, cacheWidth: 600),
+      child: _isSample
+          ? Image.asset('assets/style_sample/sample.jpg', fit: BoxFit.cover, cacheWidth: 600, gaplessPlayback: true)
+          : PhotoArt(ph, cacheWidth: 600),
     );
   }
 

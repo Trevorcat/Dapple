@@ -74,6 +74,8 @@ flutter:
     - assets/film/film_map.json
     - assets/film/NOTICE.md
     - assets/film/SPEKTRAFILM_LICENSE.txt
+    - assets/style_sample/sample.jpg
+    - assets/style_sample/NOTICE.md
 
   # To add assets to your application, add an assets section, like this:
   # assets:
