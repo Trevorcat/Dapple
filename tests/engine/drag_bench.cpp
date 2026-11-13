@@ -315,6 +315,28 @@ int main(int argc, char** argv) {
     dapple_free_image(&fin);
     return 0;
   }
+  if (filter == "firsts") {  // per stock: the first interactive film frame and the first exact (settled) frame of the process (cold vs second start with DAPPLE_FILM_TABLE_DIR)
+    const char* ids[] = {"kodak_portra_400", "kodak_ektar_100", "fujifilm_velvia_100"};
+    for (const char* st : ids) {
+      double t[2] = {0, 0};
+      for (int exact = 0; exact < 2; ++exact) {
+        char js[200];
+        std::snprintf(js, sizeof js, "{\"film\":\"%s\"}", st);
+        DappleFrameRequest rq{};
+        rq.size = sizeof rq;
+        rq.long_edge = exact ? 1080 : le;
+        rq.flags = exact ? 0 : DAPPLE_FRAME_INTERACTIVE;
+        DappleImage img{};
+        const auto t0 = Clk::now();
+        if (dapple_session_render_frame(s, js, nullptr, &rq, &img, nullptr) != DAPPLE_OK) return 1;
+        t[exact] = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+        dapple_free_image(&img);
+      }
+      std::printf("  %-22s first interactive frame %7.1f ms, first exact frame %7.1f ms\n", st, t[0], t[1]);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // the table writer thread finishes its files
+    return 0;
+  }
   if (filter == "stockslide") {  // the film map selects stocks live while the finger slides (wave 8): 10 stocks in 3 s, frame times and stock tap -> first frame
     const char* ids[] = {"kodak_portra_400", "kodak_ektar_100", "fujifilm_velvia_100", "kodak_vision3_500t", "kodak_portra_160",
                          "kodak_portra_800", "fujifilm_pro_400h", "kodak_gold_200", "kodak_ultramax_400", "fujifilm_provia_100f"};

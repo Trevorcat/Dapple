@@ -7,6 +7,10 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #include <list>
 #include <map>
 #include <mutex>
@@ -326,6 +330,395 @@ bool bakeFilmTables(const FilmResolved& r, FilmTablesHandle& out, std::string* e
   return true;
 }
 
+// ---- film tables on disk (wave 9): "warm from disk" ---------------------------------------------------------------------------------------------
+// The raw / curve / print tables of a stock are baked on the frame thread or the background pool the first time a process meets them (100-300 ms on a
+// phone per stock). A baked table is also written to <cache dir>/film_tables/<key>.bin from a writer thread (never on the frame thread), and the next
+// process finds it there. File = header (magic, format version, 128-bit key, payload length, FNV-1a checksum) + the fields of fd::FilmTables, floats as
+// stored. The key hashes: the content of the loaded pack (libraryContentHash), the build salt (app version + Build.FINGERPRINT), the format version, the
+// table kind and everything the table depends on (stock / paper ids, warmth, tint, print EV, black, mapping, split path, adaptation, LUT size). A file that
+// fails any check (size, magic, version, key, checksum) is deleted and the table is baked as before. Writes go to a per-process temporary name and are
+// renamed into place; the directory is kept under a size cap (default 64 MB, DAPPLE_FILM_DISK_CAP_MB) by deleting the least recently used files (a load
+// touches the file's time). DAPPLE_FILM_TABLE_DIR names a directory when the app did not configure one (tests, benches).
+namespace {
+constexpr std::uint32_t kDiskFormat = 1;
+constexpr std::uint32_t kDiskMagic = 0x42544644u;  // "DFTB"
+struct DiskCfg {
+  std::mutex m;
+  std::string dir, salt;
+  bool configured = false;
+};
+DiskCfg& diskCfg() {
+  static DiskCfg* c = new DiskCfg;
+  return *c;
+}
+std::atomic<unsigned long long> g_diskHits{0}, g_diskMisses{0}, g_diskStores{0}, g_diskCorrupt{0};
+
+bool diskDirOf(std::string& dir, std::string& salt) {
+  DiskCfg& c = diskCfg();
+  std::lock_guard<std::mutex> lock(c.m);
+  if (!c.configured) {
+    if (const char* e = std::getenv("DAPPLE_FILM_TABLE_DIR")) {
+      c.dir = e;
+      c.salt = "env";
+    }
+    c.configured = true;
+  }
+  if (c.dir.empty() || std::getenv("DAPPLE_FILM_DISK_OFF")) return false;
+  dir = c.dir, salt = c.salt;
+  return true;
+}
+
+struct W {
+  std::string b;
+  template <class T>
+  void p(const T& v) {
+    b.append(reinterpret_cast<const char*>(&v), sizeof v);
+  }
+  void arr(const float* a, std::size_t n) { b.append(reinterpret_cast<const char*>(a), n * sizeof(float)); }
+  void vec(const fd::AVec& v) {
+    const std::uint64_t n = v.size();
+    p(n);
+    arr(v.data(), v.size());
+  }
+};
+struct R {
+  const char* q;
+  std::size_t n;
+  bool ok = true;
+  template <class T>
+  T g() {
+    T v{};
+    if (n < sizeof v) {
+      ok = false;
+      return v;
+    }
+    std::memcpy(&v, q, sizeof v);
+    q += sizeof v, n -= sizeof v;
+    return v;
+  }
+  void arr(float* a, std::size_t k) {
+    if (n < k * sizeof(float)) {
+      ok = false;
+      return;
+    }
+    std::memcpy(a, q, k * sizeof(float));
+    q += k * sizeof(float), n -= k * sizeof(float);
+  }
+  void vec(fd::AVec& v) {
+    const std::uint64_t k = g<std::uint64_t>();
+    if (!ok || k > (1ull << 26) || n < k * sizeof(float)) {
+      ok = false;
+      return;
+    }
+    v.resize(std::size_t(k));
+    if (k) std::memcpy(v.data(), q, std::size_t(k) * sizeof(float));
+    q += k * sizeof(float), n -= std::size_t(k) * sizeof(float);
+  }
+};
+std::string serializeTables(const fd::FilmTables& t) {
+  W w;
+  w.arr(t.mIn, 12);
+  w.p(std::int32_t(t.rawN));
+  w.vec(t.raw);
+  w.p(std::int32_t(t.curveN));
+  w.p(t.curveX0);
+  w.p(t.curveInvDx);
+  w.arr(t.gamma, 4);
+  w.vec(t.dn);
+  w.vec(t.d0);
+  w.arr(t.dirQ, 12);
+  w.arr(t.dirQ0, 4);
+  w.p(std::int32_t(t.lutN));
+  w.arr(t.dmin, 4);
+  w.arr(t.dscale, 4);
+  w.vec(t.lut);
+  w.vec(t.srgbDecode);
+  w.arr(t.glareRgb, 4);
+  w.p(std::int32_t(t.split ? 1 : 0));
+  w.vec(t.lut1);
+  w.p(std::int32_t(t.paperN));
+  w.p(t.paperX0);
+  w.p(t.paperInvDx);
+  w.vec(t.paperCurve);
+  w.arr(t.dminS, 4);
+  w.arr(t.dscaleS, 4);
+  w.vec(t.lut3);
+  return std::move(w.b);
+}
+bool deserializeTables(const char* data, std::size_t size, fd::FilmTables& t) {
+  R r{data, size};
+  r.arr(t.mIn, 12);
+  t.rawN = r.g<std::int32_t>();
+  r.vec(t.raw);
+  t.curveN = r.g<std::int32_t>();
+  t.curveX0 = r.g<float>();
+  t.curveInvDx = r.g<float>();
+  r.arr(t.gamma, 4);
+  r.vec(t.dn);
+  r.vec(t.d0);
+  r.arr(t.dirQ, 12);
+  r.arr(t.dirQ0, 4);
+  t.lutN = r.g<std::int32_t>();
+  r.arr(t.dmin, 4);
+  r.arr(t.dscale, 4);
+  r.vec(t.lut);
+  r.vec(t.srgbDecode);
+  r.arr(t.glareRgb, 4);
+  t.split = r.g<std::int32_t>() != 0;
+  r.vec(t.lut1);
+  t.paperN = r.g<std::int32_t>();
+  t.paperX0 = r.g<float>();
+  t.paperInvDx = r.g<float>();
+  r.vec(t.paperCurve);
+  r.arr(t.dminS, 4);
+  r.arr(t.dscaleS, 4);
+  r.vec(t.lut3);
+  return r.ok && r.n == 0;
+}
+std::uint64_t fnv1a(const char* p, std::size_t n) {
+  std::uint64_t h = 14695981039346656037ull;
+  for (std::size_t i = 0; i < n; ++i) h = (h ^ std::uint8_t(p[i])) * 1099511628211ull;
+  return h;
+}
+
+// kind: 0 raw, 1 curves, 2 print (exact), 3 print (coarse)
+Hash128 diskKeyOf(const FilmResolved& r, int kind, const std::string& salt) {
+  Hasher h;
+  h.u64(dapple::film::libraryContentHash());
+  h.str(salt);
+  h.i32(int(kDiskFormat));
+  h.i32(kind);
+  h.str(r.stock->stock);
+  h.i32(r.quality == 0);
+  if (kind == 0 && r.adapt < 1.f && r.sceneX > 0.f) {
+    h.f32(r.sceneX);
+    h.f32(r.sceneY);
+    h.f32(r.adapt);
+  }
+  if (kind >= 2) {
+    h.str(r.paper ? r.paper->stock : std::string());
+    h.i32(r.scan);
+    h.f32(r.warmth);
+    h.f32(r.tint);
+    h.f32(r.printEv);
+    h.f32(r.black);
+    h.i32(dapple::filmPaperMappingEnabled());
+    h.i32(r.fx.enlargerFilter != 0 && r.quality != 0 && !r.scan);
+    h.i32(kind == 3 ? kCoarseLutN : 0);
+  }
+  return h.finish();
+}
+std::filesystem::path diskFile(const std::string& dir, const Hash128& k) { return std::filesystem::path(dir) / (k.hex() + ".bin"); }
+
+bool diskLoad(const std::string& dir, const Hash128& key, fd::FilmTables& out) {
+  namespace fs = std::filesystem;
+  const fs::path p = diskFile(dir, key);
+  std::error_code ec;
+  if (!fs::exists(p, ec)) {
+    ++g_diskMisses;
+    return false;
+  }
+  std::string buf;
+  {
+    std::ifstream in(p, std::ios::binary);
+    if (!in) {
+      ++g_diskMisses;
+      return false;
+    }
+    buf.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  }
+  constexpr std::size_t kHead = 4 + 4 + 16 + 8 + 8;
+  bool good = buf.size() >= kHead;
+  std::uint32_t magic = 0, ver = 0;
+  std::uint64_t ka = 0, kb = 0, len = 0, sum = 0;
+  if (good) {
+    std::memcpy(&magic, buf.data(), 4);
+    std::memcpy(&ver, buf.data() + 4, 4);
+    std::memcpy(&ka, buf.data() + 8, 8);
+    std::memcpy(&kb, buf.data() + 16, 8);
+    std::memcpy(&len, buf.data() + 24, 8);
+    std::memcpy(&sum, buf.data() + 32, 8);
+    good = magic == kDiskMagic && ver == kDiskFormat && ka == key.a && kb == key.b && len == buf.size() - kHead && fnv1a(buf.data() + kHead, std::size_t(len)) == sum;
+  }
+  fd::FilmTables t;
+  if (!good || !deserializeTables(buf.data() + kHead, std::size_t(buf.size() - kHead), t)) {
+    ++g_diskCorrupt;
+    fs::remove(p, ec);  // silent rebuild
+    return false;
+  }
+  out = std::move(t);
+  fs::last_write_time(p, fs::file_time_type::clock::now(), ec);  // least recently used eviction
+  ++g_diskHits;
+  return true;
+}
+
+void diskEnforceCap(const std::string& dir) {
+  namespace fs = std::filesystem;
+  std::uint64_t cap = 64ull << 20;
+  if (const char* e = std::getenv("DAPPLE_FILM_DISK_CAP_MB")) cap = std::uint64_t(std::max(0.0, std::atof(e)) * 1048576.0);
+  std::error_code ec;
+  struct F {
+    fs::path p;
+    fs::file_time_type t;
+    std::uint64_t size;
+  };
+  std::vector<F> files;
+  std::uint64_t total = 0;
+  const auto now = fs::file_time_type::clock::now();
+  for (const auto& e : fs::directory_iterator(dir, ec)) {
+    if (!e.is_regular_file(ec)) continue;
+    const auto sz = std::uint64_t(e.file_size(ec));
+    const auto tm = e.last_write_time(ec);
+    if (e.path().extension() == ".tmp") {  // a writer that died: older than an hour
+      if (now - tm > std::chrono::hours(1)) fs::remove(e.path(), ec);
+      continue;
+    }
+    if (e.path().extension() != ".bin") continue;
+    files.push_back({e.path(), tm, sz});
+    total += sz;
+  }
+  if (total <= cap) return;
+  std::sort(files.begin(), files.end(), [](const F& a, const F& b) { return a.t < b.t; });
+  for (const F& f : files) {
+    if (total <= cap) break;
+    fs::remove(f.p, ec);
+    total -= f.size;
+  }
+}
+
+void diskStoreNow(const std::string& dir, const Hash128& key, const fd::FilmTables& t) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  const std::string payload = serializeTables(t);
+  std::string file;
+  const std::uint32_t magic = kDiskMagic, ver = kDiskFormat;
+  const std::uint64_t len = payload.size(), sum = fnv1a(payload.data(), payload.size());
+  file.append(reinterpret_cast<const char*>(&magic), 4);
+  file.append(reinterpret_cast<const char*>(&ver), 4);
+  file.append(reinterpret_cast<const char*>(&key.a), 8);
+  file.append(reinterpret_cast<const char*>(&key.b), 8);
+  file.append(reinterpret_cast<const char*>(&len), 8);
+  file.append(reinterpret_cast<const char*>(&sum), 8);
+  file += payload;
+  // per-process temporary name (two processes writing the same table must not share a file), then renamed into place
+  static const std::string tag = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" + std::to_string(reinterpret_cast<std::uintptr_t>(&tag));
+  const fs::path dst = diskFile(dir, key), tmp = dst.string() + "." + tag + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+    out.write(file.data(), std::streamsize(file.size()));
+    if (!out) {
+      out.close();
+      fs::remove(tmp, ec);
+      return;
+    }
+  }
+  fs::rename(tmp, dst, ec);
+  if (ec) {  // Windows does not replace an existing file by rename
+    fs::remove(dst, ec);
+    fs::rename(tmp, dst, ec);
+    if (ec) {
+      fs::remove(tmp, ec);
+      return;
+    }
+  }
+  ++g_diskStores;
+  diskEnforceCap(dir);
+}
+
+// One writer thread: the frame thread and the table workers only enqueue a copy.
+struct DiskWriter {
+  std::mutex m;
+  std::condition_variable cv;
+  std::list<std::function<void()>> q;
+  bool started = false;
+  unsigned pending = 0;
+  void post(std::function<void()> fn) {
+    {
+      std::lock_guard<std::mutex> lock(m);
+      if (q.size() > 64) return;  // never an unbounded backlog
+      q.push_back(std::move(fn));
+      ++pending;
+      if (!started) {
+        started = true;
+        std::thread([this] { loop(); }).detach();
+      }
+    }
+    cv.notify_all();
+  }
+  void loop() {
+    for (;;) {
+      std::function<void()> fn;
+      {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] { return !q.empty(); });
+        fn = std::move(q.front());
+        q.pop_front();
+      }
+      try {
+        fn();
+      } catch (...) {
+      }
+      std::lock_guard<std::mutex> lock(m);
+      --pending;
+      cv.notify_all();
+    }
+  }
+  void drain() {
+    std::unique_lock<std::mutex> lock(m);
+    cv.wait(lock, [&] { return pending == 0; });
+  }
+};
+DiskWriter& diskWriter() {
+  static DiskWriter* w = new DiskWriter;
+  return *w;
+}
+
+template <int KIND, class T>
+Status bakeWithDisk(const void* resolved, void** payloadOut, Status (*bake)(const void*, std::span<const void* const>, void**)) {
+  const FilmResolved& r = *static_cast<const FilmResolved*>(resolved);
+  std::string dir, salt;
+  if (!diskDirOf(dir, salt) || !r.stock) return bake(resolved, {}, payloadOut);
+  const Hash128 key = diskKeyOf(r, KIND, salt);
+  {
+    auto t = std::make_unique<T>();
+    if (diskLoad(dir, key, t->t)) {
+      *payloadOut = static_cast<PayloadBase*>(t.release());
+      return Status::Ok;
+    }
+  }
+  const Status s = bake(resolved, {}, payloadOut);
+  if (s == Status::Ok) {
+    const fd::FilmTables copy = payloadAs<T>(*payloadOut)->t;
+    diskWriter().post([dir, key, copy] { diskStoreNow(dir, key, copy); });
+  }
+  return s;
+}
+Status bakeRawDisk(const void* r, std::span<const void* const>, void** out) { return bakeWithDisk<0, RawTable>(r, out, bakeRaw); }
+Status bakeCurvesDisk(const void* r, std::span<const void* const>, void** out) { return bakeWithDisk<1, CurvesTable>(r, out, bakeCurves); }
+Status bakePrintScanDisk(const void* r, std::span<const void* const>, void** out) { return bakeWithDisk<2, PrintTable>(r, out, bakePrintScan); }
+Status bakePrintScanCoarseDisk(const void* r, std::span<const void* const>, void** out) { return bakeWithDisk<3, PrintTable>(r, out, bakePrintScanCoarse); }
+}  // namespace
+
+void setFilmTableDisk(const std::string& dir, const std::string& salt) {
+  DiskCfg& c = diskCfg();
+  std::lock_guard<std::mutex> lock(c.m);
+  c.dir = dir, c.salt = salt, c.configured = true;
+  dapple::setFilmCalibrationDisk(dir, salt);
+}
+void filmTableDiskDrain() { diskWriter().drain(); }
+void filmTableDiskStats(unsigned long long* hits, unsigned long long* misses, unsigned long long* stores, unsigned long long* corrupt) {
+  if (hits) *hits = g_diskHits.load();
+  if (misses) *misses = g_diskMisses.load();
+  if (stores) *stores = g_diskStores.load();
+  if (corrupt) *corrupt = g_diskCorrupt.load();
+}
+bool filmTableDiskRoundTrip(const fd::FilmTables& in, fd::FilmTables& out) {
+  const std::string s = serializeTables(in);
+  return deserializeTables(s.data(), s.size(), out);
+}
+
 // ---- process-wide table cache (Renderer-facing entry) ------------------------------------------------------------------------------------
 namespace {
 template <class T>
@@ -466,7 +859,7 @@ struct PrintWorker {
         have = false;
       }
       try {
-        auto t = cachedTable(printsCoarseLru(), k, bakePrintScanCoarse, rr);
+        auto t = cachedTable(printsCoarseLru(), k, bakePrintScanCoarseDisk, rr);
         if (t) noteLastPrint(b, t);
       } catch (...) {
       }
@@ -523,8 +916,8 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
     hr.f32(r.sceneY);
     hr.f32(r.adapt);
   }
-  out.raw = cachedTable(raws, hr.finish(), bakeRaw, r);
-  out.curves = cachedTable(curves, ks, bakeCurves, r);
+  out.raw = cachedTable(raws, hr.finish(), bakeRawDisk, r);
+  out.curves = cachedTable(curves, ks, bakeCurvesDisk, r);
   const Hash128 kp = hp.finish();
   bool usedStale = false;
   // Interactive frame while a print-table slider moves (r.coarse): the exact table when it is cached, else a coarse one (cached on its own, so
@@ -542,13 +935,13 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
         out.print = staleFor(base), usedStale = out.print != nullptr;
         if (usedStale) g_staleUses.fetch_add(1, std::memory_order_relaxed);
         else g_staleOutstanding.store(false);  // nothing stale was shown (the table baked synchronously below)  // the previous step of the drag (or the settled table it started from)
-        if (!out.print) out.print = cachedTable(printsCoarseLru(), kc, bakePrintScanCoarse, r);  // the first table of this stock: bake here
+        if (!out.print) out.print = cachedTable(printsCoarseLru(), kc, bakePrintScanCoarseDisk, r);  // the first table of this stock: bake here
       }
     } else {
-      out.print = cachedTable(printsCoarseLru(), kc, bakePrintScanCoarse, r);
+      out.print = cachedTable(printsCoarseLru(), kc, bakePrintScanCoarseDisk, r);
     }
   } else {
-    out.print = cachedTable(prints, kp, bakePrintScan, r);
+    out.print = cachedTable(prints, kp, bakePrintScanDisk, r);
   }
   if (out.print && !usedStale) noteLastPrint(base, out.print);
   return out.raw && out.curves && out.print;

@@ -354,6 +354,8 @@ void setLibrary(std::shared_ptr<const FilmLibrary> lib);
 bool setLibraryPath(const std::filesystem::path& path, std::string* err = nullptr);  // loads now
 void setLibraryPathLazy(const std::filesystem::path& path);
 std::shared_ptr<const FilmLibrary> defaultLibrary();  // null when none is available (see lastLibraryError())
+// Hash of the content of the loaded pack file (or profile folder); 0 when the library was installed directly. Keys the film table files on disk.
+std::uint64_t libraryContentHash();
 std::string lastLibraryError();  // why the last lazy / explicit load failed ("" when none did)
 
 // One selectable stock for UIs: id, display name, kind "negative" | "slide" | "paper" (print paper / print film).

@@ -1,6 +1,9 @@
 // Process-wide film library and the pool of simulators with cached bakes (see film.h).
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <vector>
 #include <memory>
 #include <mutex>
 
@@ -16,12 +19,44 @@ struct Registry {
   std::filesystem::path lazyPath;
   bool lazyFailed = false;
   unsigned lazyGen = 0;  // bumped whenever the lazy path / library is replaced
+  std::uint64_t contentHash = 0;  // hash of the loaded pack file (or of the profile folder's file names, sizes and bytes): keys the table files on disk
   std::string lastError;
   std::mutex loadMtx;    // serialises the (slow) lazy load without holding `mtx`
 };
 Registry& registry() {
   static Registry* r = new Registry;  // leaked on purpose (see ThreadPool)
   return *r;
+}
+
+std::uint64_t hashBytes(std::uint64_t h, const char* p, std::size_t n) {  // FNV-1a 64
+  for (std::size_t i = 0; i < n; ++i) h = (h ^ std::uint8_t(p[i])) * 1099511628211ull;
+  return h;
+}
+std::uint64_t hashFileInto(std::uint64_t h, const std::filesystem::path& p) {
+  std::ifstream in(p, std::ios::binary);
+  char buf[1 << 16];
+  while (in) {
+    in.read(buf, sizeof buf);
+    h = hashBytes(h, buf, std::size_t(in.gcount()));
+  }
+  return h;
+}
+std::uint64_t contentHashOfPath(const std::filesystem::path& path) {
+  std::error_code ec;
+  std::uint64_t h = 14695981039346656037ull;
+  if (std::filesystem::is_directory(path, ec)) {
+    std::vector<std::filesystem::path> files;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(path, ec))
+      if (e.is_regular_file(ec)) files.push_back(e.path());
+    std::sort(files.begin(), files.end());
+    for (const auto& f : files) {
+      const std::string n = f.filename().string();
+      h = hashBytes(h, n.data(), n.size());
+      h = hashFileInto(h, f);
+    }
+    return h;
+  }
+  return hashFileInto(h, path);
 }
 
 struct PoolEntry {
@@ -63,7 +98,13 @@ bool setLibraryPath(const std::filesystem::path& path, std::string* err) {
     r.lastError = err ? *err : std::string("cannot load film library");
     return false;
   }
+  const std::uint64_t ch = contentHashOfPath(path);
   setLibrary(std::move(lib));
+  {
+    Registry& r = registry();
+    std::lock_guard<std::mutex> lock(r.mtx);
+    r.contentHash = ch;
+  }
   return true;
 }
 
@@ -103,10 +144,12 @@ std::shared_ptr<const FilmLibrary> defaultLibrary() {
   } catch (const std::exception& e) {
     err = e.what();
   }
+  const std::uint64_t ch = lib ? contentHashOfPath(path) : 0;
   std::lock_guard<std::mutex> lock(r.mtx);
   if (gen != r.lazyGen) return r.lib;  // replaced while loading: the newer setting wins
   if (lib) {
     r.lib = std::move(lib);
+    r.contentHash = ch;
   } else {
     r.lazyFailed = true;
     r.lastError = err.empty() ? "cannot load film library from " + path.string() : err;
@@ -201,4 +244,12 @@ SimulatorLease acquireSimulator(const std::shared_ptr<const FilmLibrary>& lib, c
   return l;
 }
 
+}  // namespace dapple::film
+
+namespace dapple::film {
+std::uint64_t libraryContentHash() {
+  Registry& r = registry();
+  std::lock_guard<std::mutex> lock(r.mtx);
+  return r.lib ? r.contentHash : 0;
+}
 }  // namespace dapple::film

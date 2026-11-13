@@ -334,3 +334,48 @@ Full `check-all` in own dirs: PASS (build, ctest, golden-selfcheck, flutter anal
 ## 35. APK
 
 `build/redmi/app-w9-arm64.apk` (38.3 MB, `libdapple.so` stripped 10,457,520 bytes, debug key, never installed or launched) is built from a clean `git worktree` at HEAD 7ae3b60 plus only my hunks of this round (the working tree's demosaic edits break the Android build of `libraw_decoder.cpp`: libc++ `false_type` / `true_type` unknown class names, `core/src/decoders/libraw_mosaic.inc`, not mine, and they are excluded from the APK). The release lint tasks were skipped by a temporary Gradle init script (the `CodecSelfTest.kt` lint crash), removed again; the worktree is removed. The 2 MB growth of `libdapple.so` over the wave 7 APK (8.41 MB) is in HEAD itself (wave 8b / 8c code), not in this round's hunks.
+
+# Round 9 (touch hint in the app, film tables on disk)
+
+## 36. Item 1: touch hint
+
+State at the start of the turn: the committed hint is the frame-based one (`dapple_session_touch_hint`: the newest interactive request re-rendered at 3x the long edge for `burst_ms`, results dropped, ends when a real frame is requested; `burst_ms < 0` = prepare). A GPU-only "burn" variant (a separable box blur of a scratch image in 2-3 ms slices, two slices in flight so the GPU never idles) was built and measured to get a real frame pre-empted within a slice: it does not lift the clock like real film frames do (frames 6-7 ms after it, against 4 ms after the frame burst; with the slice sizes small enough to pre-empt, no lift at all) and it did not shorten the first frame, so it was removed. The warm-up burst I had added before the seed measurement (200-300 ms of 3x frames, plus raising the thread's priority and pinning it) was measured to change nothing in the result (47-51 ms/Mpx with and without) and was removed; the seed measurement now times a 480x320 frame (the cost per megapixel is not constant: 960x640 measured 58, 480x320 47-53 on the same phone), which is the only change that stayed.
+
+First-frame times after a 3 s pause, 480 px drag, Redmi, hint burst 80 ms (frame burst, scale 3), per touch-to-move delay (no hint: 18-21 ms at every delay, frames 2-30 at 10-11 ms):
+
+| touch-to-move | first frame with hint | frames 11-30 median |
+|---|---|---|
+| 0 ms | 20.6 ms (second frame 96 ms: it waited for the burst frame that was already in flight) | 4.0 |
+| 30 ms | 62.1 ms | 4.1 |
+| 60 ms | 30.2 ms | 4.2 |
+| 100 ms | 3.6 ms | 4.1 |
+
+A real frame cannot pre-empt GPU work already submitted (one queue, no preemption in the HAL): the worst case is the burst frame in flight (up to ~40-60 ms at the low clock) and it only happens when the finger moves within the first ~80 ms after touch-down; scales 2 and 2.5 shorten the wait (first frame 22-57 ms at 30 ms) but do not lift the clock (frames 10-11 ms). A true fix needs a lower-priority queue or a cancellable GPU frame in the HAL: not done. **The app calls the hint**: `EditorEngine.beginInteraction` (the single entry of the pad, strength strip, rulers, film map and crop handles: `editor_controller.dart` and `controls.dart` both end there) calls `DappleSession.touchHint(boundSession, 80)` on the first pointer of a drag, and the "prepare" form once per photo at the first finger-up (an interactive frame exists by then). FFI hunks, kept separate from the demosaic engineer's: `dapple_bindings.dart` (the `_TouchHint` typedefs, the `touchHint` lookup, the field), `dapple_session.dart` (`DappleSession.touchHint`), `editor_engine.dart` (`touchHintBurstMs`, `_hintPreparedFor`, the two calls). `app/test/touch_hint_test.dart` (no-op without a session / symbol, burst length range); `flutter analyze` and `flutter test` clean. Not run in the app. ADPF through the Android app layer was not added: it could not be measured here and the burst already lifts the clock.
+
+## 37. Item 2: film tables on disk ("warm from disk")
+
+`film_tables.cpp`: every raw / curves / print (exact and coarse) table baked by `tablesFor` or the stock worker is written to `<gpu cache dir>/film_tables/<key>.bin` from a writer thread (never the frame thread); the next process loads it instead of baking. File = magic, format version, 128-bit key, payload length, FNV-1a checksum, then all fields of the table; key = pack content hash (`film::libraryContentHash`, new: hash of the loaded pack file or profile folder) + build salt (app version + fingerprint, from `configure`) + format version + kind + stock / paper ids, warmth, tint, print EV, black, mapping, split path, adaptation, LUT size. Corrupt, truncated, wrong-version or wrong-key file = deleted and baked as before; writes go to a per-process temporary name and are renamed; directory kept under 64 MB (`DAPPLE_FILM_DISK_CAP_MB`) by deleting the least recently used files (a load touches the file); `DAPPLE_FILM_TABLE_DIR` selects a directory when the app configured none, `DAPPLE_FILM_DISK_OFF=1` disables. The **print-exposure calibrations** (`filmPrintConstant`, ~190 ms per bucket on the phone) are persisted the same way, one 28-byte checksummed file each (`film_match.cpp`). Grain plan tables are not persisted (they are built per frame size, not per stock).
+
+Tests (`tests/engine/film_disk_tests.cpp`, ctest `film_disk.tables`; the test runs itself as child processes so every load starts with empty memory caches; passes on desktop and on the Redmi): cold run writes >= 3 files; second start loads them all (hits >= 3, 0 stores) with a **bit-identical** content checksum; a flipped byte is detected (1 corrupt, rebuilt with the same content, file replaced, next start clean); a truncated file likewise; another build salt finds nothing and writes its own files; with a 1 MB cap two stocks leave the directory under the cap (and larger without it); four processes baking the same stock into one directory at once leave only whole files, no temporary files, identical content.
+
+Time of the first exact (settled, 1080 px) frame of each stock in a fresh process, `dapple_drag_bench ... firsts` (the first *interactive* frame of a second or third stock is a few ms because it shows the previous stock while the new one is prepared, round 6, so it is not a measure of the stock being ready):
+
+| | no disk | cold (empty dir) | second start | third start |
+|---|---|---|---|---|
+| Redmi portra_400 (first stock: also device, pipelines) | 512 ms | 562 | 512 | 532 |
+| Redmi ektar_100 | 722 | 1010 | **157** | **113** |
+| Redmi velvia_100 | 273 | 418 | **118** | **95** |
+| Redmi first interactive frame of the process (portra) | 1950 | 1932 | 772 | 764 |
+| desktop (RTX) portra_400 | | 192 | **25** | |
+| desktop ektar_100 | | 518 | **10** | |
+| desktop velvia_100 | | 40 | **11** | |
+
+Cold with the disk write costs 0-290 ms more than no disk on the phone (the table copies and the writer thread compete with the frame; not measured separately); the first stock of a process still pays about 500 ms for the device, pipelines and plan upload which the disk does not hold. The directory after three stocks: 30 files, 14 MB.
+
+## 38. Items 3-5 of round 9, and the shared device
+
+Not started: the 16 MiB bands, the re-pointing of `film_match*.cpp`. Seed: re-measured at 480x320: 47-53 ms/Mpx on three runs (at 58 before at 960x640); the seed picks the rung from it as in round 8. `hal::Device* sharedDevice()` for the demosaic node: not added (the provider hands out a Context, not a device; it needs a lease protocol with the presenter's device lease, more than a one-line change).
+
+## 39. Gates and APK (round 9)
+
+Full `check-all` in own dirs: PASS (build, ctest incl. `film_disk.tables`, golden-selfcheck, flutter analyze / test (221), jvm, video-host). Redmi Vulkan: match_cache ok, seqcheck 60 / 0 mismatches, selfcheck 148 / 0, film_gpu frames ok, coverage PASSED, film-tiling PASSED, film_disk ok; GLES frames and film-tiling PASSED. `build/redmi/app-w10-arm64.apk` (36.8 MB, debug key, not installed) = HEAD 42f107b + this round's changes, release lint tasks skipped by a temporary Gradle init script (removed).

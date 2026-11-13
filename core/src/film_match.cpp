@@ -5,6 +5,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <thread>
 #include <map>
 #include <mutex>
 #include <set>
@@ -512,6 +517,92 @@ void scenePlacement(const FilmLatitude& lat, const SceneStats& st, float ev, flo
   if (aboveShoulder) *aboveShoulder = std::max(0.f, (lHi - lat.shoulder) / 0.30103f);
 }
 
+// ---- print-exposure calibrations on disk (wave 9) ----------------------------------------------------------------------------------------------------
+// filmPrintConstant costs ~190 ms per (stock, paper, EV bucket) on a phone and does not depend on the photo: one 40-byte file per constant in the film table
+// directory (setFilmCalibrationDisk, called with the table directory), keyed by the pack content hash + build salt + the cache key, checksummed, written
+// atomically from a detached thread (never on the calling frame thread), a bad file is ignored and recomputed.
+namespace {
+struct CalibDisk {
+  std::mutex m;
+  std::string dir, salt;
+};
+CalibDisk& calibDisk() {
+  static CalibDisk* c = new CalibDisk;
+  return *c;
+}
+std::uint64_t calibFnv(const void* p, std::size_t n, std::uint64_t h = 14695981039346656037ull) {
+  const auto* b = static_cast<const unsigned char*>(p);
+  for (std::size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+  return h;
+}
+std::string calibPath(const std::string& key, std::string& dirOut) {
+  std::string salt;
+  {
+    CalibDisk& c = calibDisk();
+    std::lock_guard<std::mutex> lock(c.m);
+    dirOut = c.dir, salt = c.salt;
+  }
+  if (dirOut.empty()) {  // not configured by the app: the directory of tests and benches
+    if (const char* e = std::getenv("DAPPLE_FILM_TABLE_DIR")) dirOut = e, salt = "env";
+  }
+  if (dirOut.empty() || std::getenv("DAPPLE_FILM_DISK_OFF")) return {};
+  const std::uint64_t pack = film::libraryContentHash();
+  std::uint64_t h = calibFnv(salt.data(), salt.size(), calibFnv(&pack, sizeof pack));
+  h = calibFnv(key.data(), key.size(), h);
+  char nm[64];
+  std::snprintf(nm, sizeof nm, "calib_%016llx.bin", (unsigned long long)h);
+  return (std::filesystem::path(dirOut) / nm).string();
+}
+// layout: magic u32, format u32, key hash u64, value f32, checksum u64 of the preceding bytes
+bool calibLoad(const std::string& path, const std::string& key, float& v) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  char b[28];
+  in.read(b, sizeof b);
+  if (in.gcount() != std::streamsize(sizeof b)) return false;
+  std::uint32_t magic, ver;
+  std::uint64_t kh, sum;
+  float val;
+  std::memcpy(&magic, b, 4), std::memcpy(&ver, b + 4, 4), std::memcpy(&kh, b + 8, 8), std::memcpy(&val, b + 16, 4), std::memcpy(&sum, b + 20, 8);
+  if (magic != 0x42434644u || ver != 1 || kh != calibFnv(key.data(), key.size()) || sum != calibFnv(b, 20) || !std::isfinite(val)) {
+    std::error_code ec;
+    in.close();
+    std::filesystem::remove(path, ec);
+    return false;
+  }
+  v = val;
+  return true;
+}
+void calibStore(const std::string& path, const std::string& key, float v) {
+  char b[28];
+  const std::uint32_t magic = 0x42434644u, ver = 1;
+  const std::uint64_t kh = calibFnv(key.data(), key.size());
+  std::memcpy(b, &magic, 4), std::memcpy(b + 4, &ver, 4), std::memcpy(b + 8, &kh, 8), std::memcpy(b + 16, &v, 4);
+  const std::uint64_t sum = calibFnv(b, 20);
+  std::memcpy(b + 20, &sum, 8);
+  static const std::string tag = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" + std::to_string(reinterpret_cast<std::uintptr_t>(&tag));
+  const std::string tmp = path + "." + tag + ".tmp";
+  std::error_code ec;
+  std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return;
+    out.write(b, sizeof b);
+  }
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    std::filesystem::remove(path, ec);
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) std::filesystem::remove(tmp, ec);
+  }
+}
+}  // namespace
+void setFilmCalibrationDisk(const std::string& dir, const std::string& salt) {
+  CalibDisk& c = calibDisk();
+  std::lock_guard<std::mutex> lock(c.m);
+  c.dir = dir, c.salt = salt;
+}
+
 float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId,
                         float deltaEv) try {
   static std::mutex mtx;
@@ -531,6 +622,22 @@ float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, con
     std::lock_guard<std::mutex> lock(mtx);
     cache[key] = 0.f;
     return 0.f;
+  }
+  std::string calibDir;
+  std::string dkey = key;  // the disk key without the library pointer (the pack content hash is in the file name instead)
+  {
+    const std::string ps = std::to_string(std::uintptr_t(lib.get()));
+    const auto pp = dkey.find("|" + ps);
+    if (pp != std::string::npos) dkey.erase(pp + 1, ps.size());
+  }
+  const std::string calibFile = calibPath(dkey, calibDir);
+  if (!calibFile.empty()) {
+    float dv = 0.f;
+    if (calibLoad(calibFile, dkey, dv)) {
+      std::lock_guard<std::mutex> lock(mtx);
+      cache[key] = dv;
+      return dv;
+    }
   }
   const FilmPrintRange range = filmPrintRange(lib, filmId, paperId);
   if (!range.ok) return 0.f;
@@ -560,6 +667,7 @@ float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, con
   const float ev = solvePrintEv(patch, target, open, &mi);
   std::lock_guard<std::mutex> lock(mtx);
   cache[key] = ev;
+  if (!calibFile.empty()) std::thread([calibFile, dkey, ev] { calibStore(calibFile, dkey, ev); }).detach();
   return ev;
 } catch (...) {
   return 0.f;

@@ -164,6 +164,19 @@ foreach(id equiv rebake keys graph concurrent grain_scale grain_frame fx)
   set_tests_properties(film_nodes.${id} PROPERTIES TIMEOUT 900)
 endforeach()
 
+# Film tables on disk ("warm from disk"): round trip, corruption, version (salt) mismatch, size cap, concurrent processes (it runs itself as child processes).
+add_executable(dapple_film_disk_tests engine/film_disk_tests.cpp)
+target_link_libraries(dapple_film_disk_tests PRIVATE dapple_core)
+target_include_directories(dapple_film_disk_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core)
+target_compile_definitions(dapple_film_disk_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+if(MSVC)
+  target_compile_options(dapple_film_disk_tests PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(dapple_film_disk_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_test(NAME film_disk.tables COMMAND dapple_film_disk_tests WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(film_disk.tables PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+
 # CPU planner / executor tests (steps a5 - a10): byte identity of the Whole plan, tile invariance of TiledExport, plan structure,
 # cancellation, the tonal-analysis key fix. One ctest entry per id.
 add_executable(dapple_exec_tests engine/exec_tests.cpp)

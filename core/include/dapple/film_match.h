@@ -184,6 +184,8 @@ float sceneKeyEv(float keyL);
 void scenePlacement(const FilmLatitude& lat, const SceneStats& st, float ev, float* belowToe, float* aboveShoulder);
 // v5 stage 3: the print exposure (EV, positive = brighter) at which an 18.4 % grey card exposed at box speed + the type convention
 // prints to L* 50 relative to the paper white (paper "none": scan lamp). Calibrated once per (stock, paper), cached, image independent.
+// Directory (and build salt) of the print-exposure calibrations on disk; empty = off. Set by the film table disk configuration.
+void setFilmCalibrationDisk(const std::string& dir, const std::string& salt);
 float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper,
                         float deltaEv = 0.f);
 // The same for a negative whose film EV was moved by `deltaEv` from the shared exposure: the lab prints a denser / thinner
