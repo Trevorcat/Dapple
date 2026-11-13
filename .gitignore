@@ -25,3 +25,5 @@ compile_commands.json
 
 # local Claude Code settings
 /.claude/settings.local.json
+__pycache__/
+*.pyc
