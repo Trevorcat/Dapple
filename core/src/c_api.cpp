@@ -779,7 +779,10 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         opts.quality = quality == DAPPLE_QUALITY_FULL ? DecodeQuality::Full : DecodeQuality::Preview;
         opts.wantLongEdge = long_edge;
 #ifdef DAPPLE_HAVE_GPU
-        if (opts.quality == DecodeQuality::Full) dapple::demosaic::installGpuBackend();  // the decoder's Demosaic node uses the GPU when the runtime switch is on
+        // the decoder's Demosaic node uses the GPU when the runtime switch is on: Full opens, and the preview opens above 2048 (the 2x view of an X-Trans file runs the
+        // half-resolution node, which has its own measured verdict). The backend creates its device lazily on the first node run, so a preview that never runs a
+        // node (a Bayer file binned for 2048) pays nothing here.
+        if (opts.quality == DecodeQuality::Full || long_edge > 2048) dapple::demosaic::installGpuBackend();
 #endif
         const auto t0 = std::chrono::steady_clock::now();
         auto src = decoder->decode(p, opts);
