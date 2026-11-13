@@ -1,4 +1,8 @@
-/tools/
+/tools/*
+!/tools/check-all.sh
+!/tools/emu.sh
+!/tools/env.sh
+!/tools/env.ps1
 /build*/
 /out/
 /.cache/
