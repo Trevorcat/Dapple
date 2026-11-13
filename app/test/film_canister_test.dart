@@ -4,9 +4,12 @@ import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:dapple/model/bases.dart';
+import 'package:dapple/model/film_catalog.dart';
 import 'package:dapple/model/film_map.dart';
 import 'package:dapple/theme/tokens.dart';
 import 'package:dapple/widgets/film_canister.dart';
+import 'package:dapple/widgets/film_canister_palette.dart';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -173,6 +176,124 @@ void main() {
     ));
     expect(t.takeException(), isNull);
     await _savePng(t, k, 'styles_sheet');
+  });
+
+  group('designed palette', () {
+    List<double> lab(Color c) {
+      double lin(double v) => v <= 0.04045 ? v / 12.92 : math.pow((v + 0.055) / 1.055, 2.4).toDouble();
+      final r = lin(c.r), g = lin(c.g), b = lin(c.b);
+      final l = math.pow(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b, 1 / 3), m = math.pow(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b, 1 / 3), s = math.pow(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b, 1 / 3);
+      return [0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s, 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s, 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s];
+    }
+
+    double de(Color a, Color b) {
+      final x = lab(a), y = lab(b);
+      return 100 * math.sqrt(math.pow(x[0] - y[0], 2) + math.pow(x[1] - y[1], 2) + math.pow(x[2] - y[2], 2));
+    }
+
+    test('every stock of the catalog has designed colours (a new stock fails here until someone designs it)', () {
+      for (final s in testFilmCatalog.stocks) {
+        if (s.group == FilmGroup.negative || s.group == FilmGroup.slide || s.group == FilmGroup.cinema) {
+          if (_pos.containsKey(s.id)) expect(kCanisterPalette.containsKey(s.name), isTrue, reason: '${s.id} (${s.name}) has no entry in kCanisterPalette');
+        }
+      }
+      final codes = {for (final s in testFilmCatalog.stocks) s.name};
+      for (final code in kCanisterPalette.keys) {
+        expect(codes, contains(code), reason: '$code is not a stock of the catalog');
+      }
+    });
+
+    test('a stock without an entry still gets the data-driven icon', () {
+      const s = FilmStock('future_stock', 'Future', FilmGroup.negative);
+      final a = CanisterSpec.forStock(s, character: const Offset(0.8, 0.4));
+      final b = CanisterSpec.forStock(s, character: const Offset(-0.8, -0.4));
+      expect(a.body, isNot(b.body));
+      expect(a.kind, CanisterKind.negative);
+    });
+
+    test('bodies are told apart by OKLab distance: everywhere at least 9, map neighbours at least 11; clear of the modern icons', () {
+      final byCode = {for (final s in testFilmCatalog.stocks) s.name: s.id};
+      final ids = kCanisterPalette.keys.toList();
+      Offset ref(String code) => Offset((0.5 + _pos[byCode[code]!]!.dx * kFilmMapX) * kFilmMapRef.width, (0.5 - _pos[byCode[code]!]!.dy * kFilmMapY) * kFilmMapRef.height);
+      var minAll = 999.0, minNb = 999.0;
+      String pairAll = '', pairNb = '';
+      for (var i = 0; i < ids.length; i++) {
+        for (var j = i + 1; j < ids.length; j++) {
+          final d = de(kCanisterPalette[ids[i]]!.body, kCanisterPalette[ids[j]]!.body);
+          if (d < minAll) {
+            minAll = d;
+            pairAll = '${ids[i]}/${ids[j]}';
+          }
+          if ((ref(ids[i]) - ref(ids[j])).distance < 55 && d < minNb) {
+            minNb = d;
+            pairNb = '${ids[i]}/${ids[j]}';
+          }
+        }
+      }
+      // ignore: avoid_print
+      print('palette: min body separation $minAll ($pairAll), min among map neighbours $minNb ($pairNb)');
+      expect(minAll, greaterThanOrEqualTo(9), reason: pairAll);
+      expect(minNb, greaterThanOrEqualTo(11), reason: pairNb);
+      // moderate chroma, mid lightness: nothing fluorescent, nothing invisible on either theme
+      for (final e in kCanisterPalette.entries) {
+        final l3 = lab(e.value.body);
+        expect(math.sqrt(l3[1] * l3[1] + l3[2] * l3[2]), lessThan(0.17), reason: '${e.key} chroma');
+        final L = l3[0];
+        expect(L, inInclusiveRange(0.32, 0.86), reason: e.key);
+      }
+      for (final c in [const Color(0xFFA3AEBB), const Color(0xFFE0D8E8), const Color(0xFFA3A8B1)]) {
+        for (final e in kCanisterPalette.entries) {
+          expect(de(e.value.body, c), greaterThan(6), reason: '${e.key} vs modern/standard icon colour');
+        }
+      }
+    });
+  });
+
+  testWidgets('palette sheet: every stock, round-1 colours above, soft style at 23 / 40 / 72 on light and dark', (t) async {
+    await loadTestFonts();
+    final byCode = {for (final s in testFilmCatalog.stocks) s.name: s.id};
+    final ids = [for (final code in kCanisterPalette.keys) byCode[code]!]; // the table is in family order
+    Widget panel(bool dark) {
+      final c = dark ? DC.darkTheme : DC.light;
+      Text label(String s, {double fs = 10}) => Text(s, style: TextStyle(fontSize: fs, color: c.text2));
+      return Container(
+        color: c.bg,
+        padding: const EdgeInsets.all(10),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            SizedBox(width: 50, child: label(dark ? 'dark' : 'light')),
+            for (final id in ids) SizedBox(width: 62, child: Center(child: label(baseNameOf(testFilmCatalog, id)))),
+          ]),
+          Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+            SizedBox(width: 50, child: label('round 1')),
+            for (final id in ids)
+              SizedBox(width: 62, child: Center(child: BaseIcon(data: BaseIconData.film(CanisterSpec.forStock(testFilmCatalog.stock(id)!, character: _pos[id], designed: false)), size: 40))),
+          ]),
+          const SizedBox(height: 6),
+          Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+            SizedBox(width: 50, child: label('palette')),
+            for (final id in ids)
+              SizedBox(width: 62, child: Column(children: [for (final s in _sizes) Padding(padding: const EdgeInsets.symmetric(vertical: 3), child: BaseIcon(data: _icon(id), size: s))])),
+          ]),
+        ]),
+      );
+    }
+
+    useWindowSized(t, const Size(1340, 520));
+    final k = GlobalKey();
+    await t.pumpWidget(RepaintBoundary(
+      key: k,
+      child: MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: buildTheme(Brightness.light),
+        home: Scaffold(body: Column(children: [
+          Theme(data: buildTheme(Brightness.light), child: panel(false)),
+          Theme(data: buildTheme(Brightness.dark), child: panel(true)),
+        ])),
+      ),
+    ));
+    expect(t.takeException(), isNull);
+    await _savePng(t, k, 'palette_sheet');
   });
 }
 

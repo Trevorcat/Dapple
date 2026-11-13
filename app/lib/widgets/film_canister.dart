@@ -16,6 +16,7 @@ import 'package:flutter/material.dart';
 import '../model/bases.dart';
 import '../model/film_catalog.dart';
 import '../theme/tokens.dart';
+import 'film_canister_palette.dart';
 
 /// flat: two-tone solid fills. soft: a little cylinder shading and highlight. outline: tinted label and body, drawn as lines.
 enum CanisterStyle { flat, soft, outline }
@@ -63,13 +64,15 @@ class CanisterSpec {
     return CanisterSpec(kind: kind, body: body, label: label, cap: cap, accent: accent, ink: ink, code: code);
   }
 
-  /// The spec of a catalog stock; [character] = its place on the film map (x, y in -1..1), null = unknown (neutral).
-  factory CanisterSpec.forStock(FilmStock s, {Offset? character}) => CanisterSpec.of(
-        kind: switch (s.group) { FilmGroup.negative => CanisterKind.negative, FilmGroup.slide => CanisterKind.slide, FilmGroup.cinema => CanisterKind.cinema },
-        richness: character?.dx ?? 0,
-        contrast: character?.dy ?? 0,
-        code: s.name,
-      );
+  /// The spec of a catalog stock: its designed colours ([kCanisterPalette], keyed by the display code) when it has an entry, else the data-driven colours of [CanisterSpec.of]
+  /// from [character] (its place on the film map, x, y in -1..1; null = unknown/neutral). [designed] false forces the data-driven ones.
+  factory CanisterSpec.forStock(FilmStock s, {Offset? character, bool designed = true}) {
+    final kind = switch (s.group) { FilmGroup.negative => CanisterKind.negative, FilmGroup.slide => CanisterKind.slide, FilmGroup.cinema => CanisterKind.cinema };
+    final p = designed ? kCanisterPalette[s.name] : null;
+    if (p == null) return CanisterSpec.of(kind: kind, richness: character?.dx ?? 0, contrast: character?.dy ?? 0, code: s.name);
+    final h = HSLColor.fromColor(p.body).hue;
+    return CanisterSpec(kind: kind, body: p.body, label: _hsl(h, 0.22, 0.95), cap: p.cap, accent: p.accent, ink: _hsl(h, 0.35, 0.16), code: s.name);
+  }
 }
 
 /// What a base icon shows: a film stock, a modern rendering, or 标准.
