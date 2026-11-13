@@ -9,9 +9,9 @@ class ModernBase {
 }
 
 const kModernBases = [
-  ModernBase('modern_clean', '通透', '黑白场到位，干净通透'),
-  ModernBase('modern_vivid', '鲜明', '对比与色彩更饱满'),
-  ModernBase('modern_soft', '柔和', '对比平缓，轻盈柔和'),
+  ModernBase('modern_clean', '通透', '中性干净'),
+  ModernBase('modern_vivid', '鲜明', '浓郁有力'),
+  ModernBase('modern_soft', '柔和', '轻盈低反差'),
 ];
 
 bool isModernId(String? id) => id != null && id.startsWith('modern_') && kModernBases.any((m) => m.id == id);

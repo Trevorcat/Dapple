@@ -83,6 +83,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
     required this.onToggleImmersive,
     this.filmPadFetcher,
     this.swatchSource,
+    this.lookSwatchSource,
   }) {
     edits.addListener(_maybeRefreshRanges);
   }
@@ -104,6 +105,31 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   /// Where the base swatches come from; null = the engine through the photo's session. Tests inject a fake.
   final SwatchSource Function(String photoId)? swatchSource;
+
+  /// Where the colour looks' swatches come from; null = the engine. Tests inject a fake.
+  final SwatchSource Function(String photoId, String? baseId)? lookSwatchSource;
+
+  BaseSwatches? _lookSw;
+  String? _lookSwKey;
+
+  /// Bumped when a look swatch lands (the colour pad repaints its dots).
+  final ValueNotifier<int> lookTick = ValueNotifier(0);
+
+  /// Swatches of the colour looks of the photo now open, each on top of its CURRENT base (film or modern): the service changes with
+  /// the photo and with the base. Not started: the colour pad calls [BaseSwatches.start].
+  BaseSwatches get lookSwatches {
+    final pid = id, base = edit.film, key = '$pid|$base';
+    final cur = _lookSw;
+    if (cur != null && _lookSwKey == key && !cur.closed) return cur;
+    cur?.dispose();
+    _lookSwKey = key;
+    final ph = app.photoById(pid);
+    final src = lookSwatchSource?.call(pid, base) ?? LookSwatchSource(app, ph ?? Photo(id: pid, name: pid, addedMs: 0), base);
+    final now = edit.look ?? app.settings.defaultLookId;
+    final ids = <String?>[now, ...[for (final p in colorPresets) p.look].where((x) => x != now)];
+    final sw = BaseSwatches(source: src, ids: ids)..addListener(() => lookTick.value++);
+    return _lookSw = sw;
+  }
 
   BaseSwatches? _swatches;
   String? _swatchesPhoto;
@@ -806,6 +832,8 @@ class EditorController extends ChangeNotifier implements GestureSink {
     _rangesTimer?.cancel();
     filmRanges.dispose();
     _swatches?.dispose();
+    _lookSw?.dispose();
+    lookTick.dispose();
     _idleTimer?.cancel();
     readout.dispose();
     edits.dispose();

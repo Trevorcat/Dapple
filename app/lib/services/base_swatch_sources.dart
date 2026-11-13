@@ -47,6 +47,69 @@ Future<List<ui.Image?>> renderSwatchBatch(DappleSession s, Map<String, dynamic>?
   return out;
 }
 
+// One swatch call at a time over the whole app: the engine's batch call stops when a newer one starts (base_previews' "newest wins"),
+// so the base swatches and the look swatches of the same session must not overlap.
+Future<void> _engineTail = Future.value();
+Future<T> _engineSerial<T>(Future<T> Function() f) {
+  final r = _engineTail.then((_) => f());
+  _engineTail = r.then((_) {}, onError: (_) {});
+  return r;
+}
+
+/// The nine looks ([lookIds]) on top of [baseId] (a film stock, a modern rendering, null = standard) of this photo: params carry
+/// `look` (strength 100) and the base; the engine's `dapple_session_base_previews` keeps every other key and replaces only `film`, so a
+/// look is rendered by passing it in the params and the current base as the one id (interactive tier, background priority, like the
+/// base swatches). One native call per look (an id list varies the base, not the look). An engine without the call: final-quality renders.
+Future<List<ui.Image?>> renderLookBatch(DappleSession s, Map<String, dynamic>? correction, bool auto, String? baseId, List<String?> lookIds, int longEdge) {
+  return _engineSerial(() async {
+    final out = <ui.Image?>[];
+    for (final id in lookIds) {
+      try {
+        final params = swatchParams(correction, null, auto: auto)..['look'] = id ?? 'std'..['lookStrength'] = 100;
+        if (DappleSession.hasBaseSwatches) {
+          final r = (await s.baseSwatches(params, [baseId], longEdge: longEdge)).first;
+          out.add(r == null ? null : await imageFromRgba(r));
+        } else {
+          if (baseId != null) params['film'] = baseId;
+          out.add(await imageFromRgba(await s.render(params, longEdge: longEdge)));
+        }
+      } catch (_) {
+        out.add(null);
+      }
+    }
+    return out;
+  });
+}
+
+/// Swatches of the colour looks of [photo] on its current base [baseId]; the ids of [BaseSwatches] are look ids.
+class LookSwatchSource implements BatchSwatchSource {
+  LookSwatchSource(this.app, this.photo, this.baseId);
+  final AppState app;
+  final Photo photo;
+  final String? baseId;
+  DappleSession? _live;
+
+  @override
+  String get key => 'looks|${photo.id}|${photo.path}|${photo.correction?.hashCode ?? 0}|${app.settings.autoProcess}|${baseId ?? ''}';
+
+  @override
+  int get batchSize => 1;
+
+  @override
+  Future<ui.Image?> render(String? lookId, int longEdge) async => (await renderBatch([lookId], longEdge)).first;
+
+  @override
+  Future<List<ui.Image?>> renderBatch(List<String?> ids, int longEdge) async {
+    final s = await app.sessions.get(photo, background: true);
+    if (s == null) return List.filled(ids.length, null);
+    _live = s;
+    return renderLookBatch(s, photo.correction, app.settings.autoProcess, baseId, ids, longEdge);
+  }
+
+  @override
+  void cancel() => _live?.cancelBaseSwatches();
+}
+
 class SessionSwatchSource implements BatchSwatchSource {
   SessionSwatchSource(this.app, this.photo);
   final AppState app;
@@ -67,7 +130,7 @@ class SessionSwatchSource implements BatchSwatchSource {
     final s = await app.sessions.get(photo, background: true);
     if (s == null) return List.filled(ids.length, null);
     _live = s;
-    return renderSwatchBatch(s, photo.correction, app.settings.autoProcess, ids, longEdge);
+    return _engineSerial(() => renderSwatchBatch(s, photo.correction, app.settings.autoProcess, ids, longEdge));
   }
 
   @override
@@ -101,7 +164,7 @@ class AssetSwatchSource implements BatchSwatchSource {
   Future<List<ui.Image?>> renderBatch(List<String?> ids, int longEdge) async {
     final s = await _open();
     if (s == null) return List.filled(ids.length, null);
-    return renderSwatchBatch(s, null, true, ids, longEdge);
+    return _engineSerial(() => renderSwatchBatch(s, null, true, ids, longEdge));
   }
 
   @override

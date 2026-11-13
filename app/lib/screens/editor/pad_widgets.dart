@@ -2,6 +2,7 @@
 // sits under the finger, the pad reacts only inside its drawn area, and nothing else on the panel moves while they are
 // dragged (only the cursor layer repaints, from the edit tick).
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'dart:ui' show PointMode;
 
 import 'package:flutter/material.dart';
@@ -232,7 +233,7 @@ class _PadFaceState extends State<PadFace> {
         RepaintBoundary(child: CustomPaint(painter: _FieldPainter(cat, r))),
         RepaintBoundary(
           child: ListenableBuilder(
-            listenable: Listenable.merge([ctl.app.editTick, ctl.filmRanges]),
+            listenable: Listenable.merge([ctl.app.editTick, ctl.filmRanges, ctl.lookTick]),
             builder: (context, _) {
               final s = ctl.padView(cat);
               final children = <Widget>[
@@ -276,6 +277,7 @@ class _PadFaceState extends State<PadFace> {
     final e = ctl.edit;
     final cur = e.look ?? ctl.app.settings.defaultLookId;
     final out = <Widget>[];
+    final sw = ctl.lookSwatches..start(); // real renderings of the photo with each look, on its current base
     for (final p in colorPresets) {
       final at = padToLocal(size, p.x, p.y);
       final look = lookById(p.look);
@@ -290,19 +292,7 @@ class _PadFaceState extends State<PadFace> {
         top: at.dy - 22,
         width: 44,
         height: 44,
-        child: Center(
-          child: Container(
-            key: ValueKey('preset-${p.look}'),
-            width: 16,
-            height: 16,
-            decoration: BoxDecoration(
-              color: look.swatch.last,
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: selected ? 2 : 1.5),
-              boxShadow: [BoxShadow(color: const Color(0x40000000), blurRadius: 0, spreadRadius: selected ? 1.5 : 1)],
-            ),
-          ),
-        ),
+        child: Center(child: LookDot(key: ValueKey('preset-${p.look}'), image: sw.imageOf(p.look), tint: look.swatch.last, selected: selected)),
       ));
       if (showName) {
         out.add(Positioned(
@@ -423,4 +413,37 @@ class _StripPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_StripPainter o) => o.a != a || o.accent != accent || o.mid != mid;
+}
+
+/// A colour look on the pad: a small round thumbnail of the photo with that look on its current base (the engine's rendering), over
+/// a placeholder in the look's own colour until it arrives; white ring, thicker when selected.
+class LookDot extends StatelessWidget {
+  const LookDot({super.key, required this.image, required this.tint, required this.selected, this.size = 26});
+  final ui.Image? image;
+  final Color tint;
+  final bool selected;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white, width: selected ? 2.5 : 1.5),
+        boxShadow: [BoxShadow(color: const Color(0x40000000), blurRadius: 0, spreadRadius: selected ? 1.5 : 1)],
+      ),
+      child: ClipOval(
+        child: Stack(fit: StackFit.expand, children: [
+          ColoredBox(key: const ValueKey('look-placeholder'), color: tint),
+          AnimatedOpacity(
+            opacity: image == null ? 0 : 1,
+            duration: const Duration(milliseconds: 180),
+            child: image == null ? const SizedBox.shrink() : RawImage(key: const ValueKey('look-image'), image: image, fit: BoxFit.cover, filterQuality: FilterQuality.low),
+          ),
+        ]),
+      ),
+    );
+  }
 }

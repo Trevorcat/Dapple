@@ -218,4 +218,29 @@ void main() {
     expect(find.textContaining('已断开'), findsNothing);
     await shot(tester, 'home_phone_no_permission');
   });
+
+  testWidgets('the whole connection card taps like its action pill', (tester) async {
+    useWindow(tester, phoneSize);
+    final app = AppState.demo()..linkDown = true;
+    await pumpDapple(tester, app);
+    expect(app.connAction, isNotNull);
+    final card = tester.getRect(find.byKey(const ValueKey('conn-card')));
+    // away from the pill (which sits at the right end)
+    await tester.tapAt(Offset(card.left + 40, card.center.dy));
+    await tester.pump(_t);
+    expect(app.linkDown, isFalse, reason: 'the card did what the pill does');
+  });
+
+  testWidgets('the permission card is tappable as a whole, a card without an action is not', (tester) async {
+    useWindow(tester, phoneSize);
+    final app = AppState()
+      ..ready = true
+      ..mediaPermitted = false;
+    await pumpDapple(tester, app);
+    expect(tester.widget<InkWell>(find.byKey(const ValueKey('conn-card-tap'))).onTap, isNotNull);
+    final ok = AppState.demo();
+    await pumpDapple(tester, ok);
+    expect(ok.connAction, isNull);
+    expect(tester.widget<InkWell>(find.byKey(const ValueKey('conn-card-tap'))).onTap, isNull);
+  });
 }

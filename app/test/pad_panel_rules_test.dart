@@ -335,11 +335,11 @@ void main() {
   });
 
   group('colour preset dots', () {
-    testWidgets('16 dp visible, 44 dp hit area, the label is never clipped at the pad edge', (t) async {
+    testWidgets('26 dp swatch, 44 dp hit area, the label is never clipped at the pad edge', (t) async {
       final (app, id) = await openWith(t);
       app.applyEdit(id, (_) => EditState.empty);
       await tapDock(t, EGroup.color);
-      expect(t.getSize(find.byKey(const ValueKey('preset-warm'))), const Size(16, 16));
+      expect(t.getSize(find.byKey(const ValueKey('preset-warm'))), const Size(26, 26));
       final pad = padRect(t, PadCat.color);
       // the hit area is 44: a touch 20 dp off the dot's centre still selects it
       final p = colorPresets.firstWhere((e) => e.look == 'amber');

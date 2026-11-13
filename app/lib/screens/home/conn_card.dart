@@ -27,25 +27,33 @@ class ConnCard extends StatelessWidget {
       label: '${app.connTitle}，${app.connLine}',
       child: Container(
         key: const ValueKey('conn-card'),
-        constraints: const BoxConstraints(minHeight: 64),
         margin: const EdgeInsets.symmetric(horizontal: Sp.l),
-        padding: const EdgeInsets.fromLTRB(Sp.l, Sp.m, Sp.s, Sp.m),
         decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(Rd.card)),
-        child: Row(children: [
-          Padding(padding: const EdgeInsets.only(right: Sp.m), child: Dot(dot)),
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-              Text(app.connTitle, style: T.body17(c.text)),
-              const SizedBox(height: 2),
-              Text(app.connLine,
-                  style: T.body(st == ConnState.interrupted ? c.warn : c.text2, tabular: true)),
-              if (prog != null) ...[const SizedBox(height: 8), Padding(padding: const EdgeInsets.only(right: Sp.s), child: DProgress(prog))],
-            ]),
+        clipBehavior: Clip.antiAlias,
+        // the whole card does what its action chip does (the chip alone is a small target)
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            key: const ValueKey('conn-card-tap'),
+            onTap: action == null ? null : () => app.connectAction(),
+            child: Container(
+              constraints: const BoxConstraints(minHeight: 64),
+              padding: const EdgeInsets.fromLTRB(Sp.l, Sp.m, Sp.s, Sp.m),
+              child: Row(children: [
+                Padding(padding: const EdgeInsets.only(right: Sp.m), child: Dot(dot)),
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                    Text(app.connTitle, style: T.body17(c.text)),
+                    const SizedBox(height: 2),
+                    Text(app.connLine, style: T.body(st == ConnState.interrupted ? c.warn : c.text2, tabular: true)),
+                    if (prog != null) ...[const SizedBox(height: 8), Padding(padding: const EdgeInsets.only(right: Sp.s), child: DProgress(prog))],
+                  ]),
+                ),
+                if (action != null) KeyedSubtree(key: const ValueKey('conn-action'), child: ActionChip32(action, onPressed: () => app.connectAction())),
+              ]),
+            ),
           ),
-          if (action != null)
-            KeyedSubtree(
-                key: const ValueKey('conn-action'), child: ActionChip32(action, onPressed: () => app.connectAction())),
-        ]),
+        ),
       ),
     );
   }

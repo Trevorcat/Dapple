@@ -1,18 +1,20 @@
 // Rendering bases (film stocks + three modern renderings) on the film map and the 默认成像 page: the swatch service, the map with
 // swatches (placeholder -> image, z-order, modern shape, release closes and selects), the pad with a modern base, the default
 // page, and the default base at ingest. Screenshots (widget-rendered; the swatch pixels are a stand-in tint of the bundled
-// sample, not engine output) go to build/ui-base/.
+// sample, not engine output) go to build/ui-looks/.
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:dapple/model/bases.dart';
+import 'package:dapple/model/catalog.dart';
 import 'package:dapple/model/film_map.dart';
 import 'package:dapple/model/pad_model.dart';
 import 'package:dapple/model/params.dart';
 import 'package:dapple/screens/editor/editor_page.dart';
 import 'package:dapple/screens/editor/film_map_view.dart';
+import 'package:dapple/screens/editor/pad_widgets.dart' show LookDot;
 import 'package:dapple/screens/library/styles_page.dart';
 import 'package:dapple/services/base_swatches.dart';
 import 'package:dapple/services/ingest.dart';
@@ -35,11 +37,13 @@ class FakeSource implements SwatchSource {
   Future<void>? gate;
   final List<String?> calls = [];
   int sizeSeen = 0;
+  final Set<int> sizesSeen = {};
 
   @override
   Future<ui.Image?> render(String? baseId, int longEdge) async {
     calls.add(baseId);
     sizeSeen = longEdge;
+    sizesSeen.add(longEdge);
     if (gate != null) await gate;
     return images[baseId];
   }
@@ -71,13 +75,17 @@ Future<void> shot(WidgetTester t, GlobalKey k, String name) async {
     final b = k.currentContext!.findRenderObject() as RenderRepaintBoundary;
     final img = await b.toImage(pixelRatio: 1.5);
     final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
-    final f = File('build/ui-base/$name.png');
+    final f = File('build/ui-looks/$name.png');
     f.parent.createSync(recursive: true);
     f.writeAsBytesSync(bytes!.buffer.asUint8List());
   });
 }
 
 final _shotKey = GlobalKey();
+
+/// Look swatches: remembers the base each service was made for.
+final lookBases = <String?>[];
+final lookSources = <FakeSource>[];
 
 Future<(AppState, String, FakeSource)> openEditor(WidgetTester t, {Future<void>? gate}) async {
   setView(t, const Size(1140, 2616), 2.75);
@@ -86,12 +94,22 @@ Future<(AppState, String, FakeSource)> openEditor(WidgetTester t, {Future<void>?
   app.film = testFilmCatalog;
   final id = app.photos.firstWhere((p) => p.title == '外滩夕阳' && p.id.startsWith('d')).id;
   final src = FakeSource('photo-$id', await makeImages(t, _ids), gate: gate);
+  final lookImgs = await makeImages(t, [for (final l in dLooks) l.id]);
+  lookBases.clear();
+  lookSources.clear();
   await t.pumpWidget(RepaintBoundary(
     key: _shotKey,
     child: MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: buildTheme(Brightness.light),
-      home: EditorPage(app: app, photoId: id, resamplePointers: false, filmPadFetcher: (_) async => null, swatchSource: (_) => src),
+      home: EditorPage(app: app, photoId: id, resamplePointers: false, filmPadFetcher: (_) async => null, swatchSource: (_) => src,
+        lookSwatchSource: (pid, base) {
+          lookBases.add(base);
+          final f = FakeSource('looks|$pid|$base', lookImgs);
+          lookSources.add(f);
+          return f;
+        },
+      ),
     ),
   ));
   await settle(t);
@@ -345,6 +363,47 @@ void main() {
     });
   });
 
+  group('colour looks as real swatches, on top of the current base', () {
+    testWidgets('the colour pad dots are thumbnails of the photo with each look, rendered on the current base', (t) async {
+      final (app, id, _) = await openEditor(t);
+      app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
+      await t.tap(find.byKey(ValueKey('dock-${EGroup.color}')));
+      await settle(t, 10);
+      expect(lookBases, ['kodak_portra_400'], reason: 'one look service, for the current base');
+      for (final p in colorPresets) {
+        final dot = find.byKey(ValueKey('preset-${p.look}'));
+        expect(dot, findsOneWidget);
+        expect(t.getSize(dot), const Size(26, 26));
+        expect(find.descendant(of: dot, matching: find.byKey(const ValueKey('look-image'))), findsOneWidget, reason: p.look);
+      }
+      expect(lookSources.single.calls.toSet(), containsAll({'warm', 'amber', 'rose', 'neutral', 'cool', 'teal', 'bw'}));
+      expect(lookSources.single.sizeSeen, 96);
+      await shot(t, _shotKey, 'color_pad_looks_film');
+      // a modern base: a new service for that base (the old pictures show the other base)
+      app.applyEdit(id, (e) => e.copyWith(film: 'modern_vivid'));
+      await t.pump(const Duration(milliseconds: 300));
+      await t.tap(find.byKey(ValueKey('dock-${EGroup.style}')));
+      await settle(t, 4);
+      await t.tap(find.byKey(ValueKey('dock-${EGroup.color}')));
+      await settle(t, 10);
+      expect(lookBases.last, 'modern_vivid');
+      await shot(t, _shotKey, 'color_pad_looks_modern');
+    });
+
+    testWidgets('until the picture arrives a dot shows the look own colour, the size does not change', (t) async {
+      final img = (await makeImages(t, ['x']))['x'];
+      Widget dot(ui.Image? i) => MaterialApp(home: Center(child: LookDot(image: i, tint: Colors.orange, selected: false)));
+      await t.pumpWidget(dot(null));
+      final size = t.getSize(find.byType(LookDot));
+      expect(find.byKey(const ValueKey('look-placeholder')), findsOneWidget);
+      expect(find.byKey(const ValueKey('look-image')), findsNothing);
+      await t.pumpWidget(dot(img));
+      await t.pump(const Duration(milliseconds: 300));
+      expect(find.byKey(const ValueKey('look-image')), findsOneWidget);
+      expect(t.getSize(find.byType(LookDot)), size);
+    });
+  });
+
   group('map layout', () {
     test('the modern renderings are in the layout, a separate cluster, not touching a stock or each other', () {
       final dots = layoutFilmMap(testFilmCatalog, const {});
@@ -408,6 +467,48 @@ void main() {
       await t.tap(find.byKey(const ValueKey('base-none')));
       await t.pump(const Duration(milliseconds: 300));
       expect(app.settings.defaultBaseId, isNull);
+      await t.pump(const Duration(seconds: 6));
+    });
+
+    testWidgets('the card describes the default in one line instead of repeating the name', (t) async {
+      final (app, _) = await openPage(t);
+      Finder line(String x) => find.descendant(of: find.byKey(const ValueKey('default-card')), matching: find.text(x));
+      expect(line('标准'), findsOneWidget, reason: 'the name once');
+      expect(line('不加倾向'), findsOneWidget);
+      app.setDefaultBase('modern_clean');
+      await t.pump(const Duration(milliseconds: 300));
+      expect(line('通透'), findsOneWidget);
+      expect(line('中性干净'), findsOneWidget);
+      app.setDefaultBase('modern_vivid');
+      await t.pump(const Duration(milliseconds: 300));
+      expect(line('浓郁有力'), findsOneWidget);
+      app.setDefaultBase('modern_soft');
+      await t.pump(const Duration(milliseconds: 300));
+      expect(line('轻盈低反差'), findsOneWidget);
+      app.setDefaultBase('kodak_portra_400');
+      await t.pump(const Duration(milliseconds: 300));
+      expect(line('N400C'), findsOneWidget);
+      expect(line('负片'), findsOneWidget);
+      await t.pump(const Duration(seconds: 6));
+    });
+
+    testWidgets('grid swatches are asked for at 2x (192 px), the large preview at 640', (t) async {
+      final (_, src) = await openPage(t);
+      await t.pump(const Duration(seconds: 3));
+      expect(src.calls, isNotEmpty);
+      expect(src.sizesSeen, containsAll([192, 640]));
+      expect(src.sizesSeen, isNot(contains(96)));
+    });
+
+    testWidgets('a film default is visible without scrolling when the tab opens', (t) async {
+      final app = AppState.demo();
+      app.settings.defaultBaseId = 'kodak_vision3_500t';
+      await openPage(t, with_: app);
+      await t.pump(const Duration(milliseconds: 500));
+      final r = t.getRect(find.byKey(const ValueKey('base-kodak_vision3_500t')));
+      expect(r.top, greaterThan(0));
+      expect(r.bottom, lessThan(phoneSize.height), reason: 'inside the window');
+      await shot(t, _shotKey, 'default_page_film_default');
       await t.pump(const Duration(seconds: 6));
     });
 
