@@ -77,9 +77,9 @@ class _LocalPhotoLayerState extends State<LocalPhotoLayer> {
         child: Stack(fit: StackFit.expand, clipBehavior: Clip.none, children: [
           IgnorePointer(
             child: ListenableBuilder(
-              listenable: Listenable.merge([lc.overlayOn, lc.overlayStale]),
+              listenable: Listenable.merge([lc.overlayOn, lc.overlayStale, lc.overlayFollow]),
               builder: (context, _) => AnimatedOpacity(
-                opacity: lc.overlayOn.value && !lc.overlayStale.value ? 1 : 0,
+                opacity: lc.overlayOn.value && (!lc.overlayStale.value || lc.overlayFollow.value) ? 1 : 0,
                 duration: const Duration(milliseconds: 150),
                 child: ValueListenableBuilder<ui.Image?>(
                   valueListenable: lc.overlay,

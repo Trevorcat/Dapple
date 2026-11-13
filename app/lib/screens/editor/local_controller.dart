@@ -859,6 +859,9 @@ class LocalController extends ChangeNotifier {
   /// The tool strip's range bars (inside a gesture).
   void rangeBegin() {
     ctl.gestureBegin('local-range', param: null);
+    final c = comp;
+    _rangeOpen = true;
+    _followKind = c != null && kindOfComponent(c).overlayFollowsStale;
     shaping = true;
     _updateVis();
   }
@@ -876,6 +879,7 @@ class LocalController extends ChangeNotifier {
   void rangeEnd() {
     ctl.gestureEnd();
     shaping = false;
+    _rangeOpen = false; // the stale overlay stays up until the exact one for the final values replaces it
     flash();
   }
 
@@ -1136,6 +1140,18 @@ class LocalController extends ChangeNotifier {
   /// none; the handles and the live render show the shape meanwhile).
   final ValueNotifier<bool> overlayStale = ValueNotifier(true);
 
+  /// A range band (tone, hue, near-far: [LocalKind.overlayFollowsStale]) is being dragged, or its last overlay is still on its way: a stale
+  /// overlay is shown then (it follows the drag with a small lag, swapped directly for the fresh one). Geometry drags keep hiding it.
+  final ValueNotifier<bool> overlayFollow = ValueNotifier(false);
+  bool _rangeOpen = false, _followKind = false;
+
+  void _setStale(bool stale) {
+    overlayStale.value = stale;
+    final f = _followKind && (_rangeOpen || stale);
+    if (!f) _followKind = false;
+    overlayFollow.value = f;
+  }
+
   /// The selected area's chip is held down (show the mask).
   bool peek = false;
   bool padDragging = false;
@@ -1170,7 +1186,7 @@ class LocalController extends ChangeNotifier {
     final a = sel;
     final want = active && a != null && !padDragging && (peek || shaping || _now < _showUntil || !a.hasEffect);
     if (overlayOn.value != want) overlayOn.value = want;
-    overlayStale.value = _sigNow() != _overlayFor;
+    _setStale(_sigNow() != _overlayFor);
     if (want) _wantOverlay();
   }
 
@@ -1199,6 +1215,17 @@ class LocalController extends ChangeNotifier {
   /// Test hook: overlay requests started.
   int debugOverlayRequests = 0;
 
+  void _deliverOverlay(ui.Image img, String sig) {
+    final old = overlay.value;
+    overlay.value = img; // swap first, dispose the old one after: no frame without an image
+    old?.dispose();
+    _overlayFor = sig;
+    _setStale(_sigNow() != sig);
+  }
+
+  /// Test hook: an overlay image arrives for the shape on screen now ([current]) or for an older one.
+  void debugDeliverOverlay(ui.Image img, {bool current = true}) => _deliverOverlay(img, current ? _sigNow() : '${_sigNow()}|old');
+
   Future<void> _fetchOverlay(String sig) async {
     final p = ctl.app.photoById(ctl.id);
     final idx = selIndex;
@@ -1218,10 +1245,7 @@ class LocalController extends ChangeNotifier {
       if (_sigNow() != sig && !_dirty) {
         // the selection moved on meanwhile; still better than nothing for the same area
       }
-      overlay.value?.dispose();
-      overlay.value = img;
-      _overlayFor = sig;
-      overlayStale.value = _sigNow() != sig;
+      _deliverOverlay(img, sig);
       if (!shaping && liveStroke.isNotEmpty) {
         liveStroke.clear(); // the engine's mask now has the stroke
         tick.value++;
@@ -1327,6 +1351,7 @@ class LocalController extends ChangeNotifier {
     overlay.dispose();
     overlayOn.dispose();
     overlayStale.dispose();
+    overlayFollow.dispose();
     tick.dispose();
     super.dispose();
   }

@@ -36,7 +36,7 @@ abstract final class AiBits {
 }
 
 class LocalKind {
-  const LocalKind(this.id, this.label, this.engine, this.glyph, this.place, {this.visible = true, this.aiKey, this.aiTasks = 0, this.note});
+  const LocalKind(this.id, this.label, this.engine, this.glyph, this.place, {this.visible = true, this.aiKey, this.aiTasks = 0, this.note, this.overlayFollowsStale = false});
   final String id;
 
   /// The word under the icon on the shape card (plain Chinese, no jargon).
@@ -57,6 +57,10 @@ class LocalKind {
   /// AI kinds: the AiTask bits the analysis must run (and the device must support) for this kind.
   final int aiTasks;
 
+  /// Range kinds (tone, hue, near-far band): while the band is dragged the last red overlay stays up (stale) until the fresh one replaces
+  /// it, so the selection visibly follows the drag. Shape kinds hide a stale overlay (their handles show the shape).
+  final bool overlayFollowsStale;
+
   bool get ai => place == LocalPlace.aiParts || place == LocalPlace.aiPlane || place == LocalPlace.aiTap || place == LocalPlace.aiDepth;
 
   /// A range kind (tone / colour) added to an area that already has a shape LIMITS it (intersect) instead of adding to it. AI planes behave
@@ -68,13 +72,13 @@ const List<LocalKind> localKinds = [
   LocalKind('linear', '渐变', MaskKindId.linear, LocalGlyph.linear, LocalPlace.handles),
   LocalKind('radial', '圆形', MaskKindId.radial, LocalGlyph.radial, LocalPlace.handles),
   LocalKind('brush', '画笔', MaskKindId.brush, LocalGlyph.brush, LocalPlace.paint),
-  LocalKind('luminance', '明暗', MaskKindId.luminance, LocalGlyph.luminance, LocalPlace.sample),
-  LocalKind('color', '颜色', MaskKindId.color, LocalGlyph.color, LocalPlace.sample),
+  LocalKind('luminance', '明暗', MaskKindId.luminance, LocalGlyph.luminance, LocalPlace.sample, overlayFollowsStale: true),
+  LocalKind('color', '颜色', MaskKindId.color, LocalGlyph.color, LocalPlace.sample, overlayFollowsStale: true),
   LocalKind('person', '人物', MaskKindId.raster, LocalGlyph.person, LocalPlace.aiParts, aiTasks: AiBits.person | AiBits.faces),
   LocalKind('background', '背景', MaskKindId.raster, LocalGlyph.background, LocalPlace.aiPlane, aiKey: 'background', aiTasks: AiBits.person),
   LocalKind('tap', '点选', MaskKindId.raster, LocalGlyph.tap, LocalPlace.aiTap, aiKey: 'tap', aiTasks: AiBits.tapPrepare),
   LocalKind('sky', '天空', MaskKindId.raster, LocalGlyph.sky, LocalPlace.aiPlane, aiKey: 'sky', aiTasks: AiBits.sky, note: '粗略'),
-  LocalKind('depth', '远近', MaskKindId.raster, LocalGlyph.depth, LocalPlace.aiDepth, aiKey: 'depth', aiTasks: AiBits.depth),
+  LocalKind('depth', '远近', MaskKindId.raster, LocalGlyph.depth, LocalPlace.aiDepth, aiKey: 'depth', aiTasks: AiBits.depth, overlayFollowsStale: true),
 ];
 
 /// The classic (non-AI) kinds: always offered.
