@@ -17,6 +17,7 @@
 #include "dapple/mosaic.h"
 #include "de2000.h"
 #include "engine/nodes/demosaic/demosaic_backend.h"
+#include "engine/nodes/demosaic/demosaic.h"
 #include "engine/nodes/demosaic/demosaic_session.h"
 
 using namespace dapple;
@@ -40,10 +41,10 @@ double gradEnergy(const ImageF& im) {
 }
 
 // The same proxy on the luminance after a 3 x 3 box blur: noise and 1 px aliasing speckle are suppressed, edges and texture structure remain
-double gradEnergyBlurred(const ImageF& im) {
-  const int cx = im.width / 2, cy = im.height / 2, h = std::min(512, std::min(cx, cy) - 4);
+double gradEnergyBlurred(const ImageF& im, int rad = 1) {
+  const int cx = im.width / 2, cy = im.height / 2, h = std::min(512, std::min(cx, cy) - 8);
   auto Y = [&](int x, int y) { return 0.2880 * im.row(y)[3 * x] + 0.7119 * im.row(y)[3 * x + 1]; };
-  auto B = [&](int x, int y) { double s = 0; for (int v = -1; v <= 1; ++v) for (int u = -1; u <= 1; ++u) s += Y(x + u, y + v); return s / 9.0; };
+  auto B = [&](int x, int y) { double s = 0; for (int v = -rad; v <= rad; ++v) for (int u = -rad; u <= rad; ++u) s += Y(x + u, y + v); return s / double((2 * rad + 1) * (2 * rad + 1)); };
   double sum = 0;
   long cnt = 0;
   for (int y = cy - h; y < cy + h; ++y)
@@ -90,6 +91,15 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::filesystem::path f = argv[1];
+  {  // cost of the table design (once per pattern and process)
+    static const char* rows[6] = {"GBGGRG", "RGRBGB", "GBGGRG", "GRGGBG", "BGBRGR", "GRGGBG"};
+    std::uint8_t cfa[36];
+    for (int i = 0; i < 36; ++i) cfa[i] = rows[i / 6][i % 6] == 'R' ? 0 : rows[i / 6][i % 6] == 'G' ? 1 : 2;
+    static demosaic::HalfTables T;
+    const double t0 = nowMs();
+    demosaic::buildHalfTables(cfa, demosaic::HalfDesign{}, T);
+    std::printf("table design: %.1f ms\n", nowMs() - t0);
+  }
   const std::string cropDir = argc > 2 ? argv[2] : "";
   setEnvVar("DAPPLE_ANCHOR", "off");
 #ifdef DAPPLE_HAVE_GPU
@@ -125,6 +135,7 @@ int main(int argc, char** argv) {
   const double ga = gradEnergy(A), gb = gradEnergy(B);
   std::printf("  sharpness (gradient energy, centre 1024^2): ours / LibRaw %.3f\n", gb / ga);
   std::printf("  structure sharpness (gradient energy of the 3x3-blurred luminance): ours / LibRaw %.3f\n", gradEnergyBlurred(B) / gradEnergyBlurred(A));
+  std::printf("  structure sharpness, 5x5 blur: %.3f\n", gradEnergyBlurred(B, 2) / gradEnergyBlurred(A, 2));
   double sumY = 0;
   for (int y = 0; y < A.height; y += 3)
     for (int x = 0; x < A.width; x += 3) sumY += 0.2880 * A.row(y)[3 * x] + 0.7119 * A.row(y)[3 * x + 1];
@@ -168,6 +179,32 @@ int main(int argc, char** argv) {
     double m = 0;
     for (float v : lf) m += v;
     std::printf("  low-frequency (4x4 block means) dE2000: mean %.2f p99 %.2f\n", m /double(lf.size()), lf[std::size_t(0.99 * double(lf.size() - 1))]);
+  }
+  if (!cropDir.empty()) {  // overview (1/4 scale of ours) to pick crops by eye
+    const int ow = B.width / 4, oh = B.height / 4;
+    std::vector<std::uint8_t> ov(std::size_t(ow) * oh * 3);
+    for (int y = 0; y < oh; ++y)
+      for (int x = 0; x < ow; ++x) {
+        float acc[3] = {0, 0, 0};
+        for (int v = 0; v < 4; ++v) for (int u = 0; u < 4; ++u) for (int k = 0; k < 3; ++k) acc[k] += B.row(4 * y + v)[3 * (4 * x + u) + k] / 16.f;
+        toSrgb8(acc, g, &ov[(std::size_t(y) * ow + x) * 3]);
+      }
+    std::filesystem::create_directories(cropDir);
+    stbi_write_jpg((std::filesystem::path(cropDir) / (f.stem().string() + "_overview.jpg")).string().c_str(), ow, oh, 3, ov.data(), 85);
+  }
+  if (const char* dmp = std::getenv("DAPPLE_HALF_DUMP")) {  // dir,x,y,w,h,tag: native-resolution PNG crops of LibRaw and ours (same exposure)
+    char dir[512], tag[64];
+    int cx, cy, cw, ch;
+    if (std::sscanf(dmp, "%511[^,],%d,%d,%d,%d,%63s", dir, &cx, &cy, &cw, &ch, tag) == 6) {
+      std::filesystem::create_directories(dir);
+      for (int which = 0; which < 2; ++which) {
+        const ImageF& im = which ? B : A;
+        std::vector<std::uint8_t> px(std::size_t(cw) * ch * 3);
+        for (int y = 0; y < ch; ++y) for (int x = 0; x < cw; ++x) toSrgb8(im.row(cy + y) + 3 * (cx + x), g, &px[(std::size_t(y) * cw + x) * 3]);
+        const std::string nm = std::string(dir) + "/" + f.stem().string() + "_" + (which ? tag : "libraw") + "_" + std::to_string(cx) + "_" + std::to_string(cy) + ".png";
+        stbi_write_png(nm.c_str(), cw, ch, 3, px.data(), cw * 3);
+      }
+    }
   }
   if (!cropDir.empty()) {
     const int C = 160, step = 160;

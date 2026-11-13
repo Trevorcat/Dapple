@@ -5,14 +5,12 @@
 // pixel, and because 2x mod 6 is 0, 2 or 4 the pattern seen by the window has 9 phases. For each phase and each colour c in {R, G, B} the taps of that colour get
 // weights designed by least squares so that the sum of w_k exp(2 pi i f . (p_k - centre)) follows a target response H(f) on a grid of the whole frequency plane
 // (real part: the target, imaginary part: zero = no phase shift), with a ridge term against noise gain and the constraint sum w = 1 (a flat field is exact).
-//   Gh: green taps, target = flat to gF0 = 0.25 cycles / sensor pixel (the output Nyquist) then rolling to zero at 0.5, with a gain peaking up to 1.6 at the output Nyquist
-//       (gBoost): no anti-alias cut and a sharp edge response, like a sharp decimation (measured against LibRaw's half-size picture, docs 32.12).
+//   Gh: green taps, target = flat to gF0 = 0.25 cycles / sensor pixel (the output Nyquist) then rolling to zero at 0.5, with a mild lift of 10 % at the output
+//       Nyquist (gBoost = 0.1; doc 32.12: the smallest that brings real edges to within 3 % of a half-size decode on the X-T50 files).
 //   Gl, Rl, Bl: the same for each colour at the low colour-difference bandwidth (cF0 .. cF1).
 //   G = Gh, R = Gh + (Rl - Gl), B = Gh + (Bl - Gl): luminance detail from the dense greens, colour at low bandwidth (the colour-difference principle).
 // Clip fallback (no colour from clipped samples): when any tap of the window is clipped (scaled value >= kHalfClip), each colour is the weighted mean of its unclipped
 // taps with positive gaussian weights (all of them when fewer than 15 % of the weight is unclipped): a clipped sample's colour is a lower bound, never mixed in.
-// Overshoot clamp: the peaked green may exceed the min / max of the central 4 x 4 green samples by 15 % of their range only (no ringing at steps); the same shift
-// is applied to R and B, so colour differences are untouched.
 
 namespace {
 // Solve (A + ridge I) w = b by Cholesky (A symmetric positive definite), in place.
@@ -49,7 +47,7 @@ double bandTarget(double f, double f0, double f1) {  // 1 below f0, raised cosin
 }
 
 // weights (sum 1) of the taps at offsets (dx, dy) from the window centre so that the response follows the separable band target
-void designTaps(const std::vector<float>& dx, const std::vector<float>& dy, double f0, double f1, double boost, const HalfDesign& hd, std::vector<double>& w) {
+void designTaps(const std::vector<float>& dx, const std::vector<float>& dy, double f0, double f1, double boost, double passW, double ridge, const HalfDesign& hd, std::vector<double>& w) {
   const int n = int(dx.size());
   std::vector<double> A(std::size_t(n) * n, 0.0), b(n, 0.0), cs(n), sn(n);
   const double twoPi = 6.28318530717958647692;
@@ -58,7 +56,7 @@ void designTaps(const std::vector<float>& dx, const std::vector<float>& dy, doub
       const double fx = ix / 16.0, fy = iy / 16.0;
       auto bt = [&](double f) { const double a = std::min(std::fabs(f) / 0.25, 1.0); return bandTarget(f, f0, f1) * (1.0 + boost * a * a); };
       const double H = bt(fx) * bt(fy);
-      double W = (std::fabs(fx) >= f1 || std::fabs(fy) >= f1) ? hd.stopW : ((std::fabs(fx) <= f0 && std::fabs(fy) <= f0) ? hd.passW : hd.transW);
+      double W = (std::fabs(fx) >= f1 || std::fabs(fy) >= f1) ? hd.stopW : ((std::fabs(fx) <= f0 && std::fabs(fy) <= f0) ? passW : hd.transW);
       if (ix == 0 && iy == 0) W = 1000.0;  // DC: sum of the weights = 1
       for (int k = 0; k < n; ++k) {
         const double a = twoPi * (fx * dx[k] + fy * dy[k]);
@@ -69,7 +67,7 @@ void designTaps(const std::vector<float>& dx, const std::vector<float>& dy, doub
         for (int j = 0; j < n; ++j) A[std::size_t(i) * n + j] += W * (cs[i] * cs[j] + sn[i] * sn[j]);
       }
     }
-  for (int i = 0; i < n; ++i) A[std::size_t(i) * n + i] += hd.ridge * 4.0;
+  for (int i = 0; i < n; ++i) A[std::size_t(i) * n + i] += ridge * 4.0;
   w.assign(b.begin(), b.end());
   if (!choleskySolve(A, w, n)) w.assign(n, 1.0 / n);
 }
@@ -91,8 +89,8 @@ void buildHalfTables(const std::uint8_t* cfa3, const HalfDesign& hd, HalfTables&
         for (int k = 0; k < 64; ++k)
           if (col[k] == c) idx[c].push_back(k), dx.push_back(float(k % 8) - 3.5f), dy.push_back(float(k / 8) - 3.5f);
         if (dx.empty()) continue;
-        designTaps(dx, dy, hd.cF0, hd.cF1, 0.0, hd, lo[c]);
-        if (c == 1) designTaps(dx, dy, hd.gF0, hd.gF1, hd.gBoost, hd, gh);
+        designTaps(dx, dy, hd.cF0, hd.cF1, 0.0, hd.cPassW, hd.cRidge, hd, lo[c]);
+        if (c == 1) designTaps(dx, dy, hd.gF0, hd.gF1, hd.gBoost, hd.passW, hd.ridge, hd, gh);
       }
       double w[3][64] = {};
       if (!gh.empty())
@@ -110,11 +108,9 @@ void buildHalfTables(const std::uint8_t* cfa3, const HalfDesign& hd, HalfTables&
         }
         for (int k = 0; k < 64; ++k) {
           T.w[ph][o][k] = float(w[o][k] / sum);
-          if (w[o][k] != 0) T.sup[ph][k] = 1.f;
+          if (std::fabs(w[o][k] / sum) >= 0.015) T.sup[ph][k] = 1.f;  // support of the clip test: taps that matter (a long tail of small weights must not send every pixel near a clipped sample down the slow path)
         }
       }
-      for (int k = 0; k < 64; ++k)
-        if (col[k] == 1 && k % 8 >= 2 && k % 8 <= 5 && k / 8 >= 2 && k / 8 <= 5) T.cen[ph][k] = 1.f;
       for (int c = 0; c < 3; ++c) {
         double sum = 0;
         double gw[64] = {};
@@ -190,18 +186,6 @@ void halfTile(const Desc& d, const HalfTables& T, Rect roi, float* out, std::siz
       }
       float a0 = 0.f, a1 = 0.f, a2 = 0.f, smax = 0.f;
       for (int i = 0; i < 8; ++i) a0 += l0[i], a1 += l1[i], a2 += l2[i], smax = std::max(smax, lm[i]);
-      {  // overshoot clamp: the green may not leave the range of the central green samples (plus a margin); the same shift goes to R and B (colour differences kept)
-        const float* cn = T.cen[ph];
-        float lo = 2.f, hi = -1.f;
-        for (int j = 2; j < 6; ++j)
-          for (int i = 2; i < 6; ++i) {
-            const int k = j * 8 + i;
-            if (cn[k] > 0.f) lo = std::min(lo, base[std::size_t(j) * ww + i]), hi = std::max(hi, base[std::size_t(j) * ww + i]);
-          }
-        const float mg = kHalfOvershoot * (hi - lo);
-        const float gc = std::min(std::max(a1, lo - mg), hi + mg), dg = gc - a1;
-        a0 += dg, a1 += dg, a2 += dg;
-      }
       float rgb[3] = {a0, a1, a2};
       if (smax >= kHalfClip) {  // clip fallback: colours from the unclipped taps only
         float su[3] = {0, 0, 0}, wu[3] = {0, 0, 0}, sa[3] = {0, 0, 0};

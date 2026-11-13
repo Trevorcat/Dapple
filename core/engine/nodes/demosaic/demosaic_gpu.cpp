@@ -40,7 +40,7 @@ static_assert(sizeof(U) == 144, "std140 layout of the demosaic uniform block");
 
 inline int pmod(int a, int n) { return ((a % n) + n) % n; }
 constexpr int kHalfTab = 40 + 4096 + 576 + 144;     // first float of the half-resolution tables in the table buffer (demosaic_half.comp: HT)
-constexpr int kTabFloats = kHalfTab + 1728 * 2 + 576 * 2;
+constexpr int kTabFloats = kHalfTab + 1728 * 2 + 576;
 
 float halfToFloat(std::uint16_t h) {
   const std::uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
@@ -235,7 +235,6 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
       std::memcpy(h, T.w, sizeof T.w);
       std::memcpy(h + 1728, T.g, sizeof T.g);
       std::memcpy(h + 3456, T.sup, sizeof T.sup);
-      std::memcpy(h + 4032, T.cen, sizeof T.cen);
     }
     dev.flush(P.tab, 0, std::uint64_t(kTabFloats) * 4);
   }
