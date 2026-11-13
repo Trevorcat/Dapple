@@ -17,6 +17,32 @@ FetchContent_Declare(libraw
   SOURCE_SUBDIR _no_cmake_)
 FetchContent_MakeAvailable(libraw)
 
+# Local patch (docs/legal/libomp.md, "LibRaw patch"): every `#pragma omp critical[(name)]` of LibRaw becomes a scoped std::mutex.
+# All of LibRaw's critical sections are process-global (one lock per name, shared by every LibRaw instance and every thread) and libomp implements them as spin
+# locks. That breaks as soon as two sessions decode at once (editor + prefetch + export, which is what the app does):
+#  * libraw_memmgr::mem_ptr / forget_ptr (every LibRaw allocation) take the unnamed critical from threads that are not OpenMP team members (the embedded-preview read
+#    on a std::async thread): libomp registers each as a root; on iOS this lock crashed in __kmp_acquire_ticket_lock (EXC_BAD_ACCESS) on both phones.
+#  * raw2image.cpp `critical(dataupdate)` (once per row), fuji_fill_buffer / crx.cpp (shared input stream): with several teams (64 threads on 8 cores in the stress
+#    test) the waiters starve the holder and the unpacks stop making progress (livelock for minutes, 700 % CPU in __kmp_acquire_queuing_lock).
+# A sleeping mutex gives the same mutual exclusion without the convoy; the OpenMP parallel regions themselves (Fuji strips, demosaics) are untouched. Idempotent.
+option(DAPPLE_LIBRAW_LOCKPATCH "Replace LibRaw's OpenMP critical sections by scoped mutexes (see above); OFF only to reproduce the livelock / crash" ON)
+if(DAPPLE_LIBRAW_LOCKPATCH)
+  set(_lr_alloc "${libraw_SOURCE_DIR}/libraw/libraw_alloc.h")
+  file(READ "${_lr_alloc}" _lr_txt)
+  if(NOT _lr_txt MATCHES "dapple_lr_mutex")
+    string(REPLACE "#include \"libraw_const.h\"\n" "#include \"libraw_const.h\"\n#ifdef __cplusplus\n#include <mutex>\ninline std::mutex& dapple_lr_mutex() { static std::mutex m; return m; }  // dapple LibRaw patch\n#endif\n" _lr_txt "${_lr_txt}")
+    file(WRITE "${_lr_alloc}" "${_lr_txt}")
+  endif()
+  file(GLOB_RECURSE _lr_files "${libraw_SOURCE_DIR}/src/*.cpp" "${libraw_SOURCE_DIR}/libraw/*.h" "${libraw_SOURCE_DIR}/internal/*.h")
+  foreach(_lr_path IN LISTS _lr_files)
+    file(READ "${_lr_path}" _lr_txt)
+    if(_lr_txt MATCHES "#pragma omp critical")
+      string(REGEX REPLACE "#pragma omp critical(\\([A-Za-z_0-9]*\\))?(\r?\n)" "if (std::lock_guard<std::mutex> dapple_lr_guard(dapple_lr_mutex()); true)\\2" _lr_txt "${_lr_txt}")
+      file(WRITE "${_lr_path}" "${_lr_txt}")
+    endif()
+  endforeach()
+endif()
+
 file(GLOB_RECURSE DAPPLE_LIBRAW_SOURCES CONFIGURE_DEPENDS "${libraw_SOURCE_DIR}/src/*.cpp")
 # *_ph.cpp are placeholder units that are #included by other sources.
 list(FILTER DAPPLE_LIBRAW_SOURCES EXCLUDE REGEX "_ph\\.cpp$")

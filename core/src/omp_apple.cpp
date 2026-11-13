@@ -20,6 +20,7 @@ void appleOmpInit() {
     const int team = env && *env ? std::max(1, std::atoi(env)) : n;
     omp_set_num_threads(team);
     omp_set_dynamic(0);
+    kmp_set_blocktime(0);  // idle workers sleep at once: no spinning against the other sessions' threads
 #pragma omp parallel num_threads(team)
     {
       volatile int spawn = 0;  // forces the team into existence now

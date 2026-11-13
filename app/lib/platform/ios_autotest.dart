@@ -69,6 +69,8 @@ class IosAutotest {
         }
         await _one(path, stocks, drags, cfg['export'] == true, docs, keepExport: cfg['keepExport'] == true);
       }
+      final st2 = cfg['stress'];
+      if (st2 is Map<String, dynamic>) await _stress(files.where((f) => File(f).existsSync()).toList(), (st2['seconds'] as num?)?.toInt() ?? 30, (st2['workers'] as num?)?.toInt() ?? 4);
       final tr = cfg['trace'];
       if (tr is Map<String, dynamic>) {
         final f = '$docs/Photos/${tr['file']}';
@@ -80,6 +82,40 @@ class IosAutotest {
     }
     _w({'event': 'done', 'totalMs': w.elapsedMilliseconds});
     await TestTrigger.setActive(false);
+  }
+
+  /// Concurrency stress of the decode path (tests/engine/omp_stress_tests.cpp on the phone): [workers] loops open and close sessions (preview opens with the
+  /// embedded-preview read on another thread, full opens of small files, regions, background prefetch opens) for [seconds]; one JSON line with the counts.
+  static Future<void> _stress(List<String> files, int seconds, int workers) async {
+    if (files.isEmpty) return;
+    final end = DateTime.now().add(Duration(seconds: seconds));
+    var opens = 0, fails = 0, crashed = 0;
+    Future<void> loop(int id) async {
+      var n = id * 7919;
+      while (DateTime.now().isBefore(end)) {
+        final f = files[(n + id) % files.length];
+        final small = f.toLowerCase().endsWith('.dng');
+        var kind = (n ~/ 3 + id) % 7;
+        if (kind == 2 && !small) kind = 0;
+        if (kind > 4) kind = 4;
+        try {
+          final s = kind == 3
+              ? await DappleSession.openRegion(f, 100, 100, 1300, 900, background: id.isOdd)
+              : await DappleSession.open(f, full: kind == 2, longEdge: kind == 1 ? 4096 : (kind == 4 ? 1024 : 2048), background: id.isOdd && kind == 0);
+          await s.close();
+        } catch (e) {
+          if (kind != 3) fails++;
+        }
+        opens++;
+        n++;
+      }
+    }
+    try {
+      await Future.wait([for (var i = 0; i < workers; i++) loop(i)]);
+    } catch (e) {
+      crashed++;
+    }
+    _w({'event': 'stress', 'workers': workers, 'seconds': seconds, 'files': files.length, 'opens': opens, 'failedOpens': fails, 'errors': crashed});
   }
 
   static Future<void> _one(String path, List<String> stocks, int drags, bool export, String docs, {bool keepExport = false}) async {

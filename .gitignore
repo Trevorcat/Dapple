@@ -3,6 +3,7 @@
 !/tools/emu.sh
 !/tools/env.sh
 !/tools/env.ps1
+!/tools/shaderc/
 /build*/
 /out/
 /.cache/
