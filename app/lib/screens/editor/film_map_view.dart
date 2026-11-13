@@ -1,7 +1,6 @@
-// The film map (docs/design/editor-panel.md section 7): every catalog stock is a swatch at its character (x pale..rich, y low..high
-// contrast); a swatch is a small thumbnail of THIS photo rendered with that stock (services/base_swatches.dart), a rounded square,
-// tinted with the stock's type colour until the picture arrives. The three modern renderings are round swatches in their own
-// cluster (kModernCluster: not measured positions). Pressing magnifies the neighbourhood of the finger (2.4x, animated), shows the
+// The film map (docs/design/editor-panel.md section 7): every catalog stock is a film-cartridge icon at its character (x pale..rich,
+// y low..high contrast), drawn in the app (widgets/film_canister.dart): no engine rendering, nothing computed per photo. The three
+// modern renderings are round lens icons at their measured places (kModernCluster when the asset has none). Pressing magnifies the neighbourhood of the finger (2.4x, animated), shows the
 // names and puts the swatch nearest the finger on top; sliding moves to the nearest centre and the photo follows live;
 // releasing keeps it and the map shrinks back.
 import 'dart:math' as math;
@@ -10,11 +9,10 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 
-import '../../model/film_catalog.dart';
 import '../../model/film_map.dart';
 import '../../model/pad_model.dart' show PadIconKind;
-import '../../services/base_swatches.dart';
 import '../../theme/tokens.dart';
+import '../../widgets/film_canister.dart';
 import 'editor_controller.dart';
 import 'pad_gestures.dart';
 import 'pad_icons.dart';
@@ -27,7 +25,6 @@ class FilmMapStore {
   /// Test hook: replace the positions.
   static void debugSet(Map<String, Offset>? p) {
     _positions = p;
-    BaseSwatches.mapPositions = p;
     _loading = null;
   }
 
@@ -41,25 +38,20 @@ class FilmMapStore {
       } catch (_) {
         text = null; // no asset: every stock goes on the automatic grid
       }
-      return _positions = BaseSwatches.mapPositions = parseFilmMap(text);
+      return _positions = parseFilmMap(text);
     }();
   }
 }
 
 const double kMagnify = 2.4;
 
-/// Swatch size on screen: overview and magnified (laid out at the magnified size, scaled down).
+/// Icon size on screen: overview and magnified.
 const double kSwatchOverview = 23, kSwatchMagnified = 40;
-const Color kNegativeColor = Color(0xFFC98A4A), kSlideColor = Color(0xFF3F7FD0), kCinemaColor = Color(0xFF4F9A8C), kModernColor = Color(0xFF8E97A8);
 
-Color dotColorOf(FilmStock s) => switch (dotTypeOf(s)) {
-      FilmDotType.negative => kNegativeColor,
-      FilmDotType.slide => kSlideColor,
-      FilmDotType.cinema => kCinemaColor,
-    };
-
-/// Placeholder tint of a map entry: the old dot colour of its type (grey-blue for the modern renderings).
-Color dotColor(FilmDot d) => d.stock == null ? kModernColor : dotColorOf(d.stock!);
+/// The icon of a map entry: film by its measured character, a modern rendering by its id.
+BaseIconData iconOf(FilmDot d) => d.stock == null
+    ? BaseIconData.modern(d.id)
+    : BaseIconData.film(CanisterSpec.forStock(d.stock!, character: d.placed ? d.character : null));
 
 /// Map-fraction position of a dot (0..1 of the map's width and height).
 Offset dotFraction(FilmDot d) => Offset(0.5 + d.shown.dx * kFilmMapX, 0.5 - d.shown.dy * kFilmMapY);
@@ -115,29 +107,13 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   bool _active = false;
   String? _last;
   final ValueNotifier<Offset?> _finger = ValueNotifier(null); // the finger as a fraction of the map
-  final ValueNotifier<int> _swTick = ValueNotifier(0);
-  BaseSwatches? _sw;
 
   EditorController get ctl => widget.ctl;
-
-  void _onSwatches() => _swTick.value++;
-
-  /// The swatches of the photo now open (the service changes with the photo); starts them.
-  BaseSwatches _bind() {
-    final sw = ctl.swatches;
-    if (!identical(sw, _sw)) {
-      _sw?.removeListener(_onSwatches);
-      _sw = sw..addListener(_onSwatches);
-    }
-    sw.start();
-    return sw;
-  }
 
   @override
   void initState() {
     super.initState();
     _layout();
-    _bind();
     if (FilmMapStore.positions == null) {
       FilmMapStore.load().then((_) {
         if (mounted) setState(_layout);
@@ -152,9 +128,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   @override
   void dispose() {
     if (_active) ctl.stockEnd();
-    _sw?.removeListener(_onSwatches);
     _finger.dispose();
-    _swTick.dispose();
     _zoom.dispose();
     super.dispose();
   }
@@ -214,7 +188,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
               onEnd: _end,
               child: RepaintBoundary(
                 child: ListenableBuilder(
-                  listenable: Listenable.merge([_t, ctl.app.editTick, _finger, _swTick]),
+                  listenable: Listenable.merge([_t, ctl.app.editTick, _finger]),
                   builder: (context, _) => _inner(context, c),
                 ),
               ),
@@ -244,7 +218,6 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
     final z = 1 + (kMagnify - 1) * t;
     final sel = ctl.edit.film;
     final w = _size.width, h = _size.height;
-    final sw = _bind();
     final size = ui.lerpDouble(kSwatchOverview, kSwatchMagnified, t)!;
     final f = _finger.value;
     final u = f == null ? null : Offset(_origin.dx + (f.dx - _origin.dx) / z, _origin.dy + (f.dy - _origin.dy) / z);
@@ -300,10 +273,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
               width: kSwatchMagnified,
               height: kSwatchMagnified,
               child: Stack(clipBehavior: Clip.none, alignment: Alignment.center, children: [
-                Transform.scale(
-                  scale: size / kSwatchMagnified,
-                  child: RepaintBoundary(child: BaseSwatchTile(key: ValueKey('stock-${d.id}'), image: sw.imageOf(d.id), tint: dotColor(d), round: d.isModern, selected: on, c: c)),
-                ),
+                RepaintBoundary(child: BaseIcon(key: ValueKey('stock-${d.id}'), data: iconOf(d), size: size, selected: on)),
                 if (showName)
                   Positioned(
                     top: kSwatchMagnified / 2 + size / 2 + 4,
@@ -331,46 +301,4 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   /// Test hook: the current magnification.
   @visibleForTesting
   double get magnification => 1 + (kMagnify - 1) * _t.value;
-}
-
-/// One base as a swatch (laid out at [size]): the rendered [image] fades in over a placeholder tinted with [tint]; a hairline
-/// border; the selected one has the accent ring. [round]: a modern rendering (a circle), else a film stock (a rounded square).
-class BaseSwatchTile extends StatelessWidget {
-  const BaseSwatchTile({super.key, required this.image, required this.tint, required this.round, required this.selected, required this.c, this.size = kSwatchMagnified});
-  final ui.Image? image;
-  final Color tint;
-  final bool round, selected;
-  final DC c;
-  final double size;
-
-  @override
-  Widget build(BuildContext context) {
-    final radius = BorderRadius.circular(size * 0.23);
-    final ring = [
-      BoxShadow(color: c.surface, spreadRadius: selected ? 2.5 : 2),
-      if (selected) BoxShadow(color: c.accent, spreadRadius: 5),
-    ];
-    final placeholder = Color.alphaBlend(tint.withValues(alpha: 0.5), c.surface);
-    Widget clip(Widget child) => round ? ClipOval(child: child) : ClipRRect(borderRadius: radius, child: child);
-    BoxDecoration shape({Border? border, List<BoxShadow>? shadow}) =>
-        BoxDecoration(shape: round ? BoxShape.circle : BoxShape.rectangle, borderRadius: round ? null : radius, border: border, boxShadow: shadow);
-    return SizedBox(
-      width: size,
-      height: size,
-      child: DecoratedBox(
-        decoration: shape(shadow: ring),
-        child: Stack(fit: StackFit.expand, children: [
-          clip(Stack(fit: StackFit.expand, children: [
-            ColoredBox(key: const ValueKey('swatch-placeholder'), color: placeholder),
-            AnimatedOpacity(
-              opacity: image == null ? 0 : 1,
-              duration: const Duration(milliseconds: 180),
-              child: image == null ? const SizedBox.shrink() : RawImage(key: const ValueKey('swatch-image'), image: image, fit: BoxFit.cover, filterQuality: FilterQuality.low),
-            ),
-          ])),
-          IgnorePointer(child: DecoratedBox(decoration: shape(border: Border.all(color: c.text.withValues(alpha: 0.22), width: 0.5)))),
-        ]),
-      ),
-    );
-  }
 }

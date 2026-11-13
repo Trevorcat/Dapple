@@ -82,7 +82,6 @@ class EditorController extends ChangeNotifier implements GestureSink {
     required this.onSwipe,
     required this.onToggleImmersive,
     this.filmPadFetcher,
-    this.swatchSource,
     this.lookSwatchSource,
   }) {
     edits.addListener(_maybeRefreshRanges);
@@ -102,9 +101,6 @@ class EditorController extends ChangeNotifier implements GestureSink {
   /// Asks the engine for the film pads' effective ranges (dapple_session_film_pad_json); null = the live session.
   /// Tests inject a fake.
   final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
-
-  /// Where the base swatches come from; null = the engine through the photo's session. Tests inject a fake.
-  final SwatchSource Function(String photoId)? swatchSource;
 
   /// Where the colour looks' swatches come from; null = the engine. Tests inject a fake.
   final SwatchSource Function(String photoId, String? baseId)? lookSwatchSource;
@@ -130,28 +126,6 @@ class EditorController extends ChangeNotifier implements GestureSink {
     final sw = BaseSwatches(source: src, ids: ids)..addListener(() => lookTick.value++);
     return _lookSw = sw;
   }
-
-  BaseSwatches? _swatches;
-  String? _swatchesPhoto;
-
-  /// The swatches of the bases on the photo now open (one service per photo; the previous photo's is stopped). Not started:
-  /// call [BaseSwatches.start] (the film pad and the film map do).
-  BaseSwatches get swatches {
-    final pid = id;
-    final cur = _swatches;
-    if (cur != null && _swatchesPhoto == pid && !cur.closed) return cur;
-    cur?.dispose();
-    _swatchesPhoto = pid;
-    final ph = app.photoById(pid);
-    final src = swatchSource?.call(pid) ?? SessionSwatchSource(app, ph ?? Photo(id: pid, name: pid, addedMs: 0));
-    final ids = allBaseIds(app.film);
-    // the current base first, then the modern renderings and the film stocks in the order of the map
-    final first = edit.film;
-    return _swatches = BaseSwatches(source: src, ids: [first, ...ids.where((x) => x != first)]);
-  }
-
-  /// Starts the background swatches (idempotent); the film pad does it as soon as it shows.
-  void warmSwatches() => swatches.start();
 
   final PanelSel sel = PanelSel();
 
@@ -831,7 +805,6 @@ class EditorController extends ChangeNotifier implements GestureSink {
     edits.removeListener(_maybeRefreshRanges);
     _rangesTimer?.cancel();
     filmRanges.dispose();
-    _swatches?.dispose();
     _lookSw?.dispose();
     lookTick.dispose();
     _idleTimer?.cancel();

@@ -391,7 +391,6 @@ class _Header extends StatelessWidget {
           builder: (context, _) {
             final name = ctl.edit.film == null ? '无' : baseNameOf(ctl.app.film, ctl.edit.film);
             final modern = isModernId(ctl.edit.film);
-            WidgetsBinding.instance.addPostFrameCallback((_) => ctl.warmSwatches()); // the map is one tap away: render its swatches now (idempotent)
             return HeaderButton(key: const ValueKey('stock-button'), label: name, chevron: true, pressed: ctl.filmMapOpen, semantics: '选择${modern ? '成像' : '胶片'}，当前$name', onTap: () => ctl.setFilmMap(!ctl.filmMapOpen));
           },
         ),

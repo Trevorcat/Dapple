@@ -1,7 +1,7 @@
 // Rendering bases (film stocks + three modern renderings) on the film map and the 默认成像 page: the swatch service, the map with
 // swatches (placeholder -> image, z-order, modern shape, release closes and selects), the pad with a modern base, the default
 // page, and the default base at ingest. Screenshots (widget-rendered; the swatch pixels are a stand-in tint of the bundled
-// sample, not engine output) go to build/ui-looks/.
+// sample, not engine output) go to build/ui-canister/ (colour pad: build/ui-looks/); the icons are vector, the map and the page render no swatches.
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
@@ -16,6 +16,7 @@ import 'package:dapple/screens/editor/editor_page.dart';
 import 'package:dapple/screens/editor/film_map_view.dart';
 import 'package:dapple/screens/editor/pad_widgets.dart' show LookDot;
 import 'package:dapple/screens/library/styles_page.dart';
+import 'package:dapple/widgets/film_canister.dart';
 import 'package:dapple/services/base_swatches.dart';
 import 'package:dapple/services/ingest.dart';
 import 'package:dapple/state/app_state.dart';
@@ -75,7 +76,7 @@ Future<void> shot(WidgetTester t, GlobalKey k, String name) async {
     final b = k.currentContext!.findRenderObject() as RenderRepaintBoundary;
     final img = await b.toImage(pixelRatio: 1.5);
     final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
-    final f = File('build/ui-looks/$name.png');
+    final f = File('build/${name.startsWith('color_pad') ? 'ui-looks' : 'ui-canister'}/$name.png');
     f.parent.createSync(recursive: true);
     f.writeAsBytesSync(bytes!.buffer.asUint8List());
   });
@@ -87,13 +88,12 @@ final _shotKey = GlobalKey();
 final lookBases = <String?>[];
 final lookSources = <FakeSource>[];
 
-Future<(AppState, String, FakeSource)> openEditor(WidgetTester t, {Future<void>? gate}) async {
+Future<(AppState, String)> openEditor(WidgetTester t) async {
   setView(t, const Size(1140, 2616), 2.75);
   await loadTestFonts();
   final app = AppState.demo();
   app.film = testFilmCatalog;
   final id = app.photos.firstWhere((p) => p.title == '外滩夕阳' && p.id.startsWith('d')).id;
-  final src = FakeSource('photo-$id', await makeImages(t, _ids), gate: gate);
   final lookImgs = await makeImages(t, [for (final l in dLooks) l.id]);
   lookBases.clear();
   lookSources.clear();
@@ -102,7 +102,7 @@ Future<(AppState, String, FakeSource)> openEditor(WidgetTester t, {Future<void>?
     child: MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: buildTheme(Brightness.light),
-      home: EditorPage(app: app, photoId: id, resamplePointers: false, filmPadFetcher: (_) async => null, swatchSource: (_) => src,
+      home: EditorPage(app: app, photoId: id, resamplePointers: false, filmPadFetcher: (_) async => null,
         lookSwatchSource: (pid, base) {
           lookBases.add(base);
           final f = FakeSource('looks|$pid|$base', lookImgs);
@@ -113,7 +113,7 @@ Future<(AppState, String, FakeSource)> openEditor(WidgetTester t, {Future<void>?
     ),
   ));
   await settle(t);
-  return (app, id, src);
+  return (app, id);
 }
 
 Future<void> openMap(WidgetTester t) async {
@@ -210,38 +210,28 @@ void main() {
     });
   });
 
-  group('film map with swatches', () {
-    testWidgets('a swatch is a tinted placeholder until its picture arrives, then fades in; the size does not jump', (t) async {
-      final gate = Completer<void>();
-      final (app, id, src) = await openEditor(t, gate: gate.future);
+  group('film map with icons', () {
+    testWidgets('every base is a drawn icon: film cartridges, the modern ones round, nothing is rendered by the engine', (t) async {
+      final (app, id) = await openEditor(t);
       app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
       await openMap(t);
+      await settle(t, 4);
       final tile = find.byKey(const ValueKey('stock-kodak_ektar_100'));
       expect(tile, findsOneWidget);
-      expect(find.descendant(of: tile, matching: find.byKey(const ValueKey('swatch-placeholder'))), findsOneWidget);
-      expect(find.descendant(of: tile, matching: find.byKey(const ValueKey('swatch-image'))), findsNothing);
+      expect(find.descendant(of: tile, matching: find.byType(RawImage)), findsNothing, reason: 'no picture, no engine call: the icon is vector');
+      expect(find.byType(RawImage), findsNothing);
       final before = t.getSize(tile);
-      await shot(t, _shotKey, 'map_placeholders');
-      gate.complete();
-      await settle(t, 40); // 30 renders, one at a time, 30 ms apart
-      expect(find.descendant(of: tile, matching: find.byKey(const ValueKey('swatch-image'))), findsOneWidget);
-      expect(t.getSize(tile), before, reason: 'no layout jump when the image arrives');
-      expect(src.calls.first, 'kodak_portra_400', reason: 'the current base is rendered first');
-      await shot(t, _shotKey, 'map_overview');
-    });
-
-    testWidgets('film swatches are rounded squares, the modern ones circles in a labelled cluster', (t) async {
-      await openEditor(t);
-      await openMap(t);
       await settle(t, 40);
-      expect(find.descendant(of: find.byKey(const ValueKey('stock-kodak_ektar_100')), matching: find.byType(ClipRRect)), findsOneWidget);
-      expect(find.descendant(of: find.byKey(const ValueKey('stock-kodak_ektar_100')), matching: find.byType(ClipOval)), findsNothing);
+      expect(t.getSize(tile), before);
+      expect(before.width, kSwatchOverview);
       for (final m in kModernBases) {
-        expect(find.descendant(of: find.byKey(ValueKey('stock-${m.id}')), matching: find.byType(ClipOval)), findsOneWidget, reason: m.name);
+        final box = t.widget<DecoratedBox>(find.descendant(of: find.byKey(ValueKey('stock-${m.id}')), matching: find.byType(DecoratedBox)).first);
+        expect((box.decoration as BoxDecoration).shape, BoxShape.circle, reason: m.name);
       }
+      final film = t.widget<DecoratedBox>(find.descendant(of: tile, matching: find.byType(DecoratedBox)).first);
+      expect((film.decoration as BoxDecoration).shape, BoxShape.rectangle);
       expect(find.byKey(const ValueKey('modern-plate')), findsNothing, reason: 'measured positions are spread over the map: no plate over unrelated stocks');
-      final sizes = {for (final m in kModernBases) t.getSize(find.byKey(ValueKey('stock-${m.id}'))).width};
-      expect(sizes.single, kSwatchMagnified, reason: 'laid out at the magnified size, scaled down in the overview');
+      await shot(t, _shotKey, 'map_overview');
     });
 
     testWidgets('a tight cluster of modern renderings gets the labelled plate', (t) async {
@@ -274,8 +264,8 @@ void main() {
       expect(paintOrder(dots, size, null, sel.id).last.id, sel.id);
     });
 
-    testWidgets('while magnified the swatch nearest the finger is the last one painted', (t) async {
-      final (app, id, _) = await openEditor(t);
+    testWidgets('while magnified the icon nearest the finger is the last one painted', (t) async {
+      final (app, id) = await openEditor(t);
       app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
       await openMap(t);
       await settle(t, 40);
@@ -285,16 +275,17 @@ void main() {
       await settle(t, 4);
       expect(app.editOf(id).film, 'kodak_ektar_100');
       // the selected one is last (it is the nearest); slide to another one: that one is the nearest but the selected stays on top
-      final tiles = t.widgetList<BaseSwatchTile>(find.byType(BaseSwatchTile)).toList();
+      final tiles = t.widgetList<BaseIcon>(find.byType(BaseIcon)).toList();
       expect(tiles.last.selected, isTrue);
       expect(tiles.where((x) => x.selected).length, 1);
+      expect(t.getSize(find.byKey(const ValueKey('stock-kodak_ektar_100'))).width, kSwatchMagnified);
       await shot(t, _shotKey, 'map_magnified');
       await f.up();
       await settle(t, 8);
     });
 
     testWidgets('pressing a modern rendering selects it and the map closes on release; the button names it', (t) async {
-      final (app, id, _) = await openEditor(t);
+      final (app, id) = await openEditor(t);
       app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400', values: {...e.values, 'film_grain': 150, 'film_shoot': 0.3}));
       await openMap(t);
       final dots = layoutFilmMap(testFilmCatalog, FilmMapStore.positions ?? const {});
@@ -317,7 +308,7 @@ void main() {
 
   group('the film pad with a modern base', () {
     testWidgets('both pad axes are dead, the strength strip stays, the radar has the strength only, no paper', (t) async {
-      final (app, id, _) = await openEditor(t);
+      final (app, id) = await openEditor(t);
       app.applyEdit(id, (e) => e.copyWith(film: 'modern_clean'));
       await t.tap(find.byKey(ValueKey('dock-${EGroup.style}')));
       await settle(t, 10);
@@ -365,7 +356,7 @@ void main() {
 
   group('colour looks as real swatches, on top of the current base', () {
     testWidgets('the colour pad dots are thumbnails of the photo with each look, rendered on the current base', (t) async {
-      final (app, id, _) = await openEditor(t);
+      final (app, id) = await openEditor(t);
       app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
       await t.tap(find.byKey(ValueKey('dock-${EGroup.color}')));
       await settle(t, 10);
@@ -439,7 +430,7 @@ void main() {
       return (app, src);
     }
 
-    testWidgets('groups 胶片 / 现代 / 标准, placeholders then engine swatches, tap sets the default and the card follows', (t) async {
+    testWidgets('groups 胶片 / 现代 / 标准 as icons (no engine swatches), tap sets the default and the card follows', (t) async {
       final gate = Completer<void>();
       final (app, src) = await openPage(t, gate: gate.future);
       for (final k in ['group-negative', 'group-slide', 'group-modern', 'group-none']) {
@@ -447,12 +438,12 @@ void main() {
         expect(find.byKey(ValueKey(k)), findsOneWidget, reason: k);
       }
       await t.scrollUntilVisible(find.byKey(const ValueKey('base-modern_soft')), -200, scrollable: find.byType(Scrollable).first);
-      expect(find.descendant(of: find.byKey(const ValueKey('base-modern_soft')), matching: find.byKey(const ValueKey('swatch-placeholder'))), findsOneWidget);
+      expect(find.descendant(of: find.byKey(const ValueKey('base-modern_soft')), matching: find.byType(BaseIcon)), findsOneWidget);
+      expect(find.descendant(of: find.byKey(const ValueKey('base-modern_soft')), matching: find.byType(RawImage)), findsNothing);
       gate.complete();
       await t.pump(const Duration(seconds: 3));
       await t.pump(const Duration(seconds: 3));
-      expect(src.calls, contains('modern_soft'));
-      expect(find.descendant(of: find.byKey(const ValueKey('base-modern_soft')), matching: find.byKey(const ValueKey('swatch-image'))), findsOneWidget);
+      expect(src.calls.toSet(), {null}, reason: 'only the card preview of the current default (標準) was rendered, no grid swatch');
       await t.tap(find.byKey(const ValueKey('base-modern_soft')));
       await t.pump(const Duration(milliseconds: 300));
       expect(app.settings.defaultBaseId, 'modern_soft');
@@ -460,7 +451,7 @@ void main() {
       await t.drag(find.byType(Scrollable).first, const Offset(0, 4000));
       await t.pump(const Duration(milliseconds: 600));
       expect(find.descendant(of: find.byKey(const ValueKey('default-card')), matching: find.text('柔和')), findsOneWidget);
-      expect(src.calls.where((c) => c == 'modern_soft').length, greaterThanOrEqualTo(2), reason: 'the large preview was rendered for the new default');
+      expect(src.calls, contains('modern_soft'), reason: 'the large preview was rendered for the new default');
       await t.scrollUntilVisible(find.byKey(const ValueKey('base-none')), 200, scrollable: find.byType(Scrollable).first);
       await t.ensureVisible(find.byKey(const ValueKey('base-none')));
       await t.pump(const Duration(milliseconds: 300));
@@ -492,12 +483,23 @@ void main() {
       await t.pump(const Duration(seconds: 6));
     });
 
-    testWidgets('grid swatches are asked for at 2x (192 px), the large preview at 640', (t) async {
+    testWidgets('no grid swatch is rendered: the engine is asked once, for the 640 px preview of the default', (t) async {
       final (_, src) = await openPage(t);
       await t.pump(const Duration(seconds: 3));
-      expect(src.calls, isNotEmpty);
-      expect(src.sizesSeen, containsAll([192, 640]));
-      expect(src.sizesSeen, isNot(contains(96)));
+      expect(src.calls, [null]);
+      expect(src.sizesSeen, {640});
+    });
+
+    testWidgets('the card shows the default base icon next to its name', (t) async {
+      final (app, _) = await openPage(t);
+      app.setDefaultBase('kodak_portra_400');
+      await t.pump(const Duration(milliseconds: 300));
+      final icon = t.widget<BaseIcon>(find.byKey(const ValueKey('default-icon')));
+      expect(icon.data.spec?.code, 'N400C');
+      app.setDefaultBase('modern_clean');
+      await t.pump(const Duration(milliseconds: 300));
+      expect(t.widget<BaseIcon>(find.byKey(const ValueKey('default-icon'))).data.modern, 'modern_clean');
+      await t.pump(const Duration(seconds: 6));
     });
 
     testWidgets('a film default is visible without scrolling when the tab opens', (t) async {
@@ -516,7 +518,7 @@ void main() {
       await openPage(t);
       await t.pump(const Duration(seconds: 4));
       await t.pump(const Duration(seconds: 4));
-      await shot(t, _shotKey, 'default_page_top');
+      await shot(t, _shotKey, 'page');
       await t.drag(find.byType(Scrollable).first, const Offset(0, -520));
       await t.pump(const Duration(milliseconds: 400));
       await shot(t, _shotKey, 'default_page_scrolled');

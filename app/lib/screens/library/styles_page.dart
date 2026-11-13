@@ -7,22 +7,24 @@ import '../../model/bases.dart';
 import '../../model/film_catalog.dart';
 import '../../models.dart';
 import '../../services/base_swatch_sources.dart';
-import '../../services/base_swatches.dart';
+import '../../services/base_swatches.dart' show SwatchSource;
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
+import '../../widgets/film_canister.dart';
 import '../../widgets/photo_art.dart';
-import '../editor/film_map_view.dart' show BaseSwatchTile, dotColorOf, kModernColor, kSlideColor;
+import '../editor/film_map_view.dart' show FilmMapStore;
 import 'page_bar.dart';
 
 /// 成像 tab (默认成像): the rendering base new photos start with, chosen among every film stock, the three modern renderings and
-/// 标准 (none), each shown as a real engine rendering of the latest developed photo (the bundled sample before there is one).
+/// 标准 (none), each shown as a drawn icon (widgets/film_canister.dart: nothing is computed per photo for the picker). The card on
+/// top keeps ONE real engine rendering of the current default on the latest developed photo (the bundled sample before there is one).
 /// The nine colour looks are not chosen here any more: they are the editor's 颜色 (a look on top of any base).
 class StylesPage extends StatefulWidget {
   const StylesPage({super.key, required this.app, required this.wide, this.swatchSource});
   final AppState app;
   final bool wide;
 
-  /// Test hook: where the swatches and the large preview come from (default: the engine).
+  /// Test hook: where the large preview comes from (default: the engine).
   final SwatchSource Function(Photo? photo)? swatchSource;
 
   @override
@@ -32,7 +34,6 @@ class StylesPage extends StatefulWidget {
 const kSampleAsset = 'assets/style_sample/sample.jpg';
 
 class _StylesPageState extends State<StylesPage> {
-  BaseSwatches? _sw;
   SwatchSource? _src;
   String _srcKey = '';
   ui.Image? _preview; // the large rendering of the current default
@@ -52,26 +53,19 @@ class _StylesPageState extends State<StylesPage> {
     return best;
   }
 
-  /// Follows the latest photo; (re)starts the swatches once the tab is shown (the engine is not asked for a tab nobody looks at).
+  /// Follows the latest photo; renders the one large preview once the tab is shown (the engine is not asked for a tab nobody looks at).
   void _sync() {
     final ph = _photo;
     final key = ph == null ? 'sample' : '${ph.id}|${ph.path}';
     if (key != _srcKey) {
-      _sw?.dispose();
       final old = _src;
       if (old is AssetSwatchSource) unawaited(old.close());
       _srcKey = key;
       _src = widget.swatchSource?.call(ph) ?? (ph == null ? AssetSwatchSource(kSampleAsset) : SessionSwatchSource(app, ph));
-      final ids = allBaseIds(app.film);
-      final cur = app.settings.defaultBaseId;
-      // 2x: a 56 dp swatch is up to 168 device px; the film map keeps 96 (23-40 dp)
-      _sw = BaseSwatches(source: _src!, longEdge: 192, ids: [cur, ...ids.where((x) => x != cur)])
-        ..addListener(() => mounted ? setState(() {}) : null);
       _preview = null;
       _previewFor = null;
     }
     if (app.tab == 1) {
-      _sw!.start();
       _loadPreview();
       if (!_scrolled) {
         _scrolled = true;
@@ -104,8 +98,17 @@ class _StylesPageState extends State<StylesPage> {
   }
 
   @override
+  void initState() {
+    super.initState();
+    if (FilmMapStore.positions == null) {
+      FilmMapStore.load().then((_) {
+        if (mounted) setState(() {});
+      });
+    }
+  }
+
+  @override
   void dispose() {
-    _sw?.dispose();
     final s = _src;
     if (s is AssetSwatchSource) unawaited(s.close());
     super.dispose();
@@ -155,6 +158,9 @@ class _StylesPageState extends State<StylesPage> {
     return s == null ? '不加倾向' : filmGroupNames[s.group]!;
   }
 
+  /// The icon of a base; a stock's character comes from the film map asset.
+  BaseIconData _iconOf(String? id) => baseIconOf(app.film, id, character: FilmMapStore.positions?[id]);
+
   Widget _card({double? height}) {
     final c = context.c;
     final def = app.settings.defaultBaseId;
@@ -174,8 +180,22 @@ class _StylesPageState extends State<StylesPage> {
               children: [
                 Text(_photo == null ? '新照片默认使用（预览为示例画面）' : '新照片默认使用', style: T.small(c.text2)),
                 const SizedBox(height: 4),
-                Text(baseNameOf(app.film, def), key: const ValueKey('default-name'), style: T.h2(c.text)),
-                Text(_kindOf(def), style: T.small(c.text2)),
+                const SizedBox(height: 4),
+                Row(
+                  children: [
+                    BaseIcon(key: const ValueKey('default-icon'), data: _iconOf(def), size: 48),
+                    const SizedBox(width: Sp.m),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(baseNameOf(app.film, def), key: const ValueKey('default-name'), style: T.h2(c.text)),
+                          Text(_kindOf(def), style: T.small(c.text2)),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
@@ -186,7 +206,7 @@ class _StylesPageState extends State<StylesPage> {
 
   // ---------------------------------------------------------------- the grid
 
-  Widget _tile(String? id, String name, {required bool round, required Color tint, required double size}) {
+  Widget _tile(String? id, String name, {required double size}) {
     final c = context.c;
     final selected = app.settings.defaultBaseId == id;
     return KeyedSubtree(
@@ -207,7 +227,7 @@ class _StylesPageState extends State<StylesPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  BaseSwatchTile(image: _sw?.imageOf(id), tint: tint, round: round, selected: selected, c: c, size: size),
+                  BaseIcon(data: _iconOf(id), size: size, selected: selected),
                   const SizedBox(height: 8),
                   Text(
                     name,
@@ -247,17 +267,17 @@ class _StylesPageState extends State<StylesPage> {
   }
 
   Widget _grid(double width) {
-    const size = 56.0;
+    const size = 64.0;
     final film = app.film;
     // the standard and the three modern renderings first (four tiles), then the film library
     final sections = <Widget>[
-      _group('标准', [_tile(null, '标准', round: false, tint: kSlideColor.withValues(alpha: 0.0), size: size)], key: 'group-none'),
-      _group('现代', [for (final m in kModernBases) _tile(m.id, m.name, round: true, tint: kModernColor, size: size)], key: 'group-modern'),
+      _group('标准', [_tile(null, '标准', size: size)], key: 'group-none'),
+      _group('现代', [for (final m in kModernBases) _tile(m.id, m.name, size: size)], key: 'group-modern'),
       if (!film.isEmpty)
         for (final g in FilmGroup.values)
           if (film.inGroup(g).isNotEmpty)
             _group(g == FilmGroup.negative ? '胶片 · ${filmGroupNames[g]}' : '${filmGroupNames[g]}', [
-              for (final s in film.inGroup(g)) _tile(s.id, s.name, round: false, tint: dotColorOf(s), size: size),
+              for (final s in film.inGroup(g)) _tile(s.id, s.name, size: size),
             ], key: 'group-${g.name}'),
     ];
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: sections);
