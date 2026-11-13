@@ -89,17 +89,19 @@ class PhotoPickPlugin(private val activity: Activity, messenger: BinaryMessenger
                     continue
                 }
                 val convert = ImageTranscode.needsTranscode(name)
-                val f = File(out, "${now + n}_${if (convert) ImageTranscode.jpegName(name) else name}")
+                val f = File(out, "${now + n}_${if (convert) ImageTranscode.outputName(name) else name}")
                 val raw = if (convert) File(activity.cacheDir, "pick_${now + n}_$name") else f
                 try {
                     activity.contentResolver.openInputStream(u)!!.use { i -> raw.outputStream().use { o -> i.copyTo(o, 1 shl 20) } }
+                    var written = f
                     if (convert) {
-                        val ok = ImageTranscode.toJpeg(raw, f)
+                        val w = ImageTranscode.convert(raw, f)
                         raw.delete()
-                        if (!ok) throw IllegalStateException("cannot decode $name")
+                        if (w == null) throw IllegalStateException("cannot decode $name")
+                        written = w
                     }
-                    Log.i("DappleIngest", "picked $name: ${f.length()} bytes${if (convert) ", converted to JPEG" else ""}")
-                    rows.add(mapOf("key" to key, "name" to f.name.substringAfter('_'), "dup" to false, "path" to f.absolutePath, "size" to f.length()))
+                    Log.i("DappleIngest", "picked $name: ${written.length()} bytes${if (convert) ", converted to ${written.extension}" else ""}")
+                    rows.add(mapOf("key" to key, "name" to written.name.substringAfter('_'), "dup" to false, "path" to written.absolutePath, "size" to written.length()))
                 } catch (e: Exception) {
                     f.delete()
                     raw.delete()

@@ -123,13 +123,13 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
-                "toJpeg" -> {
-                    // HEIC / PNG / WebP file -> sRGB JPEG (ImageTranscode.kt), for files that did not come through the pick channel
+                "toPng16" -> {
+                    // HEIC / WebP file -> 16-bit PNG in its own colour space (ImageTranscode.kt; an sRGB JPEG before API 28), for files that did not come through the pick channel
                     val src = File(call.argument<String>("src")!!)
                     val dest = File(call.argument<String>("dest")!!)
                     io.execute {
-                        val ok = ImageTranscode.toJpeg(src, dest)
-                        main.post { if (ok) result.success(dest.absolutePath) else result.error("convert", "cannot convert ${src.name}", null) }
+                        val written = ImageTranscode.convert(src, dest)
+                        main.post { if (written != null) result.success(written.absolutePath) else result.error("convert", "cannot convert ${src.name}", null) }
                     }
                 }
                 "openApp" -> {

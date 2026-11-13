@@ -28,13 +28,15 @@ class PhotoPickKeyTest {
         assertFalse(PhotoPickPlugin.supported("noext"))
     }
 
-    @Test fun heicAndPngAreTranscodedToJpeg() {
+    @Test fun heicAndWebpAreConvertedPngAndJpegAreNot() {
         assertTrue(ImageTranscode.needsTranscode("IMG_0001.HEIC"))
-        assertTrue(ImageTranscode.needsTranscode("a.png"))
+        assertTrue(ImageTranscode.needsTranscode("a.webp"))
+        assertFalse(ImageTranscode.needsTranscode("a.png"))  // the engine reads PNG itself: tags, 16 bit
         assertFalse(ImageTranscode.needsTranscode("a.jpg"))
         assertFalse(ImageTranscode.needsTranscode("a.dng"))
-        assertEquals("IMG_0001.jpg", ImageTranscode.jpegName("IMG_0001.HEIC"))
-        assertEquals("a.b.jpg", ImageTranscode.jpegName("a.b.png"))
-        assertEquals("noext.jpg", ImageTranscode.jpegName("noext"))
+        assertEquals("IMG_0001.png", ImageTranscode.outputName("IMG_0001.HEIC", 33))
+        assertEquals("a.b.png", ImageTranscode.outputName("a.b.webp", 28))
+        assertEquals("IMG_0001.jpg", ImageTranscode.outputName("IMG_0001.HEIC", 27))
+        assertEquals("noext.png", ImageTranscode.outputName("noext", 30))
     }
 }

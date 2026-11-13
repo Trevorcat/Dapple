@@ -134,7 +134,7 @@ class FtpIngestSource implements IngestSource {
 String pairStem(String name) => p.basenameWithoutExtension(name).toLowerCase();
 
 const _rawExt = {'.arw', '.raf', '.dng', '.cr2', '.cr3', '.nef', '.orf', '.rw2'};
-const _jpgExt = {'.jpg', '.jpeg'};
+const _jpgExt = {'.jpg', '.jpeg', '.png'};  // display-referred stills the engine reads itself (PNG: platform-converted HEIC arrives as 16-bit PNG)
 bool isRawName(String name) => _rawExt.contains(p.extension(name).toLowerCase());
 bool isJpegName(String name) => _jpgExt.contains(p.extension(name).toLowerCase());
 

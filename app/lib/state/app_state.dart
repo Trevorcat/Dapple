@@ -1003,18 +1003,20 @@ class AppState extends ChangeNotifier {
   // ---------------------------------------------------------------- source path resolution
   /// Returns a readable local path for FFI. Copies content:// into cache when the
   /// MediaStore path cannot be opened directly. [temp] tells the caller to delete it afterwards.
-  /// Types the engine does not read itself (or reads without colour management): converted to an sRGB JPEG by the platform decoder
-  /// (ImageIO on iOS, ImageDecoder on Android; capture date, camera and orientation kept) into the cache, the caller deletes it ([temp]).
-  static const _convertExts = {'.heic', '.heif', '.png', '.tif', '.tiff', '.webp', '.avif'};
+  /// Types the engine does not read itself: converted to a 16-bit PNG in their own colour space by the platform decoder (ImageIO on iOS,
+  /// ImageDecoder on Android 9+, an sRGB JPEG before; capture date, camera and orientation kept) into the cache, the caller deletes it
+  /// ([temp]). JPEG and PNG go to the engine as they are: it reads their profile / tags and depth.
+  static const _convertExts = {'.heic', '.heif', '.tif', '.tiff', '.webp', '.avif'};
 
   Future<({String path, bool temp})> resolveSource(Photo ph) async {
     final r = await _resolveRaw(ph);
     final ext = p.extension(r.path).toLowerCase();
     if (!_convertExts.contains(ext) || !(Platform.isIOS || Platform.isAndroid)) return r;
-    final dest = p.join(_cache.path, 'src', '${DateTime.now().microsecondsSinceEpoch}_${p.basenameWithoutExtension(r.path)}.jpg');
+    final dest = p.join(_cache.path, 'src', '${DateTime.now().microsecondsSinceEpoch}_${p.basenameWithoutExtension(r.path)}.png');
+    String written = dest;
     try {
       await Directory(p.dirname(dest)).create(recursive: true);
-      await MediaBridge.toJpeg(r.path, dest);
+      written = await MediaBridge.toPng16(r.path, dest);
     } finally {
       if (r.temp) {
         try {
@@ -1022,7 +1024,7 @@ class AppState extends ChangeNotifier {
         } catch (_) {}
       }
     }
-    return (path: dest, temp: true);
+    return (path: written, temp: true);
   }
 
   Future<({String path, bool temp})> _resolveRaw(Photo ph) async {

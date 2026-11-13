@@ -51,9 +51,10 @@ class MediaBridge {
   static Future<String> copyToFile(String uri, String dest) async =>
       (await _media.invokeMethod<String>('copyToFile', {'uri': uri, 'dest': dest}))!;
 
-  /// HEIC / PNG / TIFF / WebP file -> sRGB JPEG at [dest] (ImageIO on iOS, ImageDecoder on Android).
-  static Future<String> toJpeg(String src, String dest) async =>
-      (await _media.invokeMethod<String>('toJpeg', {'src': src, 'dest': dest}))!;
+  /// HEIC / HEIF / TIFF / WebP file -> 16-bit PNG in its own colour space at [dest] (ImageIO on iOS, ImageDecoder on Android 9+).
+  /// Returns the path actually written: Android before 9 cannot do it and writes an sRGB JPEG next to [dest] with a .jpg extension.
+  static Future<String> toPng16(String src, String dest) async =>
+      (await _media.invokeMethod<String>('toPng16', {'src': src, 'dest': dest}))!;
 
   /// Inserts the JPEG into MediaStore Pictures/Dapple. Returns the new URI / path.
   /// [replace] first removes this app's earlier gallery item with the same name (regenerated Motion Photos).

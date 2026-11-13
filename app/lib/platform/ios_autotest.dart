@@ -13,6 +13,7 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../native/dapple_session.dart';
+import '../services/ingest.dart';
 
 const bool kIosAutotest = bool.fromEnvironment('DAPPLE_IOS_AUTOTEST');
 
@@ -63,7 +64,7 @@ class IosAutotest {
           _w({'event': 'missing', 'file': path});
           continue;
         }
-        await _one(path, stocks, drags, cfg['export'] == true, docs);
+        await _one(path, stocks, drags, cfg['export'] == true, docs, keepExport: cfg['keepExport'] == true);
       }
       _w({'event': 'gpu_status_end', 'status': jsonDecode(DappleSession.gpuStatusJson() ?? '{}')});
     } catch (e, s) {
@@ -72,8 +73,16 @@ class IosAutotest {
     _w({'event': 'done', 'totalMs': w.elapsedMilliseconds});
   }
 
-  static Future<void> _one(String path, List<String> stocks, int drags, bool export, String docs) async {
+  static Future<void> _one(String path, List<String> stocks, int drags, bool export, String docs, {bool keepExport = false}) async {
     final name = path.split('/').last;
+    final lower = name.toLowerCase();
+    if (lower.endsWith('.heic') || lower.endsWith('.heif') || lower.endsWith('.tif') || lower.endsWith('.tiff')) {
+      // what the library does before the engine opens such a file: the platform decoder -> 16-bit PNG in its own colour space
+      final t = Stopwatch()..start();
+      final conv = await MediaBridge.toPng16(path, '$docs/autotest_conv_$name.png');
+      _w({'event': 'convert', 'file': name, 'ms': t.elapsedMilliseconds, 'out': conv.split('/').last, 'bytes': File(conv).lengthSync()});
+      path = conv;
+    }
     final sw = Stopwatch()..start();
     final s = await DappleSession.open(path, longEdge: 2048);
     final openMs = sw.elapsedMilliseconds;
@@ -117,16 +126,18 @@ class IosAutotest {
     }
     if (export) {
       final t = Stopwatch()..start();
-      final out = '$docs/autotest_export_$name.jpg';
+      final out = '$docs/autotest_export_${name.split('.').first}.jpg';
       final sf = await DappleSession.open(path, full: true, longEdge: 0);
       final fullOpen = t.elapsedMilliseconds;
       final t2 = Stopwatch()..start();
       await sf.exportJpeg({...base(), if (stocks.isNotEmpty) 'film': stocks.first}, outPath: out);
       _w({'event': 'export', 'file': name, 'fullOpenMs': fullOpen, 'exportMs': t2.elapsedMilliseconds, 'bytes': File(out).existsSync() ? File(out).lengthSync() : -1});
       await sf.close();
-      try {
-        File(out).deleteSync();
-      } catch (_) {}
+      if (!keepExport) {
+        try {
+          File(out).deleteSync();
+        } catch (_) {}
+      }
     }
     await s.close();
     debugPrint('IosAutotest: $name done');

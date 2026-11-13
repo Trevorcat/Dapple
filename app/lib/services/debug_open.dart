@@ -18,6 +18,8 @@ import 'package:path_provider/path_provider.dart';
 import '../model/pad_model.dart';
 import '../model/params.dart';
 import '../models.dart';
+import '../native/dapple_session.dart';
+import 'ingest.dart';
 import '../screens/editor/editor_page.dart';
 import '../state/app_state.dart';
 
@@ -38,6 +40,17 @@ class DebugOpen {
       final text = await f.readAsString();
       await f.delete();
       final j = jsonDecode(text) as Map<String, dynamic>;
+      if (j['convert'] is String) {
+        // {"convert":"/abs/photo.heic"}: the platform conversion the library does for such files, then an engine session on the result
+        // (logs the colour space the engine detected); the PNG stays in the external files folder as converted.png
+        final t = Stopwatch()..start();
+        final out = await MediaBridge.toPng16(j['convert'] as String, p.join(dir.path, 'converted.png'));
+        debugPrint('debug_open: converted to $out (${File(out).lengthSync()} bytes, ${t.elapsedMilliseconds} ms)');
+        final sess = await DappleSession.open(out, longEdge: 2048);
+        debugPrint('debug_open: engine info ${await sess.info()}');
+        await sess.close();
+        return;
+      }
       final nav = app.navigatorKey.currentState;
       final ctx = app.navigatorKey.currentContext;
       if (nav == null || ctx == null) return;
