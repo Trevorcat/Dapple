@@ -288,6 +288,9 @@ class EditorEngine extends ChangeNotifier {
 
   /// The camera's embedded JPEG, shown (labelled 预览) until the first RAW render is ready.
   ui.Image? placeholder;
+
+  /// True when [placeholder] is the photo's developed preview (our own look), false for the camera's JPEG.
+  bool placeholderDeveloped = false;
   List<Photo> _neighbors = const [];
   Analysis? analysis;
   Analysis? originalAnalysis;
@@ -366,12 +369,13 @@ class EditorEngine extends ChangeNotifier {
       // 1. the photo's developed preview (the JPEG the library grid shows): a plain JPEG decode on the
       //    engine's IO thread, no isolate, no RAW parsing; 2. else the camera's embedded JPEG.
       ui.Image? img = await _developedPreview(ph);
+      final dev = img != null;
       if (img == null) {
         final r = await app.sessions.preview(ph);
         if (r == null || gen != _gen || image != null) return;
         img = await imageFromRgba(r);
       }
-      _showPlaceholder(img, gen);
+      _showPlaceholder(img, gen, dev);
     } finally {
       if (done != null && !done.isCompleted) done.complete();
     }
@@ -398,14 +402,16 @@ class EditorEngine extends ChangeNotifier {
     }
   }
 
-  void _showPlaceholder(ui.Image img, int gen) {
+  void _showPlaceholder(ui.Image img, int gen, bool developed) {
     if (gen != _gen || image != null) {
       img.dispose();
       return;
     }
     placeholder?.dispose();
     placeholder = img;
+    placeholderDeveloped = developed;
     PerfProbe.log('open_placeholder', {'ms': _clock.elapsedMilliseconds - _openMs});
+    OpenTiming.mark('placeholder_decoded', extra: developed ? 'developed' : 'embedded');
     notifyListeners();
   }
 
@@ -445,6 +451,7 @@ class EditorEngine extends ChangeNotifier {
       if (ph0 != null && pd != null && !pd.isCompleted && !app.sessions.has(ph0.id)) {
         await pd.future.timeout(placeholderHead, onTimeout: () {});
       }
+      if (OpenTiming.holdRealMs > 0 && image == null) await Future<void>.delayed(Duration(milliseconds: OpenTiming.holdRealMs));
       while (_dirty && myGen == _gen) {
         _dirty = false;
         final ph = photo!;
@@ -549,6 +556,7 @@ class EditorEngine extends ChangeNotifier {
       if (first) {
         placeholder?.dispose();
         placeholder = null;
+        SchedulerBinding.instance.addPostFrameCallback((_) => OpenTiming.mark('real_frame'));
         _schedulePrefetch();
         _maybeStartGpu(img);
       }

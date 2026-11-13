@@ -13,6 +13,7 @@ import '../screens/editor/editor_page.dart';
 import '../native/dapple_bindings.dart';
 import '../state/app_state.dart';
 import '../services/ingest.dart';
+import '../services/perf_probe.dart' show OpenTiming;
 import '../native/dapple_session.dart';
 import '../services/gpu_view_backend.dart';
 import 'ios_autotest.dart' show kIosAutotest;
@@ -57,6 +58,7 @@ class IosDebugOpen {
         return;
       }
       if (_opened) return;
+      final docs0 = (await getApplicationDocumentsDirectory()).path;
       final list = app.editable;
       if (list.isEmpty) return;
       final nav = app.navigatorKey.currentState;
@@ -68,6 +70,9 @@ class IosDebugOpen {
       final stock = _cfg['film'];
       if (stock is String && stock.isNotEmpty) app.applyEdit(photo.id, (e) => e.copyWith(film: stock));
       final g = EGroup.values.where((e) => e.name == _group).firstOrNull;
+      OpenTiming.legacy = _cfg['legacy'] == true;
+      OpenTiming.holdRealMs = (_cfg['holdReal'] as num?)?.toInt() ?? 0;
+      OpenTiming.sink = (l) => File('$docs0/open_timing.txt').writeAsStringSync('$l\n', mode: FileMode.append, flush: true);
       openEditor(ctx, app, photo.id, initialGroup: g);
       if (_cfg['probeView'] == true) {
         Future<void>.delayed(const Duration(seconds: 8), () async {

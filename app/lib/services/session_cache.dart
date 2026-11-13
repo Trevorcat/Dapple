@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 
 import '../models.dart';
 import '../native/dapple_session.dart';
@@ -31,15 +31,22 @@ class SessionCache {
   /// AHD demosaic) and capped here to bound memory (4096 x 2731 float RGB = 134 MB).
   static const detailLongEdge = 4096;
 
-  bool get available => !_app.isDemo && DappleSession.isAvailable;
+  /// Tests: pretend the engine is there and open sessions through [testOpener] instead of the FFI.
+  @visibleForTesting
+  bool? testAvailable;
+  @visibleForTesting
+  Future<DappleSession?> Function(Photo ph)? testOpener;
+
+  bool get available => testAvailable ?? (!_app.isDemo && DappleSession.isAvailable);
 
   /// True when a session for [id] is open or opening.
   bool has(String id) => _open.containsKey(id);
 
   /// Session for [ph] at screen resolution (2048 px). Null when the engine is unavailable or the
   /// photo has no readable source (demo photos).
-  Future<DappleSession?> get(Photo ph, {bool background = false}) {
+  Future<DappleSession?> get(Photo ph, {bool background = false, bool speculative = false}) {
     if (!available || ph.demo != null) return Future.value(null);
+    if (!background && !speculative) _warm.remove(ph.id); // claimed by a real open: no longer speculative
     _lru.remove(ph.id);
     _lru.add(ph.id);
     final f = _open.putIfAbsent(ph.id, () => _openNew(ph, background));
@@ -49,6 +56,60 @@ class SessionCache {
     }
     return f;
   }
+
+  // ---- speculative open on pointer-down ----
+  final Set<String> _warm = {};
+
+  /// Starts opening [ph] at full priority because a finger just went down on its thumbnail. Pair with
+  /// [cancelWarm] when the tap is abandoned (scroll, drag away, long press). No-op when already open.
+  void warm(Photo ph) {
+    if (!available || ph.demo != null || !ph.isRaw || _open.containsKey(ph.id)) return;
+    _warm.add(ph.id);
+    _openDone.remove(ph.id);
+    unawaited(get(ph, speculative: true).then((_) {
+      _openDone.add(ph.id);
+      if (_warm.contains(ph.id) && _abandoned.remove(ph.id)) {
+        _warm.remove(ph.id);
+        unawaited(_close(ph.id)); // nobody claimed it: free the memory
+      }
+    }));
+  }
+
+  final Set<String> _abandoned = {};
+  Timer? _downTimer;
+
+  /// Finger down on a thumbnail. The open starts after [downDelay] if the finger is still there, so a
+  /// scroll that merely touches a tile does not start a 40 MP decode.
+  static const downDelay = Duration(milliseconds: 40);
+  void pointerDown(Photo ph) {
+    _downTimer?.cancel();
+    _downTimer = null;
+    if (!available || ph.demo != null || !ph.isRaw || _open.containsKey(ph.id)) return;
+    _downTimer = Timer(downDelay, () => warm(ph));
+  }
+
+  /// Finger up or cancelled. A tap claims the session within a frame or two; anything else (scroll,
+  /// slid off, long press) leaves it unclaimed and the warm session is dropped after a short grace.
+  void pointerEnd(Photo ph) {
+    _downTimer?.cancel();
+    _downTimer = null;
+    if (_warm.isEmpty) return;
+    Timer(const Duration(milliseconds: 250), () => cancelWarm(ph.id));
+  }
+
+  /// The tap that [warm]ed [id] was abandoned: the session is closed as soon as it is open, unless the
+  /// editor has claimed it in the meantime. (A native decode cannot be interrupted midway.)
+  void cancelWarm(String id) {
+    if (!_warm.contains(id)) return;
+    _abandoned.add(id);
+    if (_openDone.contains(id)) {
+      _abandoned.remove(id);
+      _warm.remove(id);
+      unawaited(_close(id));
+    }
+  }
+
+  final Set<String> _openDone = {};
 
   /// Local readable path of the photo's source (copied out of MediaStore at most once).
   Future<_Src?> _resolve(Photo ph) => _src.putIfAbsent(ph.id, () async {
@@ -87,6 +148,7 @@ class SessionCache {
 
   Future<DappleSession?> _openNew(Photo ph, bool background) async {
     try {
+      if (testOpener != null) return await testOpener!(ph);
       final src = await _resolve(ph);
       if (src == null) throw '没有源文件';
       return await DappleSession.open(src.path, full: false, longEdge: 2048, background: background);
@@ -224,6 +286,9 @@ class SessionCache {
   Future<void> _close(String id) async {
     if (id == _detailId || id == _regionId) closeDetail();
     final f = _open.remove(id);
+    _openDone.remove(id);
+    _abandoned.remove(id);
+    _warm.remove(id);
     _src.remove(id);
     final s = await f;
     await s?.close();
@@ -236,6 +301,7 @@ class SessionCache {
   }
 
   void dispose() {
+    _downTimer?.cancel();
     closeDetail();
     for (final id in _open.keys.toList()) {
       unawaited(_close(id));

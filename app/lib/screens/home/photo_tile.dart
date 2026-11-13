@@ -84,7 +84,14 @@ class PhotoTile extends StatelessWidget {
       button: true,
       selected: sel,
       excludeSemantics: true,
-      child: RawGestureDetector(
+      child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (_) {
+          if (photo.status == PhotoStatus.done && !app.selectMode) app.sessions.pointerDown(photo);
+        },
+        onPointerUp: (_) => app.sessions.pointerEnd(photo),
+        onPointerCancel: (_) => app.sessions.pointerEnd(photo),
+        child: RawGestureDetector(
         key: ValueKey('tile-${photo.id}'),
         behavior: HitTestBehavior.opaque,
         gestures: {
@@ -194,6 +201,7 @@ class PhotoTile extends StatelessWidget {
             ),
           if (app.selectMode && selectable) Positioned(right: 6, top: 6, child: SelectDot(number: n)),
         ]),
+      ),
       ),
     );
   }

@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:ui' as ui;
 
 import 'package:flutter/scheduler.dart';
-import 'package:flutter/foundation.dart' show BindingBase;
+import 'package:flutter/foundation.dart' show BindingBase, debugPrint;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -134,5 +134,34 @@ class _PerfBindingImpl extends BindingBase
     buildOwner!.finalizeTree();
     final total = PerfProbe.begin() - _fT0;
     if (total > 12000) PerfProbe.log('slow', {'total_us': total, 'drag': PerfProbe.dragging, ...PerfProbe.frameCounts});
+  }
+}
+
+/// Tap -> picture timestamps of opening a photo in the editor: `OPEN_TIMING <event> <ms since the tap>` on the
+/// debug console, and into [sink] when set (the iOS autotest writes them to Documents/open_timing.txt).
+class OpenTiming {
+  static final Stopwatch _w = Stopwatch();
+  static void Function(String line)? sink;
+
+  /// Measurement only (iOS autotest `"legacy":true`): the previous open behaviour, to compare before / after on one build.
+  static bool legacy = false;
+
+  /// Measurement / screenshots only (iOS autotest `"holdReal":ms`): delays the first real render so the placeholder can be photographed.
+  static int holdRealMs = 0;
+
+  /// The tap (thumbnail tap callback / debug open) that starts an editor open.
+  static final Set<String> _seen = {};
+  static void tap() {
+    _seen.clear();
+    _w
+      ..reset()
+      ..start();
+  }
+
+  static void mark(String event, {String? extra}) {
+    if (!_w.isRunning || !_seen.add(event)) return;
+    final line = 'OPEN_TIMING $event ${_w.elapsedMilliseconds}${extra == null ? '' : ' $extra'}';
+    debugPrint(line);
+    sink?.call(line);
   }
 }

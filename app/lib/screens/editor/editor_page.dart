@@ -35,6 +35,7 @@ import '../../services/perf_probe.dart';
 
 /// Opens the viewer / editor on [photoId] (full-screen route; the global navigation is hidden).
 void openEditor(BuildContext context, AppState app, String photoId, {EGroup? initialGroup, String? initialRow, bool initialCollapsed = false, String? initialHold}) {
+  OpenTiming.tap();
   Navigator.of(context).push(MaterialPageRoute<void>(
       builder: (_) => EditorPage(app: app, photoId: photoId, initialGroup: initialGroup, initialRow: initialRow, initialCollapsed: initialCollapsed, initialHold: initialHold)));
 }
@@ -105,6 +106,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     ctl.dragging.addListener(_onDragging);
     _t.addListener(() => _panelRect.value = _geoNow().panel);
     engine.attach(ph, neighbors: _neighborsOf(id));
+    WidgetsBinding.instance.addPostFrameCallback((_) => OpenTiming.mark('editor_first_frame'));
     if (widget.initialGroup != null || widget.initialHold != null) WidgetsBinding.instance.addPostFrameCallback((_) => _applyInitial());
     if (widget.resamplePointers) {
       GestureBinding.instance.resamplingEnabled = true;
@@ -376,17 +378,27 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     return (e.rot ~/ 90).isOdd ? 1 / pr : pr;
   }
 
+  /// The photo's picture; on a live photo the placeholder -> engine frame swap is a short cross-fade.
   Widget _art(Photo p, bool original) {
+    final inner = _artNow(p, original);
+    if (!engine.live) return inner;
+    final real = original || engine.image != null || engine.gpuTextureId != null;
+    return OpenTiming.legacy ? inner : ArtCrossFade(real: real, child: inner);
+  }
+
+  Widget _artNow(Photo p, bool original) {
     if (engine.live) {
       final tex = original ? null : engine.gpuTextureId; // zero-copy texture (stage d) while it is live
       if (tex != null) return Texture(textureId: tex, filterQuality: FilterQuality.medium);
       final img = original ? (engine.original ?? engine.image) : engine.image;
       if (img != null) return RawImage(image: img, fit: BoxFit.cover);
       final pl = engine.placeholder;
-      if (pl != null && !(p.status == PhotoStatus.done && p.previewPath != null)) {
+      if (pl != null && (engine.placeholderDeveloped || !(p.status == PhotoStatus.done && p.previewPath != null))) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => OpenTiming.mark('first_pixels', extra: engine.placeholderDeveloped ? 'developed_1280' : 'embedded'));
         return RawImage(image: pl, fit: BoxFit.cover);
       }
-      return PhotoArt(p);
+      // the grid's own 400 px decode (same image-cache entry): on screen at once, sharper placeholder follows
+      return PhotoArt(p, cacheWidth: OpenTiming.legacy ? null : 400, onShown: () => OpenTiming.mark('first_pixels', extra: 'thumbnail'));
     }
     final pr = _photoRatio(p);
     final e = p.edit;
@@ -580,11 +592,9 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     return Rect.fromCenter(center: r.center, width: h * a, height: h);
   }
 
-  Widget _previewPill() => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-        decoration: BoxDecoration(color: Fx.overlay55, borderRadius: BorderRadius.circular(14)),
-        child: Text('预览', key: const ValueKey('preview-pill'), style: T.small(Colors.white, w: FontWeight.w500)),
-      );
+  /// Progress hint while the placeholder is still on screen: only appears after [hintDelay] (a quick open
+  /// never shows it), a spinner without words (guidelines 10.13), fixed in the photo's top leading corner.
+  Widget _previewPill() => OpenTiming.legacy ? const DelayedBusy(key: ValueKey('preview-busy'), delay: Duration.zero) : const DelayedBusy(key: ValueKey('preview-busy'));
 
   Widget _photoStage() {
     return ListenableBuilder(
@@ -819,6 +829,66 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
 }
 
 /// Thirds grid over the photo (6x6 while straightening, as a level reference) and a white frame.
+/// Placeholder -> real frame: a 160 ms cross-fade in the same box (no geometry change); none with reduced motion.
+class ArtCrossFade extends StatelessWidget {
+  const ArtCrossFade({super.key, required this.real, required this.child});
+  final bool real;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final reduce = MediaQuery.maybeDisableAnimationsOf(context) ?? false;
+    return AnimatedSwitcher(
+      duration: reduce ? Duration.zero : const Duration(milliseconds: 160),
+      layoutBuilder: (cur, prev) => Stack(fit: StackFit.expand, children: [...prev, ?cur]),
+      child: KeyedSubtree(key: ValueKey(real ? 'art-real' : 'art-placeholder'), child: child),
+    );
+  }
+}
+
+const Duration hintDelay = Duration(milliseconds: 400);
+
+class DelayedBusy extends StatefulWidget {
+  const DelayedBusy({super.key, this.delay = hintDelay});
+  final Duration delay;
+  @override
+  State<DelayedBusy> createState() => _DelayedBusyState();
+}
+
+class _DelayedBusyState extends State<DelayedBusy> {
+  bool _show = false;
+  Timer? _t;
+
+  @override
+  void initState() {
+    super.initState();
+    _t = Timer(widget.delay, () {
+      if (mounted) setState(() => _show = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _t?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedOpacity(
+      opacity: _show ? 1 : 0,
+      duration: const Duration(milliseconds: 150),
+      child: Container(
+        width: 28,
+        height: 28,
+        alignment: Alignment.center,
+        decoration: const BoxDecoration(color: Fx.overlay55, shape: BoxShape.circle),
+        child: const Spinner(size: 18),
+      ),
+    );
+  }
+}
+
 class _ThirdsPainter extends CustomPainter {
   const _ThirdsPainter(this.n);
   final int n;
