@@ -235,6 +235,12 @@ add_executable(dapple_drag_bench engine/drag_bench.cpp)
 target_link_libraries(dapple_drag_bench PRIVATE dapple)
 target_include_directories(dapple_drag_bench PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
 
+# Strip-parallel baseline JPEG encoder: same decoded pixels as the single-threaded encode, two decoders
+add_executable(dapple_jpeg_mt_tests jpeg_mt_tests.cpp)
+target_link_libraries(dapple_jpeg_mt_tests PRIVATE dapple_core dapple_stb)
+target_include_directories(dapple_jpeg_mt_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src)
+add_test(NAME jpeg_mt COMMAND dapple_jpeg_mt_tests)
+
 # The editor decode stages through the C API (open, 2x detail, 1:1 regions, export), for device timing without the app
 add_executable(dapple_stage_bench engine/stage_bench.cpp)
 target_link_libraries(dapple_stage_bench PRIVATE dapple)

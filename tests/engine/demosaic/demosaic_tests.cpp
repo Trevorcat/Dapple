@@ -423,6 +423,19 @@ int testWirePreview() {
       std::printf("  %s: %s\n", f.filename().string().c_str(), a ? ("not on the mosaic preview (" + why + ")").c_str() : "LibRaw preview failed");
       continue;
     }
+    {  // sharpness proxy at LibRaw's own scale: mean gradient magnitude of the luminance in the central 1024 x 1024 (ours brought to LibRaw's size first)
+      const ImageF ours = b->linear.width == a->linear.width ? b->linear : resizeToLongEdge(b->linear, std::max(a->linear.width, a->linear.height));
+      auto grad = [](const ImageF& im) {
+        const int cx = im.width / 2, cy = im.height / 2, h = std::min(512, std::min(cx, cy) - 2);
+        double sum = 0;
+        long cnt = 0;
+        auto Y = [&](int x, int y) { return 0.2880 * im.row(y)[3 * x] + 0.7119 * im.row(y)[3 * x + 1]; };
+        for (int y = cy - h; y < cy + h; ++y) for (int x = cx - h; x < cx + h; ++x) sum += std::hypot(Y(x + 1, y) - Y(x, y), Y(x, y + 1) - Y(x, y)), ++cnt;
+        return sum / double(std::max(1L, cnt));
+      };
+      const double ga = grad(a->linear), gb = grad(ours);
+      std::printf("    sharpness (gradient energy at LibRaw scale): mosaic preview / LibRaw %.3f\n", gb / std::max(1e-12, ga));
+    }
     const ImageF ia = resizeToLongEdge(a->linear, 512), ib = resizeToLongEdge(b->linear, 512);
     if (std::abs(ia.width - ib.width) > 2 || std::abs(ia.height - ib.height) > 2) {
       std::printf("  %s: size differs %dx%d vs %dx%d\n", f.filename().string().c_str(), ia.width, ia.height, ib.width, ib.height);
@@ -618,6 +631,43 @@ void testZonePlate() {
     const Err e = compare(s, out, 8), b = compare(s, bil, 8);
     std::printf("  zone plate %s: node PSNR %.1f dB MAE %.4f | bilinear PSNR %.1f dB MAE %.4f\n", c == Cfa::Bayer ? "bayer " : "xtrans", e.psnr, e.mae, b.psnr, b.mae);
     CHECK(e.psnr > b.psnr, "node must beat bilinear on the zone plate (%.1f vs %.1f dB)", e.psnr, b.psnr);
+  }
+}
+
+// Luminance aliasing of the block-reduced preview (Bayer 2x2, X-Trans 3x3 per-channel block means, the arithmetic of binnedHalf) on the zone plate, against the
+// ideal reduction (the scene box-averaged over the same blocks), next to the demosaic node's output box-averaged the same way.
+void testBlockZone() {
+  for (Cfa c : {Cfa::Bayer, Cfa::XTrans}) {
+    const int bs = c == Cfa::Bayer ? 2 : 3, W = 300, H = 300;
+    Synth s(W, H, c, zoneScene(W, H));
+    const auto node = run(s.d, {0, 0, W, H});
+    const int ow = W / bs, oh = H / bs;
+    double eBlock = 0, eNode = 0, eRef = 0;
+    std::size_t cnt = 0;
+    for (int y = 4; y < oh - 4; ++y)
+      for (int x = 4; x < ow - 4; ++x) {
+        double sum[3] = {0, 0, 0}, nn[3] = {0, 0, 0}, ideal[3] = {0, 0, 0}, nodeAvg[3] = {0, 0, 0};
+        for (int v = 0; v < bs; ++v)
+          for (int u = 0; u < bs; ++u) {
+            const int sx = x * bs + u, sy = y * bs + v, col = s.d.cfa3[(sy % s.d.period) * s.d.period + sx % s.d.period];
+            sum[col] += scaleSample(s.d, sx, sy), nn[col] += 1;
+            for (int k = 0; k < 3; ++k) {
+              ideal[k] += s.truth[(std::size_t(sy) * W + sx) * 3 + k] / (bs * bs);
+              nodeAvg[k] += node[(std::size_t(sy) * W + sx) * 3 + k] / (bs * bs);
+            }
+          }
+        auto Y = [](const double* p) { return 0.2880 * p[0] + 0.7119 * p[1] + 0.0001 * p[2]; };
+        double blk[3];
+        for (int k = 0; k < 3; ++k) blk[k] = nn[k] > 0 ? sum[k] / nn[k] : 0;
+        const double yi = Y(ideal);
+        eBlock += (Y(blk) - yi) * (Y(blk) - yi);
+        eNode += (Y(nodeAvg) - yi) * (Y(nodeAvg) - yi);
+        ++cnt;
+      }
+    (void)eRef;
+    const double pb = 10 * std::log10(1.0 / std::max(eBlock / double(cnt), 1e-12)), pn = 10 * std::log10(1.0 / std::max(eNode / double(cnt), 1e-12));
+    std::printf("  block preview zone plate %s: luminance PSNR vs the ideal reduction %.1f dB (demosaic node, box-averaged: %.1f dB)\n", c == Cfa::Bayer ? "bayer " : "xtrans", pb, pn);
+    CHECK(pb >= 20.0, "block-reduced luminance PSNR %.1f dB", pb);
   }
 }
 
@@ -829,7 +879,7 @@ int testGpuReal() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::vector<std::string> all = {"flat", "edges", "zoneplate", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu"};
+  const std::vector<std::string> all = {"flat", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu"};
   std::vector<std::string> ids;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--list") {
@@ -838,7 +888,7 @@ int main(int argc, char** argv) {
     }
     ids.push_back(argv[i]);
   }
-  if (ids.empty()) ids = {"flat", "edges", "zoneplate", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache"};
+  if (ids.empty()) ids = {"flat", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache"};
   int rc = 0;
   for (const auto& id : ids) {
     std::printf("[%s]\n", id.c_str());
@@ -846,6 +896,7 @@ int main(int argc, char** argv) {
     if (id == "flat") testFlat();
     else if (id == "edges") testEdges();
     else if (id == "zoneplate") testZonePlate();
+    else if (id == "blockzone") testBlockZone();
     else if (id == "hotpixel") testHotPixel();
     else if (id == "clip") testClip();
     else if (id == "hotfilter") testHotFilter();

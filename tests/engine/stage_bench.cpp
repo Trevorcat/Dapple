@@ -13,6 +13,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "dapple/dapple_c.h"
 
@@ -35,6 +36,17 @@ int main(int argc, char** argv) {
     dapple_gpu_configure(pdir, "bench-1", "bench-fp");
     dapple_gpu_warmup();
     std::this_thread::sleep_for(std::chrono::milliseconds(4000));
+  }
+  if (const char* e = std::getenv("DAPPLE_BENCH_RAMP_MS")) {  // experiment: all cores busy for N ms first (does the unpack run at a low CPU clock at process start?)
+    const int ms = std::atoi(e);
+    std::vector<std::thread> th;
+    for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i)
+      th.emplace_back([ms] {
+        volatile double x = 1;
+        const auto end = Clk::now() + std::chrono::milliseconds(ms);
+        while (Clk::now() < end) x = x * 1.0000001 + 1e-9;
+      });
+    for (auto& t : th) t.join();
   }
   auto t = Clk::now();
   DappleSession* s = dapple_session_open(argv[1], DAPPLE_QUALITY_PREVIEW, 2048);

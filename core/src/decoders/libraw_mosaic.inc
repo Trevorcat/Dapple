@@ -448,6 +448,13 @@ Result<SourceImage> decodePreviewFromMosaic(const std::filesystem::path& path, c
     if (embedded.valid()) embedded.wait();
     return refuse(m->cfa == CfaKind::None ? m->reason : std::string("OpcodeList3 (lens warp): the picture needs the whole frame"));
   }
+  if (m->cfa == CfaKind::XTrans && options.wantLongEdge > 0) {  // 3x3 blocks give a third of the width, LibRaw's half-size a half: sharper, so it keeps the 2x view
+    const int own = std::max(m->hasCrop ? m->cropW : m->width, m->hasCrop ? m->cropH : m->height) / 3;
+    if (double(options.wantLongEdge) > 1.25 * own) {
+      if (embedded.valid()) embedded.wait();
+      return refuse("X-Trans: the half-size LibRaw picture is sharper than the block reduction at this size");
+    }
+  }
   const auto t1 = std::chrono::steady_clock::now();
   SourceImage out;
   out.meta = m->meta;

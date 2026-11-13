@@ -718,6 +718,7 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         }
         DecodeOptions opts;
         opts.quality = quality == DAPPLE_QUALITY_FULL ? DecodeQuality::Full : DecodeQuality::Preview;
+        opts.wantLongEdge = long_edge;
 #ifdef DAPPLE_HAVE_GPU
         if (opts.quality == DecodeQuality::Full) dapple::demosaic::installGpuBackend();  // the decoder's Demosaic node uses the GPU when the runtime switch is on
 #endif
