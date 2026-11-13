@@ -160,6 +160,7 @@ class EngineSession {
   // Latest-wins cancellation (5.8): bumps the ticket; a render in flight returns early (error "cancelled"). Lock-free, any thread.
   void cancel() { latest_.fetch_add(1, std::memory_order_relaxed); }
   std::uint64_t ticket() const { return latest_.load(std::memory_order_relaxed); }
+  const std::atomic<std::uint64_t>* cancelCell() const { return &latest_; }  // work outside the executors polls it too (streaming export)
 
   // Export / reference render (Full graph, exact variant: per-pixel tone + colour, always full quality) into RGB8.
   // mode = TiledExport splits the frame into tiles of `tile` px (0 = from the memory budget). false: failed (error in `err`).
@@ -177,6 +178,12 @@ class EngineSession {
     std::function<void()> beforeExec;
     // Non-null: the clamped, display-encoded float frame goes here instead of the 8-bit `out` (Whole plans; analysis, swatches).
     ImageF* outFloat = nullptr;
+    // Streaming export (docs/engine/pipeline-architecture.md section 42): set = `src` carries the size and metadata only (no pixels, its analyses
+    // come from Renderer::setAnalysisSources); sourceWindow(sx0, sy0, sx1, sy1) returns the source pixels of that rect (window pixel (0, 0) =
+    // (sx0, sy0); valid until the next call; null aborts) and rows(y0, n, rgb) receives every finished band of the output in order (RGB8, width * 3
+    // bytes per row; false aborts). TiledExport with `tile` rows per band; the GPU executor is not tried here; `out` gets the size, no pixels.
+    std::function<const ImageF*(int sx0, int sy0, int sx1, int sy1)> sourceWindow;
+    std::function<bool(int y0, int n, const std::uint8_t* rgb)> rows;
   };
   bool renderExact(const EditParams& params, const Renderer& renderer, const SourceImage& src, const ExactOptions& opt,
                    Image8& out, std::string* err = nullptr, ExecStats* stats = nullptr);

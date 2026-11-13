@@ -96,7 +96,8 @@ PlaneCache& cache() {
 struct RasterStore {
   std::mutex m;
   std::unordered_map<std::string, std::shared_ptr<const Raster>> map;
-  std::list<std::string> order;  // oldest first (cap 32)
+  std::list<std::string> order;  // oldest first (cap 64 planes / 96 MB)
+  std::size_t bytes = 0;
 };
 RasterStore& rasters() {
   static RasterStore s;
@@ -175,16 +176,21 @@ struct GuideKey {
   std::uint64_t key = 0;
   float ref = 1.f;  // 99th percentile luminance of the sample
 };
+thread_local const GuideCapture* tlGuide = nullptr;  // streaming export (section 42): the captured inputs replace the pixels of the source
+const GuideCapture* guideCaptureFor(const ImageF& im) { return tlGuide && tlGuide->W == im.width && tlGuide->H == im.height ? tlGuide : nullptr; }
+
 GuideKey guideKeyOf(const SourceImage& src) {
   const ImageF& im = src.linear;
+  const GuideCapture* cap = guideCaptureFor(im);
   GuideKey g;
   std::uint64_t h = mix64(0x51DE, std::uint64_t(im.width) << 32 | std::uint32_t(im.height));
   std::vector<float> Y;
   Y.reserve(64 * 64);
   for (int j = 0; j < 64; ++j)
     for (int i = 0; i < 64; ++i) {
-      const int x = std::min(im.width - 1, (2 * i + 1) * im.width / 128), y = std::min(im.height - 1, (2 * j + 1) * im.height / 128);
-      const float* p = im.row(y) + 3 * std::size_t(x);
+      int x, y;
+      guideSamplePos(im.width, im.height, i, j, x, y);
+      const float* p = cap ? cap->samples.data() + 3 * std::size_t(j * 64 + i) : im.row(y) + 3 * std::size_t(x);
       h = mixf(mixf(mixf(h, p[0]), p[1]), p[2]);
       Y.push_back(p[0] * kLumaPP[0] + p[1] * kLumaPP[1] + p[2] * kLumaPP[2]);
     }
@@ -207,6 +213,15 @@ std::shared_ptr<const Plane> guideGrid(const SourceImage& src, const GuideKey& g
   pl->data.assign(std::size_t(gw) * gh * 3, 0.f);
   const ImageF& im = src.linear;
   const int W = im.width, H = im.height;
+  if (const GuideCapture* cap = guideCaptureFor(im)) {  // streaming export: the means captured band by band (same sums, same order)
+    for (const GuideCapture::Grid& gr : cap->grids)
+      if (gr.gw == gw && gr.gh == gh && gr.mean.size() == std::size_t(gw) * gh * 3) {
+        for (std::size_t i = 0; i < std::size_t(gw) * gh * 3; ++i) pl->data[i] = guideCh(gr.mean[i], gk.ref);
+        std::shared_ptr<const Plane> out = pl;
+        cache().put(key, out);
+        return out;
+      }
+  }
   parallelFor(gh, [&](int j) {
     const int y0 = int(std::floor(double(j) * H / gh)), y1 = std::max(y0 + 1, int(std::floor(double(j + 1) * H / gh)));
     for (int i = 0; i < gw; ++i) {
@@ -229,12 +244,14 @@ std::shared_ptr<const Plane> guideGrid(const SourceImage& src, const GuideKey& g
 
 // Fast guided filter with a colour guide (He, Sun, Tang 2010/2013; He, Sun 2015): coefficients (a.rgb, b) of q = a . I + b on the grid.
 std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& src, const GuideKey& gk, float sx, float sy, bool interactive,
-                                         float refine) {
+                                         float refine, const MaskComponent& mc) {
   const int cap = interactive ? 512 : 1024;
   const int gl = std::clamp(std::max(ra.w, ra.h), 64, cap);
   const int gw = std::max(8, int(std::lround(gl * sx))), gh = std::max(8, int(std::lround(gl * sy)));
   std::uint64_t key = mix64(mix64(ra.hash, gk.key), std::uint64_t(gw) << 32 | std::uint32_t(gh));
   key = mixf(mix64(key, 0x4A57E4), refine);
+  const bool ranged = mc.hasRange();
+  if (ranged) key = mixf(mixf(mixf(mix64(key, 0x5A4E6E), mc.rangeLo), mc.rangeHi), mc.rangeFeather);
   if (auto p = cache().find(key)) {
     ++g_planeHits;
     return p;
@@ -252,7 +269,12 @@ std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& sr
       const float tx = fx - float(x0), ty = fy - float(y0);
       auto at = [&](int x, int y) { return float(ra.px[std::size_t(y) * ra.w + x]) * (1.f / 255.f); };
       const float a = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx, b = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
-      P[std::size_t(j) * gw + i] = a + (b - a) * ty;
+      float v = a + (b - a) * ty;
+      if (ranged) {  // range of the plane value (depth band ...) before the edge-aware refinement
+        const float f = std::max(mc.rangeFeather, 0.01f), p = v * 100.f;
+        v = sstep(mc.rangeLo - f, mc.rangeLo, p) * (1.f - sstep(mc.rangeHi, mc.rangeHi + f, p));
+      }
+      P[std::size_t(j) * gw + i] = v;
     }
   });
   auto pl = std::make_shared<Plane>();
@@ -602,10 +624,16 @@ bool rasterSet(const std::string& id, int w, int h, const std::uint8_t* bytes, i
   r->hash = hsh | 1;
   RasterStore& s = rasters();
   std::lock_guard<std::mutex> lk(s.m);
-  if (!s.map.count(id)) s.order.push_back(id);
+  if (auto old = s.map.find(id); old != s.map.end()) {
+    s.bytes -= old->second->px.size();
+  } else {
+    s.order.push_back(id);
+  }
+  s.bytes += r->px.size();
   s.map[id] = std::move(r);
-  while (s.map.size() > 32) {
-    logLine("local adjustments: raster store full (32), dropped '" + s.order.front().substr(0, 40) + "'");
+  while (s.order.size() > 1 && (s.map.size() > 64 || s.bytes > (96u << 20))) {
+    logLine("local adjustments: raster store full (64 planes / 96 MB), dropped '" + s.order.front().substr(0, 40) + "'");
+    s.bytes -= s.map[s.order.front()]->px.size();
     s.map.erase(s.order.front());
     s.order.pop_front();
   }
@@ -614,8 +642,12 @@ bool rasterSet(const std::string& id, int w, int h, const std::uint8_t* bytes, i
 bool rasterRemove(const std::string& id) {
   RasterStore& s = rasters();
   std::lock_guard<std::mutex> lk(s.m);
+  auto it = s.map.find(id);
+  if (it == s.map.end()) return false;
+  s.bytes -= it->second->px.size();
   s.order.remove(id);
-  return s.map.erase(id) > 0;
+  s.map.erase(it);
+  return true;
 }
 bool rasterHas(const std::string& id) { return rasterGet(id) != nullptr; }
 std::shared_ptr<const Raster> rasterGet(const std::string& id) {
@@ -636,6 +668,33 @@ Counters counters() {
   return c;
 }
 void resetPlaneCache() { cache().clear(); }
+
+// ---- streaming export capture (section 42) -------------------------------------------------------------------------------------------
+void guideSamplePos(int W, int H, int i, int j, int& x, int& y) {
+  x = std::min(W - 1, (2 * i + 1) * W / 128);
+  y = std::min(H - 1, (2 * j + 1) * H / 128);
+}
+void guideCellSpan(int j, int n, int N, int& a, int& b) {
+  a = int(std::floor(double(j) * N / n));
+  b = std::min(N, std::max(a + 1, int(std::floor(double(j + 1) * N / n))));
+}
+std::vector<std::pair<int, int>> guideGridSizes(const std::vector<LocalAdjustment>& list, int W, int H, bool interactive) {
+  std::vector<std::pair<int, int>> out;
+  if (W <= 0 || H <= 0) return out;
+  const int L = std::max(W, H);
+  const float sx = float(W) / float(L), sy = float(H) / float(L);
+  for (const LocalAdjustment& a : list)
+    for (const MaskComponent& m : a.mask) {
+      if (m.kind != MaskKind::Raster || m.refine <= 0.f) continue;
+      const std::shared_ptr<const Raster> ra = rasterGet(m.ref);
+      if (!ra) continue;
+      const int gl = std::clamp(std::max(ra->w, ra->h), 64, interactive ? 512 : 1024);  // rasterPlane's grid
+      const std::pair<int, int> s{std::max(8, int(std::lround(gl * sx))), std::max(8, int(std::lround(gl * sy)))};
+      if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+    }
+  return out;
+}
+void setGuideCapture(const GuideCapture* c) { tlGuide = c; }
 
 // ---- bind ----------------------------------------------------------------------------------------------------------------------------
 std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, const SourceImage& src, bool interactive, bool preview) {
@@ -719,7 +778,7 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
             gk = guideKeyOf(src);
             gkDone = true;
           }
-          c.plane = rasterPlane(*ra, src, gk, f->sx, f->sy, interactive, m.refine);
+          c.plane = rasterPlane(*ra, src, gk, f->sx, f->sy, interactive, m.refine, m);
           f->anyRaster = true;
           break;
         }

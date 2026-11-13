@@ -76,6 +76,10 @@ flutter:
     - assets/film/SPEKTRAFILM_LICENSE.txt
     - assets/style_sample/sample.jpg
     - assets/style_sample/NOTICE.md
+    # AI masks (docs/legal/ai-models.md): licence texts of the bundled models and inference runtimes, shown on the licences page
+    - assets/legal/ai/APACHE-2.0.txt
+    - assets/legal/ai/ONNXRUNTIME-MIT.txt
+    - assets/legal/ai/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt
 
   # To add assets to your application, add an assets section, like this:
   # assets:

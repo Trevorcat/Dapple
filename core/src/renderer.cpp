@@ -389,6 +389,38 @@ void sampleCubic(const ImageF& im, float x, float y, float out[3]) {
   for (int c = 0; c < 3; ++c) out[c] = std::max(0.f, out[c]);
 }
 
+// sampleCubic on a window of a W x H picture (window pixel (0, 0) = picture pixel (ox, oy)): the same taps, clamped to the picture's edges, the
+// same arithmetic (streaming export, section 42). The window must hold every tap (FrameKernels::sourceRect).
+void sampleCubicWin(const ImageF& win, int ox, int oy, int W, int H, float x, float y, float out[3]) {
+  x -= 0.5f;
+  y -= 0.5f;
+  const float fxl = std::floor(x), fyl = std::floor(y);
+  const int ix = int(fxl), iy = int(fyl);
+  auto weights = [](float t, float w[4]) {
+    const float t2 = t * t, t3 = t2 * t;
+    w[0] = -0.5f * t3 + t2 - 0.5f * t;
+    w[1] = 1.5f * t3 - 2.5f * t2 + 1.f;
+    w[2] = -1.5f * t3 + 2.f * t2 + 0.5f * t;
+    w[3] = 0.5f * t3 - 0.5f * t2;
+  };
+  float wx[4], wy[4];
+  weights(x - fxl, wx);
+  weights(y - fyl, wy);
+  out[0] = out[1] = out[2] = 0.f;
+  for (int j = 0; j < 4; ++j) {
+    const float* row = win.row(std::clamp(iy - 1 + j, 0, H - 1) - oy);
+    float acc[3] = {0.f, 0.f, 0.f};
+    for (int i = 0; i < 4; ++i) {
+      const float* px = row + 3 * (std::clamp(ix - 1 + i, 0, W - 1) - ox);
+      acc[0] += wx[i] * px[0];
+      acc[1] += wx[i] * px[1];
+      acc[2] += wx[i] * px[2];
+    }
+    for (int c = 0; c < 3; ++c) out[c] += wy[j] * acc[c];
+  }
+  for (int c = 0; c < 3; ++c) out[c] = std::max(0.f, out[c]);
+}
+
 // ---- colour style: recipe + pad + strength, resolved to numbers once per render ----
 struct StyleMix {
   bool active = false;
@@ -945,6 +977,17 @@ Renderer::PointOp Renderer::makePointOp(const SourceImage& source, const BakedLu
   return op;
 }
 
+void Renderer::modernGridSize(int W, int H, int& gw, int& gh) {
+  const int stride = std::max(1, std::max(W, H) / 256);
+  gw = (W + stride - 1) / stride;
+  gh = (H + stride - 1) / stride;
+}
+void Renderer::modernGridPixel(int W, int H, int i, int j, int& x, int& y) {  // the samples makePointOp's modern end points read (below)
+  const int stride = std::max(1, std::max(W, H) / 256);
+  x = std::min(W - 1, i * stride + stride / 2);
+  y = std::min(H - 1, j * stride + stride / 2);
+}
+
 float Renderer::modernSdrWhite(const SourceImage& source) const {
   const PointOp op = makePointOp(source, nullptr);
   if (!op.mod.tone) return 1.f;
@@ -1326,7 +1369,7 @@ void Renderer::hdrBind(const SourceImage& source, FramePlan::Hdr& out, const std
   const float expoLog2 = p_.exposure + camera_.baselineExposureEv;
   float gain[3];
   sceneGain(source, gain);
-  const std::shared_ptr<const HdrField> f = hdr::fieldFor(source, wbGain_);
+  const std::shared_ptr<const HdrField> f = hdr::fieldFor(hdrProxy_ ? *hdrProxy_ : source, wbGain_);  // streaming export: the 512 px copy (section 42)
   if (!f) return;
   const float T = tone ? hdrShownRange(*tone) : 8.f;
   const HdrParams hp = hdr::resolve(*f, kHdrUserMax * std::clamp(effectiveHdr(p_), 0.f, 100.f) / 100.f, expoLog2, source.meta.iso, gain, T);
@@ -1936,6 +1979,8 @@ struct FrameKernels::Impl {
   bool filmRan = false, filmOkV = false, valid = false;
   float pitch = 1.f;
   std::shared_ptr<const local::Frame> local;  // local adjustments (docs/engine/pipeline-architecture.md section 40); null for film frames in v1
+  const ImageF* win = nullptr;  // streaming export (section 42): the source pixels of the rect in flight; `in` then carries the size only
+  int winX = 0, winY = 0;
 
   Impl(const Renderer& rr, const SourceImage& src, const BakedLut* lut, const FastOptions& o)
       : r(rr), source(src), in(src.linear), lutp(lut), exact(lut == nullptr), opt(o) {
@@ -2006,9 +2051,11 @@ struct FrameKernels::Impl {
     float sx, sy;
     geo.mapF(fx, fy, sx, sy);
     if (exactMap) {
-      const float* px = in.row(std::clamp(int(std::floor(sy)), 0, in.height - 1)) +
-                        3 * std::clamp(int(std::floor(sx)), 0, in.width - 1);
+      const int iy = std::clamp(int(std::floor(sy)), 0, in.height - 1), ix = std::clamp(int(std::floor(sx)), 0, in.width - 1);
+      const float* px = win ? win->row(iy - winY) + 3 * (ix - winX) : in.row(iy) + 3 * ix;
       v[0] = px[0], v[1] = px[1], v[2] = px[2];
+    } else if (win) {
+      sampleCubicWin(*win, winX, winY, in.width, in.height, sx, sy, v);
     } else {
       sampleCubic(in, sx, sy, v);
     }
@@ -2081,7 +2128,36 @@ void FrameKernels::sourceRow(float* px, int n, int x0, int y) const {
 const local::Frame* FrameKernels::localFrame() const { return impl_->local.get(); }
 
 void FrameKernels::copyRow(float* px, int n, int x0, int y) const {
-  std::memcpy(px, impl_->in.row(y) + 3 * std::size_t(x0), std::size_t(n) * 3 * sizeof(float));
+  const Impl& m = *impl_;
+  const float* src = m.win ? m.win->row(y - m.winY) + 3 * std::ptrdiff_t(x0 - m.winX) : m.in.row(y) + 3 * std::size_t(x0);
+  std::memcpy(px, src, std::size_t(n) * 3 * sizeof(float));
+}
+
+void FrameKernels::setSourceWindow(const ImageF* win, int ox, int oy) {
+  impl_->win = win;
+  impl_->winX = ox;
+  impl_->winY = oy;
+}
+
+void FrameKernels::sourceRect(int x0, int y0, int x1, int y1, int& sx0, int& sy0, int& sx1, int& sy1) const {
+  const Impl& m = *impl_;
+  const int W = m.in.width, H = m.in.height;
+  if (!m.useGeo) {
+    sx0 = std::clamp(x0, 0, W), sx1 = std::clamp(x1, 0, W), sy0 = std::clamp(y0, 0, H), sy1 = std::clamp(y1, 0, H);
+    return;
+  }
+  // the mapping is affine (quarter turns, straighten, flip, scale): the extremes are at the corner pixel centres
+  float lx = 1e30f, ly = 1e30f, hx = -1e30f, hy = -1e30f;
+  for (int cy : {y0, y1 - 1})
+    for (int cx : {x0, x1 - 1}) {
+      const float fx = m.d.ox0 + (float(cx) + 0.5f) * m.d.stepX, fy = m.d.oy0 + (float(cy) + 0.5f) * m.d.stepY;
+      float sx, sy;
+      m.geo.mapF(fx, fy, sx, sy);
+      lx = std::min(lx, sx), hx = std::max(hx, sx), ly = std::min(ly, sy), hy = std::max(hy, sy);
+    }
+  const int g = m.exactMap ? 2 : 4;  // the nearest pixel / the 4 x 4 Catmull-Rom taps, and a pixel of float slack
+  sx0 = std::clamp(int(std::floor(lx)) - g, 0, W), sx1 = std::clamp(int(std::ceil(hx)) + g, 0, W);
+  sy0 = std::clamp(int(std::floor(ly)) - g, 0, H), sy1 = std::clamp(int(std::ceil(hy)) + g, 0, H);
 }
 
 void FrameKernels::fetchRow(float* px, int n, int x0, int y) const {
@@ -2134,7 +2210,7 @@ void FrameKernels::headGainTone(float* px, int n, int x0, int y) const {
   // local copies: the compiler cannot keep fields of an object it may alias with the float stores below in registers
   const LutSampler sample = *m.sample;
   const float gain[3] = {m.gain[0], m.gain[1], m.gain[2]};
-  const float* srcRow = m.useGeo ? nullptr : m.in.row(y) + 3 * std::size_t(x0);
+  const float* srcRow = m.useGeo ? nullptr : (m.win ? m.win->row(y - m.winY) + 3 * std::ptrdiff_t(x0 - m.winX) : m.in.row(y) + 3 * std::size_t(x0));
   const bool hdrOn = m.hdr.active();
   for (int i = 0; i < n; ++i) {
     float v[3];
@@ -2177,7 +2253,7 @@ void FrameKernels::vignette(float* px, int n, int x0, int y) const {
 
 bool FrameKernels::streamFilm(std::uint8_t* rgba) {
   Impl& m = *impl_;
-  if (m.exact || !(m.fr.stock && m.fr.strength >= 1.f) || !rgba || m.sp.any()) return false;
+  if (m.exact || !(m.fr.stock && m.fr.strength >= 1.f) || !rgba || m.sp.any() || m.win) return false;
   if (m.opt.keepGrain || (m.opt.fullLongEdge > 0 && m.opt.spatial == SpatialQuality::Full)) return false;  // scale-aware / kept grain: node chain only
   const Renderer& rr = m.r;
   const int w = m.d.w, h = m.d.h;
@@ -2224,7 +2300,7 @@ bool FrameKernels::streamFilm(std::uint8_t* rgba) {
 bool FrameKernels::runFilm(ImageF& F, const local::AuxTarget* aux) {
   Impl& m = *impl_;
   m.filmRan = true;
-  if (!m.fr.stock) return false;
+  if (!m.fr.stock || m.win) return false;  // a streaming export never runs the whole-frame film branch here (section 42)
   const int w = m.d.w, h = m.d.h;
   float g[3];
   if (m.exact) {

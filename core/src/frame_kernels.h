@@ -76,6 +76,14 @@ class FrameKernels {
   // The exact variant's neighbourhood parameters depend on the film outcome; call after runFilm() (no-op for baked).
   void finalizeSpatial();
 
+  // ---- streaming export (docs/engine/pipeline-architecture.md section 42) ------------------------------------------------------------
+  // The source of the frame carries its size only (no pixels): before the head runs over a rect of output pixels the executor asks sourceRect()
+  // which source pixels it reads ([sx0, sx1) x [sy0, sy1), clamped to the source; geometry is affine, so the corners plus the resampling support
+  // bound it) and hands them over with setSourceWindow() (window pixel (0, 0) = source pixel (ox, oy)). Every source read of the head then goes to
+  // the window, with the same clamping to the source edges as the whole picture, so the pixels are identical. Not for the film branch.
+  void sourceRect(int x0, int y0, int x1, int y1, int& sx0, int& sy0, int& sx1, int& sy1) const;
+  void setSourceWindow(const ImageF* win, int ox, int oy);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

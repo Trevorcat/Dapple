@@ -126,4 +126,25 @@ void maskRow(const Frame& f, const FrameKernels& fk, int index, int y, std::uint
 // The stage input of a photo point as the range components see it (UI colour / luminance picker): L* 0..100, hue 0..360, sat.
 void sampleRange(const float lin[3], float& Lstar, float& hue, float& sat);
 
+// ---- streaming export (docs/engine/pipeline-architecture.md section 42) -------------------------------------------------------------------
+// The raster refinement reads the photo itself: 64 x 64 point samples (the guide's key and white reference) and area means on the guide grids.
+// A streaming export captures exactly those inputs band by band (guideSamplePos, guideGridSizes, guideCellSpan) and installs them for the binds
+// of the calling thread; bind() then reads them instead of the pixels of `src` (which carries the size only). Equal inputs, equal planes.
+struct GuideCapture {
+  int W = 0, H = 0;
+  std::vector<float> samples;  // 64 x 64 x 3: the pixel at guideSamplePos(i, j), row-major (j outer, i inner)
+  struct Grid {
+    int gw = 0, gh = 0;
+    std::vector<float> mean;   // gw x gh x 3: the area mean guideGrid() encodes
+  };
+  std::vector<Grid> grids;
+};
+void guideSamplePos(int W, int H, int i, int j, int& x, int& y);
+// Grid sizes the binds of `list` ask for (raster components with refinement whose plane is in the store) on a W x H photo.
+std::vector<std::pair<int, int>> guideGridSizes(const std::vector<LocalAdjustment>& list, int W, int H, bool interactive);
+// Rows (or columns) [a, b) of cell j of a grid of n cells over N rows (b clamped to N), as guideGrid() averages them.
+void guideCellSpan(int j, int n, int N, int& a, int& b);
+// Installs (non-null) / removes (null) the capture for the binds of this thread.
+void setGuideCapture(const GuideCapture* c);
+
 }  // namespace dapple::local

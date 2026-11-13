@@ -6,7 +6,12 @@ add_library(dapple_core STATIC
   src/edit_params_json.cpp
   src/local_adjust.cpp
   src/local_eval.cpp
+  src/ai_masks.cpp
+  src/ai_masks_build.cpp
+  src/ai_masks_sky.cpp
+  src/ai_masks_service.cpp
   src/encode.cpp
+  src/export_stream.cpp
   src/exif_writer.cpp
   src/image.cpp
   src/hdr.cpp
@@ -86,6 +91,52 @@ if(TARGET dapple_jxl)
 endif()
 if(TARGET dapple_opencv)
   target_link_libraries(dapple_core PRIVATE dapple_opencv)
+endif()
+
+# ---------------------------------------------------------------------------
+# AI masks (core/ai, core/src/ai_masks.cpp; docs/engine/pipeline-architecture.md section 41).
+#   DAPPLE_AI = ON | OFF | AUTO. AUTO: ON for Android arm64-v8a / x86_64 when the runtime libraries are staged under tools/ai-rt, OFF on desktop.
+#   Desktop ON needs the official onnxruntime-win-x64 package (tools/ai-rt/dl/ort_win_x64): only depth / MobileSAM tap run there (no LiteRT desktop
+#   library exists); with DAPPLE_AI OFF the C API functions exist and report "unavailable".
+# Runtime libraries per ABI (tools/ai-rt/jniLibs/<abi>/, the same files Gradle packages): arm64-v8a LiteRT 1.4 + the minimal ONNX Runtime build
+# (2.8 MB); x86_64 (emulator) LiteRT 1.4 + the official full ONNX Runtime AAR library (45 MB, debug APKs for the emulator only).
+# ---------------------------------------------------------------------------
+set(DAPPLE_AI "AUTO" CACHE STRING "AI masks: ON, OFF or AUTO (AUTO = Android arm64-v8a / x86_64 when the runtimes are present)")
+set(_ai_rt ${CMAKE_CURRENT_SOURCE_DIR}/../tools/ai-rt)
+set(_ai_enable OFF)
+if(DAPPLE_AI STREQUAL "AUTO")
+  if(ANDROID AND ANDROID_ABI MATCHES "arm64-v8a|x86_64" AND EXISTS ${_ai_rt}/jniLibs/${ANDROID_ABI}/libonnxruntime.so
+     AND EXISTS ${_ai_rt}/jniLibs/${ANDROID_ABI}/libtensorflowlite_jni.so)
+    set(_ai_enable ON)
+  endif()
+elseif(DAPPLE_AI)
+  set(_ai_enable ON)
+endif()
+if(_ai_enable)
+  if(ANDROID)
+    set(DAPPLE_AI_LITERT ON CACHE BOOL "" FORCE)
+    set(DAPPLE_AI_ORT ON CACHE BOOL "" FORCE)
+    set(DAPPLE_AI_LITERT_ROOT ${_ai_rt}/dl/litert_1_4 CACHE PATH "" FORCE)
+    set(DAPPLE_AI_ORT_INCLUDE ${_ai_rt}/dl/ort_android/headers CACHE PATH "" FORCE)
+    set(DAPPLE_AI_ORT_LIB ${_ai_rt}/jniLibs/${ANDROID_ABI}/libonnxruntime.so CACHE FILEPATH "" FORCE)
+  else()
+    set(DAPPLE_AI_LITERT OFF CACHE BOOL "" FORCE)  # no LiteRT desktop C library
+    set(DAPPLE_AI_ORT ON CACHE BOOL "" FORCE)
+    set(_ort_win ${_ai_rt}/dl/ort_win_x64/onnxruntime-win-x64-1.32.0)
+    set(DAPPLE_AI_ORT_INCLUDE ${_ort_win}/include CACHE PATH "" FORCE)
+    set(DAPPLE_AI_ORT_LIB ${_ort_win}/lib/onnxruntime.lib CACHE FILEPATH "" FORCE)
+    if(NOT EXISTS ${DAPPLE_AI_ORT_LIB})
+      message(FATAL_ERROR "DAPPLE_AI=ON on desktop needs tools/ai-rt/dl/ort_win_x64 (official onnxruntime-win-x64 1.32.0)")
+    endif()
+    file(COPY ${_ort_win}/lib/onnxruntime.dll DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+  endif()
+  set(DAPPLE_AI_TESTS OFF CACHE BOOL "" FORCE)
+  add_subdirectory(ai)
+  target_link_libraries(dapple_core PRIVATE dapple_ai)
+  target_compile_definitions(dapple_core PUBLIC DAPPLE_AI=1)
+  message(STATUS "DAPPLE_AI: ON (LiteRT=${DAPPLE_AI_LITERT} ORT=${DAPPLE_AI_ORT})")
+else()
+  message(STATUS "DAPPLE_AI: OFF (C API reports AI masks unavailable)")
 endif()
 
 if(MSVC)

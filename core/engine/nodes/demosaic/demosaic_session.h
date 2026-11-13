@@ -36,6 +36,12 @@ ImageF binnedOriented(const MosaicImage& m, int step = 1);
 // mosaic: 1/2 linear size (3876 px wide for 40 MP), as sharp as a half-size decode. GPU or CPU node by the measured verdict (a separate verdict kind).
 ImageF halfOriented(const MosaicImage& m, int threads = 0, bool* usedGpu = nullptr);
 
+// Streaming export (docs/engine/pipeline-architecture.md section 42): the node demosaicFull() would run for this mosaic (the GPU when a backend is installed,
+// usable and preferred for the whole frame), and a region demosaic pinned to that choice, so that every band of one picture comes from the same node (no
+// seam between a GPU band and a CPU band). A failed GPU run of a band falls back to the CPU node and sets *fellBack.
+bool fullUsesGpu(const MosaicImage& m);
+ImageF demosaicOrientedRegionOn(const MosaicImage& m, int x0, int y0, int x1, int y1, bool gpu, bool* fellBack = nullptr, int threads = 0);
+
 struct CacheStats {
   std::uint64_t mosaicHits = 0, mosaicMisses = 0, fullHits = 0, fullMisses = 0, evictions = 0;
   std::size_t bytes = 0;

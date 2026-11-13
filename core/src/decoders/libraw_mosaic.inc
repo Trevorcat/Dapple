@@ -531,3 +531,51 @@ Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, i
   }
   return out;
 }
+
+// ---- streaming export (section 42) ----------------------------------------------------------------------------------------------------------------
+bool shadowChromaWanted(std::vector<float>& lumaSamples) { return shadowChromaEnabled() && shadowChromaDecide(lumaSamples); }
+void shadowChromaFloor(ImageF& img) { shadowChromaApply(img); }
+
+Result<LazyFull> openFullLazy(const std::filesystem::path& path, const DecodeOptions& options, std::string* reason) {
+  auto refuse = [&](const std::string& why) {
+    if (reason) *reason = why;
+    return Result<LazyFull>(fail(why));
+  };
+  if (!mosaicPathEnabled()) return refuse("DAPPLE_DEMOSAIC=off");
+  std::future<Result<Image8>> embedded;  // as decodeFullFromMosaic: the embedded preview for the anchor overlaps the decompression
+  if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::async, [&path] { return extractEmbeddedPreviewForAnchor(path); });
+  auto mr = mosaicCache().mosaic(path, options);
+  if (!mr) {
+    if (embedded.valid()) embedded.wait();
+    return refuse(mr.error().message);
+  }
+  const std::shared_ptr<const MosaicImage> m = *mr;
+  if (m->cfa == CfaKind::None || !m->opcodeList3.empty()) {
+    if (embedded.valid()) embedded.wait();
+    return refuse(m->cfa == CfaKind::None ? m->reason : std::string("OpcodeList3 (lens warp): the picture needs the whole frame"));
+  }
+  LazyFull z;
+  z.mosaic = m;
+  z.meta.meta = m->meta;
+  z.meta.sceneReferred = true;
+  demosaic::orientedSize(*m, &z.width, &z.height);
+  {  // the corrections string of the full decode (finishMosaicRgb reports the default crop; no OpcodeList3 here)
+    dng::ApplyReport corr;
+    if (m->hasCrop) corr.applied.push_back("DefaultCrop");
+    const std::string c = corr.summary();
+    z.meta.meta.dngCorrections = m->dngCorrections.empty() ? c : (c.empty() ? m->dngCorrections : m->dngCorrections + ", " + c);
+  }
+  attachMosaicAnchor(z.meta.meta, *m, path, options, &embedded);
+  return z;
+}
+
+SourceImage materializeFull(const LazyFull& z) {
+  SourceImage out;
+  out.meta = z.meta.meta;
+  out.sceneReferred = true;
+  std::string corr;
+  out.linear = demosaic::demosaicFull(*z.mosaic, 0, &corr);
+  out.meta.dngCorrections = z.mosaic->dngCorrections.empty() ? corr : (corr.empty() ? z.mosaic->dngCorrections : z.mosaic->dngCorrections + ", " + corr);
+  suppressShadowChroma(out.linear);
+  return out;
+}

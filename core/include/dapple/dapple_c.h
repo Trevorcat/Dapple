@@ -171,7 +171,7 @@ DAPPLE_API void dapple_session_base_previews_cancel(DappleSession* session);
  * (DAPPLE_ENGINE=off ignores them). Mask coordinates are the photo's own normalised space (before crop / rotate / straighten / flip).
  *
  * Raster masks (AI masks, depth): a single-channel 8-bit plane referenced by id from a "raster" component. The store is process-wide
- * (exports, other sessions and the batch previews see the same id), at most 32 planes; planes above 1024 px long edge are
+ * (exports, other sessions and the batch previews see the same id), at most 64 planes / 96 MB (oldest dropped first); planes above 1024 px long edge are
  * area-downsampled. stride = bytes per row (0 = w). Replacing an id changes the content key: frames re-render. */
 DAPPLE_API int32_t dapple_mask_raster_set(const char* id, int32_t w, int32_t h, const uint8_t* bytes, int32_t stride);
 DAPPLE_API int32_t dapple_mask_raster_remove(const char* id);
@@ -190,6 +190,54 @@ DAPPLE_API int32_t dapple_session_map_point(DappleSession* session, const char* 
 /* What the luminance / colour range components see at photo point (u, v) under params_json (global white balance, exposure, HDR):
  * {"L":0..100,"hue":0..360,"sat":..} (sat in the units of the "satMin" range / 0.25 * 100). Free with dapple_free_string. */
 DAPPLE_API char* dapple_session_mask_sample_json(DappleSession* session, const char* params_json, float u, float v);
+
+/* ---- AI masks: an engine service that produces raster planes (docs/engine/pipeline-architecture.md section 41). Additive. ----
+ * Planes are 8 bit, long edge <= 1024, in the photo's normalised space, registered in the raster store under stable ids
+ * "ai:<photo>:<key>" (see ai_masks.h): person parts (hair faceskin bodyskin clothes person background), per face f1..f4 (face eyes iris sclera lips teeth
+ * brows), depth (0 = nearest .. 255 = farthest; use a raster component with lo / hi / feather to select a band), sky (rough), tap:<taps>.
+ * Model input is the neutral standard rendering of the photo (default params, geometry "orig", white balance as shot + exposure anchor, no local
+ * adjustments, sRGB) at <= 1024 px, so a plane never depends on the user's edit. Every function exists in every build; without the runtimes /
+ * models they report available:false and the calls return an error. Jobs run on one background thread (utility priority, yielding to
+ * dapple_set_interaction), planes are cached on disk per photo content hash under cache_dir/ai_masks. */
+enum {
+  DAPPLE_AI_PERSON = 1,       /* person parts + person + background (only when a person is found) */
+  DAPPLE_AI_FACES = 2,        /* face features of up to max_faces faces (frontal faces get eyes / lips / teeth / brows) */
+  DAPPLE_AI_DEPTH = 4,
+  DAPPLE_AI_SKY = 8,          /* classical prior (+ depth far part when the depth model is present) */
+  DAPPLE_AI_TAP_PREPARE = 16  /* run the tap encoder now (about 0.7 s on a phone) so the first tap is fast */
+};
+/* model_dir: the files <id>.tflite|.ort|.onnx (person_parts, face_detector, face_landmarks, depth, tap_encoder, tap_decoder, sam_encoder,
+ * sam_decoder); cache_dir: the app cache directory (the same as dapple_gpu_configure's; may be NULL = no disk cache). */
+DAPPLE_API int32_t dapple_ai_configure(const char* model_dir, const char* cache_dir);
+/* {"compiled":bool,"available":bool,"backends":"litert+ort","tasks":{"person","faces","depth","tap","sky"},"tap_engine":"magictouch"|"mobilesam"|"",
+ *  "reason":"","resident_bytes":N}. Free with dapple_free_string. */
+DAPPLE_API char* dapple_ai_status_json(void);
+/* The 16 hex digits the plane ids of this photo carry (hash of the decoded picture). Free with dapple_free_string. */
+DAPPLE_API char* dapple_session_ai_photo_id(DappleSession* session);
+/* Starts a job (tasks = or of DAPPLE_AI_*; flags bit 0: recompute although cached). Returns the job id (> 0) or -1 (error: unavailable). */
+DAPPLE_API int32_t dapple_session_ai_start(DappleSession* session, int32_t tasks, int32_t flags, int32_t max_faces);
+/* {"job":N,"state":"queued|running|done|cancelled|error|unknown","progress":0..1,"stage":"","result":{state,message,person_found,faces,sky_found,
+ *  groups:[{group,state ok|cached|none|unavailable|error,message,ms}],planes:[{id,key,label,group,face,w,h,cached}],render_ms,total_ms}}
+ * ("result" once finished). Free with dapple_free_string. */
+DAPPLE_API char* dapple_ai_job_json(int32_t job);
+/* Latest-wins cancel (a model run in flight returns within about 60 ms). */
+DAPPLE_API void dapple_ai_job_cancel(int32_t job);
+/* Tap select (synchronous, call it off the UI thread; the encoder is prepared on the first tap of a photo). (u, v) photo normalised. op 0 add the
+ * object under the tap, 1 subtract it, 2 undo the last tap, 3 reset. Taps accumulate into one plane. Returns {"ok":bool,"message":"","id":"ai:..:tap:+412,531",
+ * "w","h","taps":[[u,v,1],..],"ms","prepare_ms"} ("id" empty after a reset); the plane is registered. Free with dapple_free_string. */
+DAPPLE_API char* dapple_session_ai_tap_json(DappleSession* session, float u, float v, int32_t op);
+/* The plane `id` as an RGBA gray image at long_edge (<= 0: 128) for lists; DAPPLE_ERROR when the id is not in the store. dapple_free_image. */
+DAPPLE_API int32_t dapple_ai_plane_preview(const char* id, int32_t long_edge, DappleImage* out);
+/* The raster ids of the enabled local adjustments of params_json that are not in the store: {"missing":[{"id","ai":bool,"photo":bool(this photo's id),
+ * "cached":bool(on disk)}]}. Free with dapple_free_string. */
+DAPPLE_API char* dapple_session_ai_missing_json(DappleSession* session, const char* params_json);
+/* Re-creates the missing "ai:" planes of params_json from the disk cache or by recomputation. flags bit 0: as a background job (returns the job id,
+ * 0 = nothing to do; tap planes are re-created synchronously), else synchronously: returns the number of ids still missing (0 = all there).
+ * Exports do this themselves: an export whose edit needs a plane that cannot be re-created FAILS (DAPPLE_ERROR, dapple_last_error names the plane)
+ * instead of rendering the mask as empty; interactive frames render a missing plane as empty. */
+DAPPLE_API int32_t dapple_session_ai_ensure(DappleSession* session, const char* params_json, int32_t flags);
+/* Frees model memory: all = 0 only what is idle (also done by the service itself every few seconds), 1 everything (memory pressure). */
+DAPPLE_API void dapple_ai_release(int32_t all);
 
 /* ---- Sessions: decode once, render many times (slider dragging) ---- */
 
@@ -508,6 +556,20 @@ DAPPLE_API const char* dapple_video_edit_last_error(void);
 DAPPLE_API int32_t dapple_video_edit_cover_uhdr(DappleVideoEdit* edit, const uint16_t* rgba_f16, int32_t width, int32_t height, int32_t colour_kind,
                                                 int32_t rotation_deg, const char* sdr_jpeg_path, const char* out_path, int32_t force_hdr,
                                                 DappleHdrInfo* info);
+
+/* ---- Streaming (band) export (docs/engine/pipeline-architecture.md section 42) --------------------------------------------------------------
+ * Nothing to call: a DAPPLE_QUALITY_FULL open of a mosaic RAW whose whole-frame export would not fit the device's memory keeps the 16-bit mosaic
+ * instead of the float picture, and the dapple_session_export_jpeg* calls on it render in bands straight into the JPEG encoder (same pixels; peak
+ * memory independent of the picture size). DAPPLE_EXPORT_STREAM=on|off|auto (default auto) forces it either way. Additive helpers: */
+/* Progress of the exports of this session, per band (stage "export"); return non-zero to cancel (the export fails with "cancelled", nothing is
+ * written). fn = NULL removes it. Called on the exporting thread. */
+DAPPLE_API int32_t dapple_session_set_export_progress(DappleSession* session, DappleProgressFn fn, void* user);
+/* 1 when the session was opened for a streamed export (no float picture held), else 0. */
+DAPPLE_API int32_t dapple_session_is_streaming(DappleSession* session);
+/* {"footprint":bytes,"resident":bytes,"available":bytes,"exportBudget":bytes,"stream":"auto"}: the process's memory as the OS counts it
+ * (phys_footprint on Apple, RSS on Linux / Android, commit on Windows), what it may still allocate (os_proc_available_memory on iOS) and the budget
+ * the export policy derives from it. Free with dapple_free_string. */
+DAPPLE_API char* dapple_memory_json(void);
 
 #ifdef __cplusplus
 }

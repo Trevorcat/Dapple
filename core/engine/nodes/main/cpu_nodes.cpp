@@ -126,7 +126,7 @@ Status tilePack8(CpuTile& t, const void* r) {
       for (int yy = a; yy < b; ++yy) {
         const int y = in.y0 + yy;
         const float* s = img.row(y) + 3 * std::size_t(in.x0);
-        std::uint8_t* o = t.out8 + (std::size_t(t.oy + y) * t.frameW + std::size_t(t.ox + in.x0)) * ch;
+        std::uint8_t* o = t.out8 + (std::size_t(t.oy + y - t.outRow0) * t.frameW + std::size_t(t.ox + in.x0)) * ch;
         const int n = in.x1 - in.x0;
         for (int x = 0; x < n; ++x) {
           o[ch * x] = std::uint8_t(s[3 * x] * 255.f + 0.5f);

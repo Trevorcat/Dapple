@@ -39,12 +39,19 @@ class LicensesPage extends StatefulWidget {
       'The parallel RAW demosaic uses the LLVM OpenMP runtime (libomp), Copyright (c) the LLVM Project contributors, under the Apache License 2.0 with LLVM Exceptions.';
   static const libompLicenseUrl = 'https://llvm.org/LICENSE.txt';
 
+  /// docs/legal/ai-models.md: AI masks. Models: Google MediaPipe (Apache-2.0) and Depth Anything V2 Small (Apache-2.0); runtimes: LiteRT (Apache-2.0)
+  /// and ONNX Runtime (MIT). The texts shown below come from assets/legal/ai/.
+  static const aiNotice =
+      'AI masks run on the device with these models, all under the Apache License 2.0: Face Detector (BlazeFace short range), Face Mesh v2, Selfie Multiclass 256x256 and the Interactive Segmenter "MagicTouch" from Google MediaPipe, Copyright The MediaPipe Authors (https://github.com/google-ai-edge/mediapipe), unmodified; and Depth Anything V2 Small, Copyright the Depth Anything V2 authors (https://github.com/DepthAnything/Depth-Anything-V2), converted to ONNX Runtime format without changing the weights. The face outline, lip, eye and eyebrow shapes use the landmark index sets of MediaPipe Face Mesh (face_mesh_connections.py). Inference uses LiteRT 1.4.0 (Google, Apache License 2.0) and a size-reduced build of ONNX Runtime 1.32.0 (Copyright (c) Microsoft Corporation, MIT License; its third-party notices follow).';
+  static const aiModelsUrl = 'https://github.com/google-ai-edge/mediapipe';
+
   @override
   State<LicensesPage> createState() => _LicensesPageState();
 }
 
 class _LicensesPageState extends State<LicensesPage> {
-  String? _notice, _license;
+  String? _notice, _license, _apache, _ortMit, _ortNotices;
+  bool _showOrtNotices = false;
 
   @override
   void initState() {
@@ -53,15 +60,23 @@ class _LicensesPageState extends State<LicensesPage> {
   }
 
   Future<void> _load() async {
-    String? n, l;
+    String? n, l, a, m, t;
     try {
       n = await rootBundle.loadString('assets/film/NOTICE.md');
       l = await rootBundle.loadString('assets/film/SPEKTRAFILM_LICENSE.txt');
+    } catch (_) {}
+    try {
+      a = await rootBundle.loadString('assets/legal/ai/APACHE-2.0.txt');
+      m = await rootBundle.loadString('assets/legal/ai/ONNXRUNTIME-MIT.txt');
+      t = await rootBundle.loadString('assets/legal/ai/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt');
     } catch (_) {}
     if (!mounted) return;
     setState(() {
       _notice = n;
       _license = l;
+      _apache = a;
+      _ortMit = m;
+      _ortNotices = t;
     });
   }
 
@@ -100,6 +115,21 @@ class _LicensesPageState extends State<LicensesPage> {
             block('licence-libjxl-link', '许可证', 'BSD 3-Clause  ${LicensesPage.libjxlLicenseUrl}'),
             block('licence-libomp', 'LLVM OpenMP 运行库', LicensesPage.libompNotice),
             block('licence-libomp-link', '许可证', 'Apache-2.0 with LLVM Exceptions  ${LicensesPage.libompLicenseUrl}'),
+            const SectionTitle('AI 蒙版'),
+            block('licence-ai', 'AI 模型与推理库（LiteRT、ONNX Runtime）', LicensesPage.aiNotice),
+            if (_apache != null) block('licence-ai-apache', 'Apache License 2.0 全文（MediaPipe 模型、LiteRT、Depth Anything V2 Small）', _apache!),
+            if (_ortMit != null) block('licence-ai-ort-mit', 'ONNX Runtime: MIT License', _ortMit!),
+            if (_ortNotices != null)
+              // 335 KB of third-party notices: laid out only when asked for
+              _showOrtNotices
+                  ? block('licence-ai-ort-notices', 'ONNX Runtime 第三方声明', _ortNotices!)
+                  : Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextAction('显示 ONNX Runtime 第三方声明全文', onPressed: () => setState(() => _showOrtNotices = true)),
+                      ),
+                    ),
           ]),
         ),
       ]),

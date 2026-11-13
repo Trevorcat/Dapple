@@ -100,6 +100,18 @@ class Renderer {
   // Optional tiny (<= 256 px) copy of the source used for the tonal analysis; saves re-scaling the
   // whole source on every call. Must outlive the renderer.
   void setToneProxy(const SourceImage* proxy) { toneProxy_ = proxy; modernProxy_ = proxy; }
+  // Streaming export (docs/engine/pipeline-architecture.md section 42): the source handed to the render carries the size only, its picture-wide
+  // analyses read these instead, each the exact input the analysis would derive from the full picture: `tone` = resizeToLongEdge(full, 256) (tonal
+  // analysis), `modern` = the stride samples of the modern rendering's end points laid out as an image (Renderer::modernGridSamples), `hdr` =
+  // resizeToLongEdge(full, 512) (single-image HDR field). Null keeps the default. Must outlive the renderer.
+  void setAnalysisSources(const SourceImage* tone, const SourceImage* modern, const SourceImage* hdr) {
+    toneProxy_ = tone;
+    modernProxy_ = modern;
+    hdrProxy_ = hdr;
+  }
+  // Pixel (x, y) of the full picture W x H that the modern rendering's end points sample at grid cell (i, j) (grid of modernGridSize()).
+  static void modernGridSize(int W, int H, int& gw, int& gh);
+  static void modernGridPixel(int W, int H, int i, int j, int& x, int& y);
 
   // Everything the lattice depends on (point-wise parameters, camera, LUT identity), without n.
   std::string pointKey() const;
@@ -188,6 +200,7 @@ class Renderer {
   float toneReach_ = 1.f;
   const SourceImage* toneProxy_ = nullptr;
   const SourceImage* modernProxy_ = nullptr;  // the same proxy, kept by the bake copies that drop toneProxy_ (scene end points of the modern rendering)
+  const SourceImage* hdrProxy_ = nullptr;     // streaming export: the 512 px copy the HDR field is built from (setAnalysisSources)
 
   struct PointOp;
   PointOp makePointOp(const SourceImage& source, const BakedLut* reuse) const;

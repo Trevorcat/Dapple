@@ -447,23 +447,23 @@ class PathDatastream final : public LibRaw_abstract_datastream {
 // the owner's A7R V library (daytime and dusk shots with 12 - 40 % of the pixels below L* 20) the unconditional version changed 12 - 40 % of the
 // pixels by dE > 0.5 and removed up to 26 C* from legitimately coloured shadows (dark fabric, dusk foliage), so it must not run on frames that have
 // a real exposure; none of those frames passes the gate (their gated renders are byte-identical to the floor-off ones).
-void suppressShadowChroma(ImageF& img) {
+namespace {
+constexpr float kShadowFloor = 0.008f, kEmptyP995 = 0.03f;
+}  // namespace
+
+bool shadowChromaEnabled() {
   static const bool off = [] { const char* e = std::getenv("DAPPLE_SHADOW_CHROMA"); return e && (std::strcmp(e, "off") == 0 || std::strcmp(e, "0") == 0); }();
-  if (off) return;  // A/B switch
-  constexpr float kShadowFloor = 0.008f, kEmptyP995 = 0.03f;
-  {
-    // 99.5th percentile of the luma on a 1/16 subsample
-    std::vector<float> ls;
-    ls.reserve(std::size_t(img.width / 4 + 1) * std::size_t(img.height / 4 + 1));
-    for (int y = 0; y < img.height; y += 4) {
-      const float* p = img.row(y);
-      for (int x = 0; x < img.width; x += 4) ls.push_back(0.2880f * p[3 * x] + 0.7119f * p[3 * x + 1] + 0.0001f * p[3 * x + 2]);
-    }
-    if (ls.empty()) return;
-    const std::size_t k = std::min(ls.size() - 1, std::size_t(0.995 * double(ls.size())));
-    std::nth_element(ls.begin(), ls.begin() + std::ptrdiff_t(k), ls.end());
-    if (ls[k] >= kEmptyP995) return;  // a photograph: leave the shadows alone
-  }
+  return !off;  // A/B switch
+}
+
+bool shadowChromaDecide(std::vector<float>& ls) {
+  if (ls.empty()) return false;
+  const std::size_t k = std::min(ls.size() - 1, std::size_t(0.995 * double(ls.size())));
+  std::nth_element(ls.begin(), ls.begin() + std::ptrdiff_t(k), ls.end());
+  return ls[k] < kEmptyP995;  // else a photograph: leave the shadows alone
+}
+
+void shadowChromaApply(ImageF& img) {
   const int h = img.height, w = img.width;
   parallelRows(h, [&](int y) {
     float* p = img.row(y);
@@ -474,6 +474,21 @@ void suppressShadowChroma(ImageF& img) {
       for (int c = 0; c < 3; ++c) p[c] = l + (p[c] - l) * k;
     }
   });
+}
+
+void suppressShadowChroma(ImageF& img) {
+  if (!shadowChromaEnabled()) return;
+  {
+    // 99.5th percentile of the luma on a 1/16 subsample
+    std::vector<float> ls;
+    ls.reserve(std::size_t(img.width / 4 + 1) * std::size_t(img.height / 4 + 1));
+    for (int y = 0; y < img.height; y += 4) {
+      const float* p = img.row(y);
+      for (int x = 0; x < img.width; x += 4) ls.push_back(shadowChromaLuma(p + 3 * x));
+    }
+    if (!shadowChromaDecide(ls)) return;
+  }
+  shadowChromaApply(img);
 }
 
 // the file's exposure anchor (core/src/exposure_anchor.h) into out.meta: an explicit reference first, else the embedded preview, else a sibling camera JPEG

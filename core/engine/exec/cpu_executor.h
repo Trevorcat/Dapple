@@ -7,6 +7,7 @@
 // contains a node without an impl for an executor is unsupported by it (Plan::unsupported / Status::Unsupported).
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "dapple/image.h"
@@ -40,6 +41,7 @@ struct CpuTile {
   Rect interior;
   std::uint8_t* out8 = nullptr;
   int outChannels = 4;
+  int outRow0 = 0;                // frame row of out8's first row (streaming export: out8 holds the band in flight)
   // LocalDetail: the per-pixel amounts LocalLinear wrote for this window (docs/engine/pipeline-architecture.md section 40)
   const local::AuxTarget* aux = nullptr;
 };
@@ -73,6 +75,12 @@ struct ExecEnv {
   // Float output (analysis, swatches, reference renders): the clamped, display-encoded frame instead of 8-bit pixels. The executor
   // sizes it; Whole plans only (a tiled plan returns Unsupported). `out` is then null.
   ImageF* outF = nullptr;
+  // Streaming export (docs/engine/pipeline-architecture.md section 42), TiledExport plans: `out` holds one band of tile rows (plan.grid.tile rows),
+  // `prepare` is called with the rect of the frame the head is about to compute (before every head run; it hands the source pixels of that rect to
+  // the FrameKernels) and `bandDone` with each finished band of the output sweep (rows [y0, y1) of the frame, in order, the pixels in `out`). A false
+  // return aborts the run (Status::Cancelled). Film plans are not run this way (Unsupported).
+  std::function<bool(int x0, int y0, int x1, int y1)> prepare;
+  std::function<bool(int y0, int y1)> bandDone;
 };
 
 class CpuExecutor {

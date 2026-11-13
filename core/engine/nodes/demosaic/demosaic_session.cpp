@@ -82,6 +82,30 @@ ImageF demosaicOrientedRegion(const MosaicImage& m, int x0, int y0, int x1, int 
   return rotateFlipImg(tmp, m.flip);
 }
 
+bool fullUsesGpu(const MosaicImage& m) {
+  GpuBackend* b = g_backend;
+  if (!b) return false;
+  const Desc d = makeDesc(m);
+  std::string why;
+  return b->available(why) && b->prefer(d, {0, 0, m.width, m.height}, why);
+}
+
+ImageF demosaicOrientedRegionOn(const MosaicImage& m, int x0, int y0, int x1, int y1, bool gpu, bool* fellBack, int threads) {
+  Rect r;
+  if (!mosaicRectOf(m, x0, y0, x1, y1, &r)) return {};
+  const Desc d = makeDesc(m);
+  ImageF tmp(r.w(), r.h());
+  bool done = false;
+  if (gpu) {
+    std::string why;
+    if (GpuBackend* b = g_backend) done = b->run(d, r, tmp.data.data(), std::size_t(r.w()) * 3, why);
+    if (!done && fellBack) *fellBack = true;
+  }
+  if (!done) demosaic(d, r, tmp.data.data(), std::size_t(r.w()) * 3, threads);
+  if (m.flip != 3 && m.flip != 5 && m.flip != 6) return tmp;  // upright: no copy (a band of a 60 MP picture is ~70 MB)
+  return rotateFlipImg(tmp, m.flip);
+}
+
 ImageF demosaicFull(const MosaicImage& m, int threads, std::string* corrections) {
   const Desc d = makeDesc(m);
   ImageF rgb(m.width, m.height);

@@ -4,6 +4,12 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// AI masks: runtime libraries (tools/ai-rt/jniLibs/<abi>) and model files (tools/ai-rt/assets/ai-models, ~150 MB) go into the APK. -Pdapple.ai=false: neither.
+// The depth model (99 MB of the 149 MB) is left out by default: depth masks then report unavailable. -Pdapple.aiDepth=true bundles it.
+val aiRt = file("../../../tools/ai-rt")
+val aiEnabled = project.findProperty("dapple.ai") != "false" && file("$aiRt/jniLibs").isDirectory
+val aiDepth = project.findProperty("dapple.aiDepth") == "true"
+
 android {
     namespace = "com.dapple.dapple"
     compileSdk = flutter.compileSdkVersion
@@ -48,6 +54,9 @@ android {
                         "-DDAPPLE_SHADERC_EXE=F:/projects/sony-render/build/shaderc/dapple_shaderc.exe",
                     )
                 }
+                // AI masks (core/ai: LiteRT + ONNX Runtime, docs/engine/pipeline-architecture.md section 41): on by default when the runtime libraries are
+                // staged under tools/ai-rt/jniLibs (CMake option DAPPLE_AI=AUTO); -Pdapple.ai=false builds without them (smaller APK, C API says unavailable).
+                if (aiEnabled) arguments("-DDAPPLE_AI=AUTO") else arguments("-DDAPPLE_AI=OFF")
                 targets("dapple", "dapple_video")
             }
         }
@@ -62,8 +71,17 @@ android {
     }
 
     sourceSets["main"].jniLibs.srcDir("../../../tools/ffmpeg/jniLibs")
+    if (aiEnabled) {
+        sourceSets["main"].jniLibs.srcDir("../../../tools/ai-rt/jniLibs")  // libtensorflowlite_jni.so + libonnxruntime.so (x86_64 only ships in -Pdapple.x86 builds)
+        if (file("$aiRt/assets/ai-models").isDirectory) sourceSets["main"].assets.srcDir("../../../tools/ai-rt/assets")
+    }
+    // model files are stored as they are: copied once to app storage at first use (AiModelsPlugin.kt); deflate would save about 7 % and cost start-up time
+    androidResources {
+        noCompress += listOf("tflite", "ort")
+    }
 
     packaging {
+        if (!aiDepth) resources.excludes += "assets/ai-models/depth.ort"  // -Pdapple.aiDepth=false
         jniLibs {
             excludes += if (project.hasProperty("dapple.x86"))
                 listOf("lib/armeabi-v7a/**", "lib/x86/**")

@@ -71,6 +71,9 @@ class MainActivity : FlutterActivity() {
         // Camera on the USB-C cable: android.mtp.MtpDevice (UsbCameraPlugin.kt), channels dapple/usbcam + dapple/usbcam_events
         usbPlugin = UsbCameraPlugin(this, messenger)
 
+        // AI masks: the bundled model files are copied to app storage on first use (AiModelsPlugin.kt), channel dapple/ai
+        AiModelsPlugin(applicationContext, messenger)
+
         // Editor landmark haptics (requirements 4.15.9): View.performHapticFeedback with the
         // finest constant the OS offers. Numeric values so this compiles against any compileSdk.
         MethodChannel(messenger, "dapple/haptics").setMethodCallHandler { call, result ->

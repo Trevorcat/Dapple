@@ -555,7 +555,8 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
 
 bool EngineSession::renderExact(const EditParams& params, const Renderer& renderer, const SourceImage& src,
                                 const ExactOptions& opt, Image8& out, std::string* err, ExecStats* statsOut) {
-  if (!opt.outFloat && opt.spatial && !opt.sessionCache) {  // export / reference frames: the GPU executor first (exact variant on the dense lattice)
+  const bool streaming = bool(opt.sourceWindow) && bool(opt.rows);  // section 42
+  if (!opt.outFloat && opt.spatial && !opt.sessionCache && !streaming) {  // export / reference frames: the GPU executor first (exact variant on the dense lattice)
     const int gr = renderExactGpu(params, renderer, src, opt, out, err);
     if (gr == 0) return true;
     if (gr < 0) return false;
@@ -593,7 +594,40 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   stats_.planMs += msSince(t0);
   ++stats_.planned;
   ExecEnv env{fk, g, cache, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, nullptr, 3};
-  if (opt.outFloat) {
+  std::vector<std::uint8_t> band;  // streaming export: the band in flight
+  int winX0 = 0, winY0 = 0, winX1 = 0, winY1 = 0;  // source rect of the window the FrameKernels hold
+  bool haveWin = false;
+  if (streaming) {
+    if (opt.outFloat || plan.unsupported) {
+      if (err) *err = "engine: streaming export needs an 8-bit tiled plan";
+      return false;
+    }
+    const int W = fk.width(), H = fk.height();
+    const int bandRows = plan.grid.nx * plan.grid.ny == 1 ? H : std::min(H, plan.grid.tile);
+    band.assign(std::size_t(bandRows) * std::size_t(W) * 3, 0);
+    out.width = W;
+    out.height = H;
+    out.data.clear();
+    env.out = band.data();
+    env.prepare = [&](int x0, int y0, int x1, int y1) {
+      int sx0, sy0, sx1, sy1;
+      fk.sourceRect(x0, y0, x1, y1, sx0, sy0, sx1, sy1);
+      if (haveWin && sx0 >= winX0 && sy0 >= winY0 && sx1 <= winX1 && sy1 <= winY1) return true;
+      // the source of the whole band row when that is not much more than the band (no or quarter-turn geometry), else of this tile alone
+      int bx0, by0, bx1, by1;
+      fk.sourceRect(0, y0, W, y1, bx0, by0, bx1, by1);
+      if (double(bx1 - bx0) * double(by1 - by0) <= 2.5 * double(W) * double(y1 - y0)) sx0 = bx0, sy0 = by0, sx1 = bx1, sy1 = by1;
+      fk.setSourceWindow(nullptr, 0, 0);
+      haveWin = false;
+      const ImageF* w = opt.sourceWindow(sx0, sy0, sx1, sy1);
+      if (!w || w->width != sx1 - sx0 || w->height != sy1 - sy0) return false;
+      fk.setSourceWindow(w, sx0, sy0);
+      winX0 = sx0, winY0 = sy0, winX1 = sx1, winY1 = sy1;
+      haveWin = true;
+      return true;
+    };
+    env.bandDone = [&](int y0, int y1) { return opt.rows(y0, y1 - y0, band.data()); };
+  } else if (opt.outFloat) {
     env.outF = opt.outFloat;
   } else {
     out.width = fk.width();
@@ -604,6 +638,7 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   ExecStats es;
   if (opt.beforeExec) opt.beforeExec();
   Status s = plan.unsupported ? Status::Unsupported : CpuExecutor::run(plan, env, &es);
+  if (streaming) fk.setSourceWindow(nullptr, 0, 0);
   addStats(stats_, es);
   if (statsOut) *statsOut = es;
   if (s == Status::Unsupported) {

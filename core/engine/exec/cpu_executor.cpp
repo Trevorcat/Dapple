@@ -55,6 +55,7 @@ struct Run {
   local::AuxTarget aux;
   std::vector<float> auxBuf;
   int auxPlanes = 0;
+  int outRow0 = 0;              // streaming export: frame row of env.out's first row (the band in flight)
 
   Run(const Plan& p, ExecEnv& e, ExecStats* s)
       : plan(p), env(e), stats(s), fk(e.fk), W(e.fk.width()), H(e.fk.height()) {}
@@ -125,7 +126,7 @@ struct Run {
         [&](int r) {
           const int y = ry0 + r;
           float* drow = dst ? dst->row(r) : nullptr;
-          std::uint8_t* o = dst ? nullptr : env.out + (std::size_t(y) * W + rx0) * ch;
+          std::uint8_t* o = dst ? nullptr : env.out + (std::size_t(y - outRow0) * W + rx0) * ch;
           for (int x = 0; x < rw; x += 256) {
             const int n = std::min(256, rw - x);
             float px[256 * 3];
@@ -206,6 +207,13 @@ struct Run {
                   std::size_t(lw) * ch * sizeof(float));
   }
 
+  // ---- streaming export hooks (section 42) ------------------------------------------------------------------------------------------
+  bool prepare(int x0, int y0, int x1, int y1) { return !env.prepare || env.prepare(x0, y0, x1, y1); }
+  void bandBegin(int y0) {
+    if (env.bandDone) outRow0 = y0;
+  }
+  bool bandEnd(const Stage& st, int y0, int y1) { return !(st.output && env.bandDone) || env.bandDone(y0, y1); }
+
   // ---- one TileSweep ----------------------------------------------------------------------------------------------------------
   Status sweep(const Stage& st) {
     if (stats) ++stats->sweeps;
@@ -221,12 +229,17 @@ struct Run {
       return cancelled() ? Status::Cancelled : Status::Ok;
     }
     if (nWin == 0 && st.output) {  // no neighbourhood stage: the chain packs the 8-bit pixels itself
-      for (int ty = 0; ty < H; ty += T)
+      for (int ty = 0; ty < H; ty += T) {
+        bandBegin(ty);
         for (int tx = 0; tx < W; tx += T) {
           if (cancelled()) return Status::Cancelled;
+          if (!prepare(tx, ty, std::min(W, tx + T), std::min(H, ty + T))) return Status::Cancelled;
           runHead(tx, ty, std::min(T, W - tx), std::min(T, H - ty), nullptr);
           if (stats) ++stats->tiles;
         }
+        if (cancelled()) return Status::Cancelled;
+        if (!bandEnd(st, ty, std::min(H, ty + T))) return Status::Cancelled;
+      }
       return cancelled() ? Status::Cancelled : Status::Ok;
     }
 
@@ -234,6 +247,7 @@ struct Run {
       if (!imgValid) {
         img = film ? film : &frameBuf.get(W, H);
         auxWindow(0, 0, W, H);
+        if (!prepare(0, 0, W, H)) return Status::Cancelled;
         if (st.groups[0].nodes.empty() == false) runHead(0, 0, W, H, img);
         if (cancelled()) return Status::Cancelled;
         scratch.yValid = false;
@@ -262,12 +276,14 @@ struct Run {
         const CpuImpl* pack = cpuImpl(NodeType::Pack8);
         s = pack->tile(t, nullptr);
         if (s != Status::Ok) return s;
+        if (!bandEnd(st, 0, H)) return Status::Cancelled;
       }
       return cancelled() ? Status::Cancelled : Status::Ok;
     }
 
     // multi-tile: the chain is recomputed per sweep (5.4)
-    for (int ty = 0; ty < H; ty += T)
+    for (int ty = 0; ty < H; ty += T) {
+      bandBegin(ty);
       for (int tx = 0; tx < W; tx += T) {
         if (cancelled()) return Status::Cancelled;
         const Rect in{tx, ty, std::min(tx + T, W), std::min(ty + T, H)};
@@ -278,6 +294,7 @@ struct Run {
         tileBuf.width = rw;
         tileBuf.height = rh;
         auxWindow(x0, y0, rw, rh);
+        if (!prepare(x0, y0, x1, y1)) return Status::Cancelled;
         runHead(x0, y0, rw, rh, &tileBuf);
         if (cancelled()) return Status::Cancelled;
         scratch.yValid = false;
@@ -295,11 +312,15 @@ struct Run {
           t.interior = local;
           t.out8 = env.out;
           t.outChannels = env.outChannels;
+          t.outRow0 = outRow0;
           s = cpuImpl(NodeType::Pack8)->tile(t, nullptr);
           if (s != Status::Ok) return s;
         }
         if (stats) ++stats->tiles;
       }
+      if (cancelled()) return Status::Cancelled;
+      if (!bandEnd(st, ty, std::min(H, ty + T))) return Status::Cancelled;
+    }
     return cancelled() ? Status::Cancelled : Status::Ok;
   }
 
@@ -383,6 +404,7 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
   // film: a whole-frame node before the sweeps (the streaming path finishes the frame by itself)
   for (const Stage& s : plan.stages) {
     if (s.kind != StageKind::FilmFrame) continue;
+    if (env.prepare) return Status::Unsupported;  // streaming export (section 42): the film branch reads the whole frame
     if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF && !env.fk.spatial().any() && !env.fk.localFrame()) {
       if (env.fk.streamFilm(env.out)) {
         if (stats) stats->streamed = true;

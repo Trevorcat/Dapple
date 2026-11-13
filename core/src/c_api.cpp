@@ -43,9 +43,12 @@
 #include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
 #include "frame_kernels.h"
 #include "local_eval.h"
+#include "ai_masks.h"
 #include "engine/nodes/film/film_async.h"
 #include "engine/nodes/film/frame_trace.h"
 #include "color.h"
+#include "export_stream.h"  // streaming (band) export, docs/engine/pipeline-architecture.md section 42
+#include "mem_probe.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
 #elif defined(__APPLE__)
@@ -59,6 +62,9 @@
 #ifndef DAPPLE_VERSION_STRING
 #define DAPPLE_VERSION_STRING "0.1.0"
 #endif
+
+static void stageLog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));  // defined below (streaming export logs, section 42)
+static double msSince(std::chrono::steady_clock::time_point t0);
 
 struct DappleSession {
   dapple::SourceImage source;
@@ -101,12 +107,23 @@ struct DappleSession {
   std::atomic<bool> hintRunning{false};
   std::atomic<std::uint64_t> swatchSeq{0};  // dapple_session_base_previews: the newest request (or cancel) wins
   ~DappleSession() {
+    dapple::aimask::cancelOwner(this);  // AI mask jobs hold a pointer to this session
+    dapple::aimask::waitOwner(this);
     for (int i = 0; i < 5000 && matchBusy.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   dapple::FilmMatchCache filmCache;  // image statistics + remembered medians of the match (film_match.h)
   // Where the executors read the full-resolution source from (the GPU keeps a device copy per store identity)
   std::once_flag storeOnce;
   std::unique_ptr<dapple::engine::MemorySourceStore> store;
+  // ---- streaming export (docs/engine/pipeline-architecture.md section 42) ----
+  // A FULL open of a large mosaic RAW keeps the cached mosaic instead of the float picture: source.linear stays empty (meta and scene flag are
+  // set) until a call needs the whole picture (ensureSource); exports stream from the mosaic in bands (streamRender).
+  std::unique_ptr<dapple::LazyFull> lazy;
+  std::atomic<bool> lazyOpen{false};
+  std::recursive_mutex lazyMtx;
+  std::shared_ptr<dapple::xstream::Analyses> streamA;  // exact reductions of the lazy picture (first streamed render)
+  DappleProgressFn exportProgress = nullptr;           // dapple_session_set_export_progress
+  void* exportProgressUser = nullptr;
 };
 
 namespace {
@@ -118,6 +135,9 @@ thread_local std::string g_lastError;
 thread_local bool tlHintFrame = false;  // set on the touch-hint worker: its frames are not real frames
 
 void setError(std::string message) { g_lastError = std::move(message); }
+
+// Streaming export (section 42): a lazy FULL session gets its float picture here when a call needs the whole of it (no-op otherwise).
+bool ensureSource(DappleSession* s);
 
 // UTF-8 C string -> path (std::filesystem handles non-ASCII on Windows).
 fs::path toPath(const char* utf8) {
@@ -485,8 +505,28 @@ bool renderSession(DappleSession* s, const char* paramsJson, const char* lutPath
   return renderSessionParams(s, params, lutPath, outLongEdge, out);
 }
 
+// Streaming export (section 42), defined below: the render of a lazy session in bands. 1 = done, 0 = this edit cannot stream, -1 = failed.
+using RowSink = std::function<bool(int y0, int n, const std::uint8_t* rgb)>;
+int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPath, int32_t outLongEdge, const std::function<void(int, int)>& onSize,
+                 const RowSink& sink, const std::vector<int>& extraLongEdges = {});
+
 bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const char* lutPath, int32_t outLongEdge,
                          Image8& out, float toneReach) {
+  if (s->lazyOpen.load() && toneReach == 1.f && outLongEdge > 0 && s->lazy && outLongEdge < std::max(s->lazy->width, s->lazy->height)) {
+    // a reduced render of a lazy session (Ultra HDR quarter renders, headroom probe): from the exact reduction / the streamed GPU export
+    const int r = streamRender(
+        s, paramsIn, lutPath, outLongEdge,
+        [&](int w, int h) {
+          out.width = w, out.height = h;
+          out.data.assign(std::size_t(w) * h * 3, 0);
+        },
+        [&](int y0, int n, const std::uint8_t* rgb) {
+          std::memcpy(out.data.data() + std::size_t(y0) * out.width * 3, rgb, std::size_t(n) * out.width * 3);
+          return true;
+        });
+    if (r != 0) return r > 0;
+  }
+  if (!ensureSource(s)) return false;
   const EditParams params = withFilmKey(s, paramsIn, lutPath);
   if (params.outputSpace == 1 && Renderer(params, *s->camera, nullptr).filmActive()) {
     // Film stocks (and their blend with the normal render) are authored for sRGB output: rendered as sRGB, then converted to Display P3 (no colour is added).
@@ -522,6 +562,220 @@ bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const cha
     out = renderer.render(s->source);
   }
   return true;
+}
+
+// ---- streaming export (docs/engine/pipeline-architecture.md section 42) -------------------------------------------------------------------
+bool ensureSource(DappleSession* s) {
+  if (!s || !s->lazyOpen.load()) return true;
+  try {
+    std::lock_guard<std::recursive_mutex> lk(s->lazyMtx);
+    if (!s->lazy) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    s->source = materializeFull(*s->lazy);
+    s->lazy.reset();
+    s->streamA.reset();
+    s->lazyOpen = false;
+    stageLog("session materialised %dx%d in %.0f ms (a call needs the whole picture)", s->source.linear.width, s->source.linear.height, msSince(t0));
+    if (s->source.linear.empty()) {
+      setError("cannot decode the full picture");
+      return false;
+    }
+    return true;
+  } catch (const std::exception& e) {
+    setError(std::string("exception: ") + e.what());
+  } catch (...) {
+    setError("unknown exception");
+  }
+  return false;
+}
+
+// The progress of an export (per band): false = the caller cancelled (dapple_session_set_export_progress).
+bool exportProgressOk(DappleSession* s, float f) { return !s->exportProgress || s->exportProgress(std::clamp(f, 0.f, 1.f), "export", s->exportProgressUser) == 0; }
+
+// The exact reductions of a lazy picture with at least `want` (one pass, kept by the session; a long edge or a guide grid not yet there runs the
+// pass again with the union). Also gives the session the 256 px proxies the film match and the modern white point read (what they would make of
+// the whole picture). Null = cancelled / failed (error set).
+std::shared_ptr<const xstream::Analyses> lazyAnalyses(DappleSession* s, xstream::Wants want, float progressFrom, float progressTo) {
+  std::lock_guard<std::recursive_mutex> lk(s->lazyMtx);
+  if (!s->lazy) return nullptr;
+  if (const auto have = s->streamA) {
+    bool ok = true;
+    for (int le : want.longEdges) ok &= have->at(le) != nullptr || le >= std::max(s->lazy->width, s->lazy->height);
+    for (const auto& g : want.guideGrids) {
+      bool found = false;
+      if (have->guide)
+        for (const auto& gg : have->guide->grids) found |= gg.gw == g.first && gg.gh == g.second;
+      ok &= found;
+    }
+    if (ok) return have;
+    for (const auto& r : have->reduced)
+      if (std::find(want.longEdges.begin(), want.longEdges.end(), r.first) == want.longEdges.end()) want.longEdges.push_back(r.first);
+    if (have->guide)
+      for (const auto& gg : have->guide->grids)
+        if (std::find(want.guideGrids.begin(), want.guideGrids.end(), std::make_pair(gg.gw, gg.gh)) == want.guideGrids.end()) want.guideGrids.emplace_back(gg.gw, gg.gh);
+  }
+  want.longEdges.erase(std::remove_if(want.longEdges.begin(), want.longEdges.end(), [&](int le) { return le <= 0 || le >= std::max(s->lazy->width, s->lazy->height); }),
+                       want.longEdges.end());
+  xstream::BandSource bs(s->lazy->mosaic);
+  bs.setCancel(s->exportEngine.cancelCell(), s->exportEngine.ticket());
+  auto a = std::make_shared<xstream::Analyses>();
+  std::string err;
+  mem::mark("analyse");
+  if (!xstream::analyse(bs, s->lazy->meta, want, *a, [&](float f) { return exportProgressOk(s, progressFrom + (progressTo - progressFrom) * f); }, &err)) {
+    setError(err == "cancelled" ? "cancelled" : "streaming export: " + err);
+    return nullptr;
+  }
+  s->streamA = a;
+  if (!s->proxy) s->proxy = a->p256;
+  {
+    std::lock_guard<std::mutex> ml(s->matchMtx);
+    if (!s->keyProxy) s->keyProxy = a->p256;
+  }
+  stageLog("export_stream analyses %dx%d: %d pass(es) %.0f ms, shadow floor %d, %d reductions, guide grids %d, %s demosaic", s->lazy->width, s->lazy->height, a->passes,
+           a->ms, a->shadow ? 1 : 0, int(a->reduced.size()), a->guide ? int(a->guide->grids.size()) : 0, bs.gpu() ? "GPU" : "CPU");
+  return a;
+}
+
+// 8-bit sRGB -> Display P3 on rows (srgb8ToDisplayP3 of the whole picture, band by band: a per-pixel table + matrix).
+void srgb8RowsToDisplayP3(std::uint8_t* rgb, std::size_t pixels) {
+  Image8 tmp;
+  tmp.width = int(pixels), tmp.height = 1;
+  tmp.data.assign(rgb, rgb + pixels * 3);
+  srgb8ToDisplayP3(tmp);
+  std::memcpy(rgb, tmp.data.data(), pixels * 3);
+}
+
+int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPath, int32_t outLongEdge, const std::function<void(int, int)>& onSize,
+                 const RowSink& sink, const std::vector<int>& extraLongEdges) {
+  if (!s->lazyOpen.load() || !s->lazy) return 0;
+  if (dapple::engine::mode() != dapple::engine::Mode::Full) return 0;  // the golden oracle (DAPPLE_ENGINE=off) renders whole pictures only
+  const int W = s->lazy->width, H = s->lazy->height, own = std::max(W, H);
+  const bool reduced = outLongEdge > 0 && outLongEdge < own;
+  if (paramsIn.outputSpace == 1 && Renderer(paramsIn, *s->camera, nullptr).filmActive()) {
+    // as renderSessionParams: a film is rendered as sRGB, then converted to Display P3 (band by band)
+    EditParams q = paramsIn;
+    q.outputSpace = 0;
+    int ow = 0;
+    return streamRender(
+        s, q, lutPath, outLongEdge, [&](int w, int h) { ow = w, onSize(w, h); },
+        [&](int y0, int n, const std::uint8_t* rgb) {
+          std::vector<std::uint8_t> b(rgb, rgb + std::size_t(n) * ow * 3);
+          srgb8RowsToDisplayP3(b.data(), std::size_t(n) * ow);
+          return sink(y0, n, b.data());
+        },
+        extraLongEdges);
+  }
+  if (Renderer(paramsIn, *s->camera, nullptr).filmActive()) return 0;  // the film branch reads the whole frame: not streamed (section 42.6)
+  xstream::Wants want;
+  want.longEdges = extraLongEdges;
+  if (reduced) want.longEdges.push_back(outLongEdge);
+  want.guideGrids = local::guideGridSizes(paramsIn.local, W, H, false);
+  want.guide = !want.guideGrids.empty();
+  const auto a = lazyAnalyses(s, want, 0.f, reduced ? 1.f : 0.3f);
+  if (!a) return -1;
+  const EditParams params = withFilmKey(s, paramsIn, lutPath);
+  std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
+  std::shared_ptr<const Lut3D> lut;
+  if (!lutFile.empty()) {
+    lut = loadLut(lutFile);
+    if (!lut) return -1;
+  }
+  Renderer renderer(params, *s->camera, lut.get());
+  renderer.setAnalysisSources(a->p256.get(), a->grid.get(), a->p512.get());
+  const xstream::GuideScope guideScope(a->guide.get());
+  const SourceImage virt = xstream::sizeOnly(s->lazy->meta, W, H);
+  xstream::BandSource bs(s->lazy->mosaic);
+  bs.setShadowFloor(a->shadow);
+  const float p0 = reduced ? 0.f : 0.3f;
+  int bandsDone = 0, outH = 0;
+  auto progressSink = [&](int y0, int n, const std::uint8_t* rgb) {
+    ++bandsDone;
+    if (!exportProgressOk(s, p0 + (1.f - p0) * float(y0 + n) / float(std::max(1, outH)))) return false;
+    return sink(y0, n, rgb);
+  };
+  auto sized = [&](int w, int h) {
+    outH = h;
+    onSize(w, h);
+  };
+  mem::mark("render");
+#ifdef DAPPLE_HAVE_GPU
+  dapple::engine::gpu::installProvider();
+  if (dapple::engine::gpu::runtimeEnabled() && (outLongEdge <= 0 || outLongEdge >= 1500)) {  // as renderSessionParams: the GPU export, its tiles streamed
+    std::lock_guard<std::mutex> lock(s->exportMtx);
+    bs.setCancel(s->exportEngine.cancelCell(), s->exportEngine.ticket());
+    xstream::BandSourceStore store(bs);
+    dapple::engine::EngineSession::GpuExport e{params, renderer, virt, store, *s->camera, lut.get()};
+    e.outLongEdge = outLongEdge;
+    e.forceStream = true;
+    // tiles of 512: the device pool (shared memory on phones) stays small; the GPU executor is tile-invariant (same pixels at any tile size)
+    e.tile = 512;
+    if (const char* te = std::getenv("DAPPLE_EXPORT_STREAM_TILE")) e.tile = std::max(64, std::atoi(te) / 4 * 4);
+    std::vector<std::uint8_t> band;
+    int ow = 0, bandY = -1;
+    bool aborted = false;
+    e.onSize = [&](int w, int h) {
+      ow = w;
+      sized(w, h);
+    };
+    e.target.sink = [&](int x, int y, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
+      if (y != bandY) {  // tiles arrive in raster order: a new band row
+        bandY = y;
+        band.assign(std::size_t(th) * ow * 3, 0);
+      }
+      for (int j = 0; j < th; ++j) {
+        const std::uint8_t* src = rgba + std::size_t(j) * stride;
+        std::uint8_t* dst = band.data() + (std::size_t(j) * ow + x) * 3;
+        for (int i = 0; i < tw; ++i) dst[3 * i] = src[4 * i], dst[3 * i + 1] = src[4 * i + 1], dst[3 * i + 2] = src[4 * i + 2];
+      }
+      if (x + tw < ow) return true;
+      bandY = -1;
+      if (!progressSink(y, th, band.data())) return !(aborted = true);
+      return true;
+    };
+    std::string err;
+    const int r = s->exportEngine.exportGpu(e, nullptr, &err);
+    stageLog("export_stream GPU %dx%d -> long edge %d: %s (%llu windows, demosaic %.0f ms %s%s)", W, H, int(outLongEdge), r == 0 ? "ok" : r > 0 ? "GPU declined" : err.c_str(),
+             (unsigned long long)bs.windows(), bs.demosaicMs(), bs.gpu() ? "GPU" : "CPU", bs.fellBack() ? ", fell back" : "");
+    if (r == 0) return 1;
+    if (r < 0 || aborted) {
+      setError(aborted ? "cancelled" : (err.empty() ? "GPU export failed" : err));
+      return -1;
+    }
+    // r == 1: the CPU below (onSize starts the output again)
+  }
+#endif
+  if (reduced) {  // the exact reduction, rendered whole (as resizedSource + renderExact of the whole-frame path)
+    const std::shared_ptr<SourceImage> R = a->at(outLongEdge);
+    if (!R) return 0;
+    Image8 img;
+    if (!engineRenderExact(s, params, renderer, *R, img)) return -1;
+    sized(img.width, img.height);
+    for (int y = 0; y < img.height; y += 512) {
+      const int n = std::min(512, img.height - y);
+      if (!progressSink(y, n, img.data.data() + std::size_t(y) * img.width * 3)) {
+        setError("cancelled");
+        return -1;
+      }
+    }
+    return 1;
+  }
+  std::lock_guard<std::mutex> lock(s->exportMtx);
+  bs.setCancel(s->exportEngine.cancelCell(), s->exportEngine.ticket());
+  int tile = 512;  // one JPEG strip per band
+  if (const char* e = std::getenv("DAPPLE_EXPORT_STREAM_TILE")) tile = std::max(64, std::atoi(e) / 4 * 4);
+  std::string err;
+  const auto t0 = std::chrono::steady_clock::now();
+  int fw = 0, fh = 0;
+  const bool ok = xstream::renderBands(s->exportEngine, params, renderer, virt, bs, tile, s->proxy != nullptr, [&](int w, int h) { fw = w, fh = h, sized(w, h); },
+                                       progressSink, &err);
+  stageLog("export_stream CPU %dx%d: %s in %.0f ms (%d bands, %llu windows, demosaic %.0f ms %s, largest window %.0f MB)", fw, fh, ok ? "ok" : err.c_str(), msSince(t0),
+           bandsDone, (unsigned long long)bs.windows(), bs.demosaicMs(), bs.gpu() ? "GPU" : "CPU", double(bs.peakWindowBytes()) / 1048576.0);
+  if (!ok) {
+    if (err.rfind("engine: plan not supported", 0) == 0) return 0;
+    setError(err);
+    return -1;
+  }
+  return 1;
 }
 
 template <class Fn>
@@ -689,6 +943,7 @@ struct MaskView {
   std::unique_ptr<FrameKernels> fk;
 };
 bool maskView(DappleSession* s, const EditParams& params, int longEdge, MaskView& mv) {
+  if (!ensureSource(s)) return false;
   if (longEdge <= 0) longEdge = 1024;
   mv.hold = s->engine.resizedSource(s->source, longEdge, false);
   mv.src = mv.hold ? mv.hold.get() : &s->source;
@@ -749,6 +1004,7 @@ int32_t dapple_session_mask_preview(DappleSession* s, const char* params_json, i
 }
 
 int32_t dapple_session_map_point(DappleSession* s, const char* params_json, int32_t long_edge, float x, float y, int32_t direction, float* u, float* v) {
+  ensureSource(s);
   return guarded(
       [&]() -> int32_t {
         if (!s || !u || !v) {
@@ -789,6 +1045,7 @@ int32_t dapple_session_map_point(DappleSession* s, const char* params_json, int3
 }
 
 char* dapple_session_mask_sample_json(DappleSession* s, const char* params_json, float u, float v) {
+  ensureSource(s);
   return guarded(
       [&]() -> char* {
         if (!s) {
@@ -820,6 +1077,214 @@ char* dapple_session_mask_sample_json(DappleSession* s, const char* params_json,
         return dupString(buf);
       },
       static_cast<char*>(nullptr));
+}
+
+// ---- AI masks (docs/engine/pipeline-architecture.md section 41) -------------------------------------------------------------------------------
+extern "C++" {
+namespace {
+// What the AI service needs of a session: the photo's identity (hash of the decoded scene-linear picture) and its neutral rendition: default
+// params (white balance as shot, exposure anchor, standard base, no look, no local adjustments), geometry "orig", sRGB, <= 1024 px. It never depends
+// on the user's edit, so a plane is valid for every edit of the photo.
+aimask::Source aiSource(DappleSession* s) {
+  aimask::Source src;
+  src.owner = s;
+  src.photoId = aimask::photoIdOf(s->source.linear.data.data(), s->source.linear.width, s->source.linear.height);
+  src.render = [s](aimask::Rendition& r, std::string& err) {
+    EditParams p;
+    p.crop = "orig", p.rotate = 0, p.straighten = 0.f, p.flip = false, p.outputSpace = 0;
+    p.local.clear();
+    Image8 img;
+    if (!renderSessionParams(s, p, nullptr, aimask::kPlaneLongEdge, img) || img.data.empty()) {
+      err = g_lastError.empty() ? "render failed" : g_lastError;
+      return false;
+    }
+    r.w = img.width, r.h = img.height, r.rgb = std::move(img.data);
+    return true;
+  };
+  return src;
+}
+std::vector<std::string> localRasterIds(const EditParams& p) {
+  std::vector<std::string> ids;
+  for (const LocalAdjustment& a : p.local) {
+    if (!a.enabled || a.strength <= 0.f || !(a.ops.anyLinear() || a.ops.anyWindow())) continue;
+    for (const MaskComponent& m : a.mask)
+      if (m.kind == MaskKind::Raster && !m.ref.empty() && std::find(ids.begin(), ids.end(), m.ref) == ids.end()) ids.push_back(m.ref);
+  }
+  return ids;
+}
+std::vector<std::string> missingRasterIds(const EditParams& p) {
+  std::vector<std::string> out;
+  for (const std::string& id : localRasterIds(p))
+    if (!local::rasterHas(id)) out.push_back(id);
+  return out;
+}
+// Export rule: every raster plane the edit uses must exist, else it is re-created (disk cache, then recomputation); if that fails the export fails.
+bool ensureLocalRasters(DappleSession* s, const EditParams& p) {
+  const std::vector<std::string> missing = missingRasterIds(p);
+  if (missing.empty()) return true;
+  aimask::Control ctl;
+  ctl.yield = false;
+  std::string why;
+  const std::vector<std::string> still = aimask::ensure(aiSource(s), missing, ctl, &why);
+  if (still.empty()) return true;
+  setError("export: local mask plane '" + still[0] + "' is missing and could not be re-created (" + why + "); nothing was written");
+  return false;
+}
+std::string jsonEsc(const std::string& in) {
+  std::string o;
+  for (char c : in) {
+    if (c == '"' || c == '\\') o += '\\', o += c;
+    else if (static_cast<unsigned char>(c) < 0x20) o += ' ';
+    else o += c;
+  }
+  return o;
+}
+}  // namespace
+}  // extern "C++"
+
+int32_t dapple_ai_configure(const char* model_dir, const char* cache_dir) {
+  aimask::configure(model_dir ? model_dir : "", cache_dir ? cache_dir : "");
+  return DAPPLE_OK;
+}
+char* dapple_ai_status_json(void) { return dupString(aimask::availabilityJson()); }
+char* dapple_session_ai_photo_id(DappleSession* s) {
+  if (!s) return nullptr;
+  return dupString(aiSource(s).photoId);
+}
+int32_t dapple_session_ai_start(DappleSession* s, int32_t tasks, int32_t flags, int32_t max_faces) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!s) {
+          setError("null session");
+          return -1;
+        }
+        const aimask::rt::Avail a = aimask::rt::availability(aimask::modelDir());
+        if (!(a.person || a.faces || a.depth || a.tap || aimask::rt::compiled())) {
+          setError("AI masks unavailable: " + a.reason);
+          return -1;
+        }
+        return aimask::startJob(aiSource(s), tasks & 31, max_faces > 0 ? max_faces : aimask::kMaxFaces, (flags & 1) != 0);
+      },
+      -1);
+}
+char* dapple_ai_job_json(int32_t job) { return dupString(aimask::jobJson(job)); }
+void dapple_ai_job_cancel(int32_t job) { aimask::cancelJob(job); }
+
+char* dapple_session_ai_tap_json(DappleSession* s, float u, float v, int32_t op) {
+  return guarded(
+      [&]() -> char* {
+        if (!s) {
+          setError("null session");
+          return nullptr;
+        }
+        aimask::Control ctl;
+        const aimask::TapResult r = aimask::tap(aiSource(s), u, v, op, ctl);
+        char b[96];
+        std::string j = std::string("{\"ok\":") + (r.ok ? "true" : "false") + ",\"message\":\"" + jsonEsc(r.message) + "\",\"id\":\"" + jsonEsc(r.id) + "\",\"w\":" +
+                        std::to_string(r.w) + ",\"h\":" + std::to_string(r.h) + ",\"taps\":[";
+        for (std::size_t i = 0; i < r.taps.size(); ++i) {
+          std::snprintf(b, sizeof b, "%s[%.4f,%.4f,%d]", i ? "," : "", r.taps[i].x, r.taps[i].y, r.taps[i].add ? 1 : 0);
+          j += b;
+        }
+        std::snprintf(b, sizeof b, "],\"ms\":%.1f,\"prepare_ms\":%.1f}", r.ms, r.prepareMs);
+        return dupString(j + b);
+      },
+      nullptr);
+}
+
+int32_t dapple_ai_plane_preview(const char* id, int32_t long_edge, DappleImage* out) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!id || !out) {
+          setError("null argument");
+          return DAPPLE_ERROR;
+        }
+        *out = DappleImage{0, 0, nullptr};
+        const std::shared_ptr<const local::Raster> r = local::rasterGet(id);
+        if (!r) {
+          setError("plane preview: id not in the raster store");
+          return DAPPLE_ERROR;
+        }
+        const int L = long_edge > 0 ? long_edge : 128, m = std::max(r->w, r->h);
+        const int w = std::max(1, int(std::lround(double(r->w) * L / m))), h = std::max(1, int(std::lround(double(r->h) * L / m)));
+        const aimask::Plane p = aimask::resizePlane(r->px.data(), r->w, r->h, w, h);
+        auto* px = static_cast<std::uint8_t*>(std::malloc(std::size_t(w) * h * 4));
+        if (!px) {
+          setError("out of memory");
+          return DAPPLE_ERROR;
+        }
+        for (std::size_t i = 0; i < std::size_t(w) * h; ++i) px[4 * i] = px[4 * i + 1] = px[4 * i + 2] = p.px[i], px[4 * i + 3] = 255;
+        out->width = w, out->height = h, out->rgba = px;
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+char* dapple_session_ai_missing_json(DappleSession* s, const char* params_json) {
+  return guarded(
+      [&]() -> char* {
+        if (!s) {
+          setError("null session");
+          return nullptr;
+        }
+        EditParams params;
+        if (!parseParams(params_json, params)) return nullptr;
+        const std::string photo = aimask::photoIdOf(s->source.linear.data.data(), s->source.linear.width, s->source.linear.height);
+        std::string j = "{\"missing\":[";
+        bool first = true;
+        for (const std::string& id : missingRasterIds(params)) {
+          const aimask::ParsedId p = aimask::parseId(id);
+          j += std::string(first ? "" : ",") + "{\"id\":\"" + jsonEsc(id) + "\",\"ai\":" + (p.ok ? "true" : "false") + ",\"photo\":" + (p.ok && p.photo == photo ? "true" : "false") + "}";
+          first = false;
+        }
+        return dupString(j + "]}");
+      },
+      nullptr);
+}
+
+int32_t dapple_session_ai_ensure(DappleSession* s, const char* params_json, int32_t flags) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!s) {
+          setError("null session");
+          return -1;
+        }
+        EditParams params;
+        if (!parseParams(params_json, params)) return -1;
+        const std::vector<std::string> missing = missingRasterIds(params);
+        if (missing.empty()) return 0;
+        if (!(flags & 1)) {
+          aimask::Control ctl;
+          ctl.yield = false;
+          std::string why;
+          const auto still = aimask::ensure(aiSource(s), missing, ctl, &why);
+          if (!still.empty()) setError(why);
+          return int32_t(still.size());
+        }
+        int tasks = 0;
+        std::vector<std::string> taps;
+        for (const std::string& id : missing) {
+          const aimask::ParsedId p = aimask::parseId(id);
+          if (!p.ok) continue;
+          if (p.group == "person") tasks |= aimask::kTaskPerson;
+          else if (p.group == "faces") tasks |= aimask::kTaskFaces;
+          else if (p.group == "depth") tasks |= aimask::kTaskDepth;
+          else if (p.group == "sky") tasks |= aimask::kTaskSky;
+          else taps.push_back(id);
+        }
+        if (!taps.empty()) {  // tap planes: the disk cache is read, else the taps are replayed (encoder + decoder, a second or two)
+          aimask::Control ctl;
+          ctl.yield = false;
+          std::string why;
+          aimask::ensure(aiSource(s), taps, ctl, &why);
+        }
+        return tasks ? aimask::startJob(aiSource(s), tasks, aimask::kMaxFaces, false) : 0;
+      },
+      -1);
+}
+void dapple_ai_release(int32_t all) {
+  if (all) aimask::releaseAll();
+  else aimask::releaseIdle();
 }
 
 void dapple_free_image(DappleImage* image) {
@@ -924,6 +1389,40 @@ static double msSince(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// Streaming export (section 42): the FULL open of a mosaic RAW whose whole-frame export would not fit the device (xstream::openLazy) keeps the cached
+// mosaic and the metadata only; with long_edge > 0 the reduction is built band by band (bit-identical to resizeToLongEdge of the full decode) and
+// the session is an ordinary one. Null = open it the usual way (the mosaic and the anchor are cached: no second unpack).
+static DappleSession* openLazySession(const fs::path& p, const DecodeOptions& opts, int32_t longEdge) {
+  const auto t0 = std::chrono::steady_clock::now();
+  std::string why;
+  auto z = openFullLazy(p, opts, &why);
+  if (!z) return nullptr;
+  std::string policy;
+  if (!xstream::openLazy(z->width, z->height, &policy)) return nullptr;
+  auto session = std::make_unique<DappleSession>();
+  session->source = z->meta;
+  session->cameraOwned = dapple::effectiveCamera(cameras(), session->source.meta);
+  session->camera = &session->cameraOwned;
+  if (longEdge > 0 && std::max(z->width, z->height) > longEdge) {
+    xstream::BandSource bs(z->mosaic);
+    xstream::Wants w;
+    w.longEdges = {int(longEdge)};
+    xstream::Analyses a;
+    std::string err;
+    if (!xstream::analyse(bs, z->meta, w, a, {}, &err) || !a.at(longEdge)) return nullptr;
+    session->source.linear = std::move(a.at(longEdge)->linear);
+    stageLog("session_open %s quality=full streamed to long edge %d: %dx%d in %.0f ms (%s; %d pass, %s demosaic)", pathToUtf8(p.filename()).c_str(), int(longEdge),
+             session->source.linear.width, session->source.linear.height, msSince(t0), policy.c_str(), a.passes, bs.gpu() ? "GPU" : "CPU");
+    return session.release();
+  }
+  const int W = z->width, H = z->height;
+  session->lazy = std::make_unique<LazyFull>(std::move(*z));
+  session->lazyOpen = true;
+  stageLog("session_open %s quality=full lazy %dx%d (mosaic kept, %s) in %.0f ms (footprint %.0f MB, available %.0f MB)", pathToUtf8(p.filename()).c_str(), W, H,
+           policy.c_str(), msSince(t0), double(mem::footprint()) / 1048576.0, double(mem::available()) / 1048576.0);
+  return session.release();
+}
+
 DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t long_edge) {
 #if defined(__APPLE__)
   sys::OpenQos openQos;
@@ -946,6 +1445,9 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         if (opts.quality == DecodeQuality::Full || long_edge > 2048) dapple::demosaic::installGpuBackend();
 #endif
         const auto t0 = std::chrono::steady_clock::now();
+        // streaming export (section 42): a FULL open of a large mosaic RAW keeps the mosaic, not the float picture
+        if (opts.quality == DecodeQuality::Full && std::strcmp(decoder->name(), "libraw") == 0 && xstream::envMode() != xstream::Mode::Off)
+          if (DappleSession* lazy = openLazySession(p, opts, long_edge)) return lazy;
         auto src = decoder->decode(p, opts);
         if (!src) {
           setError(src.error().message);
@@ -955,8 +1457,9 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         session->source = std::move(*src);
         const double decodeMs = msSince(t0);
         if (long_edge > 0) session->source.linear = resizeToLongEdge(session->source.linear, long_edge);
-        stageLog("session_open %s quality=%s decoded %dx%d in %.0f ms, long_edge %d total %.0f ms", pathToUtf8(p.filename()).c_str(),
-                 opts.quality == DecodeQuality::Full ? "full" : "preview", session->source.linear.width, session->source.linear.height, decodeMs, long_edge, msSince(t0));
+        stageLog("session_open %s quality=%s decoded %dx%d in %.0f ms, long_edge %d total %.0f ms (footprint %.0f MB, available %.0f MB)", pathToUtf8(p.filename()).c_str(),
+                 opts.quality == DecodeQuality::Full ? "full" : "preview", session->source.linear.width, session->source.linear.height, decodeMs, long_edge, msSince(t0),
+                 double(mem::footprint()) / 1048576.0, double(mem::available()) / 1048576.0);
         session->cameraOwned = dapple::effectiveCamera(cameras(), session->source.meta);
         session->camera = &session->cameraOwned;
         return session.release();
@@ -1012,6 +1515,7 @@ char* dapple_session_info_json(DappleSession* session) {
 }
 
 char* dapple_session_auto_json(DappleSession* session, float strength) {
+  ensureSource(session);
   return guarded(
       [&]() -> char* {
         if (!session) {
@@ -1098,6 +1602,7 @@ static thread_local double tlSwatchMatchMs = 0;  // film match time of the swatc
 // noise reduction, so a background swatch never changes what the editor's next frame does.
 static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lutPath, const DappleFrameRequest& rq,
                  DappleImage* out, char** analysisOut, const EditParams* paramsIn = nullptr) {
+  if (!ensureSource(s)) return false;
   std::lock_guard<std::mutex> lock(s->mtx);
   EditParams params;
   if (paramsIn)
@@ -1290,6 +1795,7 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
 char* dapple_session_analyze_json(DappleSession* session) { return dapple_session_analyze_params_json(session, nullptr); }
 
 char* dapple_session_analyze_params_json(DappleSession* session, const char* params_json) {
+  ensureSource(session);
   return guarded(
       [&]() -> char* {
         if (!session) {
@@ -1625,6 +2131,7 @@ char* dapple_looks_json(void) { return dupString(looksJson()); }
 char* dapple_params_schema_json(void) { return dupString(paramsSchemaJson()); }
 
 char* dapple_session_film_pad_json(DappleSession* session, const char* params_json) {
+  ensureSource(session);
   return guarded(
       [&]() -> char* {
         if (!session) {
@@ -1672,6 +2179,7 @@ char* dapple_session_film_pad_json(DappleSession* session, const char* params_js
 
 int32_t dapple_session_render_look_previews(DappleSession* session, const char* params_json, int32_t out_long_edge,
                                             DappleImage* out) {
+  ensureSource(session);
   return guarded(
       [&]() -> int32_t {
         if (!out) {
@@ -1703,6 +2211,7 @@ int32_t dapple_session_render_look_previews(DappleSession* session, const char* 
 
 int32_t dapple_session_render_tone_previews(DappleSession* session, const char* params_json, int32_t out_long_edge,
                                             float strength, DappleImage* out) {
+  ensureSource(session);
   return guarded(
       [&]() -> int32_t {
         if (!out) {
@@ -1741,6 +2250,7 @@ int32_t dapple_session_render_tone_previews(DappleSession* session, const char* 
 // touch-hint burst runs, and it holds the session lock only for one frame at a time.
 int32_t dapple_session_base_previews(DappleSession* session, const char* params_json, const char* const* base_ids, int32_t n, int32_t long_edge,
                                      DappleImage* out) {
+  ensureSource(session);
   return guarded(
       [&]() -> int32_t {
         if (!out || n <= 0 || n > 256) {
@@ -1867,6 +2377,11 @@ bool applyExportMeta(DappleSession* s, const char* optionsJson, const Image8& im
 
 int32_t exportJpegImpl(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge, int32_t jpeg_quality,
                        const char* out_path, const char* export_json);
+// Streaming export of a lazy session (section 42), defined with the Ultra HDR helpers: 1 = written, 0 = this edit cannot stream, -1 = failed.
+int streamExportJpeg(DappleSession* s, const EditParams& ep, const char* lutPath, int32_t outLongEdge, int32_t quality, const char* outPath,
+                     const char* exportJson, bool hdr, float headroom, DappleHdrInfo* info);
+// An edit that cannot stream on a lazy session: the whole frame if it fits the device, else a clean error (never a kill by the OS).
+bool wholeFrameFits(DappleSession* s, const EditParams& ep);
 }  // namespace
 
 int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_json, const char* lut_path,
@@ -1886,6 +2401,8 @@ int32_t exportJpegImpl(DappleSession* session, const char* params_json, const ch
       [&]() -> int32_t {
         Image8 img;
         const auto t0 = std::chrono::steady_clock::now();
+        mem::Sampler memSmp;  // peak footprint of the export for the stage log (section 42: the whole-frame path, for comparison)
+        const std::size_t memAvail0 = mem::available();
         {
           EditParams ep;
           if (!session) {
@@ -1894,6 +2411,13 @@ int32_t exportJpegImpl(DappleSession* session, const char* params_json, const ch
           }
           if (!parseParams(params_json, ep)) return DAPPLE_ERROR;
           ep.outputSpace = exportSpaceOf(export_json);
+          if (session->lazyOpen.load() && !missingRasterIds(ep).empty() && !ensureSource(session)) return DAPPLE_ERROR;  // re-creating a plane needs the picture
+          if (!ensureLocalRasters(session, ep)) return DAPPLE_ERROR;  // a plane the edit needs must exist: never export a silently empty mask
+          if (session->lazyOpen.load()) {  // streaming export (section 42)
+            const int r = streamExportJpeg(session, ep, lut_path, out_long_edge, jpeg_quality, out_path, export_json, false, 0.f, nullptr);
+            if (r != 0) return r > 0 ? DAPPLE_OK : DAPPLE_ERROR;
+            if (!wholeFrameFits(session, ep)) return DAPPLE_ERROR;
+          }
           if (!renderSessionParams(session, ep, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
         }
         const double renderMs = msSince(t0);
@@ -1901,7 +2425,10 @@ int32_t exportJpegImpl(DappleSession* session, const char* params_json, const ch
         if (jpeg_quality > 0) jo.quality = jpeg_quality > 100 ? 100 : jpeg_quality;
         if (!applyExportMeta(session, export_json, img, jo)) return DAPPLE_ERROR;
         auto r = writeJpeg(img, toPath(out_path), jo);
-        stageLog("export_jpeg %dx%d render %.0f ms, encode+write %.0f ms", img.width, img.height, renderMs, msSince(t0) - renderMs);
+        memSmp.finish();
+        stageLog("export_jpeg %dx%d render %.0f ms, encode+write %.0f ms; peak footprint %.0f MB (+%.0f over the start, available at the start %.0f MB)", img.width,
+                 img.height, renderMs, msSince(t0) - renderMs, double(memSmp.peak()) / 1048576.0,
+                 double(memSmp.peak() - std::min(memSmp.peak(), memSmp.base())) / 1048576.0, double(memAvail0) / 1048576.0);
         if (!r) {
           setError(r.error().message);
           return DAPPLE_ERROR;
@@ -2011,6 +2538,120 @@ bool writeBytesAtomic(const fs::path& path, const std::vector<std::uint8_t>& byt
   }
   return true;
 }
+// ---- streaming export (section 42): the JPEG / Ultra HDR export of a lazy session -------------------------------------------------------------
+bool wholeFrameFits(DappleSession* s, const EditParams& ep) {
+  if (!s->lazy) return true;
+  const std::size_t need = xstream::predictWholePeak(s->lazy->width, s->lazy->height, Renderer(ep, *s->camera, nullptr).filmActive());
+  const std::size_t budget = xstream::budgetBytes();
+  if (xstream::envMode() == xstream::Mode::On || need <= budget) return true;
+  char b[256];
+  std::snprintf(b, sizeof b, "export: this edit needs the whole %dx%d picture in memory (about %.0f MB) and the device has about %.0f MB for it; nothing was written",
+                s->lazy->width, s->lazy->height, double(need) / 1048576.0, double(budget) / 1048576.0);
+  setError(b);
+  stageLog("%s", b);
+  return false;
+}
+
+int streamExportJpeg(DappleSession* s, const EditParams& ep, const char* lutPath, int32_t outLongEdge, int32_t quality, const char* outPath,
+                     const char* exportJson, bool hdr, float headroom, DappleHdrInfo* info) {
+  const auto t0 = std::chrono::steady_clock::now();
+  mem::Sampler smp;
+  struct Mark {
+    explicit Mark(mem::Sampler* m) { mem::current() = m; }
+    ~Mark() { mem::current() = nullptr; }
+  } mark(&smp);
+  const std::size_t avail0 = mem::available();
+  JpegOptions jo;
+  if (quality > 0) jo.quality = quality > 100 ? 100 : quality;
+  std::unique_ptr<JpegStripEncoder> enc;
+  Image8 dims;
+  bool metaOk = true;
+  auto onSize = [&](int w, int h) {
+    dims.width = w, dims.height = h;
+    jo.exifSegment.clear(), jo.iccSegment.clear();
+    metaOk = applyExportMeta(s, exportJson, dims, jo);
+    enc = std::make_unique<JpegStripEncoder>(w, h, jo);
+  };
+  auto sink = [&](int, int n, const std::uint8_t* rgb) { return metaOk && enc && enc->push(rgb, n); };
+  int quarter = 0;
+  std::vector<int> extra;
+  if (hdr) {  // the gain map's renders are at a quarter of the output's long edge: build that reduction in the same pass
+    int fw = 0, fh = 0;
+    Renderer(ep, *s->camera, nullptr).fastSize(xstream::sizeOnly(s->lazy->meta, s->lazy->width, s->lazy->height), RenderRegion{}, fw, fh);
+    if (outLongEdge > 0 && std::max(fw, fh) > outLongEdge) {
+      const double k = double(outLongEdge) / std::max(fw, fh);
+      fw = int(std::lround(fw * k)), fh = int(std::lround(fh * k));
+    }
+    quarter = std::max(1, (std::max(fw, fh) + 3) / 4);
+    extra.push_back(quarter);
+  }
+  const int r = streamRender(s, ep, lutPath, outLongEdge, onSize, sink, extra);
+  if (r <= 0) return r;
+  if (!metaOk) return -1;
+  mem::mark("encode");
+  auto bytes = enc->finish();
+  enc.reset();
+  if (!bytes) {
+    setError(bytes.error().message);
+    return -1;
+  }
+  bool written = false;
+  if (hdr) {
+    mem::mark("gainmap");
+    auto plain = [&](const HdrDecision& d) -> int {
+      auto w = writeJpegBytes(*bytes, toPath(outPath));
+      if (!w) {
+        setError(w.error().message);
+        return -1;
+      }
+      fillHdrInfo(info, d, false, 0.f, 0.f);
+      return 1;
+    };
+    // the output size the quarter is taken from: the size of the streamed picture (as the whole-frame export takes img's)
+    quarter = std::max(1, (std::max(dims.width, dims.height) + 3) / 4);
+    HdrDecision d;
+    if (!hdrDecide(s, ep, lutPath, quarter, headroom, d)) return -1;
+    if (d.reason != 0) {
+      if (plain(d) < 0) return -1;
+    } else {
+      Image8 sdr4;
+      if (!renderSessionParams(s, ep, lutPath, quarter, sdr4)) return -1;
+      if (sdr4.width != d.bright.width || sdr4.height != d.bright.height) {
+        d.reason = 3;
+        if (plain(d) < 0) return -1;
+      } else {
+        const dapple::uhdr::GainMap gm = dapple::uhdr::makeGainMap(sdr4, d.bright, d.H, ep.outputSpace == 1);
+        if (gm.meta.gainMax <= 0.f) {
+          d.reason = 1;
+          if (plain(d) < 0) return -1;
+        } else {
+          auto file = dapple::uhdr::assemble(*bytes, gm);
+          if (!file) {
+            setError(file.error().message);
+            return -1;
+          }
+          if (!writeBytesAtomic(toPath(outPath), *file)) {
+            setError("Cannot write " + std::string(outPath ? outPath : ""));
+            return -1;
+          }
+          fillHdrInfo(info, d, true, gm.meta.gainMax, gm.meta.capacityMax);
+          written = true;
+        }
+      }
+    }
+  } else {
+    auto w = writeJpegBytes(*bytes, toPath(outPath));
+    if (!w) {
+      setError(w.error().message);
+      return -1;
+    }
+  }
+  smp.finish();
+  stageLog("export_stream %s %dx%d%s in %.0f ms: peak footprint %.0f MB (+%.0f over the start, available at the start %.0f MB): %s", outPath ? pathToUtf8(toPath(outPath).filename()).c_str() : "",
+           dims.width, dims.height, hdr ? (written ? " Ultra HDR" : " (plain)") : "", msSince(t0), double(smp.peak()) / 1048576.0, double(smp.peak() - std::min(smp.peak(), smp.base())) / 1048576.0,
+           double(avail0) / 1048576.0, smp.summary().c_str());
+  return 1;
+}
 }  // namespace
 
 int32_t dapple_session_hdr_headroom(DappleSession* session, const char* params_json, const char* lut_path, DappleHdrInfo* info) {
@@ -2089,6 +2730,13 @@ int32_t exportJpegHdrImpl(DappleSession* session, const char* params_json, const
         EditParams params;
         if (!parseParams(params_json, params)) return DAPPLE_ERROR;
         params.outputSpace = exportSpaceOf(export_json);
+        if (session->lazyOpen.load() && !missingRasterIds(params).empty() && !ensureSource(session)) return DAPPLE_ERROR;
+        if (!ensureLocalRasters(session, params)) return DAPPLE_ERROR;
+        if (session->lazyOpen.load()) {  // streaming export (section 42)
+          const int r = streamExportJpeg(session, params, lut_path, out_long_edge, jpeg_quality, out_path, export_json, true, headroom_stops, info);
+          if (r != 0) return r > 0 ? DAPPLE_OK : DAPPLE_ERROR;
+          if (!wholeFrameFits(session, params)) return DAPPLE_ERROR;
+        }
         Image8 img;
         if (!renderSessionParams(session, params, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
         JpegOptions jo;
@@ -2215,6 +2863,7 @@ DappleSession* dapple_session_open_merged(const char* const* paths, int32_t coun
 }
 
 int32_t dapple_session_save_linear(DappleSession* session, const char* out_path, const char* format) {
+  ensureSource(session);
   return guarded(
       [&]() -> int32_t {
         if (!session) {
@@ -2385,9 +3034,28 @@ char* dapple_motion_photo_validate_json(const char* path) {
 
 }  // extern "C"
 
+// ---- streaming export (section 42): progress of an export, memory probe -----------------------------------------------------------------
+int32_t dapple_session_set_export_progress(DappleSession* session, DappleProgressFn fn, void* user) {
+  if (!session) return DAPPLE_ERROR;
+  session->exportProgress = fn;
+  session->exportProgressUser = user;
+  return DAPPLE_OK;
+}
+
+char* dapple_memory_json(void) {
+  char b[192];
+  std::snprintf(b, sizeof b, "{\"footprint\":%llu,\"resident\":%llu,\"available\":%llu,\"exportBudget\":%llu,\"stream\":\"%s\"}",
+                (unsigned long long)mem::footprint(), (unsigned long long)mem::resident(), (unsigned long long)mem::available(),
+                (unsigned long long)xstream::budgetBytes(),
+                xstream::envMode() == xstream::Mode::On ? "on" : xstream::envMode() == xstream::Mode::Off ? "off" : "auto");
+  return dupString(b);
+}
+
+int32_t dapple_session_is_streaming(DappleSession* session) { return session && session->lazyOpen.load() ? 1 : 0; }
+
 // Not part of the C API (not in dapple_c.h): the test suite reads the bright-rendition shift of a modern rendering (EV, see modernWhiteEv).
 extern "C" float dapple_internal_modern_white_ev(DappleSession* session, const char* params_json) {
   EditParams params;
-  if (!session || !parseParams(params_json, params)) return 0.f;
+  if (!session || !parseParams(params_json, params) || !ensureSource(session)) return 0.f;
   return modernWhiteEv(session, params);
 }

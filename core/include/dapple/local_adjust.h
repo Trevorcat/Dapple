@@ -46,6 +46,10 @@ struct MaskComponent {
   // raster: plane id (dapple_mask_raster_set) and edge-aware refinement 0..100 (0 = bilinear upsampling only)
   std::string ref;
   float refine = 50.f;
+  // raster with range (depth, AI planes): the plane's value 0..100 is first ranged like a luminance (lo..hi with a soft edge), then refined. The
+  // default 0..100 is the identity (and is not written to JSON).
+  float rangeLo = 0.f, rangeHi = 100.f, rangeFeather = 10.f;
+  bool hasRange() const { return rangeLo > 0.f || rangeHi < 100.f; }
   // Unknown: the component's JSON as read (written back verbatim, evaluates to nothing)
   std::string raw;
 };

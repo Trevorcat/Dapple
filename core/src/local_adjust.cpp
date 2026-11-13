@@ -126,6 +126,7 @@ bool readComponent(const JValue& c, MaskComponent& m) {
     case MaskKind::Raster:
       rds(c, "ref", m.ref);
       rd(c, "refine", m.refine);
+      rd(c, "lo", m.rangeLo), rd(c, "hi", m.rangeHi), rd(c, "feather", m.rangeFeather);
       break;
     default: break;
   }
@@ -197,6 +198,7 @@ void writeComponent(std::string& o, const MaskComponent& m) {
     case MaskKind::Raster:
       o += ",\"ref\":" + esc(m.ref);
       f("refine", m.refine);
+      if (m.hasRange()) f("lo", m.rangeLo), f("hi", m.rangeHi), f("feather", m.rangeFeather);
       break;
     default: break;
   }
@@ -287,6 +289,9 @@ void clampLocal(std::vector<LocalAdjustment>& list) {
       m.hueFeather = fixf(m.hueFeather, 0.f, 90.f, 20.f);
       m.satMin = fixf(m.satMin, 0.f, 100.f, 10.f);
       m.refine = fixf(m.refine, 0.f, 100.f, 50.f);
+      m.rangeLo = fixf(m.rangeLo, 0.f, 100.f, 0.f), m.rangeHi = fixf(m.rangeHi, 0.f, 100.f, 100.f);
+      if (m.rangeHi < m.rangeLo) std::swap(m.rangeLo, m.rangeHi);
+      m.rangeFeather = fixf(m.rangeFeather, 0.f, 50.f, 10.f);
       if (m.ref.size() > 128) m.ref.resize(128);
       for (BrushStroke& s : m.strokes) {
         s.size = fixf(s.size, 0.0005f, 0.5f, 0.05f);
@@ -406,6 +411,7 @@ std::uint64_t localHash(const std::vector<LocalAdjustment>& list) {
           s(m.ref);
           f(m.refine);
           mix(local::rasterContentHash(m.ref));
+          if (m.hasRange()) f(m.rangeLo), f(m.rangeHi), f(m.rangeFeather);  // identity range: the hash of older edits is unchanged
           break;
         default: break;
       }

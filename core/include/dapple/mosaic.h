@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -73,5 +74,24 @@ Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, i
 void clearMosaicCache();
 // Entries the cache served without decoding / decoded (tests).
 void mosaicCacheCounters(unsigned long long* hits, unsigned long long* misses);
+
+// ---- streaming export (docs/engine/pipeline-architecture.md section 42) -------------------------------------------------------------------------
+// The shadow-chroma floor of the full decode (applied after the demosaic), split into its picture-wide decision and its per-pixel step so that a picture
+// produced band by band gets exactly what the whole decode does: the decision samples the luma below on every 4th row and column of the oriented,
+// cropped picture (before the floor), shadowChromaWanted() takes those samples (reordered in place) and returns whether the floor applies.
+inline float shadowChromaLuma(const float* p) { return 0.2880f * p[0] + 0.7119f * p[1] + 0.0001f * p[2]; }
+bool shadowChromaWanted(std::vector<float>& lumaSamples);
+void shadowChromaFloor(ImageF& img);
+
+// A FULL open that does not demosaic: the cached mosaic, the metadata of the full decode (exposure anchor included) and the size of the oriented,
+// cropped picture. Refuses (reason) what the band path cannot read in windows: no mosaic path, OpcodeList3 warps. materializeFull() is then the very
+// SourceImage decodeFullFromMosaic() returns (same demosaic node choice, same corrections string, same shadow floor).
+struct LazyFull {
+  std::shared_ptr<const MosaicImage> mosaic;
+  SourceImage meta;  // linear empty; meta, sceneReferred as the full decode
+  int width = 0, height = 0;
+};
+Result<LazyFull> openFullLazy(const std::filesystem::path& path, const DecodeOptions& options, std::string* reason = nullptr);
+SourceImage materializeFull(const LazyFull& lazy);
 
 }  // namespace dapple

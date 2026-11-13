@@ -196,6 +196,7 @@ class ThreadPool {
   // Total threads (caller included) a job may use; 0 / out of range = all.
   void setLimit(int n) { limit_.store(n <= 0 ? threads_ + 1 : std::min(n, threads_ + 1)); }
   int size() const { return threads_ + 1; }
+  int limit() const { return limit_.load(std::memory_order_relaxed); }  // threads (caller included) a job may use now
   std::vector<int> workerTids() {
     std::lock_guard<std::mutex> lock(mtx_);
     return tids_;
