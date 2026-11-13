@@ -25,6 +25,11 @@
 #include <unistd.h>
 #define DAPPLE_SYSPERF_LINUX 1
 #endif
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#include <sys/sysctl.h>
+#endif
 
 namespace dapple::sys {
 
@@ -85,7 +90,24 @@ inline const Topology& topology() {
 // would hold the last chunk of every pass. With fewer big cores (Helio G85 2+6, 2+6 Unisoc...) every cpu takes
 // part: the chunks are claimed dynamically, so the slower cores just take fewer of them, and 6 little cores add
 // more throughput than they cost in tail latency.
+#if defined(__APPLE__)
+// Performance cores of this device (A11 / A12: 2, M1: 4); the burst never uses the efficiency cores (hw.perflevel0 exists on macOS 12+ / iOS 15+, older: 2 for
+// six-core phones, half of the cores otherwise).
+inline int applePerfCores() {
+  static const int n = [] {
+    int v = 0;
+    std::size_t sz = sizeof v;
+    if (::sysctlbyname("hw.perflevel0.logicalcpu", &v, &sz, nullptr, 0) == 0 && v > 0) return v;
+    const int total = int(std::max(1u, std::thread::hardware_concurrency()));
+    return total <= 6 ? std::min(total, 2) : std::max(2, total / 2);
+  }();
+  return n;
+}
+#endif
 inline std::vector<int> poolCpus(const Topology& t) {
+#if defined(__APPLE__)
+  return std::vector<int>(std::size_t(std::min(applePerfCores(), std::max(1, t.total))), 0);  // only the count matters (no affinity API on Darwin)
+#endif
   if (t.hetero() && t.perf.size() >= 4) return t.perf;
   std::vector<int> all;
   for (int i = 0; i < t.total; ++i) all.push_back(i);
@@ -106,6 +128,9 @@ inline void cpuRelax() {
 // preempted low-priority worker holding the last chunk stalls the whole pass. Kept as a single switch point.
 inline constexpr int kInteractiveNice = 0;
 inline void setInteractivePriority() {
+#if defined(__APPLE__)
+  ::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
 #ifdef DAPPLE_SYSPERF_LINUX
   if (kInteractiveNice != 0) ::setpriority(PRIO_PROCESS, gettid_(), kInteractiveNice);
 #endif
@@ -132,6 +157,9 @@ inline void setBackground(bool on) {
   const int was = g_class;
   (void)was;
   g_class = on ? 2 : 0;
+#if defined(__APPLE__)
+  ::pthread_set_qos_class_self_np(on ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED, 0);
+#endif
 #ifdef DAPPLE_SYSPERF_LINUX
   const Topology& t = topology();
   if (on && was != 2) {
@@ -234,5 +262,26 @@ inline Adpf& adpf() {
   static Adpf* a = new Adpf;
   return *a;
 }
+
+#if defined(__APPLE__)
+// Starts LibRaw's OpenMP team once (omp_apple.cpp: team size = performance cores, workers created at user-initiated QoS: a pthread inherits the QoS of the thread
+// that creates it, so a team first spawned from a utility prefetch would stay at utility). No-op without libomp.
+void appleOmpInit();
+// The open the user is waiting for runs at user-initiated QoS even when the calling (Dart worker) thread is at the default one; prefetch threads that called
+// setBackground(true) keep utility.
+struct OpenQos {
+  qos_class_t old_ = QOS_CLASS_UNSPECIFIED;
+  int rel_ = 0;
+  bool raised_ = false;
+  OpenQos() {
+    if (g_class == 2) return;
+    ::pthread_get_qos_class_np(::pthread_self(), &old_, &rel_);
+    if (old_ != QOS_CLASS_USER_INTERACTIVE && old_ != QOS_CLASS_USER_INITIATED && ::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) == 0) raised_ = true;
+  }
+  ~OpenQos() {
+    if (raised_) ::pthread_set_qos_class_self_np(old_ == QOS_CLASS_UNSPECIFIED ? QOS_CLASS_DEFAULT : old_, rel_);
+  }
+};
+#endif
 
 }  // namespace dapple::sys

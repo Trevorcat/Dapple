@@ -708,6 +708,9 @@ static double msSince(std::chrono::steady_clock::time_point t0) {
 }
 
 DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t long_edge) {
+#if defined(__APPLE__)
+  sys::OpenQos openQos;
+#endif
   return guarded(
       [&]() -> DappleSession* {
         const fs::path p = toPath(path);
@@ -746,6 +749,9 @@ static std::atomic<std::uint64_t> g_regionGen{0};  // latest wins: a new region 
 void dapple_region_cancel(void) { g_regionGen.fetch_add(1); }
 
 DappleSession* dapple_session_open_region(const char* path, int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+#if defined(__APPLE__)
+  sys::OpenQos openQos;
+#endif
   const std::uint64_t ticket = g_regionGen.fetch_add(1) + 1;
   return guarded(
       [&]() -> DappleSession* {

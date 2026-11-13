@@ -70,6 +70,12 @@ target_include_directories(dapple_core
           ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dapple_core PRIVATE dapple_libraw dapple_stb)
+if(APPLE)
+  target_sources(dapple_core PRIVATE src/omp_apple.cpp)
+  if(DAPPLE_LIBRAW_OPENMP AND DAPPLE_LIBOMP_DIR)
+    set_source_files_properties(src/omp_apple.cpp PROPERTIES COMPILE_OPTIONS "-Xclang;-fopenmp;-I${DAPPLE_LIBOMP_DIR}/include" COMPILE_DEFINITIONS DAPPLE_LIBOMP=1)
+  endif()
+endif()
 if(TARGET dapple_jxl)
   target_link_libraries(dapple_core PRIVATE dapple_jxl)
   target_compile_definitions(dapple_core PRIVATE DAPPLE_HAVE_JXL=1)

@@ -17,5 +17,7 @@ case "$TARGET" in
                      -DDAPPLE_BUILD_TESTS=OFF -DDAPPLE_BUILD_CLI=OFF);;
   *) echo "unknown target $TARGET"; exit 2;;
 esac
+OMP="$HOME/dapple/tools/libomp/$TARGET"
+[ -f "$OMP/lib/libomp.a" ] && ARGS+=(-DDAPPLE_LIBOMP_DIR="$OMP")  # LibRaw OpenMP (build-libomp.sh); absent: single-threaded LibRaw
 cmake -S "$SRC" -B "$B" "${ARGS[@]}"
 cmake --build "$B" -j8

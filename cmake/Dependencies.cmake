@@ -38,6 +38,7 @@ endif()
 # threaded (the engine runs its own work in parallel elsewhere). Android links the NDK's libomp statically, Windows needs libomp.dll next to
 # the executables (copied after the build).
 option(DAPPLE_LIBRAW_OPENMP "Build LibRaw with OpenMP (parallel X-Trans / Bayer demosaic)" ON)
+set(DAPPLE_LIBOMP_DIR "" CACHE PATH "Apple only: directory with include/omp.h and lib/libomp.a (scripts/ios/build-libomp.sh)")
 if(DAPPLE_LIBRAW_OPENMP AND NOT APPLE AND NOT MSVC)
   include(CheckCXXCompilerFlag)
   set(CMAKE_REQUIRED_LINK_OPTIONS "-fopenmp")
@@ -68,6 +69,13 @@ if(DAPPLE_LIBRAW_OPENMP AND NOT APPLE AND NOT MSVC)
     endif()
     message(STATUS "LibRaw: OpenMP on")
   endif()
+elseif(DAPPLE_LIBRAW_OPENMP AND APPLE AND DAPPLE_LIBOMP_DIR)
+  # Apple: the toolchains ship no OpenMP; scripts/ios/build-libomp.sh builds LLVM's libomp.a (static, Apache-2.0 with LLVM exception, docs/legal/libomp.md)
+  # per target into DAPPLE_LIBOMP_DIR (include/omp.h, lib/libomp.a). Only LibRaw uses OpenMP (Fuji strips, X-Trans / Bayer demosaic, Nikon HE, CRX).
+  target_compile_options(dapple_libraw PRIVATE -Xclang -fopenmp "-I${DAPPLE_LIBOMP_DIR}/include")
+  target_compile_definitions(dapple_libraw PRIVATE LIBRAW_USE_OPENMP LIBRAW_FORCE_OPENMP)
+  target_link_libraries(dapple_libraw PUBLIC "${DAPPLE_LIBOMP_DIR}/lib/libomp.a")
+  message(STATUS "LibRaw: OpenMP on (static libomp from ${DAPPLE_LIBOMP_DIR})")
 endif()
 
 # ---------------------------------------------------------------------------

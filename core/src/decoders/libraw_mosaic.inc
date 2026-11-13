@@ -109,6 +109,9 @@ Result<MosaicImage> decodeRawMosaic(const std::filesystem::path& path, const Dec
   if (!xtrans && !bayer) return none("unsupported filter layout");
   const bool timing = std::getenv("DAPPLE_DECODE_TIMING") != nullptr;
   const auto t0 = std::chrono::steady_clock::now();
+#if defined(__APPLE__)
+  dapple::sys::appleOmpInit();
+#endif
   if (int rc = raw->unpack(); rc != LIBRAW_SUCCESS) return fail("LibRaw unpack failed: " + std::string(libraw_strerror(rc)));
   const auto t1 = std::chrono::steady_clock::now();
   if (!raw->imgdata.rawdata.raw_image) return none("the format delivers 3 / 4-channel data, not a 16-bit mosaic");

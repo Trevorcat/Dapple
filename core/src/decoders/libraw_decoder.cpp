@@ -3,6 +3,8 @@
 
 #include <libraw/libraw.h>
 
+#include "../sysperf.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -722,6 +724,9 @@ class LibRawDecoder final : public ImageDecoder {
     timer.mark("open (file read of headers, identify)");
     std::future<Result<Image8>> embeddedPreview;  // for the exposure anchor: the full-size JPEG decode (0.25 - 0.8 s) overlaps the demosaic
     if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embeddedPreview = std::async(std::launch::async, [&path] { return extractEmbeddedPreviewForAnchor(path); });
+#if defined(__APPLE__)
+    dapple::sys::appleOmpInit();
+#endif
     if (int rc = raw->unpack(); rc != LIBRAW_SUCCESS)
       return fail("LibRaw unpack failed: " + std::string(libraw_strerror(rc)));
     timer.mark("unpack (file read + decompression)");
