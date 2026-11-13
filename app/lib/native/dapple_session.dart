@@ -522,6 +522,76 @@ class DappleSession {
   static Future<String?> filmSwatchesJsonIsolate() => Isolate.run(filmSwatchesJson);
 
   /// The licence line the About screen must show ("" without a pack).
+  /// True when the engine can render the base swatches in one call ([baseSwatches]).
+  static bool get hasBaseSwatches => DappleBindings.instanceOrNull?.sessionBasePreviews != null;
+
+  int _swatchCalls = 0;
+  bool _closing = false; // close() is waiting for the swatch batch in flight: no new one starts
+  Completer<void>? _swatchIdle;
+
+  /// One small picture per base id ([ids]: a film stock, a modern rendering, or null / '' = the standard rendering) of this photo with [params] (its own
+  /// correction; any `film` key is replaced by the id): `dapple_session_base_previews`. Interactive tier, coarse film tables, background thread priority,
+  /// waits while a finger is down in the editor, and stops at the next frame after [cancelBaseSwatches] or a newer call: the pictures not rendered come
+  /// back as null. Throws when the engine predates the call. Not serialised with the session's other calls: the engine takes its own lock one frame at a time.
+  Future<List<RenderedImage?>> baseSwatches(Map<String, dynamic> params, List<String?> ids, {int longEdge = 96}) async {
+    if (_closed || _closing) return List<RenderedImage?>.filled(ids.length, null);
+    final pj = jsonEncode(params);
+    final a = _address;
+    _swatchCalls++;
+    _swatchIdle ??= Completer<void>();
+    try {
+      return await Isolate.run(() => _baseSwatchesNative(a, pj, ids, longEdge));
+    } finally {
+      if (--_swatchCalls == 0) {
+        _swatchIdle?.complete();
+        _swatchIdle = null;
+      }
+    }
+  }
+
+  /// Stops the batch in flight at the next frame (`dapple_session_base_previews_cancel`). Lock-free; a no-op when none runs or the engine lacks it.
+  void cancelBaseSwatches() {
+    final f = DappleBindings.instanceOrNull?.sessionBasePreviewsCancel;
+    if (f == null || _closed) return;
+    f(ffi.Pointer.fromAddress(_address));
+  }
+
+  static List<RenderedImage?> _baseSwatchesNative(int addr, String pj, List<String?> ids, int longEdge) {
+    final b = _b();
+    final f = b.sessionBasePreviews;
+    if (f == null) throw DappleException('原生库缺少 dapple_session_base_previews');
+    final n = ids.length;
+    final pp = pj.toNativeUtf8();
+    final idp = calloc<ffi.Pointer<Utf8>>(n);
+    final out = calloc<DappleImageStruct>(n);
+    for (var i = 0; i < n; i++) {
+      idp[i] = (ids[i] ?? '').toNativeUtf8();
+    }
+    try {
+      final rc = f(ffi.Pointer.fromAddress(addr), pp, idp, n, longEdge, out);
+      if (rc != dappleOk) throw DappleException(_lastError(b));
+      final res = <RenderedImage?>[];
+      for (var i = 0; i < n; i++) {
+        final img = out + i;
+        if (img.ref.rgba == ffi.nullptr) {
+          res.add(null);
+          continue;
+        }
+        final w = img.ref.width, h = img.ref.height;
+        res.add(RenderedImage(w, h, Uint8List.fromList(img.ref.rgba.asTypedList(w * h * 4))));
+        b.freeImage(img);
+      }
+      return res;
+    } finally {
+      for (var i = 0; i < n; i++) {
+        malloc.free(idp[i]);
+      }
+      malloc.free(pp);
+      calloc.free(idp);
+      calloc.free(out);
+    }
+  }
+
   static String filmAttribution() {
     final f = DappleBindings.instanceOrNull?.filmAttribution;
     return f == null ? '' : (_takeString(_b(), f()) ?? '');
@@ -657,6 +727,12 @@ class DappleSession {
 
   Future<void> close() => _serial(() async {
         if (_closed) return;
+        final busy = _swatchIdle?.future; // a swatch batch in flight uses the native session: stop it and let it end first
+        _closing = true;
+        if (busy != null) {
+          DappleBindings.instanceOrNull?.sessionBasePreviewsCancel?.call(ffi.Pointer.fromAddress(_address));
+          await busy;
+        }
         _closed = true;
         _shutdownWorker();
         await _closeIso(_address);
@@ -776,6 +852,32 @@ class DappleSession {
         malloc.free(pp);
         malloc.free(lp);
         malloc.free(info);
+        b.sessionClose(s);
+      }
+    });
+  }
+
+  /// Share (0..1) of the picture, after the edit, whose colour lies outside sRGB (`dapple_session_wide_gamut_fraction`): the publish page offers the
+  /// "广色域 P3" export only when this is not negligible. 0 for a library without the call. Preview-quality session, one-shot.
+  static Future<double> wideGamutFraction(String srcPath, Map<String, dynamic> params) {
+    final pj = jsonEncode(params);
+    return Isolate.run(() {
+      final b = _b();
+      final f = b.sessionWideGamutFraction;
+      if (f == null) return 0.0;
+      final cp = srcPath.toNativeUtf8();
+      final s = b.sessionOpen(cp, dappleQualityPreview, 1600);
+      malloc.free(cp);
+      if (s == ffi.nullptr) return 0.0;
+      final pp = pj.toNativeUtf8();
+      final lp = ''.toNativeUtf8();
+      final out = malloc<ffi.Float>();
+      try {
+        return f(s, pp, lp, out) == dappleOk ? out.value : 0.0;
+      } finally {
+        malloc.free(pp);
+        malloc.free(lp);
+        malloc.free(out);
         b.sessionClose(s);
       }
     });

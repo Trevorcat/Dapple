@@ -558,7 +558,7 @@ static void testSession() {
   CHECK(exifOf(sess, eo) && ascii(eo.i0[0x0110]).find("EOS") != std::string::npos && !eo.haveGpsPtr);
   // colour spaces this build cannot render
   const fs::path bad = dir / "bad.jpg";
-  CHECK(dapple_session_export_jpeg_ex(s, "{}", "", 1200, 92, bad.string().c_str(), "{\"colorSpace\":\"p3\"}") == DAPPLE_ERROR);
+  CHECK(dapple_session_export_jpeg_ex(s, "{}", "", 1200, 92, bad.string().c_str(), "{\"colorSpace\":\"rec2020\"}") == DAPPLE_ERROR);
   // Ultra HDR: the base is the _ex SDR export, keep and strip
   for (const std::string* opt : {&keep, &strip}) {
     const fs::path sdrP = dir / "u_sdr.jpg", hdrP = dir / "u_hdr.jpg";

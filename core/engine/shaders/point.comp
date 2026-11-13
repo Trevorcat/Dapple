@@ -16,7 +16,7 @@ layout(std140, binding = 0) uniform P {
   ivec4 b;      // bound source image origin x, y; origin of this working image in the picture x, y
   vec4 geoA;    // cs, sn, fw, fh
   vec4 geoB;    // ox0, oy0, stepX, stepY
-  vec4 geoC;    // fullW, fullH, vignette, 0
+  vec4 geoC;    // fullW, fullH, vignette, 1 = the lattice holds Display P3 encoded values (export): the vignette runs on sRGB-encoded ones
   ivec4 c;      // rot, flip, latN, toneN
   ivec4 d;      // toneBase, lat2N, 0, 0
   vec4 e;       // bakeMax, bake2Max, grain amp, grain period
@@ -123,6 +123,19 @@ vec3 sampleCubic(float x, float y) {
   return max(o, vec3(0.0));
 }
 
+// Display P3 export: twins of core/src/color.h (p3ToSrgb / srgbToP3, srgbEncodeExt / srgbDecodeExt) for the vignette.
+vec3 srgbDecodeExt(vec3 x) {
+  const vec3 a = abs(x);
+  return sign(x) * mix(a / 12.92, pow((a + 0.055) / 1.055, vec3(2.4)), greaterThan(a, vec3(0.04045)));
+}
+vec3 srgbEncodeExt(vec3 x) {
+  const vec3 a = abs(x);
+  return sign(x) * mix(a * 12.92, 1.055 * pow(a, vec3(1.0 / 2.4)) - 0.055, greaterThan(a, vec3(0.0031308)));
+}
+// GLSL matrices are column-major: each vec3 below is a column of the C++ matrix
+const mat3 kP3ToSrgb = mat3(vec3(1.2247450, -0.0420578, -0.0196423), vec3(-0.2249043, 1.0420810, -0.0786549), vec3(0.0, 0.0, 1.0985372));
+const mat3 kSrgbToP3 = mat3(vec3(0.8225929, 0.0331995, 0.0170854), vec3(0.1775340, 0.9667836, 0.0723957), vec3(0.0, 0.0, 0.9103014));
+
 vec3 tetra(sampler3D s, vec3 x) {
   const ivec3 i = ivec3(x);
   const vec3 f = x - vec3(i);
@@ -196,7 +209,14 @@ void main() {
     const float py = u.geoB.y + (float(q.y) + 0.5) * u.geoB.w - 0.5;
     const float dx = (px - cx) / cx, dy = (py - cy) / cy;
     const float f = smoothstep(0.35, 1.05, sqrt((dx * dx + dy * dy) * 0.5));
-    e = vig < 0.0 ? e * (1.0 + vig * 0.6 * f) : e + (1.0 - e) * vig * 0.6 * f;
+    if (u.geoC.w > 0.5) {
+      vec3 s = kP3ToSrgb * srgbDecodeExt(e);
+      s = srgbEncodeExt(s);
+      s = vig < 0.0 ? s * (1.0 + vig * 0.6 * f) : s + (1.0 - s) * vig * 0.6 * f;
+      e = srgbEncodeExt(kSrgbToP3 * srgbDecodeExt(s));
+    } else {
+      e = vig < 0.0 ? e * (1.0 + vig * 0.6 * f) : e + (1.0 - e) * vig * 0.6 * f;
+    }
   }
   e = clamp(e, vec3(0.0), vec3(1.0));
   if (GRAIN) e = grainApply(e, q, u.e.z, u.e.w);

@@ -13,6 +13,9 @@ import '../state/app_state.dart';
 import 'base_swatches.dart';
 import 'session_cache.dart';
 
+/// Bases per native call of the batch route (small chunks first, see BaseSwatches).
+const int kSwatchBatch = 6;
+
 /// Params of a swatch: the photo's own automatic correction (what the photo looks like when developed) and the base. No user
 /// edit, no look, no tone strength: a swatch compares bases, so it is edit independent.
 Map<String, dynamic> swatchParams(Map<String, dynamic>? correction, String? baseId, {bool auto = true}) {
@@ -26,25 +29,53 @@ Map<String, dynamic> swatchParams(Map<String, dynamic>? correction, String? base
   return out;
 }
 
-class SessionSwatchSource implements SwatchSource {
+/// Renders [ids] on [s]: one native batch call (`dapple_session_base_previews`: interactive tier, coarse film tables, background priority,
+/// shared decode and scaling) when the engine has it, else one final-quality `render` per base. Null entries: failed or cancelled.
+Future<List<ui.Image?>> renderSwatchBatch(DappleSession s, Map<String, dynamic>? correction, bool auto, List<String?> ids, int longEdge) async {
+  if (DappleSession.hasBaseSwatches) {
+    final rs = await s.baseSwatches(swatchParams(correction, null, auto: auto), ids, longEdge: longEdge);
+    return [for (final r in rs) r == null ? null : await imageFromRgba(r)];
+  }
+  final out = <ui.Image?>[];
+  for (final id in ids) {
+    try {
+      out.add(await imageFromRgba(await s.render(swatchParams(correction, id, auto: auto), longEdge: longEdge)));
+    } catch (_) {
+      out.add(null);
+    }
+  }
+  return out;
+}
+
+class SessionSwatchSource implements BatchSwatchSource {
   SessionSwatchSource(this.app, this.photo);
   final AppState app;
   final Photo photo;
+  DappleSession? _live;
 
   @override
   String get key => '${photo.id}|${photo.path}|${photo.correction?.hashCode ?? 0}|${app.settings.autoProcess}';
 
   @override
-  Future<ui.Image?> render(String? baseId, int longEdge) async {
+  int get batchSize => DappleSession.hasBaseSwatches ? kSwatchBatch : 1;
+
+  @override
+  Future<ui.Image?> render(String? baseId, int longEdge) async => (await renderBatch([baseId], longEdge)).first;
+
+  @override
+  Future<List<ui.Image?>> renderBatch(List<String?> ids, int longEdge) async {
     final s = await app.sessions.get(photo, background: true);
-    if (s == null) return null;
-    final r = await s.render(swatchParams(photo.correction, baseId, auto: app.settings.autoProcess), longEdge: longEdge);
-    return imageFromRgba(r);
+    if (s == null) return List.filled(ids.length, null);
+    _live = s;
+    return renderSwatchBatch(s, photo.correction, app.settings.autoProcess, ids, longEdge);
   }
+
+  @override
+  void cancel() => _live?.cancelBaseSwatches();
 }
 
 /// A bundled picture through its own small session (opened on first use, closed with [close]).
-class AssetSwatchSource implements SwatchSource {
+class AssetSwatchSource implements BatchSwatchSource {
   AssetSwatchSource(this.asset);
   final String asset;
   Future<DappleSession?>? _session;
@@ -61,10 +92,22 @@ class AssetSwatchSource implements SwatchSource {
       }();
 
   @override
-  Future<ui.Image?> render(String? baseId, int longEdge) async {
+  int get batchSize => DappleSession.hasBaseSwatches ? kSwatchBatch : 1;
+
+  @override
+  Future<ui.Image?> render(String? baseId, int longEdge) async => (await renderBatch([baseId], longEdge)).first;
+
+  @override
+  Future<List<ui.Image?>> renderBatch(List<String?> ids, int longEdge) async {
     final s = await _open();
-    if (s == null) return null;
-    return imageFromRgba(await s.render(swatchParams(null, baseId), longEdge: longEdge));
+    if (s == null) return List.filled(ids.length, null);
+    return renderSwatchBatch(s, null, true, ids, longEdge);
+  }
+
+  @override
+  void cancel() {
+    final f = _session;
+    if (f != null) unawaited(f.then((s) => s?.cancelBaseSwatches(), onError: (_) {}));
   }
 
   Future<void> close() async {

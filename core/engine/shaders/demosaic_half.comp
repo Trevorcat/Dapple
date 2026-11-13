@@ -1,0 +1,66 @@
+#version 450
+// Half-resolution X-Trans reconstruction (docs/engine/pipeline-architecture.md 32.12). Mirrors demosaic_half.inc (halfTile): each output pixel is a fixed linear
+// combination of the 8 x 8 scaled samples 2x-3 .. 2x+4 with per-phase weights from the host table (tab[HT ..]), a clip fallback of unclipped gaussian means,
+// the matrix and the clamp. The window plane S has width u.dims.x = 2 * tile + 6 (window pixel (2 q + i, 2 q + j) is tap (i, j) of output pixel q).
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+#include "demosaic_common.glsl"
+#include "common.glsl"
+layout(binding = 1, std430) readonly buffer Sb { float S[]; };
+layout(binding = 2, std430) readonly buffer Tab { float tab[]; };
+layout(binding = 3, OUT_FMT) uniform writeonly image2D uOut;
+const int HT = 4856;  // start of the half tables in tab: weights [9][3][64], fallback [9][3][64], support [9][64], central greens [9][64]
+const float kClip = 0.995;
+const float kOvershoot = 0.15;  // kHalfOvershoot (demosaic.h)
+
+void main() {
+  const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+  if (q.x >= u.dims.z || q.y >= u.dims.w) return;
+  const int ww = u.dims.x;
+  // phase of the output pixel: window (0, 0) is at sensor phase org (mod 6); the output pixel's sensor x is window x + 3 (mod 6) = 2 x (mod 6)
+  const int pa = ((u.org.x + 3 + 2 * q.x) % 6) / 2, pb = ((u.org.y + 3 + 2 * q.y) % 6) / 2;
+  const int ph = pb * 3 + pa;
+  const int wBase = HT + ph * 192, gBase = HT + 1728 + ph * 192, sBase = HT + 3456 + ph * 64, cBase = HT + 4032 + ph * 64;
+  const int s0 = (2 * q.y) * ww + 2 * q.x;
+  vec3 acc = vec3(0.0);
+  float smax = 0.0;
+  for (int j = 0; j < 8; ++j)
+    for (int i = 0; i < 8; ++i) {
+      const int k = j * 8 + i;
+      const float s = S[s0 + j * ww + i];
+      acc.x += tab[wBase + k] * s;
+      acc.y += tab[wBase + 64 + k] * s;
+      acc.z += tab[wBase + 128 + k] * s;
+      smax = max(smax, s * tab[sBase + k]);
+    }
+  {  // overshoot clamp: the green stays within the range of the central green samples (+ margin), the same shift goes to R and B
+    float lo = 2.0, hi = -1.0;
+    for (int j = 2; j < 6; ++j)
+      for (int i = 2; i < 6; ++i) {
+        const int k = j * 8 + i;
+        if (tab[cBase + k] > 0.0) { const float s = S[s0 + j * ww + i]; lo = min(lo, s); hi = max(hi, s); }
+      }
+    const float mg = kOvershoot * (hi - lo);
+    const float dg = min(max(acc.y, lo - mg), hi + mg) - acc.y;
+    acc += vec3(dg);
+  }
+  if (smax >= kClip) {  // clip fallback: colours from the unclipped taps only
+    vec3 su = vec3(0.0), wu = vec3(0.0), sa = vec3(0.0);
+    for (int j = 0; j < 8; ++j)
+      for (int i = 0; i < 8; ++i) {
+        const int c = colAt(2 * q.x + i, 2 * q.y + j, 6);
+        const float s = S[s0 + j * ww + i];
+        const float g = tab[gBase + c * 64 + j * 8 + i];
+        const vec3 oh = vec3(c == 0 ? 1.0 : 0.0, c == 1 ? 1.0 : 0.0, c == 2 ? 1.0 : 0.0);  // explicit select: no dynamic vector index
+        sa += oh * (g * s);
+        if (s < kClip) { su += oh * (g * s); wu += oh * g; }
+      }
+    acc = vec3(wu.x >= 0.15 ? su.x / wu.x : sa.x, wu.y >= 0.15 ? su.y / wu.y : sa.y, wu.z >= 0.15 ? su.z / wu.z : sa.z);
+  }
+  const vec3 o = finishRgb(acc);
+#ifdef OUT16
+  imageStore(uOut, q + u.io.yz, h16v(vec4(o, 1.0)));
+#else
+  imageStore(uOut, q + u.io.yz, vec4(o, 1.0));
+#endif
+}

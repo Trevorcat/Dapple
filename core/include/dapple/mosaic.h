@@ -59,7 +59,7 @@ ImageF finishMosaicRgb(const MosaicImage& m, ImageF rgb, std::string* correction
 // DAPPLE_DEMOSAIC=off) the result is an error and `reason` says why: the caller takes the RGB path.
 // The preview-quality picture from the same cached mosaic (one unpack serves the preview, the 2x view, the regions and the export): the half-resolution
 // block reduction (Bayer 2x2, X-Trans 3x3, no interpolation), same black level, white balance, matrix, crop, orientation and exposure anchor as the full
-// decode. Refuses (reason, then the caller uses LibRaw's half-size decode) when the mosaic path is off, the file has no mosaic path, or a lens-warp opcode
+// decode (X-Trans with a request well above 1/3 of the width: the half-resolution reconstruction instead, docs 32.12). Refuses (reason, then the caller uses LibRaw's half-size decode) when the mosaic path is off, the file has no mosaic path, or a lens-warp opcode
 // needs the whole frame. DAPPLE_PREVIEW_MOSAIC=off keeps the LibRaw half-size decode.
 Result<SourceImage> decodePreviewFromMosaic(const std::filesystem::path& path, const DecodeOptions& options, std::string* reason = nullptr);
 Result<SourceImage> decodeFullFromMosaic(const std::filesystem::path& path, const DecodeOptions& options, std::string* reason = nullptr);

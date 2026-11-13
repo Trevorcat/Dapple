@@ -3,7 +3,7 @@
 
 Usage (Git Bash, from the repo root):
   python scripts/film/gen_film_map.py [--cli build/filmmap/bin/dapple.exe] [--stocks id,id] [--auto-exposure match|off]
-                                    [--work build/filmmap] [--no-write]
+                                    [--work build/filmmap] [--no-write] [--chart-tool dapple_base_previews_tests.exe] [--modern-only]
 Method and limits: docs/film/film-map.md. Needs numpy + Pillow. Renders a synthetic 24-patch chart with `dapple film`
 (default paper of the stock, spatial effects off, same input for every stock), measures per stock
 
@@ -12,6 +12,13 @@ Method and limits: docs/film/film-map.md. Needs numpy + Pillow. Renders a synthe
 
 and maps both to [-1, 1] (robust, per axis): median -> 0, p5 -> -0.85, p95 -> +0.85, clamp.
 With --stocks the table is measured for those stocks only (smoke test) and the asset is not written.
+
+The modern renderings (modern_clean / modern_vivid / modern_soft, app/lib/model/bases.dart) are measured on the same chart with the same two
+numbers and mapped with the SAME per-axis scale as the stocks (median / p5 / p95 of the stocks only, so adding them moves no stock): the engine's
+reference render with `film` = the id at strength 100 and no auto correction, through `<chart-tool> chart in.pfm id out.png` (the `chart` mode of
+tests/base_previews_tests.cpp, built as dapple_base_previews_tests: the CLI has no scene-referred chart input for the standard pipeline). They are
+written with kind "modern" and measured true; when the tool is missing the existing asset entries of the modern ids are kept as they are.
+--modern-only keeps every stock entry of the existing asset byte for byte and only replaces the modern ones.
 """
 import argparse, json, os, re, subprocess, sys
 import numpy as np
@@ -26,6 +33,12 @@ def load_names():
     src = open(os.path.join(R, 'app/lib/model/film_names.dart'), encoding='utf-8').read()
     body = src.split('kFilmDisplayNames = {')[1].split('};')[0]
     return re.findall(r"'([a-z0-9_]+)':\s*'([^']+)'", body)
+
+
+def load_modern():
+    """[(id, name)] of kModernBases in app/lib/model/bases.dart."""
+    src = open(os.path.join(R, 'app/lib/model/bases.dart'), encoding='utf-8').read()
+    return re.findall(r"ModernBase\('(modern_[a-z0-9_]+)',\s*'([^']+)'", src)
 
 
 def info_of(sid):
@@ -94,6 +107,12 @@ def measure(lab, lab_in):
                 L_mid_grey=round(float(lab[21, 0]), 2))
 
 
+def scale_with(v, med, lo, hi):
+    """One value on the scale of scale(): the stocks' median -> 0, p5 -> -0.85, p95 -> +0.85 (not clamped)."""
+    dn, up = max(med - lo, 1e-9), max(hi - med, 1e-9)
+    return (v - med) / dn * 0.85 if v < med else (v - med) / up * 0.85
+
+
 def scale(vals):
     v = np.array(vals); med, lo, hi = np.median(v), np.percentile(v, 5), np.percentile(v, 95)
     dn, up = max(med - lo, 1e-9), max(hi - med, 1e-9)       # each side scaled on its own
@@ -107,6 +126,8 @@ def main():
     ap.add_argument('--stocks', default='')
     ap.add_argument('--auto-exposure', default='match')
     ap.add_argument('--no-write', action='store_true')
+    ap.add_argument('--chart-tool', default='')
+    ap.add_argument('--modern-only', action='store_true')
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
     pf = os.path.join(a.work, 'chart.pfm'); write_chart(pf)
@@ -132,12 +153,46 @@ def main():
     ys, yst = scale([v['contrast'] for v in rows.values()])
     for (sid, v), x, y in zip(rows.items(), xs, ys):
         v['x'] = round(float(x), 3); v['y'] = round(float(y), 3)
+    # the modern renderings: same chart, same measure, the stocks' scale (clamped to the map)
+    old = {}
+    asset = os.path.join(R, 'app/assets/film/film_map.json')
+    if os.path.exists(asset):
+        old = json.load(open(asset, encoding='utf-8'))
+    tool = a.chart_tool
+    if not tool:
+        for c in ('build/swatch-desktop/bin/dapple_base_previews_tests.exe', 'build/check-desktop/bin/dapple_base_previews_tests.exe'):
+            if os.path.exists(os.path.join(R, c)):
+                tool = os.path.join(R, c)
+                break
+    modern = {}
+    if not only:
+        for mid, name in load_modern():
+            code = old.get(mid, {}).get('code') or 'M-' + mid.split('_', 1)[1].upper()
+            if not tool or not os.path.exists(tool):
+                if mid in old:
+                    modern[mid] = old[mid]
+                    print('%-24s no chart tool: kept the existing entry' % mid)
+                continue
+            out = os.path.join(a.work, 'chart_%s.png' % mid)
+            r = subprocess.run([tool, 'chart', pf, mid, out], capture_output=True, text=True)
+            if r.returncode:
+                sys.exit('chart render failed for %s: %s %s' % (mid, r.stdout, r.stderr))
+            d = measure(patches(out), lab_in)
+            xm = float(np.clip(scale_with(d['richness'], *xst), -1, 1)); ym = float(np.clip(scale_with(d['contrast'], *yst), -1, 1))
+            d.update(code=code, type='modern', kind='modern', x_unclamped=round(float(scale_with(d['richness'], *xst)), 3),
+                     y_unclamped=round(float(scale_with(d['contrast'], *yst)), 3), x=round(xm, 3), y=round(ym, 3))
+            modern[mid] = d
+            print('%-24s %-8s rich %.3f contrast %.3f -> x %+.3f y %+.3f (unclamped %+.3f %+.3f)' % (mid, code, d['richness'], d['contrast'], xm, ym, d['x_unclamped'], d['y_unclamped']), flush=True)
     raw = dict(method=dict(chroma='CIELAB C*ab D65 sRGB', auto_exposure=a.auto_exposure,
                            richness_med_p5_p95=[float(t) for t in xst], contrast_med_p5_p95=[float(t) for t in yst]),
-               stocks=rows)
+               stocks=rows, modern=modern)
     json.dump(raw, open(os.path.join(a.work, 'measure.json'), 'w'), indent=2, ensure_ascii=False)
     if not a.no_write and not only:
         m = {sid: {'x': v['x'], 'y': v['y'], 'type': v['type'], 'code': v['code']} for sid, v in rows.items()}
+        if a.modern_only:  # the stocks of the existing asset stay exactly as they are
+            m = {sid: old[sid] for sid in rows if sid in old} or m
+        for mid, v in modern.items():
+            m[mid] = v if 'measured' in v else {'x': v['x'], 'y': v['y'], 'type': 'modern', 'kind': 'modern', 'code': v['code'], 'measured': True}
         outp = os.path.join(R, 'app/assets/film/film_map.json')
         with open(outp, 'w', encoding='utf-8', newline='\n') as f:
             json.dump(m, f, indent=2, ensure_ascii=False); f.write('\n')

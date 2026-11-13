@@ -28,6 +28,7 @@ struct FramePlan {
 
   float gain[3] = {1.f, 1.f, 1.f};  // white balance * exposure, applied to the source before the tone stage
   float vignette = 0.f;             // -1..1
+  int outputSpace = 0;              // 0 sRGB, 1 Display P3 (export only): the lattice holds P3-encoded values; the vignette then runs on sRGB-encoded ones
   // Single-image HDR (EditParams::hdr, engine only): a smooth gain field applied right after `gain`, before the tone stage. Active when
   // `field` is set and s > 0; resolved by Renderer::hdrBind (which needs the source).
   struct Hdr {

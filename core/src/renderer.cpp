@@ -266,6 +266,8 @@ Renderer::Renderer(const EditParams& params, const CameraProfile& camera, const 
   // DAPPLE_ENGINE=off (the golden oracle) ignores the modern rendering family, as it ignores `hdr` (section 37)
   if (isModernId(p_.filmStock) && engine::mode() == engine::Mode::Off) p_.filmStock.clear();
   whiteBalanceGain(p_, wbGain_);
+  // Film frames are authored for sRGB output (their LUTs, grain, paper mapping): they never render in P3; the C layer converts the finished sRGB frame.
+  if (p_.outputSpace == 1 && filmActive()) p_.outputSpace = 0;
 
   // Each curve = parametric (four regions) followed by the point curve.
   auto build = [&](Curve1D& c, const float amt[4], const std::vector<CurvePoint>& pts) {
@@ -470,9 +472,24 @@ SpatialParams makeSpatial(const EditParams& p, bool scene, const StyleMix& style
   return sp;
 }
 
-inline void applyVignette(float e3[3], float dx, float dy, float vig) {
+// `p3`: e3 holds Display P3 encoded values (export colour space). The vignette is authored on sRGB-encoded values, so it runs there (P3 -> sRGB
+// primaries, extended transfer curve, the formula, back): a colour inside sRGB gets the sRGB path's value. GPU twin: point.comp (u.geoC.w).
+inline void applyVignette(float e3[3], float dx, float dy, float vig, bool p3 = false) {
   const float f = smoothstep(0.35f, 1.05f, std::sqrt((dx * dx + dy * dy) * 0.5f));
-  for (int c = 0; c < 3; ++c) e3[c] = vig < 0 ? e3[c] * (1.f + vig * 0.6f * f) : e3[c] + (1.f - e3[c]) * vig * 0.6f * f;
+  if (!p3) {
+    for (int c = 0; c < 3; ++c) e3[c] = vig < 0 ? e3[c] * (1.f + vig * 0.6f * f) : e3[c] + (1.f - e3[c]) * vig * 0.6f * f;
+    return;
+  }
+  const float q[3] = {srgbDecode(e3[0]), srgbDecode(e3[1]), srgbDecode(e3[2])};
+  float s[3];
+  p3ToSrgb().apply(q, s);
+  for (int c = 0; c < 3; ++c) {
+    const float e = srgbEncodeExt(s[c]);
+    s[c] = srgbDecodeExt(vig < 0 ? e * (1.f + vig * 0.6f * f) : e + (1.f - e) * vig * 0.6f * f);
+  }
+  float o[3];
+  srgbToP3().apply(s, o);
+  for (int c = 0; c < 3; ++c) e3[c] = srgbEncode(o[c]);
 }
 
 }  // namespace
@@ -496,6 +513,7 @@ struct Renderer::PointOp {
   const Lut3D* lut = nullptr;
   float lutMix = 0.f;
   float fade = 0.f;
+  bool p3 = false;  // export colour space Display P3 (EditParams::outputSpace): the lattice holds P3-encoded values
   const Curve1D *master = nullptr, *red = nullptr, *green = nullptr, *blue = nullptr;
   ToneAnalysis analysis;
   bool hasAnalysis = false;
@@ -584,8 +602,10 @@ struct Renderer::PointOp {
     L = std::min(L, 1.f);
     auto fits = [&](float k) {
       const float lab[3] = {L, k * a, k * b};
-      float r[3];
-      oklabToLinearSrgb(lab, r);
+      float r0[3], r[3];
+      oklabToLinearSrgb(lab, r0);
+      if (p3) srgbToP3().apply(r0, r);  // the gamut to compress into is the output space's
+      else r[0] = r0[0], r[1] = r0[1], r[2] = r0[2];
       return r[0] >= -2e-4f && r[1] >= -2e-4f && r[2] >= -2e-4f && r[0] <= 1.0002f && r[1] <= 1.0002f && r[2] <= 1.0002f;
     };
     float kmax = 3.f;
@@ -612,6 +632,52 @@ struct Renderer::PointOp {
     const float ratio = toneRatio(proPhotoLuma(v_in));
     const float t[3] = {v_in[0] * ratio, v_in[1] * ratio, v_in[2] * ratio};
     colour(t, e3);
+  }
+
+  // Display P3 output (export only). `rgb` = linear sRGB primaries after the colour stage (unbounded). Same hue-preserving pull towards the
+  // same-luminance grey as the sRGB path, but into the P3 cube; the display-referred stages (curves, look LUT, fade) are authored on
+  // sRGB-encoded values, so they run there (extended past [0, 1] by an identity offset: a P3-only colour keeps its excess) and the result is
+  // converted to P3 afterwards: a colour inside sRGB gets exactly the sRGB path's value, P3 only adds what sRGB could not hold.
+  void colourP3(const float rgbIn[3], float e3[3]) const {
+    float q[3];
+    srgbToP3().apply(rgbIn, q);
+    const float Ys = std::clamp(p3Luma(q), 0.f, 1.f);
+    const float mn = std::min({q[0], q[1], q[2]});
+    if (mn < 0.f) {
+      const float t = Ys / std::max(1e-7f, Ys - mn);
+      for (float& c : q) c = Ys + (c - Ys) * t;
+    }
+    const float mx = std::max({q[0], q[1], q[2]});
+    if (mx > 1.f) {
+      const float t = (1.f - Ys) / std::max(1e-7f, mx - Ys);
+      for (float& c : q) c = Ys + (c - Ys) * t;
+    }
+    const bool plain = master->identity && red->identity && green->identity && blue->identity && !(lut && lutMix > 0) && !(fade > 0.f);
+    if (plain) {
+      for (int c = 0; c < 3; ++c) e3[c] = srgbEncode(q[c]);
+      return;
+    }
+    float s[3], ex[3];
+    p3ToSrgb().apply(q, s);
+    for (int c = 0; c < 3; ++c) ex[c] = srgbEncodeExt(s[c]);
+    auto ext = [](const Curve1D& f, float x) {
+      const float k = std::clamp(x, 0.f, 1.f);
+      return f(k) + (x - k);
+    };
+    for (int c = 0; c < 3; ++c) ex[c] = ext(*master, ex[c]);
+    ex[0] = ext(*red, ex[0]);
+    ex[1] = ext(*green, ex[1]);
+    ex[2] = ext(*blue, ex[2]);
+    if (lut && lutMix > 0) {
+      float k[3] = {std::clamp(ex[0], 0.f, 1.f), std::clamp(ex[1], 0.f, 1.f), std::clamp(ex[2], 0.f, 1.f)}, l[3];
+      lut->apply(k, l);
+      for (int c = 0; c < 3; ++c) ex[c] += (l[c] - k[c]) * lutMix;
+    }
+    if (fade > 0.f)
+      for (int c = 0; c < 3; ++c) ex[c] = fade + ex[c] * (1.f - fade);
+    for (int c = 0; c < 3; ++c) s[c] = srgbDecodeExt(ex[c]);
+    srgbToP3().apply(s, q);
+    for (int c = 0; c < 3; ++c) e3[c] = srgbEncode(q[c]);
   }
 
   // Everything after the tone stage; `v` = tone-mapped linear ProPhoto. This is what the lattice holds.
@@ -712,6 +778,11 @@ struct Renderer::PointOp {
       }
       const float lab2[3] = {L, a, b};
       oklabToLinearSrgb(lab2, rgb);
+    }
+
+    if (p3) {
+      colourP3(rgb, e3);
+      return;
     }
 
     // ---- gamut map into [0,1] towards same-luminance grey ----
@@ -865,6 +936,7 @@ Renderer::PointOp Renderer::makePointOp(const SourceImage& source, const BakedLu
   op.lut = lut_;
   op.lutMix = std::clamp(p_.lutAmount / 100.f, 0.f, 1.f);
   op.fade = op.style.fade;
+  op.p3 = p_.outputSpace == 1;
   op.master = &master_;
   op.red = &red_;
   op.green = &green_;
@@ -1089,7 +1161,7 @@ ImageF Renderer::renderFloat(const SourceImage& source, bool spatial) const {
         displayStages(ef);
         for (int c = 0; c < 3; ++c) e3[c] = needNormal ? e3[c] + fr.strength * (ef[c] - e3[c]) : ef[c];
       }
-      if (vig != 0) applyVignette(e3, (x - cx) / cx, (y - cy) / cy, vig);
+      if (vig != 0) applyVignette(e3, (x - cx) / cx, (y - cy) / cy, vig, p_.outputSpace == 1);
       for (int c = 0; c < 3; ++c) dst[3 * x + c] = std::clamp(e3[c], 0.f, 1.f);
     }
   });
@@ -1310,9 +1382,9 @@ std::string Renderer::pointKey() const {
   // crop, straighten, rotate, flip and vignette stay in the key: the tonal analysis (histogram, tonal class, the move built
   // from it) is taken from the cropped / vignetted render of the proxy, so a bake made for another framing is stale
   // (the old key masked them: a crop change returned the previous crop's analysis; documented in docs/engine, a4b).
-  char buf[96];
-  std::snprintf(buf, sizeof buf, "|%p|%s|%.3f|%d", static_cast<const void*>(lut_), camera_.id.c_str(), toneReach_,
-                toneProxy_ ? 1 : 0);
+  char buf[104];
+  std::snprintf(buf, sizeof buf, "|%p|%s|%.3f|%d|%d", static_cast<const void*>(lut_), camera_.id.c_str(), toneReach_,
+                toneProxy_ ? 1 : 0, p_.outputSpace);
   return toJson(k) + buf;
 }
 
@@ -1649,7 +1721,7 @@ std::uint8_t* Renderer::renderBakedImpl(const SourceImage& source, const BakedLu
       if (vig != 0) {
         const float cx = d.fullW * 0.5f, cy = d.fullH * 0.5f;
         const float px = d.ox0 + (float(x) + 0.5f) * d.stepX - 0.5f, py = d.oy0 + (float(y) + 0.5f) * d.stepY - 0.5f;
-        applyVignette(e3, (px - cx) / cx, (py - cy) / cy, vig);
+        applyVignette(e3, (px - cx) / cx, (py - cy) / cy, vig, p_.outputSpace == 1);
       }
       for (float& c : e3) c = std::clamp(c, 0.f, 1.f);
       if (dstF) {
@@ -1748,6 +1820,7 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
   const float expo = std::exp2(p_.exposure + (sceneReferred ? camera_.baselineExposureEv : 0.f));
   for (int c = 0; c < 3; ++c) fp.gain[c] = wbGain_[c] * expo;
   fp.vignette = p_.vignette / 100.f;
+  fp.outputSpace = p_.outputSpace;
   EditParams pStyle = p_;
   if (filmRun.stock) pStyle.look = "std";  // a film at full strength brings its own grain (FrameKernels::Impl)
   SpatialParams sp = makeSpatial(p_, sceneReferred, makeStyle(pStyle));
@@ -1981,6 +2054,7 @@ FramePlan FrameKernels::framePlan() const {
   fp.fullH = m.d.fullH;
   for (int c = 0; c < 3; ++c) fp.gain[c] = m.gain[c];
   fp.vignette = m.vig;
+  fp.outputSpace = m.r.p_.outputSpace;
   fp.hdr = m.hdr;
   fp.nrLuma = m.sp.nrLuma;
   fp.nrColor = m.sp.nrColor;
@@ -2085,7 +2159,7 @@ void FrameKernels::vignette(float* px, int n, int x0, int y) const {
   const float py = m.d.oy0 + (float(y) + 0.5f) * m.d.stepY - 0.5f;
   for (int i = 0; i < n; ++i) {
     const float pxx = m.d.ox0 + (float(x0 + i) + 0.5f) * m.d.stepX - 0.5f;
-    applyVignette(px + 3 * i, (pxx - cx) / cx, (py - cy) / cy, m.vig);
+    applyVignette(px + 3 * i, (pxx - cx) / cx, (py - cy) / cy, m.vig, m.r.p_.outputSpace == 1);
   }
 }
 

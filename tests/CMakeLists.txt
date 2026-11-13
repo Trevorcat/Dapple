@@ -342,6 +342,42 @@ foreach(id icc exif jpeg strip uhdr motion reader session)
   set_tests_properties(export_meta.${id} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
 endforeach()
 
+# Display P3 export (colorSpace "p3"): identity of the sRGB default, tags, chroma kept, equality inside sRGB, hue, CPU / GPU parity, Ultra HDR, evidence.
+add_executable(dapple_p3_tests p3_export_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
+target_link_libraries(dapple_p3_tests PRIVATE dapple_core dapple_stb)
+target_include_directories(dapple_p3_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/cli)
+target_compile_definitions(dapple_p3_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+                           $<$<BOOL:${DAPPLE_FILM_AVX2}>:DAPPLE_FILM_HAVE_AVX2=1>)
+if(MSVC)
+  target_compile_options(dapple_p3_tests PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(dapple_p3_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+if(TARGET dapple_gpu)  # the parity id needs the GPU export path (c_api.cpp is compiled in here, so DAPPLE_HAVE_GPU comes from this link)
+  target_link_libraries(dapple_p3_tests PRIVATE dapple_gpu)
+  target_include_directories(dapple_p3_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src)
+endif()
+foreach(id identity tags chroma direct inside hue parity hdr fraction)
+  add_test(NAME p3.${id} COMMAND dapple_p3_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(p3.${id} PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+endforeach()
+
+# Batch base swatches (dapple_session_base_previews): per-base frame equality, final-render tolerance, modern / unknown ids, cancellation, interaction yield.
+add_executable(dapple_base_previews_tests base_previews_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
+target_link_libraries(dapple_base_previews_tests PRIVATE dapple_core dapple_stb)
+target_include_directories(dapple_base_previews_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/cli)
+target_compile_definitions(dapple_base_previews_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+                           $<$<BOOL:${DAPPLE_FILM_AVX2}>:DAPPLE_FILM_HAVE_AVX2=1>)
+if(MSVC)
+  target_compile_options(dapple_base_previews_tests PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(dapple_base_previews_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+foreach(id equal ids cancel yield raw)
+  add_test(NAME base_previews.${id} COMMAND dapple_base_previews_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(base_previews.${id} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+endforeach()
+
 # Wide-gamut / 16-bit display-referred sources (colour space tags, ICC matrix profiles, banding).
 add_executable(dapple_wide_tests wide_gamut_tests.cpp)
 target_link_libraries(dapple_wide_tests PRIVATE dapple_core)

@@ -77,18 +77,32 @@ class _HdrApp extends AppState {
   Future<double> hdrHeadroomOf(Photo ph) async => stops;
 }
 
+/// Demo app whose photos report a fixed share of colour outside sRGB (the real probe needs the native library); records the colour space asked for.
+class _WideApp extends AppState {
+  _WideApp(this.share) : super.demo();
+  final double share;
+  final wide = <bool>[];
+  @override
+  Future<double> wideGamutOf(Photo ph) async => share;
+  @override
+  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation, bool wideGamut = false}) async {
+    wide.add(wideGamut);
+    return '/demo/${ph.id}.jpg';
+  }
+}
+
 /// Demo app that records how the publish page calls the export functions.
 class _SpyApp extends AppState {
   _SpyApp() : super.demo();
   final calls = <({String kind, bool strip})>[];
   @override
-  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
+  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation, bool wideGamut = false}) async {
     calls.add((kind: 'export', strip: stripLocation ?? settings.stripLocation));
     return '/demo/${ph.id}.jpg';
   }
 
   @override
-  Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
+  Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation, bool wideGamut = false}) async {
     calls.add((kind: 'gallery', strip: stripLocation ?? settings.stripLocation));
     return list.length;
   }
@@ -241,6 +255,37 @@ void main() {
     await tester.pump();
     expect((tester.widget(find.byKey(const ValueKey('switch-hdr'))) as DSwitch).value, isTrue);
     await shot(tester, 'publish_phone_hdr');
+  });
+
+  testWidgets('色彩空间 option is hidden when no photo has colour outside sRGB', (tester) async {
+    final app = _WideApp(0.0);
+    await open(tester, app, idsOf(app, 2));
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(find.byKey(const ValueKey('row-cs')), findsNothing);
+    expect(find.text('色彩空间'), findsNothing);
+  });
+
+  testWidgets('色彩空间 option: sRGB by default, one plain warning, tap switches to 广色域 P3 and reaches the export', (tester) async {
+    final app = _WideApp(0.2);
+    await open(tester, app, idsOf(app, 2));
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(find.byKey(const ValueKey('row-cs')), findsOneWidget);
+    expect((tester.widget(find.byKey(const ValueKey('row-cs-value'))) as Text).data, 'sRGB');
+    expect((tester.widget(find.byKey(const ValueKey('row-cs-sub'))) as Text).data, contains('不识别色彩配置'));
+    await shot(tester, 'publish_phone_p3');
+    await tester.tap(find.byKey(const ValueKey('row-cs')));
+    await tester.pump();
+    expect((tester.widget(find.byKey(const ValueKey('row-cs-value'))) as Text).data, '广色域 P3');
+    await tester.tap(find.byKey(const ValueKey('publish-share')));
+    await step(tester);
+    await tester.tap(find.byKey(const ValueKey('handoff-system')));
+    await step(tester);
+    expect(app.wide, [true, true]);
+  });
+
+  test('export options JSON: sRGB by default, p3 for the wide-gamut choice', () {
+    expect((jsonDecode(AppState.exportMetaJson(original: 'x', stripLocation: true)) as Map)['colorSpace'], 'srgb');
+    expect((jsonDecode(AppState.exportMetaJson(original: 'x', stripLocation: true, wideGamut: true)) as Map)['colorSpace'], 'p3');
   });
 
   testWidgets('去除位置信息 reaches the export call (share and gallery paths)', (tester) async {

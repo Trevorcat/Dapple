@@ -221,10 +221,22 @@ void main() {
       for (final m in kModernBases) {
         expect(find.descendant(of: find.byKey(ValueKey('stock-${m.id}')), matching: find.byType(ClipOval)), findsOneWidget, reason: m.name);
       }
-      expect(find.byKey(const ValueKey('modern-plate')), findsOneWidget);
-      expect(find.descendant(of: find.byKey(const ValueKey('modern-plate')), matching: find.text('现代')), findsOneWidget);
+      expect(find.byKey(const ValueKey('modern-plate')), findsNothing, reason: 'measured positions are spread over the map: no plate over unrelated stocks');
       final sizes = {for (final m in kModernBases) t.getSize(find.byKey(ValueKey('stock-${m.id}'))).width};
       expect(sizes.single, kSwatchMagnified, reason: 'laid out at the magnified size, scaled down in the overview');
+    });
+
+    testWidgets('a tight cluster of modern renderings gets the labelled plate', (t) async {
+      FilmMapStore.debugSet({
+        'modern_clean': const Offset(-0.80, 0.50),
+        'modern_vivid': const Offset(-0.62, 0.64),
+        'modern_soft': const Offset(-0.62, 0.36),
+      });
+      await openEditor(t);
+      await openMap(t);
+      await settle(t, 10);
+      expect(find.byKey(const ValueKey('modern-plate')), findsOneWidget);
+      expect(find.descendant(of: find.byKey(const ValueKey('modern-plate')), matching: find.text('现代')), findsOneWidget);
     });
 
     test('paint order: nearest the finger on top, the selected one always last', () {

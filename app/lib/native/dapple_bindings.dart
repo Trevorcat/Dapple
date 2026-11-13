@@ -109,6 +109,10 @@ typedef _HdrProbe = ffi.Int32 Function(
     ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<ffi.Uint8>);
 typedef _HdrProbeD = int Function(
     ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<ffi.Uint8>);
+typedef _WideProbe = ffi.Int32 Function(
+    ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<ffi.Float>);
+typedef _WideProbeD = int Function(
+    ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<ffi.Float>);
 
 typedef _RenderFrame = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
     ffi.Pointer<DappleFrameRequestStruct>, ffi.Pointer<DappleImageStruct>, ffi.Pointer<ffi.Pointer<Utf8>>);
@@ -122,6 +126,13 @@ typedef _Previews = ffi.Int32 Function(
     ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Int32, ffi.Pointer<DappleImageStruct>);
 typedef _PreviewsD = int Function(
     ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, int, ffi.Pointer<DappleImageStruct>);
+// dapple_session_base_previews(session, params_json, const char* const* base_ids, n, long_edge, DappleImage* out)
+typedef _BasePreviews = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<ffi.Pointer<Utf8>>, ffi.Int32,
+    ffi.Int32, ffi.Pointer<DappleImageStruct>);
+typedef _BasePreviewsD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<ffi.Pointer<Utf8>>, int, int,
+    ffi.Pointer<DappleImageStruct>);
+typedef _BasePreviewsCancel = ffi.Void Function(ffi.Pointer<DappleSessionStruct>);
+typedef _BasePreviewsCancelD = void Function(ffi.Pointer<DappleSessionStruct>);
 typedef _TonePreviews = ffi.Int32 Function(
     ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Int32, ffi.Float, ffi.Pointer<DappleImageStruct>);
 typedef _TonePreviewsD = int Function(
@@ -212,6 +223,9 @@ class DappleBindings {
         sessionHdrHeadroom = lib.providesSymbol('dapple_session_hdr_headroom')
             ? lib.lookupFunction<_HdrProbe, _HdrProbeD>('dapple_session_hdr_headroom')
             : null,
+        sessionWideGamutFraction = lib.providesSymbol('dapple_session_wide_gamut_fraction')
+            ? lib.lookupFunction<_WideProbe, _WideProbeD>('dapple_session_wide_gamut_fraction')
+            : null,
         sessionCancel = lib.providesSymbol('dapple_session_cancel') ? lib.lookupFunction<_Cancel, _CancelD>('dapple_session_cancel') : null,
         sessionInfoJson = lib.lookupFunction<_Info, _Info>('dapple_session_info_json'),
         sessionAutoJson = lib.lookupFunction<_Auto, _AutoD>('dapple_session_auto_json'),
@@ -241,6 +255,12 @@ class DappleBindings {
             : null,
         sessionFilmPadJson = lib.providesSymbol('dapple_session_film_pad_json')
             ? lib.lookupFunction<_AnalyzeP, _AnalyzePD>('dapple_session_film_pad_json')
+            : null,
+        sessionBasePreviews = lib.providesSymbol('dapple_session_base_previews')
+            ? lib.lookupFunction<_BasePreviews, _BasePreviewsD>('dapple_session_base_previews')
+            : null,
+        sessionBasePreviewsCancel = lib.providesSymbol('dapple_session_base_previews_cancel')
+            ? lib.lookupFunction<_BasePreviewsCancel, _BasePreviewsCancelD>('dapple_session_base_previews_cancel')
             : null,
         sessionAnalyzeParamsJson = lib.providesSymbol('dapple_session_analyze_params_json')
             ? lib.lookupFunction<_AnalyzeP, _AnalyzePD>('dapple_session_analyze_params_json')
@@ -326,6 +346,7 @@ class DappleBindings {
   final _ExportExD? sessionExportJpegEx; // export with Exif / ICC (metadata options JSON); null when the library predates it
   final _ExportHdrExD? sessionExportJpegHdrEx;
   final _HdrProbeD? sessionHdrHeadroom;
+  final _WideProbeD? sessionWideGamutFraction;
   final _RenderFrameD? sessionRenderFrame;
   final _PerfConfD? perfConfigure;
   final _PerfConf1D? threadBackground;
@@ -335,6 +356,8 @@ class DappleBindings {
   final _Info0D? perfInfoJson;
   final _Info? sessionAnalyzeJson;
   final _AnalyzePD? sessionAnalyzeParamsJson;
+  final _BasePreviewsD? sessionBasePreviews; // batch swatches of rendering bases (one small interactive frame per base id)
+  final _BasePreviewsCancelD? sessionBasePreviewsCancel; // lock-free, any thread
 
   /// dapple_session_film_pad_json(session, params_json): the film pads' labels and effective ranges (optional symbol).
   final _AnalyzePD? sessionFilmPadJson;

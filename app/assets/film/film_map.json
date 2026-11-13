@@ -120,27 +120,27 @@
     "code": "R64"
   },
   "modern_clean": {
-    "x": -0.8,
-    "y": 0.5,
+    "x": -0.281,
+    "y": 0.424,
     "type": "modern",
     "kind": "modern",
     "code": "M-CLEAR",
-    "measured": false
+    "measured": true
   },
   "modern_vivid": {
-    "x": -0.52,
-    "y": 0.74,
+    "x": 0.541,
+    "y": 0.746,
     "type": "modern",
     "kind": "modern",
     "code": "M-VIVID",
-    "measured": false
+    "measured": true
   },
   "modern_soft": {
-    "x": -0.52,
-    "y": 0.32,
+    "x": -0.747,
+    "y": 0.02,
     "type": "modern",
     "kind": "modern",
     "code": "M-SOFT",
-    "measured": false
+    "measured": true
   }
 }

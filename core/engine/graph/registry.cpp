@@ -33,7 +33,7 @@ NodeRegistry::NodeRegistry() {
   const ParamMask TONE = P.mask({"contrast", "highlights", "shadows", "whites", "blacks"});
   const ParamMask WB = P.mask({"temp", "tint"});
   ParamMask COLOUR = P.mask({"modern", "vibrance", "saturation", "look", "lookStrength", "palette", "curve_rgb", "curve_r",
-                             "curve_g", "curve_b", "lutAmount"});
+                             "curve_g", "curve_b", "lutAmount", "ctx.outSpace"});
   COLOUR.add(byPrefix(P, "hsl_")).add(byPrefix(P, "gr_")).add(byPrefix(P, "cv_"));
   const ParamMask LOOK = P.mask({"look", "lookStrength", "palette"});
   const ParamMask FILMCTX = P.mask({"ctx.filmActive", "ctx.filmOnly"});
@@ -124,7 +124,7 @@ NodeRegistry::NodeRegistry() {
   }
   {
     ParamMask m = FRAME;
-    m.add(P.mask({"vignette"}));
+    m.add(P.mask({"vignette", "ctx.outSpace"}));
     NodeDesc& d = def(NodeType::Vignette, "Vignette", Domain::Image, Footprint::Point, 1, 1, m);
     d.usesGeometry = true;
   }

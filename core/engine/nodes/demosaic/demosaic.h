@@ -43,7 +43,31 @@ struct Desc {
   const std::atomic<std::uint64_t>* cancelCur = nullptr;  // latest-wins cancellation (engine CancelToken pattern): the work stops between tiles when *cancelCur != cancelMine
   std::uint64_t cancelMine = 0;
   bool clampOut = true;           // clip the output to [0, 1] like LibRaw's 16-bit output
+  bool half = false;              // X-Trans only: half-resolution reconstruction (docs 32.12): ROI and output are in half-resolution pixels (output pixel (x, y) = sensor pixels 2x..2x+1, 2y..2y+1)
 };
+
+// Half-resolution X-Trans reconstruction: the 6 x 6 pattern repeats every 3 output pixels, so there are 9 phases; each output pixel is a fixed linear combination of the
+// 8 x 8 sensor samples 2x-3 .. 2x+4 (and 2y-3 .. 2y+4), designed per phase by least squares against a target frequency response (see demosaic_half.inc).
+// w[phase][channel][tap]: phase = (y % 3) * 3 + (x % 3) of the output pixel, tap = row * 8 + column of the window, channel R, G, B (before the matrix).
+// g[phase][colour][tap]: positive weights (sum 1 per colour) of the clip fallback; sup[phase][tap] = 1 where a main weight is non-zero.
+struct HalfTables {
+  float w[9][3][64];
+  float g[9][3][64];
+  float sup[9][64];
+  float cen[9][64];  // 1 on the green taps of the central 4 x 4 of the window: the overshoot clamp of the reconstructed green is their min / max
+};
+struct HalfDesign {
+  float gF0 = 0.25f, gF1 = 0.5f;   // green (luminance) band: flat below gF0 cycles / sensor pixel, zero above gF1 (output Nyquist is 0.25): no anti-alias cut, like a sharp decimation
+  float cF0 = 0.08f, cF1 = 0.22f;  // colour-difference band
+  float passW = 1.f, transW = 0.2f, stopW = 0.1f, ridge = 2e-3f;
+  float gBoost = 0.6f;             // green target gain at the output Nyquist above 1 (peaking, grows with f^2)
+};
+// Design the tables for a pattern (cfa3: colour per cell, 0 R, 1 G, 2 B). halfTables() builds once per pattern and caches.
+void buildHalfTables(const std::uint8_t* cfa3, const HalfDesign& hd, HalfTables& out);
+const HalfTables& halfTables(const Desc& d);
+void demosaicHalf(const Desc& d, Rect roi, float* out, std::size_t strideFloats, int threads = 0);  // CPU node of the half-resolution path (demosaic() calls it when d.half)
+constexpr float kHalfOvershoot = 0.15f;  // the reconstructed green may exceed the min / max of the central green samples by this fraction of their range (no ringing at steps)
+constexpr float kHalfClip = 0.995f;  // scaled value from which a sample counts as clipped (clip fallback of the half-resolution path)
 
 constexpr int kHaloBayer = 4, kHaloXTrans = 6, kHaloXTransCand = 9;
 inline int halo(Cfa c) { return c == Cfa::Bayer ? kHaloBayer : kHaloXTrans; }

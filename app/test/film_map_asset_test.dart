@@ -3,18 +3,29 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dapple/model/film_map.dart' show kModernCluster;
 import 'package:dapple/model/film_names.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test('film_map.json covers the camera stocks, in range, codes match film_names.dart', () {
     final all = jsonDecode(File('assets/film/film_map.json').readAsStringSync()) as Map<String, dynamic>;
-    // the modern renderings (kind: modern) sit in a separate cluster, not at measured positions
+    // the modern renderings (kind: modern) are measured on the same axes as the stocks (gen_film_map.py), and the Dart fallback carries the same numbers
     final modern = {for (final e in all.entries) if ((e.value as Map)['kind'] == 'modern') e.key: e.value};
     expect(modern.keys.toSet(), {'modern_clean', 'modern_vivid', 'modern_soft'});
-    for (final v in modern.values) {
-      expect((v as Map)['measured'], isFalse);
+    for (final e in modern.entries) {
+      final v = e.value as Map<String, dynamic>;
+      expect(v['measured'], isTrue);
+      expect(v['type'], 'modern');
+      expect((v['x'] as num).abs(), lessThanOrEqualTo(1.0));
+      expect((v['y'] as num).abs(), lessThanOrEqualTo(1.0));
+      expect(v['code'], startsWith('M-'));
+      final fb = kModernCluster[e.key]!;
+      expect(fb.dx, closeTo((v['x'] as num).toDouble(), 0.0011), reason: '${e.key}: kModernCluster (film_map.dart) is the measured x');
+      expect(fb.dy, closeTo((v['y'] as num).toDouble(), 0.0011), reason: '${e.key}: kModernCluster (film_map.dart) is the measured y');
     }
+    // the stocks did not move when the modern renderings were measured: 20 stocks, each still where the catalog measurement put it
+    expect(all.length - modern.length, 20);
     final m = {for (final e in all.entries) if (!modern.containsKey(e.key)) e.key: e.value};
     final stocks = kFilmDisplayNames.keys.where((id) => File('../core/data/film/profiles/$id.json').readAsStringSync().contains('"stage": "filming"'));
     expect(m.keys.toSet(), stocks.toSet());

@@ -61,6 +61,25 @@ inline const Mat3& srgbToProPhoto() {
   return m;
 }
 
+// Display P3 (P3 primaries, D65 white, sRGB transfer function): linear P3 <-> XYZ D65, and the sRGB <-> P3 conversions (export colour space).
+inline constexpr Mat3 kP3ToXyzD65{{{0.4865709f, 0.2656677f, 0.1982173f},
+                                   {0.2289746f, 0.6917385f, 0.0792869f},
+                                   {0.0000000f, 0.0451134f, 1.0439444f}}};
+inline constexpr Mat3 kXyzD65ToP3{{{2.4934969f, -0.9313836f, -0.4027108f},
+                                   {-0.8294890f, 1.7626641f, 0.0236247f},
+                                   {0.0358458f, -0.0761724f, 0.9568845f}}};
+inline const Mat3& srgbToP3() {
+  static const Mat3 m = mul(kXyzD65ToP3, kSrgbToXyzD65);
+  return m;
+}
+inline const Mat3& p3ToSrgb() {
+  static const Mat3 m = mul(kXyzD65ToSrgb, kP3ToXyzD65);
+  return m;
+}
+inline float p3Luma(const float* rgb) {
+  return 0.2289746f * rgb[0] + 0.6917385f * rgb[1] + 0.0792869f * rgb[2];
+}
+
 inline float proPhotoLuma(const float* rgb) {
   return 0.2880402f * rgb[0] + 0.7118741f * rgb[1] + 0.0000857f * rgb[2];
 }
@@ -75,6 +94,10 @@ inline float srgbEncode(float x) {
 inline float srgbDecode(float x) {
   return x <= 0.04045f ? x / 12.92f : std::pow((x + 0.055f) / 1.055f, 2.4f);
 }
+
+// The transfer functions extended to the whole real line (odd symmetry): for values outside [0, 1] of a wide-gamut colour held in sRGB primaries.
+inline float srgbEncodeExt(float x) { return x < 0.f ? -srgbEncode(-x) : (x > 1.f ? 1.055f * std::pow(x, 1.f / 2.4f) - 0.055f : srgbEncode(x)); }
+inline float srgbDecodeExt(float x) { return x < 0.f ? -srgbDecode(-x) : srgbDecode(x); }
 
 // OKLab (Björn Ottosson) from/to linear sRGB. Works for out-of-gamut values.
 inline void linearSrgbToOklab(const float in[3], float out[3]) {

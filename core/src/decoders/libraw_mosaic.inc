@@ -451,18 +451,30 @@ Result<SourceImage> decodePreviewFromMosaic(const std::filesystem::path& path, c
     if (embedded.valid()) embedded.wait();
     return refuse(m->cfa == CfaKind::None ? m->reason : std::string("OpcodeList3 (lens warp): the picture needs the whole frame"));
   }
-  if (m->cfa == CfaKind::XTrans && options.wantLongEdge > 0) {  // 3x3 blocks give a third of the width, LibRaw's half-size a half: sharper, so it keeps the 2x view
+  // X-Trans: 3 x 3 blocks give a third of the width, which is softer than a half-size decode, so a request well above that size (the 2x view) is served by the
+  // half-resolution reconstruction from the same cached mosaic (docs 32.12; DAPPLE_XTRANS_HALF=off keeps LibRaw's half-size decode for that request)
+  bool useHalf = false;
+  {
+    const char* he = std::getenv("DAPPLE_XTRANS_HALF");
+    useHalf = m->cfa == CfaKind::XTrans && he && std::strcmp(he, "all") == 0;  // A/B: every preview size from the half-resolution reconstruction
+  }
+  if (!useHalf && m->cfa == CfaKind::XTrans && options.wantLongEdge > 0) {
     const int own = std::max(m->hasCrop ? m->cropW : m->width, m->hasCrop ? m->cropH : m->height) / 3;
     if (double(options.wantLongEdge) > 1.25 * own) {
-      if (embedded.valid()) embedded.wait();
-      return refuse("X-Trans: the half-size LibRaw picture is sharper than the block reduction at this size");
+      const char* he = std::getenv("DAPPLE_XTRANS_HALF");
+      if (he && std::strcmp(he, "off") == 0) {
+        if (embedded.valid()) embedded.wait();
+        return refuse("X-Trans: the half-size LibRaw picture is sharper than the block reduction at this size");
+      }
+      useHalf = true;
     }
   }
   const auto t1 = std::chrono::steady_clock::now();
   SourceImage out;
   out.meta = m->meta;
   out.sceneReferred = true;
-  out.linear = demosaic::binnedOriented(*m);
+  out.linear = useHalf ? demosaic::halfOriented(*m) : demosaic::binnedOriented(*m);
+  if (out.linear.empty()) out.linear = demosaic::binnedOriented(*m);
   out.meta.dngCorrections = m->dngCorrections;
   suppressShadowChroma(out.linear);
   const auto t2 = std::chrono::steady_clock::now();
@@ -470,7 +482,7 @@ Result<SourceImage> decodePreviewFromMosaic(const std::filesystem::path& path, c
   {
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     char ln[200];
-    std::snprintf(ln, sizeof ln, "preview %s: mosaic %.0f ms, block reduction %.0f ms, anchor %.0f ms", pathToUtf8(path.filename()).c_str(), ms(t0, t1), ms(t1, t2), ms(t2, std::chrono::steady_clock::now()));
+    std::snprintf(ln, sizeof ln, "preview %s: mosaic %.0f ms, %s %.0f ms, anchor %.0f ms", pathToUtf8(path.filename()).c_str(), ms(t0, t1), useHalf ? "half-resolution reconstruction" : "block reduction", ms(t1, t2), ms(t2, std::chrono::steady_clock::now()));
 #if defined(__ANDROID__)
     __android_log_write(ANDROID_LOG_INFO, "dapple_demosaic", ln);
 #elif defined(__APPLE__)

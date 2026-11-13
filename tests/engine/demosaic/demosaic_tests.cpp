@@ -466,6 +466,62 @@ int testWirePreview() {
   return g_fail ? 1 : 0;
 }
 
+
+// The half-resolution X-Trans picture served for the 2x-view request against LibRaw's half-size decode, on every public X-Trans sample: gradient-energy sharpness
+// (the proxy of wire_preview) >= 1.0 and the low-frequency colour (4 x 4 block means, dE2000 at a viewing exposure) <= 2.0; exit 77 without sample files.
+int testHalfReal() {
+  const auto files = allSampleFiles();
+  int ran = 0;
+  setEnvVar("DAPPLE_ANCHOR", "off");
+  for (const auto& f : files) {
+    if (f.extension() != ".RAF" && f.extension() != ".raf") continue;
+    if (auto mm = decodeRawMosaic(f); !mm || mm->cfa != CfaKind::XTrans) continue;  // Bayer Fuji bodies (X-A7) keep the 2 x 2 block reduction
+    DecodeOptions o;
+    o.quality = DecodeQuality::Preview;
+    setEnvVar("DAPPLE_PREVIEW_MOSAIC", "off");
+    auto a = makeLibRawDecoder()->decode(f, o);
+    setEnvVar("DAPPLE_PREVIEW_MOSAIC", "on");
+    o.wantLongEdge = 4096;
+    clearMosaicCache();
+    std::string why;
+    auto b = decodePreviewFromMosaic(f, o, &why);
+    if (!a || !b) {
+      std::printf("  %s: %s\n", f.filename().string().c_str(), a ? ("not on the mosaic preview (" + why + ")").c_str() : "LibRaw preview failed");
+      continue;
+    }
+    const ImageF &A = a->linear, &B = b->linear;
+    if (A.width != B.width || A.height != B.height) {
+      CHECK(false, "%s: size %dx%d vs LibRaw %dx%d", f.filename().string().c_str(), B.width, B.height, A.width, A.height);
+      continue;
+    }
+    auto grad = [](const ImageF& im) {
+      const int cx = im.width / 2, cy = im.height / 2, h = std::min(512, std::min(cx, cy) - 2);
+      double sum = 0;
+      auto Y = [&](int x, int y) { return 0.2880 * im.row(y)[3 * x] + 0.7119 * im.row(y)[3 * x + 1]; };
+      for (int y = cy - h; y < cy + h; ++y) for (int x = cx - h; x < cx + h; ++x) sum += std::hypot(Y(x + 1, y) - Y(x, y), Y(x, y + 1) - Y(x, y));
+      return sum;
+    };
+    const double ratio = grad(B) / grad(A);
+    double sumY = 0;
+    long n = 0;
+    for (int y = 0; y < A.height; y += 3) for (int x = 0; x < A.width; x += 3) sumY += 0.2880 * A.row(y)[3 * x] + 0.7119 * A.row(y)[3 * x + 1], ++n;
+    const float g = float(0.18 / std::max(1e-4, sumY / double(n)));
+    double lfSum = 0;
+    long lfN = 0;
+    for (int y = 0; y + 4 <= A.height; y += 4)
+      for (int x = 0; x + 4 <= A.width; x += 4) {
+        float pa[3] = {0, 0, 0}, pb[3] = {0, 0, 0};
+        for (int v = 0; v < 4; ++v) for (int u = 0; u < 4; ++u) for (int k = 0; k < 3; ++k) pa[k] += A.row(y + v)[3 * (x + u) + k] / 16.f, pb[k] += B.row(y + v)[3 * (x + u) + k] / 16.f;
+        lfSum += demo::dE2000(demo::toLab(pa, g), demo::toLab(pb, g)), ++lfN;
+      }
+    std::printf("  %s: half picture %dx%d, sharpness ours / LibRaw %.3f, low-frequency dE2000 mean %.2f\n", f.filename().string().c_str(), B.width, B.height, ratio, lfSum / double(lfN));
+    CHECK(ratio >= 1.0, "%s: sharpness ratio %.3f", f.filename().string().c_str(), ratio);
+    CHECK(lfSum / double(lfN) <= 2.0, "%s: low-frequency dE2000 %.2f", f.filename().string().c_str(), lfSum / double(lfN));
+    ++ran;
+  }
+  return ran ? (g_fail ? 1 : 0) : 77;
+}
+
 // The anchor read from the embedded preview at 1/8 scale (DC coefficients) against the full decode of the preview: within 0.02 EV, same tier, on every sample
 int testWireAnchorFast() {
   std::vector<std::filesystem::path> files;  // every public sample, at the half-size open (the anchor is the same code on every path)
@@ -668,6 +724,124 @@ void testBlockZone() {
     const double pb = 10 * std::log10(1.0 / std::max(eBlock / double(cnt), 1e-12)), pn = 10 * std::log10(1.0 / std::max(eNode / double(cnt), 1e-12));
     std::printf("  block preview zone plate %s: luminance PSNR vs the ideal reduction %.1f dB (demosaic node, box-averaged: %.1f dB)\n", c == Cfa::Bayer ? "bayer " : "xtrans", pb, pn);
     CHECK(pb >= 20.0, "block-reduced luminance PSNR %.1f dB", pb);
+  }
+}
+
+
+// ---- half-resolution X-Trans path (docs 32.12) -------------------------------------------------------------------------------------------
+struct HalfZone { double yPsnr = 0, cPsnr = 0; };
+// Luminance / chroma error of a half-resolution picture (w/2 x h/2, interleaved) against the ideal reduction of the scene (2 x 2 box mean of the truth).
+HalfZone halfZoneErr(const Synth& s, const std::vector<float>& half) {
+  const int ow = s.w / 2, oh = s.h / 2;
+  double eY = 0, eC = 0;
+  std::size_t cnt = 0;
+  for (int y = 4; y < oh - 4; ++y)
+    for (int x = 4; x < ow - 4; ++x) {
+      double ideal[3] = {0, 0, 0};
+      for (int v = 0; v < 2; ++v)
+        for (int u = 0; u < 2; ++u)
+          for (int k = 0; k < 3; ++k) ideal[k] += s.truth[(std::size_t(2 * y + v) * s.w + 2 * x + u) * 3 + k] / 4.0;
+      const float* p = &half[(std::size_t(y) * ow + x) * 3];
+      auto Y = [](const double* q) { return 0.2880 * q[0] + 0.7119 * q[1] + 0.0001 * q[2]; };
+      const double dy = (0.2880 * p[0] + 0.7119 * p[1] + 0.0001 * p[2]) - Y(ideal);
+      const double dr = (p[0] - p[1]) - (ideal[0] - ideal[1]), db = (p[2] - p[1]) - (ideal[2] - ideal[1]);
+      eY += dy * dy, eC += 0.5 * (dr * dr + db * db);
+      ++cnt;
+    }
+  return {10 * std::log10(1.0 / std::max(eY / double(cnt), 1e-12)), 10 * std::log10(1.0 / std::max(eC / double(cnt), 1e-12))};
+}
+
+std::vector<float> halfRun(Desc d, Rect r, int threads = 0) {
+  d.half = true;
+  return run(d, r, threads);
+}
+
+// Zone plate: the half-resolution reconstruction against the ideal 2:1 reduction of the scene, next to the full demosaic node box-averaged 2 x 2 (what a
+// "demosaic then decimate" gives with the existing node). Gates: chroma PSNR not more than 1 dB below the box-averaged node's, luminance PSNR >= 12 dB (guard).
+void testHalfZone() {
+  const int W = 300, H = 300;
+  Synth s(W, H, Cfa::XTrans, zoneScene(W, H));
+  const auto node = run(s.d, {0, 0, W, H});
+  std::vector<float> box(std::size_t(W / 2) * (H / 2) * 3);
+  for (int y = 0; y < H / 2; ++y)
+    for (int x = 0; x < W / 2; ++x)
+      for (int k = 0; k < 3; ++k) {
+        double a = 0;
+        for (int v = 0; v < 2; ++v)
+          for (int u = 0; u < 2; ++u) a += node[(std::size_t(2 * y + v) * W + 2 * x + u) * 3 + k] / 4.0;
+        box[(std::size_t(y) * (W / 2) + x) * 3 + k] = float(a);
+      }
+  const auto half = halfRun(s.d, {0, 0, W / 2, H / 2});
+  const HalfZone a = halfZoneErr(s, half), b = halfZoneErr(s, box);
+  std::printf("  half zone plate xtrans: luminance PSNR %.1f dB, chroma PSNR %.1f dB | demosaic node box-averaged: %.1f dB, %.1f dB\n", a.yPsnr, a.cPsnr, b.yPsnr, b.cPsnr);
+  // The reference (2 x 2 box mean of the scene) is itself a soft low-pass: the node box-averaged matches it by construction, a deliberately sharper picture (the
+  // design peaks the response toward the output Nyquist so the 2x view is at least as sharp as a half-size decode, test half_real) cannot. The luminance gate is a
+  // regression guard; the colour gate (moire, false colour) is the real comparison.
+  CHECK(a.yPsnr >= 12.0, "half luminance PSNR %.1f below the guard", a.yPsnr);
+  CHECK(a.cPsnr >= b.cPsnr - 1.0, "half chroma PSNR %.1f vs box-averaged node %.1f", a.cPsnr, b.cPsnr);
+}
+
+// Region of interest and thread invariance of the half path: any rectangle equals the same rectangle of the whole frame, bit for bit.
+void testHalfTiles() {
+  Synth s(602, 514, Cfa::XTrans, zoneScene(602, 514));
+  s.d.half = true;
+  const int ow = s.w / 2, oh = s.h / 2;
+  const auto whole = run(s.d, {0, 0, ow, oh}, 1);
+  int bad = 0;
+  unsigned seed = 5;
+  auto rnd = [&](int n) { seed = seed * 1664525u + 1013904223u; return int((seed >> 8) % unsigned(n)); };
+  for (int k = 0; k < 30; ++k) {
+    Rect r;
+    r.x0 = k < 4 ? (k & 1 ? 0 : ow - 11) : rnd(ow - 8);
+    r.y0 = k < 4 ? (k & 2 ? 0 : oh - 9) : rnd(oh - 8);
+    r.x1 = std::min(ow, r.x0 + 1 + rnd(160));
+    r.y1 = std::min(oh, r.y0 + 1 + rnd(160));
+    const auto part = run(s.d, r, 3);
+    for (int y = r.y0; y < r.y1; ++y)
+      for (int x = r.x0; x < r.x1; ++x)
+        for (int ch = 0; ch < 3; ++ch) bad += part[(std::size_t(y - r.y0) * r.w() + (x - r.x0)) * 3 + ch] != whole[(std::size_t(y) * ow + x) * 3 + ch];
+  }
+  const auto mt = run(s.d, {0, 0, ow, oh}, 4);
+  for (std::size_t i = 0; i < whole.size(); ++i) bad += mt[i] != whole[i];
+  std::printf("  half tiles xtrans: 30 random regions + 4 threads vs the whole frame, %d differing values\n", bad);
+  CHECK(bad == 0, "half region / thread result differs in %d values", bad);
+}
+
+// Flat fields are exact (white balance 1), a grey step stays grey, and a clipped blob gives no coloured specks.
+void testHalfFlatClip() {
+  {
+    Synth s(120, 120, Cfa::XTrans, flatScene(120, 120, 0.2f, 0.5f, 0.7f));
+    const auto out = halfRun(s.d, {0, 0, 60, 60});
+    double worst = 0;
+    for (std::size_t i = 0; i < out.size(); ++i) worst = std::max(worst, double(std::fabs(out[i] - (i % 3 == 0 ? 0.2f : i % 3 == 1 ? 0.5f : 0.7f))));
+    std::printf("  half flat field: worst deviation %.5f\n", worst);
+    CHECK(worst < 0.003, "flat field deviates by %.5f", worst);
+  }
+  {
+    std::vector<float> t = flatScene(96, 96, 0.3f, 0.3f, 0.3f);
+    for (int y = 30; y < 66; ++y)
+      for (int x = 30; x < 66; ++x) t[(std::size_t(y) * 96 + x) * 3] = t[(std::size_t(y) * 96 + x) * 3 + 1] = t[(std::size_t(y) * 96 + x) * 3 + 2] = 1.f;
+    Synth s(96, 96, Cfa::XTrans, t);
+    s.d.wb[0] = 1.8f, s.d.wb[2] = 1.6f;
+    for (int y = 0; y < 96; ++y)
+      for (int x = 0; x < 96; ++x) {
+        const int col = s.d.cfa3[(y % 6) * 6 + x % 6];
+        const bool in = x >= 30 && x < 66 && y >= 30 && y < 66;
+        const float v = in ? (col == 1 ? 0.62f : 1.f) : 0.3f / (col == 0 ? 1.8f : col == 2 ? 1.6f : 1.f);
+        s.raw[std::size_t(y) * 96 + x] = std::uint16_t(std::lround(512.f + v * (16383.f - 512.f)));
+      }
+    const auto out = halfRun(s.d, {0, 0, 48, 48});
+    int bad = 0;
+    double worst = 0;
+    for (int y = 19; y < 30; ++y)  // output pixels whose whole window is inside the blob (sensor 38..60)
+      for (int x = 19; x < 30; ++x) {
+        const float* p = &out[(std::size_t(y) * 48 + x) * 3];
+        const double ch = std::max({std::fabs(p[0] - 1.0), std::fabs(p[1] - 0.62), std::fabs(p[2] - 1.0)});
+        worst = std::max(worst, ch);
+        if (ch > 0.03) ++bad;
+      }
+    std::printf("  half clipped blob: interior pixels deviating > 0.03 from the data colour: %d of 121 (worst %.3f)\n", bad, worst);
+    CHECK(bad == 0, "colour shift inside a clipped highlight: %d pixels", bad);
   }
 }
 
@@ -875,11 +1049,69 @@ int testGpuReal() {
   if (!ran) return 77;
   return g_fail ? 1 : 0;
 }
+
+// Half-resolution path on the GPU: parity with the CPU node (fp32 and RGBA16F), tile / region invariance (bit-exact), including a clipped block (fallback path)
+int testHalfGpu() {
+  std::string why;
+  auto dev = makeDevice(why);
+  if (!dev) return 77;
+  std::string err;
+  auto gpu = GpuDemosaic::create(*dev, false, err);
+  auto gpu16 = GpuDemosaic::create(*dev, true, err);
+  Synth s(666, 546, Cfa::XTrans, zoneScene(666, 546));
+  const float mtx[9] = {1.3f, -0.2f, -0.1f, -0.1f, 1.2f, -0.1f, 0.0f, -0.3f, 1.3f};
+  std::memcpy(s.d.m, mtx, sizeof mtx);
+  s.d.wb[0] = 1.8f, s.d.wb[2] = 1.4f;
+  for (int y = 200; y < 290; ++y)  // a block where red / blue clip (and some green): the clip fallback
+    for (int x = 300; x < 400; ++x) {
+      const int col = s.d.cfa3[(y % 6) * 6 + x % 6];
+      s.raw[std::size_t(y) * s.w + x] = std::uint16_t(col == 1 ? (x % 5 == 0 ? 16383 : 9000) : 16383);
+    }
+  s.d.half = true;
+  const int ow = s.w / 2, oh = s.h / 2;
+  const auto cpu = run(s.d, {0, 0, ow, oh});
+  std::vector<float> g(cpu.size()), g16(cpu.size()), tiled(cpu.size());
+  GpuStats st;
+  hal::Status rc = gpu->run(s.d, {0, 0, ow, oh}, g.data(), std::size_t(ow) * 3, 128, &st);
+  CHECK(rc == hal::Status::Ok, "gpu half run failed: %s", gpu->error().c_str());
+  if (rc != hal::Status::Ok) return 1;
+  double p99, mx;
+  const double mean = meanDe(g, cpu, &p99, &mx);
+  std::printf("  half gpu vs cpu (fp32 output): mean dE2000 %.5f p99 %.5f max abs %.2e, %d tiles\n", mean, p99, mx, st.tiles);
+  CHECK(mean <= 0.1 && p99 <= 1.0, "half parity budget exceeded: mean %.4f p99 %.4f", mean, p99);
+  CHECK(mx < 2e-3 || p99 < 0.5, "half max abs difference %.2e", mx);
+  rc = gpu16->run(s.d, {0, 0, ow, oh}, g16.data(), std::size_t(ow) * 3, 128, &st);
+  CHECK(rc == hal::Status::Ok, "gpu half fp16 run failed");
+  if (rc == hal::Status::Ok) {
+    const double m16 = meanDe(g16, cpu, &p99, &mx);
+    std::printf("  half gpu vs cpu (RGBA16F output): mean dE2000 %.5f p99 %.5f\n", m16, p99);
+    CHECK(m16 <= 0.1 && p99 <= 1.0, "half fp16 parity budget exceeded");
+  }
+  CHECK(gpu->run(s.d, {0, 0, ow, oh}, tiled.data(), std::size_t(ow) * 3, 48) == hal::Status::Ok, "tiled");
+  std::size_t bad = 0;
+  for (std::size_t i = 0; i < g.size(); ++i) bad += g[i] != tiled[i];
+  std::printf("  half gpu tiles: 128 px tiles vs 48 px tiles: %zu differing values\n", bad);
+  CHECK(bad == 0, "half tile seams: %zu differing values", bad);
+  const Rect r{37, 41, 211, 199};
+  std::vector<float> part(std::size_t(r.w()) * r.h() * 3);
+  CHECK(gpu->run(s.d, r, part.data(), std::size_t(r.w()) * 3, 100) == hal::Status::Ok, "roi");
+  std::size_t bad2 = 0;
+  for (int y = r.y0; y < r.y1; ++y)
+    for (int x = r.x0; x < r.x1; ++x)
+      for (int ch = 0; ch < 3; ++ch) bad2 += part[(std::size_t(y - r.y0) * r.w() + (x - r.x0)) * 3 + ch] != g[(std::size_t(y) * ow + x) * 3 + ch];
+  CHECK(bad2 == 0, "half roi differs from the whole frame in %zu values", bad2);
+  // the full-resolution path still works on the same device after the half path (pipelines / buffers re-created)
+  s.d.half = false;
+  const auto full = run(s.d, {0, 0, 120, 120});
+  std::vector<float> gf(full.size());
+  CHECK(gpu->run(s.d, {0, 0, 120, 120}, gf.data(), 120 * 3, 128) == hal::Status::Ok, "full after half");
+  return g_fail ? 1 : 0;
+}
 #endif
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::vector<std::string> all = {"flat", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu"};
+  const std::vector<std::string> all = {"flat", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu", "half_zone", "half_tiles", "half_flatclip", "half_real", "half_gpu"};
   std::vector<std::string> ids;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--list") {
@@ -901,6 +1133,10 @@ int main(int argc, char** argv) {
     else if (id == "clip") testClip();
     else if (id == "hotfilter") testHotFilter();
     else if (id == "tiles") testTiles();
+    else if (id == "half_real") { const int r = testHalfReal(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "half_zone") testHalfZone();
+    else if (id == "half_tiles") testHalfTiles();
+    else if (id == "half_flatclip") testHalfFlatClip();
     else if (id == "threads") testThreads();
     else if (id == "cache") testCache();
     else if (id == "wire_region") { const int r = testWireRegion(); if (r == 77 && g_fail == before) return 77; }
@@ -913,6 +1149,7 @@ int main(int argc, char** argv) {
     else if (id == "gpu_parity") { const int r = testGpuParity(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "gpu_tiles") { const int r = testGpuTiles(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "gpu_real") { const int r = testGpuReal(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "half_gpu") { const int r = testHalfGpu(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_gpu") { const int r = testWireGpu(); if (r == 77 && g_fail == before) return 77; }
 #else
     else if (id.rfind("gpu_", 0) == 0) return 77;

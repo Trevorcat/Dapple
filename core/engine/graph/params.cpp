@@ -233,6 +233,11 @@ ParamRegistry::ParamRegistry() {
         in.ctx.fullLongEdge = v ? 6000 : 4000;
         return true;
       });
+  add("ctx.outSpace", C, [](const ParamInputs& in, Hasher& h) { h.i32(in.edit.outputSpace); },
+      [](ParamInputs& in, int v) {
+        in.edit.outputSpace = v ? 1 : 0;
+        return true;
+      });
   add("ctx.filmKeyEv", C, [](const ParamInputs& in, Hasher& h) { h.f32(in.edit.filmKeyEv); },
       [](ParamInputs& in, int v) {
         in.edit.filmKeyEv = v ? 0.75f : -0.5f;

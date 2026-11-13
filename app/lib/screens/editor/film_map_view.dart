@@ -27,6 +27,7 @@ class FilmMapStore {
   /// Test hook: replace the positions.
   static void debugSet(Map<String, Offset>? p) {
     _positions = p;
+    BaseSwatches.mapPositions = p;
     _loading = null;
   }
 
@@ -40,7 +41,7 @@ class FilmMapStore {
       } catch (_) {
         text = null; // no asset: every stock goes on the automatic grid
       }
-      return _positions = parseFilmMap(text);
+      return _positions = BaseSwatches.mapPositions = parseFilmMap(text);
     }();
   }
 }
@@ -248,9 +249,14 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
     final f = _finger.value;
     final u = f == null ? null : Offset(_origin.dx + (f.dx - _origin.dx) / z, _origin.dy + (f.dy - _origin.dy) / z);
     final children = <Widget>[];
-    // the modern renderings' cluster: a soft plate behind them, so they read as one family that is not film
+    // The modern renderings: circles (film is rounded squares). Where their measured characters sit close together (a tight cluster) a soft plate
+    // behind them says "one family that is not film"; once they are spread over the map (measured positions) a plate would only cover
+    // unrelated stocks, so there is none.
     final mod = [for (final d in _dots) if (d.isModern) dotFraction(d)];
-    if (mod.isNotEmpty) {
+    final tight = mod.isNotEmpty &&
+        mod.map((p) => p.dx).reduce(math.max) - mod.map((p) => p.dx).reduce(math.min) < 0.3 &&
+        mod.map((p) => p.dy).reduce(math.max) - mod.map((p) => p.dy).reduce(math.min) < 0.3;
+    if (tight) {
       var l = double.infinity, tp = double.infinity, r = -double.infinity, bt = -double.infinity;
       for (final p in mod) {
         l = math.min(l, p.dx * w);

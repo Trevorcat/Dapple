@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../services/live_edit.dart';
+import '../services/safe_name.dart';
 import '../platform/platform_services.dart';
 import '../services/media_permission.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -1116,7 +1117,7 @@ class AppState extends ChangeNotifier {
     }
     if (ph.uri == null) throw '找不到原始文件';
     final dest = p.join(
-        _cache.path, 'src', '${DateTime.now().microsecondsSinceEpoch}_${ph.id.replaceAll(':', '_')}_${ph.name}');
+        _cache.path, 'src', '${DateTime.now().microsecondsSinceEpoch}_${safeFileStem(ph.id)}_${safeFileName(ph.name)}');
     await MediaBridge.copyToFile(ph.uri!, dest);
     return (path: dest, temp: true);
   }
@@ -1169,7 +1170,7 @@ class AppState extends ChangeNotifier {
     _scheduleDetect();
   }
 
-  String previewPathFor(Photo ph) => p.join(previews.path, '${ph.id.replaceAll(':', '_')}.jpg');
+  String previewPathFor(Photo ph) => p.join(previews.path, '${safeFileStem(ph.id)}.jpg');
 
   Future<void> _develop(Photo ph) async {
     ph.status = PhotoStatus.developing;
@@ -1265,15 +1266,40 @@ class AppState extends ChangeNotifier {
   // ---------------------------------------------------------------- export (publish / save)
   /// Renders a full-quality JPEG of [ph] into the exports cache. [cropOverride] applies a
   /// destination aspect ratio at export time only (requirements 4.11.2).
-  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
+  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation, bool wideGamut = false}) async {
     if (isDemo) return '/demo/${ph.id}.jpg';
     // A Motion Photo made from a video exports as a Motion Photo: the edited still plus the clip rendered with the same edit (film included).
     if (ph.kind == PhotoKind.live && ph.liveSrc != null && !isDemo) {
       final live = await exportLive(ph, longEdge: longEdge, cropOverride: cropOverride, stripLocation: stripLocation);
       if (live != null) return live;
     }
-    return exportStill(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr, stripLocation: stripLocation);
+    return exportStill(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr, stripLocation: stripLocation, wideGamut: wideGamut);
   }
+
+  final Map<String, Future<double>> _wideGamut = {};
+
+  /// Share (0..1) of the picture of [ph], after its edit, that has colour outside sRGB (what a Display P3 export would keep). 0 for a film look
+  /// (authored for sRGB), a Motion Photo, the demo. Cached per edit.
+  Future<double> wideGamutOf(Photo ph) {
+    if (isDemo || (ph.kind == PhotoKind.live && ph.liveSrc != null)) return Future.value(0);
+    final params = wireParams(ph);
+    final key = '${ph.id}|${jsonEncode(params)}';
+    return _wideGamut.putIfAbsent(key, () async {
+      try {
+        final src = await resolveSource(ph);
+        try {
+          return await DappleSession.wideGamutFraction(src.path, params);
+        } finally {
+          if (src.temp) _tryDelete(src.path);
+        }
+      } catch (_) {
+        return 0.0;
+      }
+    });
+  }
+
+  /// The wide-gamut export is offered when at least this share of the picture lies outside sRGB.
+  static const double wideGamutMinShare = 0.01;
 
   final Map<String, Future<double>> _hdrHeadroom = {};
 
@@ -1344,12 +1370,12 @@ class AppState extends ChangeNotifier {
   /// Renders a full-quality JPEG of the still of [ph] (no clip).
   /// [stripLocation] null = the setting "导出时去除位置信息" (default on, requirements 4.11.2: GPS is stripped unless the user keeps it). The file carries
   /// Exif (camera, exposure, capture time) and an sRGB profile; GPS only when the original has a fix and the location is kept.
-  Future<String> exportStill(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
+  Future<String> exportStill(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation, bool wideGamut = false}) async {
     final le = longEdge ?? settings.exportLongEdge; // 0 = original size
     final extra = <String, dynamic>{if (cropOverride != null && cropOverride != 'orig') 'crop': cropOverride};
     final params = wireParams(ph, override: extra);
     final strip = stripLocation ?? settings.stripLocation;
-    final tag = jsonEncode([params, le, settings.jpegQuality, if (hdr) 'uhdr', 'meta1', strip]).hashCode.toRadixString(16);
+    final tag = jsonEncode([params, le, settings.jpegQuality, if (hdr) 'uhdr', if (wideGamut) 'p3', 'meta1', strip]).hashCode.toRadixString(16);
     final out = p.join(exports.path, '${p.basenameWithoutExtension(ph.name)}_dapple_$tag.jpg');
     if (await File(out).exists()) return out;
     final src = await _resolveWithOriginal(ph);
@@ -1360,7 +1386,7 @@ class AppState extends ChangeNotifier {
           outLongEdge: le,
           quality: settings.jpegQuality,
           hdr: hdr,
-          exportJson: exportMetaJson(original: src.original, stripLocation: strip),
+          exportJson: exportMetaJson(original: src.original, stripLocation: strip, wideGamut: wideGamut),
           outPath: out);
     } finally {
       await src.cleanup();
@@ -1370,8 +1396,8 @@ class AppState extends ChangeNotifier {
 
   /// The options string of the native export calls (dapple_c.h): Exif source file, location choice, colour space.
   @visibleForTesting
-  static String exportMetaJson({required String original, required bool stripLocation}) =>
-      jsonEncode({'metaSource': original, 'stripLocation': stripLocation, 'colorSpace': 'srgb'});
+  static String exportMetaJson({required String original, required bool stripLocation, bool wideGamut = false}) =>
+      jsonEncode({'metaSource': original, 'stripLocation': stripLocation, 'colorSpace': wideGamut ? 'p3' : 'srgb'});
 
   /// [resolveSource] that also names the file the user imported: a HEIC / TIFF / WebP is converted to PNG first and the copy has lost its Exif and GPS,
   /// so the export reads them from [original]. [cleanup] removes every temporary file.
@@ -1426,7 +1452,7 @@ class AppState extends ChangeNotifier {
     return ok;
   }
 
-  Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
+  Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation, bool wideGamut = false}) async {
     var n = 0;
     for (final ph in list) {
       try {
@@ -1434,7 +1460,7 @@ class AppState extends ChangeNotifier {
           n++;
           continue;
         }
-        final f = await exportJpeg(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr, stripLocation: stripLocation);
+        final f = await exportJpeg(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr, stripLocation: stripLocation, wideGamut: wideGamut);
         await MediaBridge.saveToGallery(f, f.endsWith('_MP.jpg') ? '${p.basenameWithoutExtension(ph.name).replaceFirst(RegExp(r'_MP$'), '')}_dapple_MP.jpg' : '${p.basenameWithoutExtension(ph.name)}_dapple.jpg');
         ph.exported = true;
         n++;

@@ -123,6 +123,19 @@ ImageF binnedHalf(const MosaicImage& m, int step) {
   return out;
 }
 
+ImageF halfOriented(const MosaicImage& m, int threads, bool* usedGpu) {
+  if (m.cfa != CfaKind::XTrans) return {};
+  Desc d = makeDesc(m);
+  d.half = true;
+  // output pixel (x, y) = sensor pixels 2x..2x+1: the crop (DNG default crop, active-area pixels) maps to half-resolution pixels like binnedOriented's
+  const int cx = m.hasCrop ? m.cropX / 2 : 0, cy = m.hasCrop ? m.cropY / 2 : 0;
+  const int cw = std::min(m.hasCrop ? m.cropW / 2 : m.width / 2, m.width / 2 - cx), ch = std::min(m.hasCrop ? m.cropH / 2 : m.height / 2, m.height / 2 - cy);
+  if (cw <= 0 || ch <= 0) return {};
+  ImageF tmp(cw, ch);
+  runNode(d, {cx, cy, cx + cw, cy + ch}, tmp.data.data(), std::size_t(cw) * 3, threads, usedGpu);
+  return rotateFlipImg(tmp, m.flip);
+}
+
 ImageF binnedOriented(const MosaicImage& m, int step) {
   step = std::max(step, 1);
   ImageF h = binnedHalf(m, step);

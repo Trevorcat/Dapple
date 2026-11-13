@@ -21,8 +21,8 @@ struct DecodeOptions {
   // (RAW+JPEG), or any sidecar image of the same frame. Used first when set; when empty the embedded preview is used and, if that is missing
   // or unusable, a sibling file with the same stem and a .jpg / .jpeg extension is tried. Orientation is read from its EXIF.
   std::filesystem::path referenceImage;
-  // Long edge the caller will resize to (0 = unknown). The mosaic preview (block reduction) declines an X-Trans file when this is well above its own size
-  // (the 2x-view request): LibRaw's half-size picture is sharper there, and the block reduction is not allowed to make any zoom level softer.
+  // Long edge the caller will resize to (0 = unknown). The mosaic preview serves an X-Trans file well above its own block-reduction size (the 2x-view request) from the
+  // half-resolution reconstruction of the cached mosaic (docs 32.12), which is at least as sharp as LibRaw's half-size picture; smaller requests stay block-reduced.
   int wantLongEdge = 0;
 };
 

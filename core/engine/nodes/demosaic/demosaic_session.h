@@ -32,6 +32,9 @@ ImageF demosaicFull(const MosaicImage& m, int threads = 0, std::string* correcti
 ImageF binnedHalf(const MosaicImage& m, int step = 1);  // step > 1: every step-th block in x and y only (statistics)
 // The same, cropped (DNG default crop) and oriented like the full picture: the picture the exposure anchor is computed from (no OpcodeList3).
 ImageF binnedOriented(const MosaicImage& m, int step = 1);
+// X-Trans only (empty otherwise): the half-resolution reconstruction (Desc::half, docs 32.12), cropped and oriented like the full picture, from the same cached
+// mosaic: 1/2 linear size (3876 px wide for 40 MP), as sharp as a half-size decode. GPU or CPU node by the measured verdict (a separate verdict kind).
+ImageF halfOriented(const MosaicImage& m, int threads = 0, bool* usedGpu = nullptr);
 
 struct CacheStats {
   std::uint64_t mosaicHits = 0, mosaicMisses = 0, fullHits = 0, fullMisses = 0, evictions = 0;

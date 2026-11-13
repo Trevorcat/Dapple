@@ -12,7 +12,11 @@ namespace dapple::uhdr {
 
 namespace {
 constexpr float kLw[3] = {0.2126f, 0.7152f, 0.0722f};  // Rec.709 / sRGB luminance
-inline float luma(const float* c) { return kLw[0] * c[0] + kLw[1] * c[1] + kLw[2] * c[2]; }
+constexpr float kLwP3[3] = {0.2289746f, 0.6917385f, 0.0792869f};  // Display P3 luminance (Y row of the P3 -> XYZ D65 matrix)
+inline float luma(const float* c, bool p3 = false) {
+  const float* w = p3 ? kLwP3 : kLw;
+  return w[0] * c[0] + w[1] * c[1] + w[2] * c[2];
+}
 inline float smooth01(float t) {
   t = std::min(1.f, std::max(0.f, t));
   return t * t * (3.f - 2.f * t);
@@ -32,14 +36,14 @@ const float* lut8() {
 float srgbToLinear(float e) { return e <= 0.04045f ? e / 12.92f : std::pow((e + 0.055f) / 1.055f, 2.4f); }
 float linearToSrgb(float l) { return l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1.f / 2.4f) - 0.055f; }
 
-float brightPeak(const Image8& bright, float H) {
+float brightPeak(const Image8& bright, float H, bool p3) {
   const float* t = lut8();
   const std::size_t n = std::size_t(bright.width) * bright.height;
   if (!n) return 0.f;
   std::vector<float> y(n);
   for (std::size_t i = 0; i < n; ++i) {
     const float c[3] = {t[bright.data[3 * i]], t[bright.data[3 * i + 1]], t[bright.data[3 * i + 2]]};
-    y[i] = luma(c);
+    y[i] = luma(c, p3);
   }
   const std::size_t k = std::min(n - 1, std::size_t(double(n) * 0.999));
   std::nth_element(y.begin(), y.begin() + std::ptrdiff_t(k), y.end());
@@ -52,14 +56,14 @@ float autoHeadroom(float peak) {
   return std::min(kMaxHeadroomStops, std::max(0.5f, h));
 }
 
-ImageF hdrLinear(const Image8& sdr, const Image8& bright, float H) {
+ImageF hdrLinear(const Image8& sdr, const Image8& bright, float H, bool p3) {
   ImageF out(sdr.width, sdr.height);
   const float* t = lut8();
   const float g = std::exp2(H);
   const std::size_t n = std::size_t(sdr.width) * sdr.height;
   for (std::size_t i = 0; i < n; ++i) {
     const float b[3] = {t[bright.data[3 * i]] * g, t[bright.data[3 * i + 1]] * g, t[bright.data[3 * i + 2]] * g};
-    const float yb = luma(b);
+    const float yb = luma(b, p3);
     const float c = std::max(0.f, yb - 1.f);
     const float e = c > 0.f ? c * smooth01(c) / yb : 0.f;  // excess per unit of the bright colour
     for (int k = 0; k < 3; ++k) out.data[3 * i + k] = t[sdr.data[3 * i + k]] + e * b[k];
@@ -67,17 +71,17 @@ ImageF hdrLinear(const Image8& sdr, const Image8& bright, float H) {
   return out;
 }
 
-GainMap makeGainMap(const Image8& sdr, const Image8& bright, float H) {
+GainMap makeGainMap(const Image8& sdr, const Image8& bright, float H, bool p3) {
   GainMap gm;
   gm.width = sdr.width;
   gm.height = sdr.height;
-  const ImageF hdr = hdrLinear(sdr, bright, H);
+  const ImageF hdr = hdrLinear(sdr, bright, H, p3);
   const float* t = lut8();
   const std::size_t n = std::size_t(gm.width) * gm.height;
   std::vector<float> g(n);
   for (std::size_t i = 0; i < n; ++i) {
     const float s[3] = {t[sdr.data[3 * i]], t[sdr.data[3 * i + 1]], t[sdr.data[3 * i + 2]]};
-    const float ys = luma(s), yh = luma(&hdr.data[3 * i]);
+    const float ys = luma(s, p3), yh = luma(&hdr.data[3 * i], p3);
     g[i] = std::max(0.f, std::log2((yh + kOffset) / (ys + kOffset)));
   }
   // Edge guard: where a neighbour is much darker in the SDR picture (below 0.6 of this pixel) the gain is limited to the neighbour's, but never below half
@@ -86,7 +90,7 @@ GainMap makeGainMap(const Image8& sdr, const Image8& bright, float H) {
   std::vector<float> ys(n);
   for (std::size_t i = 0; i < n; ++i) {
     const float s[3] = {t[sdr.data[3 * i]], t[sdr.data[3 * i + 1]], t[sdr.data[3 * i + 2]]};
-    ys[i] = luma(s);
+    ys[i] = luma(s, p3);
   }
   std::vector<float> m(n);
   for (int y = 0; y < gm.height; ++y)

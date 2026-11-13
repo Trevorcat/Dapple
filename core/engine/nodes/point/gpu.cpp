@@ -43,6 +43,7 @@ bool recordPoint(GpuRecorder& r, const PointNode& n, H D) {
   u.geoC[0] = P.fullW;
   u.geoC[1] = P.fullH;
   u.geoC[2] = P.vignette;
+  u.geoC[3] = P.outputSpace == 1 ? 1.f : 0.f;
   u.c[0] = P.rot;
   u.c[1] = P.flip ? 1 : 0;
   u.c[2] = n.lut.n;

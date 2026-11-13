@@ -57,13 +57,13 @@ const double kFilmMapX = 0.38, kFilmMapY = 0.32; // fraction of the map's width 
 Offset _toRef(Offset c) => Offset((0.5 + c.dx * kFilmMapX) * kFilmMapRef.width, (0.5 - c.dy * kFilmMapY) * kFilmMapRef.height);
 Offset _fromRef(Offset p) => Offset((p.dx / kFilmMapRef.width - 0.5) / kFilmMapX, (0.5 - p.dy / kFilmMapRef.height) / kFilmMapY);
 
-/// Where the modern renderings sit when the asset does not name them: a separate cluster in the upper left corner, which no
-/// film stock occupies. These are NOT measured characters (the film map's axes are measured with the film pack): the cluster
-/// reads as "a different family", the order inside it carries no meaning.
+/// Where the modern renderings sit when the asset does not name them: their measured character (scripts/film/gen_film_map.py on the same chart
+/// and axes as the stocks, docs/film/film-map.md; the asset carries the same numbers with `measured: true`). A modern dot may land close to a
+/// stock (通透 vs the Portra family, 鲜明 on Superia 200 / Velvia): the layout nudges them apart and the diamond shape tells the families apart.
 const kModernCluster = {
-  'modern_clean': Offset(-0.80, 0.50),
-  'modern_vivid': Offset(-0.52, 0.74),
-  'modern_soft': Offset(-0.52, 0.32),
+  'modern_clean': Offset(-0.281, 0.424),
+  'modern_vivid': Offset(0.541, 0.746),
+  'modern_soft': Offset(-0.747, 0.020),
 };
 
 /// Places the stocks of [catalog] and the modern renderings. Deterministic.

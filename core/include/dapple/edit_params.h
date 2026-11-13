@@ -144,6 +144,10 @@ struct EditParams {
   // Internal, not serialised: CIE xy of the scene's as-shot illuminant (the C layer sets it from the RAW's white balance; 0 = unknown).
   float filmSceneX = 0.f, filmSceneY = 0.f;
 
+  // Internal, not serialised: the colour space the render is written in. 0 = sRGB (every preview and the default export), 1 = Display P3
+  // (export only; set by the C layer from the export option "colorSpace"). Part of every colour cache key.
+  int outputSpace = 0;
+
   // Optional creative look (3D LUT, .cube); applied in sRGB at the end.
   std::string lutPath;
   float lutAmount = 100.f;  // 0..100

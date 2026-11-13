@@ -59,6 +59,9 @@ class _PublishPageState extends State<PublishPage> {
   bool _hdr = false;
   bool _hdrAvailable = false;
   String _hdrFor = '';
+  // "色彩空间": sRGB (default) or 广色域 P3; offered only when at least one photo has colour outside sRGB worth keeping (AppState.wideGamutOf).
+  bool _p3 = false;
+  bool _p3Available = false;
 
   @override
   void initState() {
@@ -73,19 +76,20 @@ class _PublishPageState extends State<PublishPage> {
     final key = ids.join(',');
     if (key == _hdrFor) return;
     _hdrFor = key;
-    var any = false;
+    var any = false, wide = false;
     for (final id in ids) {
       final ph = app.photoById(id);
       if (ph == null) continue;
-      if (await app.hdrHeadroomOf(ph) > 0) {
-        any = true;
-        break;
-      }
+      if (!any && await app.hdrHeadroomOf(ph) > 0) any = true;
+      if (!wide && await app.wideGamutOf(ph) >= AppState.wideGamutMinShare) wide = true;
+      if (any && wide) break;
     }
     if (!mounted || _hdrFor != key) return;
     setState(() {
       _hdrAvailable = any;
       if (!any) _hdr = false;
+      _p3Available = wide;
+      if (!wide) _p3 = false;
     });
   }
 
@@ -221,9 +225,11 @@ class _PublishPageState extends State<PublishPage> {
       if (cancelled()) return null;
       final ph = photos[i];
       if (fallback) {
-        await app.saveToGallery([ph], longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable, stripLocation: _strip);
+        await app.saveToGallery([ph],
+            longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable, stripLocation: _strip, wideGamut: _p3 && _p3Available);
       } else {
-        out.add(await app.exportJpeg(ph, longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable, stripLocation: _strip));
+        out.add(await app.exportJpeg(ph,
+            longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable, stripLocation: _strip, wideGamut: _p3 && _p3Available));
       }
       progress.value = (i + 1) / photos.length;
     }
@@ -443,7 +449,30 @@ class _PublishPageState extends State<PublishPage> {
           final v = await showExportSizeSheet(context, current: _size, photo: _photos.length == 1 ? _photos.first : null);
           if (v != null && mounted) setState(() => _size = v);
         }, sub: _sizeDims()),
-        row('row-loc', '位置信息', _strip ? '已去除' : '保留', () => setState(() => _strip = !_strip), last: !_hdrAvailable),
+        row('row-loc', '位置信息', _strip ? '已去除' : '保留', () => setState(() => _strip = !_strip), last: !_hdrAvailable && !_p3Available),
+        if (_p3Available)
+          GestureDetector(
+            key: const ValueKey('row-cs'),
+            behavior: HitTestBehavior.opaque,
+            onTap: () => setState(() => _p3 = !_p3),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              decoration: BoxDecoration(border: Border(top: BorderSide(color: c.sep))),
+              child: Row(children: [
+                Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('色彩空间', style: T.body17(c.text)),
+                  const SizedBox(height: 2),
+                  Text('广色域能留住更鲜艳的颜色；有些应用和较旧的屏幕不识别色彩配置，会把它显示得偏灰或偏色。',
+                      key: const ValueKey('row-cs-sub'), style: T.small(c.text2)),
+                ])),
+                const SizedBox(width: 12),
+                Text(_p3 ? '广色域 P3' : 'sRGB', key: const ValueKey('row-cs-value'), style: T.body17(c.text2, w: FontWeight.w400)),
+                const SizedBox(width: 4),
+                DIcon(DI.forward, size: 18, color: c.text2),
+              ]),
+            ),
+          ),
         if (_hdrAvailable)
           Container(
             key: const ValueKey('row-hdr'),

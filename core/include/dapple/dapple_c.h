@@ -152,6 +152,20 @@ DAPPLE_API int32_t dapple_session_render_look_previews(DappleSession* session, c
 DAPPLE_API int32_t dapple_session_render_tone_previews(DappleSession* session, const char* params_json,
                                                        int32_t out_long_edge, float strength, DappleImage* out);
 
+/* Batch swatches of rendering bases on one photo (film map, 成像 page): renders the session's picture once per base id at long_edge (default 96 when <= 0)
+ * with params_json (the photo's own correction; any "film" key is replaced by the id) and returns 8-bit sRGB images in out[0..n-1] (n <= 256; release each
+ * with dapple_free_image). A base id is a film stock id, a modern rendering id (modern_clean / modern_vivid / modern_soft), or "" / NULL = the standard
+ * rendering; an unknown id renders as the standard rendering (one log line). Each image is the interactive tier of dapple_session_render_frame (coarse film
+ * tables, which the prebake has for every stock; modern bases through their lattice; GPU frames when the engine has a device, else CPU), sharing the source
+ * downscaled to long_edge, the tone proxy and the engine plans between bases. Runs on the calling thread at background priority, holds the session lock one frame
+ * at a time, and waits between frames while dapple_set_interaction(1) or a touch-hint burst is active. Latest wins: a newer call on the session, or
+ * dapple_session_base_previews_cancel, makes this one return at the next frame boundary; images not rendered stay {0,0,NULL}. Returns DAPPLE_OK (check each
+ * rgba) or DAPPLE_ERROR for bad arguments or when no frame could be rendered. Additive. */
+DAPPLE_API int32_t dapple_session_base_previews(DappleSession* session, const char* params_json, const char* const* base_ids, int32_t n,
+                                                int32_t long_edge, DappleImage* out);
+/* Lock-free, any thread: stops the base_previews call in flight on this session (see above). A no-op when none runs. */
+DAPPLE_API void dapple_session_base_previews_cancel(DappleSession* session);
+
 /* ---- Sessions: decode once, render many times (slider dragging) ---- */
 
 /* Decodes `path`. long_edge > 0 downsizes the working image once after
@@ -308,6 +322,9 @@ DAPPLE_API int32_t dapple_session_export_jpeg_hdr(DappleSession* session, const 
 DAPPLE_API int32_t dapple_session_export_jpeg_hdr_ex(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge,
                                                      int32_t jpeg_quality, const char* out_path, float headroom_stops, DappleHdrInfo* info,
                                                      const char* export_json);
+/* Export colour space "p3" (Display P3) of the *_ex calls: share (0..1) of the picture after the edit that lies outside sRGB (see c_api.cpp); the
+ * app offers the wide-gamut export only when it is not negligible. Additive. */
+DAPPLE_API int32_t dapple_session_wide_gamut_fraction(DappleSession* session, const char* params_json, const char* lut_path, float* fraction);
 
 /* ===== HDR merge, panorama stitching, bracket / panorama detection, Motion Photo (phase 3) ===========
  *

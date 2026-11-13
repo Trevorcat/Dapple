@@ -3,6 +3,7 @@
 #include "dapple/dapple_c.h"
 #include "file_util.h"
 
+#include <array>
 #include <atomic>
 #include <cstdarg>
 #include <cmath>
@@ -96,6 +97,7 @@ struct DappleSession {
   bool hintHave = false;
   std::atomic<std::uint64_t> frameSeq{0};
   std::atomic<bool> hintRunning{false};
+  std::atomic<std::uint64_t> swatchSeq{0};  // dapple_session_base_previews: the newest request (or cancel) wins
   ~DappleSession() {
     for (int i = 0; i < 5000 && matchBusy.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -374,6 +376,24 @@ EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath 
 bool renderSessionParams(DappleSession* s, const EditParams& params, const char* lutPath, int32_t outLongEdge,
                          Image8& out, float toneReach = 1.f);
 
+// In place: 8-bit sRGB -> 8-bit Display P3 (colorimetric, D65, same transfer curve).
+void srgb8ToDisplayP3(Image8& img) {
+  static const std::array<float, 256> dec = [] {
+    std::array<float, 256> t{};
+    for (int i = 0; i < 256; ++i) t[std::size_t(i)] = dapple::color::srgbDecode(float(i) / 255.f);
+    return t;
+  }();
+  const dapple::color::Mat3& m = dapple::color::srgbToP3();
+  const std::size_t n = std::size_t(img.width) * img.height;
+  for (std::size_t i = 0; i < n; ++i) {
+    std::uint8_t* px = img.data.data() + 3 * i;
+    const float in[3] = {dec[px[0]], dec[px[1]], dec[px[2]]};
+    float o[3];
+    m.apply(in, o);
+    for (int c = 0; c < 3; ++c) px[c] = std::uint8_t(dapple::color::srgbEncode(o[c]) * 255.f + 0.5f);
+  }
+}
+
 bool fillImage(const Image8& img, DappleImage* out) {
   const std::size_t pixels = std::size_t(img.width) * img.height;
   auto* rgba = static_cast<uint8_t*>(std::malloc(pixels * 4));
@@ -466,6 +486,14 @@ bool renderSession(DappleSession* s, const char* paramsJson, const char* lutPath
 bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const char* lutPath, int32_t outLongEdge,
                          Image8& out, float toneReach) {
   const EditParams params = withFilmKey(s, paramsIn, lutPath);
+  if (params.outputSpace == 1 && Renderer(params, *s->camera, nullptr).filmActive()) {
+    // Film stocks (and their blend with the normal render) are authored for sRGB output: rendered as sRGB, then converted to Display P3 (no colour is added).
+    EditParams q = paramsIn;
+    q.outputSpace = 0;
+    if (!renderSessionParams(s, q, lutPath, outLongEdge, out, toneReach)) return false;
+    srgb8ToDisplayP3(out);
+    return true;
+  }
   std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
   std::shared_ptr<const Lut3D> lut;
   if (!lutFile.empty()) {
@@ -898,15 +926,25 @@ class RenderThread {
 };
 
 static bool nearEq(float a, float b) { return std::fabs(a - b) < 1e-6f; }
+static thread_local double tlSwatchTablesMs = 0, tlSwatchExecMs = 0;
+static thread_local int tlSwatchGpu = 0;
+static thread_local double tlSwatchMatchMs = 0;  // film match time of the swatch frames of this thread's current dapple_session_base_previews call
 
+// `quiet` (base swatches): `paramsIn` replaces the JSON, the frame leaves the session's "last frame" memory (noise decision, kept LUT) alone and skips
+// noise reduction, so a background swatch never changes what the editor's next frame does.
 static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lutPath, const DappleFrameRequest& rq,
-                 DappleImage* out, char** analysisOut) {
+                 DappleImage* out, char** analysisOut, const EditParams* paramsIn = nullptr) {
   std::lock_guard<std::mutex> lock(s->mtx);
   EditParams params;
-  if (!parseParams(paramsJson, params)) return false;
+  if (paramsIn)
+    params = *paramsIn;
+  else if (!parseParams(paramsJson, params))
+    return false;
+  const bool quiet = paramsIn != nullptr;
   const auto tMatch0 = std::chrono::steady_clock::now();
-  params = withFilmKey(s, params, lutPath, (rq.flags & DAPPLE_FRAME_INTERACTIVE) != 0);
+  params = withFilmKey(s, params, lutPath, (rq.flags & DAPPLE_FRAME_INTERACTIVE) != 0 && !quiet);  // a swatch wants the exact match, not an interpolated one
   const double matchMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tMatch0).count();
+  if (quiet) tlSwatchMatchMs += matchMs;
   std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
   std::shared_ptr<const Lut3D> lut;
   if (!lutFile.empty()) {
@@ -981,8 +1019,8 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     job.request.wantAnalysis = analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS);
     job.request.bakeSize = n;
     job.request.fastAnalysis = interactive && !std::getenv("DAPPLE_EXACT_ANALYSIS");
-    job.request.noise = !interactive || !s->haveLast || !nearEq(s->lastParams.nrLuma, params.nrLuma) ||
-                        !nearEq(s->lastParams.nrColor, params.nrColor);
+    job.request.noise = !quiet && (!interactive || !s->haveLast || !nearEq(s->lastParams.nrLuma, params.nrLuma) ||
+                                   !nearEq(s->lastParams.nrColor, params.nrColor));
     job.fastOptions.spatial = interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
     job.fastOptions.noise = job.request.noise;
     job.fastOptions.region = region;
@@ -991,9 +1029,11 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     job.fastOptions.coarseFilm = interactive && !activeParam.empty() && activeParam != "grain" && activeParam != "film_grain" && activeParam != "film_strength" &&
                                  activeParam != "film_halation" && !std::getenv("DAPPLE_FILM_COARSE_OFF");
     job.fastOptions.fullLongEdge = fullLongEdge;
-    s->lutKeep = lut;
-    s->lastParams = params;
-    s->haveLast = true;
+    if (!quiet) {
+      s->lutKeep = lut;
+      s->lastParams = params;
+      s->haveLast = true;
+    }
 #ifdef DAPPLE_HAVE_GPU
     if (dapple::engine::gpu::runtimeEnabled()) job.store = sourceStoreOf(s);  // the GPU executor reads the full-resolution source
 #endif
@@ -1013,6 +1053,11 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     if (!s->engine.renderFrame(job, res)) {
       setError(res.error.empty() ? "engine failure" : res.error);
       return false;
+    }
+    if (quiet) {
+      tlSwatchTablesMs += res.cpu.tablesMs;
+      tlSwatchExecMs += res.cpu.execMs;
+      tlSwatchGpu += res.executor != "cpu";
     }
     out->width = res.w;
     out->height = res.h;
@@ -1507,16 +1552,94 @@ int32_t dapple_session_render_tone_previews(DappleSession* session, const char* 
       DAPPLE_ERROR);
 }
 
+// ---- Base swatches (dapple_session_base_previews) ----
+// One small interactive frame per base id on the session's own picture: the shared work (the downscaled source of that long edge, the tone proxy, geometry, the engine
+// plans and the film tables) is the session's and is reused from one base to the next; only the base changes. Frames use the coarse film tier (prebaked tables), run on
+// the calling thread at background priority and yield to the editor: between two bases the call waits while a finger is down (dapple_set_interaction), or while a
+// touch-hint burst runs, and it holds the session lock only for one frame at a time.
+int32_t dapple_session_base_previews(DappleSession* session, const char* params_json, const char* const* base_ids, int32_t n, int32_t long_edge,
+                                     DappleImage* out) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!out || n <= 0 || n > 256) {
+          setError("base previews: bad output");
+          return DAPPLE_ERROR;
+        }
+        for (int i = 0; i < n; ++i) out[i] = DappleImage{0, 0, nullptr};
+        if (!session) {
+          setError("null session");
+          return DAPPLE_ERROR;
+        }
+        EditParams base;
+        if (!parseParams(params_json, base)) return DAPPLE_ERROR;
+        const std::uint64_t mine = session->swatchSeq.fetch_add(1) + 1;  // a newer request or a cancel makes this one stop
+        const auto cancelled = [&] { return session->swatchSeq.load() != mine; };
+        const auto lib = film::defaultLibrary();
+        struct Background {  // the calling thread is a background thread for the whole call
+          Background() { sys::setBackground(true); }
+          ~Background() { sys::setBackground(false); }
+        } background;
+        int done = 0;
+        tlSwatchMatchMs = tlSwatchTablesMs = tlSwatchExecMs = 0;
+        tlSwatchGpu = 0;
+        const auto tBatch = std::chrono::steady_clock::now();
+        for (int i = 0; i < n && !cancelled(); ++i) {
+          while ((sys::interacting() || session->hintRunning.load()) && !cancelled()) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+          if (cancelled()) break;
+          EditParams p = base;
+          std::string id = base_ids && base_ids[i] ? base_ids[i] : "";
+          if (!id.empty() && !isModernId(id) && !(lib && lib->find(id))) {
+            stageLog("base previews: unknown base '%.40s', standard rendering", id.c_str());
+            id.clear();
+          }
+          p.filmStock = id;
+          DappleFrameRequest rq{};
+          rq.size = std::int32_t(sizeof rq);
+          rq.long_edge = long_edge > 0 ? long_edge : 96;
+          rq.flags = DAPPLE_FRAME_INTERACTIVE | DAPPLE_FRAME_BACKGROUND;
+          rq.bake_size = 33;  // a 96 px picture does not need the 57-node lattice of a drag frame: a modern base bakes in a fraction of the time
+          rq.active_param = "film_swatch";  // not a grain slider; a table-moving name: the coarse print tier (cached tables, never a bake on this thread)
+          DappleImage img{0, 0, nullptr};
+          bool ok = false;
+          try {
+            ok = renderFrame(session, nullptr, nullptr, rq, &img, nullptr, &p);
+          } catch (const std::exception& e) {
+            setError(e.what());
+          }
+          if (ok && img.rgba) {
+            out[i] = img;
+            ++done;
+          } else {
+            dapple_free_image(&img);
+          }
+        }
+        stageLog("base previews: %d of %d at %d px in %.0f ms (film match %.0f, tables %.0f, exec %.0f; %d on GPU)%s", done, n, long_edge > 0 ? long_edge : 96, msSince(tBatch),
+                 tlSwatchMatchMs, tlSwatchTablesMs, tlSwatchExecMs, tlSwatchGpu, cancelled() ? " cancelled" : "");
+        if (done == 0 && !cancelled()) return DAPPLE_ERROR;  // every frame failed (the error of the last one is set)
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+void dapple_session_base_previews_cancel(DappleSession* session) {
+  if (session) session->swatchSeq.fetch_add(1);
+}
+
 namespace {
 // Export options of the *_ex calls: {"metaSource":"<original file>","stripLocation":true,"colorSpace":"srgb","software":"Dapple 1.0"}. Writes the Exif and ICC
 // segments into `jo`: the camera facts of the session (decoder metadata), the capture date, sub-second, offset and GPS read from metaSource (the file the user
 // imported: HEIC / PNG conversions lose them), then the gaps filled from the session. Location only when the file has it and stripLocation is false (default
 // true). False (error set) for a colour space this build cannot produce.
+// 1 when the export options ask for Display P3 ("colorSpace":"p3"), else 0.
+int exportSpaceOf(const char* optionsJson) {
+  return optionsJson && optionsJson[0] && jsonlite::text(optionsJson, "colorSpace", "srgb") == "p3" ? 1 : 0;
+}
+
 bool applyExportMeta(DappleSession* s, const char* optionsJson, const Image8& img, JpegOptions& jo) {
   if (!optionsJson || !optionsJson[0]) return true;  // the plain calls: the bare stream
   const std::string o = optionsJson;
   const std::string cs = jsonlite::text(o, "colorSpace", "srgb");
-  if (cs != "srgb") {
+  if (cs != "srgb" && cs != "p3") {
     setError("unsupported export colour space: " + cs);
     return false;
   }
@@ -1554,8 +1677,9 @@ bool applyExportMeta(DappleSession* s, const char* optionsJson, const Image8& im
   m.software = jsonlite::text(o, "software", "Dapple " DAPPLE_VERSION_STRING);
   m.width = img.width;
   m.height = img.height;
+  if (cs == "p3") m.colorSpace = 0xFFFF;  // Exif: uncalibrated, the ICC profile tells
   jo.exifSegment = buildExifSegment(m);
-  jo.iccSegment = buildIccSegment(IccSpace::Srgb);
+  jo.iccSegment = buildIccSegment(cs == "p3" ? IccSpace::DisplayP3 : IccSpace::Srgb);
   return true;
 }
 
@@ -1580,7 +1704,16 @@ int32_t exportJpegImpl(DappleSession* session, const char* params_json, const ch
       [&]() -> int32_t {
         Image8 img;
         const auto t0 = std::chrono::steady_clock::now();
-        if (!renderSession(session, params_json, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
+        {
+          EditParams ep;
+          if (!session) {
+            setError("null session");
+            return DAPPLE_ERROR;
+          }
+          if (!parseParams(params_json, ep)) return DAPPLE_ERROR;
+          ep.outputSpace = exportSpaceOf(export_json);
+          if (!renderSessionParams(session, ep, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
+        }
         const double renderMs = msSince(t0);
         JpegOptions jo;
         if (jpeg_quality > 0) jo.quality = jpeg_quality > 100 ? 100 : jpeg_quality;
@@ -1650,7 +1783,7 @@ bool hdrDecide(DappleSession* s, const EditParams& params, const char* lutPath, 
   }
   Image8 probe;
   if (!renderBright(s, bp, lutPath, longEdge, probeH, probe)) return false;
-  d.peak = dapple::uhdr::brightPeak(probe, probeH);
+  d.peak = dapple::uhdr::brightPeak(probe, probeH, params.outputSpace == 1);
   float H = requested > 0.f ? std::min(dapple::uhdr::kMaxHeadroomStops, std::max(0.5f, requested)) : dapple::uhdr::autoHeadroom(d.peak);
   H = std::min(H, probeH);
   if (H < 0.5f || d.peak < 1.0001f) {
@@ -1715,6 +1848,40 @@ int32_t dapple_session_hdr_headroom(DappleSession* session, const char* params_j
       DAPPLE_ERROR);
 }
 
+// Share of the picture (0..1) whose colour after the edit lies outside sRGB by more than 0.03 in linear light (a Display P3 render of a 384 px
+// proxy, converted back to linear sRGB). Film edits are authored for sRGB and report 0.
+int32_t dapple_session_wide_gamut_fraction(DappleSession* session, const char* params_json, const char* lut_path, float* fraction) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!session || !fraction) {
+          setError("null argument");
+          return DAPPLE_ERROR;
+        }
+        EditParams params;
+        if (!parseParams(params_json, params)) return DAPPLE_ERROR;
+        params.outputSpace = 1;
+        Image8 img;
+        if (!renderSessionParams(session, params, lut_path, 384, img)) return DAPPLE_ERROR;
+        static const std::array<float, 256> dec = [] {
+          std::array<float, 256> t{};
+          for (int i = 0; i < 256; ++i) t[std::size_t(i)] = dapple::color::srgbDecode(float(i) / 255.f);
+          return t;
+        }();
+        const std::size_t n = std::size_t(img.width) * img.height;
+        std::size_t out = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          const std::uint8_t* px = img.data.data() + 3 * i;
+          const float q[3] = {dec[px[0]], dec[px[1]], dec[px[2]]};
+          float s[3];
+          dapple::color::p3ToSrgb().apply(q, s);
+          if (std::min({s[0], s[1], s[2]}) < -0.03f || std::max({s[0], s[1], s[2]}) > 1.03f) ++out;
+        }
+        *fraction = n ? float(double(out) / double(n)) : 0.f;
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
 namespace {
 int32_t exportJpegHdrImpl(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge, int32_t jpeg_quality,
                           const char* out_path, float headroom_stops, DappleHdrInfo* info, const char* export_json);
@@ -1739,6 +1906,7 @@ int32_t exportJpegHdrImpl(DappleSession* session, const char* params_json, const
         }
         EditParams params;
         if (!parseParams(params_json, params)) return DAPPLE_ERROR;
+        params.outputSpace = exportSpaceOf(export_json);
         Image8 img;
         if (!renderSessionParams(session, params, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
         JpegOptions jo;
@@ -1763,7 +1931,7 @@ int32_t exportJpegHdrImpl(DappleSession* session, const char* params_json, const
           d.reason = 3;
           return plain(d);
         }
-        const dapple::uhdr::GainMap gm = dapple::uhdr::makeGainMap(sdr4, d.bright, d.H);
+        const dapple::uhdr::GainMap gm = dapple::uhdr::makeGainMap(sdr4, d.bright, d.H, params.outputSpace == 1);
         if (gm.meta.gainMax <= 0.f) {
           d.reason = 1;
           return plain(d);

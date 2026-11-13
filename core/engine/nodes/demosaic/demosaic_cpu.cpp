@@ -5,7 +5,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -570,8 +575,11 @@ void runTiles(const Desc& d, Rect roi, int threads, int tile, F&& tileFn) {
 }
 }  // namespace
 
+#include "demosaic_half.inc"
+
 void demosaic(const Desc& d, Rect roi, float* out, std::size_t strideFloats, int threads) {
   if (roi.empty()) return;
+  if (d.half && d.cfa == Cfa::XTrans) return demosaicHalf(d, roi, out, strideFloats, threads);
   runTiles(d, roi, threads, 256, [&](Rect t, std::vector<float>& S) {
     buildWindow(d, t, S);
     demosaicWindow(d, S.data(), t, out + std::size_t(t.y0 - roi.y0) * strideFloats + std::size_t(t.x0 - roi.x0) * 3, strideFloats);

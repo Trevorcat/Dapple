@@ -39,6 +39,8 @@ struct U {
 static_assert(sizeof(U) == 144, "std140 layout of the demosaic uniform block");
 
 inline int pmod(int a, int n) { return ((a % n) + n) % n; }
+constexpr int kHalfTab = 40 + 4096 + 576 + 144;     // first float of the half-resolution tables in the table buffer (demosaic_half.comp: HT)
+constexpr int kTabFloats = kHalfTab + 1728 * 2 + 576 * 2;
 
 float halfToFloat(std::uint16_t h) {
   const std::uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
@@ -72,6 +74,7 @@ struct GpuDemosaic::Impl {
   hal::PipelineH pScale, pG, pC, pH, pO;
   Cfa cfa = Cfa::Bayer;
   int xt = 1, extra = 0;
+  bool hf = false;  // half-resolution path (Desc::half): window = 2 x tile + 6, two passes (scale, reconstruction)
   void release() {
     for (hal::BufferH* b : {&staging, &mosaic, &tab, &S, &G, &D, &Hh, &readback, &readback2})
       if (*b) dev->destroy(*b);
@@ -106,13 +109,14 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
   GpuStats& S_ = st ? *st : local;
   S_ = GpuStats{};
   if (roi.empty()) return Status::Ok;
-  const int H = haloOf(d), per = d.period;
+  const bool hf = d.half && d.cfa == Cfa::XTrans;  // half-resolution: roi and output in half-resolution pixels, window of 2 x tile + 6 samples
+  const int H = hf ? 3 : haloOf(d), per = d.period;
   tile = std::max(16, tile);
-  const int E = hotExtra(d);  // extra samples of the staged window for the hot-sample filter
-  const int ww = tile + 2 * H, wh = tile + 2 * H, wwE = ww + 2 * E, whE = wh + 2 * E;
+  const int E = hf ? 0 : hotExtra(d);  // extra samples of the staged window for the hot-sample filter
+  const int ww = hf ? 2 * tile + 6 : tile + 2 * H, wh = ww, wwE = ww + 2 * E, whE = wh + 2 * E;
   // (re)allocate for this tile size / CFA
-  const bool cand = d.cfa == Cfa::XTrans && d.xtMode >= 1;
-  if (P.tile != tile || P.cfa != d.cfa || P.period != per || P.xt != (cand ? 1 : 0) || P.extra != E) {
+  const bool cand = d.cfa == Cfa::XTrans && d.xtMode >= 1 && !hf;
+  if (P.tile != tile || P.cfa != d.cfa || P.period != per || P.xt != (cand ? 1 : 0) || P.extra != E || P.hf != hf) {
     dev.waitIdle();
     P.release();
     const std::uint64_t planeBytes = std::uint64_t(ww) * wh * 4;
@@ -120,11 +124,11 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
     auto mk = [&](std::uint64_t bytes, hal::MemKind k, bool storage, hal::BufferH* b) { return dev.createBuffer({bytes, k, storage}, b); };
     Status s = mk(winBytes, hal::MemKind::Upload, true, &P.staging);
     if (s == Status::Ok) s = mk(winBytes, hal::MemKind::DeviceLocal, true, &P.mosaic);
-    if (s == Status::Ok) s = mk((40 + 4096 + 576 + 144) * 4, hal::MemKind::Upload, true, &P.tab);
+    if (s == Status::Ok) s = mk(std::uint64_t(kTabFloats) * 4, hal::MemKind::Upload, true, &P.tab);
     if (s == Status::Ok) s = mk(planeBytes, hal::MemKind::DeviceLocal, true, &P.S);
-    if (s == Status::Ok) s = mk(cand ? planeBytes * 4 : planeBytes, hal::MemKind::DeviceLocal, true, &P.G);  // candidates: 4 greens per pixel
+    if (s == Status::Ok) s = mk(hf ? 256 : (cand ? planeBytes * 4 : planeBytes), hal::MemKind::DeviceLocal, true, &P.G);  // candidates: 4 greens per pixel (the half path has none)
     const std::uint64_t dBytes = cand ? planeBytes * 8 : std::uint64_t(tile + 2) * (tile + 2) * 8;
-    if (s == Status::Ok && d.cfa == Cfa::XTrans) s = mk(dBytes, hal::MemKind::DeviceLocal, true, &P.D);  // candidates: red / blue differences x 4 directions
+    if (s == Status::Ok && d.cfa == Cfa::XTrans && !hf) s = mk(dBytes, hal::MemKind::DeviceLocal, true, &P.D);  // candidates: red / blue differences x 4 directions
     if (s == Status::Ok && cand) s = mk(planeBytes * 4, hal::MemKind::DeviceLocal, true, &P.Hh);       // candidates: 4 derivatives
     const hal::Format of = P.half ? hal::Format::RGBA16F : hal::Format::RGBA32F;
     if (s == Status::Ok) s = dev.createImage({of, std::uint32_t(tile), std::uint32_t(tile), 1}, &P.out);
@@ -135,7 +139,7 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
       P.release();
       return s;
     }
-    S_.deviceBytes = planeBytes + (cand ? planeBytes * 4 : planeBytes) + winBytes + std::uint64_t(tile) * tile * hal::bytesPerTexel(of) + (d.cfa == Cfa::XTrans ? dBytes : 0) + (cand ? planeBytes * 4 : 0);
+    S_.deviceBytes = planeBytes + (hf ? 256 : (cand ? planeBytes * 4 : planeBytes)) + winBytes + std::uint64_t(tile) * tile * hal::bytesPerTexel(of) + (d.cfa == Cfa::XTrans && !hf ? dBytes : 0) + (cand ? planeBytes * 4 : 0);
     auto pipe = [&](const char* name, hal::PipelineH* ph, bool wantPeriod) {
       hal::PipelineDesc pd;
       pd.shader = name;
@@ -147,6 +151,14 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
     };
     const bool bay = d.cfa == Cfa::Bayer;
     s = pipe("dm_scale", &P.pScale, true);
+    if (hf) {
+      if (s == Status::Ok) s = pipe(P.half ? "dm_h16" : "dm_h32", &P.pO, false);
+      if (s != Status::Ok) {
+        err_ = dev.lastError();
+        return s;
+      }
+      P.tile = tile, P.cfa = d.cfa, P.period = per, P.xt = 0, P.extra = E, P.hf = true;
+    } else {
     if (s == Status::Ok) s = pipe(bay ? "dm_bg" : (cand ? "dm_x0" : "dm_fg"), &P.pG, false);
     if (s == Status::Ok && !bay) s = pipe(cand ? "dm_x1" : "dm_fc", &P.pC, false);
     if (s == Status::Ok && cand) s = pipe("dm_x2", &P.pH, false);
@@ -155,7 +167,8 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
       err_ = dev.lastError();
       return s;
     }
-    P.tile = tile, P.cfa = d.cfa, P.period = per, P.xt = cand ? 1 : 0, P.extra = E;
+    P.tile = tile, P.cfa = d.cfa, P.period = per, P.xt = cand ? 1 : 0, P.extra = E, P.hf = false;
+    }
   } else {
     S_.deviceBytes = 0;
   }
@@ -216,7 +229,15 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
               }
         }
     }
-    dev.flush(P.tab, 0, (40 + 4096 + 576 + 144) * 4);
+    if (hf) {  // the half-resolution tables (demosaic_half.comp): weights, fallback, support
+      const HalfTables& T = halfTables(d);
+      float* h = t + kHalfTab;
+      std::memcpy(h, T.w, sizeof T.w);
+      std::memcpy(h + 1728, T.g, sizeof T.g);
+      std::memcpy(h + 3456, T.sup, sizeof T.sup);
+      std::memcpy(h + 4032, T.cen, sizeof T.cen);
+    }
+    dev.flush(P.tab, 0, std::uint64_t(kTabFloats) * 4);
   }
   std::uint32_t cfaBits[4] = {0, 0, 0, 0};
   for (int i = 0; i < per * per; ++i) cfaBits[i >> 4] |= std::uint32_t(d.cfa3[i] & 3) << ((i & 15) * 2);
@@ -236,11 +257,11 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
       yieldWhileInteracting(d.cancelCur, d.cancelMine);
       if (d.cancelCur && d.cancelCur->load(std::memory_order_relaxed) != d.cancelMine) return Status::Timeout;  // cancelled
       const Rect t{tx, ty, std::min(tx + tile, roi.x1), std::min(ty + tile, roi.y1)};
-      const int rw = t.w(), rh = t.h(), cw = rw + 2 * H, ch = rh + 2 * H;
+      const int rw = t.w(), rh = t.h(), cw = hf ? 2 * rw + 6 : rw + 2 * H, ch = hf ? 2 * rh + 6 : rh + 2 * H;
       auto t0 = Clock::now();
       // window of the mosaic, coordinate mapped
       std::uint16_t* win = static_cast<std::uint16_t*>(P.staging.mapped);
-      const int wx0 = t.x0 - H, wy0 = t.y0 - H, cwE = cw + 2 * E, chE = ch + 2 * E;
+      const int wx0 = hf ? 2 * t.x0 - 3 : t.x0 - H, wy0 = hf ? 2 * t.y0 - 3 : t.y0 - H, cwE = cw + 2 * E, chE = ch + 2 * E;
       const bool xin = wx0 - E >= 0 && wx0 - E + cwE <= d.width;
       xs.resize(std::size_t(cwE));
       for (int i = 0; i < cwE; ++i) xs[std::size_t(i)] = mapCoord(wx0 - E + i, d.width, d.cfa);
@@ -259,7 +280,7 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
       u.io[0] = cwE, u.io[1] = 0, u.io[2] = 0, u.io[3] = E;
       std::memcpy(u.cfa, cfaBits, 16);
       for (int c = 0; c < 4; ++c) u.wb[c] = d.wb[c];
-      u.sc[0] = d.invSpan, u.sc[1] = d.clampOut ? 1.f : 0.f, u.sc[2] = d.hot ? 1.f : 0.f;
+      u.sc[0] = d.invSpan, u.sc[1] = d.clampOut ? 1.f : 0.f, u.sc[2] = d.hot && !hf ? 1.f : 0.f;
       for (int c = 0; c < 3; ++c) u.m0[c] = d.m[c], u.m1[c] = d.m[3 + c], u.m2[c] = d.m[6 + c];
       S_.prepMs += msSince(t0);
       t0 = Clock::now();
@@ -286,9 +307,12 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
       cl->copyBufferToBuffer(P.staging, P.mosaic, winBytes, 0);
       cl->barrier(hal::kAll);
       disp("scale", P.pScale, {P.mosaic, P.tab, P.S}, nullptr, cw, ch);
-      if (cand) disp("green", P.pG, {P.S, P.G, P.tab}, nullptr, cw, ch, true);
+      if (hf) {
+        disp("half", P.pO, {P.S, P.tab}, &P.out, rw, rh);
+      } else if (cand) disp("green", P.pG, {P.S, P.G, P.tab}, nullptr, cw, ch, true);
       else disp("green", P.pG, {P.S, P.G}, nullptr, cw, ch);
-      if (bay) {
+      if (hf) {
+      } else if (bay) {
         disp("out", P.pO, {P.S, P.G}, &P.out, rw, rh);
       } else if (cand) {
         disp("chroma", P.pC, {P.S, P.G, P.D, P.tab}, nullptr, cw, ch, true);
@@ -386,11 +410,12 @@ class DeviceBackend final : public GpuBackend {
       return e && std::strcmp(e, "gpu") == 0 ? 1 : (e && std::strcmp(e, "cpu") == 0 ? 0 : -1);
     }();
     if (forced >= 0) return forced == 1 ? true : (why = "DAPPLE_DEMOSAIC_NODE=cpu", false);
-    const bool region = std::int64_t(roi.w()) * roi.h() * 2 < std::int64_t(d.width) * d.height;
+    const bool hf = d.half && d.cfa == Cfa::XTrans;  // half-resolution path: its own verdict kind (docs 32.12), the roi is in half-resolution pixels
+    const bool region = std::int64_t(roi.w()) * roi.h() * 2 < std::int64_t(d.width) * d.height / (hf ? 4 : 1);
     std::lock_guard<std::mutex> lk(mu_);
     std::string w2;
     if (!ensure(w2)) return true;  // run() reports the failure
-    const int key = int(d.cfa) * 8 + (d.xtMode >= 1 ? 4 : 0) + (d.hot ? 2 : 0);
+    const int key = int(d.cfa) * 8 + (d.xtMode >= 1 ? 4 : 0) + (d.hot ? 2 : 0) + (hf ? 64 : 0);
     auto it = verdicts_.find(key);
     if (it == verdicts_.end()) it = verdicts_.emplace(key, measure(d)).first;
     const bool gpu = region ? it->second.region : it->second.full;
@@ -434,7 +459,8 @@ class DeviceBackend final : public GpuBackend {
     std::string dir, app, fp;
     engine::gpu::cacheConfig(&dir, &app, &fp);
     char key[200];
-    std::snprintf(key, sizeof key, "%s|%s|%s|%s|%d|%d|%d|%d", fp.c_str(), app.c_str(), hal::apiName(dev_->caps().api), dev_->caps().key().c_str(), int(d.cfa), d.xtMode, d.hot ? 1 : 0, 1);
+    const bool hf = d.half && d.cfa == Cfa::XTrans;
+    std::snprintf(key, sizeof key, "%s|%s|%s|%s|%d|%d|%d|%d%s", fp.c_str(), app.c_str(), hal::apiName(dev_->caps().api), dev_->caps().key().c_str(), int(d.cfa), d.xtMode, d.hot ? 1 : 0, 1, hf ? "|half1" : "");
     if (!dir.empty()) {
       char nm[96];
       std::snprintf(nm, sizeof nm, "demosaic_verdict_%016llx.txt", (unsigned long long)std::hash<std::string>{}(key));
@@ -467,24 +493,24 @@ class DeviceBackend final : public GpuBackend {
         }
       Desc p = d;
       p.width = pw, p.height = ph, p.data = data.data(), p.cancelCur = nullptr;
-      const Rect all{0, 0, pw, ph};
-      std::vector<float> out(std::size_t(pw) * ph * 3);
+      const Rect all = hf ? Rect{0, 0, pw / 2, ph / 2} : Rect{0, 0, pw, ph};  // the half path outputs half-resolution pixels
+      std::vector<float> out(std::size_t(all.w()) * all.h() * 3);
       using Ck = std::chrono::steady_clock;
       auto ms = [](Ck::time_point t) { return std::chrono::duration<double, std::milli>(Ck::now() - t).count(); };
       double g = 1e30, c = 1e30;
-      if (gpu_->run(p, all, out.data(), std::size_t(pw) * 3, tile_) == hal::Status::Ok)  // warm-up: pipelines, allocation
+      if (gpu_->run(p, all, out.data(), std::size_t(all.w()) * 3, tile_) == hal::Status::Ok)  // warm-up: pipelines, allocation
         for (int rep = 0; rep < 3; ++rep) {
           const auto t0 = Ck::now();
-          if (gpu_->run(p, all, out.data(), std::size_t(pw) * 3, tile_) != hal::Status::Ok) { g = 1e30; break; }
+          if (gpu_->run(p, all, out.data(), std::size_t(all.w()) * 3, tile_) != hal::Status::Ok) { g = 1e30; break; }
           g = std::min(g, ms(t0));
         }
       for (int rep = 0; rep < (k == 0 ? 1 : 2); ++rep) {
         const auto t0 = Ck::now();
-        demosaic(p, all, out.data(), std::size_t(pw) * 3, 0);
+        demosaic(p, all, out.data(), std::size_t(all.w()) * 3, 0);
         c = std::min(c, ms(t0));
       }
       v.ms[k * 2] = g < 1e29 ? g : -1.0, v.ms[k * 2 + 1] = c;
-      (k == 0 ? v.full : v.region) = g < c;
+      (k == 0 ? v.full : v.region) = hf ? g * 1.3 < c : g < c;  // half-resolution path: the GPU must win clearly (the probe is small, the real frame adds read-back and window upload per tile)
     }
     v.note = noteOf(v, "");
     logLine(std::string("verdict frame ") + (v.full ? "GPU" : "CPU") + ", region " + (v.region ? "GPU" : "CPU") + ": " + v.note);

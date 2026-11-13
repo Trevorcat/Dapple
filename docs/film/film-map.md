@@ -56,3 +56,7 @@ only those stocks (smoke test, writes no asset).
   (the automatic one for this chart). The numbers describe the default look only, not film_exp, film_shoot, pad moves or other papers.
   CIELAB chroma is not perceptually uniform for blue and saturated patches; the 18 patches are mostly mid-chroma, so very saturated colours are underweighted.
   The map is relative (percentile scaling): adding or removing stocks moves everyone. Nothing here was checked against real film scans.
+
+## Modern renderings
+
+`modern_clean / modern_vivid / modern_soft` are measured on the same chart with the same two numbers and mapped with the stocks' own scale (median / p5 / p95 of the 20 stocks, so no stock moves; clamped to the map). Render: the engine's reference path with `film` = the id at strength 100, no auto correction (`dapple_base_previews_tests chart in.pfm id out.png`, used by `gen_film_map.py`). Result (richness, contrast -> x, y): clean 1.053 / 1.367 -> -0.281, +0.424; vivid 1.261 / 1.452 -> +0.541, +0.746; soft 0.968 / 1.260 -> -0.747, +0.020. Vivid lands 0.09 from Superia 200 (N200A); the layout nudges the dots apart, the circle shape tells them from film.

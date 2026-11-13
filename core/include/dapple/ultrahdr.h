@@ -41,14 +41,15 @@ struct GainMap {
 float srgbToLinear(float e);
 float linearToSrgb(float l);
 // Peak of the bright rendition (99.9th percentile of its linear luminance times 2^H), in SDR white units.
-float brightPeak(const Image8& bright, float H);
+// `p3`: both renditions are Display P3 encoded (luminance weights of P3; the transfer curve is the same as sRGB's).
+float brightPeak(const Image8& bright, float H, bool p3 = false);
 // H from the peak: ceil(2 log2 peak) / 2 clamped to 0.5 .. kMaxHeadroomStops; 0 when the peak is below kWorthPeak (no headroom worth encoding).
 float autoHeadroom(float peak);
 // Linear HDR rendition (3 floats per pixel, 1 = SDR white) of two renditions of the same size.
-ImageF hdrLinear(const Image8& sdr, const Image8& bright, float H);
+ImageF hdrLinear(const Image8& sdr, const Image8& bright, float H, bool p3 = false);
 // Gain map from the renditions (same size, usually a quarter of the base picture): luminance gain log2((Yh + o) / (Ys + o)), 3x3 minimum then a
 // [1 2 1] smoothing so the up-scaled map does not light the dark side of an edge.
-GainMap makeGainMap(const Image8& sdr, const Image8& bright, float H);
+GainMap makeGainMap(const Image8& sdr, const Image8& bright, float H, bool p3 = false);
 // Decoder side (what a viewer does at full display headroom): linear HDR from the SDR picture and the gain map (bilinear up-scale).
 ImageF reconstruct(const Image8& sdr, const GainMap& gm);
 
