@@ -16,7 +16,7 @@ void runNode(const Desc& d, Rect roi, float* out, std::size_t stride, int thread
   if (usedGpu) *usedGpu = false;
   if (GpuBackend* b = g_backend) {
     std::string why;
-    if (b->available(why) && b->run(d, roi, out, stride, why)) {
+    if (b->available(why) && b->prefer(d, roi, why) && b->run(d, roi, out, stride, why)) {
       if (usedGpu) *usedGpu = true;
       return;
     }

@@ -5,6 +5,7 @@
 // that is read back here (the engine integration keeps it on the device and feeds the point chain instead: see the hunk in the docs).
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "engine/hal/hal.h"
 #include "engine/nodes/demosaic/demosaic.h"
@@ -19,6 +20,7 @@ struct GpuStats {
   int tiles = 0;
   std::uint64_t deviceBytes = 0;  // device memory allocated for the planes and the output tile
   hal::SubmitStats submit;
+  std::vector<hal::PassTime> passTimes;  // per pass GPU ms summed over the tiles (only with DeviceOptions::profile and a device with timestamps)
 };
 
 class GpuDemosaic {

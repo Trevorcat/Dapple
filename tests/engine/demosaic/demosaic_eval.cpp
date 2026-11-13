@@ -2,6 +2,7 @@
 //   dapple_demosaic_eval <file.raw> [--out dir] [--tag name] [--crops N] [--bilinear] [--no-ref] [--threads N] [--cache]
 // Prints one summary line per file (machine readable "RESULT ..." line) and, with --out, writes a contact sheet and 200 % crops
 // (JPEG, sRGB, side by side: LibRaw | node | difference x4). Only for the public sample files: nothing here leaves build/.
+#include "engine/exec/gpu_runtime.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -21,6 +22,7 @@
 #include "engine/nodes/demosaic/demosaic_session.h"
 #ifdef DAPPLE_HAVE_GPU
 #include "engine/hal/select.h"
+#include "engine/nodes/demosaic/demosaic_backend.h"
 #include "engine/nodes/demosaic/demosaic_gpu.h"
 #endif
 
@@ -39,6 +41,13 @@ void printPeak() {
 #if defined(_WIN32)
   PROCESS_MEMORY_COUNTERS pmc{};
   if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) std::printf("  PEAK working set %.0f MB\n", double(pmc.PeakWorkingSetSize) / 1048576.0);
+#else
+  if (FILE* f = std::fopen("/proc/self/status", "r")) {  // Linux / Android: the high-water mark of the resident set
+    char line[256];
+    while (std::fgets(line, sizeof line, f))
+      if (std::strncmp(line, "VmHWM:", 6) == 0) std::printf("  PEAK resident %s", line + 6);
+    std::fclose(f);
+  }
 #endif
 }
 constexpr double M_PI_ = 3.14159265358979323846;
@@ -181,7 +190,7 @@ int main(int argc, char** argv) {
   int crops = 4, threads = 0;
   bool bil = false, noRef = false, cache = false;
   int atX = -1, atY = -1, atS = 4, gpuTile = 0;
-  bool proxyTiming = false, gpuOnly = false, noReadback = false;
+  bool proxyTiming = false, gpuOnly = false, noReadback = false, decodeOnly = false, backendRun = false;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--out" && i + 1 < argc) outDir = argv[++i];
@@ -193,6 +202,8 @@ int main(int argc, char** argv) {
     else if (a == "--cache") cache = true;
     else if (a == "--proxy") proxyTiming = true;
     else if (a == "--gpu-only") gpuOnly = true;
+    else if (a == "--backend") backendRun = true;  // the decoder's node: GPU backend installed, verdict applies (frame, then a 1920 x 1080 region at 1:1)
+    else if (a == "--decode-only") decodeOnly = true;  // the whole Full decode as the app does it (file to linear RGB), nothing else
     else if (a == "--no-readback") noReadback = true;
     else if (a == "--gpu" && i + 1 < argc) gpuTile = std::atoi(argv[++i]);
     else if (a == "--at" && i + 1 < argc) std::sscanf(argv[++i], "%d,%d,%d", &atX, &atY, &atS);
@@ -208,6 +219,21 @@ int main(int argc, char** argv) {
   if (tag.empty()) tag = path.stem().string();
 
   auto t = Clock::now();
+  if (decodeOnly) {
+#ifdef DAPPLE_HAVE_GPU
+    if (backendRun) {  // --decode-only --backend: the whole Full decode with the GPU node installed (the app's configuration)
+      demosaic::installGpuBackend();
+      dapple::engine::gpu::setRuntimeEnabled(1);
+      if (const char* vd = std::getenv("DAPPLE_VERDICT_DIR")) dapple::engine::gpu::configure(vd, "eval", "eval-fingerprint");
+    }
+#endif
+    DecodeOptions o;
+    o.quality = DecodeQuality::Full;
+    auto sr = makeLibRawDecoder()->decode(path, o);
+    std::printf("DECODE %s full decode %.0f ms %s\n", tag.c_str(), msSince(t), sr ? "ok" : "error");
+    printPeak();
+    return sr ? 0 : 1;
+  }
   auto mr = decodeRawMosaic(path);
   const double tMosaic = msSince(t);
   if (!mr) {
@@ -239,18 +265,19 @@ int main(int argc, char** argv) {
 #ifdef DAPPLE_HAVE_GPU
   if (gpuTile > 0) {  // GPU timing of the node on the whole frame: compute only (result stays on the device) and with the read-back
     dapple::hal::DeviceOptions dopt;
+    if (std::getenv("DAPPLE_GPU_PROFILE")) dopt.profile = true;
     if (const char* v = std::getenv("DAPPLE_GPU_SOFTWARE")) dopt.allowSoftware = v[0] == '1';
     auto sel = dapple::hal::selectDevice(dopt);
     if (sel.device) {
       std::string gerr;
       const demosaic::Desc d = demosaic::makeDesc(m);
-      for (int half = 0; half < 2; ++half) {
+      for (int half = std::getenv("DEMO_QUICK") ? 1 : 0; half < 2; ++half) {  // DEMO_QUICK: one repetition, RGBA16F only
         auto gpu = demosaic::GpuDemosaic::create(*sel.device, half != 0, gerr);
         demosaic::GpuStats st;
         gpu->run(d, {0, 0, m.width, m.height}, nullptr, 0, gpuTile, &st);  // warm-up (pipelines, allocation)
         const double devMB = double(st.deviceBytes) / 1048576.0;
         double best = 1e30, bestPrep = 0, bestGpu = 0;
-        for (int rep = 0; rep < 3; ++rep) {
+        for (int rep = 0; rep < (std::getenv("DEMO_QUICK") ? 1 : 3); ++rep) {
           gpu->run(d, {0, 0, m.width, m.height}, nullptr, 0, gpuTile, &st);
           if (st.totalMs < best) best = st.totalMs, bestPrep = st.prepMs, bestGpu = st.gpuMs;
         }
@@ -259,6 +286,11 @@ int main(int argc, char** argv) {
         gpu->run(d, {0, 0, m.width, m.height}, noReadback ? nullptr : rb.data(), std::size_t(m.width) * 3, gpuTile, &st);
         std::printf("  GPU %s tile %d (%d tiles): compute-only %.0f ms (host window build %.0f, device %.0f) | with read-back to host %.0f ms (conversion %.0f) | device memory %.0f MB | %s\n", half ? "RGBA16F" : "RGBA32F", gpuTile, st.tiles, best, bestPrep, bestGpu, msSince(t), st.readbackMs,
                     devMB, sel.device->caps().name.c_str());
+        if (!st.passTimes.empty()) {
+          std::printf("  GPU passes (ms, whole frame):");
+          for (const auto& pt : st.passTimes) std::printf(" %s %.1f;", pt.name.c_str(), pt.ms);
+          std::printf("\n");
+        }
         if (half) {  // the visible region at 1:1 (1920 x 1080 of the sensor, no orientation), read back to the host
           const demosaic::Rect roi{m.width / 2 - 960, m.height / 2 - 540, m.width / 2 + 960, m.height / 2 + 540};
           std::vector<float> rr(std::size_t(roi.w()) * roi.h() * 3);
@@ -274,6 +306,26 @@ int main(int argc, char** argv) {
     } else {
       std::printf("  GPU: no device\n");
     }
+  }
+#endif
+#ifdef DAPPLE_HAVE_GPU
+  if (backendRun) {
+    demosaic::installGpuBackend();
+    dapple::engine::gpu::setRuntimeEnabled(1);
+    if (const char* vd = std::getenv("DAPPLE_VERDICT_DIR")) dapple::engine::gpu::configure(vd, "eval", "eval-fingerprint");  // persist the verdict like the app does
+    int ow, oh;
+    demosaic::orientedSize(m, &ow, &oh);
+    const int rx = std::max(0, ow / 2 - 960), ry = std::max(0, oh / 2 - 540);
+    for (int rep = 0; rep < 2; ++rep) {
+      t = Clock::now();
+      ImageF reg = demosaic::demosaicOrientedRegion(m, rx, ry, rx + 1920, ry + 1080, threads);
+      const double tReg = msSince(t);
+      t = Clock::now();
+      ImageF full = demosaic::demosaicFull(m, threads);
+      std::printf("  BACKEND region 1920x1080 %.0f ms | frame %.0f ms (%s)\n", tReg, msSince(t), rep == 0 ? "first: includes the verdict probe" : "second");
+    }
+    printPeak();
+    return 0;
   }
 #endif
   if (gpuOnly) {

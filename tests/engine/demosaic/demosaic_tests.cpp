@@ -480,6 +480,7 @@ int testWireGpu() {
   if (files.empty()) return 77;
   std::string why;
   if (!makeDevice(why)) return 77;
+  setEnvVar("DAPPLE_DEMOSAIC_NODE", "gpu");  // this test is about the GPU node itself: no verdict
   setEnvVar("DAPPLE_ANCHOR", "off");
   engine::gpu::setRuntimeEnabled(1);
   for (const auto& f : {files[0], files[1]}) {

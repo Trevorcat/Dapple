@@ -3,32 +3,38 @@
 //   MODE 0: green candidate of each of the 4 directions (H, V, D1, D2): nearest greens along the direction + directional Laplacian.
 //   MODE 1: red / blue colour differences per direction: guide-weighted mean of the unclipped samples within one pixel of the line along the direction.
 //   MODE 2: derivative map of every candidate in a cube-root colour space (+ a penalty for candidates that interpolated across a clipped green).
-//   MODE 3: (ROI + 1 ring) homogeneity over 3 x 3, mean of the best candidates -> (green, red - green, blue - green), written over the difference buffer.
-//   MODE 4: 3 x 3 median of the two colour differences, matrix, output.
+//           The candidate colours (matrix + cube root) of a 16 x 16 tile and its ring of 1 are evaluated ONCE into shared memory, then the derivatives are
+//           taken from there (the direct form evaluated every candidate 5 times and the 60 pow() per pixel dominated the frame on a phone GPU).
+//   MODE 5: (ROI + 1 ring) homogeneity over 3 x 3, mean of the best candidates -> (green, red - green, blue - green) into shared memory, then the 3 x 3 median
+//           of the two colour differences, matrix, output (what used to be two passes with a round trip through memory).
+// The result is the same arithmetic as before (same expressions, same order), only where the values live changed.
+// The shared-memory kernels take any workgroup shape: a logical 16 x 16 tile is walked by the invocations of the group (dispatch: ceil(w / 16) x ceil(h / 16)).
 // No constant arrays and no dynamic indexing of vectors (ANGLE's HLSL output asserts on array constructors, MSL does not swizzle dynamically).
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_control_flow_attributes : enable
 layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+layout(constant_id = 19) const int RWG = 256;  // invocations per group (the host sets it with the shape, like reduce.comp); gl_WorkGroupSize is not available in ESSL with specialised sizes
 #include "demosaic_common.glsl"
 #include "common.glsl"
-#if MODE <= 3
+#if MODE <= 3 || MODE == 5
 layout(binding = 1, std430) readonly buffer Sb { float S[]; };
 #endif
 #if MODE == 0
 layout(binding = 2, std430) writeonly buffer Gb { vec4 G4[]; };
+layout(binding = 3, std430) readonly buffer Tb { uint tabm[]; };  // host table (demosaic_gpu.cpp): chroma tap masks at 4136, green neighbour entries at 4712
 #elif MODE == 1
 layout(binding = 2, std430) readonly buffer Gb { vec4 G4[]; };
 layout(binding = 3, std430) writeonly buffer Db { vec4 Dv[]; };
+layout(binding = 4, std430) readonly buffer Tb { uint tabm[]; };  // the shared table of the host: tap masks per phase / direction / colour at 4136 (demosaic_gpu.cpp)
 #elif MODE == 2
 layout(binding = 2, std430) readonly buffer Gb { vec4 G4[]; };
 layout(binding = 3, std430) readonly buffer Db { vec4 Dv[]; };
 layout(binding = 4, std430) writeonly buffer Hb { vec4 D4[]; };
-#elif MODE == 3
+#elif MODE == 5
 layout(binding = 2, std430) readonly buffer Gb { vec4 G4[]; };
-layout(binding = 3, std430) buffer Db { vec4 Dv[]; };  // each invocation reads and then overwrites only its own pixel's two vec4
+layout(binding = 3, std430) readonly buffer Db { vec4 Dv[]; };
 layout(binding = 4, std430) readonly buffer Hb { vec4 D4[]; };
-#else
-layout(binding = 1, std430) readonly buffer Cb { vec4 Dv[]; };
-layout(binding = 2, OUT_FMT) uniform writeonly image2D uOut;
+layout(binding = 5, OUT_FMT) uniform writeonly image2D uOut;
 #endif
 const float kLapD = 0.25, kGuide = 0.02, kThrF = 1.5, kThrA = 2e-4, kClip = 0.995, kClipPen = 0.3;
 const int kTie = 1;
@@ -47,51 +53,63 @@ int nearestGreen(int i, int j, int dir, int sg) {
 }
 
 #if MODE == 0
-float greenCand(int k, int i, int j, int c, int dir, int ww) {
-  if (c == 1) return S[k];
-  const ivec2 e = dv(dir);
-  const int st = e.y * ww + e.x;
-  const int km = nearestGreen(i, j, dir, -1), kp = nearestGreen(i, j, dir, 1);
-  const float gm = S[k - km * st], gp = S[k + kp * st];
+const int T = 16, PW = T + 6, NP = PW * PW;  // tile and a patch with a ring of 3 (the greens look 3 samples along a direction)
+shared float shS[NP];
+shared uint shE[144];  // per (phase * 4 + direction): nearest green before (bits 0-1) / after (2-3) along the direction, mask of the 6 same-colour samples within 3 (bits 4-9, q = -3 -2 -1 1 2 3), the pixel is green (bit 10)
+float greenCand(int pc, uint e, int dir) {
+  if (((e >> 10) & 1u) != 0u) return shS[pc];
+  const ivec2 ed = dv(dir);
+  const int st = ed.y * PW + ed.x;
+  const int km = int(e & 3u), kp = int((e >> 2) & 3u);
+  const float gm = shS[pc - km * st], gp = shS[pc + kp * st];
   const float lm = float(km) * dlen(dir), lp = float(kp) * dlen(dir);
   float g = (lp * gm + lm * gp) / (lm + lp);
   float cs = 0.0;
   int cn = 0;
-  for (int q = -3; q <= 3; ++q) {
-    if (q == 0) continue;
-    if (colAt(i + q * e.x, j + q * e.y, 6) == c) { cs += S[k + q * st]; ++cn; }
+  for (int qi = 0; qi < 6; ++qi) {
+    if (((e >> uint(4 + qi)) & 1u) == 0u) continue;
+    cs += shS[pc + (qi < 3 ? qi - 3 : qi - 2) * st];
+    ++cn;
   }
-  if (cn > 0) g += kLapD * (S[k] - cs / float(cn));
+  if (cn > 0) g += kLapD * (shS[pc] - cs / float(cn));
   return min(max(g, min(gm, gp)), max(gm, gp));
 }
 #endif
 
 #if MODE == 1
-vec2 chromaDiff(int k, int i, int j, int c, int dir, int ww) {
+const int T = 16, PW = T + 6, NP = PW * PW;  // the differences look 3 samples around: patch with a ring of 3
+shared float shS[NP];
+shared vec4 shG[NP];
+shared uint shM[576];  // tap masks: ((phase * 4 + direction) * 2 + colour(R, B)) * 2 + word; bit b = (v + 3) * 7 + (u + 3) of the 7 x 7 neighbourhood
+vec2 chromaDiff(int pc, int ph, int c, int dir) {
   const ivec2 e = dv(dir);
-  const float g = comp(G4[k], dir);
+  const float g = comp(shG[pc], dir);
   const float ln = dlen(dir);
   float dr = 0.0, db = 0.0;
   for (int t = 0; t < 2; ++t) {
     const int ct = t * 2;
     float res;
     if (c == ct) {
-      res = S[k] - g;
+      res = shS[pc] - g;
     } else {
       float num = 0.0, den = 0.0, numC = 0.0, denC = 0.0;  // unclipped / clipped samples (see demosaic_cpu.cpp for the rule)
-      for (int v = -3; v <= 3; ++v)
-        for (int uu = -3; uu <= 3; ++uu) {
+      const int mi = ((ph * 4 + dir) * 2 + t) * 2;
+      for (int part = 0; part < 2; ++part) {
+        uint m = shM[mi + part];
+        while (m != 0u) {  // ascending bit order = the row-major order of the plain 7 x 7 loop
+          const int b = findLSB(m) + part * 32;
+          m &= m - 1u;
+          const int uu = b % 7 - 3, v = b / 7 - 3;
           const int r2 = uu * uu + v * v;
-          if (r2 == 0 || r2 > 10) continue;
           const float perp = abs(float(uu * e.y - v * e.x)) / ln;
-          if (perp > 1.01) continue;
-          if (colAt(i + uu, j + v, 6) != ct) continue;
-          const int q = k + v * ww + uu;
-          const float gq = comp(G4[q], dir);
+          const int pq = pc + v * PW + uu;
+          const float gq = comp(shG[pq], dir);
+          const float sq = shS[pq];
           const float w = 1.0 / (float(r2) * (1.0 + perp * perp) * (kGuide + abs(gq - g)));
-          if (S[q] >= kClip) { numC += w * (S[q] - gq); denC += w; }
-          else { num += w * (S[q] - gq); den += w; }
+          if (sq >= kClip) { numC += w * (sq - gq); denC += w; }
+          else { num += w * (sq - gq); den += w; }
         }
+      }
       res = den > 0.0 ? num / den : (denC >= kClipSim ? numC / denC : 0.0);
     }
     if (t == 0) dr = res; else db = res;
@@ -100,36 +118,18 @@ vec2 chromaDiff(int k, int i, int j, int c, int dir, int ww) {
 }
 #endif
 
-#if MODE == 2 || MODE == 3
-vec3 candCube(int k, int c, int dir) {
-  const float g = comp(G4[k], dir);
-  vec3 rgb = vec3(c == 0 ? S[k] : g + comp(Dv[2 * k], dir), g, c == 2 ? S[k] : g + comp(Dv[2 * k + 1], dir));
-  rgb = clamp(rgb, vec3(0.0), vec3(1.0));
-  const vec3 o = vec3(dot(u.m0.xyz, rgb), dot(u.m1.xyz, rgb), dot(u.m2.xyz, rgb));
-  return pow(max(o, vec3(0.0)), vec3(1.0 / 3.0));
-}
-float deriv(int k, int i, int j, int c, int cl, int cr, int cu, int cd, int dir, int ww) {
-  // one call site of candCube in a loop (the unrolled version of 5 x 4 inlined calls took minutes to compile on ANGLE / SwiftShader)
-  vec3 c0 = vec3(0.0);
-  float sum = 0.0;
-  for (int n = 0; n < 5; ++n) {
-    const int off = n == 0 ? 0 : (n == 1 ? -1 : (n == 2 ? 1 : (n == 3 ? -ww : ww)));
-    const int cc = n == 0 ? c : (n == 1 ? cl : (n == 2 ? cr : (n == 3 ? cu : cd)));
-    const vec3 cn = candCube(k + off, cc, dir);
-    if (n == 0) c0 = cn;
-    else { const vec3 df = c0 - cn; sum += dot(df, df); }
-  }
-  if (c != 1) {
-    const ivec2 e = dv(dir);
-    const int st = e.y * ww + e.x;
-    const int km = nearestGreen(i, j, dir, -1), kp = nearestGreen(i, j, dir, 1);
-    if (S[k - km * st] >= kClip || S[k + kp * st] >= kClip) sum += kClipPen;
-  }
-  return sum;
-}
+#if MODE == 2
+const int T = 16, P1 = T + 2, N1 = P1 * P1;  // tile, patch with a ring of 1, its pixel count
+shared float shc[12 * N1];                   // candidate colours in the cube-root space, planar: (dir * 3 + channel) * N1 + patch pixel
+#endif
+#if MODE == 5
+const int T = 16, P1 = T + 2, N1 = P1 * P1, P2 = T + 4, N2 = P2 * P2;
+shared vec4 shD[N2];    // derivatives of the 4 candidates, ring of 2 around the tile
+shared float shT[N2];   // the homogeneity threshold of each of them
+shared vec4 shSel[N1];  // (green, red - green, blue - green) of the selection, ring of 1
 #endif
 
-#if MODE == 4
+#if MODE == 5
 float med9(float a0, float a1, float a2, float a3, float a4, float a5, float a6, float a7, float a8) {
   // exact median of nine by a sorting network (19 compare-exchanges), no arrays
   float t;
@@ -145,81 +145,174 @@ void main() {
   const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
   const int ww = u.dims.x, wh = u.dims.y, rw = u.dims.z, rh = u.dims.w;
 #if MODE == 0
-  if (q.x >= ww || q.y >= wh) return;
-  const int i = q.x, j = q.y, k = j * ww + i;
-  if (i < 3 || j < 3 || i >= ww - 3 || j >= wh - 3) { G4[k] = vec4(0.0); return; }
-  const int c = colAt(i, j, 6);
-  vec4 gr = vec4(0.0);
-  for (int dir = 0; dir < 4; ++dir) {
-    const float g = greenCand(k, i, j, c, dir, ww);
-    if (dir == 0) gr.x = g; else if (dir == 1) gr.y = g; else if (dir == 2) gr.z = g; else gr.w = g;
+  const int NT = RWG;
+  const int tid = int(gl_LocalInvocationIndex);
+  const ivec2 o = ivec2(gl_WorkGroupID.xy) * T;
+  for (int n = tid; n < NP; n += NT) {
+    const int i = o.x + n % PW - 3, j = o.y + n / PW - 3;
+    shS[n] = (i >= 0 && j >= 0 && i < ww && j < wh) ? S[j * ww + i] : 0.0;
   }
-  G4[k] = gr;
-#elif MODE == 1
-  if (q.x >= ww || q.y >= wh) return;
-  const int i = q.x, j = q.y, k = j * ww + i;
-  if (i < 6 || j < 6 || i >= ww - 6 || j >= wh - 6) { Dv[2 * k] = vec4(0.0); Dv[2 * k + 1] = vec4(0.0); return; }
-  const int c = colAt(i, j, 6);
-  vec4 dr4 = vec4(0.0), db4 = vec4(0.0);
-  for (int dir = 0; dir < 4; ++dir) {
-    const vec2 a = chromaDiff(k, i, j, c, dir, ww);
-    if (dir == 0) { dr4.x = a.x; db4.x = a.y; } else if (dir == 1) { dr4.y = a.x; db4.y = a.y; } else if (dir == 2) { dr4.z = a.x; db4.z = a.y; } else { dr4.w = a.x; db4.w = a.y; }
-  }
-  Dv[2 * k] = dr4;
-  Dv[2 * k + 1] = db4;
-#elif MODE == 2
-  if (q.x >= ww || q.y >= wh) return;
-  const int i = q.x, j = q.y, k = j * ww + i;
-  if (i < 7 || j < 7 || i >= ww - 7 || j >= wh - 7) { D4[k] = vec4(0.0); return; }
-  const int c = colAt(i, j, 6);
-  const int cl = colAt(i - 1, j, 6), cr = colAt(i + 1, j, 6), cu = colAt(i, j - 1, 6), cd = colAt(i, j + 1, 6);
-  vec4 dres = vec4(0.0);
-  for (int dir = 0; dir < 4; ++dir) {
-    const float v = deriv(k, i, j, c, cl, cr, cu, cd, dir, ww);
-    if (dir == 0) dres.x = v; else if (dir == 1) dres.y = v; else if (dir == 2) dres.z = v; else dres.w = v;
-  }
-  D4[k] = dres;
-#elif MODE == 3
-  const int x = q.x - 1, y = q.y - 1;
-  if (x >= rw + 1 || y >= rh + 1) return;
-  const int i = x + H, j = y + H, k = j * ww + i;
-  int h0 = 0, h1 = 0, h2 = 0, h3 = 0;
-  for (int v = -1; v <= 1; ++v)
-    for (int uu = -1; uu <= 1; ++uu) {
-      const vec4 dd = D4[k + v * ww + uu];
-      const float m = min(min(dd.x, dd.y), min(dd.z, dd.w));
-      const float thr = m * kThrF + kThrA;
-      h0 += dd.x <= thr ? 1 : 0;
-      h1 += dd.y <= thr ? 1 : 0;
-      h2 += dd.z <= thr ? 1 : 0;
-      h3 += dd.w <= thr ? 1 : 0;
+  for (int n = tid; n < 144; n += NT) shE[n] = tabm[4712 + n];
+  barrier();
+  for (int n = tid; n < T * T; n += NT) {
+    const int i = o.x + n % T, j = o.y + n / T;
+    if (i >= ww || j >= wh) continue;
+    const int k = j * ww + i;
+    if (i < 3 || j < 3 || i >= ww - 3 || j >= wh - 3) { G4[k] = vec4(0.0); continue; }
+    const int pc = (n / T + 3) * PW + n % T + 3;
+    const int ph = ((j + u.org.y + 12) % 6) * 6 + ((i + u.org.x + 12) % 6);
+    vec4 gr = vec4(0.0);
+    [[unroll]] for (int dir = 0; dir < 4; ++dir) {
+      const float g = greenCand(pc, shE[ph * 4 + dir], dir);
+      if (dir == 0) gr.x = g; else if (dir == 1) gr.y = g; else if (dir == 2) gr.z = g; else gr.w = g;
     }
-  const int hmax = max(max(h0, h1), max(h2, h3));
-  const int c = colAt(i, j, 6);
-  vec3 acc = vec3(0.0);
-  float cnt = 0.0;
-  const vec4 g4 = G4[k], dr4 = Dv[2 * k], db4 = Dv[2 * k + 1];
-  for (int dir = 0; dir < 4; ++dir) {
-    const int hd = dir == 0 ? h0 : (dir == 1 ? h1 : (dir == 2 ? h2 : h3));
-    if (hd < hmax - kTie) continue;
-    const float g = comp(g4, dir);
-    acc += vec3(c == 0 ? S[k] : g + comp(dr4, dir), g, c == 2 ? S[k] : g + comp(db4, dir));
-    cnt += 1.0;
+    G4[k] = gr;
   }
-  const vec3 m = acc / cnt;  // (red, green, blue) means
-  Dv[2 * k] = vec4(m.y, clamp(m.x, 0.0, 1.0) - clamp(m.y, 0.0, 1.0), clamp(m.z, 0.0, 1.0) - clamp(m.y, 0.0, 1.0), 0.0);
+#elif MODE == 1
+  const int NT = RWG;
+  const int tid = int(gl_LocalInvocationIndex);
+  const ivec2 o = ivec2(gl_WorkGroupID.xy) * T;
+  for (int n = tid; n < NP; n += NT) {
+    const int i = o.x + n % PW - 3, j = o.y + n / PW - 3;
+    const bool ok = i >= 0 && j >= 0 && i < ww && j < wh;
+    shS[n] = ok ? S[j * ww + i] : 0.0;
+    shG[n] = ok ? G4[j * ww + i] : vec4(0.0);
+  }
+  for (int n = tid; n < 576; n += NT) shM[n] = tabm[4136 + n];
+  barrier();
+  for (int n = tid; n < T * T; n += NT) {
+    const int i = o.x + n % T, j = o.y + n / T;
+    if (i >= ww || j >= wh) continue;
+    const int k = j * ww + i;
+    if (i < 6 || j < 6 || i >= ww - 6 || j >= wh - 6) { Dv[2 * k] = vec4(0.0); Dv[2 * k + 1] = vec4(0.0); continue; }
+    const int pc = (n / T + 3) * PW + n % T + 3;
+    const int ph = ((j + u.org.y + 12) % 6) * 6 + ((i + u.org.x + 12) % 6);
+    const int c = colAt(i, j, 6);
+    vec4 dr4 = vec4(0.0), db4 = vec4(0.0);
+    [[unroll]] for (int dir = 0; dir < 4; ++dir) {
+      const vec2 a = chromaDiff(pc, ph, c, dir);
+      if (dir == 0) { dr4.x = a.x; db4.x = a.y; } else if (dir == 1) { dr4.y = a.x; db4.y = a.y; } else if (dir == 2) { dr4.z = a.x; db4.z = a.y; } else { dr4.w = a.x; db4.w = a.y; }
+    }
+    Dv[2 * k] = dr4;
+    Dv[2 * k + 1] = db4;
+  }
+#elif MODE == 2
+  const int NT = RWG;
+  const int tid = int(gl_LocalInvocationIndex);
+  const ivec2 o = ivec2(gl_WorkGroupID.xy) * T;
+  for (int n = tid; n < N1; n += NT) {  // candidate colours of the patch (window pixels o - 1 .. o + 16)
+    const int i = o.x + n % P1 - 1, j = o.y + n / P1 - 1;
+    const bool ok = i >= 0 && j >= 0 && i < ww && j < wh;
+    const int k = ok ? j * ww + i : 0;
+    const int c = colAt(i, j, 6);
+    const float s = ok ? S[k] : 0.0;
+    const vec4 g4 = ok ? G4[k] : vec4(0.0), dr4 = ok ? Dv[2 * k] : vec4(0.0), db4 = ok ? Dv[2 * k + 1] : vec4(0.0);
+    [[unroll]] for (int d = 0; d < 4; ++d) {
+      vec3 cube = vec3(0.0);
+      if (ok) {
+        const float g = comp(g4, d);
+        vec3 rgb = vec3(c == 0 ? s : g + comp(dr4, d), g, c == 2 ? s : g + comp(db4, d));
+        rgb = clamp(rgb, vec3(0.0), vec3(1.0));
+        const vec3 oo = vec3(dot(u.m0.xyz, rgb), dot(u.m1.xyz, rgb), dot(u.m2.xyz, rgb));
+        cube = pow(max(oo, vec3(0.0)), vec3(1.0 / 3.0));
+      }
+      shc[(d * 3 + 0) * N1 + n] = cube.x;
+      shc[(d * 3 + 1) * N1 + n] = cube.y;
+      shc[(d * 3 + 2) * N1 + n] = cube.z;
+    }
+  }
+  barrier();
+  for (int n = tid; n < T * T; n += NT) {
+    const int px = n % T, py = n / T;
+    const int i = o.x + px, j = o.y + py;
+    if (i >= ww || j >= wh) continue;
+    const int k = j * ww + i;
+    if (i < 7 || j < 7 || i >= ww - 7 || j >= wh - 7) { D4[k] = vec4(0.0); continue; }
+    const int pc = (py + 1) * P1 + px + 1;
+    const int c = colAt(i, j, 6);
+    vec4 dres = vec4(0.0);
+    [[unroll]] for (int dir = 0; dir < 4; ++dir) {
+      const int b = dir * 3 * N1;
+      const vec3 c0 = vec3(shc[b + pc], shc[b + N1 + pc], shc[b + 2 * N1 + pc]);
+      float sum = 0.0;
+      for (int nb = 0; nb < 4; ++nb) {
+        const int pn = pc + (nb == 0 ? -1 : (nb == 1 ? 1 : (nb == 2 ? -P1 : P1)));
+        const vec3 df = c0 - vec3(shc[b + pn], shc[b + N1 + pn], shc[b + 2 * N1 + pn]);
+        sum += dot(df, df);
+      }
+      if (c != 1) {
+        const ivec2 e = dv(dir);
+        const int st = e.y * ww + e.x;
+        const int km = nearestGreen(i, j, dir, -1), kp = nearestGreen(i, j, dir, 1);
+        if (S[k - km * st] >= kClip || S[k + kp * st] >= kClip) sum += kClipPen;
+      }
+      if (dir == 0) dres.x = sum; else if (dir == 1) dres.y = sum; else if (dir == 2) dres.z = sum; else dres.w = sum;
+    }
+    D4[k] = dres;
+  }
 #else
-  if (q.x >= rw || q.y >= rh) return;
-  const int k = (q.y + H) * ww + q.x + H;
-  const float g = clamp(Dv[2 * k].x, 0.0, 1.0);
-  const vec4 n0 = Dv[2 * (k - ww - 1)], n1 = Dv[2 * (k - ww)], n2 = Dv[2 * (k - ww + 1)], n3 = Dv[2 * (k - 1)], n4 = Dv[2 * k], n5 = Dv[2 * (k + 1)], n6 = Dv[2 * (k + ww - 1)], n7 = Dv[2 * (k + ww)], n8 = Dv[2 * (k + ww + 1)];
-  const float mr = med9(n0.y, n1.y, n2.y, n3.y, n4.y, n5.y, n6.y, n7.y, n8.y);
-  const float mb = med9(n0.z, n1.z, n2.z, n3.z, n4.z, n5.z, n6.z, n7.z, n8.z);
-  const vec3 o = finishRgb(clamp(vec3(g + mr, g, g + mb), vec3(0.0), vec3(1.0)));
+  const int NT = RWG;
+  const int tid = int(gl_LocalInvocationIndex);
+  const ivec2 o = ivec2(gl_WorkGroupID.xy) * T;  // first output pixel of the tile (ROI coordinates); window pixel = ROI pixel + H
+  for (int n = tid; n < N2; n += NT) {           // derivatives of ROI pixels o - 2 .. o + 17
+    const int i = o.x + n % P2 - 2 + H, j = o.y + n / P2 - 2 + H;
+    vec4 dd = vec4(1.0e30);
+    if (i >= 0 && j >= 0 && i < ww && j < wh) dd = D4[j * ww + i];
+    shD[n] = dd;
+    shT[n] = min(min(dd.x, dd.y), min(dd.z, dd.w)) * kThrF + kThrA;
+  }
+  barrier();
+  for (int n = tid; n < N1; n += NT) {  // the selection of ROI pixels o - 1 .. o + 16
+    const int a = n % P1, b = n / P1;
+    const int i = o.x + a - 1 + H, j = o.y + b - 1 + H;
+    vec4 res = vec4(0.0);
+    if (i >= 0 && j >= 0 && i < ww && j < wh) {
+      const int pc = (b + 1) * P2 + a + 1;  // the same pixel in the derivative patch
+      int h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+      for (int v = -1; v <= 1; ++v)
+        for (int uu = -1; uu <= 1; ++uu) {
+          const int pn = pc + v * P2 + uu;
+          const vec4 dd = shD[pn];
+          const float thr = shT[pn];
+          h0 += dd.x <= thr ? 1 : 0;
+          h1 += dd.y <= thr ? 1 : 0;
+          h2 += dd.z <= thr ? 1 : 0;
+          h3 += dd.w <= thr ? 1 : 0;
+        }
+      const int hmax = max(max(h0, h1), max(h2, h3));
+      const int k = j * ww + i;
+      const int c = colAt(i, j, 6);
+      const float s = S[k];
+      vec3 acc = vec3(0.0);
+      float cnt = 0.0;
+      const vec4 g4 = G4[k], dr4 = Dv[2 * k], db4 = Dv[2 * k + 1];
+      [[unroll]] for (int dir = 0; dir < 4; ++dir) {
+        const int hd = dir == 0 ? h0 : (dir == 1 ? h1 : (dir == 2 ? h2 : h3));
+        if (hd < hmax - kTie) continue;
+        const float g = comp(g4, dir);
+        acc += vec3(c == 0 ? s : g + comp(dr4, dir), g, c == 2 ? s : g + comp(db4, dir));
+        cnt += 1.0;
+      }
+      const vec3 m = acc / cnt;  // (red, green, blue) means
+      res = vec4(m.y, clamp(m.x, 0.0, 1.0) - clamp(m.y, 0.0, 1.0), clamp(m.z, 0.0, 1.0) - clamp(m.y, 0.0, 1.0), 0.0);
+    }
+    shSel[n] = res;
+  }
+  barrier();
+  for (int n = tid; n < T * T; n += NT) {
+    const ivec2 p = o + ivec2(n % T, n / T);
+    if (p.x >= rw || p.y >= rh) continue;
+    const int pc = (n / T + 1) * P1 + n % T + 1;
+    const vec4 n0 = shSel[pc - P1 - 1], n1 = shSel[pc - P1], n2 = shSel[pc - P1 + 1], n3 = shSel[pc - 1], n4 = shSel[pc], n5 = shSel[pc + 1], n6 = shSel[pc + P1 - 1], n7 = shSel[pc + P1], n8 = shSel[pc + P1 + 1];
+    const float g = clamp(n4.x, 0.0, 1.0);
+    const float mr = med9(n0.y, n1.y, n2.y, n3.y, n4.y, n5.y, n6.y, n7.y, n8.y);
+    const float mb = med9(n0.z, n1.z, n2.z, n3.z, n4.z, n5.z, n6.z, n7.z, n8.z);
+    const vec3 o3 = finishRgb(clamp(vec3(g + mr, g, g + mb), vec3(0.0), vec3(1.0)));
 #ifdef OUT16
-  imageStore(uOut, q + u.io.yz, h16v(vec4(o, 1.0)));
+    imageStore(uOut, p + u.io.yz, h16v(vec4(o3, 1.0)));
 #else
-  imageStore(uOut, q + u.io.yz, vec4(o, 1.0));
+    imageStore(uOut, p + u.io.yz, vec4(o3, 1.0));
 #endif
+  }
 #endif
 }

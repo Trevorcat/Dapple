@@ -13,6 +13,8 @@ void setRuntimeEnabled(int enabled);  // 0 off, 1 on, -1 back to environment / p
 // Where the self-test verdicts and the in-progress marker live (an app-private directory), the app version and Build.FINGERPRINT they are keyed by
 // (empty fingerprint = the ro.build.fingerprint property). Call before startWarmup(); without a directory nothing is persisted.
 void configure(const std::string& cacheDir, const std::string& appVersion, const std::string& fingerprint);
+// The cache directory, app version and fingerprint passed to configure() (empty when never configured): per-device verdicts of other nodes (demosaic) are cached next to the probe verdicts.
+void cacheConfig(std::string* dir, std::string* appVersion, std::string* fingerprint);
 // Auto mode: starts the device creation + self-test on a detached low-priority thread (idempotent, returns at once).
 void startWarmup();
 // Installs the provider into EngineSession (idempotent). Call before the first frame that may use the GPU.

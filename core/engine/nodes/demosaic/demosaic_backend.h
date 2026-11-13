@@ -14,6 +14,9 @@ class GpuBackend {
   virtual ~GpuBackend() = default;
   // True when the GPU may be used now (runtime switch on and a device usable). `why` says why not.
   virtual bool available(std::string& why) = 0;
+  // Whether the GPU is the faster node for this work on this device (measured once per device, see demosaic_gpu.cpp; separately for a whole frame and for a
+  // region). The decoder runs the CPU node when this says no: the slower node is never used. Default: yes.
+  virtual bool prefer(const Desc& d, Rect roi, std::string& why) { (void)d, (void)roi, (void)why; return true; }
   // Demosaic `roi` into out (interleaved float RGB). False = failed / unavailable: the caller falls back to the CPU node.
   virtual bool run(const Desc& d, Rect roi, float* out, std::size_t strideFloats, std::string& why) = 0;
 };

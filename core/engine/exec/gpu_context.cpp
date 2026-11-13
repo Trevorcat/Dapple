@@ -994,6 +994,13 @@ ProviderImpl& provider() {
 bool runtimeEnabled() { return mode() != Mode::Off; }
 void setRuntimeEnabled(int enabled) { g_override.store(enabled); }
 void setPresentExtensions(int on) { g_presentExt.store(on); }
+void cacheConfig(std::string* dir, std::string* appVersion, std::string* fingerprint) {
+  std::lock_guard<std::mutex> lk(config().mu);
+  if (dir) *dir = config().dir;
+  if (appVersion) *appVersion = config().app;
+  if (fingerprint) *fingerprint = config().fingerprint.empty() ? systemFingerprint() : config().fingerprint;
+}
+
 void configure(const std::string& cacheDir, const std::string& appVersion, const std::string& fingerprint) {
   std::lock_guard<std::mutex> lk(config().mu);
   config().dir = cacheDir;
