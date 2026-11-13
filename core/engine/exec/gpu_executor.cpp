@@ -1319,6 +1319,7 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   hal::FenceH fence;
   hal::Status s = runGraph(d, g, *cl, &fence, err);
   if (s != hal::Status::Ok) return failStatus(s, err), Status::Internal;
+  keepWarmAfterSubmit(*ctx_);  // touch hint: a keep-warm unit queued behind this frame (no-op outside a window; never ahead of the frame)
   const auto tWait = Clock::now();
   for (SolveStore& ss : stores) {
     ResultCache::Entry e;

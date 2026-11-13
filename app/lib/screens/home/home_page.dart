@@ -90,7 +90,7 @@ class _HomePageState extends State<HomePage> {
       slivers: [
         const SliverToBoxAdapter(child: SizedBox(height: Sp.s)),
         // wide layouts show the status in the title row; the card only appears when something needs attention
-        if (!widget.wide || app.connState != ConnState.connected) SliverToBoxAdapter(child: ConnCard(app: app)),
+        if (!widget.wide || app.connState != ConnState.connected || app.usbCardActive) SliverToBoxAdapter(child: ConnCard(app: app)),
         if (app.hasBackgroundJob) SliverToBoxAdapter(child: _TaskBar(job: app.job!)),
         if (app.importing) const SliverToBoxAdapter(child: _ImportBar()),
         if (!app.isEmpty && !app.selectMode) SliverToBoxAdapter(child: _EntryCards(app: app)),

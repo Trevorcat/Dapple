@@ -72,26 +72,28 @@ ImageF hdrLinear(const Image8& sdr, const Image8& bright, float H, bool p3) {
 }
 
 GainMap makeGainMap(const Image8& sdr, const Image8& bright, float H, bool p3) {
-  GainMap gm;
-  gm.width = sdr.width;
-  gm.height = sdr.height;
   const ImageF hdr = hdrLinear(sdr, bright, H, p3);
   const float* t = lut8();
-  const std::size_t n = std::size_t(gm.width) * gm.height;
-  std::vector<float> g(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    const float s[3] = {t[sdr.data[3 * i]], t[sdr.data[3 * i + 1]], t[sdr.data[3 * i + 2]]};
-    const float ys = luma(s, p3), yh = luma(&hdr.data[3 * i], p3);
-    g[i] = std::max(0.f, std::log2((yh + kOffset) / (ys + kOffset)));
-  }
-  // Edge guard: where a neighbour is much darker in the SDR picture (below 0.6 of this pixel) the gain is limited to the neighbour's, but never below half
-  // of its own (stops), so the up-scaled map lights the dark side of an edge by at most a quarter of the highlight's gain while a thin highlight (a glint, sky
-  // through leaves) keeps half of its gain; smooth gradients are left alone (a plain 3x3 minimum costs 0.3 stop on a sky gradient).
-  std::vector<float> ys(n);
+  const std::size_t n = std::size_t(sdr.width) * sdr.height;
+  std::vector<float> ys(n), yh(n);
   for (std::size_t i = 0; i < n; ++i) {
     const float s[3] = {t[sdr.data[3 * i]], t[sdr.data[3 * i + 1]], t[sdr.data[3 * i + 2]]};
     ys[i] = luma(s, p3);
+    yh[i] = luma(&hdr.data[3 * i], p3);
   }
+  return makeGainMapFromLuma(ys, yh, sdr.width, sdr.height);
+}
+
+GainMap makeGainMapFromLuma(const std::vector<float>& ys, const std::vector<float>& yh, int width, int height) {
+  GainMap gm;
+  gm.width = width;
+  gm.height = height;
+  const std::size_t n = std::size_t(gm.width) * gm.height;
+  std::vector<float> g(n);
+  for (std::size_t i = 0; i < n; ++i) g[i] = std::max(0.f, std::log2((yh[i] + kOffset) / (ys[i] + kOffset)));
+  // Edge guard: where a neighbour is much darker in the SDR picture (below 0.6 of this pixel) the gain is limited to the neighbour's, but never below half
+  // of its own (stops), so the up-scaled map lights the dark side of an edge by at most a quarter of the highlight's gain while a thin highlight (a glint, sky
+  // through leaves) keeps half of its gain; smooth gradients are left alone (a plain 3x3 minimum costs 0.3 stop on a sky gradient).
   std::vector<float> m(n);
   for (int y = 0; y < gm.height; ++y)
     for (int x = 0; x < gm.width; ++x) {

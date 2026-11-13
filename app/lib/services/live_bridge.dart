@@ -140,6 +140,23 @@ class StillResult {
   final String kind;
 }
 
+/// The engine's verdict on an Ultra HDR Motion Photo cover (see [LiveBridge.coverHdr]).
+class CoverHdrResult {
+  CoverHdrResult(this.path, this.written, this.reason, this.peak, this.gainMax);
+
+  /// The cover file: the SDR still plus a gain map, or an unchanged copy of the still when there is no gain map.
+  final String path;
+
+  /// True when [path] carries a gain map.
+  final bool written;
+
+  /// Why not: 1 no highlight headroom (or an SDR clip), 2 film (a print), 3 the renders did not pair.
+  final int reason;
+
+  /// 99.9th percentile of the cover frame's HDR luminance in SDR white units; the gain map's largest gain (stops).
+  final double peak, gainMax;
+}
+
 /// The platform has no decoder that can decode this video correctly (e.g. H.264 4:2:2 10-bit on a device whose
 /// decoders only do 8-bit 4:2:0); it would return false-colour frames, so none are produced.
 class UnsupportedVideoException implements Exception {
@@ -206,6 +223,18 @@ class LiveBridge {
       }
       rethrow;
     }
+  }
+
+  /// The Ultra HDR cover of an edited Motion Photo: the cover frame of [uri] at [timeMs] goes through the engine with [edit] (the still's edit), its HDR
+  /// rendition gives a gain map that is attached to [sdr] (the exported still, kept byte for byte as the base image) into [out]. [force] = the user chose
+  /// HDR in the export options. [out] always exists afterwards (a plain copy of [sdr] when there is no headroom, the clip is SDR or the edit has film).
+  static Future<CoverHdrResult> coverHdr(String uri, int timeMs,
+      {required String sdr, required String out, required EditedClip edit, LiveSource source = LiveSource.auto, bool force = false}) async {
+    final m = (await _live.invokeMapMethod<String, dynamic>('coverHdr', {
+      'uri': uri, 'timeMs': timeMs, 'sdr': sdr, 'out': out, 'source': source.code, 'force': force, 'edit': edit.toMap(),
+    }))!;
+    return CoverHdrResult(m['path'] as String? ?? out, m['written'] == true, (m['reason'] as num?)?.toInt() ?? 0, (m['peak'] as num?)?.toDouble() ?? 0,
+        (m['gainMax'] as num?)?.toDouble() ?? 0);
   }
 
   /// Decodes and re-encodes the clip: HEVC Main10 when the device can, else H.264 8-bit; [compat] = 8-bit H.264 for sharing. [edit]: every frame goes

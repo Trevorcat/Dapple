@@ -21,3 +21,13 @@ EditedClip? editedClipFor({
   if (!edited) return null;
   return EditedClip(paramsJson: jsonEncode(wire), lutPath: lutPath, refMs: coverMs, stillLongEdge: stillLongEdge);
 }
+
+/// Does the Motion Photo cover get an HDR gain map (docs/engine/pipeline-architecture.md section 30.14)? Only an HDR clip (colour kind 2 HLG, 3 PQ of the
+/// video core) has highlights above SDR white to put into it; the engine then decides from the cover frame's headroom (peak >= 1.5 x SDR white, or >= 1.1
+/// when the user chose HDR in the export options: [hdrOption] lowers the threshold, it cannot create headroom an SDR clip does not have).
+bool liveCoverWantsHdr({required bool hdrOption, required int colorKind}) => colorKind == 2 || colorKind == 3;
+
+/// The payload for [LiveBridge.coverHdr]: the edit the still was rendered with (also when the clip itself is exported as recorded: the cover frame is
+/// then rendered with the identity of the still's wire), the cover time as the reference frame, the long edge of the still.
+EditedClip coverEditFor({required Map<String, dynamic> wire, required int coverMs, int stillLongEdge = 0, String? lutPath}) =>
+    EditedClip(paramsJson: jsonEncode(wire), lutPath: lutPath, refMs: coverMs, stillLongEdge: stillLongEdge);

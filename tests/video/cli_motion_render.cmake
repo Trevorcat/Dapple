@@ -35,3 +35,18 @@ foreach(case "none|18|9" "kodak_portra_400|1|1")
     message(FATAL_ERROR "verify (HLG, film ${film}) failed (${rc2})")
   endif()
 endforeach()
+
+# HDR + geometry through the CLI: an HLG source with crop 1:1 + rotate 90 + straighten, no film, stays 10-bit HLG BT.2020 (stream tags 9 / 18) end to end
+file(WRITE "${OUT}.geo.json" "{\"crop\": \"1:1\", \"rot\": 90, \"straighten\": 3.5}")
+file(REMOVE "${OUT}.geo.mkv")
+execute_process(COMMAND "${CLI}" motion render "${SRC}/tests/data/video/hlg_ramp_hevc_420_10.mp4" -o "${OUT}.geo.mkv" --edit "${OUT}.geo.json" --bits 10
+                RESULT_VARIABLE rc OUTPUT_VARIABLE o ERROR_VARIABLE e)
+message("${o}${e}")
+if(NOT rc EQUAL 0)
+  message(FATAL_ERROR "dapple motion render (HLG, crop + rotate + straighten) failed (${rc})")
+endif()
+execute_process(COMMAND "${TESTER}" verify "${OUT}.geo.mkv" 18 9 RESULT_VARIABLE rc2 OUTPUT_VARIABLE o2 ERROR_VARIABLE e2)
+message("${o2}${e2}")
+if(NOT rc2 EQUAL 0)
+  message(FATAL_ERROR "verify (HLG geometry) failed (${rc2})")
+endif()

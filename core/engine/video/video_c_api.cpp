@@ -1,7 +1,11 @@
 // C API of VideoFrameSession (dapple_c.h, "Edited Motion Photo clips"): compiled into libdapple itself (the exports must live in the shared
 // library, see core/CMakeLists.txt). The frames come from the video core (DV_RGBAF16) through a direct buffer; nothing here touches FFmpeg.
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -12,6 +16,7 @@
 #include "dapple/dapple_c.h"
 #include "dapple/edit_params.h"
 #include "dapple/lut.h"
+#include "dapple/ultrahdr.h"
 #include "engine/video/video_frame_session.h"
 
 namespace {
@@ -167,6 +172,169 @@ DAPPLE_API int32_t dapple_video_edit_output_kind(DappleVideoEdit* h, int32_t tag
   if (tags) h->s->outputTags(tags);
   if (note) *note = h->s->outputNote();
   return static_cast<int32_t>(h->s->outputKind());
+}
+
+namespace {
+
+bool readAll(const char* path, std::vector<uint8_t>& out) {
+  std::ifstream f(std::filesystem::u8path(path ? path : ""), std::ios::binary);
+  if (!f) return false;
+  out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+  return !out.empty();
+}
+bool writeAllAtomic(const char* path, const std::vector<uint8_t>& b) {
+  const std::filesystem::path p = std::filesystem::u8path(path ? path : "");
+  const std::filesystem::path tmp = p.string() + ".part";
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f.write(reinterpret_cast<const char*>(b.data()), std::streamsize(b.size()));
+    f.flush();
+    if (!f) return false;
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp, p, ec);
+  if (ec) {
+    std::filesystem::remove(p, ec);
+    std::filesystem::rename(tmp, p, ec);
+  }
+  return !ec;
+}
+// Pixel size of a baseline / progressive JPEG from its SOF marker.
+bool jpegSize(const std::vector<uint8_t>& j, int& w, int& h) {
+  size_t i = 2;
+  while (i + 9 < j.size()) {
+    if (j[i] != 0xFF) {
+      ++i;
+      continue;
+    }
+    const uint8_t m = j[i + 1];
+    if (m == 0xFF) {
+      ++i;
+      continue;
+    }
+    if (m >= 0xC0 && m <= 0xC2) {
+      h = (j[i + 5] << 8) | j[i + 6];
+      w = (j[i + 7] << 8) | j[i + 8];
+      return w > 0 && h > 0;
+    }
+    if (m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 0x01) {
+      i += 2;
+      continue;
+    }
+    i += 2 + size_t((j[i + 2] << 8) | j[i + 3]);
+  }
+  return false;
+}
+// Area average of a per-pixel plane into gw x gh.
+std::vector<float> boxDown(const std::vector<float>& src, int w, int h, int gw, int gh) {
+  std::vector<double> acc(size_t(gw) * gh, 0.0);
+  std::vector<int> cnt(size_t(gw) * gh, 0);
+  for (int y = 0; y < h; ++y) {
+    const int gy = std::min(gh - 1, int(int64_t(y) * gh / h));
+    for (int x = 0; x < w; ++x) {
+      const int gx = std::min(gw - 1, int(int64_t(x) * gw / w));
+      acc[size_t(gy) * gw + gx] += src[size_t(y) * w + x];
+      ++cnt[size_t(gy) * gw + gx];
+    }
+  }
+  std::vector<float> out(acc.size());
+  for (size_t i = 0; i < out.size(); ++i) out[i] = cnt[i] ? float(acc[i] / cnt[i]) : 0.f;
+  return out;
+}
+
+}  // namespace
+
+DAPPLE_API int32_t dapple_video_edit_cover_uhdr(DappleVideoEdit* h, const uint16_t* rgba_f16, int32_t w, int32_t h_px, int32_t colour_kind,
+                                                int32_t rotation_deg, const char* sdr_jpeg_path, const char* out_path, int32_t force_hdr,
+                                                DappleHdrInfo* info) {
+  if (info) *info = DappleHdrInfo{0, 0, 0.f, 0.f, 0.f, 0.f};
+  if (!h || !rgba_f16 || !sdr_jpeg_path || !out_path) {
+    setErr("null argument");
+    return DAPPLE_ERROR;
+  }
+  try {
+    std::vector<uint8_t> base;
+    if (!readAll(sdr_jpeg_path, base) || base.size() < 4 || base[0] != 0xFF || base[1] != 0xD8) {
+      setErr(std::string("cover JPEG unreadable: ") + sdr_jpeg_path);
+      return DAPPLE_ERROR;
+    }
+    auto plain = [&](int reason, float peak) -> int32_t {
+      if (!writeAllAtomic(out_path, base)) {
+        setErr(std::string("cannot write ") + out_path);
+        return DAPPLE_ERROR;
+      }
+      if (info) {
+        info->written = 0;
+        info->reason = reason;
+        info->peak = peak;
+      }
+      return DAPPLE_OK;
+    };
+    std::string err;
+    const InputFrame f = frameOf(rgba_f16, w, h_px, colour_kind, rotation_deg);
+    if (!h->s->hasReference() && !h->s->setReference(f, &err)) {
+      setErr(err);
+      return DAPPLE_ERROR;
+    }
+    if (h->s->outputKind() == dapple::engine::video::OutputKind::Sdr709) return plain(h->s->heldParams().filmStock.empty() ? 1 : 2, 0.f);
+    dapple::ImageF sdr, hdr;
+    if (!h->s->renderStillHdr(f, sdr, hdr, &err)) {
+      setErr(err);
+      return DAPPLE_ERROR;
+    }
+    int bw = 0, bh = 0;
+    if (!jpegSize(base, bw, bh)) return plain(3, 0.f);
+    const float ab = float(bw) / float(bh), asp = float(sdr.width) / float(sdr.height);
+    if (std::fabs(ab - asp) / ab > 0.02f) return plain(3, 0.f);
+    // gain map at a quarter of the base picture (never above the rendered size), luminance only: linear luminance is linear, so the area average of
+    // the luminance is the luminance of the average
+    const int longG = std::max(8, std::min((std::max(bw, bh) + 3) / 4, std::max(sdr.width, sdr.height)));
+    const int gw = std::max(1, sdr.width >= sdr.height ? longG : int(std::lround(double(longG) * sdr.width / sdr.height)));
+    const int gh = std::max(1, sdr.width >= sdr.height ? int(std::lround(double(longG) * sdr.height / sdr.width)) : longG);
+    const size_t n = size_t(sdr.width) * sdr.height;
+    std::vector<float> ys(n), yh(n);
+    auto dec = [](float e) { return e <= 0.04045f ? e / 12.92f : std::pow((e + 0.055f) / 1.055f, 2.4f); };
+    for (size_t i = 0; i < n; ++i) {
+      const float* s = &sdr.data[3 * i];
+      const float* x = &hdr.data[3 * i];
+      float r = dec(std::min(1.f, std::max(0.f, s[0]))), g = dec(std::min(1.f, std::max(0.f, s[1]))), b = dec(std::min(1.f, std::max(0.f, s[2])));
+      ys[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+      yh[i] = 0.2126f * x[0] + 0.7152f * x[1] + 0.0722f * x[2];
+    }
+    const std::vector<float> Ys = boxDown(ys, sdr.width, sdr.height, gw, gh), Yh = boxDown(yh, sdr.width, sdr.height, gw, gh);
+    const size_t gn = size_t(gw) * gh;
+    std::vector<float> sorted = Yh;
+    const size_t k = std::min(gn - 1, size_t(double(gn) * 0.999));
+    std::nth_element(sorted.begin(), sorted.begin() + std::ptrdiff_t(k), sorted.end());
+    const float peak = sorted[k];
+    if (!(peak >= (force_hdr ? 1.1f : dapple::uhdr::kWorthPeak))) return plain(1, peak);
+    // gain log2((Yh + o) / (Ys + o)) >= 0 with the edge guard, one shared function with the still export
+    const dapple::uhdr::GainMap gm = dapple::uhdr::makeGainMapFromLuma(Ys, Yh, gw, gh);
+    if (gm.meta.gainMax <= 0.f) return plain(1, peak);
+    const float gmax = gm.meta.gainMax;
+    auto file = dapple::uhdr::assemble(base, gm);
+    if (!file) {
+      setErr(file.error().message);
+      return DAPPLE_ERROR;
+    }
+    if (!writeAllAtomic(out_path, *file)) {
+      setErr(std::string("cannot write ") + out_path);
+      return DAPPLE_ERROR;
+    }
+    if (info) {
+      info->written = 1;
+      info->reason = 0;
+      info->peak = peak;
+      info->headroom_stops = std::log2(std::max(1.f, peak));
+      info->gain_max = gmax;
+      info->capacity_max = gmax;
+    }
+    return DAPPLE_OK;
+  } catch (const std::exception& e) {
+    setErr(std::string("cover_uhdr: ") + e.what());
+    return DAPPLE_ERROR;
+  }
 }
 
 DAPPLE_API const char* dapple_video_edit_last_error(void) { return g_err.c_str(); }

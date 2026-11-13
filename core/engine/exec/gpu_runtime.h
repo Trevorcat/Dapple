@@ -26,4 +26,20 @@ void setPresentExtensions(int on);
 //  "reason":..,"fallbacks":..,"executors":{engine_session.h executorStatsJson},...}
 std::string statusJson();
 
+// Keep-warm (touch hint, docs/engine/device-results/redmi-garnet.md round 10): after an idle pause the GPU / memory clocks are low, the first submission
+// pays a wake-up, and a drag alone does not lift the clocks. keepWarm(ms), called on touch-down, opens a window of GPU-only work units (a copy over a
+// working set larger than the caches, ~1.5 ms each at the low clock; nothing read back, no effect on any picture) plus one busy thread on the big
+// cores. At most two units are on the queue while no real frame is pending, none is submitted while one is (it waits for at most the units already on
+// the GPU), and while the drag runs units are queued right behind each real frame (keepWarmAfterSubmit). Window: at least `ms`; until the first real
+// frame or 250 ms; then 300 ms of the drag; never more than 400 ms after touch-down. Returns at once (one worker thread; a second call extends the
+// window). ms < 0: allocate the working set now and run one unit. No-op when no GPU device is active. Env (measurement): DAPPLE_HINT_* in gpu_context.cpp.
+void keepWarm(int ms);
+// Real-frame bracket for the keep-warm pump: +1 when a foreground frame is requested, -1 when it returned (cheap, any thread).
+void keepWarmFrame(int delta);
+// GPU executor, right after a foreground frame was submitted (context mutex held): queues keep-warm units behind it while a window is open.
+class Context;
+void keepWarmAfterSubmit(Context& c);
+// Diagnostics of the last keep-warm window: {"units":..,"gpuMs":..,"firstMBps":..,"lastMBps":..,...}
+std::string keepWarmJson();
+
 }  // namespace dapple::engine::gpu

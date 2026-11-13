@@ -126,6 +126,29 @@ class SoftwareMedia(private val ctx: Context) {
         }
     }
 
+    /**
+     * The Ultra HDR cover of an edited Motion Photo (docs section 30.14). [sdrJpeg] is the exported still of the same edit; the cover frame at [timeMs] goes through the
+     * engine session of [edit] (the same one the clip uses), its HDR rendition gives the gain map and [out] = [sdrJpeg] + gain map (or a plain copy of it when the
+     * frame has no headroom, the source is SDR or the edit has film). Needs no Android 14 API: the container is written by the engine.
+     */
+    fun coverHdr(uri: String, dec: SwVideo.DecodeSel, source: Int, timeMs: Long, edit: EditSpec, sdrJpeg: String, out: String, forceHdr: Boolean): Map<String, Any?> {
+        val t0 = System.nanoTime()
+        SwVideo.open(ctx, uri, dec, source).use { s ->
+            val us = timeMs * 1000L
+            val run = EditRun.start(s, edit.copy(refMs = timeMs), us, us)
+            try {
+                val r = run.session.coverUhdr(run.src, s.outW, s.outH, run.kind, run.rotation, sdrJpeg, out, forceHdr)
+                afterDecode(dec, s)
+                val ms = (System.nanoTime() - t0) / 1_000_000
+                Log.i(TAG, "cover @${timeMs}ms hdr=${r.written} reason=${r.reason} peak=${r.peak} gainMax=${r.gainMax} session=${run.session.note}: $ms ms")
+                return mapOf("written" to r.written, "reason" to r.reason, "peak" to r.peak.toDouble(), "gainMax" to r.gainMax.toDouble(),
+                    "colorKind" to s.info.colorKind, "elapsedMs" to ms, "path" to out)
+            } finally {
+                run.close()
+            }
+        }
+    }
+
     private fun stillUltraHdr(s: SwVideo.Session, timeMs: Long, maxEdge: Int, quality: Int, dest: File) {
         s.begin(timeMs * 1000L, timeMs * 1000L, maxEdge, 0.0, SwVideo.RGBAF16, false)
         val buf = ByteBuffer.allocateDirect(s.bufferSize(SwVideo.RGBAF16)).order(ByteOrder.nativeOrder())

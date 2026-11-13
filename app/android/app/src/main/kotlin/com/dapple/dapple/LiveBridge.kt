@@ -252,6 +252,13 @@ class LiveBridge(private val ctx: Context) {
         return sw.frame(uri, decodeSel(uri), source, timeMs, dest, maxEdge, quality, compat)
     }
 
+    /** The Ultra HDR cover of an edited Motion Photo (see [SoftwareMedia.coverHdr]); [out] is always written (a plain copy of [sdrJpeg] when there is no headroom). */
+    fun coverHdr(uri: String, timeMs: Long, source: Int, edit: EditSpec, sdrJpeg: String, out: String, forceHdr: Boolean): Map<String, Any?> {
+        requireDecodable(uri)
+        if (!DappleVideoEdit.available) throw UnsupportedVideo("the edit engine is not available in this build")
+        return sw.coverHdr(uri, decodeSel(uri), source, timeMs, edit, sdrJpeg, out, forceHdr)
+    }
+
     /**
      * Decodes (core/video) and re-encodes [startMs, startMs + durationMs] into [dest] (MP4): HEVC Main10 when the device has an
      * encoder for it, else 8-bit H.264 ([compat] forces the 8-bit H.264 + SDR sharing version); LPCM audio becomes AAC. [edit] = the still's edit

@@ -4,6 +4,10 @@
 !/tools/env.sh
 !/tools/env.ps1
 !/tools/shaderc/
+!/tools/ffmpeg/
+/tools/ffmpeg/*
+!/tools/ffmpeg/*.sh
+!/tools/ffmpeg/*.py
 /build*/
 /out/
 /.cache/

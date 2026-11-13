@@ -50,6 +50,9 @@ ImageF hdrLinear(const Image8& sdr, const Image8& bright, float H, bool p3 = fal
 // Gain map from the renditions (same size, usually a quarter of the base picture): luminance gain log2((Yh + o) / (Ys + o)), 3x3 minimum then a
 // [1 2 1] smoothing so the up-scaled map does not light the dark side of an edge.
 GainMap makeGainMap(const Image8& sdr, const Image8& bright, float H, bool p3 = false);
+// The same from the linear luminance of the SDR and the HDR rendition (one value per pixel, SDR white = 1): gain log2((Yh + o) / (Ys + o)) >= 0 with the
+// edge guard. Used by the Motion Photo cover (the HDR rendition comes from the clip's frame, not from a bright render).
+GainMap makeGainMapFromLuma(const std::vector<float>& ys, const std::vector<float>& yh, int width, int height);
 // Decoder side (what a viewer does at full display headroom): linear HDR from the SDR picture and the gain map (bilinear up-scale).
 ImageF reconstruct(const Image8& sdr, const GainMap& gm);
 

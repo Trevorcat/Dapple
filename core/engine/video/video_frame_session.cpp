@@ -219,12 +219,91 @@ float pqOetf(float nits) {  // SMPTE ST 2084, absolute luminance in nits
 const float kTo2020[9] = {0.6274039f, 0.3292830f, 0.0433131f, 0.0690973f, 0.9195404f, 0.0113623f, 0.0163914f, 0.0880133f, 0.8955953f};
 }  // namespace
 
-bool VideoFrameSession::toHdrEncoded(const ImageF& sdrEnc, const SourceImage& src, float gainEv, OutputKind kind, ImageF& out) {
-  if (src.linear.width != sdrEnc.width || src.linear.height != sdrEnc.height || kind == OutputKind::Sdr709) return false;
+namespace {
+// The geometry of the edit (rotate 90 -> straighten with the ratio crop -> flip) applied to the working-space source, the same mapping as
+// Geometry in core/src/renderer.cpp (kept in step by the geometry test of video_session.hdr_geometry). The highlight excess of an HDR clip is
+// taken from this warped float source, so a geometry edit warps the 10-bit / float HDR data itself and never touches an 8-bit or sRGB target.
+// Returns false when the edit has no geometry (the source is used as it is).
+bool warpSourceLikeGraph(const EditParams& p, const ImageF& in, ImageF& out) {
+  const int rot = (p.rotate / 90) % 4;
+  const bool tilted = p.straighten != 0.f;
+  const bool cropped = !p.crop.empty() && p.crop != "orig";
+  if (rot == 0 && !p.flip && !tilted && !cropped) return false;
+  const int w = in.width, h = in.height;
+  const float fw = float(rot % 2 ? h : w), fh = float(rot % 2 ? w : h);
+  float ar = fw / fh;
+  if (p.crop == "1:1") ar = 1.f;
+  else if (p.crop == "4:5") ar = 4.f / 5.f;
+  else if (p.crop == "3:4") ar = 3.f / 4.f;
+  else if (p.crop == "16:9") ar = 16.f / 9.f;
+  else if (p.crop == "9:16") ar = 9.f / 16.f;
+  const float th = p.straighten * 3.14159265358979f / 180.f;
+  const float cs = std::cos(th), sn = std::sin(th);
+  const float c = std::fabs(cs), s = std::fabs(sn);
+  float bw = std::min(fw / (c + s / ar), fh / (s + c / ar));
+  if (tilted) bw -= 2.5f;
+  bw = std::max(1.f, bw);
+  const int ow = std::clamp(int(tilted ? std::floor(bw) : std::lround(bw)), 1, int(fw));
+  const int oh = std::clamp(int(tilted ? std::floor(bw / ar) : std::lround(bw / ar)), 1, int(fh));
+  out = ImageF(ow, oh);
+  auto cubic = [&](float x, float y, float o[3]) {
+    x -= 0.5f;
+    y -= 0.5f;
+    const float fxl = std::floor(x), fyl = std::floor(y);
+    const int ix = int(fxl), iy = int(fyl);
+    auto weights = [](float t, float k[4]) {
+      const float t2 = t * t, t3 = t2 * t;
+      k[0] = -0.5f * t3 + t2 - 0.5f * t;
+      k[1] = 1.5f * t3 - 2.5f * t2 + 1.f;
+      k[2] = -1.5f * t3 + 2.f * t2 + 0.5f * t;
+      k[3] = 0.5f * t3 - 0.5f * t2;
+    };
+    float wx[4], wy[4];
+    weights(x - fxl, wx);
+    weights(y - fyl, wy);
+    o[0] = o[1] = o[2] = 0.f;
+    for (int j = 0; j < 4; ++j) {
+      const float* row = in.row(std::clamp(iy - 1 + j, 0, h - 1));
+      float acc[3] = {0.f, 0.f, 0.f};
+      for (int i = 0; i < 4; ++i) {
+        const float* px = row + 3 * std::clamp(ix - 1 + i, 0, w - 1);
+        for (int k = 0; k < 3; ++k) acc[k] += wx[i] * px[k];
+      }
+      for (int k = 0; k < 3; ++k) o[k] += wy[j] * acc[k];
+    }
+    for (int k = 0; k < 3; ++k) o[k] = std::max(0.f, o[k]);
+  };
+  parallelRows(oh, [&](int oy) {
+    float* d = out.row(oy);
+    for (int ox = 0; ox < ow; ++ox) {
+      float u = float(ox) + 0.5f - float(ow) * 0.5f;
+      const float v = float(oy) + 0.5f - float(oh) * 0.5f;
+      if (p.flip) u = -u;
+      const float fx = u * cs + v * sn + fw * 0.5f, fy = -u * sn + v * cs + fh * 0.5f;
+      float sx, sy;
+      switch (rot) {
+        case 0: sx = fx; sy = fy; break;
+        case 1: sx = fy; sy = float(h) - fx; break;
+        case 2: sx = float(w) - fx; sy = float(h) - fy; break;
+        default: sx = float(w) - fy; sy = fx; break;
+      }
+      if (!tilted) {  // exact: pure index mapping, as the graph does
+        const float* px = in.row(std::clamp(int(std::floor(sy)), 0, h - 1)) + 3 * std::clamp(int(std::floor(sx)), 0, w - 1);
+        d[3 * ox] = px[0], d[3 * ox + 1] = px[1], d[3 * ox + 2] = px[2];
+      } else {
+        cubic(sx, sy, d + 3 * ox);
+      }
+    }
+  });
+  return true;
+}
+}  // namespace
+
+bool VideoFrameSession::toHdrLinear(const ImageF& sdrEnc, const SourceImage& src, float gainEv, ImageF& out) {
+  if (src.linear.width != sdrEnc.width || src.linear.height != sdrEnc.height) return false;
   const float g = std::exp2(gainEv);
   const auto& toSrgb = color::proPhotoToSrgb();
   out = ImageF(sdrEnc.width, sdrEnc.height);
-  const bool hlg = kind == OutputKind::Hlg2020;
   parallelRows(sdrEnc.height, [&](int y) {
     const float* e = sdrEnc.row(y);
     const float* s = src.linear.row(y);
@@ -238,12 +317,26 @@ bool VideoFrameSession::toHdrEncoded(const ImageF& sdrEnc, const SourceImage& sr
       const float pp[3] = {s[3 * x] * g * r, s[3 * x + 1] * g * r, s[3 * x + 2] * g * r};
       float ex[3];
       toSrgb.apply(pp, ex);
-      for (int c = 0; c < 3; ++c) lin[c] = std::max(0.f, lin[c] + std::max(0.f, ex[c]));
+      for (int c = 0; c < 3; ++c) o[3 * x + c] = std::max(0.f, lin[c] + std::max(0.f, ex[c]));
+    }
+  });
+  return true;
+}
+
+bool VideoFrameSession::toHdrEncoded(const ImageF& sdrEnc, const SourceImage& src, float gainEv, OutputKind kind, ImageF& out) {
+  if (kind == OutputKind::Sdr709) return false;
+  ImageF lin;
+  if (!toHdrLinear(sdrEnc, src, gainEv, lin)) return false;
+  out = ImageF(sdrEnc.width, sdrEnc.height);
+  const bool hlg = kind == OutputKind::Hlg2020;
+  parallelRows(sdrEnc.height, [&](int y) {
+    const float* l = lin.row(y);
+    float* o = out.row(y);
+    for (int x = 0; x < sdrEnc.width; ++x)
       for (int c = 0; c < 3; ++c) {
-        const float L = kTo2020[3 * c] * lin[0] + kTo2020[3 * c + 1] * lin[1] + kTo2020[3 * c + 2] * lin[2];
+        const float L = kTo2020[3 * c] * l[3 * x] + kTo2020[3 * c + 1] * l[3 * x + 1] + kTo2020[3 * c + 2] * l[3 * x + 2];
         o[3 * x + c] = clamp01(hlg ? hlgOetf(L * 0.2650f) : pqOetf(L * 203.f));
       }
-    }
   });
   return true;
 }
@@ -280,10 +373,10 @@ struct VideoFrameSession::Impl {
     if (!hdrSource) outNote = refKind == ColourKind::Slog3 ? "S-Log3 source: converted to SDR BT.709 (as the unedited clip is)" : "SDR source";
     else if (!cfg.allowHdr) outNote = "HDR source, HDR output switched off: SDR BT.709";
     else if (!held.filmStock.empty() && !isModernId(held.filmStock)) outNote = "film is a print: SDR BT.709 (10-bit Main10)";
-    else if (geometry) outNote = "HDR source with a geometry edit (crop / rotate / straighten / flip): SDR BT.709, the highlight headroom is not warped";
     else {
       outKind = refKind == ColourKind::Hlg ? OutputKind::Hlg2020 : OutputKind::Pq2020;
       outNote = refKind == ColourKind::Hlg ? "HLG source without film: stays HLG BT.2020" : "PQ source without film: stays PQ BT.2020";
+      if (geometry) outNote += " (geometry edit applied to the float HDR source)";
     }
   }
   // The film exposure of the clip: metered once on the reference proxy, held for every frame.
@@ -478,7 +571,10 @@ bool VideoFrameSession::render(const InputFrame& f, std::uint32_t frameIndex, Pa
   int w = 0, h = 0;
   if ((fmt == PackFormat::P010Hdr || fmt == PackFormat::Rgb10A2Hdr) && d_->outKind != OutputKind::Sdr709) {
     ImageF hdr;
-    if (toHdrEncoded(img, src, d_->held.exposure, d_->outKind, hdr)) {
+    SourceImage warped;
+    const SourceImage* hsrc = &src;
+    if (warpSourceLikeGraph(d_->held, src.linear, warped.linear)) hsrc = &warped;
+    if (toHdrEncoded(img, *hsrc, d_->held.exposure, d_->outKind, hdr)) {
       pack(hdr, fmt, out, &w, &h);
       fi.packMs = msSince(t);
       fi.width = w;
@@ -486,7 +582,7 @@ bool VideoFrameSession::render(const InputFrame& f, std::uint32_t frameIndex, Pa
       if (info) *info = fi;
       return true;
     }
-    if (err) *err = "HDR output needs the edit's geometry to be the identity";
+    if (err) *err = "HDR output: the warped source and the edit's frame differ in size";
     return false;
   }
   if (fmt == PackFormat::P010Hdr) fmt = PackFormat::P010;
@@ -496,6 +592,24 @@ bool VideoFrameSession::render(const InputFrame& f, std::uint32_t frameIndex, Pa
   fi.width = w;
   fi.height = h;
   if (info) *info = fi;
+  return true;
+}
+
+bool VideoFrameSession::renderStillHdr(const InputFrame& f, ImageF& sdrEnc, ImageF& hdrLinear, std::string* err) {
+  SourceImage src;
+  FrameInfo fi;
+  if (!renderFloatSrc(f, 0, sdrEnc, src, &fi, err)) return false;
+  if (d_->outKind == OutputKind::Sdr709) {
+    if (err) *err = d_->outNote;
+    return false;
+  }
+  SourceImage warped;
+  const SourceImage* hsrc = &src;
+  if (warpSourceLikeGraph(d_->held, src.linear, warped.linear)) hsrc = &warped;
+  if (!toHdrLinear(sdrEnc, *hsrc, d_->held.exposure, hdrLinear)) {
+    if (err) *err = "HDR still: the warped source and the edit's frame differ in size";
+    return false;
+  }
   return true;
 }
 

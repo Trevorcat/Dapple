@@ -36,6 +36,44 @@ class DebugClipReceiver : BroadcastReceiver() {
                     return@Thread
                 }
                 val uri = i.getStringExtra("uri") ?: error("uri missing")
+                if (i.getBooleanExtra("inspect", false)) {
+                    // what the platform sees: --es uri <file> [--el off <video offset> --el len <video length> for a Motion Photo JPEG]. Video track format
+                    // (profile / colour keys) through MediaExtractor, and for a JPEG BitmapFactory's gain map verdict (API 34+).
+                    val off = i.getLongExtra("off", -1L)
+                    val file = java.io.File(uri)
+                    val ex = android.media.MediaExtractor()
+                    if (off < 0 && uri.endsWith(".jpg")) { /* a plain JPEG has no video track */ } else {
+                    if (off >= 0) java.io.FileInputStream(file).use { ex.setDataSource(it.fd, off, i.getLongExtra("len", file.length() - off)) } else ex.setDataSource(uri)
+                    for (t in 0 until ex.trackCount) {
+                        val f = ex.getTrackFormat(t)
+                        if ((f.getString(android.media.MediaFormat.KEY_MIME) ?: "").startsWith("video/")) {
+                            fun k(n: String) = if (f.containsKey(n)) f.getInteger(n) else null
+                            Log.i(tag, "INSPECT video mime=${f.getString(android.media.MediaFormat.KEY_MIME)} ${f.getInteger(android.media.MediaFormat.KEY_WIDTH)}x${f.getInteger(android.media.MediaFormat.KEY_HEIGHT)} " +
+                                "profile=${k("profile")} color-standard=${k("color-standard")} color-transfer=${k("color-transfer")} color-range=${k("color-range")} hdr-static-info=${f.containsKey("hdr-static-info")}")
+                        }
+                    }
+                    }
+                    ex.release()
+                    if (off >= 0 || uri.endsWith(".jpg")) {
+                        val bmp = android.graphics.BitmapFactory.decodeFile(uri)
+                        if (bmp != null) {
+                            val gm = if (android.os.Build.VERSION.SDK_INT >= 34 && bmp.hasGainmap()) bmp.gainmap else null
+                            Log.i(tag, "INSPECT jpeg ${bmp.width}x${bmp.height} sdk=${android.os.Build.VERSION.SDK_INT} hasGainmap=${gm != null}" +
+                                (gm?.let { " ratioMax=${it.ratioMax[0]} ratioMin=${it.ratioMin[0]} gamma=${it.gamma[0]} gainmapContents=${it.gainmapContents.width}x${it.gainmapContents.height} displayRatioForFullHdr=${it.displayRatioForFullHdr}" } ?: ""))
+                        } else Log.i(tag, "INSPECT jpeg: decode failed")
+                    }
+                    return@Thread
+                }
+                if (i.getBooleanExtra("cover", false)) {
+                    // the Ultra HDR cover of a Motion Photo (docs section 30.14): --es sdr <the still of the same edit> --es out <cover.jpg> --el refMs <cover time> [--ez force true]
+                    val p = i.getStringExtra("params") ?: i.getStringExtra("paramsFile")?.let { java.io.File(it).readText() } ?: "{}"
+                    i.getStringExtra("pack")?.let { DappleVideoEdit.setFilmPack(it) }
+                    val spec = EditSpec(paramsJson = p, refMs = i.getLongExtra("refMs", 0L), stillLongEdge = i.getIntExtra("stillLongEdge", 0))
+                    val m = LiveBridge(app).coverHdr(uri, i.getLongExtra("refMs", 0L), 0, spec, i.getStringExtra("sdr") ?: error("sdr missing"),
+                        i.getStringExtra("out") ?: error("out missing"), i.getBooleanExtra("force", false))
+                    Log.i(tag, "COVER OK: $m")
+                    return@Thread
+                }
                 val dest = i.getStringExtra("dest") ?: error("dest missing")
                 val params = i.getStringExtra("params") ?: i.getStringExtra("paramsFile")?.let { java.io.File(it).readText() }
                 i.getStringExtra("pack")?.let { DappleVideoEdit.setFilmPack(it) }

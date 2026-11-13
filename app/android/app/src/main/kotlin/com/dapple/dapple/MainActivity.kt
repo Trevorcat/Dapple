@@ -32,6 +32,7 @@ class MainActivity : FlutterActivity() {
     private var viewPlugin: DappleViewPlugin? = null
     private var capturePlugin: CapturePlugin? = null
     private var pickPlugin: PhotoPickPlugin? = null
+    private var usbPlugin: UsbCameraPlugin? = null
 
     private val extensions = listOf("arw", "raf", "dng", "jpg", "jpeg")
 
@@ -44,6 +45,11 @@ class MainActivity : FlutterActivity() {
         if (pickPlugin?.onActivityResult(requestCode, resultCode, data) == true) return
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    override fun onDestroy() {
+        usbPlugin?.dispose()
+        super.onDestroy()
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -61,6 +67,9 @@ class MainActivity : FlutterActivity() {
 
         // "从相册选择" / "从文件选择": system photo picker and document picker (PhotoPickPlugin.kt), same channel and result rows as iOS
         pickPlugin = PhotoPickPlugin(this, messenger)
+
+        // Camera on the USB-C cable: android.mtp.MtpDevice (UsbCameraPlugin.kt), channels dapple/usbcam + dapple/usbcam_events
+        usbPlugin = UsbCameraPlugin(this, messenger)
 
         // Editor landmark haptics (requirements 4.15.9): View.performHapticFeedback with the
         // finest constant the OS offers. Numeric values so this compiles against any compileSdk.
@@ -192,6 +201,16 @@ class MainActivity : FlutterActivity() {
                     val src = call.argument<Int>("source") ?: 0
                     val compat = call.argument<Boolean>("compat") ?: false
                     run { live.frameToFile(u, t, d, edge, q, src, compat) }
+                }
+                "coverHdr" -> {
+                    val u = call.argument<String>("uri")!!
+                    val t = (call.argument<Number>("timeMs") ?: 0).toLong()
+                    val src = call.argument<Int>("source") ?: 0
+                    val edit = EditSpec.fromMap(call.argument<Map<String, Any?>>("edit")) ?: throw IllegalArgumentException("edit missing")
+                    val sdr = call.argument<String>("sdr")!!
+                    val out = call.argument<String>("out")!!
+                    val force = call.argument<Boolean>("force") ?: false
+                    run { live.coverHdr(u, t, src, edit, sdr, out, force) }
                 }
                 "trim" -> {
                     val u = call.argument<String>("uri")!!

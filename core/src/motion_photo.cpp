@@ -965,6 +965,47 @@ bool patchMpf(Bytes& primary, std::size_t primaryLen) {
   return false;
 }
 
+
+// The MP Entry table of the primary's MPF segment (entry 0 = the primary, entry 1 = the gain map of an Ultra HDR file). Offsets are made absolute.
+struct MpfEntries {
+  bool found = false;
+  unsigned count = 0;
+  std::uint32_t size0 = 0, size1 = 0;
+  std::size_t offset1 = 0;  // absolute file offset of entry 1
+};
+MpfEntries readMpf(const Bytes& f, const std::vector<JSeg>& segs) {
+  MpfEntries m;
+  for (const auto& sg : segs) {
+    if (sg.marker != 0xE2 || sg.end - sg.start < 4 + 4 + 8) continue;
+    if (std::memcmp(f.data() + sg.start + 4, "MPF\0", 4) != 0) continue;
+    const std::size_t T = sg.start + 8;
+    const bool le = f[T] == 'I';
+    auto r16 = [&](std::size_t o) { return le ? std::uint16_t(f[o] | (f[o + 1] << 8)) : rd16(&f[o]); };
+    auto r32 = [&](std::size_t o) {
+      return le ? std::uint32_t(f[o] | (f[o + 1] << 8) | (f[o + 2] << 16) | (std::uint32_t(f[o + 3]) << 24)) : rd32(&f[o]);
+    };
+    if (T + 8 > sg.end) return m;
+    const std::size_t ifd = T + r32(T + 4);
+    if (ifd + 2 > sg.end) return m;
+    const unsigned n = r16(ifd);
+    for (unsigned i = 0; i < n; i++) {
+      const std::size_t e = ifd + 2 + i * 12;
+      if (e + 12 > sg.end) return m;
+      if (r16(e) != 0xB002) continue;
+      const std::size_t arr = T + r32(e + 8);
+      m.count = r32(e + 4) / 16;
+      if (m.count < 1 || arr + 16 * std::size_t(std::min(m.count, 2u)) > f.size()) return m;
+      m.size0 = r32(arr + 4);
+      if (m.count >= 2) {
+        m.size1 = r32(arr + 16 + 4);
+        m.offset1 = T + r32(arr + 16 + 8);
+      }
+      m.found = true;
+      return m;
+    }
+  }
+  return m;
+}
 }  // namespace
 
 Result<Bytes> buildMotionPhoto(const Bytes& jpeg, const Bytes& mp4, const MotionPhotoOptions& opt) {
@@ -1141,6 +1182,44 @@ MotionPhotoInfo validateMotionPhoto(const Bytes& f) {
     info.videoLength = last.length;
     info.videoOffset = f.size() - last.length;
     if (info.videoOffset < info.jpegLength + items.front().padding) bad("video overlaps the still image");
+
+    // Ultra HDR cover: Primary, GainMap, MotionPhoto in one directory. Google's Motion Photo readers find the video from the file tail (Item:Length of the
+    // last item), Ultra HDR readers find the gain map from the MPF index (and the directory): both have to agree with the bytes.
+    int nGain = 0;
+    for (const auto& it : items) nGain += it.semantic == "GainMap";
+    if (nGain > 0) {
+      info.hasGainMap = true;
+      if (nGain != 1) bad("more than one GainMap item");
+      if (items.size() != 3 || items[1].semantic != "GainMap") bad("an Ultra HDR Motion Photo lists exactly Primary, GainMap, MotionPhoto in this order");
+      else {
+        const Item& g = items[1];
+        info.gainMapOffset = info.jpegLength + items.front().padding;
+        info.gainMapLength = g.length;
+        if (g.mime != "image/jpeg") bad("gain map item Mime is not image/jpeg");
+        if (!g.hasLength || g.length == 0) bad("gain map item lacks a positive Length");
+        else if (info.gainMapOffset + g.length != info.videoOffset) bad("the video does not start where the gain map item ends");
+        else if (f[info.gainMapOffset] != 0xFF || f[info.gainMapOffset + 1] != 0xD8) bad("no JPEG (SOI) at the gain map offset");
+        else {
+          if (jpegEnd(f.data() + info.gainMapOffset, std::size_t(g.length)) != std::size_t(g.length)) bad("the gain map JPEG does not end (EOI) at its item's end");
+          Bytes gj(f.begin() + std::ptrdiff_t(info.gainMapOffset), f.begin() + std::ptrdiff_t(info.gainMapOffset + g.length));
+          std::size_t gsos = npos;
+          bool gainXmp = false;
+          for (const auto& gs : headerSegments(gj.data(), gj.size(), gsos))
+            if (isXmpSegment(gj.data(), gs) &&
+                std::string(reinterpret_cast<const char*>(gj.data() + gs.start), gs.end - gs.start).find("hdrgm:Version") != std::string::npos)
+              gainXmp = true;
+          if (!gainXmp) bad("the gain map JPEG has no hdrgm XMP");
+        }
+        const MpfEntries mpf = readMpf(f, segs);
+        if (!mpf.found || mpf.count < 2) bad("Ultra HDR cover without an MPF index of two images");
+        else {
+          if (mpf.size0 != info.jpegLength) bad("MPF primary size " + std::to_string(mpf.size0) + " != primary JPEG length " + std::to_string(info.jpegLength));
+          if (mpf.offset1 != info.gainMapOffset) bad("MPF gain map offset " + std::to_string(mpf.offset1) + " != gain map position " + std::to_string(info.gainMapOffset));
+          if (mpf.size1 != g.length) bad("MPF gain map size " + std::to_string(mpf.size1) + " != gain map item Length " + std::to_string(g.length));
+        }
+        if (xmp.find("hdrgm:Version") == std::string::npos) info.notes.push_back("the primary XMP has no hdrgm:Version (Ultra HDR readers use the gain map's own)");
+      }
+    }
 
     if (info.videoOffset + 8 <= f.size() && info.videoOffset >= info.jpegLength) {
       if (rd32(f.data() + info.videoOffset + 4) != cc("ftyp")) {

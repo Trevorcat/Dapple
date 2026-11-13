@@ -146,6 +146,114 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (filter == "touch") {  // round 10: the user's quick drag. Pause, touch-down (hint), first movement after d ms, a 30-frame drag; per hint mode
+    // Env: DAPPLE_BENCH_HINT_MODES (default "off,frames,units": no hint / the frame burst / the keep-warm pump), DAPPLE_BENCH_DELAYS (default
+    // "0,15,30,60,100,200"), DAPPLE_BENCH_REPEATS (3), DAPPLE_BENCH_PAUSE_MS (3000), DAPPLE_BENCH_PERIOD_MS (0 = frames back to back, 8.33 = paced
+    // like a 120 Hz display: frame k is requested at k periods after the first, or at once when the previous one overran), DAPPLE_BENCH_HINT_MS (80).
+    auto envS = [](const char* k, const char* d) { const char* e = std::getenv(k); return std::string(e && *e ? e : d); };
+    auto split = [](const std::string& s) {
+      std::vector<std::string> v;
+      std::size_t a = 0;
+      while (a <= s.size()) {
+        const std::size_t b = s.find(',', a);
+        const std::string t = s.substr(a, b == std::string::npos ? std::string::npos : b - a);
+        if (!t.empty()) v.push_back(t);
+        if (b == std::string::npos) break;
+        a = b + 1;
+      }
+      return v;
+    };
+    const std::vector<std::string> modes = split(envS("DAPPLE_BENCH_HINT_MODES", "off,frames,units"));
+    std::vector<int> delays;
+    for (const std::string& d : split(envS("DAPPLE_BENCH_DELAYS", "0,15,30,60,100,200"))) delays.push_back(std::atoi(d.c_str()));
+    const int repeats = std::atoi(envS("DAPPLE_BENCH_REPEATS", "3").c_str());
+    const int pauseMs = std::atoi(envS("DAPPLE_BENCH_PAUSE_MS", "3000").c_str());
+    const double periodMs = std::atof(envS("DAPPLE_BENCH_PERIOD_MS", "0").c_str());
+    const int hintMs = std::atoi(envS("DAPPLE_BENCH_HINT_MS", "80").c_str());
+    const int nFrames = 30;
+    auto frame = [&](int i, double* ms) {
+      char js[200];
+      std::snprintf(js, sizeof js, "{\"film\":\"kodak_portra_400\",\"film_latitude\":%.3f}", 60.0 + double(i) * 1.0);
+      DappleFrameRequest rq{};
+      rq.size = sizeof rq;
+      rq.long_edge = le;
+      rq.flags = DAPPLE_FRAME_INTERACTIVE;
+      rq.active_param = "film_latitude";
+      DappleImage img{};
+      const auto t0 = Clk::now();
+      const bool ok = dapple_session_render_frame(s, js, nullptr, &rq, &img, nullptr) == DAPPLE_OK;
+      *ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+      dapple_free_image(&img);
+      return ok;
+    };
+    auto setMode = [](const std::string& m) {
+#if defined(_WIN32)
+      _putenv_s("DAPPLE_HINT_MODE", m.c_str());
+#else
+      setenv("DAPPLE_HINT_MODE", m.c_str(), 1);
+#endif
+    };
+    double ms = 0;
+    for (int i = 0; i < 40; ++i)
+      if (!frame(i % nFrames, &ms)) return 1;  // warm, and the newest interactive request for the hint
+    for (const std::string& m : modes)
+      if (m != "off") {  // the app's "prepare" call, once per photo at idle
+        setMode(m);
+        dapple_session_touch_hint(s, -1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+      }
+    struct Row {
+      double first, mean2to10, med11to30, worst;
+    };
+    std::vector<std::vector<std::vector<Row>>> rows(modes.size(), std::vector<std::vector<Row>>(delays.size()));
+    std::printf("  touch bench: %d px, pause %d ms, hint %d ms, period %.2f ms (0 = back to back), %d repeats\n", le, pauseMs, hintMs, periodMs, repeats);
+    for (int rep = 0; rep < repeats; ++rep)
+      for (std::size_t di = 0; di < delays.size(); ++di)
+        for (std::size_t mi = 0; mi < modes.size(); ++mi) {
+          const std::string& m = modes[mi];
+          setMode(m == "off" ? "off" : m);
+          std::this_thread::sleep_for(std::chrono::milliseconds(pauseMs));
+          const auto tDown = Clk::now();
+          if (m != "off") dapple_session_touch_hint(s, hintMs);
+          std::this_thread::sleep_until(tDown + std::chrono::microseconds(delays[di] * 1000));
+          const auto tMove = Clk::now();
+          std::vector<double> t;
+          for (int i = 0; i < nFrames; ++i) {
+            if (periodMs > 0) std::this_thread::sleep_until(tMove + std::chrono::microseconds(std::int64_t(periodMs * 1000.0 * i)));
+            if (!frame(i, &ms)) return 1;
+            t.push_back(ms);
+          }
+          Row r{};
+          r.first = t[0];
+          r.mean2to10 = std::accumulate(t.begin() + 1, t.begin() + 10, 0.0) / 9.0;
+          std::vector<double> rest(t.begin() + 10, t.end());
+          std::sort(rest.begin(), rest.end());
+          r.med11to30 = rest[rest.size() / 2];
+          r.worst = *std::max_element(t.begin(), t.end());
+          rows[mi][di].push_back(r);
+          std::printf("  rep %d d %3d %-6s first %5.1f  2-10 mean %5.1f  11-30 med %5.1f  worst %5.1f | first 8:", rep, delays[di], m.c_str(), r.first, r.mean2to10,
+                      r.med11to30, r.worst);
+          for (int i = 0; i < 8; ++i) std::printf(" %.1f", t[std::size_t(i)]);
+          std::printf("\n");
+          std::fflush(stdout);
+        }
+    std::printf("\n| mode | touch-to-move | first frame (min / med / max) | frames 2-10 mean (med) | frames 11-30 median (med) | worst frame (max) |\n|---|---|---|---|---|---|\n");
+    for (std::size_t mi = 0; mi < modes.size(); ++mi)
+      for (std::size_t di = 0; di < delays.size(); ++di) {
+        std::vector<Row>& v = rows[mi][di];
+        auto med = [&](double Row::*f) {
+          std::vector<double> x;
+          for (const Row& r : v) x.push_back(r.*f);
+          std::sort(x.begin(), x.end());
+          return x[x.size() / 2];
+        };
+        double fmin = 1e9, fmax = 0, wmax = 0;
+        for (const Row& r : v) fmin = std::min(fmin, r.first), fmax = std::max(fmax, r.first), wmax = std::max(wmax, r.worst);
+        std::printf("| %s | %d ms | %.1f / %.1f / %.1f | %.1f | %.1f | %.1f |\n", modes[mi].c_str(), delays[di], fmin, med(&Row::first), fmax, med(&Row::mean2to10),
+                    med(&Row::med11to30), wmax);
+      }
+    return 0;
+  }
   if (filter == "touchmove") {  // touch-down -> first movement delays after a 3 s pause, hint burst 80 ms (wave 8)
     auto frame = [&](int i, double* ms) {
       char js[200];

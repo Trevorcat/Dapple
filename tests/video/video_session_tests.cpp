@@ -431,7 +431,7 @@ static int testHdr(bool filmOk) {
       {"hlg_ramp_hevc_420_10.mp4", "HLG, no film", false, "orig", 0.f, true, OutputKind::Hlg2020, 9, 18},
       {"pq_ramp_hevc_420_10.mp4", "PQ, no film", false, "orig", 0.f, true, OutputKind::Pq2020, 9, 16},
       {"hlg_ramp_hevc_420_10.mp4", "HLG, film", true, "orig", 0.f, true, OutputKind::Sdr709, 1, 1},
-      {"hlg_ramp_hevc_420_10.mp4", "HLG, crop (geometry)", false, "1:1", 0.f, true, OutputKind::Sdr709, 1, 1},
+      {"hlg_ramp_hevc_420_10.mp4", "HLG, crop (geometry)", false, "1:1", 0.f, true, OutputKind::Hlg2020, 9, 18},
       {"hlg_ramp_hevc_420_10.mp4", "HLG, hdr off", false, "orig", 0.f, false, OutputKind::Sdr709, 1, 1},
       {"gradient_hevc_main10.mp4", "SDR 10-bit, no film", false, "orig", 0.f, true, OutputKind::Sdr709, 1, 1},
       {"slog3_h264_422_10.mp4", "S-Log3, no film", false, "orig", 0.f, true, OutputKind::Sdr709, 1, 1},
@@ -481,7 +481,7 @@ static int testHdr(bool filmOk) {
     CHECK(s.outputKind() == c.want, "%s: output kind %d, wanted %d", c.label, int(s.outputKind()), int(c.want));
     CHECK(tags[0] == c.prim && tags[1] == c.trc, "%s: tags %d / %d, wanted %d / %d", c.label, tags[0], tags[1], c.prim, c.trc);
     CHECK(int(codes.size()) >= W / 2 || std::string(c.clip).find("slog3") != std::string::npos, "%s: only %zu distinct codes (width %d)", c.label, codes.size(), W);
-    if (c.want == OutputKind::Hlg2020 && std::string(c.clip).find("hlg") == 0) {
+    if (c.want == OutputKind::Hlg2020 && std::string(c.clip).find("hlg") == 0 && c.crop == "orig") {
       CHECK(maxY > 850, "HLG highlight headroom lost: max code %d", maxY);   // the ramp reaches 100 % signal = 3.8 x SDR white
       meanHi = outY;
       CHECK(std::abs(outY - (64 + 876 * col / (w - 1))) < 25, "HLG highlight round trip: source code %d, output %d", 64 + 876 * col / (w - 1), outY);
@@ -729,6 +729,83 @@ static int testE2E(bool filmOk) {
   return 0;
 }
 
+// HDR clip + geometry (crop / rotate / straighten / flip) stays HDR: the 10-bit packed output is HLG / PQ BT.2020, and a highlight patch above SDR white sits
+// where the graph's own (SDR) render puts the patch, i.e. the float HDR source is warped the way the graph warps the frame.
+static int testHdrGeometry() {
+  struct Case {
+    const char* label;
+    const char* crop;
+    int rotate;
+    float straighten;
+    bool flip;
+  };
+  const Case cases[] = {
+      {"rotate 90", "orig", 90, 0.f, false},
+      {"crop 1:1", "1:1", 0, 0.f, false},
+      {"straighten 4", "orig", 0, 4.f, false},
+      {"crop 16:9 + rotate 270 + straighten -3 + flip", "16:9", 270, -3.f, true},
+  };
+  const int w = 320, h = 180;
+  std::vector<std::uint16_t> px(std::size_t(w) * h * 4);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const bool patch = x >= 200 && x < 240 && y >= 60 && y < 100;
+      const float v = patch ? 4.0f : 0.18f + 0.1f * float(x) / w;  // 4.0 = 4x SDR white (HLG ~ code 920)
+      std::uint16_t* p = &px[(std::size_t(y) * w + x) * 4];
+      p[0] = p[1] = p[2] = toHalf(v);
+      p[3] = 0x3c00;
+    }
+  for (ColourKind kind : {ColourKind::Hlg, ColourKind::Pq})
+    for (const Case& c : cases) {
+      double cen[2][2] = {{0, 0}, {0, 0}};
+      long cnt[2] = {0, 0};
+      int maxCode[2] = {0, 0}, ow[2] = {0, 0}, oh[2] = {0, 0};
+      OutputKind got = OutputKind::Sdr709;
+      int tags[4] = {0, 0, 0, 0};
+      for (int hdr = 1; hdr >= 0; --hdr) {  // 1 = HDR output, 0 = the graph's SDR render of the same edit (the geometry reference)
+        Config cfg = baseConfig();
+        cfg.params.crop = c.crop;
+        cfg.params.rotate = c.rotate;
+        cfg.params.straighten = c.straighten;
+        cfg.params.flip = c.flip;
+        cfg.allowHdr = hdr != 0;
+        VideoFrameSession s(cfg);
+        InputFrame f{px.data(), w, h, kind, 0};
+        std::string e;
+        CHECK(s.setReference(f, &e), "%s: reference %s", c.label, e.c_str());
+        std::vector<std::uint8_t> out;
+        CHECK(s.render(f, 1, PackFormat::P010Hdr, out, nullptr, &e), "%s: render %s", c.label, e.c_str());
+        const int W = s.outputWidth(), H = s.outputHeight();
+        ow[hdr] = W, oh[hdr] = H;
+        if (hdr) got = s.outputKind(), s.outputTags(tags);
+        const auto* y = reinterpret_cast<const std::uint16_t*>(out.data());
+        // patch pixels = the bright ones (above 76 % of the code range: SDR content is lower, the SDR render of the patch is white)
+        for (int j = 0; j < H; ++j)
+          for (int i = 0; i < W; ++i) {
+            const int code = y[std::size_t(j) * W + i] >> 6;
+            maxCode[hdr] = std::max(maxCode[hdr], code);
+            if (code > 640) cen[hdr][0] += i, cen[hdr][1] += j, ++cnt[hdr];
+          }
+        if (cnt[hdr] > 0) cen[hdr][0] /= double(cnt[hdr]), cen[hdr][1] /= double(cnt[hdr]);
+      }
+      const OutputKind want = kind == ColourKind::Hlg ? OutputKind::Hlg2020 : OutputKind::Pq2020;
+      std::printf("hdr_geometry %s %-46s: out %dx%d (SDR ref %dx%d), tags %d/%d/%d, max code %d, patch %ld px at (%.1f, %.1f) vs SDR ref %ld px at (%.1f, %.1f)\n",
+                  kind == ColourKind::Hlg ? "HLG" : "PQ ", c.label, ow[1], oh[1], ow[0], oh[0], tags[0], tags[1], tags[2], maxCode[1], cnt[1], cen[1][0], cen[1][1],
+                  cnt[0], cen[0][0], cen[0][1]);
+      CHECK(got == want, "%s: output kind %d", c.label, int(got));
+      CHECK(tags[0] == 9 && tags[1] == (kind == ColourKind::Hlg ? 18 : 16) && tags[2] == 9, "%s: tags %d/%d/%d", c.label, tags[0], tags[1], tags[2]);
+      CHECK(ow[0] == ow[1] && oh[0] == oh[1], "%s: HDR frame size differs from the graph's", c.label);
+      CHECK(maxCode[1] > (kind == ColourKind::Hlg ? 800 : 650), "%s: highlight above SDR white lost (max code %d)", c.label, maxCode[1]);
+      CHECK(cnt[1] > 0 && cnt[0] > 0, "%s: no patch found", c.label);
+      if (cnt[1] > 0 && cnt[0] > 0) {
+        CHECK(std::fabs(cen[1][0] - cen[0][0]) < 1.5 && std::fabs(cen[1][1] - cen[0][1]) < 1.5, "%s: patch position differs from the graph's (%.1f,%.1f) vs (%.1f,%.1f)",
+              c.label, cen[1][0], cen[1][1], cen[0][0], cen[0][1]);
+        CHECK(std::fabs(double(cnt[1]) - double(cnt[0])) < 0.15 * double(cnt[0]), "%s: patch size %ld vs %ld", c.label, cnt[1], cnt[0]);
+      }
+    }
+  return 0;
+}
+
 static int testVerify(const char* path, int wantTrc, int wantPrim) {
 #ifdef DAPPLE_HAVE_VIDEO_HOST
   char err[256] = {0};
@@ -778,6 +855,7 @@ int main(int argc, char** argv) {
   else if (id == "depth10") rc = testDepth10();
   else if (id == "flicker") rc = testFlicker(filmOk);
   else if (id == "hdr") rc = testHdr(filmOk);
+  else if (id == "hdr_geometry") rc = testHdrGeometry();
   else if (id == "anchor") rc = testAnchor();
   else if (id == "grain") rc = testGrain(filmOk);
   else if (id == "perf") rc = testPerf(filmOk);

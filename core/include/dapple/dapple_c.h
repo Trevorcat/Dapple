@@ -411,6 +411,8 @@ DAPPLE_API char* dapple_video_probe_json(const char* mp4_path);
  * {"valid":true,"fileSize","jpegLength","videoOffset","videoLength","presentationTimestampUs","videoMime",
  *  "duration","width","height","videoCodec","audioCodec","problems":[...],"notes":[...],
  *  "clip":{"start","duration","frames","audioKept","coverInClip","note"}} (clip only for from_video).
+ * An Ultra HDR cover (gain map between the primary and the video) is checked against the directory, the MPF index and the bytes and reported as
+ * "gainMap":true,"gainMapOffset","gainMapLength" (docs section 30.14).
  * Name the output "*MP.jpg" (spec filename pattern). */
 DAPPLE_API int32_t dapple_motion_photo_from_video(const char* video_path, const char* jpeg_path, const char* out_path,
                                                   const char* options_json, char** info_json_out);
@@ -466,10 +468,21 @@ DAPPLE_API int64_t dapple_video_edit_frame_bytes(DappleVideoEdit* edit, int32_t 
 DAPPLE_API int32_t dapple_video_edit_render(DappleVideoEdit* edit, const uint16_t* rgba_f16, int32_t width, int32_t height,
                                             int32_t colour_kind, int32_t rotation_deg, uint32_t frame_index, int32_t format, uint8_t* dst,
                                             int64_t dst_size);
-/* What the clip is written as: 0 SDR BT.709, 1 HLG BT.2020, 2 PQ BT.2020 (HDR source, edit without film, no geometry edit; docs section 30.8), -1 on error.
+/* What the clip is written as: 0 SDR BT.709, 1 HLG BT.2020, 2 PQ BT.2020 (HDR source, edit without film; crop / rotate / straighten / flip keep HDR, the float source is warped like the frame; docs section 30.8), -1 on error.
  * tags = primaries, transfer, matrix, range (FFmpeg AVCOL_*); note (static string) says why. Format 3 / 5 are then HLG / PQ encoded BT.2020 frames. */
 DAPPLE_API int32_t dapple_video_edit_output_kind(DappleVideoEdit* edit, int32_t tags[4], const char** note);
 DAPPLE_API const char* dapple_video_edit_last_error(void);
+
+/* Ultra HDR cover of an HDR Motion Photo (docs section 30.14). `frame` = the cover frame (half-float RGBA as above), rendered through the same edit as the
+ * clip; its SDR result and its HDR rendition (30.8, geometry included) give a gain map that is attached to the SDR cover JPEG at sdr_jpeg_path (the
+ * still export of the same edit): the base stream of out_path is that file byte for byte, plus the MPF / XMP / ISO / gain-map segments, so
+ * dapple_motion_photo_write accepts it as the cover and lists Primary, GainMap and MotionPhoto in one Container directory. When the picture has no
+ * headroom (peak of the HDR luminance < 1.5 x SDR white, or >= 1.1 with force_hdr = 1: the user asked for HDR), the source is SDR, the edit has a film
+ * stock or the sizes do not pair, out_path is a copy of the SDR cover and info->written = 0 (reason 1 no headroom / SDR source, 2 film, 3 not paired).
+ * Returns DAPPLE_OK in both cases. info may be NULL. */
+DAPPLE_API int32_t dapple_video_edit_cover_uhdr(DappleVideoEdit* edit, const uint16_t* rgba_f16, int32_t width, int32_t height, int32_t colour_kind,
+                                                int32_t rotation_deg, const char* sdr_jpeg_path, const char* out_path, int32_t force_hdr,
+                                                DappleHdrInfo* info);
 
 #ifdef __cplusplus
 }

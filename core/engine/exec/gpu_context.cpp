@@ -6,7 +6,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -19,6 +21,7 @@
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
 #include "dapple/renderer.h"
+#include "engine/exec/big_core.h"
 #include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
 #include "engine/nodes/film/film_gpu.h"
@@ -792,7 +795,7 @@ class ProviderImpl final : public GpuProvider {
     if (!tried.empty()) j += ",\"skipped\":\"" + jsonEsc(tried) + "\"";
     j += ",\"frames\":" + std::to_string(cnt.frames) + ",\"fallbacks\":" + std::to_string(cnt.fallbacks) + ",\"transients\":" + std::to_string(cnt.transients) +
          ",\"deviceLost\":" + std::to_string(cnt.lost) + ",\"demotions\":" + std::to_string(cnt.demotions) + ",\"rebuilds\":" + std::to_string(c ? c->rebuilds() : 0) +
-         ",\"executors\":" + executorStatsJson();
+         ",\"executors\":" + executorStatsJson() + ",\"keepWarm\":" + keepWarmJson();
     return j + "}";
   }
   std::size_t pooledBytes() override {
@@ -1015,5 +1018,330 @@ void startWarmup() {
 }
 std::shared_ptr<Context> sharedContext(std::string* why) { return provider().context(why); }
 std::string statusJson() { return provider().statusJson(); }
+
+// ---- keep-warm pump (gpu_runtime.h keepWarm) ----------------------------------------------------------------------------------------------------------
+// Measured on a mid-range phone (docs/engine/device-results/redmi-garnet.md, round 10): after a pause the first GPU submission pays a wake-up of ~8 ms
+// whatever its size; the GPU and memory clocks then need ~45-60 ms of saturating load to step up (sooner when the big CPU cores are busy as well: the
+// memory clock follows the CPU clock too), and they fall back within ~100-200 ms of idle. A drag on its own (60-70 % GPU busy) holds a raised clock but
+// never raises a low one. What a real frame waits for is the work queued ahead of it.
+// So: the load is GPU-only units of bounded cost (a buffer copy over a ring larger than the caches, sized by measurement to ~unitMs), at most `depth`
+// on the queue and none submitted while a real frame is between request and completion (it waits for <= the units already on the GPU); while a frame
+// runs, up to three units sized for the low clock are queued right BEHIND it (piggyback: costs that frame nothing, keeps the GPU busy while the host
+// reads back and prepares the next; the next frame waits for at most their remainder); one spinning thread on the big cores for the whole window. Window: from touch-down, at least `burst_ms`; until the first real frame or `holdMs`
+// (a finger that has not moved yet); after the first real frame `dragMs` more (the drag holds the clock from there); never more than `maxMs`.
+// Every device call holds the context mutex (the HAL device is not thread-safe; a frame holds it for its whole run), and only for the call itself.
+namespace {
+struct KeepWarmPump {
+  using Clk = std::chrono::steady_clock;
+  std::mutex m;
+  std::condition_variable cv;
+  bool started = false;
+  Clk::time_point deadline{};  // touch-down + burst_ms of the newest request
+  Clk::time_point touchAt{};
+  bool prepare = false;
+  std::atomic<int> realActive{0};
+  std::atomic<std::uint64_t> realSeq{0};
+  std::atomic<bool> live{false};   // a window is open: piggyback units are wanted
+  std::atomic<int> piggyUnits{0};  // units queued behind real frames in this window
+  // device state: touched only with the context mutex held
+  std::weak_ptr<Context> ctxOf;  // the context the buffers belong to
+  Context* ctxRaw = nullptr;
+  hal::BufferH ring, sink;
+  std::uint64_t ringBytes = 0, sinkBytes = 0, chunk = 256ull << 10, off = 0;
+  // unit throughput in the low-clock state (median of the units of a calibration at idle, refreshed by the first ~40 ms of every window): sizes the
+  // first units of a window and every piggyback unit, so a unit costs ~unitMs at the slowest clock and less once the clock is up. 0 = not measured yet
+  double lowMBps = 0;
+  std::uint64_t lowBytes(double unitMs, std::uint64_t cap) const {
+    if (lowMBps <= 0) return std::min<std::uint64_t>(chunk, cap);  // not measured yet (first window of the process): the adapted size
+    return std::clamp<std::uint64_t>(std::uint64_t(lowMBps * unitMs / 1000.0 * double(1ull << 20)) & ~std::uint64_t(0xFFFF), 64ull << 10, cap);
+  }
+  double pigUnitMs = 1.5;
+  int piggyDepth = 1;
+  // last window (diagnostics)
+  std::mutex jm;
+  std::string json = "{}";
+
+  static double envD(const char* k, double d) {
+    const char* e = std::getenv(k);
+    return e && *e ? std::atof(e) : d;
+  }
+  void request(int ms) {
+    std::lock_guard<std::mutex> lk(m);
+    const Clk::time_point now = Clk::now();
+    if (ms < 0) {
+      prepare = true;
+    } else {
+      if (now >= deadline) touchAt = now;  // a new touch (not an extension of a running window)
+      deadline = std::max(deadline, now + std::chrono::milliseconds(ms));
+    }
+    if (!started) {
+      started = true;
+      std::thread([this] { loop(); }).detach();
+    }
+    cv.notify_all();
+  }
+  void loop() {
+    detail::pinCurrentThreadToBigCores();  // the pump polls fences: a prompt wake-up keeps the gaps between units short
+    std::unique_lock<std::mutex> lk(m);
+    for (;;) {
+      // The working set (12 MB) is kept for the life of the context: allocating it costs ~25-50 ms on a phone, with the context mutex held, which a
+      // touch must never make a real frame wait for. It is allocated by the prepare call (at idle, once per photo), else by the first touch.
+      cv.wait(lk, [&] { return prepare || Clk::now() < deadline; });
+      const bool prep = prepare;
+      prepare = false;
+      lk.unlock();
+      run(prep);
+      lk.lock();
+    }
+  }
+  void release() {
+    std::shared_ptr<Context> c = ctxOf.lock();
+    if (!c) return;
+    std::lock_guard<std::mutex> dl(c->mutex());
+    hal::Device& dev = c->core().dev();
+    dev.waitAll();
+    if (ring) dev.destroy(ring);
+    if (sink) dev.destroy(sink);
+    ring = sink = hal::BufferH{};
+    ringBytes = sinkBytes = 0;
+    ctxOf.reset();
+    ctxRaw = nullptr;
+  }
+  bool ensure(Context& c, std::uint64_t wantRing, std::uint64_t wantSink) {  // context mutex held
+    hal::Device& dev = c.core().dev();
+    if (ring && ringBytes >= wantRing && sink && sinkBytes >= wantSink) return true;
+    if (ring) dev.destroy(ring);
+    if (sink) dev.destroy(sink);
+    ring = sink = hal::BufferH{};
+    hal::BufferDesc d;
+    d.kind = hal::MemKind::DeviceLocal;
+    d.storage = true;
+    d.bytes = wantRing;
+    if (dev.createBuffer(d, &ring) != hal::Status::Ok) return ring = hal::BufferH{}, false;
+    d.bytes = wantSink;
+    if (dev.createBuffer(d, &sink) != hal::Status::Ok) {
+      dev.destroy(ring);
+      ring = sink = hal::BufferH{};
+      return false;
+    }
+    ringBytes = wantRing, sinkBytes = wantSink, off = 0;
+    return true;
+  }
+  // one unit: copy `chunk` bytes of the ring (rolling offset) into the sink; context mutex held
+  bool submitUnit(hal::Device& dev, hal::FenceH* f, std::uint64_t* bytes) {
+    std::unique_ptr<hal::CommandList> cl = dev.begin();
+    if (!cl) return false;
+    const std::uint64_t n = std::min(chunk, sinkBytes);
+    if (off + n > ringBytes) off = 0;
+    cl->copyBufferToBuffer(ring, sink, n, off);
+    if (dev.submit(*cl, f) != hal::Status::Ok) return false;
+    off += n;
+    if (bytes) *bytes = n;
+    return true;
+  }
+  // Executor::run, right after a frame's submission (context mutex held by the caller)
+  void piggyback(Context& c) {
+    if (!live.load(std::memory_order_acquire) || ctxRaw != &c || !ring) return;
+    hal::Device& dev = c.core().dev();
+    const std::uint64_t keep = chunk;
+    chunk = lowBytes(pigUnitMs, sinkBytes);  // sized for the low clock: <= ~unitMs whatever state the clock is in
+    for (int i = 0; i < piggyDepth; ++i) {
+      if (!submitUnit(dev, nullptr, nullptr)) return void(chunk = keep);
+      piggyUnits.fetch_add(1, std::memory_order_relaxed);
+    }
+    chunk = keep;
+  }
+  void run(bool prep) {
+    if (!provider().enabled()) return;
+    std::shared_ptr<Context> c = provider().context(nullptr);
+    if (!c) return;
+    if (ctxOf.lock() != c) {
+      release();
+      std::lock_guard<std::mutex> dl(c->mutex());
+      ctxOf = c;
+      ctxRaw = c.get();
+    }
+    const std::uint64_t mb = 1ull << 20;
+    const std::uint64_t wantRing = std::uint64_t(std::max(4.0, envD("DAPPLE_HINT_RING_MB", 8))) * mb;
+    const std::uint64_t wantSink = std::min<std::uint64_t>(wantRing, std::uint64_t(std::max(1.0, envD("DAPPLE_HINT_SINK_MB", 4))) * mb);
+    const double unitMs = std::max(0.3, envD("DAPPLE_HINT_UNIT_MS", 1.5));
+    const int depthIdle = std::max(1, int(envD("DAPPLE_HINT_DEPTH", 2)));  // units on the queue while no real frame is pending
+    piggyDepth = std::max(0, int(envD("DAPPLE_HINT_PIGGY", 3)));          // units queued behind each real frame
+    const double holdMs = envD("DAPPLE_HINT_HOLD_MS", 250), dragMs = envD("DAPPLE_HINT_DRAG_MS", 300), maxMs = envD("DAPPLE_HINT_MAX_MS", 400);
+    const double holdDuty = std::clamp(envD("DAPPLE_HINT_HOLD_DUTY", 1.0), 0.1, 1.0);  // GPU duty after burst_ms while the finger has not moved yet
+    const int logLevel = int(envD("DAPPLE_HINT_LOG", 0));
+    const bool cpu = envD("DAPPLE_HINT_CPU", 1) != 0;
+    const bool cpuYield = envD("DAPPLE_HINT_CPU_YIELD", 0) != 0;
+    Clk::time_point tDown, base;
+    {
+      std::lock_guard<std::mutex> lk(m);
+      tDown = touchAt;
+      base = deadline;
+    }
+    const Clk::time_point t0 = Clk::now();
+    if (prep) tDown = base = t0;
+    const std::uint64_t seq0 = realSeq.load();
+    Clk::time_point firstReal{};
+    bool haveReal = false;
+    auto windowEnd = [&]() {
+      Clk::time_point b;
+      {
+        std::lock_guard<std::mutex> lk(m);
+        b = deadline;
+      }
+      auto us = [](double v) { return std::chrono::microseconds(std::int64_t(v * 1000.0)); };
+      const Clk::time_point e = std::max(b, haveReal ? firstReal + us(dragMs) : tDown + us(holdMs));
+      return std::min(e, std::max(b, tDown + us(maxMs)));
+    };
+    std::atomic<bool> spinOn{cpu && !prep};
+    std::atomic<bool> spinPause{false};
+    std::thread spinner;
+    if (spinOn.load())
+      spinner = std::thread([&] {  // big-core load (the memory clock follows the CPU clock; DAPPLE_HINT_CPU_YIELD=1: not while a real frame runs)
+        detail::pinCurrentThreadToBigCores();
+        volatile double x = 1.0;
+        while (spinOn.load(std::memory_order_relaxed)) {
+          if ((cpuYield && realActive.load(std::memory_order_relaxed) > 0) || spinPause.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            continue;
+          }
+          for (int i = 0; i < 2000; ++i) x = x * 1.0000001 + 1e-9;
+        }
+      });
+    struct Fly {
+      hal::FenceH f;
+      Clk::time_point t;
+      std::uint64_t bytes;
+      std::uint64_t seq;
+      int piggy;
+    };
+    std::deque<Fly> q;
+    std::vector<double> early;  // unit throughputs of the first ~40 ms (low clock)
+    Clk::time_point lastDone = t0, restUntil = t0;
+    int units = 0, measured = 0;
+    double busyMs = 0, firstMBps = 0, lastMBps = 0, allocMs = 0, maxUnitMs = 0, lastUnitMs = unitMs;
+    std::uint64_t bytesTotal = 0;
+    piggyUnits.store(0);
+    bool failed = false;
+    {
+      std::lock_guard<std::mutex> dl(c->mutex());
+      // every window starts with units sized for the slowest state seen so far (the clock is low after a pause), and adapts from there
+      pigUnitMs = unitMs;
+      chunk = lowMBps > 0 ? lowBytes(unitMs, wantSink) : (256ull << 10);
+      const Clk::time_point a0 = Clk::now();
+      failed = c->deviceLost() || !ensure(*c, wantRing, wantSink);
+      allocMs = std::chrono::duration<double, std::milli>(Clk::now() - a0).count();
+    }
+    if (!failed && !prep) live.store(true, std::memory_order_release);
+    auto retire = [&](hal::Device& dev) {
+      while (!q.empty()) {
+        if (!dev.poll(q.front().f)) break;
+        const Clk::time_point now = Clk::now();
+        const Clk::time_point from = std::max(lastDone, q.front().t);
+        const double ms = std::chrono::duration<double, std::milli>(now - from).count();
+        lastDone = now;
+        // the interval between two completions on a queue that only held units is the unit's GPU time (+ the poll granularity): adapt the chunk
+        // to `unitMs`. Intervals with a real frame or a piggyback unit in between are not measured.
+        if (ms > 0.05 && q.front().seq == realSeq.load() && q.front().piggy == piggyUnits.load()) {
+          const double mbps = double(q.front().bytes) / double(mb) / (ms / 1000.0);
+          if (logLevel >= 2) std::fprintf(stderr, "keepwarm unit t %.1f ms: %.2f ms %.0f MB/s\n", std::chrono::duration<double, std::milli>(now - t0).count(), ms, mbps);
+          if (measured == 0) firstMBps = mbps;
+          lastMBps = mbps;
+          if (measured > 0 && !prep && std::chrono::duration<double, std::milli>(now - t0).count() < 40.0) early.push_back(mbps);  // the first unit carries the wake-up
+          maxUnitMs = std::max(maxUnitMs, ms);
+          lastUnitMs = ms;
+          ++measured;
+          busyMs += ms;
+          const double scale = std::clamp(unitMs / ms, 0.5, 2.0);
+          chunk = std::clamp<std::uint64_t>(std::uint64_t(double(chunk) * scale) & ~std::uint64_t(0xFFFF), 256ull << 10, sinkBytes);
+        }
+        q.pop_front();
+        if (holdDuty < 1.0) restUntil = now + std::chrono::microseconds(std::int64_t(lastUnitMs * (1.0 / holdDuty - 1.0) * 1000.0));
+      }
+    };
+    while (!failed) {
+      const Clk::time_point now = Clk::now();
+      if (!haveReal && realSeq.load(std::memory_order_relaxed) != seq0) haveReal = true, firstReal = now;
+      const bool open = prep ? units == 0 : now < windowEnd();  // prepare: allocation + one unit (no calibration: the clock is high right after a frame)
+      if (!open) break;  // units still on the GPU finish on their own (their slots are reused safely; release() waits before freeing the buffers)
+      const bool holding = !haveReal && now >= base && holdDuty < 1.0;  // the finger is down but has not moved: lighter load
+      spinPause.store(holding, std::memory_order_relaxed);
+      const int depth = realActive.load(std::memory_order_acquire) > 0 ? 0 : haveReal || holding ? 1 : depthIdle;
+      if (int(q.size()) >= depth && q.empty()) {  // nothing to retire, nothing to submit
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        continue;
+      }
+      bool submitted = false;
+      {
+        std::lock_guard<std::mutex> dl(c->mutex());
+        if (c->deviceLost()) break;
+        hal::Device& dev = c->core().dev();
+        retire(dev);
+        // a real frame may have been requested while this thread waited for the mutex: check again under it
+        if (int(q.size()) < depth && realActive.load(std::memory_order_acquire) == 0 && !(holding && Clk::now() < restUntil)) {
+          Fly fl{};
+          if (!submitUnit(dev, &fl.f, &fl.bytes)) break;
+          fl.t = Clk::now();
+          fl.seq = realSeq.load();
+          fl.piggy = piggyUnits.load();
+          q.push_back(fl);
+          bytesTotal += fl.bytes;
+          ++units;
+          submitted = true;
+        }
+      }
+      if (!submitted) std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    live.store(false, std::memory_order_release);
+    if (prep) {  // the calibration waits for its last units
+      std::lock_guard<std::mutex> dl(c->mutex());
+      hal::Device& dev = c->core().dev();
+      for (int i = 0; i < 2000 && !q.empty(); ++i) {
+        retire(dev);
+        if (!q.empty()) std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
+    }
+    if (early.size() >= 3) {
+      std::sort(early.begin(), early.end());
+      lowMBps = early[early.size() / 2];
+    }
+    spinOn.store(false);
+    if (spinner.joinable()) spinner.join();
+    const double wallMs = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+    char b[512];
+    std::snprintf(b, sizeof b,
+                  "{\"units\":%d,\"piggyback\":%d,\"wallMs\":%.1f,\"firstRealMs\":%.1f,\"busyMs\":%.1f,\"MB\":%.1f,\"firstMBps\":%.0f,\"lastMBps\":%.0f,"
+                  "\"maxUnitMs\":%.2f,\"chunkKB\":%llu,\"allocMs\":%.2f,\"realFrames\":%llu,\"lowMBps\":%.0f}",
+                  units, piggyUnits.load(), wallMs, haveReal ? std::chrono::duration<double, std::milli>(firstReal - tDown).count() : -1.0, busyMs,
+                  double(bytesTotal) / double(mb), firstMBps, lastMBps, maxUnitMs, static_cast<unsigned long long>(chunk >> 10), allocMs,
+                  static_cast<unsigned long long>(realSeq.load() - seq0), lowMBps);
+    {
+      std::lock_guard<std::mutex> lk(jm);
+      json = b;
+    }
+    if (logLevel >= 1) std::fprintf(stderr, "keepwarm %s\n", b);
+  }
+};
+KeepWarmPump& pump() {
+  static auto* p = new KeepWarmPump;  // leaked like the provider (never torn down from a static destructor)
+  return *p;
+}
+}  // namespace
+
+void keepWarm(int ms) {
+  if (ms == 0 || !provider().enabled()) return;
+  pump().request(ms);
+}
+void keepWarmFrame(int delta) {
+  KeepWarmPump& p = pump();
+  if (delta > 0) p.realSeq.fetch_add(1, std::memory_order_relaxed);
+  p.realActive.fetch_add(delta, std::memory_order_acq_rel);
+}
+void keepWarmAfterSubmit(Context& c) { pump().piggyback(c); }
+std::string keepWarmJson() {
+  KeepWarmPump& p = pump();
+  std::lock_guard<std::mutex> lk(p.jm);
+  return p.json;
+}
 
 }  // namespace dapple::engine::gpu

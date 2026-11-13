@@ -64,7 +64,7 @@ struct Config {
   int bakeSize = 65;           // lattice size of the point chain
   bool allowGpu = false;       // 8-bit output only: the GPU executor writes RGBA8 (see section 30.6)
   // HDR policy: an HLG / PQ source with an edit WITHOUT film stays HDR (output HLG / PQ on BT.2020, highlights above SDR white preserved); film is a print and
-  // is always SDR; an edit with geometry (crop / rotate / straighten / flip) is SDR too (the highlight headroom is not warped). false = always SDR.
+  // is always SDR; an edit with geometry (crop / rotate / straighten / flip) stays HDR (the float source is warped the way the graph warps the frame). false = always SDR.
   bool allowHdr = true;
 };
 
@@ -132,6 +132,12 @@ class VideoFrameSession {
   // exposure. The result is the BT.2020 HLG / PQ encoded RGB (0..1): linear(sdrEnc) + the part of the source above SDR white (scaled by the exposure)
   // converted to BT.2020, then the transfer's OETF. Same size as `sdrEnc`; false when the sizes differ (geometry edit).
   static bool toHdrEncoded(const ImageF& sdrEnc, const SourceImage& src, float gainEv, OutputKind kind, ImageF& out);
+  // The same HDR picture before the transfer: linear light in the graph's primaries (sRGB / Rec.709), 1.0 = SDR white, values above 1 = the highlight excess.
+  // Used for the gain map of an Ultra HDR Motion Photo cover. false when the sizes differ.
+  static bool toHdrLinear(const ImageF& sdrEnc, const SourceImage& src, float gainEv, ImageF& out);
+  // One frame as a still: `sdrEnc` = the graph's display-encoded float result (the SDR look), `hdrLinear` = linear HDR (see toHdrLinear) with the edit's
+  // geometry applied to the float source. false (err set) when the session's output is SDR by policy (SDR source, film, switched off) or the sizes differ.
+  bool renderStillHdr(const InputFrame& f, ImageF& sdrEnc, ImageF& hdrLinear, std::string* err = nullptr);
   static std::size_t packedBytes(PackFormat fmt, int w, int h);
 
  private:

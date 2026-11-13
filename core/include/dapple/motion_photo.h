@@ -77,6 +77,9 @@ struct MotionPhotoInfo {
   double videoDurationSec = 0;
   int videoWidth = 0, videoHeight = 0;
   std::string videoCodec, audioCodec;
+  // Ultra HDR cover (gain map between the primary and the video): checked against the XMP directory, the MPF index and the bytes
+  bool hasGainMap = false;
+  std::uint64_t gainMapOffset = 0, gainMapLength = 0;
 };
 
 MotionPhotoInfo validateMotionPhoto(const std::vector<std::uint8_t>& file);

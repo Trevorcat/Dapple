@@ -80,6 +80,20 @@ JNIEXPORT jint JNICALL Java_com_dapple_dapple_DappleVideoEdit_nativeRender(JNIEn
                                   env->GetDirectBufferCapacity(dst));
 }
 
+// {written, reason, peak, gainMax} of dapple_video_edit_cover_uhdr; null on error (dapple_video_edit_last_error)
+JNIEXPORT jfloatArray JNICALL Java_com_dapple_dapple_DappleVideoEdit_nativeCoverUhdr(JNIEnv* env, jclass, jlong h, jobject src, jint w, jint hgt, jint kind,
+                                                                                  jint rot, jstring sdrPath, jstring outPath, jint force) {
+  auto* s = static_cast<const uint16_t*>(env->GetDirectBufferAddress(src));
+  if (!s) return nullptr;
+  const std::string a = jstr(env, sdrPath), b = jstr(env, outPath);
+  DappleHdrInfo info{};
+  if (dapple_video_edit_cover_uhdr(reinterpret_cast<DappleVideoEdit*>(h), s, w, hgt, kind, rot, a.c_str(), b.c_str(), force, &info) != DAPPLE_OK) return nullptr;
+  const jfloat v[4] = {float(info.written), float(info.reason), info.peak, info.gain_max};
+  jfloatArray r = env->NewFloatArray(4);
+  env->SetFloatArrayRegion(r, 0, 4, v);
+  return r;
+}
+
 JNIEXPORT jstring JNICALL Java_com_dapple_dapple_DappleVideoEdit_nativeLastError(JNIEnv* env, jclass) {
   return env->NewStringUTF(dapple_video_edit_last_error());
 }

@@ -25,7 +25,9 @@ import '../native/dapple_session.dart';
 import '../services/blank_check.dart';
 import '../services/capture.dart';
 import '../services/detection.dart';
+import '../platform/usb_camera.dart';
 import '../services/ftp_ingest.dart';
+import '../services/usb_ingest.dart';
 import '../services/ingest.dart';
 import '../services/ingest_log.dart';
 import '../services/live_bridge.dart';
@@ -105,6 +107,10 @@ class AppState extends ChangeNotifier {
   FtpBackend ftpBackend = ChannelFtpBackend();
   late final FtpIngestSource ftpSource = FtpIngestSource(ftpBackend);
   StreamSubscription<FtpEvent>? _ftpSub;
+
+  /// Camera on the USB cable (wired import); tests substitute the backend before [init].
+  UsbCameraBackend usbBackend = UsbCameraBackend.forPlatform();
+  late final UsbIngest usb = UsbIngest(usbBackend);
   final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
   /// Set by the app shell: reopens the tool page of a (failed) background job.
@@ -280,6 +286,14 @@ class AppState extends ChangeNotifier {
   String get sourceLabel => cameraSource && cameraName.isNotEmpty ? cameraName : '手机相册';
 
   ConnState get connState {
+    if (usbCardActive) {
+      return switch (usb.phase) {
+        UsbPhase.ready => ConnState.connected,
+        UsbPhase.unplugged => ConnState.disconnected,
+        UsbPhase.error => ConnState.interrupted,
+        _ => ConnState.idle,
+      };
+    }
     if (linkDown) return ConnState.disconnected;
     if (_photos.isEmpty) return ConnState.idle;
     if (_photos.values.any(_transferBroken)) {
@@ -308,6 +322,7 @@ class AppState extends ChangeNotifier {
   bool get needsMediaPermission => !isDemo && !mediaPermitted;
 
   String get connTitle {
+    if (usbCardActive) return usb.cardTitle;
     if (needsMediaPermission) return '还不能读取手机里的照片';
     switch (connState) {
       case ConnState.disconnected:
@@ -321,6 +336,7 @@ class AppState extends ChangeNotifier {
   }
 
   String get connLine {
+    if (usbCardActive) return usb.cardLine;
     if (needsMediaPermission) return mediaBlocked ? '在系统设置里允许 Dapple 访问照片' : '允许后，手机相册里的照片会出现在这里';
     switch (connState) {
       case ConnState.disconnected:
@@ -345,6 +361,7 @@ class AppState extends ChangeNotifier {
 
   /// Label of the card's action button or null.
   String? get connAction {
+    if (usbCardActive) return usb.cardAction;
     if (needsMediaPermission) return mediaBlocked ? '打开设置' : '允许访问';
     switch (connState) {
       case ConnState.interrupted:
@@ -360,6 +377,11 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> connectAction() async {
+    if (usbCardActive) {
+      // the picker of the card's photos is opened by the card itself (it needs a context); asking again is all that is left here
+      if (usb.phase == UsbPhase.permission || usb.phase == UsbPhase.error) await usb.retry();
+      return;
+    }
     switch (connState) {
       case ConnState.interrupted:
         retryAll();
@@ -667,6 +689,7 @@ class AppState extends ChangeNotifier {
     unawaited(auditLive());
     unawaited(refreshVideos());
     unawaited(initFtp());
+    unawaited(initUsb());
     _scheduleDetect();
   }
 
@@ -728,7 +751,7 @@ class AppState extends ChangeNotifier {
     if (isDemo) return;
     _saveTimer?.cancel();
     _saveTimer = Timer(const Duration(milliseconds: 500), () async {
-      await _libFile.writeAsString(jsonEncode(_photos.values.where((e) => !e.id.startsWith('ftp:arr:')).map((e) => e.toJson()).toList()));
+      await _libFile.writeAsString(jsonEncode(_photos.values.where((e) => !e.id.startsWith('ftp:arr:') && !e.id.startsWith('usb:arr:')).map((e) => e.toJson()).toList()));
     });
   }
 
@@ -1133,7 +1156,7 @@ class AppState extends ChangeNotifier {
   }
 
   void retry(Photo ph, {bool quiet = false}) {
-    if (ph.id.startsWith('ftp:arr:')) {
+    if (ph.id.startsWith('ftp:arr:') || ph.id.startsWith('usb:arr:')) {
       // An interrupted camera upload can only be resent by the camera.
       _photos.remove(ph.id);
       if (!quiet) showToast('请在相机上重新发送');
@@ -1270,7 +1293,7 @@ class AppState extends ChangeNotifier {
     if (isDemo) return '/demo/${ph.id}.jpg';
     // A Motion Photo made from a video exports as a Motion Photo: the edited still plus the clip rendered with the same edit (film included).
     if (ph.kind == PhotoKind.live && ph.liveSrc != null && !isDemo) {
-      final live = await exportLive(ph, longEdge: longEdge, cropOverride: cropOverride, stripLocation: stripLocation);
+      final live = await exportLive(ph, longEdge: longEdge, cropOverride: cropOverride, stripLocation: stripLocation, hdr: hdr);
       if (live != null) return live;
     }
     return exportStill(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr, stripLocation: stripLocation, wideGamut: wideGamut);
@@ -1331,8 +1354,10 @@ class AppState extends ChangeNotifier {
 
   /// The Motion Photo export: the edited still ([exportStill]) + the clip trimmed with [LiveBridge.trim] (with the still's edit when the still is
   /// edited, as recorded otherwise) + the container. Null = the clip could not be produced (source video gone, decoder failure): the caller falls back
-  /// to the still alone, as before.
-  Future<String?> exportLive(Photo ph, {int? longEdge, String? cropOverride, bool? stripLocation}) async {
+  /// to the still alone, as before. [hdr] = the user chose HDR in the export options: an HDR clip's cover then becomes an Ultra HDR JPEG (the SDR still
+  /// byte for byte + gain map) already at a lower headroom threshold; an HDR clip gets the gain map without the option when its cover frame has
+  /// highlight headroom ([liveHdrCover], docs section 30.14).
+  Future<String?> exportLive(Photo ph, {int? longEdge, String? cropOverride, bool? stripLocation, bool hdr = false}) async {
     final src = ph.liveSrc, startMs = ph.liveStartMs, coverMs = ph.liveCoverMs;
     if (src == null || startMs == null || coverMs == null) return null;
     final le = longEdge ?? settings.exportLongEdge;
@@ -1340,11 +1365,12 @@ class AppState extends ChangeNotifier {
     final wire = wireParams(ph, override: extra);
     final edited = liveEdited(ph, cropOverride: cropOverride);
     final strip = stripLocation ?? settings.stripLocation;
-    final tag = jsonEncode([wire, le, settings.jpegQuality, edited, startMs, coverMs, ph.liveMute, 'meta1', strip]).hashCode.toRadixString(16);
+    final tag = jsonEncode([wire, le, settings.jpegQuality, edited, startMs, coverMs, ph.liveMute, 'meta1', strip, 'cov1', hdr]).hashCode.toRadixString(16);
     final stem = p.basenameWithoutExtension(ph.name).replaceFirst(RegExp(r'_MP$'), '');
     final out = p.join(exports.path, '${stem}_dapple_${tag}_MP.jpg');
     if (await File(out).exists()) return out;
     final clip = p.join(exports.path, '${stem}_dapple_$tag.clip.mp4');
+    final coverFile = p.join(exports.path, '${stem}_dapple_$tag.cover.jpg');
     try {
       final still = await exportStill(ph, longEdge: longEdge, cropOverride: cropOverride, stripLocation: strip);
       final edit = editedClipFor(wire: wire, edited: edited, coverMs: coverMs, stillLongEdge: le);
@@ -1356,7 +1382,8 @@ class AppState extends ChangeNotifier {
           source: LiveSource.fromCode(ph.liveSource),
           edit: edit);
       final rel = ((coverMs - t.actualStartMs) / 1000.0).clamp(0.0, LiveDraft.windowSec + 1.0).toDouble();
-      await engine.writeMotionPhoto(jpeg: still, mp4: clip, out: out, coverSec: rel);
+      final cover = await liveHdrCover(ph, still: still, wire: wire, le: le, coverMs: coverMs, hdr: hdr, dest: coverFile);
+      await engine.writeMotionPhoto(jpeg: cover, mp4: clip, out: out, coverSec: rel);
       return out;
     } catch (e) {
       debugPrint('exportLive: $e (the still is exported alone)');
@@ -1364,6 +1391,32 @@ class AppState extends ChangeNotifier {
       return null;
     } finally {
       _tryDelete(clip);
+      _tryDelete(coverFile);
+    }
+  }
+
+  /// The cover of a Motion Photo export: [still] itself, or, for an HDR clip whose cover frame has highlight headroom, [dest] = [still] byte for byte plus a
+  /// gain map (Ultra HDR JPEG; the engine renders the cover frame through the still's edit, [LiveBridge.coverHdr]). Never throws: any failure leaves the SDR
+  /// still as the cover.
+  @visibleForTesting
+  Future<String> liveHdrCover(Photo ph,
+      {required String still, required Map<String, dynamic> wire, required int le, required int coverMs, required bool hdr, required String dest}) async {
+    final src = ph.liveSrc;
+    if (src == null) return still;
+    try {
+      final colorKind = ((await LiveBridge.probe(src))['colorKind'] as num?)?.toInt() ?? 0;
+      if (!liveCoverWantsHdr(hdrOption: hdr, colorKind: colorKind)) return still;
+      final r = await LiveBridge.coverHdr(src, coverMs,
+          sdr: still,
+          out: dest,
+          edit: coverEditFor(wire: wire, coverMs: coverMs, stillLongEdge: le),
+          source: LiveSource.fromCode(ph.liveSource),
+          force: hdr);
+      debugPrint('live cover: ${r.written ? 'Ultra HDR (peak ${r.peak.toStringAsFixed(2)}, gain ${r.gainMax.toStringAsFixed(2)} stops)' : 'SDR (reason ${r.reason})'}');
+      return r.written ? r.path : still;
+    } catch (e) {
+      debugPrint('live cover: $e (SDR cover)');
+      return still;
     }
   }
 
@@ -2111,7 +2164,7 @@ class AppState extends ChangeNotifier {
       if (_photos.values.any((e) => e.id == f.id || e.pairedJpeg == f.path)) continue;
       final stem = pairStem(f.name);
       if (isJpegName(f.name)) {
-        final raw = _photos.values.where((e) => e.id.startsWith('ftp:') && isRawName(e.name) && pairStem(e.name) == stem);
+        final raw = _photos.values.where((e) => _isWireless(e.id) && isRawName(e.name) && pairStem(e.name) == stem);
         if (raw.isNotEmpty) {
           final r = raw.first;
           r.pairedJpeg = f.path;
@@ -2123,7 +2176,7 @@ class AppState extends ChangeNotifier {
       String? pair;
       if (isRawName(f.name)) {
         final jpg =
-            _photos.values.where((e) => e.id.startsWith('ftp:') && isJpegName(e.name) && pairStem(e.name) == stem).toList();
+            _photos.values.where((e) => _isWireless(e.id) && isJpegName(e.name) && pairStem(e.name) == stem).toList();
         for (final j in jpg) {
           pair = j.path;
           _photos.remove(j.id);
@@ -2140,6 +2193,53 @@ class AppState extends ChangeNotifier {
       if (ph.status == PhotoStatus.pending) _enqueue(ph.id);
     }
     _scheduleDetect();
+  }
+
+  // ---------------------------------------------------------------- camera on the USB cable (有线导入)
+  bool get usbCardActive => usb.cardActive;
+
+  /// Photos that came from the camera (FTP or the USB cable) are paired RAW + JPEG the same way.
+  static bool _isWireless(String id) => id.startsWith('ftp:') || id.startsWith('usb:');
+
+  Future<void> initUsb({String? inboxPath}) async {
+    if (!usbBackend.available) return;
+    usb.isKnown = usbKnown;
+    usb.onArrivalStart = (name) {
+      final id = 'usb:arr:$name';
+      _photos[id] = Photo(
+          id: id,
+          name: name,
+          addedMs: DateTime.now().millisecondsSinceEpoch,
+          status: PhotoStatus.arriving,
+          camera: usb.model.isEmpty ? null : usb.model);
+      notifyListeners();
+    };
+    usb.onArrivalProgress = (name, f) {
+      final ph = _photos['usb:arr:$name'];
+      if (ph != null) ph.progress = f.clamp(0.02, 0.95).toDouble();
+    };
+    usb.onArrivalEnd = (name, ok) {
+      if (_photos.remove('usb:arr:$name') != null) notifyListeners();
+    };
+    usb.onFiles = ingestFtpFiles;
+    usb.addListener(notifyListeners);
+    await usb.start(inboxPath ?? inbox.path);
+  }
+
+  /// A card file is already in the library: same identity key, or a photo with the same name and size (the shot came over FTP).
+  bool usbKnown(UsbFile f) {
+    if (_photos.containsKey(f.key)) return true;
+    final n = f.name.toLowerCase();
+    bool same(String? path) {
+      if (path == null || p.basename(path).toLowerCase() != n) return false;
+      try {
+        return File(path).lengthSync() == f.size;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    return _photos.values.any((e) => same(e.path) || same(e.pairedJpeg));
   }
 
   // ---------------------------------------------------------------- demo data
@@ -2241,6 +2341,7 @@ class AppState extends ChangeNotifier {
   void dispose() {
     _watchSub?.cancel();
     _ftpSub?.cancel();
+    usb.dispose();
     _detectTimer?.cancel();
     _scanDebounce?.cancel();
     _saveTimer?.cancel();

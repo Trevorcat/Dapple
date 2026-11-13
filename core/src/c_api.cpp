@@ -605,7 +605,8 @@ std::string motionInfoJson(const MotionPhotoInfo& i) {
                   ",\"videoLength\":" + std::to_string(i.videoLength) + ",\"presentationTimestampUs\":" + std::to_string(i.presentationTimestampUs) +
                   ",\"videoMime\":" + q(i.videoMime) + ",\"duration\":" + n(i.videoDurationSec) + ",\"width\":" + std::to_string(i.videoWidth) +
                   ",\"height\":" + std::to_string(i.videoHeight) + ",\"videoCodec\":" + q(i.videoCodec) + ",\"audioCodec\":" + q(i.audioCodec) +
-                  ",\"problems\":[";
+                  ",\"gainMap\":" + (i.hasGainMap ? "true" : "false") + ",\"gainMapOffset\":" + std::to_string(i.gainMapOffset) +
+                  ",\"gainMapLength\":" + std::to_string(i.gainMapLength) + ",\"problems\":[";
   for (std::size_t k = 0; k < i.problems.size(); ++k) j += (k ? "," : "") + q(i.problems[k]);
   j += "],\"notes\":[";
   for (std::size_t k = 0; k < i.notes.size(); ++k) j += (k ? "," : "") + q(i.notes[k]);
@@ -1165,8 +1166,19 @@ int32_t dapple_session_render(DappleSession* session, const char* params_json, c
 // Touch hint (wave 8): on pointer-down the editor calls this before the first parameter change. A short burst of the newest interactive frame is rendered on a
 // background thread (the same frames a drag renders, results dropped) so the GPU clock that fell during the pause is up when the first real frame arrives;
 // the burst ends at `burst_ms` or as soon as a real frame is requested. It runs only while a finger is down (one burst per call, never two at once).
+// Round 10: the default is the GPU keep-warm pump (gpu_runtime.h keepWarm): GPU-only units of ~1.5 ms (at most two ahead of a frame, none submitted while
+// a real frame is pending, more queued behind each frame of the drag), so a finger that moves at once is not held behind a burst frame. DAPPLE_HINT_MODE=frames selects the frame burst below
+// (measurement only), =off disables the hint.
 int32_t dapple_session_touch_hint(DappleSession* session, int32_t burst_ms) {
   if (!session || burst_ms == 0) return DAPPLE_OK;
+  const char* hintMode = std::getenv("DAPPLE_HINT_MODE");
+  if (hintMode && std::strcmp(hintMode, "off") == 0) return DAPPLE_OK;
+  if (!(hintMode && std::strcmp(hintMode, "frames") == 0)) {
+#ifdef DAPPLE_HAVE_GPU
+    dapple::engine::gpu::keepWarm(burst_ms);  // no-op when frames do not run on the GPU
+#endif
+    return DAPPLE_OK;
+  }
   const bool prepareOnly = burst_ms < 0;  // one burst-size frame: builds the plans of that size now (idle), so the first real burst does not
   bool expected = false;
   if (!session->hintRunning.compare_exchange_strong(expected, true)) return DAPPLE_OK;
@@ -1225,6 +1237,13 @@ int32_t dapple_session_render_frame(DappleSession* session, const char* params_j
           std::memcpy(&rq, request, n);
           rq.size = std::int32_t(sizeof rq);
         }
+#ifdef DAPPLE_HAVE_GPU
+        struct KeepWarmBracket {  // a real foreground frame is pending: the keep-warm pump submits nothing until it returned
+          bool on;
+          explicit KeepWarmBracket(bool o) : on(o) { if (on) dapple::engine::gpu::keepWarmFrame(1); }
+          ~KeepWarmBracket() { if (on) dapple::engine::gpu::keepWarmFrame(-1); }
+        } keepWarmBracket(!tlHintFrame && !(rq.flags & DAPPLE_FRAME_BACKGROUND));
+#endif
         if (!tlHintFrame) {  // a real frame: remembered for the touch hint, and it ends a running burst
           session->frameSeq.fetch_add(1, std::memory_order_relaxed);
           if ((rq.flags & DAPPLE_FRAME_INTERACTIVE) && params_json) {

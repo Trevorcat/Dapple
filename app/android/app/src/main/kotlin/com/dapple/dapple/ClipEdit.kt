@@ -99,6 +99,7 @@ object DappleVideoEdit {
     @JvmStatic private external fun nativeOutputNote(handle: Long): String
     @JvmStatic private external fun nativeFrameBytes(handle: Long, format: Int): Long
     @JvmStatic private external fun nativeRender(handle: Long, src: ByteBuffer, w: Int, h: Int, kind: Int, rot: Int, frameIndex: Int, format: Int, dst: ByteBuffer): Int
+    @JvmStatic private external fun nativeCoverUhdr(handle: Long, src: ByteBuffer, w: Int, h: Int, kind: Int, rot: Int, sdrPath: String, outPath: String, force: Int): FloatArray?
     @JvmStatic private external fun nativeLastError(): String
 
     class Session internal constructor(private var handle: Long) : AutoCloseable {
@@ -132,6 +133,17 @@ object DappleVideoEdit {
             if (nativeRender(handle, frame, w, h, colorKind, rotation, frameIndex, format, dst) != 0) throw IllegalStateException("edit render failed: ${nativeLastError()}")
         }
 
+        /**
+         * The Ultra HDR cover of this edit (docs section 30.14): [frame] (the cover frame, the session's reference) is rendered like the clip; its SDR result and
+         * HDR rendition make a gain map that is attached to [sdrJpeg] (the still of the same edit) into [out]. [forceHdr] = the user asked for HDR (lower threshold).
+         * Returns the engine's verdict; [CoverResult.written] false = [out] is a plain copy of [sdrJpeg] (reason 1 no headroom / SDR source, 2 film, 3 not paired).
+         */
+        fun coverUhdr(frame: ByteBuffer, w: Int, h: Int, colorKind: Int, rotation: Int, sdrJpeg: String, out: String, forceHdr: Boolean): CoverResult {
+            val r = nativeCoverUhdr(handle, frame, w, h, colorKind, rotation, sdrJpeg, out, if (forceHdr) 1 else 0)
+                ?: throw IllegalStateException("Ultra HDR cover failed: ${nativeLastError()}")
+            return CoverResult(r[0] != 0f, r[1].toInt(), r[2], r[3])
+        }
+
         override fun close() {
             if (handle != 0L) { nativeClose(handle); handle = 0L }
         }
@@ -148,3 +160,6 @@ object DappleVideoEdit {
         return Session(h)
     }
 }
+
+/** Verdict of [DappleVideoEdit.Session.coverUhdr]: a gain map was written, or why not (1 no headroom / SDR source, 2 film, 3 not paired). */
+data class CoverResult(val written: Boolean, val reason: Int, val peak: Float, val gainMax: Float)
