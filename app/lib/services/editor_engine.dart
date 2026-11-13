@@ -836,7 +836,8 @@ class EditorEngine extends ChangeNotifier {
   static bool _regionNeutral(Map<String, dynamic> p) {
     num n(String k) => (p[k] is num) ? p[k] as num : 0;
     final crop = p['crop'];
-    return (crop == null || crop == 'orig') && n('rot') == 0 && n('straighten') == 0 && p['flip'] != true && p['flip'] != 1 && n('vignette') == 0;
+    // local adjustments place their masks in the whole picture's coordinates: a region session would put them elsewhere
+    return (crop == null || crop == 'orig') && n('rot') == 0 && n('straighten') == 0 && p['flip'] != true && p['flip'] != 1 && n('vignette') == 0 && p['local'] == null;
   }
 
   Future<void> _renderDetail() async {

@@ -23,6 +23,7 @@ import 'editor_controller.dart';
 import 'editor_widgets.dart' show CurvePainter, curveY;
 import 'film_map_view.dart';
 import 'itemised_view.dart';
+import 'local_panel.dart' show LocalBodyView, LocalHeader;
 import 'mini_maps.dart' show BandDots, WheelMini;
 import 'pad_gestures.dart';
 import 'pad_widgets.dart';
@@ -224,18 +225,22 @@ class _DockedPanelState extends State<DockedPanel> {
     debugPanelBuilds++;
     final g = widget.group;
     final cat = PadCatX.ofGroup(g);
+    final local = g == EGroup.local;
     final ts = MediaQuery.textScalerOf(context).scale(15) / 15;
     return Semantics(
       container: true,
-      label: '${cat?.label ?? '裁切'}调整面板',
+      label: '${local ? '局部' : cat?.label ?? '裁切'}调整面板',
       child: Column(key: ValueKey('panel-${g.name}'), children: [
         _Handle(ctl: ctl, group: g, collapsed: widget.collapsed),
-        _Header(ctl: ctl, group: g, cat: cat, side: widget.side, textScale: ts),
+        if (local)
+          LocalHeader(ctl: ctl, side: widget.side, textScale: ts)
+        else
+          _Header(ctl: ctl, group: g, cat: cat, side: widget.side, textScale: ts),
         if (!widget.collapsed)
           Expanded(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(12, kPanelTopGap, 12, kPanelBottomPad),
-              child: cat == null ? CropBody(ctl: ctl) : _body(cat),
+              child: local ? LocalBodyView(ctl: ctl, side: widget.side) : (cat == null ? CropBody(ctl: ctl) : _body(cat)),
             ),
           ),
       ]),

@@ -3,9 +3,10 @@
 // dapple_session_render; the engine ignores keys it does not know yet.
 import 'dart:ui' show Offset;
 
+import 'local_adjust.dart';
 import 'pad_model.dart' show migratePalette;
 
-enum EGroup { style, light, color, curve, effects, detail, grade, crop }
+enum EGroup { style, light, color, curve, effects, detail, grade, crop, local }
 
 const groupLabels = {
   EGroup.style: '风格',
@@ -16,6 +17,7 @@ const groupLabels = {
   EGroup.detail: '细节',
   EGroup.grade: '分级',
   EGroup.crop: '裁切',
+  EGroup.local: '局部',
 };
 
 enum Fmt { signed, ev, plain, pct, deg, hue, radius }
@@ -205,6 +207,8 @@ SyncCat? syncCatOfKey(String key) {
       return SyncCat.crop;
     case EGroup.style:
       return SyncCat.style;
+    case EGroup.local:
+      return null;
   }
 }
 
@@ -261,7 +265,11 @@ class EditState {
     this.rot = 0,
     this.flip = false,
     this.pads = const {},
+    this.local = LocalList.empty,
   });
+
+  /// Local adjustments (docs/design/local-adjustments.md): the engine's "local" list plus each area's pad state.
+  final LocalList local;
 
   /// Control pad states by category name (`light`, `color`, `film`, `texture`); absent = pad at the centre.
   final Map<String, PadState> pads;
@@ -308,6 +316,7 @@ class EditState {
     int? rot,
     bool? flip,
     Map<String, PadState>? pads,
+    LocalList? local,
   }) =>
       EditState(
         look: identical(look, _keep) ? this.look : look as String?,
@@ -322,6 +331,7 @@ class EditState {
         rot: rot ?? this.rot,
         flip: flip ?? this.flip,
         pads: pads ?? this.pads,
+        local: local ?? this.local,
       );
 
   static const Object _keep = Object();
@@ -354,7 +364,7 @@ class EditState {
     }
   }
 
-  bool get isAdjusted => styleAdjusted || toneAdjusted || values.isNotEmpty || crop != 'orig' || rot != 0 || flip;
+  bool get isAdjusted => styleAdjusted || toneAdjusted || values.isNotEmpty || crop != 'orig' || rot != 0 || flip || !local.isEmpty;
 
   bool sameAs(EditState o) =>
       look == o.look &&
@@ -370,7 +380,8 @@ class EditState {
       values.length == o.values.length &&
       values.entries.every((e) => o.values[e.key] == e.value) &&
       pads.length == o.pads.length &&
-      pads.entries.every((e) => o.pads[e.key]?.same(e.value) ?? false);
+      pads.entries.every((e) => o.pads[e.key]?.same(e.value) ?? false) &&
+      local.same(o.local);
 
   /// Copy settings (clipboard): everything except crop / rot / flip / straighten.
   EditState withoutCrop() {
@@ -403,7 +414,8 @@ class EditState {
         crop: crop,
         rot: rot,
         flip: flip,
-        pads: clip.pads);
+        pads: clip.pads,
+        local: local);
   }
 
   /// Sync = merge: only what the source overrides, only the chosen categories,
@@ -465,6 +477,8 @@ class EditState {
     if (crop != 'orig') m['crop'] = crop;
     if (rot != 0) m['rot'] = rot;
     if (flip) m['flip'] = true;
+    final l = local.toEngineJson();
+    if (l != null) m['local'] = l;
     return m;
   }
 
@@ -481,6 +495,7 @@ class EditState {
         'rot': rot,
         'flip': flip,
         if (pads.isNotEmpty) 'pads': {for (final e in pads.entries) e.key: e.value.toJson()},
+        if (!local.isEmpty) 'local': local.toAppJson(),
       };
 
   factory EditState.fromJson(Map<String, dynamic> j) {
@@ -500,6 +515,7 @@ class EditState {
       rot: (j['rot'] as num?)?.toInt() ?? 0,
       flip: (j['flip'] as bool?) ?? false,
       pads: _padsFromJson(j['pads']),
+      local: LocalList.fromJson(j['local']),
     );
     return e.palette == null ? e : migratePalette(e);
   }

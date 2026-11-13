@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 
 import '../../model/catalog.dart';
+import '../../model/params.dart' show PadState;
 import '../../model/pad_model.dart';
 import '../../theme/tokens.dart';
 import 'editor_controller.dart';
@@ -149,13 +150,58 @@ class PadCursorPainter extends CustomPainter {
   bool shouldRepaint(PadCursorPainter o) => o.x != x || o.y != y || o.limits != limits;
 }
 
+/// What a pad and a strength strip read and write. The global categories use [CatPadSource]; a local area (局部) supplies its own,
+/// so the same pad and strip drive it (docs/design/local-adjustments.md section 4).
+abstract class PadSource {
+  /// Repaints the cursor / thumb.
+  Listenable get changes;
+  PadState get view;
+  PadLimits get limits;
+  void begin();
+  void move(double x, double y);
+  void strip(double a);
+  void end();
+  void reset();
+  String get readout;
+
+  /// False: drawn dimmed and ignores the finger (an empty 局部).
+  bool get enabled => true;
+}
+
+class CatPadSource extends PadSource {
+  CatPadSource(this.ctl, this.cat);
+  final EditorController ctl;
+  final PadCat cat;
+  @override
+  Listenable get changes => Listenable.merge([ctl.app.editTick, ctl.filmRanges, ctl.lookTick]);
+  @override
+  PadState get view => ctl.padView(cat);
+  @override
+  PadLimits get limits => ctl.padLimits(cat);
+  @override
+  void begin() => ctl.padBegin(cat);
+  @override
+  void move(double x, double y) => ctl.padMove(cat, x, y);
+  @override
+  void strip(double a) => ctl.stripSet(cat, a);
+  @override
+  void end() => ctl.padEnd();
+  @override
+  void reset() => ctl.resetPad(cat);
+  @override
+  String get readout => padReadout(cat, ctl.padView(cat));
+}
+
 /// A pad of [cat]. [interactive] false = a picture of the pad (the hold popup, where the dock glyph takes the finger).
 class PadFace extends StatefulWidget {
-  const PadFace({super.key, required this.ctl, required this.cat, this.interactive = true, this.presets = false, this.radius = 18});
+  const PadFace({super.key, required this.ctl, required this.cat, this.interactive = true, this.presets = false, this.radius = 18, this.source});
   final EditorController ctl;
   final PadCat cat;
   final bool interactive, presets;
   final double radius;
+
+  /// Where the cursor reads and writes; null = the category's own pad.
+  final PadSource? source;
 
   @override
   State<PadFace> createState() => _PadFaceState();
@@ -168,6 +214,13 @@ class _PadFaceState extends State<PadFace> {
   bool _begun = false;
 
   EditorController get ctl => widget.ctl;
+  late PadSource _src = widget.source ?? CatPadSource(ctl, widget.cat);
+
+  @override
+  void didUpdateWidget(PadFace old) {
+    super.didUpdateWidget(old);
+    if (old.source != widget.source || old.cat != widget.cat) _src = widget.source ?? CatPadSource(ctl, widget.cat);
+  }
 
   ColorPreset? _hit(Offset p) {
     if (!widget.presets) return null;
@@ -179,18 +232,19 @@ class _PadFaceState extends State<PadFace> {
 
   void _set(Offset p) {
     final v = padFromLocal(_size, p);
-    ctl.padMove(widget.cat, v.dx, v.dy);
+    _src.move(v.dx, v.dy);
   }
 
   void _onDown(Offset p) {
     _down = p;
-    _cand = _hit(p);
     _begun = false;
+    if (!_src.enabled) return;
+    _cand = _hit(p);
     if (_cand != null) {
       setState(() => _pressed = _cand);
       return;
     }
-    ctl.padBegin(widget.cat);
+    _src.begin();
     _begun = true;
     _set(p);
   }
@@ -200,10 +254,10 @@ class _PadFaceState extends State<PadFace> {
       if ((p - _down).distance < 8) return;
       _cand = null;
       setState(() => _pressed = null);
-      ctl.padBegin(widget.cat);
+      _src.begin();
       _begun = true;
     }
-    _set(p);
+    if (_begun) _set(p);
   }
 
   void _onEnd(Offset p, bool cancelled) {
@@ -214,13 +268,14 @@ class _PadFaceState extends State<PadFace> {
       if (!cancelled) ctl.selectPreset(c);
       return;
     }
-    if (_begun) ctl.padEnd();
+    if (_begun) _src.end();
     _begun = false;
   }
 
   @override
   Widget build(BuildContext context) {
     final cat = widget.cat;
+    final src = _src;
     final dark = context.c.dark;
     final r = widget.radius;
     final overlay = padFieldOverlay(cat, dark, r);
@@ -233,11 +288,11 @@ class _PadFaceState extends State<PadFace> {
         RepaintBoundary(child: CustomPaint(painter: _FieldPainter(cat, r))),
         RepaintBoundary(
           child: ListenableBuilder(
-            listenable: Listenable.merge([ctl.app.editTick, ctl.filmRanges, ctl.lookTick]),
+            listenable: src.changes,
             builder: (context, _) {
-              final s = ctl.padView(cat);
+              final s = src.view;
               final children = <Widget>[
-                CustomPaint(painter: PadCursorPainter(s.x, s.y, ctl.padLimits(cat), r)),
+                if (src.enabled) CustomPaint(painter: PadCursorPainter(s.x, s.y, src.limits, r)),
               ];
               if (widget.presets) children.addAll(_presetWidgets(context, _size));
               return Stack(fit: StackFit.expand, clipBehavior: Clip.hardEdge, children: children);
@@ -253,7 +308,7 @@ class _PadFaceState extends State<PadFace> {
       key: ValueKey('pad-${cat.name}'),
       container: true,
       label: '${cat.label}：横向 ${words[0]} 到 ${words[1]}，纵向 ${words[2]} 到 ${words[3]}',
-      value: padReadout(cat, ctl.padView(cat)),
+      value: src.readout,
       increasedValue: words[1],
       decreasedValue: words[0],
       onIncrease: () => _step(0.1, 0),
@@ -261,16 +316,17 @@ class _PadFaceState extends State<PadFace> {
       customSemanticsActions: {
         CustomSemanticsAction(label: '往${words[3]}'): () => _step(0, 0.1),
         CustomSemanticsAction(label: '往${words[2]}'): () => _step(0, -0.1),
-        const CustomSemanticsAction(label: '回到自动'): () => ctl.resetPad(cat),
+        const CustomSemanticsAction(label: '回到自动'): src.reset,
       },
-      child: ClipRRect(borderRadius: BorderRadius.circular(r), child: face),
+      child: ClipRRect(borderRadius: BorderRadius.circular(r), child: Opacity(opacity: src.enabled ? 1 : 0.38, child: face)),
     );
   }
 
   void _step(double dx, double dy) {
-    final s = ctl.padView(widget.cat);
-    ctl.padMove(widget.cat, s.x + dx, s.y + dy);
-    ctl.padEnd();
+    final s = _src.view;
+    _src.begin();
+    _src.move(s.x + dx, s.y + dy);
+    _src.end();
   }
 
   List<Widget> _presetWidgets(BuildContext context, Size size) {
@@ -321,10 +377,16 @@ class _PadFaceState extends State<PadFace> {
 /// The vertical strength strip: bottom 0 (the category has no effect), the middle line 100 %, the top heavier. Absolute: the
 /// thumb is under the finger.
 class StrengthStrip extends StatefulWidget {
-  const StrengthStrip({super.key, required this.ctl, required this.cat, this.width = 40});
+  const StrengthStrip({super.key, required this.ctl, required this.cat, this.width = 40, this.source, this.label});
   final EditorController ctl;
   final PadCat cat;
   final double width;
+
+  /// Where the thumb reads and writes; null = the category's own strip.
+  final PadSource? source;
+
+  /// Spoken name; null = the category's.
+  final String? label;
 
   @override
   State<StrengthStrip> createState() => _StrengthStripState();
@@ -340,47 +402,58 @@ class _StrengthStripState extends State<StrengthStrip> {
 
   EditorController get ctl => widget.ctl;
 
-  void _set(Offset p) => ctl.stripSet(widget.cat, stripFromLocal(_h, p.dy));
+  PadSource get _src => widget.source ?? (_own ??= CatPadSource(ctl, widget.cat));
+  PadSource? _own;
+
+  void _set(Offset p) => _src.strip(stripFromLocal(_h, p.dy));
+
+  void _nudge(double d) {
+    _src.begin();
+    _src.strip(_src.view.a + d);
+    _src.end();
+  }
 
   @override
   Widget build(BuildContext context) {
     final c = context.c;
+    final src = _src;
+    final a = src.view.a;
     return Semantics(
-      key: ValueKey('strip-${widget.cat.name}'),
+      key: ValueKey('strip-${widget.source == null ? widget.cat.name : 'local'}'),
       slider: true,
-      label: '${widget.cat.label}强度',
-      value: '${(ctl.padView(widget.cat).a * 200).round()}%',
-      increasedValue: '${((ctl.padView(widget.cat).a + 0.05).clamp(0.0, 1.0) * 200).round()}%',
-      decreasedValue: '${((ctl.padView(widget.cat).a - 0.05).clamp(0.0, 1.0) * 200).round()}%',
-      onIncrease: () {
-        ctl.stripSet(widget.cat, ctl.padView(widget.cat).a + 0.05);
-        ctl.padEnd();
-      },
-      onDecrease: () {
-        ctl.stripSet(widget.cat, ctl.padView(widget.cat).a - 0.05);
-        ctl.padEnd();
-      },
+      label: widget.label ?? '${widget.cat.label}强度',
+      value: '${(a * 200).round()}%',
+      increasedValue: '${((a + 0.05).clamp(0.0, 1.0) * 200).round()}%',
+      decreasedValue: '${((a - 0.05).clamp(0.0, 1.0) * 200).round()}%',
+      onIncrease: () => _nudge(0.05),
+      onDecrease: () => _nudge(-0.05),
       child: SizedBox(
         width: widget.width,
         child: LayoutBuilder(builder: (context, cons) {
           _h = math.max(1.0, cons.maxHeight);
           return ClaimSurface(
             onDown: (p) {
-              ctl.padBegin(widget.cat);
+              if (!src.enabled) return;
+              src.begin();
               _begun = true;
               _set(p);
             },
-            onMove: _set,
+            onMove: (p) {
+              if (_begun) _set(p);
+            },
             onEnd: (p, cancelled) {
-              if (_begun) ctl.padEnd();
+              if (_begun) src.end();
               _begun = false;
             },
-            child: DecoratedBox(
-              decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(18)),
-              child: RepaintBoundary(
-                child: ListenableBuilder(
-                  listenable: ctl.app.editTick,
-                  builder: (context, _) => CustomPaint(painter: _StripPainter(ctl.padView(widget.cat).a, c.accent, c.text2)),
+            child: Opacity(
+              opacity: src.enabled ? 1 : 0.38,
+              child: DecoratedBox(
+                decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(18)),
+                child: RepaintBoundary(
+                  child: ListenableBuilder(
+                    listenable: src.changes,
+                    builder: (context, _) => CustomPaint(painter: _StripPainter(src.view.a, c.accent, c.text2)),
+                  ),
                 ),
               ),
             ),

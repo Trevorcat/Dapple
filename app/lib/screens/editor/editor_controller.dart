@@ -18,6 +18,7 @@ import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../services/editor_engine.dart';
 import '../../state/app_state.dart';
+import 'local_controller.dart';
 import 'zoom_view.dart';
 
 /// Transient readout near the top of the photo: the "原片" pill and the "n / N" counter.
@@ -85,7 +86,11 @@ class EditorController extends ChangeNotifier implements GestureSink {
     this.lookSwatchSource,
   }) {
     edits.addListener(_maybeRefreshRanges);
+    local = LocalController(this);
   }
+
+  /// 局部: areas, the photo's "editing an area" mode, the overlay (docs/design/local-adjustments.md).
+  late final LocalController local;
 
   final AppState app;
   final String Function() photoId;
@@ -335,6 +340,9 @@ class EditorController extends ChangeNotifier implements GestureSink {
     dragging.value = false;
     _bump();
   }
+
+  /// Writes an edit: inside a control gesture it joins the gesture's undo step, otherwise it is its own step.
+  void applyGesture(EditState Function(EditState) f) => _apply(f);
 
   void _apply(EditState Function(EditState) f) {
     if (!_gestureOn) {
@@ -637,7 +645,9 @@ class EditorController extends ChangeNotifier implements GestureSink {
   // ------------------------------------------------------------ GestureSink: context
 
   @override
-  ArbiterMode get mode => ArbiterMode.browse; // the photo only zooms, pans and compares
+  // the photo only zooms, pans and compares; while 局部 is open one finger belongs to the area's shape (the handle layer), so the
+  // arbiter ignores one-finger drags (adjust mode with no active kind) and keeps two fingers for zoom / pan
+  ArbiterMode get mode => local.active ? ArbiterMode.adjust : ArbiterMode.browse;
 
   @override
   ActiveKind get activeKind => ActiveKind.none;
@@ -646,7 +656,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
   bool get zoomed => zoom.zoomed;
 
   @override
-  bool get adjustEnabled => false;
+  bool get adjustEnabled => local.active && !exploring;
 
   @override
   void adjustBegin(LockAxis axis, double x, double y) {}
@@ -676,6 +686,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   @override
   void longPress(bool on) {
+    if (on && local.active) return; // holding a handle or the brush still must not flip to the original
     if (compare.value == on) return;
     wm.setInteracting(on);
     compare.value = on;
@@ -704,6 +715,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   @override
   void tap(double x, double y) {
+    if (local.active) return; // the handle layer owns taps (picking a tone / colour)
     if (editingRow.value != null) {
       editingRow.value = null; // the entry widget commits on losing focus
       _bump();
@@ -765,6 +777,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
       cancelNumeric();
       return true;
     }
+    if (local.handleBack()) return true;
     if (extra != null) {
       openExtra(null);
       return true;
@@ -803,6 +816,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
   @override
   void dispose() {
     edits.removeListener(_maybeRefreshRanges);
+    local.dispose();
     _rangesTimer?.cancel();
     filmRanges.dispose();
     _lookSw?.dispose();

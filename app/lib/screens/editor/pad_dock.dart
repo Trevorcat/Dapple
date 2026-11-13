@@ -12,12 +12,14 @@ import '../../theme/tokens.dart';
 import '../../widgets/icons.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart' show GlassCapsule;
+import 'local_panel.dart' show LocalDockGlyphPainter;
+import '../../model/local_kinds.dart';
 import 'pad_widgets.dart';
 
 /// The dock's categories, in order.
-const List<EGroup> padDockOrder = [EGroup.light, EGroup.color, EGroup.style, EGroup.effects, EGroup.crop];
+const List<EGroup> padDockOrder = [EGroup.light, EGroup.color, EGroup.style, EGroup.effects, EGroup.local, EGroup.crop];
 
-String dockLabel(EGroup g) => g == EGroup.crop ? '裁切' : PadCatX.ofGroup(g)!.label;
+String dockLabel(EGroup g) => g == EGroup.crop ? '裁切' : (g == EGroup.local ? '局部' : PadCatX.ofGroup(g)!.label);
 
 /// Hold time before the popup appears (a drag beyond [kHoldSlop] starts it at once).
 const Duration kHoldDelay = Duration(milliseconds: 260);
@@ -30,10 +32,10 @@ class PadDock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
-      listenable: Listenable.merge([ctl.wm, ctl.app.editTick, ctl.hold]),
+      listenable: Listenable.merge([ctl.wm, ctl.app.editTick, ctl.hold, ctl.local]),
       builder: (context, _) => LayoutBuilder(builder: (context, cons) {
         final n = padDockOrder.length;
-        final iw = (cons.maxWidth / n).clamp(52.0, 76.0).toDouble();
+        final iw = (cons.maxWidth / n).clamp(46.0, 76.0).toDouble(); // six items: the side-pane dock on a landscape phone is ~300 dp
         return GlassCapsule(
           radius: 28,
           child: SizedBox(
@@ -131,13 +133,25 @@ class _DockItemState extends State<DockItem> {
     final PadState s = pc == null ? PadState.centre : padViewOf(ed, pc, ctl.padCtx);
     final dim = pc != null && (s.a < 0.02 || (pc == PadCat.film && ed.film == null));
     final adjusted = pc != null && padCatAdjusted(ed, pc, ctl.padCtx);
-    final Widget glyph = pc == null
+    final local = g == EGroup.local;
+    final areas = ed.local;
+    final la = local && !areas.isEmpty ? (areas.byId(ctl.local.selId ?? '') ?? areas.items.last) : null;
+    final Widget glyph = local
+        ? Opacity(
+            opacity: la == null ? 0.38 : 1,
+            child: SizedBox(
+                width: 34,
+                height: 26,
+                child: CustomPaint(
+                    key: const ValueKey('glyph-local'),
+                    painter: LocalDockGlyphPainter(la == null || la.mask.isEmpty ? LocalGlyph.radial : kindOfComponent(la.mask.first).glyph, areas.length, fg))))
+        : pc == null
         ? DIcon(DI.crop, size: 24, color: fg, stroke: 1.9)
         : Opacity(opacity: dim ? 0.38 : 1, child: SizedBox(width: 34, height: 26, child: CustomPaint(key: ValueKey('glyph-${pc.name}'), painter: GlyphPainter(s.x, s.y, s.a, pc == PadCat.film, fg))));
     return Semantics(
       selected: on,
       button: true,
-      label: pc == null ? label : '$label，${padReadout(pc, s)}${adjusted ? '，已调整' : ''}，按住拖动直接调整',
+      label: local ? '$label${areas.isEmpty ? '' : '，${areas.length} 个区域'}' : (pc == null ? label : '$label，${padReadout(pc, s)}${adjusted ? '，已调整' : ''}，按住拖动直接调整'),
       excludeSemantics: true,
       onTap: () => ctl.openCategory(g),
       child: Listener(

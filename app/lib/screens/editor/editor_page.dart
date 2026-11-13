@@ -30,6 +30,8 @@ import 'pad_panel.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart';
 import 'gesture_surface.dart';
+import 'local_layer.dart';
+import 'local_panel.dart' show LocalToolStrip;
 import 'sync_dialog.dart';
 import 'zoom_view.dart';
 import '../../services/perf_probe.dart';
@@ -268,7 +270,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     PanelNeeds needsFor({required bool collapsed, required bool itemised}) => panelNeeds(
         screenW: size.width, paneW: sw - e.marginL, screenH: e.size.height, region: region, photoW: size.width - e.photoPad.horizontal, aspect: aspect,
         textScale: e.textScale, collapsed: collapsed, itemised: itemised);
-    PanelNeeds needs() => needsFor(collapsed: w.collapsed, itemised: ctl.itemised && PadCatX.ofGroup(w.group) != null);
+    PanelNeeds needs() => needsFor(collapsed: w.collapsed, itemised: ctl.itemised && (PadCatX.ofGroup(w.group) != null || w.group == EGroup.local));
     final key = '${w.group.name}|${size.width.round()}x${size.height.round()}|${aspect.toStringAsFixed(3)}|$trailing|$id';
     if (key != _placeKey && !ctl.dragging.value) {
       _placeKey = key;
@@ -340,6 +342,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     zoom.reset();
     ctl.compare.value = false;
     setState(() => id = next.id);
+    ctl.local.photoChanged();
     engine.attach(next, neighbors: _neighborsOf(next.id));
     ctl.edits.value++;
     if (announce != null) ctl.showText(announce);
@@ -495,6 +498,14 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
           ),
         ),
       ),
+      // 局部: the brush / range tools on the photo's bottom edge
+      AnimatedBuilder(
+        animation: _t,
+        builder: (context, _) {
+          final r = _geoNow().region;
+          return Positioned(left: r.left + 8, width: math.max(0.0, r.width - 16), top: r.bottom - 60, height: 52, child: LocalToolStrip(ctl: ctl));
+        },
+      ),
       // browse-mode filmstrip on wide screens
       if (wide) _filmstrip(bottom: dockBottom + 56 + 12, left: marginL, right: marginR),
       // 1 the control panel: under the photo or beside it
@@ -638,6 +649,8 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
                   child: RawImage(image: engine.detail, fit: BoxFit.fill, filterQuality: FilterQuality.medium),
                 ),
               if (showGrid) IgnorePointer(child: CustomPaint(painter: _ThirdsPainter(fine ? 6 : 3))),
+              // 局部: the area's handles, painting and its red overlay, in the frame's own space (zoom / pan apply to it)
+              if (focusGroup == EGroup.local && !original) Positioned.fill(child: LocalPhotoLayer(lc: ctl.local, zoom: zoom)),
             ]);
           },
         ),

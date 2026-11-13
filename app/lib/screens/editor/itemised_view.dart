@@ -74,15 +74,53 @@ class RadarGeo {
   bool inside(Offset p) => radius(p) <= r1 + 10;
 }
 
+// ------------------------------------------------------------------------------------------------ what the radar and ruler edit
+
+/// The values the radar and the ruler read and write: a category's items ([CatItemSource]) or a local area's ops (局部).
+abstract class ItemSource {
+  Listenable get changes;
+  double actual(PadItem it);
+
+  /// What the pad position implies (the dashed polygon; the ruler's reset appears when the value is elsewhere).
+  double implied(PadItem it);
+  void begin(PadItem it);
+  void set(PadItem it, double v);
+  void end();
+  void reset(PadItem it);
+}
+
+class CatItemSource extends ItemSource {
+  CatItemSource(this.ctl, this.cat);
+  final EditorController ctl;
+  final PadCat cat;
+  @override
+  Listenable get changes => Listenable.merge([ctl.app.editTick, ctl.edits]);
+  @override
+  double actual(PadItem it) => readItem(ctl.edit, it, ctl.padCtx);
+  @override
+  double implied(PadItem it) => padImplied(ctl.edit, cat, ctl.padCtx)[it.id] ?? it.auto;
+  @override
+  void begin(PadItem it) => ctl.itemBegin(cat, it);
+  @override
+  void set(PadItem it, double v) => ctl.itemSet(cat, it, v);
+  @override
+  void end() => ctl.itemEnd();
+  @override
+  void reset(PadItem it) => ctl.resetItem(cat, it);
+}
+
 // ------------------------------------------------------------------------------------------------ the radar
 
 class RadarView extends StatefulWidget {
-  const RadarView({super.key, required this.ctl, required this.cat, required this.items, required this.selected, required this.onSelect});
+  const RadarView({super.key, required this.ctl, required this.cat, required this.items, required this.selected, required this.onSelect, this.source});
   final EditorController ctl;
   final PadCat cat;
   final List<PadItem> items;
   final int selected;
   final ValueChanged<int> onSelect;
+
+  /// Null = the category's own items.
+  final ItemSource? source;
 
   @override
   State<RadarView> createState() => _RadarViewState();
@@ -94,12 +132,14 @@ class _RadarViewState extends State<RadarView> {
   bool _began = false;
 
   EditorController get ctl => widget.ctl;
+  ItemSource get _src => widget.source ?? (_own ??= CatItemSource(ctl, widget.cat));
+  ItemSource? _own;
 
   void _setFrom(Offset p, int i) {
     final geo = RadarGeo(_size, [for (final it in widget.items) it.label]);
     final it = widget.items[i];
     final t = geo.tAlong(p, i, widget.items.length);
-    ctl.itemSet(widget.cat, it, _quantise(it, it.fromNorm(t)));
+    _src.set(it, _quantise(it, it.fromNorm(t)));
   }
 
   double _quantise(PadItem it, double v) {
@@ -115,7 +155,7 @@ class _RadarViewState extends State<RadarView> {
     if (geo.inside(p)) {
       _lock = i;
       _began = true;
-      ctl.itemBegin(widget.cat, widget.items[i]);
+      _src.begin(widget.items[i]);
       _setFrom(p, i);
     } else {
       _lock = null;
@@ -129,7 +169,7 @@ class _RadarViewState extends State<RadarView> {
   }
 
   void _onEnd(Offset p, bool cancelled) {
-    if (_began) ctl.itemEnd();
+    if (_began) _src.end();
     _began = false;
     _lock = null;
   }
@@ -149,18 +189,16 @@ class _RadarViewState extends State<RadarView> {
             onEnd: _onEnd,
             child: RepaintBoundary(
               child: ListenableBuilder(
-                listenable: Listenable.merge([ctl.app.editTick, ctl.edits]),
+                listenable: _src.changes,
                 builder: (context, _) {
-                  final ctx = ctl.padCtx;
-                  final e = ctl.edit;
-                  final implied = padImplied(e, widget.cat, ctx);
+                  final src = _src;
                   return CustomPaint(
                     key: const ValueKey('radar'),
                     painter: _RadarPainter(
                       geo: geo,
                       items: widget.items,
-                      actual: [for (final it in widget.items) readItem(e, it, ctx)],
-                      implied: [for (final it in widget.items) implied[it.id] ?? it.auto],
+                      actual: [for (final it in widget.items) src.actual(it)],
+                      implied: [for (final it in widget.items) src.implied(it)],
                       selected: widget.selected,
                       accent: c.accent,
                       line: c.sep,
@@ -486,13 +524,41 @@ class ItemisedView extends StatelessWidget {
 
 /// The ruler of one item: reads and writes it through the pad's offsets.
 class ItemRuler extends StatelessWidget {
-  const ItemRuler({super.key, required this.ctl, required this.cat, required this.item});
+  const ItemRuler({super.key, required this.ctl, required this.cat, required this.item, this.source});
   final EditorController ctl;
   final PadCat cat;
   final PadItem item;
 
+  /// Null = the category's own items (with typed entry).
+  final ItemSource? source;
+
   @override
   Widget build(BuildContext context) {
+    final src = source;
+    if (src != null) {
+      return ListenableBuilder(
+        listenable: src.changes,
+        builder: (context, _) {
+          final v = src.actual(item);
+          return TapeRuler(
+            key: ValueKey('ruler-${item.id}'),
+            label: item.label,
+            value: v,
+            min: item.min,
+            max: item.max,
+            auto: item.auto,
+            step: item.step,
+            format: item.fmt,
+            haptics: ctl.haptics,
+            onBegin: () => src.begin(item),
+            onChanged: (x) => src.set(item, x),
+            onEnd: src.end,
+            typed: (v - src.implied(item)).abs() > 1e-6,
+            onReset: () => src.reset(item),
+          );
+        },
+      );
+    }
     return ListenableBuilder(
       listenable: Listenable.merge([ctl.app.editTick, ctl.editingRow]),
       builder: (context, _) {
