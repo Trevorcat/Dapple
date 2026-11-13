@@ -1,4 +1,5 @@
 #include "dapple/renderer.h"
+#include "hdr_field.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1029,6 +1030,62 @@ void fillToneTable(std::vector<float>& tone, const Op& op) {
   }
 }
 
+// EV range (around mid-grey) that this frame's tone curve shows well: the contiguous span where the encoded output of a neutral keeps at
+// least 30 % of its peak slope per EV (the toe and the shoulder fall outside). This is the range the single-image HDR leaves alone.
+float hdrShownRange(const std::vector<float>& tone) {
+  if (tone.size() < std::size_t(kToneN)) return 8.f;
+  auto ratioAt = [&](float Y) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &Y, 4);
+    int k = int(bits >> 15) - kToneBase;
+    float fr = float(bits & 0x7FFFu) * (1.f / 32768.f);
+    if (k < 0) k = 0, fr = 0.f;
+    else if (k > kToneN - 2) k = kToneN - 2, fr = 0.f;
+    return tone[std::size_t(k)] + fr * (tone[std::size_t(k) + 1] - tone[std::size_t(k)]);
+  };
+  constexpr int kN = 69;  // -14 .. +3 EV in quarter steps
+  float enc[kN];
+  for (int i = 0; i < kN; ++i) {
+    const float Y = std::exp2(-14.f + 0.25f * float(i));
+    const float y = std::min(1.f, Y * ratioAt(Y));
+    enc[i] = y <= 0.0031308f ? 12.92f * y : 1.055f * std::pow(y, 1.f / 2.4f) - 0.055f;
+  }
+  float best = 0.f;
+  int ip = 0;
+  for (int i = 0; i + 1 < kN; ++i)
+    if (enc[i + 1] - enc[i] > best) best = enc[i + 1] - enc[i], ip = i;
+  if (best <= 0.f) return 8.f;
+  int a = ip, b = ip;
+  while (a > 0 && enc[a] - enc[a - 1] >= 0.6f * best) --a;
+  while (b + 1 < kN - 1 && enc[b + 2] - enc[b + 1] >= 0.6f * best) ++b;
+  return 0.25f * float(b + 1 - a);
+}
+
+}  // namespace
+
+// The user's 100 is internal strength 0.65 (round 2 review: the internal 100 greys foliage and darkens shadows); the stored value stays 0..100.
+constexpr float kHdrUserMax = 0.65f;
+
+void Renderer::hdrBind(const SourceImage& source, FramePlan::Hdr& out, const std::vector<float>* tone) const {
+  out = FramePlan::Hdr{};
+  if (!(p_.hdr > 0.f) || !source.sceneReferred) return;
+  const FilmRun fr = resolveFilm(p_);
+  if (fr.stock && fr.strength > 0.f) return;  // the film branch takes the source before this stage (not implemented there)
+  const float expoLog2 = p_.exposure + camera_.baselineExposureEv;
+  float gain[3];
+  sceneGain(source, gain);
+  const std::shared_ptr<const HdrField> f = hdr::fieldFor(source, wbGain_);
+  if (!f) return;
+  const float T = tone ? hdrShownRange(*tone) : 8.f;
+  const HdrParams hp = hdr::resolve(*f, kHdrUserMax * std::clamp(p_.hdr, 0.f, 100.f) / 100.f, expoLog2, source.meta.iso, gain, T);
+  out.range = hp.hi - hp.lo, out.shown = T;
+  if (!hp.active()) return;  // the scene fits the range the tone curve shows: nothing to compress
+  out.s = hp.s, out.ev = hp.ev, out.key = hp.key, out.yn = hp.yn, out.yclip = hp.yclip, out.lo = hp.lo, out.hi = hp.hi, out.ls = hp.ls, out.hp = hp.hp;
+  out.field = f;
+}
+
+namespace {
+
 struct FastDims {
   int w = 0, h = 0;
   float ox0 = 0.f, oy0 = 0.f, stepX = 1.f, stepY = 1.f;  // output-space origin and pixel pitch
@@ -1617,6 +1674,8 @@ struct FrameKernels::Impl {
   SpatialParams sp;
   float gain[3] = {1.f, 1.f, 1.f};
   float vig = 0.f;
+  FramePlan::Hdr hdr;           // single-image HDR (inactive: strength 0, film, display-referred source)
+  HdrParams hdrP;
   std::optional<LutSampler> sample;
   mutable std::once_flag opOnce;
   mutable std::optional<Renderer::PointOp> overflowOp;
@@ -1656,7 +1715,35 @@ struct FrameKernels::Impl {
     vig = r.p_.vignette / 100.f;
     useGeo = geo.active || region;
     exactMap = geo.exact && !region;
+    if (r.p_.hdr > 0.f) {
+      std::vector<float> exactTone;
+      if (exact) fillToneTable(exactTone, *exactOp);
+      r.hdrBind(source, hdr, exact ? &exactTone : &lut->tone);
+    }
+    if (hdr.active()) {
+      hdrP.s = hdr.s, hdrP.ev = hdr.ev, hdrP.key = hdr.key, hdrP.yn = hdr.yn, hdrP.yclip = hdr.yclip;
+      hdrP.lo = hdr.lo, hdrP.hi = hdr.hi, hdrP.ls = hdr.ls, hdrP.hp = hdr.hp;
+    }
     valid = true;
+  }
+
+  // source position (continuous, pixel centres at +0.5) of output pixel (x, y), normalised by the source size
+  void srcUV(int x, int y, float& u, float& v) const {
+    if (!useGeo) {
+      u = (float(x) + 0.5f) / float(in.width);
+      v = (float(y) + 0.5f) / float(in.height);
+      return;
+    }
+    const float fx = d.ox0 + (float(x) + 0.5f) * d.stepX, fy = d.oy0 + (float(y) + 0.5f) * d.stepY;
+    float sx, sy;
+    geo.mapF(fx, fy, sx, sy);
+    u = sx / float(in.width);
+    v = sy / float(in.height);
+  }
+  void hdrPixel(int x, int y, float* v3) const {
+    float u, v;
+    srcUV(x, y, u, v);
+    hdr::apply(*hdr.field, hdrP, u, v, v3);
   }
 
   void fetchPixel(int x, int y, float v[3]) const {
@@ -1715,6 +1802,7 @@ FramePlan FrameKernels::framePlan() const {
   fp.fullH = m.d.fullH;
   for (int c = 0; c < 3; ++c) fp.gain[c] = m.gain[c];
   fp.vignette = m.vig;
+  fp.hdr = m.hdr;
   fp.nrLuma = m.sp.nrLuma;
   fp.nrColor = m.sp.nrColor;
   fp.dehaze = m.sp.dehaze;
@@ -1770,6 +1858,11 @@ void FrameKernels::toneColour(float* px, int n) const {
 }
 
 bool FrameKernels::canFuseHead() const { return !impl_->exact; }
+bool FrameKernels::hdrActive() const { return impl_->hdr.active(); }
+void FrameKernels::hdrBlock(float* px, int n, int x0, int y) const {
+  if (!impl_->hdr.active()) return;
+  for (int i = 0; i < n; ++i) impl_->hdrPixel(x0 + i, y, px + 3 * i);
+}
 
 void FrameKernels::headGainTone(float* px, int n, int x0, int y) const {
   const Impl& m = *impl_;
@@ -1777,6 +1870,7 @@ void FrameKernels::headGainTone(float* px, int n, int x0, int y) const {
   const LutSampler sample = *m.sample;
   const float gain[3] = {m.gain[0], m.gain[1], m.gain[2]};
   const float* srcRow = m.useGeo ? nullptr : m.in.row(y) + 3 * std::size_t(x0);
+  const bool hdrOn = m.hdr.active();
   for (int i = 0; i < n; ++i) {
     float v[3];
     if (srcRow) {
@@ -1785,6 +1879,7 @@ void FrameKernels::headGainTone(float* px, int n, int x0, int y) const {
       m.fetchPixel(x0 + i, y, v);
     }
     for (int c = 0; c < 3; ++c) v[c] = std::max(0.f, v[c] * gain[c]);
+    if (hdrOn) m.hdrPixel(x0 + i, y, v);
     float e3[3], tm[3];
     if (!sample(v, e3, tm)) {
       std::call_once(m.opOnce, [&] { m.overflowOp.emplace(m.r.makePointOp(m.source, m.lutp)); });

@@ -148,3 +148,6 @@ core/baked_float_n41 39f36bfa6adc9f7e
 core/baked_rgba_n41 d5a520557008e73e
 core/bake_tables_n41 bd4f069490c4297e
 core/bake_fast_analysis 35e6f8d52f87c342
+hdr/hdr_50 ab7d25c6092a919d:7e3834f605d2526e
+hdr/hdr_100_interactive 277681ef9b98abec:2f09057cf1541aa1
+hdr/hdr_100_exact_clarity f8303039351460f3

@@ -62,6 +62,7 @@ List<SliderSpec> _buildSpecs() {
     const SliderSpec('shadows', '阴影', -100, 100, 0, Fmt.signed, g),
     const SliderSpec('whites', '白色色阶', -100, 100, 0, Fmt.signed, g),
     const SliderSpec('blacks', '黑色色阶', -100, 100, 0, Fmt.signed, g),
+    const SliderSpec('hdr', '单张 HDR', 0, 100, 0, Fmt.pct, g),
     const SliderSpec('temp', '色温', -100, 100, 0, Fmt.signed, EGroup.color, track: TrackKind.temp),
     const SliderSpec('tint', '色偏', -100, 100, 0, Fmt.signed, EGroup.color, track: TrackKind.tint),
     const SliderSpec('vibrance', '鲜艳度', -100, 100, 0, Fmt.signed, EGroup.color),

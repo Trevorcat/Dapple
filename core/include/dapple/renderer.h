@@ -164,6 +164,10 @@ class Renderer {
   // Per-channel linear gain the pipeline applies to the source before tone mapping / the film (white balance x develop
   // exposure x the camera's baseline exposure), for scene statistics.
   void sceneGain(const SourceImage& source, float gain[3]) const;
+  // EditParams::hdr resolved for this source (field built / cached, parameters): leaves `out` inactive when the strength is 0, the source is
+  // display-referred or a film stock is selected. Engine only: the old Renderer paths ignore the parameter.
+  // `tone`: the frame's 1D tone table (BakedLut::tone); the range the curve shows well is derived from it (null: 8 EV).
+  void hdrBind(const SourceImage& source, FramePlan::Hdr& out, const std::vector<float>* tone = nullptr) const;
 
  private:
   struct Curve1D {

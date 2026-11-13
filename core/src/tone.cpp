@@ -18,7 +18,9 @@ constexpr int kProxyEdge = 256;
 
 // The develop render of a proxy without neighbourhood stages, as float. Through the engine (graph + planner + CpuExecutor, the
 // exact variant); DAPPLE_ENGINE=off keeps the old Renderer here so the golden oracle stays independent of the engine.
-ImageF renderProxy(const EditParams& p, const CameraProfile& camera, const SourceImage& proxy) {
+ImageF renderProxy(const EditParams& pIn, const CameraProfile& camera, const SourceImage& proxy) {
+  EditParams p = pIn;
+  p.hdr = 0.f;  // the tonal analysis is taken without the single-image HDR (EditParams::hdr): it would otherwise enter every table key
   if (engine::mode() == engine::Mode::Off) return Renderer(p, camera, nullptr).renderFloat(proxy, false);
   ImageF f;
   std::string err;

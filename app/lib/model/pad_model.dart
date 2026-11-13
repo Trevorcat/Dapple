@@ -106,6 +106,8 @@ List<PadItem> padItems(PadCat cat, {bool printed = true}) {
         _s('whites', '白色色阶', _sg),
         _s('blacks', '黑色色阶', _sg),
         const PadItem('toneStrength', '明暗强度', 0, 100, 60, _pct, kind: ItemKind.tone),
+        // last: with eight spokes the 3rd and 7th sit on the horizontal axis, where a long name costs radar radius
+        _s('hdr', '单张 HDR', _pct),
       ];
     case PadCat.color:
       return [
@@ -180,6 +182,7 @@ Map<String, double> padRecipe(PadCat cat, double x, double y, double a, {PadCtx 
         'shadows': x * 20 - y * 15,
         'whites': y * 15,
         'blacks': -y * 15,
+        'hdr': 0, // not driven by the pad: the user's own control
         'toneStrength': toneStrengthOf(a, ctx.defaultTone),
       };
     case PadCat.color:

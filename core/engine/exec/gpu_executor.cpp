@@ -3,6 +3,7 @@
 // (on a ResultCache). Whole-frame runs record every stage into one command list; a tiled export records one job per tile and
 // sweep (docs/engine/pipeline-architecture.md 5.1 - 5.5).
 #include "engine/exec/gpu_executor.h"
+#include "hdr_field.h"
 #include "determinism.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -206,6 +207,13 @@ struct DeviceTables {
   int n = 0, n2 = 0;
 };
 
+// Device copy of the single-image HDR field (one SSBO of float pairs), cached like the tables.
+struct DeviceHdr {
+  std::shared_ptr<Context> ctx;
+  std::uint64_t epoch = 0;
+  hal::BufferH buf;
+};
+
 // The device copy of one SourceStore (RGBA16F), plus its Lanczos-resized variants. Shared by every executor of a context that
 // reads the same store (a frame session and its export session do not upload the 24 MP twice); lives while one of them uses it.
 struct ResidentSource {
@@ -297,7 +305,7 @@ struct DeviceSolve {
 
 // Node types a GPU plan may contain (everything else makes the plan Unsupported, 5.9).
 bool headNodeOk(NodeType t) {
-  return t == NodeType::Resize || t == NodeType::Geometry || t == NodeType::Gain || t == NodeType::ToneColour || t == NodeType::ToneColourExact ||
+  return t == NodeType::Resize || t == NodeType::Geometry || t == NodeType::Gain || t == NodeType::Hdr || t == NodeType::ToneColour || t == NodeType::ToneColourExact ||
          t == NodeType::Vignette;
 }
 bool windowNodeOk(NodeType t) {
@@ -320,6 +328,7 @@ class Executor final : public IGpuExecutor {
  public:
   explicit Executor(std::shared_ptr<Context> c) : ctx_(std::move(c)) {
     epoch_ = ctx_->epoch();
+    tables_.setLimit(NodeType::Hdr, 2);
     tables_.setLimit(NodeType::ColourLattice, 2);  // the two lattices of an interactive and a final frame
     solves_.setLimit(NodeType::Dehaze, 2);  // the 1/4 grids of the last frames (a slider that does not touch the solve keeps hitting)
     solves_.setLimit(NodeType::Detail, 2);
@@ -400,6 +409,7 @@ class Executor final : public IGpuExecutor {
   bool ensureResident();
   hal::ImageH* resizedSource(int w, int h);
   std::shared_ptr<DeviceTables> ensureTables(const GpuRun& in);
+  std::shared_ptr<DeviceHdr> ensureHdr(const GpuRun& in);
   LutBind lutBind(GpuGraph& g, const DeviceTables& t);
   // Film frames (section 20): arguments of the film nodes from the FramePlan, device tables of their bake
   bool filmResolve(const GpuRun& in, filmnode::FilmResolved& r);
@@ -579,6 +589,46 @@ std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
   e.payload = t;
   e.bytes = latBytes + lat2Bytes + kToneN * 4;
   tables_.put(NodeType::ColourLattice, std::move(e));
+  return t;
+}
+
+std::shared_ptr<DeviceHdr> Executor::ensureHdr(const GpuRun& in) {
+  const FramePlan::Hdr& h = in.frame.hdr;
+  if (!h.active()) return nullptr;
+  Hasher hk;
+  hk.u64(h.field->id);
+  const Hash128 key = hk.finish();
+  if (ResultCache::Entry* e = tables_.findLru(NodeType::Hdr, key)) return std::static_pointer_cast<DeviceHdr>(e->payload);
+  const std::size_t bytes = h.field->g.size() * sizeof(float);
+  auto t = std::shared_ptr<DeviceHdr>(new DeviceHdr, [](DeviceHdr* p) {
+    if (p->ctx && p->epoch == p->ctx->epoch()) {
+      hal::Device& d = p->ctx->core().dev();
+      d.waitIdle();
+      d.destroy(p->buf);
+    }
+    delete p;
+  });
+  t->ctx = ctx_;
+  t->epoch = epoch_;
+  hal::Status s = dev().createBuffer({bytes, hal::MemKind::DeviceLocal, true}, &t->buf);
+  if (s != hal::Status::Ok) return failStatus(s, ""), nullptr;
+  auto cl = dev().begin();
+  if (!cl) return failStatus(hal::Status::Timeout, ""), nullptr;
+  std::string err;
+  if (!core().ensureStaging(cl->slot(), (bytes + 255) / 256 * 256, err)) return fail(GpuFailure::Transient, err), nullptr;
+  auto& sr = core().slot(cl->slot());
+  std::memcpy(static_cast<std::uint8_t*>(sr.staging.mapped), h.field->g.data(), bytes);
+  GpuGraph g(dev(), core().pool());
+  g.copyBufferToBuffer(sr.staging, g.externalBuf(t->buf), bytes, 0);
+  hal::FenceH f;
+  s = runGraph(dev(), g, *cl, &f, err);
+  if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
+  if (s != hal::Status::Ok) return failStatus(s, err), nullptr;
+  ResultCache::Entry e;
+  e.key = e.family = key;
+  e.payload = t;
+  e.bytes = bytes;
+  tables_.put(NodeType::Hdr, std::move(e));
   return t;
 }
 
@@ -1029,6 +1079,7 @@ struct Executor::Walk {
         case NodeType::Resize:
         case NodeType::Geometry:
         case NodeType::Gain:
+        case NodeType::Hdr:
         case NodeType::ToneColour:
         case NodeType::Vignette:
           new (&rs.point) PointNode{&P, src, lut, W, Hh, ox, oy, e};
@@ -1159,6 +1210,11 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
     L = ensureTables(in);
     if (!L) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
   }
+  std::shared_ptr<DeviceHdr> HD;
+  if (in.frame.hdr.active()) {
+    HD = ensureHdr(in);
+    if (!HD) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
+  }
   const double uploadMs = msSince(t0);
   if (in.cancel.cancelled()) return fail(GpuFailure::None, "cancelled"), Status::Cancelled;
 
@@ -1185,6 +1241,7 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   w.interior = w.work = WRect{0, 0, fw, fh};
   w.src.img = g.external(*S);
   if (L) w.lut = lutBind(g, *L);
+  if (HD) w.lut.hdr = g.externalBuf(HD->buf);
   if (DF) {
     w.fres = &fres;
     w.ftab = &DF->gt;
@@ -1328,6 +1385,11 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   if (!filmFrame || planHasBlend(in)) {  // a film frame needs the colour lattice only for the blend with the normal branch
     L = ensureTables(in);
     if (!L) return bad(Status::Internal);
+  }
+  std::shared_ptr<DeviceHdr> HD;
+  if (in.frame.hdr.active()) {
+    HD = ensureHdr(in);
+    if (!HD) return bad(Status::Internal);
   }
   std::shared_ptr<DeviceFilm> DF;
   std::shared_ptr<DeviceDisplay> DD;
@@ -1513,6 +1575,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     w.interior = interior;
     w.work = work;
     if (L) w.lut = lutBind(g, *L);
+    if (HD) w.lut.hdr = g.externalBuf(HD->buf);
     if (filmFrame) {
       w.fres = &fres;
       w.ftab = &DF->gt;

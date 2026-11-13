@@ -42,6 +42,9 @@ void blkFusedHead(const void* r, float* px, int n, const PixelPos& pos) {
   static_cast<const PtRes*>(r)->fk->headGainTone(px, n, pos.x, pos.y);
 }
 void blkGain(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->gain(px, n); }
+void blkHdr(const void* r, float* px, int n, const PixelPos& pos) {
+  static_cast<const PtRes*>(r)->fk->hdrBlock(px, n, pos.x, pos.y);
+}
 void blkToneColour(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->toneColour(px, n); }
 void blkVignette(const void* r, float* px, int n, const PixelPos& pos) {
   static_cast<const PtRes*>(r)->fk->vignette(px, n, pos.x, pos.y);
@@ -181,6 +184,7 @@ const CpuImpl kOverflow{nullptr, nullptr, nullptr, bakeOverflow, freeAs<std::vec
 const CpuImpl kGeometry{nullptr, blkGeometry, nullptr, nullptr};
 const CpuImpl kFusedHead{nullptr, blkFusedHead, nullptr, nullptr};
 const CpuImpl kGain{nullptr, blkGain, nullptr, nullptr};
+const CpuImpl kHdr{nullptr, blkHdr, nullptr, nullptr};
 const CpuImpl kToneColour{nullptr, blkToneColour, nullptr, nullptr};
 const CpuImpl kVignette{nullptr, blkVignette, nullptr, nullptr};
 const CpuImpl kDisplay{nullptr, blkDisplay, nullptr, nullptr};
@@ -203,6 +207,7 @@ const CpuImpl* cpuImpl(NodeType t) {
     case NodeType::Resize: return &kResize;
     case NodeType::Geometry: return &kGeometry;
     case NodeType::Gain: return &kGain;
+    case NodeType::Hdr: return &kHdr;
     case NodeType::ToneColour:
     case NodeType::ToneColourExact: return &kToneColour;
     case NodeType::Vignette: return &kVignette;

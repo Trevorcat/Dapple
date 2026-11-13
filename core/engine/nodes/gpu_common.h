@@ -54,6 +54,7 @@ struct SourceBind {
 };
 struct LutBind {
   H tone = -1, lat = -1, lat2 = -1;
+  H hdr = -1;  // single-image HDR field (SSBO), -1 = none
   int n = 0, n2 = 0, toneN = 0, toneBase = 0;
   float max1 = 1.5f, max2 = 8.f;
 };

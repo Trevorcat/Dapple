@@ -47,7 +47,9 @@ class FrameKernels {
   // CPU fusion recipe: [Resize | Geometry] + Gain + ToneColour in one pass (baked variant only; same per-pixel operations,
   // in the same order, as the three fragments above, without the two extra passes over the block).
   bool canFuseHead() const;
-  void headGainTone(float* px, int n, int x0, int y) const;
+  void headGainTone(float* px, int n, int x0, int y) const;  // applies the HDR gain after the gain when hdrActive()
+  bool hdrActive() const;                                 // single-image HDR is part of this frame (EditParams::hdr, FramePlan::hdr)
+  void hdrBlock(float* px, int n, int x0, int y) const;   // Hdr node (unfused chain): the HDR gain on gained pixels
   void displayStages(float* px, int n) const;             // curves + LUT on an encoded display value (film path)
   void blend(float* main, const float* film, int n) const;  // main += strength * (film - main)
   void vignette(float* px, int n, int x0, int y) const;

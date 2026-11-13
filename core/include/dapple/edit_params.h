@@ -42,6 +42,7 @@ struct EditParams {
   float shadows = 0.f;     // -100..100
   float whites = 0.f;      // -100..100
   float blacks = 0.f;      // -100..100
+  float hdr = 0.f;         // 0..100 single-image HDR (engine only: shadows lifted / highlights held on the scene-linear base layer, core/src/hdr_field.h)
 
   // Parametric curve (Lightroom "Region" curve)
   float parametricShadows = 0.f;     // -100..100

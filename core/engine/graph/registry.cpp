@@ -75,6 +75,10 @@ NodeRegistry::NodeRegistry() {
   def(NodeType::Gain, "Gain", Domain::Image, Footprint::Point, 1, 1,
       P.mask({"temp", "tint", "exposure", "ctx.camera", "ctx.source"}));
 
+  // The field is a function of the source, the white balance and the exposure (all inherited through the keyed edge from Gain) and of
+  // the ISO (ctx.source); the strength is the node's own key.
+  def(NodeType::Hdr, "Hdr", Domain::Image, Footprint::Point, 1, 1, P.mask({"hdr", "ctx.source"}));
+
   // ---- tables (always CPU, cached) ---------------------------------------------------------------------------------------
   {
     ParamMask m = COLOUR;

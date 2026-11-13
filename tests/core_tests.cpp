@@ -671,10 +671,10 @@ void testCApi() {
 
 // ---------------------------------------------------- full parameter set (chapter 6) ---
 
-// The 74 numeric keys of docs/design/requirements.md 6.3, spelled out independently of the code.
+// The 74 numeric keys of docs/design/requirements.md 6.3 + the engine-only "hdr" (single-image HDR), spelled out independently of the code.
 std::vector<std::string> contractKeys() {
   std::vector<std::string> k = {"exposure", "contrast", "highlights", "shadows", "whites", "blacks", "temp", "tint",
-                                "vibrance", "saturation", "clarity", "texture", "dehaze", "vignette", "grain",
+                                "vibrance", "saturation", "clarity", "texture", "dehaze", "vignette", "grain", "hdr",
                                 "sharpen", "sharpRadius", "nrLuma", "nrColor", "gr_blend", "gr_balance", "straighten"};
   for (const char* b : {"red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"})
     for (const char* c : {"h", "s", "l"}) k.push_back(std::string("hsl_") + b + "_" + c);
@@ -721,13 +721,13 @@ double jsonNumber(const std::string& json, const std::string& key) {
 
 void testAllKeys() {
   const auto entries = schemaEntries();
-  CHECK(entries.size() == 88);  // 74 contract keys + lookStrength, toneStrength, lutAmount + 10 film keys (6 + film_shoot, film_print, film_black, film_latitude, film_wb)
+  CHECK(entries.size() == 89);  // 75 contract keys (incl. hdr) + lookStrength, toneStrength, lutAmount + 10 film keys (6 + film_shoot, film_print, film_black, film_latitude, film_wb)
   for (const std::string& k : contractKeys()) {
     const bool found = std::any_of(entries.begin(), entries.end(), [&](const SchemaEntry& e) { return e.key == k; });
     CHECK(found);
     if (!found) std::fprintf(stderr, "  missing contract key %s\n", k.c_str());
   }
-  CHECK(contractKeys().size() == 74);
+  CHECK(contractKeys().size() == 75);
 
   const std::string defJson = toJson(EditParams{});
   for (const SchemaEntry& e : entries) {

@@ -3,12 +3,14 @@
 // resolved by the CPU reference so the numbers cannot drift apart: geometry, gain, vignette and the
 // neighbourhood parameters. See Renderer::framePlan() and docs/engine/gpu-backend.md.
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace dapple {
 
 class Lut3D;
+struct HdrField;  // core/src/hdr_field.h
 
 struct FramePlan {
   bool supported = true;      // false: the CPU path must render this frame (reason in `why`)
@@ -26,6 +28,14 @@ struct FramePlan {
 
   float gain[3] = {1.f, 1.f, 1.f};  // white balance * exposure, applied to the source before the tone stage
   float vignette = 0.f;             // -1..1
+  // Single-image HDR (EditParams::hdr, engine only): a smooth gain field applied right after `gain`, before the tone stage. Active when
+  // `field` is set and s > 0; resolved by Renderer::hdrBind (which needs the source).
+  struct Hdr {
+    float s = 0.f, ev = 0.f, key = -2.5f, yn = 0.002f, yclip = 1.f, lo = -8.f, hi = -1.f, ls = 0.f, hp = 0.f;  // HdrParams (core/src/hdr_field.h)
+    float range = 0.f, shown = 0.f;  // diagnostics: base range p1..p99 of the frame and the range the tone curve shows well (EV)
+    std::shared_ptr<const HdrField> field;
+    bool active() const { return s > 0.f && ls + hp > 1e-3f && field != nullptr; }
+  } hdr;
 
   // neighbourhood stages, after the quality level / region were applied (see SpatialParams)
   float nrLuma = 0.f, nrColor = 0.f, dehaze = 0.f, clarity = 0.f, texture = 0.f, sharpen = 0.f, sharpRadius = 1.f,

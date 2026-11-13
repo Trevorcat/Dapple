@@ -35,7 +35,7 @@ endif()
 # S sampled image + sampler, B storage buffer). The binding string is checked against the shader by the self-test.
 set(_SH "${PROJECT_SOURCE_DIR}/core/engine/shaders")
 set(DAPPLE_GPU_SHADERS
-  "point|point.comp||SBSSII"
+  "point|point.comp||SBSSIIB"
   "sep_d2y|sepconv.comp|IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
   "sep_d2y_v|sepconv.comp|BIGV=1,IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
   "sep_d2y_s|sepconv.comp|SMALL=1,IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"

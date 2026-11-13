@@ -482,6 +482,7 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   // executor remains the per-pixel reference (docs/engine/pipeline-architecture.md 21).
   const std::shared_ptr<const BakedLut> bake = renderer.bake(src, 65, nullptr, false);
   if (!bake) return 1;
+  renderer.hdrBind(src, fp.hdr, &bake->tone);
   const bool tiled = opt.mode == ExecMode::TiledExport;
   const int tile = opt.tile > 0 ? opt.tile : (x->caps().unifiedMemory ? 1024 : 2048);
   const Plan plan = Planner::plan(g, requestFromFrame(fp, tiled ? ExecMode::TiledExport : ExecMode::Whole, tiled ? tile : 0, std::size_t(1) << 30, true), nullptr);
@@ -960,6 +961,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
     }
   }
   FramePlan fp = job.renderer.framePlan(rw, rh, job.src.sceneReferred, job.fastOptions);
+  job.renderer.hdrBind(job.src, fp.hdr, &bake.tone);  // single-image HDR: the field comes from the CPU source (a pure function of source + white balance)
   if (job.resizeSharpen > 0.f && (rw < job.store->width() || rh < job.store->height())) fp.resizeSharpen = job.resizeSharpen;  // adds the Detail node
   if (!fp.supported) {
     ++stats_.gpuUnsupported;
@@ -1069,6 +1071,7 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
     rh = std::max(1, int(std::lround(H * scale)));
   }
   FramePlan fp = e.renderer.framePlan(rw, rh, e.image.sceneReferred, fj.fastOptions);
+  e.renderer.hdrBind(e.image, fp.hdr, &bake->tone);
   if (!fp.supported) return bail(1, "unsupported on the GPU: " + fp.why);
   fp.resizeSharpen = down ? e.resizeSharpen : 0.f;
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);

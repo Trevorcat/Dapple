@@ -535,6 +535,28 @@ std::vector<Scenario> buildScenarios(const std::string& cubePath, bool haveFilm)
       out.push_back(std::move(s));
     }
   }
+
+  // single-image HDR (EditParams::hdr): engine only, the old Renderer ignores it (selfcheck skips these frames). Last on purpose: scenarios share
+  // process state (bake caches), a scenario in the middle shifts the cache classification of every later one.
+  {
+    Scenario s;
+    s.name = "hdr";
+    auto add = [&](const char* label, auto&& edit, int flags) {
+      Frame f;
+      f.label = label;
+      f.p = b;
+      f.p.sharpen = 0.f;
+      f.p.nrColor = 0.f;
+      edit(f.p);
+      f.flags = flags;
+      f.longEdge = 420;
+      s.frames.push_back(f);
+    };
+    add("hdr_50", [](EditParams& p) { p.hdr = 50.f; }, A);
+    add("hdr_100_interactive", [](EditParams& p) { p.hdr = 100.f; }, I | A);
+    add("hdr_100_exact_clarity", [](EditParams& p) { p.hdr = 100.f; p.clarity = 25.f; p.exposure = -0.4f; }, X);
+    out.push_back(std::move(s));
+  }
   return out;
 }
 
@@ -843,7 +865,7 @@ int selfcheck(bool haveFilm) {
     ++bad;
   }
   for (std::size_t i = 0; i < std::min(off.size(), full.size()); ++i)
-    if (off[i].name != full[i].name || off[i].hash != full[i].hash) {
+    if (off[i].name != full[i].name || (off[i].hash != full[i].hash && off[i].name.rfind("hdr/", 0) != 0)) {  // hdr/: engine-only parameter
       std::printf("MISMATCH %s: off %s full %s\n", off[i].name.c_str(), off[i].hash.c_str(), full[i].hash.c_str());
       ++bad;
     }
@@ -1048,9 +1070,10 @@ int main(int argc, char** argv) {
       const auto r = runAll(haveFilm);
       int bad = 0;
       for (const GoldenHash& x : r) {
+        if (m == "off" && x.name.rfind("hdr/", 0) == 0) continue;  // engine-only parameter: the old Renderer path ignores it (record: append the full-mode hashes by hand)
         const auto it = want.find(x.name);
         if (it == want.end()) {
-          std::printf("[%s] NEW (not in corpus) %s\n", m.c_str(), x.name.c_str());
+          std::printf("[%s] NEW (not in corpus) %s %s\n", m.c_str(), x.name.c_str(), x.hash.c_str());
           ++bad;
         } else if (it->second != x.hash) {
           std::printf("[%s] MISMATCH %s: got %s want %s\n", m.c_str(), x.name.c_str(), x.hash.c_str(), it->second.c_str());

@@ -58,6 +58,7 @@ const std::vector<ParamField>& paramFields() {
     };
     add("exposure", d.exposure, -5.f, 5.f, "light", 20.f);
     add("contrast", d.contrast, -100.f, 100.f, "light");
+    add("hdr", d.hdr, 0.f, 100.f, "light");
     add("highlights", d.highlights, -100.f, 100.f, "light");
     add("shadows", d.shadows, -100.f, 100.f, "light");
     add("whites", d.whites, -100.f, 100.f, "light");

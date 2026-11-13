@@ -37,6 +37,7 @@ const GpuImpl* gpuImplFor(NodeType t) {
     // the point recipe: one pass for Geometry + Gain + ToneColour (+ the Exact variant) + Vignette
     case NodeType::Geometry:
     case NodeType::Gain:
+    case NodeType::Hdr:
     case NodeType::ToneColour:
     case NodeType::ToneColourExact:  // the exact variant runs on the same lattice kernel (a denser bake), see docs/engine/pipeline-architecture.md 21
     case NodeType::Vignette: return &kPointImpl;

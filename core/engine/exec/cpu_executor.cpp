@@ -73,13 +73,15 @@ struct Run {
       head.push_back(s);
     }
     // fusion recipe: the three leading fragments become one pass over the block (same operations, same order)
-    if (head.size() >= 3 && fk.canFuseHead() && (head[0].type == NodeType::Resize || head[0].type == NodeType::Geometry ||
+    // (an Hdr node after the Gain is part of the fused pass: headGainTone applies the HDR gain between the two)
+    const std::size_t nf = head.size() >= 4 && head[2].type == NodeType::Hdr ? 4 : 3;
+    if (head.size() >= nf && fk.canFuseHead() && (head[0].type == NodeType::Resize || head[0].type == NodeType::Geometry ||
                                                   head[0].type == NodeType::Source) &&
-        head[1].type == NodeType::Gain && head[2].type == NodeType::ToneColour) {
+        head[1].type == NodeType::Gain && head[nf - 1].type == NodeType::ToneColour) {
       Step f = head[0];
       f.impl = cpuFusedHead();
       f.type = NodeType::ToneColour;
-      head.erase(head.begin(), head.begin() + 3);
+      head.erase(head.begin(), head.begin() + long(nf));
       head.insert(head.begin(), f);
     }
     return true;

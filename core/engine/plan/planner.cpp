@@ -62,7 +62,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
 
   // ---- classify -------------------------------------------------------------------------------------------------------
   Group tables{GroupKind::Table, {}, {}};
-  const NodeInstance *nResize = nullptr, *nGeo = nullptr, *nGain = nullptr, *nTone = nullptr, *nFilm = nullptr,
+  const NodeInstance *nResize = nullptr, *nGeo = nullptr, *nGain = nullptr, *nHdr = nullptr, *nTone = nullptr, *nFilm = nullptr,
                      *nDisp = nullptr, *nBlend = nullptr, *nVig = nullptr, *nPack = nullptr;
   std::vector<const NodeInstance*> windows;
   std::vector<NodeId> filmChain;
@@ -75,6 +75,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
       case NodeType::Resize: nResize = &n; break;
       case NodeType::Geometry: nGeo = &n; break;
       case NodeType::Gain: nGain = &n; break;
+      case NodeType::Hdr: nHdr = &n; break;
       case NodeType::ToneColour:
       case NodeType::ToneColourExact: nTone = &n; break;
       case NodeType::FilmSim: nFilm = &n; break;
@@ -152,6 +153,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
   if (nGain) {  // the normal branch: its Resample head, then gain + tone/colour
     head.nodes.push_back(nGeo ? nGeo->id : (nResize ? nResize->id : 0));
     head.nodes.push_back(nGain->id);
+    if (nHdr) head.nodes.push_back(nHdr->id);
     if (nTone) head.nodes.push_back(nTone->id);
   }
   if (nDisp) head.nodes.push_back(nDisp->id);

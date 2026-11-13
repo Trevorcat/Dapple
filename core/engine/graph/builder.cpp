@@ -100,7 +100,8 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
     const bool needMain = !useFilm || strength < 1.f;
     NodeId mainOut = 0;
     if (needMain) {
-      const NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
+      NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
+      if (fp.hdr.active()) gain = g.add(NodeType::Hdr, {Edge{gain}});
       mainOut = g.add(NodeType::ToneColourExact, {Edge{gain}});
     }
     if (useFilm) {
@@ -118,7 +119,8 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
     const bool useFilm = in.filmActive && strength > 0.f;  // 4.6: strength 0 = main branch only
     const bool needMain = !useFilm || strength < 1.f;
     if (needMain) {
-      const NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
+      NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
+      if (fp.hdr.active()) gain = g.add(NodeType::Hdr, {Edge{gain}});
       if (t.hasOverflow) mainOut = g.add(NodeType::ToneColour, {Edge{gain}, Edge{t.tone}, Edge{t.lattice}, Edge{t.overflow}});
       else mainOut = g.add(NodeType::ToneColour, {Edge{gain}, Edge{t.tone}, Edge{t.lattice}});
     }

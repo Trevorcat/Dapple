@@ -16,6 +16,7 @@ add_library(dapple_core STATIC
   src/renderer.cpp
   src/sequence.cpp
   src/spatial.cpp
+  src/hdr_field.cpp
   src/tone.cpp
   src/xmp_preset.cpp
   src/decoders/jpeg_decoder.cpp
