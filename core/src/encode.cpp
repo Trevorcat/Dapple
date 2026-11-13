@@ -8,6 +8,17 @@
 
 namespace dapple {
 
+Result<std::vector<std::uint8_t>> encodeJpeg(const Image8& image, const JpegOptions& options) {
+  if (image.width <= 0 || image.height <= 0) return fail("empty image");
+  std::vector<std::uint8_t> bytes;
+  auto sink = [](void* ctx, void* data, int size) {
+    auto* v = static_cast<std::vector<std::uint8_t>*>(ctx);
+    v->insert(v->end(), static_cast<const std::uint8_t*>(data), static_cast<const std::uint8_t*>(data) + size);
+  };
+  if (!stbi_write_jpg_to_func(sink, &bytes, image.width, image.height, 3, image.data.data(), options.quality)) return fail("JPEG encode failed");
+  return bytes;
+}
+
 Result<void> writeJpeg(const Image8& image, const std::filesystem::path& path, const JpegOptions& options) {
   if (image.width <= 0 || image.height <= 0) return fail("empty image");
   // Write to a temp file and rename, so a failed or interrupted write never

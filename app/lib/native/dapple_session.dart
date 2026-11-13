@@ -658,6 +658,7 @@ class DappleSession {
       int decodeLongEdge = 0,
       int outLongEdge = 0,
       int quality = 92,
+      bool hdr = false,
       required String outPath}) {
     final pj = jsonEncode(params);
     return Isolate.run(() {
@@ -667,7 +668,11 @@ class DappleSession {
       malloc.free(cp);
       if (s == ffi.nullptr) throw DappleException(_lastError(b));
       try {
-        _exportNative(s.address, pj, lutPath, outLongEdge, quality, outPath);
+        if (hdr) {
+          _exportHdrNative(s.address, pj, lutPath, outLongEdge, quality, outPath);
+        } else {
+          _exportNative(s.address, pj, lutPath, outLongEdge, quality, outPath);
+        }
       } finally {
         b.sessionClose(s);
       }
@@ -687,6 +692,65 @@ class DappleSession {
       malloc.free(lp);
       malloc.free(op);
     }
+  }
+
+  /// Ultra HDR export (gain-map JPEG). Writes the plain JPEG when the picture has no highlight headroom worth encoding (or the edit is a film
+  /// look); the library predating the call exports plain. Returns the headroom the file carries in stops (0 = plain JPEG).
+  static double _exportHdrNative(int addr, String paramsJson, String? lut, int longEdge, int quality, String outPath) {
+    final b = _b();
+    final f = b.sessionExportJpegHdr;
+    if (f == null) {
+      _exportNative(addr, paramsJson, lut, longEdge, quality, outPath);
+      return 0;
+    }
+    final pp = paramsJson.toNativeUtf8();
+    final lp = (lut ?? '').toNativeUtf8();
+    final op = outPath.toNativeUtf8();
+    final info = malloc<ffi.Uint8>(24);
+    try {
+      final rc = f(ffi.Pointer.fromAddress(addr), pp, lp, longEdge, quality, op, 0.0, info);
+      if (rc != dappleOk) throw DappleException(_lastError(b));
+      return _hdrInfo(info).written ? _hdrInfo(info).stops : 0;
+    } finally {
+      malloc.free(pp);
+      malloc.free(lp);
+      malloc.free(op);
+      malloc.free(info);
+    }
+  }
+
+  static ({bool written, int reason, double stops, double peak}) _hdrInfo(ffi.Pointer<ffi.Uint8> p) {
+    final i = p.cast<ffi.Int32>().asTypedList(2);
+    final f = (p + 8).cast<ffi.Float>().asTypedList(2);
+    return (written: i[0] == 1, reason: i[1], stops: f[0], peak: f[1]);
+  }
+
+  /// Highlight headroom of the edit in stops above SDR white (0 = nothing worth an HDR export, or a film look): the publish page shows its
+  /// "HDR 照片" option only when this is above 0. Opens a preview-quality session of [srcPath] (cheap, one-shot).
+  static Future<double> hdrHeadroom(String srcPath, Map<String, dynamic> params) {
+    final pj = jsonEncode(params);
+    return Isolate.run(() {
+      final b = _b();
+      final f = b.sessionHdrHeadroom;
+      if (f == null) return 0.0;
+      final cp = srcPath.toNativeUtf8();
+      final s = b.sessionOpen(cp, dappleQualityPreview, 1600);
+      malloc.free(cp);
+      if (s == ffi.nullptr) return 0.0;
+      final pp = pj.toNativeUtf8();
+      final lp = ''.toNativeUtf8();
+      final info = malloc<ffi.Uint8>(24);
+      try {
+        if (f(s, pp, lp, info) != dappleOk) return 0.0;
+        final r = _hdrInfo(info);
+        return r.written ? r.stops : 0.0;
+      } finally {
+        malloc.free(pp);
+        malloc.free(lp);
+        malloc.free(info);
+        b.sessionClose(s);
+      }
+    });
   }
 
   static Future<Map<String, dynamic>?> probe(String path) => Isolate.run(() {

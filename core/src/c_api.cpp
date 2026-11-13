@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -29,6 +30,7 @@
 #include "dapple/renderer.h"
 #include "dng_thumbnail.h"
 #include "dapple/tone.h"
+#include "dapple/ultrahdr.h"
 #include "parallel.h"
 #include "determinism.h"
 #include "sysperf.h"
@@ -1425,6 +1427,159 @@ int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_js
           setError(r.error().message);
           return DAPPLE_ERROR;
         }
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+// ---- Ultra HDR (docs/engine/pipeline-architecture.md section 34) ----
+namespace {
+// The bright rendition of an edit: the same params with the exposure lowered by H (the Renderer clamps exposure to -5, so H is cut to what is left).
+bool renderBright(DappleSession* s, const EditParams& params, const char* lutPath, int longEdge, float H, Image8& out) {
+  EditParams p = params;
+  p.exposure -= H;
+  return renderSessionParams(s, p, lutPath, longEdge, out);
+}
+
+struct HdrDecision {
+  float H = 0.f, peak = 0.f;
+  int reason = 0;
+  Image8 bright;  // at H
+};
+
+// Decides H (requested 0 = from the scene) and renders the bright rendition at `longEdge`.
+bool hdrDecide(DappleSession* s, const EditParams& params, const char* lutPath, int longEdge, float requested, HdrDecision& d) {
+  d = HdrDecision{};
+  if (!params.filmStock.empty()) {
+    d.reason = 2;
+    return true;
+  }
+  const float room = std::max(0.f, params.exposure + 5.f);  // exposure is clamped to -5 by the Renderer
+  const float probeH = std::min(dapple::uhdr::kMaxHeadroomStops, room);
+  if (probeH < 0.5f) {
+    d.reason = 1;
+    return true;
+  }
+  Image8 probe;
+  if (!renderBright(s, params, lutPath, longEdge, probeH, probe)) return false;
+  d.peak = dapple::uhdr::brightPeak(probe, probeH);
+  float H = requested > 0.f ? std::min(dapple::uhdr::kMaxHeadroomStops, std::max(0.5f, requested)) : dapple::uhdr::autoHeadroom(d.peak);
+  H = std::min(H, probeH);
+  if (H < 0.5f || d.peak < 1.0001f) {
+    d.reason = 1;
+    return true;
+  }
+  d.H = H;
+  if (H == probeH) d.bright = std::move(probe);
+  else if (!renderBright(s, params, lutPath, longEdge, H, d.bright)) return false;
+  return true;
+}
+
+void fillHdrInfo(DappleHdrInfo* info, const HdrDecision& d, bool written, float gainMax, float capMax) {
+  if (!info) return;
+  info->written = written ? 1 : 0;
+  info->reason = d.reason;
+  info->headroom_stops = d.H;
+  info->peak = d.peak;
+  info->gain_max = gainMax;
+  info->capacity_max = capMax;
+}
+
+bool writeBytesAtomic(const fs::path& path, const std::vector<std::uint8_t>& bytes) {
+  fs::path tmp = path;
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+    out.flush();
+    if (!out) return false;
+  }
+  std::error_code ec;
+  fs::rename(tmp, path, ec);
+  if (ec) {
+    fs::remove(path, ec);
+    std::error_code ec2;
+    fs::rename(tmp, path, ec2);
+    if (ec2) {
+      fs::remove(tmp, ec);
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
+int32_t dapple_session_hdr_headroom(DappleSession* session, const char* params_json, const char* lut_path, DappleHdrInfo* info) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!session) {
+          setError("null session");
+          return DAPPLE_ERROR;
+        }
+        EditParams params;
+        if (!parseParams(params_json, params)) return DAPPLE_ERROR;
+        HdrDecision d;
+        if (!hdrDecide(session, params, lut_path, 384, 0.f, d)) return DAPPLE_ERROR;
+        fillHdrInfo(info, d, d.reason == 0, 0.f, 0.f);
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+int32_t dapple_session_export_jpeg_hdr(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge,
+                                       int32_t jpeg_quality, const char* out_path, float headroom_stops, DappleHdrInfo* info) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!session) {
+          setError("null session");
+          return DAPPLE_ERROR;
+        }
+        EditParams params;
+        if (!parseParams(params_json, params)) return DAPPLE_ERROR;
+        Image8 img;
+        if (!renderSessionParams(session, params, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
+        JpegOptions jo;
+        if (jpeg_quality > 0) jo.quality = jpeg_quality > 100 ? 100 : jpeg_quality;
+        auto plain = [&](const HdrDecision& d) -> int32_t {
+          auto r = writeJpeg(img, toPath(out_path), jo);
+          if (!r) {
+            setError(r.error().message);
+            return DAPPLE_ERROR;
+          }
+          fillHdrInfo(info, d, false, 0.f, 0.f);
+          return DAPPLE_OK;
+        };
+        const int quarter = std::max(1, (std::max(img.width, img.height) + 3) / 4);
+        HdrDecision d;
+        if (!hdrDecide(session, params, lut_path, quarter, headroom_stops, d)) return DAPPLE_ERROR;
+        if (d.reason != 0) return plain(d);
+        Image8 sdr4;
+        if (!renderSessionParams(session, params, lut_path, quarter, sdr4)) return DAPPLE_ERROR;
+        if (sdr4.width != d.bright.width || sdr4.height != d.bright.height) {
+          d.reason = 3;
+          return plain(d);
+        }
+        const dapple::uhdr::GainMap gm = dapple::uhdr::makeGainMap(sdr4, d.bright, d.H);
+        if (gm.meta.gainMax <= 0.f) {
+          d.reason = 1;
+          return plain(d);
+        }
+        auto base = encodeJpeg(img, jo);
+        if (!base) {
+          setError(base.error().message);
+          return DAPPLE_ERROR;
+        }
+        auto file = dapple::uhdr::assemble(*base, gm);
+        if (!file) {
+          setError(file.error().message);
+          return DAPPLE_ERROR;
+        }
+        if (!writeBytesAtomic(toPath(out_path), *file)) {
+          setError("Cannot write " + std::string(out_path ? out_path : ""));
+          return DAPPLE_ERROR;
+        }
+        fillHdrInfo(info, d, true, gm.meta.gainMax, gm.meta.capacityMax);
         return DAPPLE_OK;
       },
       DAPPLE_ERROR);

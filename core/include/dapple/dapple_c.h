@@ -268,6 +268,23 @@ DAPPLE_API char* dapple_engine_info_json(void);
 DAPPLE_API int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_json, const char* lut_path,
                                               int32_t out_long_edge, int32_t jpeg_quality, const char* out_path);
 
+/* Ultra HDR (gain-map JPEG) from the same edit. dapple_session_hdr_headroom reports, without writing a file, whether the picture has highlights
+ * worth encoding; dapple_session_export_jpeg_hdr writes the SDR export (the base stream is byte for byte the one dapple_session_export_jpeg
+ * writes) plus MPF, XMP (hdrgm), ISO 21496-1 and the gain map, or the plain JPEG when `written` comes back 0 (reason: 1 no highlight headroom,
+ * 2 film stock (a print: paper white is the top), 3 the renders could not be paired). headroom_stops 0 = from the scene (0.5 .. 3), else that
+ * value (capped at 3). Additive; docs/engine/pipeline-architecture.md section 34. */
+typedef struct DappleHdrInfo {
+  int32_t written;       /* 1 = the file carries a gain map */
+  int32_t reason;        /* 0 ok, 1 no headroom, 2 film, 3 not paired */
+  float headroom_stops;  /* H used (0 when none) */
+  float peak;            /* 99.9th percentile of the scene luminance in SDR white units (>= 1.5 = worth encoding) */
+  float gain_max;        /* GainMapMax (log2) */
+  float capacity_max;    /* HDRCapacityMax (log2) */
+} DappleHdrInfo;
+DAPPLE_API int32_t dapple_session_hdr_headroom(DappleSession* session, const char* params_json, const char* lut_path, DappleHdrInfo* info);
+DAPPLE_API int32_t dapple_session_export_jpeg_hdr(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge,
+                                                  int32_t jpeg_quality, const char* out_path, float headroom_stops, DappleHdrInfo* info);
+
 /* ===== HDR merge, panorama stitching, bracket / panorama detection, Motion Photo (phase 3) ===========
  *
  * All options are *flat* JSON objects ({"key": value, ...}); unknown keys are ignored and missing keys take

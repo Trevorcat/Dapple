@@ -1186,13 +1186,35 @@ class AppState extends ChangeNotifier {
   // ---------------------------------------------------------------- export (publish / save)
   /// Renders a full-quality JPEG of [ph] into the exports cache. [cropOverride] applies a
   /// destination aspect ratio at export time only (requirements 4.11.2).
-  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride}) async {
+  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false}) async {
     // A Motion Photo made from a video exports as a Motion Photo: the edited still plus the clip rendered with the same edit (film included).
     if (ph.kind == PhotoKind.live && ph.liveSrc != null && !isDemo) {
       final live = await exportLive(ph, longEdge: longEdge, cropOverride: cropOverride);
       if (live != null) return live;
     }
-    return exportStill(ph, longEdge: longEdge, cropOverride: cropOverride);
+    return exportStill(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr);
+  }
+
+  final Map<String, Future<double>> _hdrHeadroom = {};
+
+  /// Highlight headroom (stops above SDR white) the edit of [ph] has, 0 when an HDR export (Ultra HDR gain-map JPEG) is not worth offering: no
+  /// highlights above white, a film look, a Motion Photo, the demo. Cached per edit.
+  Future<double> hdrHeadroomOf(Photo ph) {
+    if (isDemo || (ph.kind == PhotoKind.live && ph.liveSrc != null)) return Future.value(0);
+    final params = wireParams(ph);
+    final key = '${ph.id}|${jsonEncode(params)}';
+    return _hdrHeadroom.putIfAbsent(key, () async {
+      try {
+        final src = await resolveSource(ph);
+        try {
+          return await DappleSession.hdrHeadroom(src.path, params);
+        } finally {
+          if (src.temp) _tryDelete(src.path);
+        }
+      } catch (_) {
+        return 0.0;
+      }
+    });
   }
 
   /// Does the clip of [ph] go through the node graph? (the still has an edit, the automatic correction applies, or a destination crop is asked for)
@@ -1239,17 +1261,17 @@ class AppState extends ChangeNotifier {
   }
 
   /// Renders a full-quality JPEG of the still of [ph] (no clip).
-  Future<String> exportStill(Photo ph, {int? longEdge, String? cropOverride}) async {
+  Future<String> exportStill(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false}) async {
     final le = longEdge ?? settings.exportLongEdge; // 0 = original size
     final extra = <String, dynamic>{if (cropOverride != null && cropOverride != 'orig') 'crop': cropOverride};
     final params = wireParams(ph, override: extra);
-    final tag = jsonEncode([params, le, settings.jpegQuality]).hashCode.toRadixString(16);
+    final tag = jsonEncode([params, le, settings.jpegQuality, if (hdr) 'uhdr']).hashCode.toRadixString(16);
     final out = p.join(exports.path, '${p.basenameWithoutExtension(ph.name)}_dapple_$tag.jpg');
     if (await File(out).exists()) return out;
     final src = await resolveSource(ph);
     try {
       await DappleSession.exportOneShot(src.path, params,
-          full: true, decodeLongEdge: le, outLongEdge: le, quality: settings.jpegQuality, outPath: out);
+          full: true, decodeLongEdge: le, outLongEdge: le, quality: settings.jpegQuality, hdr: hdr, outPath: out);
     } finally {
       if (src.temp) {
         try {
@@ -1281,7 +1303,7 @@ class AppState extends ChangeNotifier {
     return ok;
   }
 
-  Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride}) async {
+  Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride, bool hdr = false}) async {
     var n = 0;
     for (final ph in list) {
       try {
@@ -1289,7 +1311,7 @@ class AppState extends ChangeNotifier {
           n++;
           continue;
         }
-        final f = await exportJpeg(ph, longEdge: longEdge, cropOverride: cropOverride);
+        final f = await exportJpeg(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr);
         await MediaBridge.saveToGallery(f, f.endsWith('_MP.jpg') ? '${p.basenameWithoutExtension(ph.name).replaceFirst(RegExp(r'_MP$'), '')}_dapple_MP.jpg' : '${p.basenameWithoutExtension(ph.name)}_dapple.jpg');
         ph.exported = true;
         n++;

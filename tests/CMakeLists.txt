@@ -276,3 +276,20 @@ endif()
 
 # Demosaic node (core/engine/nodes/demosaic): tests and evaluation tool
 include(${PROJECT_SOURCE_DIR}/tests/engine/demosaic/demosaic.cmake)
+
+# Ultra HDR (gain-map JPEG) export: container, gain-map maths, session export (docs/engine/pipeline-architecture.md section 34). Compiles the C API in,
+# like the film tests; the session test skips (exit 77) without build/rawsamples.
+add_executable(dapple_uhdr_tests uhdr_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
+target_link_libraries(dapple_uhdr_tests PRIVATE dapple_core dapple_stb)
+target_include_directories(dapple_uhdr_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/cli)
+target_compile_definitions(dapple_uhdr_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+                           $<$<BOOL:${DAPPLE_FILM_AVX2}>:DAPPLE_FILM_HAVE_AVX2=1>)
+if(MSVC)
+  target_compile_options(dapple_uhdr_tests PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(dapple_uhdr_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+foreach(id container reconstruct rule jpeg_source session)
+  add_test(NAME uhdr.${id} COMMAND dapple_uhdr_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(uhdr.${id} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+endforeach()

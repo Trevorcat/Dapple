@@ -55,6 +55,39 @@ class _PublishPageState extends State<PublishPage> {
   late bool _strip = widget.app.settings.stripLocation; // TODO: honour "保留" (engine writes no EXIF today)
   bool _split = false;
   int _batch = 0;
+  // "HDR 照片" (Ultra HDR gain-map JPEG): offered only when at least one photo has highlights worth encoding; off by default.
+  bool _hdr = false;
+  bool _hdrAvailable = false;
+  String _hdrFor = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _probeHdr();
+  }
+
+  void _probeHdrSoon() => Future.microtask(_probeHdr);
+
+  Future<void> _probeHdr() async {
+    final ids = List<String>.of(_ids);
+    final key = ids.join(',');
+    if (key == _hdrFor) return;
+    _hdrFor = key;
+    var any = false;
+    for (final id in ids) {
+      final ph = app.photoById(id);
+      if (ph == null) continue;
+      if (await app.hdrHeadroomOf(ph) > 0) {
+        any = true;
+        break;
+      }
+    }
+    if (!mounted || _hdrFor != key) return;
+    setState(() {
+      _hdrAvailable = any;
+      if (!any) _hdr = false;
+    });
+  }
 
   AppState get app => widget.app;
 
@@ -83,6 +116,7 @@ class _PublishPageState extends State<PublishPage> {
       Navigator.of(context).pop(false);
       return;
     }
+    _probeHdrSoon();
     setState(() {
       _ids = List.of(_ids)..remove(id);
       if (_split && _batch >= _batches) _batch = _batches - 1;
@@ -189,9 +223,9 @@ class _PublishPageState extends State<PublishPage> {
       if (app.isDemo) {
         out.add('/demo/${ph.id}.jpg');
       } else if (fallback) {
-        await app.saveToGallery([ph], longEdge: _size, cropOverride: _ratio);
+        await app.saveToGallery([ph], longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable);
       } else {
-        out.add(await app.exportJpeg(ph, longEdge: _size, cropOverride: _ratio));
+        out.add(await app.exportJpeg(ph, longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable));
       }
       progress.value = (i + 1) / photos.length;
     }
@@ -411,7 +445,24 @@ class _PublishPageState extends State<PublishPage> {
           final v = await showExportSizeSheet(context, current: _size, photo: _photos.length == 1 ? _photos.first : null);
           if (v != null && mounted) setState(() => _size = v);
         }, sub: _sizeDims()),
-        row('row-loc', '位置信息', _strip ? '已去除' : '保留', () => setState(() => _strip = !_strip), last: true),
+        row('row-loc', '位置信息', _strip ? '已去除' : '保留', () => setState(() => _strip = !_strip), last: !_hdrAvailable),
+        if (_hdrAvailable)
+          Container(
+            key: const ValueKey('row-hdr'),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            decoration: BoxDecoration(border: Border(top: BorderSide(color: c.sep))),
+            child: Row(children: [
+              Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('HDR 照片', style: T.body17(c.text)),
+                const SizedBox(height: 2),
+                Text('在支持 HDR 的屏幕上，高光会比白色更亮，其他屏幕照常显示；部分平台上传后会丢掉 HDR。',
+                    key: const ValueKey('row-hdr-sub'), style: T.small(c.text2)),
+              ])),
+              const SizedBox(width: 12),
+              DSwitch(key: const ValueKey('switch-hdr'), value: _hdr, label: 'HDR 照片', onChanged: (v) => setState(() => _hdr = v)),
+            ]),
+          ),
       ]),
     );
   }

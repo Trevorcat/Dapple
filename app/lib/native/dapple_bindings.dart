@@ -93,6 +93,15 @@ typedef _Export = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Point
 typedef _ExportD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int, int,
     ffi.Pointer<Utf8>);
 
+typedef _ExportHdr = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Int32,
+    ffi.Int32, ffi.Pointer<Utf8>, ffi.Float, ffi.Pointer<ffi.Uint8>);
+typedef _ExportHdrD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int, int,
+    ffi.Pointer<Utf8>, double, ffi.Pointer<ffi.Uint8>);
+typedef _HdrProbe = ffi.Int32 Function(
+    ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<ffi.Uint8>);
+typedef _HdrProbeD = int Function(
+    ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Pointer<ffi.Uint8>);
+
 typedef _RenderFrame = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
     ffi.Pointer<DappleFrameRequestStruct>, ffi.Pointer<DappleImageStruct>, ffi.Pointer<ffi.Pointer<Utf8>>);
 typedef _RenderFrameD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
@@ -183,6 +192,12 @@ class DappleBindings {
         isSupportedFile = lib.lookupFunction<_IsSupported, _IsSupportedD>('dapple_is_supported_file'),
         sessionOpen = lib.lookupFunction<_Open, _OpenD>('dapple_session_open'),
         sessionClose = lib.lookupFunction<_Close, _CloseD>('dapple_session_close'),
+        sessionExportJpegHdr = lib.providesSymbol('dapple_session_export_jpeg_hdr')
+            ? lib.lookupFunction<_ExportHdr, _ExportHdrD>('dapple_session_export_jpeg_hdr')
+            : null,
+        sessionHdrHeadroom = lib.providesSymbol('dapple_session_hdr_headroom')
+            ? lib.lookupFunction<_HdrProbe, _HdrProbeD>('dapple_session_hdr_headroom')
+            : null,
         sessionCancel = lib.providesSymbol('dapple_session_cancel') ? lib.lookupFunction<_Cancel, _CancelD>('dapple_session_cancel') : null,
         sessionInfoJson = lib.lookupFunction<_Info, _Info>('dapple_session_info_json'),
         sessionAutoJson = lib.lookupFunction<_Auto, _AutoD>('dapple_session_auto_json'),
@@ -290,6 +305,8 @@ class DappleBindings {
   final _AutoD sessionAutoJson;
   final _RenderD sessionRender;
   final _ExportD sessionExportJpeg;
+  final _ExportHdrD? sessionExportJpegHdr; // Ultra HDR (gain-map JPEG); null when the library predates it
+  final _HdrProbeD? sessionHdrHeadroom;
   final _RenderFrameD? sessionRenderFrame;
   final _PerfConfD? perfConfigure;
   final _PerfConf1D? threadBackground;

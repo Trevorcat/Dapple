@@ -18,6 +18,7 @@ add_library(dapple_core STATIC
   src/spatial.cpp
   src/hdr_field.cpp
   src/tone.cpp
+  src/ultrahdr.cpp
   src/xmp_preset.cpp
   src/decoders/jpeg_decoder.cpp
   src/decoders/libraw_decoder.cpp

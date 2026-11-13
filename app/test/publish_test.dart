@@ -3,6 +3,7 @@ import 'package:dapple/screens/publish/publish_page.dart';
 import 'package:dapple/services/share_service.dart';
 import 'package:dapple/state/app_state.dart';
 import 'package:dapple/theme/tokens.dart';
+import 'package:dapple/widgets/controls.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -63,6 +64,14 @@ class _ThemedHost extends StatelessWidget {
   final Widget child;
   @override
   Widget build(BuildContext context) => MaterialApp(debugShowCheckedModeBanner: false, theme: buildTheme(Brightness.light), home: child);
+}
+
+/// Demo app whose photos report a fixed highlight headroom (the real probe needs the native library).
+class _HdrApp extends AppState {
+  _HdrApp(this.stops) : super.demo();
+  final double stops;
+  @override
+  Future<double> hdrHeadroomOf(Photo ph) async => stops;
 }
 
 List<String> idsOf(AppState app, int n) =>
@@ -190,5 +199,27 @@ void main() {
     await open(tester, app, idsOf(app, 2), size: foldSize);
     await shot(tester, 'publish_fold');
     expect(find.text('分享…'), findsOneWidget);
+  });
+
+  testWidgets('HDR 照片 option is hidden when no photo has highlight headroom', (tester) async {
+    final app = _HdrApp(0);
+    await open(tester, app, idsOf(app, 2));
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(find.byKey(const ValueKey('row-hdr')), findsNothing);
+    expect(find.text('HDR 照片'), findsNothing);
+  });
+
+  testWidgets('HDR 照片 option: off by default, explains itself, switch toggles', (tester) async {
+    final app = _HdrApp(1.5);
+    await open(tester, app, idsOf(app, 2));
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(find.byKey(const ValueKey('row-hdr')), findsOneWidget);
+    expect(find.text('HDR 照片'), findsOneWidget);
+    expect((tester.widget(find.byKey(const ValueKey('row-hdr-sub'))) as Text).data, contains('部分平台上传后会丢掉 HDR'));
+    expect((tester.widget(find.byKey(const ValueKey('switch-hdr'))) as DSwitch).value, isFalse);
+    await tester.tap(find.byKey(const ValueKey('switch-hdr')));
+    await tester.pump();
+    expect((tester.widget(find.byKey(const ValueKey('switch-hdr'))) as DSwitch).value, isTrue);
+    await shot(tester, 'publish_phone_hdr');
   });
 }
