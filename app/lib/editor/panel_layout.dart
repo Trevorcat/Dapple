@@ -14,6 +14,14 @@ enum PanelPlace { bottom, side }
 /// Side pane width: 36 % of the screen, 300 to 400 dp.
 double sidePaneWidth(double screenWidth) => (screenWidth * 0.36).clamp(300.0, 400.0).toDouble();
 
+/// A side pane fits at this logical width (the photo column keeps at least 260 dp). Below it the panel is always under the photo.
+bool sidePaneFits(double screenWidth) => screenWidth - sidePaneWidth(screenWidth) >= 260;
+
+/// Whether the screen can ever show the side panel in some orientation, i.e. whether the hand side (which edge the pane takes)
+/// has a visible effect: the long edge must reach the side-pane width. Slab phones qualify in landscape (long edge >= 640 dp);
+/// only a window that is narrow both ways (a small split-screen / pop-up window) never does.
+bool handSideMatters(Size screen) => sidePaneFits(math.max(screen.width, screen.height));
+
 /// The side must win by this factor (area) to be chosen; avoids flapping at the boundary.
 const double kSideMustWin = 1.08;
 
@@ -86,7 +94,7 @@ PanelLayout solvePanelLayout({
   // no-panel references (the 80 % photo-as-pad rule and `fill`)
   final refBottom = _fit(w - 2 * photoInsetH, a, aspect);
   final sw = sidePaneWidth(w);
-  final sideOk = w - sw >= 260;
+  final sideOk = sidePaneFits(w);
   final sideRegionH = h - regionTop - margin;
   final refSideFull = sideOk ? _fit(w - 16, sideRegionH, aspect) : Size.zero;
   final ref = math.max(refBottom.width * refBottom.height, math.max(refSideFull.width * refSideFull.height, 0.0));

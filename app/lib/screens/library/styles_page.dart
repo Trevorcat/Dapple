@@ -26,10 +26,17 @@ class _StylesPageState extends State<StylesPage> {
 
   AppState get app => widget.app;
 
-  Photo? get _example {
-    final l = app.photos.where((p) => p.status == PhotoStatus.done && (p.demo != null || p.previewPath != null)).toList();
-    return l.isEmpty ? null : l.first;
+  /// Preview picture: the first processed photo, else a built-in synthetic scene (a new install has no photo yet: grey tiles told nothing).
+  static final Photo _sample = Photo(id: 'style-sample', name: 'sample', addedMs: 0, demo: 0, status: PhotoStatus.done);
+
+  Photo get _example {
+    for (final p in app.photos) {
+      if (p.status == PhotoStatus.done && (p.demo != null || p.previewPath != null)) return p;
+    }
+    return _sample;
   }
+
+  bool get _isSample => identical(_example, _sample);
 
   List<DLook> get _looks =>
       dLooks.where((l) => _cat == 'all' || l.cat == _cat || l.id == 'std').toList();
@@ -37,7 +44,6 @@ class _StylesPageState extends State<StylesPage> {
   /// The example photo with [look] approximated through a colour matrix (the engine renders the real thing).
   Widget looked(DLook l, {double strength = 1}) {
     final ph = _example;
-    if (ph == null) return ColoredBox(color: context.c.placeholder);
     final s = strength;
     return ColorFiltered(
       colorFilter: approxFilter(
@@ -127,7 +133,7 @@ class _StylesPageState extends State<StylesPage> {
             Padding(
               padding: const EdgeInsets.all(Sp.l),
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('新照片默认使用', style: T.small(c.text2)),
+                Text(_isSample ? '新照片默认使用（预览为示例画面）' : '新照片默认使用', style: T.small(c.text2)),
                 const SizedBox(height: 4),
                 Text(def.name, style: T.h2(c.text)),
                 Text(def.tags, style: T.small(c.text2)),

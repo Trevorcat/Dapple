@@ -393,13 +393,15 @@ class _Empty extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.c;
+    // access allowed and the first scan (last 7 days only) came back empty: say so instead of "no photos"
+    final recent = !app.isDemo && app.mediaPermitted && app.scanDone;
     return Center(
       child: Column(mainAxisSize: MainAxisSize.min, children: [
         DIcon(DI.camera, size: 48, color: c.text2, stroke: 1.6),
         const SizedBox(height: Sp.m),
-        Text('还没有照片', style: T.body17(c.text, w: FontWeight.w500)),
+        Text(recent ? '最近 7 天没有新照片' : '还没有照片', style: T.body17(c.text, w: FontWeight.w500)),
         const SizedBox(height: Sp.xs),
-        Text('从相册选几张，或用相机传输', style: T.small(c.text2)),
+        Text(recent ? '更早的照片可以从相册选择' : '从相册选几张，或用相机传输', style: T.small(c.text2)),
         const SizedBox(height: Sp.l),
         SizedBox(
           width: 200,
@@ -414,6 +416,10 @@ class _Empty extends StatelessWidget {
               key: const ValueKey('empty-connect'),
               child: SecondaryButton('连接相机', height: 48, onPressed: () => app.connectAction())),
         ),
+        if (app.mediaLimited)
+          KeyedSubtree(
+              key: const ValueKey('empty-more'),
+              child: TextAction('选择更多照片', onPressed: () => app.chooseMorePhotos())),
         if (canPickFiles)
           KeyedSubtree(
               key: const ValueKey('empty-import-files'),

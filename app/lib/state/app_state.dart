@@ -128,7 +128,9 @@ class AppState extends ChangeNotifier {
         return;
       }
       film = FilmCatalog.fromJson(DappleSession.filmListJson(), attribution: DappleSession.filmAttribution());
-      if (!film.isEmpty) unawaited(_loadFilmSwatches(bytes.length));
+      if (!film.isEmpty) {
+        unawaited(_loadFilmSwatches(bytes.length).whenComplete(_prebakeFilmWhenIdle));
+      }
     } catch (e) {
       debugPrint('film pack failed: $e');
     }
@@ -139,6 +141,16 @@ class AppState extends ChangeNotifier {
 
   /// Swatches of the stocks, rendered by the engine from fixed test patches (a few seconds, once per pack): read from
   /// the cache file when its key (version, pack size, stock ids) matches, else computed in a background isolate and cached.
+  /// Once the swatches are done and the GPU probe has finished (so the tables reach the disk cache): bakes every stock's tables in the background.
+  Future<void> _prebakeFilmWhenIdle() async {
+    for (var i = 0; i < 60; i++) {
+      final st = DappleSession.gpuStatusJson() ?? '';
+      if (st.contains('"state":"ready"') || st.contains('"state":"failed"')) break;
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+    DappleSession.startFilmPrebake();
+  }
+
   Future<void> _loadFilmSwatches(int packBytes) async {
     try {
       final key = '$_swatchVersion|$packBytes|${film.stocks.map((s) => s.id).join(',')}';
@@ -168,6 +180,14 @@ class AppState extends ChangeNotifier {
 
   bool ready = false;
   bool mediaPermitted = true;
+
+  /// Finer than [mediaPermitted]: limited = only the photos the user picked are visible; blocked = refused, only system Settings can change it.
+  MediaAccess mediaAccess = MediaAccess.full;
+  bool get mediaLimited => mediaPermitted && mediaAccess == MediaAccess.limited;
+  bool get mediaBlocked => !mediaPermitted && mediaAccess == MediaAccess.blocked;
+
+  /// True once a library scan has finished since the app started (the empty state must not claim "no new photos" before that).
+  bool scanDone = false;
   bool nativeOk = true;
   String? nativeError;
 
@@ -299,7 +319,7 @@ class AppState extends ChangeNotifier {
   }
 
   String get connLine {
-    if (needsMediaPermission) return '允许后，手机相册里的照片会出现在这里';
+    if (needsMediaPermission) return mediaBlocked ? '在系统设置里允许 Dapple 访问照片' : '允许后，手机相册里的照片会出现在这里';
     switch (connState) {
       case ConnState.disconnected:
         return '最后收到第 ${_photos.length} 张';
@@ -323,7 +343,7 @@ class AppState extends ChangeNotifier {
 
   /// Label of the card's action button or null.
   String? get connAction {
-    if (needsMediaPermission) return '允许访问';
+    if (needsMediaPermission) return mediaBlocked ? '打开设置' : '允许访问';
     switch (connState) {
       case ConnState.interrupted:
         return '重试';
@@ -353,7 +373,7 @@ class AppState extends ChangeNotifier {
           // Wireless transfer works (camera FTP ingest, see the settings section): only the gallery permission can be (re)granted here.
           if (!mediaPermitted) {
             await requestPermission();
-            if (!mediaPermitted) showToast('需要允许访问照片');
+            if (!mediaPermitted && !mediaBlocked) showToast('需要允许访问照片');
           } else {
             showToast('正在等待相机：请在相机上开启 FTP 传输并选择这台手机');
           }
@@ -715,20 +735,44 @@ class AppState extends ChangeNotifier {
   }
 
   // ---------------------------------------------------------------- permissions
-  final MediaPermission _mediaPerm = MediaPermission();
-  Future<void> refreshPermission() async {
-    if (!(Platform.isAndroid || Platform.isIOS) || isDemo) return;
-    mediaPermitted = await _mediaPerm.isGranted(); // READ_MEDIA_IMAGES on 13+, READ_EXTERNAL_STORAGE before
+  @visibleForTesting
+  MediaPermission mediaPerm = MediaPermission();
+  @visibleForTesting
+  bool permissionPlatform = Platform.isAndroid || Platform.isIOS;
+
+  void _setAccess(MediaAccess a) {
+    mediaAccess = a;
+    mediaPermitted = a.listing;
     linkDown = !mediaPermitted;
-    notifyListeners();
   }
 
+  /// Re-reads the system state (start, return from Settings or the system prompt); a newly granted access starts the scan at once.
+  Future<void> refreshPermission() async {
+    if (!permissionPlatform || isDemo) return;
+    final was = mediaPermitted;
+    _setAccess(await mediaPerm.level()); // READ_MEDIA_IMAGES on 13+, READ_EXTERNAL_STORAGE before; PhotoKit on iOS
+    notifyListeners();
+    if (mediaPermitted && !was) unawaited(scan());
+  }
+
+  /// The card's / settings row's action: the system prompt while it can be shown, the app's Settings page once the user has refused.
   Future<void> requestPermission() async {
-    if (!(Platform.isAndroid || Platform.isIOS) || isDemo) return;
-    mediaPermitted = await _mediaPerm.request();
-    linkDown = !mediaPermitted;
+    if (!permissionPlatform || isDemo) return;
+    if (mediaBlocked) {
+      await mediaPerm.openSettings(); // the state is re-read when the app resumes
+      return;
+    }
+    _setAccess(await mediaPerm.requestLevel());
     notifyListeners();
     if (mediaPermitted) unawaited(scan());
+  }
+
+  /// Limited access: let the user pick more photos, then look again.
+  Future<void> chooseMorePhotos() async {
+    if (!permissionPlatform || isDemo) return;
+    await mediaPerm.chooseMore();
+    await refreshPermission();
+    unawaited(scan());
   }
 
   /// Android 11+: needed to see RAW files MediaStore does not classify as images and to read them by path.
@@ -755,7 +799,7 @@ class AppState extends ChangeNotifier {
 
   /// Pages through everything added since the persisted high-water mark (DATE_ADDED seconds).
   Future<void> scan() async {
-    if (isDemo || !(Platform.isAndroid || Platform.isIOS) || !mediaPermitted) return;
+    if (isDemo || !permissionPlatform || !mediaPermitted) return;
     if (_scanning) {
       _rescan = true;
       return;
@@ -779,6 +823,8 @@ class AppState extends ChangeNotifier {
         since = maxSec;
       }
       await _prefs.setInt('ingestSince', since);
+      scanDone = true;
+      notifyListeners();
     } catch (e) {
       debugPrint('scan failed: $e');
     } finally {

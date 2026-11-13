@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../editor/panel_layout.dart';
 import '../../services/ftp_ingest.dart';
 
 import '../../model/catalog.dart';
@@ -208,9 +209,12 @@ class _SettingsPageState extends State<SettingsPage> {
         if (!app.isDemo) {
           return [
             _row(context, '手机相册',
-                sub: app.mediaPermitted ? '当前照片来源' : '未允许访问照片',
+                key: 'photo-access',
+                sub: app.mediaLimited ? '只能读取你选的照片' : (app.mediaPermitted ? '当前照片来源' : '未允许访问照片'),
                 leading: Dot(app.mediaPermitted ? c.okIcon : c.track),
-                trailing: app.mediaPermitted ? null : ActionChip32('允许访问', onPressed: () => app.connectAction())),
+                trailing: app.mediaLimited
+                    ? ActionChip32('选择更多', onPressed: () => app.chooseMorePhotos())
+                    : (app.mediaPermitted ? null : ActionChip32(app.connAction ?? '允许访问', onPressed: () => app.connectAction()))),
             _row(context, '相机无线接收',
                 key: 'add-camera',
                 sub: app.ftpRunning ? (app.ftpClients > 0 ? '相机已连接' : '已开启 · 等待相机') : '未开启',
@@ -254,12 +258,13 @@ class _SettingsPageState extends State<SettingsPage> {
         ];
       case 4:
         return [
+          if (handSideMatters(MediaQuery.sizeOf(context)))
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text('惯用手', style: T.body17(c.text)),
               const SizedBox(height: 2),
-              Text('浮窗默认停靠在惯用手一侧；自动会根据你的拇指习惯判断', style: T.small(c.text2)),
+              Text('横屏、展开的折叠屏和平板上，控制面板默认停靠在惯用手一侧；自动会根据你的拇指习惯判断', style: T.small(c.text2)),
               const SizedBox(height: Sp.s),
               DSegmented(
                 key: const ValueKey('seg-handedness'),
@@ -278,7 +283,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   label: '触感反馈',
                   value: s.haptics,
                   onChanged: (v) => app.updateSettings((x) => x.haptics = v))),
-          if (s.handedness == 0)
+          if (s.handedness == 0 && handSideMatters(MediaQuery.sizeOf(context)))
             _row(context, '重置自动判断',
                 key: 'reset-hand',
                 onTap: () {
