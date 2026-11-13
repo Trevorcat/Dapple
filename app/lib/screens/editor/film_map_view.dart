@@ -137,8 +137,13 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   void _end(Offset p, bool cancelled) {
     if (!_active) return;
     _active = false;
-    _zoom.reverse();
+    final shrink = _zoom.reverse();
     ctl.stockEnd();
+    if (cancelled) return;
+    // the choice is final: once the map has shrunk back, return to the film pad
+    shrink.whenComplete(() {
+      if (mounted && !_active && ctl.filmMapOpen) ctl.setFilmMap(false);
+    });
   }
 
   @override

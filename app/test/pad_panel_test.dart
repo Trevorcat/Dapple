@@ -345,12 +345,45 @@ void main() {
       await f.drag(d, step: 4);
       expect(app.editOf(id).film, 'fujifilm_velvia_100', reason: 'sliding moves to the nearest stock, live');
       await f.up();
+      await t.pump(const Duration(milliseconds: 130));
+      expect(zoomNow(), lessThan(kMagnify - 0.1), reason: 'the map is shrinking back before it closes');
       await settle(t, 6);
-      expect(zoomNow(), closeTo(1, 0.02), reason: 'the map shrinks back');
+      expect(find.byKey(const ValueKey('film-map')), findsNothing, reason: 'release is final: the map closes by itself');
+      expect(find.byKey(const ValueKey('pad-film')), findsOneWidget);
       expect(app.editOf(id).film, 'fujifilm_velvia_100', reason: 'release keeps it');
       app.undo(id);
       expect(app.editOf(id).film, 'kodak_portra_400', reason: 'the whole press was one undo step');
       expect(dotPos(0, 0), isNotNull);
+    });
+
+    testWidgets('a pointer cancel keeps the map open; releasing on the selected stock closes it; the button reopens', (t) async {
+      final (app, id) = await openFilm(t);
+      app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
+      await tapDock(t, EGroup.style);
+      await t.tap(find.byKey(const ValueKey('stock-button')));
+      await settle(t, 6);
+      final map = t.getRect(find.byKey(const ValueKey('film-map')));
+      final dots = layoutFilmMap(testFilmCatalog, FilmMapStore.positions!);
+      Offset at(String sid) {
+        final fr = dotFraction(dots.firstWhere((d) => d.id == sid));
+        return map.topLeft + Offset(fr.dx * map.width, fr.dy * map.height);
+      }
+
+      final f = await Finger.down(t, at('kodak_ektar_100'));
+      await settle(t, 3);
+      await t.sendEventToBinding(f.p.cancel());
+      await settle(t, 6);
+      expect(find.byKey(const ValueKey('film-map')), findsOneWidget, reason: 'a cancelled gesture does not close the map');
+      // press and release on the stock that is selected now
+      final sel = app.editOf(id).film!;
+      final g = await Finger.down(t, at(sel));
+      await g.up();
+      await settle(t, 6);
+      expect(find.byKey(const ValueKey('film-map')), findsNothing);
+      expect(app.editOf(id).film, sel);
+      await t.tap(find.byKey(const ValueKey('stock-button')));
+      await settle(t, 6);
+      expect(find.byKey(const ValueKey('film-map')), findsOneWidget, reason: 'the stock button reopens the map');
     });
 
     testWidgets('the 无 pill clears the film', (t) async {

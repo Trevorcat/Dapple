@@ -326,8 +326,10 @@ void main() {
       await settle(t, 6);
       expect(iconOpacity(), lessThan(0.05), reason: 'magnified: the edge icons fade out');
       await f.up();
+      await t.pump(const Duration(milliseconds: 130));
+      expect(iconOpacity(), inExclusiveRange(0.05, 0.95), reason: 'the icons fade back in while the map shrinks, before it closes');
       await settle(t, 6);
-      expect(iconOpacity(), greaterThan(0.95));
+      expect(find.byKey(const ValueKey('film-map')), findsNothing, reason: 'release closes the map');
       expect(app.editOf(id).film, isNotNull);
     });
   });
