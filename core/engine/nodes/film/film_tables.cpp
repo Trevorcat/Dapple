@@ -20,6 +20,7 @@
 #include "parallel.h"
 #include "determinism.h"
 #include "engine/nodes/film/film_async.h"
+#include "engine/nodes/film/frame_trace.h"
 
 #include "dapple/film_match.h"
 #include "engine/nodes/film/film_node_internal.h"
@@ -738,8 +739,15 @@ std::shared_ptr<const T> cachedTable(TableLru<T>& c, const Hash128& key, Status 
       }
   }
   void* p = nullptr;
-  if (bake(&r, {}, &p) != Status::Ok) return nullptr;
+  {
+    const bool bg = ThreadPool::tlUse() == &ThreadPool::background();
+    if (!bg) ftrace::with([](ftrace::Rec& x) { ++x.frameBake; });
+    ftrace::Busy busy(bg ? ftrace::S().bgBake : ftrace::S().frameBakeCtr);
+    ftrace::Timer tm(nullptr);
+    if (bake(&r, {}, &p) != Status::Ok) return nullptr;
+  }
   std::shared_ptr<const T> sp(payloadAs<T>(p), [](const T* q) { freePayload(const_cast<T*>(q)); });
+  const_cast<T*>(sp.get())->gen = ftrace::nextGen();
   std::lock_guard<std::mutex> lock(c.m);
   c.l.emplace_front(key, sp);
   while (c.l.size() > 24) c.l.pop_back();  // wave 8: 24 (was 6): the film map slides across ~10 stocks in a second and each needs its raw / curves / print tables (about 1.5 MB each)
@@ -887,6 +895,10 @@ bool asyncTables() {
 }  // namespace
 
 bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
+  const bool traceHere = ftrace::on() && ThreadPool::tlUse() != &ThreadPool::background();
+  double tablesMs = 0;
+  ftrace::Timer traceTimer(traceHere ? &tablesMs : nullptr);
+  int traceKind = ftrace::kExact;
   TableLru<RawTable>& raws = rawsLru();
   TableLru<CurvesTable>& curves = curvesLru();
   TableLru<PrintTable>& prints = printsExact();
@@ -922,28 +934,56 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
   bool usedStale = false;
   // Interactive frame while a print-table slider moves (r.coarse): the exact table when it is cached, else a coarse one (cached on its own, so
   // a drag does not evict the exact tables); the frame after the drag is not coarse and bakes the exact table.
-  if (r.coarse && !cachedPeek(prints, kp)) {
-    Hasher hc;
-    hc.hash(kp);
-    hc.i32(kCoarseLutN);
-    const Hash128 kc = hc.finish();
+  Hasher hc;
+  hc.hash(kp);
+  hc.i32(kCoarseLutN);
+  const Hash128 kc = hc.finish();
+  // One table size for a whole drag: a drag frame takes the coarse table of its own values when it is cached, even when the exact one is too (the exact
+  // table is only the first choice when no coarse one exists, and then a coarse table of the same values is baked behind it); the settled frame queues the
+  // coarse table of its values so that the next drag starts on the coarse tier (frame trace: 1 - 3 table size changes per drag before).
+  if (r.coarse && !(cachedPeek(prints, kp) && !cachedPeek(printsCoarseLru(), kc))) {
     if (asyncTables()) {
       out.print = cachedFind(printsCoarseLru(), kc);
+      traceKind = ftrace::kCoarse;
       if (!out.print) {
-        g_staleOutstanding.store(true);  // before the request: the worker may land the table before this frame has used the stale one
-        printWorker().request(r, kc, base);
-        out.print = staleFor(base), usedStale = out.print != nullptr;
-        if (usedStale) g_staleUses.fetch_add(1, std::memory_order_relaxed);
-        else g_staleOutstanding.store(false);  // nothing stale was shown (the table baked synchronously below)  // the previous step of the drag (or the settled table it started from)
+        // a stale table of the same stock exists: show it and bake the wanted one in the background; none (first table of this stock): bake it here, a second
+        // request would only repeat the same bake on the other pool
+        const std::shared_ptr<const PrintTable> stale = staleFor(base);
+        if (stale) {
+          g_staleOutstanding.store(true);  // before the request: the worker may land the table before this frame has used the stale one
+          printWorker().request(r, kc, base);
+          out.print = stale;
+          usedStale = true;
+          traceKind = ftrace::kStaleSameStock;
+          g_staleUses.fetch_add(1, std::memory_order_relaxed);
+        }
         if (!out.print) out.print = cachedTable(printsCoarseLru(), kc, bakePrintScanCoarseDisk, r);  // the first table of this stock: bake here
       }
     } else {
+      traceKind = ftrace::kCoarse;
       out.print = cachedTable(printsCoarseLru(), kc, bakePrintScanCoarseDisk, r);
     }
   } else {
     out.print = cachedTable(prints, kp, bakePrintScanDisk, r);
+    if (asyncTables() && !cachedPeek(printsCoarseLru(), kc)) printWorker().request(r, kc, base);  // the coarse twin of these values (next drag, or the rest of this one)
   }
   if (out.print && !usedStale) noteLastPrint(base, out.print);
+  if (traceHere && out.print) {
+    traceTimer.dst = nullptr;
+    const std::uint64_t gen = out.print->gen;
+    const int lutN = out.print->t.lutN;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traceTimer.t).count();
+    ftrace::with([&](ftrace::Rec& x) {
+      x.printKind = x.wantedKind = traceKind;
+      x.printGen = x.wantedGen = gen;
+      x.lutN = lutN;
+      x.tablesMs += ms;
+      x.printEv = r.printEv;
+      x.warmth = r.warmth;
+      x.tint = r.tint;
+      x.black = r.black;
+    });
+  }
   return out.raw && out.curves && out.print;
 }
 
@@ -1236,6 +1276,7 @@ struct StockWorker {
       }
       try {
         rr.coarse = 0;
+        if (stockTablesReady(rr)) dapple::sys::yieldToInteraction(60000);  // own-stock frames need no fallback: the exact tables are for the settled frame
         FilmTablesHandle tb;
         tablesFor(rr, tb);
         planOf(rr);
@@ -1263,5 +1304,90 @@ bool tablesCachedFor(const FilmResolved& r) {
 void requestStockPrep(const FilmResolved& r) {
   g_stockStale.store(true);
   stockWorker().request(r);
+}
+}  // namespace dapple::engine::filmnode
+
+// ---- prebake of all stocks ------------------------------------------------------------------------------------------------------------------
+namespace dapple::engine::filmnode {
+namespace {
+struct PrebakeState {
+  std::atomic<bool> running{false};
+  std::atomic<int> done{0}, total{0};
+  std::atomic<long long> rawUs{0}, curvesUs{0}, printUs{0};
+  std::atomic<bool> finished{false};
+};
+PrebakeState& prebake() {
+  static PrebakeState* p = new PrebakeState;
+  return *p;
+}
+}  // namespace
+
+void startFilmPrebake() {
+  PrebakeState& st = prebake();
+  if (st.running.exchange(true)) return;
+  std::thread([&st] {
+    ThreadPool::tlUse() = &ThreadPool::background();
+    dapple::sys::utilityQos();
+    try {
+      const std::shared_ptr<const dapple::film::FilmLibrary> lib = dapple::film::defaultLibrary();
+      if (!lib) return;
+      std::vector<std::string> ids;
+      for (const std::string& n : lib->names()) {
+        const dapple::film::FilmStock* s = lib->find(n);
+        if (s && !s->isPrintMedium()) ids.push_back(n);
+      }
+      st.total = int(ids.size());
+      using Clock = std::chrono::steady_clock;
+      for (const std::string& id : ids) {
+        dapple::sys::yieldToInteraction(60000);
+        std::string paper = dapple::film::defaultPaperFor(*lib, id);
+        if (paper.empty()) paper = "none";
+        FilmFrameArgs a;
+        a.lib = lib.get();
+        a.stock = id.c_str();
+        a.paper = paper.c_str();
+        a.w = a.h = 64;
+        a.quality = 1;
+        a.coarse = true;
+        FilmResolved r{};
+        if (filmFrameResolved(a, r)) {
+          const StockKeys k = stockKeys(r);
+          Hasher hc;
+          hc.hash(k.kp);
+          hc.i32(kCoarseLutN);
+          auto t0 = Clock::now();
+          auto us = [&] {
+            const auto t1 = Clock::now();
+            const long long v = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            t0 = t1;
+            return v;
+          };
+          cachedTable(rawsLru(), k.hr, bakeRawDisk, r);
+          st.rawUs += us();
+          cachedTable(curvesLru(), k.ks, bakeCurvesDisk, r);
+          st.curvesUs += us();
+          cachedTable(printsCoarseLru(), hc.finish(), bakePrintScanCoarseDisk, r);
+          st.printUs += us();
+          planOf(r);
+        }
+        st.done.fetch_add(1);
+      }
+    } catch (...) {
+    }
+    st.finished = true;
+  }).detach();
+}
+
+void filmPrebakeStatus(char* buf, int n) {
+  PrebakeState& s = prebake();
+  const int d = std::max(1, s.done.load());
+  std::snprintf(buf, std::size_t(n), "{\"done\":%d,\"total\":%d,\"finished\":%s,\"running\":%s,\"rawMs\":%.1f,\"curvesMs\":%.1f,\"coarsePrintMs\":%.1f}", s.done.load(),
+                s.total.load(), s.finished.load() ? "true" : "false", s.running.load() ? "true" : "false", s.rawUs.load() / 1000.0 / d, s.curvesUs.load() / 1000.0 / d,
+                s.printUs.load() / 1000.0 / d);
+}
+
+bool stockTablesReady(const FilmResolved& r) {
+  const StockKeys k = stockKeys(r);
+  return cachedPeek(rawsLru(), k.hr) && cachedPeek(curvesLru(), k.ks);
 }
 }  // namespace dapple::engine::filmnode

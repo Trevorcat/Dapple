@@ -16,6 +16,7 @@ namespace fd = dapple::film::detail;
 // Table payloads: a FilmTables with only the part of the node populated.
 struct PayloadBase {
   virtual ~PayloadBase() = default;
+  unsigned long long gen = 0;  // creation order inside the process (frame trace: which table a frame showed, and whether the generation ever goes backwards)
 };
 struct RawTable : PayloadBase { fd::FilmTables t; };     // mIn, rawN, raw
 struct CurvesTable : PayloadBase { fd::FilmTables t; };  // curveN.., dn, d0, gamma, dirQ, dirQ0

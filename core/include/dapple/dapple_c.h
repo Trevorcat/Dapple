@@ -106,6 +106,10 @@ DAPPLE_API void dapple_film_set_pack_path(const char* path);
  * films ("film" key); "paper" are print papers / print films ("film_paper" key, or "none" to scan the film).
  * Free with dapple_free_string. */
 DAPPLE_API char* dapple_film_list_json(void);
+/* Prebake of every film stock at its default settings (raw + curves + coarse print tables) on a utility-QoS thread, paused while dapple_set_interaction(1).
+ * Start once the pack is loaded; the tables persist on disk when the GPU cache dir is set. status: {"done","total","finished","running","rawMs","curvesMs","coarsePrintMs"}. */
+DAPPLE_API void dapple_film_prebake_start(void);
+DAPPLE_API char* dapple_film_prebake_status(void);
 /* The licence line for the About screen ("" when no pack is loaded). Free with dapple_free_string. */
 DAPPLE_API char* dapple_film_attribution(void);
 /* {"<stock id>":["rrggbb","rrggbb","rrggbb"],...} for every camera film (not papers): the stock's rendering of three
@@ -246,6 +250,11 @@ DAPPLE_API void dapple_perf_configure(int32_t thread_limit, int32_t target_frame
 DAPPLE_API void dapple_thread_background(int32_t on);
 /* A finger is on a control (1) / lifted (0): background demosaic tile loops (regions, previews) wait between tiles meanwhile. */
 DAPPLE_API void dapple_set_interaction(int32_t active);
+/* Frame trace (diagnostics, off by default): one TSV row per rendered session frame (stock, print table kind / generation, bakes and match running, timings).
+ * enable(1) clears and starts, dump writes the rows so far, clear drops them. */
+DAPPLE_API void dapple_frame_trace_enable(int32_t on);
+DAPPLE_API int32_t dapple_frame_trace_dump(const char* path);
+DAPPLE_API void dapple_frame_trace_clear(void);
 /* AThermal headroom forecast (0 = cool, 1 = throttling threshold), < 0 when unavailable. */
 DAPPLE_API float dapple_thermal_headroom(int32_t forecast_seconds);
 /* {"cpus":N,"perf":N,"efficient":N,"pool":N,"adpf":bool,"thermal_status":N}; free with dapple_free_string. */

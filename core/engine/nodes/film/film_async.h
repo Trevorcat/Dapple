@@ -13,6 +13,16 @@ void markMatchStale();
 void notifyRepaintIfMatchStale();
 
 struct FilmResolved;
+// Prebake of every film stock (the stock sliding of the film map must never compute): a utility-QoS thread bakes the raw + curves tables and the coarse print
+// table of each stock at its default settings into the table caches (and, through them, onto disk when it is configured), pausing while a finger is down.
+// A later launch loads them from disk. `filmPrebakeStatus` writes a one-line summary (stocks done / total, milliseconds per table kind, running).
+void startFilmPrebake();
+void filmPrebakeStatus(char* buf, int n);
+// Own-stock tables are ready for this frame (raw + curves cached, coarse print cached for its values or at least raw + curves for a quick coarse bake):
+// the frame may show its own stock instead of the previous one.
+bool stockTablesReady(const FilmResolved& r);
+
+struct FilmResolved;
 // Stock selection (wave 8): are the raw / curve / print tables of this film frame cached, and queue their bake (+ the plan) on the background pool.
 bool tablesCachedFor(const FilmResolved& r);
 void requestStockPrep(const FilmResolved& r);

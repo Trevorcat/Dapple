@@ -14,6 +14,8 @@ import 'package:path_provider/path_provider.dart';
 
 import '../native/dapple_session.dart';
 import '../services/ingest.dart';
+import 'ios_frame_trace.dart';
+import 'test_trigger.dart';
 
 const bool kIosAutotest = bool.fromEnvironment('DAPPLE_IOS_AUTOTEST');
 
@@ -35,12 +37,13 @@ class IosAutotest {
   static Future<void> runIfRequested() async {
     if (!kIosAutotest || !Platform.isIOS || _started) return;
     final docs = (await getApplicationDocumentsDirectory()).path;
-    final cfgFile = File('$docs/autotest.json');
-    if (!cfgFile.existsSync()) return;
+    final text = TestTrigger.consume(File('$docs/autotest.json')); // one-shot: deleted now, a later launch is a normal app
+    if (text == null) return;
     _started = true;
+    await TestTrigger.setActive(true);
     _log = File('$docs/autotest_log.txt');
     if (_log.existsSync()) _log.deleteSync();
-    final cfg = jsonDecode(cfgFile.readAsStringSync()) as Map<String, dynamic>;
+    final cfg = jsonDecode(text) as Map<String, dynamic>;
     final drags = (cfg['drags'] as num?)?.toInt() ?? 12;
     final w = Stopwatch()..start();
     try {
@@ -66,11 +69,17 @@ class IosAutotest {
         }
         await _one(path, stocks, drags, cfg['export'] == true, docs, keepExport: cfg['keepExport'] == true);
       }
+      final tr = cfg['trace'];
+      if (tr is Map<String, dynamic>) {
+        final f = '$docs/Photos/${tr['file']}';
+        if (File(f).existsSync()) await FrameTraceRun(docs, tr).run(f, _w);
+      }
       _w({'event': 'gpu_status_end', 'status': jsonDecode(DappleSession.gpuStatusJson() ?? '{}')});
     } catch (e, s) {
       _w({'event': 'error', 'error': '$e', 'stack': '$s'.split('\n').take(6).toList()});
     }
     _w({'event': 'done', 'totalMs': w.elapsedMilliseconds});
+    await TestTrigger.setActive(false);
   }
 
   static Future<void> _one(String path, List<String> stocks, int drags, bool export, String docs, {bool keepExport = false}) async {

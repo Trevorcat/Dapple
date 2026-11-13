@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   refreshBudgetTests();
   seedTests();
+  dragHoldTests();
   test('steps down after two frames over budget, not after one', () {
     final q = AdaptiveQuality(budgetMs: 55);
     expect(q.rung.longEdge, 1080);
@@ -110,3 +111,26 @@ void seedTests() {
     expect(none.seeded, isFalse);
   });
 }
+
+void dragHoldTests() {
+  test('the rung is frozen for the whole drag and moves by one step at its end', () {
+    final q = AdaptiveQuality(budgetMs: 16.7);
+    q.beginDrag();
+    for (var i = 0; i < 40; i++) {
+      expect(q.record(60), isFalse);
+      expect(q.rung.longEdge, 1080);
+    }
+    expect(q.endDrag(), isTrue);
+    expect(q.rung.longEdge, 810); // one step only, however slow the frames were
+    q.beginDrag();
+    for (var i = 0; i < 40; i++) {
+      q.record(1);
+    }
+    expect(q.rung.longEdge, 810);
+    expect(q.endDrag(), isTrue);
+    expect(q.rung.longEdge, 1080);
+    q.beginDrag();
+    expect(q.endDrag(), isFalse);
+  });
+}
+

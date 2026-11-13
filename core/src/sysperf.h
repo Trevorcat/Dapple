@@ -174,6 +174,24 @@ inline void setBackground(bool on) {
 #endif
 }
 
+// ---- interaction / background work policy ----------------------------------------------------------------
+// A finger is down (dapple_set_interaction): background workers that are not needed by the frame being dragged (calibration warm-up, medians seeding, the
+// prebake of all film stocks) pause between work items; every background worker runs on utility QoS (efficiency cores under load) on Apple.
+inline std::atomic<int>& interactionFlag() {
+  static std::atomic<int> f{0};
+  return f;
+}
+inline void setInteraction(bool on) { interactionFlag().store(on ? 1 : 0, std::memory_order_relaxed); }
+inline bool interacting() { return interactionFlag().load(std::memory_order_relaxed) != 0; }
+inline void utilityQos() {
+#if defined(__APPLE__)
+  ::pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+}
+inline void yieldToInteraction(int maxMs = 8000) {
+  for (int w = 0; interacting() && w < maxMs; w += 4) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+}
+
 // ---- Android ADPF -------------------------------------------------------------------------------------
 struct Adpf {
   using GetMgr = void* (*)();

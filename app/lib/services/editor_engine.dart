@@ -216,6 +216,7 @@ class EditorEngine extends ChangeNotifier {
     _idle?.cancel();
     if (_drag == 1) {
       PerfProbe.dragging = true;
+      quality.beginDrag(); // one resolution for the whole drag
       DappleBindings.instanceOrNull?.setInteraction?.call(1); // background region / preview tiles wait while the finger is down
       // wave 8: keep-warm hint before the first parameter change (every control that drives live frames goes through here); the burst lifts the GPU clock
       // that fell during the pause (first drag frame 18-21 ms -> 5 ms, then 4 ms instead of 10 ms on a mid-range phone); no-op on the CPU path.
@@ -250,6 +251,7 @@ class EditorEngine extends ChangeNotifier {
       }
       _releaseMs = _clock.elapsedMilliseconds;
       PerfProbe.dragging = false;
+      if (quality.endDrag()) PerfProbe.log('rung', {'to': quality.rung.toString(), 'ema': quality.emaMs, 'at': 'drag end'});
       DappleBindings.instanceOrNull?.setInteraction?.call(0);
       _scheduleFinal(delay: releaseDelay);
       _schedulePrefetch();

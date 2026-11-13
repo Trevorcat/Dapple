@@ -279,6 +279,8 @@ class DappleBindings {
             ? lib.lookupFunction<_LoadMem, _LoadMemD>('dapple_film_load_pack_memory')
             : null,
         filmListJson = lib.providesSymbol('dapple_film_list_json') ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_list_json') : null,
+        filmPrebakeStart = lib.providesSymbol('dapple_film_prebake_start') ? lib.lookupFunction<_VoidFn, _VoidFnD>('dapple_film_prebake_start') : null,
+        filmPrebakeStatus = lib.providesSymbol('dapple_film_prebake_status') ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_prebake_status') : null,
         filmAttribution =
             lib.providesSymbol('dapple_film_attribution') ? lib.lookupFunction<_CStrFn, _CStrFnD>('dapple_film_attribution') : null,
         filmSwatchesJson =
@@ -338,6 +340,8 @@ class DappleBindings {
   final _CStrArg? motionPhotoValidate;
   final _LoadMemD? filmLoadPackMemory;
   final _CStrFnD? filmListJson;
+  final _VoidFnD? filmPrebakeStart; // dapple_film_prebake_start
+  final _CStrFnD? filmPrebakeStatus;
   final _CStrFnD? filmAttribution;
   final _CStrFnD? filmSwatchesJson;
   final _CStrFnD? filmSwatchBandsJson;

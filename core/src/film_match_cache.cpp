@@ -5,6 +5,7 @@
 // median-L* evaluations of film_print are remembered per (stock, paper, film EV): a pad move is arithmetic on the cached statistics.
 // While a slider moves (exact = false) a median that lies between two remembered samples closer than kBracketEv is interpolated; the frame
 // after the drag (exact = true) evaluates everything for real, so the final render is identical to the uncached match.
+#include "engine/nodes/film/frame_trace.h"
 #include <chrono>
 #include <cstdio>
 #include <algorithm>
@@ -189,8 +190,11 @@ FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& c
     const CameraProfile* cam = &camera;
     const float fev = fe.filmEv, pev0 = fe.printEv;
     std::thread([seed, fp0, px, lo, cam, fev, pev0] {
+      ftrace::Busy busy(ftrace::S().bgMatch);
+      sys::utilityQos();
       try {
         for (float d : {0.f, -1.f, 1.f, -2.f, 2.f, -3.f, 3.f}) {
+          sys::yieldToInteraction();
           EditParams f = fp0;
           f.filmKeyEv = fev;
           f.filmPrintEv = pev0 + d;
@@ -229,27 +233,52 @@ void prewarmFilmCalibration(const EditParams& p, void (*lowPriority)()) {
   if (!st || st->positive() || paper == "none") return;  // a slide has no print constant to calibrate
   static std::mutex mtx;
   static std::set<std::string> done;
+  static std::atomic<std::uint64_t> selectEpoch{0};  // bumped whenever a stock meets the match for the first time
   const std::string key = p.filmStock + "|" + paper + "|" + std::to_string(std::uintptr_t(lib.get()));
+  std::uint64_t epoch;
   {
     std::lock_guard<std::mutex> lock(mtx);
     if (!done.insert(key).second) return;
+    epoch = ++selectEpoch;
   }
+  // Sliding across the film map visits a stock for ~150 ms: its calibration starts only once the selection has rested (a first-visit stock that is left
+  // again gives its key back, so a later visit starts it afresh); on the A11 the 15 buckets x 2 workers x every visited stock kept both performance cores
+  // busy for minutes (frame trace, docs/engine/pipeline-architecture.md section "stock sliding and pad drags").
+  auto stillSelected = [epoch] { return selectEpoch.load() == epoch; };
   // Wave 8 (Redmi, Adreno 710 / SM7435): one low-priority thread on an efficiency core needed more than 10 s for the 15 buckets, so a drag started a few
   // seconds after choosing the stock met a cold bucket (~190 ms) in nearly every frame. Two workers on the normal scheduler class (the big cores) pull the
   // buckets outward from 0; `lowPriority` is kept only for a single-core device.
   const unsigned hc = std::max(1u, std::thread::hardware_concurrency());
+#if defined(__APPLE__)
+  const int workers = 1;  // two performance cores on the oldest supported phones: one utility-QoS worker
+#else
   const int workers = hc >= 4 ? 2 : 1;
+#endif
   auto next = std::make_shared<std::atomic<int>>(0);
   auto nDone = std::make_shared<std::atomic<int>>(0);
   const auto tStart = std::chrono::steady_clock::now();
   for (int wk = 0; wk < workers; ++wk)
-    std::thread([lib, film = p.filmStock, paper, lowPriority, next, workers, nDone, tStart] {
+    std::thread([lib, film = p.filmStock, paper, lowPriority, next, workers, nDone, tStart, stillSelected, key] {
       ThreadPool::tlUse() = &ThreadPool::background();
+      ftrace::Busy busy(ftrace::S().bgMatch);
+      sys::utilityQos();
       if (lowPriority && workers == 1) lowPriority();
       try {
+        for (int w = 0; w < 600 && stillSelected(); w += 50) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (!stillSelected()) {
+          std::lock_guard<std::mutex> lock(mtx);
+          done.erase(key);
+          return;
+        }
         // +-3.5 EV: film_shoot reaches +-3 EV and the constant interpolates to the next bucket. Outward from 0: a drag starts at the automatic exposure
         // and the buckets next to it are needed first (it was -3.5 .. +3.5)
         for (int i; (i = next->fetch_add(1)) < 15;) {
+          sys::yieldToInteraction();
+          if (!stillSelected()) {  // another stock was chosen: the rest of the buckets are computed if this stock is visited again
+            std::lock_guard<std::mutex> lock(mtx);
+            done.erase(key);
+            return;
+          }
           filmPrintConstant(lib, film, paper, i == 0 ? 0.f : (i & 1 ? 0.5f : -0.5f) * float((i + 1) / 2));
           if (nDone->fetch_add(1) + 1 == 15 && std::getenv("DAPPLE_ENGINE_LOG"))
             std::fprintf(stderr, "dapple_engine: print calibration warm-up done after %.0f ms\n",

@@ -26,7 +26,11 @@ final class DappleTexture: NSObject, FlutterTexture {
     private let lock = NSLock()
     private var ring: [(buf: CVPixelBuffer, tex: MTLTexture?)] = []
     private var state: [Int] = []  // 0 free, 1 being written by the GPU, 2 latest shown
-    private var latest = -1, writing = -1
+    private var latest = -1
+    // Surfaces handed to the GPU that have not completed yet, oldest first. The completion handlers run in commit order, so `ready` always belongs to the
+    // front one: with a single `writing` slot a handler that ran after the next `acquire` published the surface that was still being drawn into (a torn frame)
+    // and leaked the finished one.
+    private var pending: [Int] = []
     private var w: Int, h: Int
     private var allocW = 0, allocH = 0
     var textureId: Int64 = -1
@@ -65,7 +69,7 @@ final class DappleTexture: NSObject, FlutterTexture {
         ring.removeAll()
         state.removeAll()
         latest = -1
-        writing = -1
+        pending.removeAll()
         for _ in 0..<3 {
             var pb: CVPixelBuffer?
             let attrs: [CFString: Any] = [
@@ -93,18 +97,18 @@ final class DappleTexture: NSObject, FlutterTexture {
         if ring.isEmpty || allocW != w || allocH != h { rebuild(device: device) }
         guard let i = state.firstIndex(of: 0), let t = ring[i].tex else { return nil }
         state[i] = 1
-        writing = i
+        pending.append(i)
         return Unmanaged.passUnretained(t as AnyObject).toOpaque()
     }
 
     /// The GPU finished the surface acquired last: it becomes the one Flutter shows.
     func ready() {
         lock.lock()
-        if writing >= 0 {
+        if !pending.isEmpty {
+            let done = pending.removeFirst()
             if latest >= 0, latest < state.count { state[latest] = 0 }
-            state[writing] = 2
-            latest = writing
-            writing = -1
+            state[done] = 2
+            latest = done
         }
         frames += 1
         let n = frames

@@ -2,6 +2,7 @@
 // of its nodes through gpuImplFor(type)->recordPorts, keeps the resident source (fed by a SourceStore) and the device tables
 // (on a ResultCache). Whole-frame runs record every stage into one command list; a tiled export records one job per tile and
 // sweep (docs/engine/pipeline-architecture.md 5.1 - 5.5).
+#include "engine/nodes/film/frame_trace.h"
 #include "engine/exec/gpu_executor.h"
 #include "hdr_field.h"
 #include "determinism.h"
@@ -678,10 +679,18 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
   r.clampOut = f.strength >= 1.f && f.displayPlain && in.frame.vignette == 0.f;
   // stock selection (wave 8): an interactive frame of a stock whose tables are not cached shows the previous stock until the background bake landed
   // (the repaint hook fires then); frame fields come from this frame, everything the tables depend on from the previous one, so nothing is baked here
+  // An interactive frame never bakes the 33^3 print table: it takes the exact one when cached, else the coarse 17^3 of its own values (frame trace: the A11 showed
+  // the 33^3 bake of every first-visited stock on the frame thread while the film map slid).
+  if (r.quality == 1 && !deterministicMode()) r.coarse = 1;
   if (r.quality == 1 && haveLastFilmR_ && (r.stock != lastFilmR_.stock || r.paper != lastFilmR_.paper) && !filmnode::tablesCachedFor(r) && !deterministicMode()) {
     const char* off = std::getenv("DAPPLE_FILM_STOCK_FALLBACK");
-    if (!(off && off[0] == '0')) {
+    if (filmnode::stockTablesReady(r)) {
+      // the stock's raw + curves tables are cached (prebake, or an earlier visit): the frame shows its OWN stock, its coarse print table is a ~25 ms bake;
+      // the exact tables of the settled frame are prepared in the background
       filmnode::requestStockPrep(r);
+    } else if (!(off && off[0] == '0')) {
+      filmnode::requestStockPrep(r);
+      ftrace::with([](ftrace::Rec& x) { x.stockFallback = 1; });
       filmnode::FilmResolved fb = lastFilmR_;
       for (int c = 0; c < 3; ++c) fb.gain[c] = r.gain[c];
       fb.w = r.w, fb.h = r.h, fb.fullLongEdge = r.fullLongEdge, fb.seed = r.seed, fb.frameIndex = r.frameIndex;
@@ -737,6 +746,16 @@ std::shared_ptr<DeviceFilm> Executor::ensureFilm(const filmnode::FilmResolved& r
     film_->planKeep = pd;
     if (!filmnode::uploadGpuPlan(core(), r, film_->pr, err)) return failStatus(hal::Status::OutOfMemory, "film grain tables upload: " + err), nullptr;
     film_->havePlan = true;
+  }
+  if (ftrace::on() && film_->tb.print) {
+    const std::uint64_t boundGen = film_->tb.print->gen;
+    const int boundN = film_->gt.lutN;
+    ftrace::with([&](ftrace::Rec& x) {
+      if (x.stockFallback) x.printKind = ftrace::kFallbackOtherStock;
+      else if (boundGen != x.wantedGen) x.printKind = ftrace::kLagging;
+      x.printGen = boundGen;
+      x.lutN = boundN;
+    });
   }
   lastFilmR_ = r;
   haveLastFilmR_ = true;

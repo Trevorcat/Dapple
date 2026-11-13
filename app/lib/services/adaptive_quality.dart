@@ -99,6 +99,37 @@ class AdaptiveQuality {
     if (_rung < _thermalCap) _rung = _thermalCap;
   }
 
+  bool _held = false, _pendingDown = false, _pendingUp = false;
+
+  /// True between [beginDrag] and [endDrag]: the rung does not change.
+  bool get held => _held;
+
+  /// A drag starts: the rung is frozen for its whole length (a resolution step in the middle of a drag is a visible jump; frame trace on the iPhone X
+  /// showed 1 - 3 of them in every 2 s drag). The frames are still measured; the step they ask for is applied once by [endDrag].
+  void beginDrag() {
+    _held = true;
+    _pendingDown = _pendingUp = false;
+  }
+
+  /// The drag ended: applies at most one step that the drag's frames asked for (so the rung cannot oscillate within a drag and moves by one rung
+  /// between drags). Returns true when the rung changed.
+  bool endDrag() {
+    _held = false;
+    final floor = _displayCap > _thermalCap ? _displayCap : _thermalCap;
+    var changed = false;
+    if (_pendingDown && _rung < rungs.length - 1) {
+      _rung++;
+      changed = true;
+    } else if (_pendingUp && _rung > floor) {
+      _rung--;
+      changed = true;
+    }
+    _pendingDown = _pendingUp = false;
+    _over = _under = 0;
+    if (changed) _ema = 0;
+    return changed;
+  }
+
   /// Feed the cycle time of an interactive frame rendered at the current rung. Returns true when the rung changed.
   bool record(double cycleMs) {
     _ema = _ema == 0 ? cycleMs : _ema * 0.6 + cycleMs * 0.4;
@@ -107,6 +138,10 @@ class AdaptiveQuality {
       _over++;
       _under = 0;
       if (_over >= downAfter && _rung < rungs.length - 1) {
+        if (_held) {
+          _pendingDown = true;
+          return false;
+        }
         _rung++;
         _over = 0;
         _ema = 0;
@@ -120,6 +155,10 @@ class AdaptiveQuality {
       final predicted = cycleMs * px * px;
       if (predicted < budgetMs * upMargin) {
         if (++_under >= upAfter) {
+          if (_held) {
+            _pendingUp = !_pendingDown;
+            return false;
+          }
           _rung--;
           _under = 0;
           _ema = 0;

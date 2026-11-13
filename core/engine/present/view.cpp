@@ -16,6 +16,7 @@
 #endif
 #include "dapple/dapple_view.h"
 #include "engine/nodes/film/film_async.h"
+#include "engine/nodes/film/frame_trace.h"
 #ifdef DAPPLE_HAVE_GPU
 #include "engine/exec/gpu_runtime.h"
 #endif
@@ -122,6 +123,7 @@ struct DappleView {
             ++extRefused;
           }
         }
+        dapple::ftrace::S().viewSeq.store(std::int64_t(s.seq));
         const std::int64_t t0 = steadyNowNs();
         const int rc = dapple_session_render_frame(session, s.payload.c_str(), s.lutPath.empty() ? nullptr : s.lutPath.c_str(), &rq, &img,
                                                    (s.flags & DAPPLE_FRAME_ANALYSIS) ? &an : nullptr);

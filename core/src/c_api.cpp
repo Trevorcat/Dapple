@@ -39,6 +39,7 @@
 #include "dapple/xmp_preset.h"
 #include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
 #include "engine/nodes/film/film_async.h"
+#include "engine/nodes/film/frame_trace.h"
 #include "color.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -262,6 +263,7 @@ void queueFilmMatch(DappleSession* s, const EditParams& params, const std::strin
   s->matchBusy.fetch_add(1);
   std::thread([s] {
     dapple::ThreadPool::tlUse() = &dapple::ThreadPool::background();
+    sys::utilityQos();
     for (;;) {
       EditParams p;
       std::string lf, k;
@@ -277,6 +279,7 @@ void queueFilmMatch(DappleSession* s, const EditParams& params, const std::strin
         s->asyncHave = false;
       }
       try {
+        dapple::ftrace::Busy traceBusy(dapple::ftrace::S().bgMatch);
         std::lock_guard<std::mutex> ml(s->matchMtx);
         bool hit = false;
         {
@@ -323,20 +326,43 @@ EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath 
       if (e.key == key && (e.exact || interactive)) {
         params.filmKeyEv = e.ev.filmEv;
         params.filmPrintEv = e.ev.printEv;
+        dapple::ftrace::with([&](dapple::ftrace::Rec& x) {
+          x.matchKind = e.exact ? dapple::ftrace::kMatchHit : dapple::ftrace::kMatchInterp;
+          x.filmEv = e.ev.filmEv;
+          std::snprintf(x.stock, sizeof x.stock, "%s", params.filmStock.c_str());
+        });
         return params;
       }
     if (asyncOn && interactive && !uncached && !s->filmKeys.empty()) {  // any stock: while another stock is selected the frame shows the previous stock too
       // previous result of the same stock now, the new one on the background pool
       const FilmExposure& prev = s->filmKeys.back().ev;
       params.filmKeyEv = prev.filmEv;
-      params.filmPrintEv = prev.printEv;
+      // a stock that has no match of its own yet (the film map slides across stocks): the print exposure is the stock's neutral 0, the value of its prebaked
+      // coarse table (a hit costs nothing, a bake ~25 ms on the A11) and not the previous stock's solved print EV; the repaint hook refines after the match lands
+      params.filmPrintEv = s->lastMatchStock != params.filmStock ? 0.f : prev.printEv;
+      dapple::ftrace::with([&](dapple::ftrace::Rec& x) {
+        x.matchKind = dapple::ftrace::kMatchStalePrev;
+        x.filmEv = prev.filmEv;
+        std::snprintf(x.stock, sizeof x.stock, "%s", params.filmStock.c_str());
+      });
       dapple::engine::filmnode::markMatchStale();
       queueFilmMatch(s, params, lutFile, key);
       return params;
     }
   }
   std::lock_guard<std::mutex> ml(s->matchMtx);
-  const FilmExposure ev = computeFilmMatch(s, params, lutFile, key, interactive, uncached);
+  double traceMatchMs = 0;
+  FilmExposure ev;
+  {
+    dapple::ftrace::Timer traceTimer(&traceMatchMs);
+    ev = computeFilmMatch(s, params, lutFile, key, interactive, uncached);
+  }
+  dapple::ftrace::with([&](dapple::ftrace::Rec& x) {
+    x.matchKind = dapple::ftrace::kMatchComputed;
+    x.matchMs += traceMatchMs;
+    x.filmEv = ev.filmEv;
+    std::snprintf(x.stock, sizeof x.stock, "%s", params.filmStock.c_str());
+  });
   params.filmKeyEv = ev.filmEv;
   params.filmPrintEv = ev.printEv;
   return params;
@@ -1176,8 +1202,10 @@ int32_t dapple_session_render_frame(DappleSession* session, const char* params_j
           return ok ? DAPPLE_OK : DAPPLE_ERROR;
         }
         const bool timed = (rq.flags & DAPPLE_FRAME_INTERACTIVE) != 0;
+        const bool hintFrame = tlHintFrame;  // the touch hint's keep-warm frames are never shown: not in the trace
         const std::function<void()> job = [&] {
           const auto t0 = std::chrono::steady_clock::now();
+          if (!hintFrame && dapple::ftrace::on()) dapple::ftrace::beginFrame();
           if (timed) {
             std::vector<std::int32_t> tids = ThreadPool::instance().workerTids();
             tids.push_back(RenderThread::instance().tid());
@@ -1191,6 +1219,9 @@ int32_t dapple_session_render_frame(DappleSession* session, const char* params_j
           }
           if (timed)
             sys::adpf().reportDuration(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+          if (!hintFrame)
+            dapple::ftrace::endFrame(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), rq.long_edge, out->width, out->height,
+                                   timed ? 1 : 0, ok);
         };
         RenderThread::instance().run(job);
         return ok ? DAPPLE_OK : DAPPLE_ERROR;
@@ -1209,7 +1240,17 @@ int32_t dapple_session_cancel(DappleSession* session) {
 
 void dapple_thread_background(int32_t on) { sys::setBackground(on != 0); }
 
-void dapple_set_interaction(int32_t active) { dapple::demosaic::setInteraction(active != 0); }
+void dapple_frame_trace_enable(int32_t on) {
+  dapple::ftrace::S().on.store(on != 0);
+  if (on) dapple::ftrace::clear();
+}
+int32_t dapple_frame_trace_dump(const char* path) { return path && dapple::ftrace::dump(path) ? DAPPLE_OK : DAPPLE_ERROR; }
+void dapple_frame_trace_clear(void) { dapple::ftrace::clear(); }
+
+void dapple_set_interaction(int32_t active) {
+  dapple::demosaic::setInteraction(active != 0);
+  sys::setInteraction(active != 0);
+}
 
 void dapple_perf_configure(int32_t thread_limit, int32_t target_frame_ms) {
   ThreadPool::instance().setLimit(thread_limit);
@@ -1272,6 +1313,13 @@ int32_t dapple_film_load_pack_memory(const void* data, size_t size) {
 }
 
 void dapple_film_set_pack_path(const char* path) { film::setLibraryPathLazy(toPath(path)); }
+
+void dapple_film_prebake_start(void) { dapple::engine::filmnode::startFilmPrebake(); }
+char* dapple_film_prebake_status(void) {
+  char b[256];
+  dapple::engine::filmnode::filmPrebakeStatus(b, int(sizeof b));
+  return dupString(b);
+}
 
 char* dapple_film_list_json(void) {
   return guarded(

@@ -18,6 +18,7 @@ import '../native/dapple_session.dart';
 import '../services/gpu_view_backend.dart';
 import 'ios_autotest.dart' show kIosAutotest;
 import 'ios_services.dart';
+import 'test_trigger.dart';
 
 class IosDebugOpen {
   static Timer? _timer;
@@ -36,13 +37,15 @@ class IosDebugOpen {
     try {
       if (!_armed) {
         // armed by a file in Documents (simctl cannot pass environment variables reliably): Documents/DAPPLE_OPEN, the content is the group
-        final f = File('${(await getApplicationDocumentsDirectory()).path}/DAPPLE_OPEN');
-        if (!f.existsSync()) return;
-        final txt = (await f.readAsString()).trim();
-        // plain text = panel group; JSON: {"group":"style","film":"<stock id>","open":"<name substring>","photokit":true,"documents":true}
+        final raw = TestTrigger.consume(File('${(await getApplicationDocumentsDirectory()).path}/DAPPLE_OPEN')); // one-shot, stale ones are dropped
+        if (raw == null) return; // keeps polling: a script may push the trigger after the launch
+        await TestTrigger.setActive(true);
+        final txt = raw.trim();
+        // plain text = panel group; JSON: {"group":"style","film":"<stock id>","open":"<name substring>","photokit":true,"documents":true,"tab":1,"noopen":true}
         _cfg = txt.startsWith('{') ? (jsonDecode(txt) as Map<String, dynamic>) : {'group': txt, 'documents': true};
         _group = '${_cfg['group'] ?? ''}';
         _armed = true;
+        if (_cfg['tab'] is int) app.setTab(_cfg['tab'] as int); // simctl cannot tap: {"tab":1} shows the 风格 page
       }
       debugPrint('IosDebugOpen: ready=${app.ready} added=$_added editable=${app.editable.length} engine=${DappleBindings.instanceOrNull != null} err=${DappleBindings.loadError}');
       if (!app.ready) return;
@@ -57,7 +60,7 @@ class IosDebugOpen {
         }
         return;
       }
-      if (_opened) return;
+      if (_opened || _cfg['noopen'] == true) return;
       final docs0 = (await getApplicationDocumentsDirectory()).path;
       final list = app.editable;
       if (list.isEmpty) return;

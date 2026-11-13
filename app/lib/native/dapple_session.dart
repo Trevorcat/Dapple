@@ -480,6 +480,21 @@ class DappleSession {
     return f == null ? null : _takeString(_b(), f());
   }
 
+  /// Bakes the raw / curves / coarse print tables of every film stock at default settings in the background (utility priority, paused while a finger is
+  /// down) so that sliding across the film map never computes; false when the engine lacks the call.
+  static bool startFilmPrebake() {
+    final f = DappleBindings.instanceOrNull?.filmPrebakeStart;
+    if (f == null) return false;
+    f();
+    return true;
+  }
+
+  /// `{"done","total","finished","running","rawMs","curvesMs","coarsePrintMs"}` of the prebake, or null.
+  static String? filmPrebakeStatus() {
+    final f = DappleBindings.instanceOrNull?.filmPrebakeStatus;
+    return f == null ? null : _takeString(_b(), f());
+  }
+
   /// `{"<stock id>":["rrggbb" x3]}` the engine's rendering of three test patches per stock, in the order skin, sky, shadow (a
   /// pure function of the pack; null without native support). Takes a few seconds: call from a background isolate
   /// ([filmSwatchesJsonIsolate]). An engine without the band function gives its older grey / skin / sky table, reordered.

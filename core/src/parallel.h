@@ -108,7 +108,11 @@ class ThreadPool {
     if (bg_) n = std::max(2, n / 2);
     threads_ = n - 1;
     limit_.store(n);
-    for (int i = 0; i < threads_; ++i) std::thread([this, i] { loop(i); }).detach();
+    for (int i = 0; i < threads_; ++i)
+      std::thread([this, i] {
+        if (bg_) sys::utilityQos();  // the background pool (table bakes) works on the efficiency cores under load on Apple
+        loop(i);
+      }).detach();
   }
 
   void work() {
