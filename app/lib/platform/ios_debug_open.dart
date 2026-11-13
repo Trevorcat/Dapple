@@ -16,13 +16,15 @@ import '../services/ingest.dart';
 import '../services/perf_probe.dart' show OpenTiming;
 import '../native/dapple_session.dart';
 import '../services/gpu_view_backend.dart';
+import '../screens/home/capture_flow.dart';
 import 'ios_autotest.dart' show kIosAutotest;
+import 'ios_capture.dart';
 import 'ios_services.dart';
 import 'test_trigger.dart';
 
 class IosDebugOpen {
   static Timer? _timer;
-  static bool _added = false, _opened = false;
+  static bool _added = false, _opened = false, _captured = false;
 
   static void start(AppState app) {
     if (!(kDebugMode || kIosAutotest) || !Platform.isIOS || _timer != null) return;
@@ -49,6 +51,21 @@ class IosDebugOpen {
       }
       debugPrint('IosDebugOpen: ready=${app.ready} added=$_added editable=${app.editable.length} engine=${DappleBindings.instanceOrNull != null} err=${DappleBindings.loadError}');
       if (!app.ready) return;
+      if (_cfg['capture'] != null && !_captured) {
+        // {"capture":true,"autoMs":6000,"save":false}: the camera button's flow (permission -> capture screen -> ingest -> editor) with a self-pressing shutter;
+        // the shot stays out of the Photos library unless "save":true. capabilities of every lens go to Documents/capture_caps.json
+        final ctx = app.navigatorKey.currentContext;
+        final cb = app.captureBackend;
+        if (ctx == null || !ctx.mounted || cb is! IosCaptureBackend) return;
+        _captured = true;
+        IosCaptureBackend.saveToLibrary = _cfg['save'] == true;
+        await cb.setAutoShutter(true, delayMs: (_cfg['autoMs'] as num?)?.toInt() ?? 6000, mode: _cfg['mode'] as String?);
+        await captureAndEdit(ctx, app); // ignore: use_build_context_synchronously
+        final docs = (await getApplicationDocumentsDirectory()).path;
+        File('$docs/capture_caps.json').writeAsStringSync(jsonEncode(await cb.capabilities()));
+        await cb.setAutoShutter(false);
+        return;
+      }
       if (!_added) {
         _added = true;
         if (_cfg['documents'] != false) app.ingestFtpFiles(await IosDocumentsSource().scan());

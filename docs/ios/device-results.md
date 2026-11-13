@@ -112,3 +112,15 @@ XR (autotest openMs): X-T50 RAF 2207 -> 1772, X-S10 RAF 1619 -> 1237, A7 V ARW 1
 X: X-T50 RAF 2387 -> 1596, X-S10 1731 -> 1264, ARW 1176 -> 1232; round 5: 2527 / 2102.
 Correctness: golden selfcheck 0 differences, all demosaic.* pass (incl. gpu_parity, wire_*), dng tests ok; `dapple develop` of the RAF and the ARW is byte-identical with OMP_NUM_THREADS=1 and 4 (md5 equal).
 Not done: the phones' stage lines (os_log of Runner is not exposed by dvt stream / syslog), so the phone profile is only open totals; ARW unpack (Sony decoders) and the remaining 2-core limit of A11 / A12 (RAF still 1.6-1.8 s: unpack ~2x parallel + the serial anchor / block reduction / mosaic copy); `open_timing.txt` is written by the DAPPLE_OPEN editor path, not the autotest, and was not exercised; the pool-size change was not tuned for CPU-only exports. Profiles renewed: expiry 2026-11-20 (XR 10:11 UTC, X 10:12 UTC).
+
+## Camera capture (2026-11-13, build with `DappleCapturePlugin`)
+
+| phone | lens | RAW kind | max pixels | modes | shot (RAW + JPEG) | engine |
+|---|---|---|---|---|---|---|
+| XR (iPhone11,8, iOS 18.7.10) | back wide 1x | Bayer (`rgg4`), no ProRAW | 4032x3024 | raw+jpeg, raw, jpeg | DNG 9.6 MB + JPEG in 0.4 s | developed 3024x4032 in 1.9 s (RAW only: 0.9 s) |
+| XR | front | none | 3088x2316 | jpeg | - | - |
+| X (iPhone10,3, iOS 16.7.16) | back wide 1x | Bayer, no ProRAW | 4032x3024 | raw+jpeg, raw, jpeg | DNG 9.7 MB + JPEG in 0.5 s | developed in 3.3 - 3.8 s |
+| X | back tele 2x | Bayer | 4032x3024 | raw+jpeg, raw, jpeg | DNG 10.0 MB + JPEG, 0.6 s | developed in 3.3 s |
+| X | front | none | 3088x2320 | jpeg | - | - |
+
+Settle 0.70 - 0.76 s after session start. Apple's DNG carries a 320x240 embedded preview when asked (`rawEmbeddedThumbnailPhotoFormat`), so a RAW-only shot has an exposure-anchor reference without the viewfinder JPEG (the tier itself is not exposed by the C API; not read). Orientation: the DNG decodes as 3024x4032 (portrait) with the phone upright. The preview content could not be judged for uprightness (phones lie face up on a desk); layout and rotation are set by the portrait preview connection.

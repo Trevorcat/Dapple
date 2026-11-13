@@ -40,7 +40,16 @@ Bundle ids `com.lumi.dapple.00008020` (XR) and `com.lumi.dapple.26d2a524` (X); f
 
 ## Stubbed / missing
 
-Capture (AVFoundation), wireless camera transfer, codec layer (VideoToolbox), Live Photo tools: designs with the API mapping in `swift-designs.md`. The Dart stubs (`app/lib/platform/ios_services.dart`) fail gracefully. Haptics go through Flutter.
+Wireless camera transfer, codec layer (VideoToolbox), Live Photo tools: designs with the API mapping in `swift-designs.md`. The Dart stubs (`app/lib/platform/ios_services.dart`) fail gracefully. Haptics go through Flutter.
+
+## Camera capture (done 2026-11-13)
+
+`DappleCapturePlugin.swift` (channel `dapple/capture`, result maps like Android: `capture` -> `{jpg?, dng?, thumb?, source:"avfoundation"}`; extra calls `available`, `permission`, `openSettings`, `capabilities`, `autoShutter` for test runs) + `app/lib/platform/ios_capture.dart` (`IosCaptureBackend`, wired by `IosPlatformServices` and by `AppState.captureBackend = PlatformServices.current.capture`). The capture screen is a native full-screen view controller (AVCaptureVideoPreviewLayer, portrait), `capture_flow.dart` / `ingestCapture` are shared with Android. Ladder RAW+JPEG -> RAW -> JPEG per lens, remembered per lens id + OS build (`UserDefaults`), ProRAW preferred over Bayer when the output supports it, flash off, orientation from the device, tap to focus / expose, vertical drag = exposure compensation, GPS only from an already granted location permission, settle = exposure / focus / white balance stop adjusting (min 0.7 s after start, 2.5 s timeout), interruptions and runtime errors handled; camera denied / restricted -> toast with Settings. The simulator reports `available=false` (no button). Capabilities per phone: `build/ios/capture/*_capture_caps.json`.
+Test drive: build with `DAPPLE_IOS_AUTOTEST=true`, push `Documents/DAPPLE_OPEN` = `{"capture":true,"documents":false,"noopen":true,"autoMs":6000,"save":false,"mode":"raw"}` (mode optional, one capture per app launch, `save:false` keeps the shot out of Photos); the shot log is `Documents/capture_log.txt`, capabilities `Documents/capture_caps.json`. Real shots through the button save the DNG + JPEG into the Photos album "Dapple" (Android parity); `queryNew` now skips that album so the shots are not ingested twice.
+
+## Driving the UI from the PC (WebDriverAgent)
+
+`python -m src.devices.ios_setup <udid>` (autotest framework) starts WDA; `pymobiledevice3 usbmux forward --serial <udid> 8101 8100`; `scripts/ios/wda.py 8101 launch|source|tap|alert|shot` (set `PYTHONUTF8=1`). Answer only Dapple's own prompts (Camera, Photos, and the China "wireless data" prompt). Stop with `ios_setup <udid> --stop-wda` and kill the forward. Over-installing Dapple hangs on both phones: uninstall the app's own bundle id first.
 
 ## Blockers and things not verified
 
@@ -64,10 +73,10 @@ Capture (AVFoundation), wireless camera transfer, codec layer (VideoToolbox), Li
 
 ## Shared files touched (list)
 
-New: `core/engine/hal/metal/*`, `core/engine/present/metal_presenter.mm`, `cmake/apple_framework*.{cmake,plist.in}`, `scripts/ios/*`, `docs/ios/*`, `app/native_ios/dapple_engine/**`, `app/lib/platform/*`.
+New: `core/engine/hal/metal/*`, `core/engine/present/metal_presenter.mm`, `cmake/apple_framework*.{cmake,plist.in}`, `scripts/ios/*`, `docs/ios/*`, `app/native_ios/dapple_engine/**`, `app/lib/platform/*`, `scripts/ios/wda.py`.
 Hunks in existing files: `core/engine/hal/hal.cpp`, `select.cpp` (Metal first on Apple), `core/gpu/CMakeLists.txt` (`if(APPLE)`), `core/engine/present/null_presenter.cpp` (`!__APPLE__`), `present.cmake` (Apple presenter sources + frameworks), `tools/shaderc/main.cpp` (MSL table),
 `app/pubspec.yaml` (plugin dependency), `app/lib/main.dart` (two hook lines), `app/lib/native/dapple_bindings.dart` (iOS library lookup), `app/lib/services/ingest.dart`, `media_permission.dart`, `gpu_view_backend.dart` (iOS branches),
-`app/lib/state/app_state.dart` (three gates: `refreshPermission`, `requestPermission`, `scan`), `app/ios/Runner/Info.plist`, `Runner.xcodeproj` (deployment target), `app/ios/Flutter/*.xcconfig`.
+`app/lib/state/app_state.dart` (`captureBackend` from `PlatformServices.current.capture`; three gates: `refreshPermission`, `requestPermission`, `scan`), `app/ios/Runner/Info.plist`, `Runner.xcodeproj` (deployment target), `app/ios/Flutter/*.xcconfig`.
 
 ## Demosaic kernels: what to check on the next Mac build (demosaic engineer, 2026-11-13)
 

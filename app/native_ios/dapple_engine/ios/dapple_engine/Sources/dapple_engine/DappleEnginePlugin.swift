@@ -25,10 +25,12 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
     private let io = DispatchQueue(label: "dapple.photos.io", qos: .userInitiated)
 
     private static var viewPlugin: DappleViewPlugin?
+    private static var capturePlugin: DappleCapturePlugin?
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         let p = DappleEnginePlugin()
         viewPlugin = DappleViewPlugin(registrar: registrar)  // dapple/view (zero-copy display)
+        capturePlugin = DappleCapturePlugin(registrar: registrar)  // dapple/capture (AVFoundation)
         startGpu()
         FlutterMethodChannel(name: "dapple/media", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handleMedia)
         FlutterMethodChannel(name: "dapple/photos", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handlePhotos)
@@ -119,8 +121,18 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         o.fetchLimit = limit
         let res = PHAsset.fetchAssets(with: o)
         NSLog("dapple photos: status %d, %d assets match (since %d)", st.rawValue, res.count, sinceSec)
+        // what Dapple itself saved (captures, exports: album "Dapple") is not an arrival: the capture flow ingests it from its own files
+        var own = Set<String>()
+        let ao = PHFetchOptions(); ao.predicate = NSPredicate(format: "localizedTitle == %@", "Dapple")
+        PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: ao).enumerateObjects { a, _, _ in
+            PHAsset.fetchAssets(in: a, options: nil).enumerateObjects { x, _, _ in own.insert(x.localIdentifier) }
+        }
+        if let id = UserDefaults.standard.string(forKey: albumKey), let a = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [id], options: nil).firstObject {
+            PHAsset.fetchAssets(in: a, options: nil).enumerateObjects { x, _, _ in own.insert(x.localIdentifier) }
+        }
         var out: [[String: Any]] = []
         res.enumerateObjects { asset, _, _ in
+            if own.contains(asset.localIdentifier) { return }
             let rs = PHAssetResource.assetResources(for: asset)
             guard let (idx, r) = pickResource(rs) else { return }
             let ms = Int((asset.creationDate ?? Date()).timeIntervalSince1970 * 1000)
@@ -166,6 +178,8 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
     /// else converted by [DeepImage.convert].
     static func place(tmp: String, dest: String, raw: Bool, jpeg: Bool) -> Bool {
         try? FileManager.default.removeItem(atPath: dest)
+        // the cache's src folder does not exist on a fresh install (the Dart side only names the path)
+        try? FileManager.default.createDirectory(atPath: (dest as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         if raw || jpeg {
             do { try FileManager.default.moveItem(atPath: tmp, toPath: dest); return true } catch { return false }
         }

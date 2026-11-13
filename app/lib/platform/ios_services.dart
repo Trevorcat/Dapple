@@ -1,7 +1,7 @@
 // iOS implementation of PlatformServices (docs/ios/platform-interface.md, docs/ios/README.md).
 //
 // PhotoKit media library (DappleEnginePlugin.swift: list / copy / save / system picker / change notifications), the share sheet (share_plus),
-// and graceful stubs for capture, wireless transfer and the video / codec layer (docs/ios/platform-interface.md).
+// AVFoundation capture (ios_capture.dart), and graceful stubs for wireless transfer and the video / codec layer (docs/ios/platform-interface.md).
 import 'dart:async';
 import 'dart:io';
 
@@ -13,6 +13,7 @@ import '../services/ftp_ingest.dart';
 import '../services/ingest.dart';
 import '../services/media_permission.dart';
 import '../services/share_service.dart';
+import 'ios_capture.dart';
 import 'platform_services.dart';
 
 class IosPlatformServices implements PlatformServices {
@@ -21,7 +22,7 @@ class IosPlatformServices implements PlatformServices {
   @override
   final MediaLibrary media = IosPhotoLibrary();
   @override
-  final CaptureBackend capture = NullCaptureBackend();
+  final CaptureBackend capture = IosCaptureBackend();
   @override
   final FtpBackend wirelessTransfer = NullFtpBackend();
   @override
