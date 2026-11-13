@@ -118,5 +118,29 @@
     "y": -0.846,
     "type": "rev",
     "code": "R64"
+  },
+  "modern_clean": {
+    "x": -0.8,
+    "y": 0.5,
+    "type": "modern",
+    "kind": "modern",
+    "code": "M-CLEAR",
+    "measured": false
+  },
+  "modern_vivid": {
+    "x": -0.52,
+    "y": 0.74,
+    "type": "modern",
+    "kind": "modern",
+    "code": "M-VIVID",
+    "measured": false
+  },
+  "modern_soft": {
+    "x": -0.52,
+    "y": 0.32,
+    "type": "modern",
+    "kind": "modern",
+    "code": "M-SOFT",
+    "measured": false
   }
 }

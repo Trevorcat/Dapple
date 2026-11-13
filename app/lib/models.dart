@@ -213,6 +213,7 @@ class Photo {
 class AppSettings {
   AppSettings({
     this.defaultLookId = 'std',
+    this.defaultBaseId,
     this.toneStrength = 60,
     this.autoProcess = true,
     this.exportLongEdge = 0,
@@ -230,6 +231,9 @@ class AppSettings {
     this.editorLayout = '',
   });
   String defaultLookId;
+
+  /// Rendering base (film stock id or a modern id) new photos start with; null = the standard rendering.
+  String? defaultBaseId;
 
   /// 0..100, default 60.
   double toneStrength;

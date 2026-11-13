@@ -337,7 +337,10 @@ class EditState {
     return copyWith(values: m);
   }
 
-  bool get styleAdjusted => look != null || lookStrength != 100 || palette != null || film != null;
+  /// The rendering base new photos start with (默认成像, set by the app): a photo on it is not "adjusted" by that alone.
+  static String? defaultBase;
+
+  bool get styleAdjusted => look != null || lookStrength != 100 || palette != null || (film != null && film != defaultBase);
   bool get toneAdjusted => toneTarget != null || toneStrength != null;
 
   bool groupAdjusted(EGroup g) {

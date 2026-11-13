@@ -93,6 +93,14 @@ typedef _Export = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Point
 typedef _ExportD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int, int,
     ffi.Pointer<Utf8>);
 
+typedef _ExportEx = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>,
+    ffi.Int32, ffi.Int32, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _ExportExD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int, int,
+    ffi.Pointer<Utf8>, ffi.Pointer<Utf8>);
+typedef _ExportHdrEx = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Int32,
+    ffi.Int32, ffi.Pointer<Utf8>, ffi.Float, ffi.Pointer<ffi.Uint8>, ffi.Pointer<Utf8>);
+typedef _ExportHdrExD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int, int,
+    ffi.Pointer<Utf8>, double, ffi.Pointer<ffi.Uint8>, ffi.Pointer<Utf8>);
 typedef _ExportHdr = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, ffi.Int32,
     ffi.Int32, ffi.Pointer<Utf8>, ffi.Float, ffi.Pointer<ffi.Uint8>);
 typedef _ExportHdrD = int Function(ffi.Pointer<DappleSessionStruct>, ffi.Pointer<Utf8>, ffi.Pointer<Utf8>, int, int,
@@ -194,6 +202,12 @@ class DappleBindings {
         sessionClose = lib.lookupFunction<_Close, _CloseD>('dapple_session_close'),
         sessionExportJpegHdr = lib.providesSymbol('dapple_session_export_jpeg_hdr')
             ? lib.lookupFunction<_ExportHdr, _ExportHdrD>('dapple_session_export_jpeg_hdr')
+            : null,
+        sessionExportJpegEx = lib.providesSymbol('dapple_session_export_jpeg_ex')
+            ? lib.lookupFunction<_ExportEx, _ExportExD>('dapple_session_export_jpeg_ex')
+            : null,
+        sessionExportJpegHdrEx = lib.providesSymbol('dapple_session_export_jpeg_hdr_ex')
+            ? lib.lookupFunction<_ExportHdrEx, _ExportHdrExD>('dapple_session_export_jpeg_hdr_ex')
             : null,
         sessionHdrHeadroom = lib.providesSymbol('dapple_session_hdr_headroom')
             ? lib.lookupFunction<_HdrProbe, _HdrProbeD>('dapple_session_hdr_headroom')
@@ -309,6 +323,8 @@ class DappleBindings {
   final _RenderD sessionRender;
   final _ExportD sessionExportJpeg;
   final _ExportHdrD? sessionExportJpegHdr; // Ultra HDR (gain-map JPEG); null when the library predates it
+  final _ExportExD? sessionExportJpegEx; // export with Exif / ICC (metadata options JSON); null when the library predates it
+  final _ExportHdrExD? sessionExportJpegHdrEx;
   final _HdrProbeD? sessionHdrHeadroom;
   final _RenderFrameD? sessionRenderFrame;
   final _PerfConfD? perfConfigure;

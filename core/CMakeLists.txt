@@ -5,10 +5,12 @@ add_library(dapple_core STATIC
   src/edit_params.cpp
   src/edit_params_json.cpp
   src/encode.cpp
+  src/exif_writer.cpp
   src/image.cpp
   src/hdr.cpp
   src/ingest.cpp
   src/look.cpp
+  src/modern.cpp
   src/lut.cpp
   src/merge_io.cpp
   src/motion_photo.cpp

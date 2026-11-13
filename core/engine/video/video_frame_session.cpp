@@ -279,7 +279,7 @@ struct VideoFrameSession::Impl {
     const bool geometry = (!held.crop.empty() && held.crop != "orig") || held.rotate != 0 || held.straighten != 0.f || held.flip;
     if (!hdrSource) outNote = refKind == ColourKind::Slog3 ? "S-Log3 source: converted to SDR BT.709 (as the unedited clip is)" : "SDR source";
     else if (!cfg.allowHdr) outNote = "HDR source, HDR output switched off: SDR BT.709";
-    else if (!held.filmStock.empty()) outNote = "film is a print: SDR BT.709 (10-bit Main10)";
+    else if (!held.filmStock.empty() && !isModernId(held.filmStock)) outNote = "film is a print: SDR BT.709 (10-bit Main10)";
     else if (geometry) outNote = "HDR source with a geometry edit (crop / rotate / straighten / flip): SDR BT.709, the highlight headroom is not warped";
     else {
       outKind = refKind == ColourKind::Hlg ? OutputKind::Hlg2020 : OutputKind::Pq2020;
@@ -293,7 +293,7 @@ struct VideoFrameSession::Impl {
     held.filmPrintEv = 0.f;
     held.filmSceneX = cfg.sceneIlluminantX;
     held.filmSceneY = cfg.sceneIlluminantY;
-    if (!held.filmStock.empty()) {
+    if (!held.filmStock.empty() && !isModernId(held.filmStock)) {
       const FilmExposure ev = matchFilmExposure(held, cfg.camera, cfg.lut.get(), *proxy);
       held.filmKeyEv = ev.filmEv;
       held.filmPrintEv = ev.printEv;

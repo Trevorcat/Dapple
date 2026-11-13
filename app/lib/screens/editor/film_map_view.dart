@@ -1,12 +1,19 @@
-// The film map (docs/design/editor-panel.md section 7): every catalog stock is a dot at its character (x pale..rich, y low..high
-// contrast), coloured by type. Pressing magnifies the neighbourhood of the finger (2.4x, animated) and shows the names;
-// sliding moves to the nearest stock and the photo follows live; releasing keeps it and the map shrinks back.
+// The film map (docs/design/editor-panel.md section 7): every catalog stock is a swatch at its character (x pale..rich, y low..high
+// contrast); a swatch is a small thumbnail of THIS photo rendered with that stock (services/base_swatches.dart), a rounded square,
+// tinted with the stock's type colour until the picture arrives. The three modern renderings are round swatches in their own
+// cluster (kModernCluster: not measured positions). Pressing magnifies the neighbourhood of the finger (2.4x, animated), shows the
+// names and puts the swatch nearest the finger on top; sliding moves to the nearest centre and the photo follows live;
+// releasing keeps it and the map shrinks back.
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 
 import '../../model/film_catalog.dart';
 import '../../model/film_map.dart';
 import '../../model/pad_model.dart' show PadIconKind;
+import '../../services/base_swatches.dart';
 import '../../theme/tokens.dart';
 import 'editor_controller.dart';
 import 'pad_gestures.dart';
@@ -39,13 +46,19 @@ class FilmMapStore {
 }
 
 const double kMagnify = 2.4;
-const Color kNegativeColor = Color(0xFFC98A4A), kSlideColor = Color(0xFF3F7FD0), kCinemaColor = Color(0xFF4F9A8C);
+
+/// Swatch size on screen: overview and magnified (laid out at the magnified size, scaled down).
+const double kSwatchOverview = 23, kSwatchMagnified = 40;
+const Color kNegativeColor = Color(0xFFC98A4A), kSlideColor = Color(0xFF3F7FD0), kCinemaColor = Color(0xFF4F9A8C), kModernColor = Color(0xFF8E97A8);
 
 Color dotColorOf(FilmStock s) => switch (dotTypeOf(s)) {
       FilmDotType.negative => kNegativeColor,
       FilmDotType.slide => kSlideColor,
       FilmDotType.cinema => kCinemaColor,
     };
+
+/// Placeholder tint of a map entry: the old dot colour of its type (grey-blue for the modern renderings).
+Color dotColor(FilmDot d) => d.stock == null ? kModernColor : dotColorOf(d.stock!);
 
 /// Map-fraction position of a dot (0..1 of the map's width and height).
 Offset dotFraction(FilmDot d) => Offset(0.5 + d.shown.dx * kFilmMapX, 0.5 - d.shown.dy * kFilmMapY);
@@ -68,6 +81,22 @@ FilmDot? pickDot(List<FilmDot> dots, Size size, Offset origin, double z, Offset 
   return best;
 }
 
+/// Paint order of the dots while the finger is at [u] (unmagnified map fraction, null = no finger): furthest first, so the one
+/// nearest the finger is drawn last (on top); the selected [sel] is always last of all.
+List<FilmDot> paintOrder(List<FilmDot> dots, Size size, Offset? u, String? sel) {
+  double dist(FilmDot d) {
+    if (u == null) return 0;
+    final p = dotFraction(d);
+    return Offset((p.dx - u.dx) * size.width, (p.dy - u.dy) * size.height).distanceSquared;
+  }
+
+  return [...dots]
+    ..sort((a, b) {
+      if ((a.id == sel) != (b.id == sel)) return a.id == sel ? 1 : -1;
+      return dist(b).compareTo(dist(a));
+    });
+}
+
 class FilmMapView extends StatefulWidget {
   const FilmMapView({super.key, required this.ctl});
   final EditorController ctl;
@@ -84,13 +113,30 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   Offset _origin = const Offset(0.5, 0.5);
   bool _active = false;
   String? _last;
+  final ValueNotifier<Offset?> _finger = ValueNotifier(null); // the finger as a fraction of the map
+  final ValueNotifier<int> _swTick = ValueNotifier(0);
+  BaseSwatches? _sw;
 
   EditorController get ctl => widget.ctl;
+
+  void _onSwatches() => _swTick.value++;
+
+  /// The swatches of the photo now open (the service changes with the photo); starts them.
+  BaseSwatches _bind() {
+    final sw = ctl.swatches;
+    if (!identical(sw, _sw)) {
+      _sw?.removeListener(_onSwatches);
+      _sw = sw..addListener(_onSwatches);
+    }
+    sw.start();
+    return sw;
+  }
 
   @override
   void initState() {
     super.initState();
     _layout();
+    _bind();
     if (FilmMapStore.positions == null) {
       FilmMapStore.load().then((_) {
         if (mounted) setState(_layout);
@@ -105,6 +151,9 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   @override
   void dispose() {
     if (_active) ctl.stockEnd();
+    _sw?.removeListener(_onSwatches);
+    _finger.dispose();
+    _swTick.dispose();
     _zoom.dispose();
     super.dispose();
   }
@@ -112,6 +161,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   void _pick(Offset local) {
     if (_size.isEmpty) return;
     final at = Offset(local.dx / _size.width, local.dy / _size.height);
+    _finger.value = at;
     final d = pickDot(_dots, _size, _origin, kMagnify, at);
     if (d != null && d.id != _last) {
       _last = d.id;
@@ -138,6 +188,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
     if (!_active) return;
     _active = false;
     final shrink = _zoom.reverse();
+    _finger.value = null;
     ctl.stockEnd();
     if (cancelled) return;
     // the choice is final: once the map has shrunk back, return to the film pad
@@ -162,7 +213,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
               onEnd: _end,
               child: RepaintBoundary(
                 child: ListenableBuilder(
-                  listenable: Listenable.merge([_t, ctl.app.editTick]),
+                  listenable: Listenable.merge([_t, ctl.app.editTick, _finger, _swTick]),
                   builder: (context, _) => _inner(context, c),
                 ),
               ),
@@ -188,24 +239,77 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   }
 
   Widget _inner(BuildContext context, DC c) {
-    final z = 1 + (kMagnify - 1) * _t.value;
+    final t = _t.value;
+    final z = 1 + (kMagnify - 1) * t;
     final sel = ctl.edit.film;
     final w = _size.width, h = _size.height;
-    final dots = <Widget>[];
-    // the selected dot last so it is never hidden
-    final ordered = [..._dots.where((d) => d.id != sel), ..._dots.where((d) => d.id == sel)];
-    for (final d in ordered) {
-      final f = dotFraction(d);
+    final sw = _bind();
+    final size = ui.lerpDouble(kSwatchOverview, kSwatchMagnified, t)!;
+    final f = _finger.value;
+    final u = f == null ? null : Offset(_origin.dx + (f.dx - _origin.dx) / z, _origin.dy + (f.dy - _origin.dy) / z);
+    final children = <Widget>[];
+    // the modern renderings' cluster: a soft plate behind them, so they read as one family that is not film
+    final mod = [for (final d in _dots) if (d.isModern) dotFraction(d)];
+    if (mod.isNotEmpty) {
+      var l = double.infinity, tp = double.infinity, r = -double.infinity, bt = -double.infinity;
+      for (final p in mod) {
+        l = math.min(l, p.dx * w);
+        r = math.max(r, p.dx * w);
+        tp = math.min(tp, p.dy * h);
+        bt = math.max(bt, p.dy * h);
+      }
+      const pad = 19.0;
+      children.add(Positioned(
+        key: const ValueKey('modern-plate'),
+        left: l - pad,
+        top: tp - pad - 9,
+        width: r - l + 2 * pad,
+        height: bt - tp + 2 * pad + 9,
+        child: IgnorePointer(
+          child: DecoratedBox(
+            decoration: BoxDecoration(color: c.text.withValues(alpha: 0.05), borderRadius: BorderRadius.circular(14), border: Border.all(color: c.text.withValues(alpha: 0.12), width: 0.5)),
+            child: Align(
+              alignment: Alignment.topLeft,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 8, top: 3),
+                child: Transform.scale(alignment: Alignment.topLeft, scale: 1 / z, child: Text('现代', style: TextStyle(fontSize: 9, height: 1, color: c.text2))),
+              ),
+            ),
+          ),
+        ),
+      ));
+    }
+    for (final d in paintOrder(_dots, _size, u, sel)) {
+      final p = dotFraction(d);
       final on = d.id == sel;
-      final showName = on || _t.value > 0.35;
-      dots.add(Positioned(
-        left: f.dx * w,
-        top: f.dy * h,
+      final showName = on || t > 0.35;
+      children.add(Positioned(
+        left: p.dx * w,
+        top: p.dy * h,
         child: FractionalTranslation(
           translation: const Offset(-0.5, -0.5),
           child: Transform.scale(
             scale: 1 / z,
-            child: _Dot(key: ValueKey('stock-${d.id}'), color: dotColorOf(d.stock), selected: on, name: d.name, showName: showName, nameOpacity: on ? 1 : ((_t.value - 0.35) / 0.4).clamp(0.0, 1.0), c: c),
+            child: SizedBox(
+              width: kSwatchMagnified,
+              height: kSwatchMagnified,
+              child: Stack(clipBehavior: Clip.none, alignment: Alignment.center, children: [
+                Transform.scale(
+                  scale: size / kSwatchMagnified,
+                  child: RepaintBoundary(child: BaseSwatchTile(key: ValueKey('stock-${d.id}'), image: sw.imageOf(d.id), tint: dotColor(d), round: d.isModern, selected: on, c: c)),
+                ),
+                if (showName)
+                  Positioned(
+                    top: kSwatchMagnified / 2 + size / 2 + 4,
+                    left: -40,
+                    right: -40,
+                    child: Opacity(
+                      opacity: on ? 1 : ((t - 0.35) / 0.4).clamp(0.0, 1.0),
+                      child: Center(child: Text(d.name, softWrap: false, style: TextStyle(fontSize: 10.5, height: 1.1, fontWeight: on ? FontWeight.w600 : FontWeight.w400, color: c.text))),
+                    ),
+                  ),
+              ]),
+            ),
           ),
         ),
       ));
@@ -214,7 +318,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
       key: const ValueKey('film-map-zoom'),
       alignment: Alignment(_origin.dx * 2 - 1, _origin.dy * 2 - 1),
       transform: Matrix4.diagonal3Values(z, z, 1),
-      child: SizedBox(width: w, height: h, child: Stack(clipBehavior: Clip.none, children: dots)),
+      child: SizedBox(width: w, height: h, child: Stack(clipBehavior: Clip.none, children: children)),
     );
   }
 
@@ -223,43 +327,44 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   double get magnification => 1 + (kMagnify - 1) * _t.value;
 }
 
-class _Dot extends StatelessWidget {
-  const _Dot({super.key, required this.color, required this.selected, required this.name, required this.showName, required this.nameOpacity, required this.c});
-  final Color color;
-  final bool selected, showName;
-  final String name;
-  final double nameOpacity;
+/// One base as a swatch (laid out at [size]): the rendered [image] fades in over a placeholder tinted with [tint]; a hairline
+/// border; the selected one has the accent ring. [round]: a modern rendering (a circle), else a film stock (a rounded square).
+class BaseSwatchTile extends StatelessWidget {
+  const BaseSwatchTile({super.key, required this.image, required this.tint, required this.round, required this.selected, required this.c, this.size = kSwatchMagnified});
+  final ui.Image? image;
+  final Color tint;
+  final bool round, selected;
   final DC c;
+  final double size;
 
   @override
   Widget build(BuildContext context) {
+    final radius = BorderRadius.circular(size * 0.23);
+    final ring = [
+      BoxShadow(color: c.surface, spreadRadius: selected ? 2.5 : 2),
+      if (selected) BoxShadow(color: c.accent, spreadRadius: 5),
+    ];
+    final placeholder = Color.alphaBlend(tint.withValues(alpha: 0.5), c.surface);
+    Widget clip(Widget child) => round ? ClipOval(child: child) : ClipRRect(borderRadius: radius, child: child);
+    BoxDecoration shape({Border? border, List<BoxShadow>? shadow}) =>
+        BoxDecoration(shape: round ? BoxShape.circle : BoxShape.rectangle, borderRadius: round ? null : radius, border: border, boxShadow: shadow);
     return SizedBox(
-      width: 18,
-      height: 18,
-      child: Stack(clipBehavior: Clip.none, alignment: Alignment.center, children: [
-        Container(
-          width: 18,
-          height: 18,
-          decoration: BoxDecoration(
-            color: color,
-            shape: BoxShape.circle,
-            boxShadow: [
-              BoxShadow(color: c.surface, spreadRadius: selected ? 2 : 1.5),
-              if (selected) BoxShadow(color: c.accent, spreadRadius: 4.5),
-            ],
-          ),
-        ),
-        if (showName)
-          Positioned(
-            top: 18 + 5,
-            left: -40,
-            right: -40,
-            child: Opacity(
-              opacity: nameOpacity,
-              child: Center(child: Text(name, softWrap: false, style: TextStyle(fontSize: 10.5, height: 1.1, fontWeight: selected ? FontWeight.w600 : FontWeight.w400, color: c.text))),
+      width: size,
+      height: size,
+      child: DecoratedBox(
+        decoration: shape(shadow: ring),
+        child: Stack(fit: StackFit.expand, children: [
+          clip(Stack(fit: StackFit.expand, children: [
+            ColoredBox(key: const ValueKey('swatch-placeholder'), color: placeholder),
+            AnimatedOpacity(
+              opacity: image == null ? 0 : 1,
+              duration: const Duration(milliseconds: 180),
+              child: image == null ? const SizedBox.shrink() : RawImage(key: const ValueKey('swatch-image'), image: image, fit: BoxFit.cover, filterQuality: FilterQuality.low),
             ),
-          ),
-      ]),
+          ])),
+          IgnorePointer(child: DecoratedBox(decoration: shape(border: Border.all(color: c.text.withValues(alpha: 0.22), width: 0.5)))),
+        ]),
+      ),
     );
   }
 }

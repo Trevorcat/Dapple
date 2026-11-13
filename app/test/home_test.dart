@@ -1,3 +1,4 @@
+import 'package:dapple/model/params.dart' show EditState;
 import 'package:dapple/services/merge_engine.dart';
 import 'package:dapple/state/app_state.dart';
 import 'package:flutter/material.dart';
@@ -135,15 +136,16 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('nav-1')));
     await tester.pump(_t);
     expect(app.tab, 1);
-    expect(find.text('新照片默认使用'), findsOneWidget);
+    expect(find.textContaining('新照片默认使用'), findsOneWidget);
     await shot(tester, 'styles_phone');
-    await tester.tap(find.byKey(const ValueKey('look-warm')));
+    await tester.tap(find.byKey(const ValueKey('base-modern_vivid')));
     await tester.pump(_t);
-    expect(app.settings.defaultLookId, 'warm');
-    expect(find.text('新照片默认使用「暖阳」'), findsOneWidget);
+    expect(app.settings.defaultBaseId, 'modern_vivid');
+    expect(find.text('新照片默认使用「鲜明」'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('toast-action')));
     await tester.pump(_t);
-    expect(app.settings.defaultLookId, 'std');
+    expect(app.settings.defaultBaseId, isNull);
+    EditState.defaultBase = null;
 
     await tester.tap(find.byKey(const ValueKey('nav-2')));
     await tester.pump(_t);

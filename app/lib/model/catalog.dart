@@ -49,7 +49,7 @@ DLook lookById(String? id) => dLooks.firstWhere((l) => l.id == id, orElse: () =>
 
 class Preset {
   const Preset(this.id, this.name, this.spec, this.maxCount, this.defRatio, this.ratios, this.longEdge, this.app,
-      {this.package});
+      {this.package, this.iosScheme});
   final String id, name, spec;
   final int? maxCount;
   final String defRatio;
@@ -63,17 +63,21 @@ class Preset {
 
   /// Android package for the "open app" fallback.
   final String? package;
+
+  /// iOS URL scheme for the same fallback (data only; the iOS service opens it with canOpenURL / openURL, and the schemes must be listed in
+  /// LSApplicationQueriesSchemes). docs/design/publish-presets.md has the sources and confidence.
+  final String? iosScheme;
 }
 
-// All counts / sizes / ratios are second-hand assumptions (requirements 4.11.2 [待验]).
+// Counts / sizes / ratios: see docs/design/publish-presets.md for what is verified (Instagram) and what is still an assumption (requirements 4.11.2 [待验]).
 const presets = <Preset>[
-  Preset('wechat', '朋友圈', '原比例 · 九宫格', 9, 'orig', ['orig', '1:1'], 1440, '微信', package: 'com.tencent.mm'),
-  Preset('xhs', '小红书', '3:4 · 多图', 18, '3:4', ['3:4', 'orig'], 2048, '小红书', package: 'com.xingin.xhs'),
-  Preset('weibo', '微博', '原比例 · 多图', 18, 'orig', ['orig', '1:1'], null, '微博', package: 'com.sina.weibo'),
+  Preset('wechat', '朋友圈', '原比例 · 九宫格', 9, 'orig', ['orig', '1:1'], 1440, '微信', package: 'com.tencent.mm', iosScheme: 'weixin://'),
+  Preset('xhs', '小红书', '3:4 · 多图', 18, '3:4', ['3:4', 'orig'], 2048, '小红书', package: 'com.xingin.xhs', iosScheme: 'xhsdiscover://'),
+  Preset('weibo', '微博', '原比例 · 多图', 18, 'orig', ['orig', '1:1'], null, '微博', package: 'com.sina.weibo', iosScheme: 'sinaweibo://'),
   Preset('douyin', '抖音图文', '3:4 · 图文', null, '3:4', ['3:4', '9:16'], 2048, '抖音',
-      package: 'com.ss.android.ugc.aweme'),
+      package: 'com.ss.android.ugc.aweme', iosScheme: 'snssdk1128://'),
   Preset('ig', 'Instagram', '4:5 · 轮播', 20, '4:5', ['4:5', '1:1', 'orig'], 2048, 'Instagram',
-      package: 'com.instagram.android'),
+      package: 'com.instagram.android', iosScheme: 'instagram://'),
   Preset('other', '其他 App', '系统分享', null, 'orig', ['orig'], null, null),
 ];
 

@@ -557,6 +557,30 @@ std::vector<Scenario> buildScenarios(const std::string& cubePath, bool haveFilm)
     add("hdr_100_exact_clarity", [](EditParams& p) { p.hdr = 100.f; p.clarity = 25.f; p.exposure = -0.4f; }, X);
     out.push_back(std::move(s));
   }
+
+  // the modern rendering family (filmStock = modern_*, section 37): engine only, like hdr (the old Renderer ignores it). Last, as hdr.
+  {
+    Scenario s;
+    s.name = "modern";
+    auto add = [&](const char* label, auto&& edit, int flags) {
+      Frame f;
+      f.label = label;
+      f.p = b;
+      f.p.sharpen = 0.f;
+      f.p.nrColor = 0.f;
+      edit(f.p);
+      f.flags = flags;
+      f.longEdge = 420;
+      s.frames.push_back(f);
+    };
+    add("clean", [](EditParams& p) { p.filmStock = "modern_clean"; }, A);
+    add("vivid", [](EditParams& p) { p.filmStock = "modern_vivid"; }, A);
+    add("soft", [](EditParams& p) { p.filmStock = "modern_soft"; }, A);
+    add("vivid_interactive", [](EditParams& p) { p.filmStock = "modern_vivid"; }, I | A);
+    add("clean_55_look_edits", [](EditParams& p) { p.filmStock = "modern_clean"; p.filmStrength = 55.f; p.look = "teal"; p.contrast = 12.f; p.exposure = 0.3f; }, A);
+    add("vivid_exact_clarity", [](EditParams& p) { p.filmStock = "modern_vivid"; p.clarity = 20.f; p.exposure = -0.4f; }, X);
+    out.push_back(std::move(s));
+  }
   return out;
 }
 
@@ -865,7 +889,7 @@ int selfcheck(bool haveFilm) {
     ++bad;
   }
   for (std::size_t i = 0; i < std::min(off.size(), full.size()); ++i)
-    if (off[i].name != full[i].name || (off[i].hash != full[i].hash && off[i].name.rfind("hdr/", 0) != 0)) {  // hdr/: engine-only parameter
+    if (off[i].name != full[i].name || (off[i].hash != full[i].hash && off[i].name.rfind("hdr/", 0) != 0 && off[i].name.rfind("modern/", 0) != 0)) {  // hdr/, modern/: engine-only parameters
       std::printf("MISMATCH %s: off %s full %s\n", off[i].name.c_str(), off[i].hash.c_str(), full[i].hash.c_str());
       ++bad;
     }
@@ -1070,7 +1094,7 @@ int main(int argc, char** argv) {
       const auto r = runAll(haveFilm);
       int bad = 0;
       for (const GoldenHash& x : r) {
-        if (m == "off" && x.name.rfind("hdr/", 0) == 0) continue;  // engine-only parameter: the old Renderer path ignores it (record: append the full-mode hashes by hand)
+        if (m == "off" && (x.name.rfind("hdr/", 0) == 0 || x.name.rfind("modern/", 0) == 0)) continue;  // engine-only parameter: the old Renderer path ignores it (record: append the full-mode hashes by hand)
         const auto it = want.find(x.name);
         if (it == want.end()) {
           std::printf("[%s] NEW (not in corpus) %s %s\n", m.c_str(), x.name.c_str(), x.hash.c_str());

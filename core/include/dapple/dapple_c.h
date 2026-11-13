@@ -279,6 +279,15 @@ DAPPLE_API char* dapple_engine_info_json(void);
 DAPPLE_API int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_json, const char* lut_path,
                                               int32_t out_long_edge, int32_t jpeg_quality, const char* out_path);
 
+/* Export with metadata. export_json (null = "{}"): {"metaSource":"<the user's original file>","stripLocation":true,"colorSpace":"srgb","software":"Dapple 1.0"}.
+ * The stream carries an Exif APP1 block (orientation normal, camera make / model / lens, ISO, shutter, aperture, focal length, capture date with
+ * sub-second and UTC offset when the source has them, pixel size, software) and an sRGB ICC profile. Camera facts come from the file named by
+ * metaSource (JPEG, TIFF-based RAW / DNG, Fujifilm RAF, PNG eXIf, HEIC / AVIF) and from the session's decoder metadata where the file has none. GPS is
+ * written only when the source has a fix and stripLocation is false (default true: no GPS IFD at all). colorSpace "srgb" only today: anything else is
+ * an error (the render pipeline ends in sRGB). The plain dapple_session_export_jpeg / _hdr write the bare stream as before. Additive. */
+DAPPLE_API int32_t dapple_session_export_jpeg_ex(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge,
+                                                 int32_t jpeg_quality, const char* out_path, const char* export_json);
+
 /* Ultra HDR (gain-map JPEG) from the same edit. dapple_session_hdr_headroom reports, without writing a file, whether the picture has highlights
  * worth encoding; dapple_session_export_jpeg_hdr writes the SDR export (the base stream is byte for byte the one dapple_session_export_jpeg
  * writes) plus MPF, XMP (hdrgm), ISO 21496-1 and the gain map, or the plain JPEG when `written` comes back 0 (reason: 1 no highlight headroom,
@@ -295,6 +304,10 @@ typedef struct DappleHdrInfo {
 DAPPLE_API int32_t dapple_session_hdr_headroom(DappleSession* session, const char* params_json, const char* lut_path, DappleHdrInfo* info);
 DAPPLE_API int32_t dapple_session_export_jpeg_hdr(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge,
                                                   int32_t jpeg_quality, const char* out_path, float headroom_stops, DappleHdrInfo* info);
+/* The Ultra HDR export with the metadata of dapple_session_export_jpeg_ex (the base stream and the plain fallback carry the same segments). */
+DAPPLE_API int32_t dapple_session_export_jpeg_hdr_ex(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge,
+                                                     int32_t jpeg_quality, const char* out_path, float headroom_stops, DappleHdrInfo* info,
+                                                     const char* export_json);
 
 /* ===== HDR merge, panorama stitching, bracket / panorama detection, Motion Photo (phase 3) ===========
  *

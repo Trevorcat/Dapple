@@ -645,6 +645,15 @@ std::vector<Baseline> conformanceBaselines() {
     e.filmStrength = 50.f;
     mk("film_blend", e, true, true, true);
   }
+  {  // the modern rendering family shares the film selector (section 37): its key and its tone table are declared and tested
+    EditParams e = edit0();
+    e.filmStock = "modern_vivid";
+    e.filmStrength = 100.f;
+    mk("modern_final", e, false, true, false);
+    e.filmStrength = 60.f;
+    e.contrast = 12.f;
+    mk("modern_fast", e, true, true, true);
+  }
   return v;
 }
 

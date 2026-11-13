@@ -1,3 +1,6 @@
+import 'dart:convert';
+
+import 'package:dapple/model/catalog.dart';
 import 'package:dapple/models.dart';
 import 'package:dapple/screens/publish/publish_page.dart';
 import 'package:dapple/services/share_service.dart';
@@ -72,6 +75,23 @@ class _HdrApp extends AppState {
   final double stops;
   @override
   Future<double> hdrHeadroomOf(Photo ph) async => stops;
+}
+
+/// Demo app that records how the publish page calls the export functions.
+class _SpyApp extends AppState {
+  _SpyApp() : super.demo();
+  final calls = <({String kind, bool strip})>[];
+  @override
+  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
+    calls.add((kind: 'export', strip: stripLocation ?? settings.stripLocation));
+    return '/demo/${ph.id}.jpg';
+  }
+
+  @override
+  Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
+    calls.add((kind: 'gallery', strip: stripLocation ?? settings.stripLocation));
+    return list.length;
+  }
 }
 
 List<String> idsOf(AppState app, int n) =>
@@ -221,5 +241,61 @@ void main() {
     await tester.pump();
     expect((tester.widget(find.byKey(const ValueKey('switch-hdr'))) as DSwitch).value, isTrue);
     await shot(tester, 'publish_phone_hdr');
+  });
+
+  testWidgets('去除位置信息 reaches the export call (share and gallery paths)', (tester) async {
+    final app = _SpyApp();
+    await open(tester, app, idsOf(app, 2));
+    expect(valueOf(tester, 'row-loc'), '已去除'); // the setting's default: strip
+    await tester.tap(find.byKey(const ValueKey('publish-share')));
+    await step(tester);
+    await tester.tap(find.byKey(const ValueKey('handoff-system')));
+    await step(tester);
+    expect(app.calls, [(kind: 'export', strip: true), (kind: 'export', strip: true)]);
+    app.calls.clear();
+    // keep the location: the switch value follows to the call
+    await tester.tap(find.byKey(const ValueKey('done-again')));
+    await step(tester);
+    await tester.tap(find.byKey(const ValueKey('row-loc')));
+    await tester.pump();
+    expect(valueOf(tester, 'row-loc'), '保留');
+    await tester.tap(find.byKey(const ValueKey('publish-share')));
+    await step(tester);
+    await tester.tap(find.byKey(const ValueKey('handoff-system')));
+    await step(tester);
+    expect(app.calls, [(kind: 'export', strip: false), (kind: 'export', strip: false)]);
+  });
+
+  testWidgets('去除位置信息 reaches the gallery fallback', (tester) async {
+    final app = _SpyApp();
+    await open(tester, app, idsOf(app, 1));
+    await tester.tap(find.byKey(const ValueKey('row-loc'))); // keep
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('publish-share')));
+    await step(tester);
+    await tester.tap(find.byKey(const ValueKey('handoff-gallery')));
+    await step(tester);
+    expect(app.calls, [(kind: 'gallery', strip: false)]);
+  });
+
+  test('export options JSON carries the location choice and colour space', () {
+    final a = jsonDecode(AppState.exportMetaJson(original: '/a/b.heic', stripLocation: true)) as Map;
+    expect(a, {'metaSource': '/a/b.heic', 'stripLocation': true, 'colorSpace': 'srgb'});
+    expect((jsonDecode(AppState.exportMetaJson(original: 'x', stripLocation: false)) as Map)['stripLocation'], isFalse);
+  });
+
+  test('platform presets: ids, open-app data, Instagram limits', () {
+    expect([for (final p in presets) p.id], ['wechat', 'xhs', 'weibo', 'douyin', 'ig', 'other']);
+    for (final p in presets.where((p) => p.id != 'other')) {
+      expect(p.package, isNotEmpty);
+      expect(p.iosScheme, endsWith('://'), reason: p.id);
+    }
+    final ig = presets.firstWhere((p) => p.id == 'ig');
+    expect(ig.maxCount, 20); // carousel limit since August 2024
+    expect(ig.defRatio, '4:5'); // inside 1.91:1 .. 4:5, so the feed does not crop
+    expect(presets.firstWhere((p) => p.id == 'wechat').maxCount, 9);
+    for (final p in presets) {
+      expect(p.ratios, contains(p.defRatio), reason: p.id);
+    }
   });
 }

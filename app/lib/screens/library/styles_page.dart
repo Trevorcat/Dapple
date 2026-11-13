@@ -1,241 +1,255 @@
+import 'dart:async';
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 
-import '../../model/catalog.dart';
+import '../../model/bases.dart';
+import '../../model/film_catalog.dart';
 import '../../models.dart';
+import '../../services/base_swatch_sources.dart';
+import '../../services/base_swatches.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
-import '../../widgets/controls.dart';
-import '../../widgets/icons.dart';
 import '../../widgets/photo_art.dart';
+import '../editor/film_map_view.dart' show BaseSwatchTile, dotColorOf, kModernColor, kSlideColor;
 import 'page_bar.dart';
 
-/// 风格 tab: default look + library (requirements 4.12; wide: list + preview, 4.14.2).
+/// 成像 tab (默认成像): the rendering base new photos start with, chosen among every film stock, the three modern renderings and
+/// 标准 (none), each shown as a real engine rendering of the latest developed photo (the bundled sample before there is one).
+/// The nine colour looks are not chosen here any more: they are the editor's 颜色 (a look on top of any base).
 class StylesPage extends StatefulWidget {
-  const StylesPage({super.key, required this.app, required this.wide});
+  const StylesPage({super.key, required this.app, required this.wide, this.swatchSource});
   final AppState app;
   final bool wide;
+
+  /// Test hook: where the swatches and the large preview come from (default: the engine).
+  final SwatchSource Function(Photo? photo)? swatchSource;
 
   @override
   State<StylesPage> createState() => _StylesPageState();
 }
 
+const kSampleAsset = 'assets/style_sample/sample.jpg';
+
 class _StylesPageState extends State<StylesPage> {
-  String _cat = 'all';
-  String? _previewId; // wide: look shown in the preview pane
-  double _strength = 100;
+  BaseSwatches? _sw;
+  SwatchSource? _src;
+  String _srcKey = '';
+  ui.Image? _preview; // the large rendering of the current default
+  String? _previewFor; // `${source key}|${base}` of [_preview]
+  int _gen = 0;
 
   AppState get app => widget.app;
 
-  /// Preview picture: the first processed photo, else a bundled synthetic scene with skin tones, foliage, sky, a grey ramp and saturated accents, on which the looks are distinguishable (a new install has no photo yet).
-  static final Photo _sample = Photo(id: 'style-sample', name: 'sample', addedMs: 0, demo: 0, status: PhotoStatus.done);
-
-  Photo get _example {
+  /// The picture the swatches show: the latest developed photo with a readable file, else null (the bundled sample).
+  Photo? get _photo {
+    Photo? best;
     for (final p in app.photos) {
-      if (p.status == PhotoStatus.done && (p.demo != null || p.previewPath != null)) return p;
+      if (p.status == PhotoStatus.done && p.demo == null && p.path != null && (best == null || p.addedMs > best.addedMs)) best = p;
     }
-    return _sample;
+    return best;
   }
 
-  bool get _isSample => identical(_example, _sample);
+  /// Follows the latest photo; (re)starts the swatches once the tab is shown (the engine is not asked for a tab nobody looks at).
+  void _sync() {
+    final ph = _photo;
+    final key = ph == null ? 'sample' : '${ph.id}|${ph.path}';
+    if (key != _srcKey) {
+      _sw?.dispose();
+      final old = _src;
+      if (old is AssetSwatchSource) unawaited(old.close());
+      _srcKey = key;
+      _src = widget.swatchSource?.call(ph) ?? (ph == null ? AssetSwatchSource(kSampleAsset) : SessionSwatchSource(app, ph));
+      final ids = allBaseIds(app.film);
+      final cur = app.settings.defaultBaseId;
+      _sw = BaseSwatches(source: _src!, ids: [cur, ...ids.where((x) => x != cur)])..addListener(() => mounted ? setState(() {}) : null);
+      _preview = null;
+      _previewFor = null;
+    }
+    if (app.tab == 1) {
+      _sw!.start();
+      _loadPreview();
+    }
+  }
 
-  List<DLook> get _looks =>
-      dLooks.where((l) => _cat == 'all' || l.cat == _cat || l.id == 'std').toList();
+  void _loadPreview() {
+    final base = app.settings.defaultBaseId;
+    final want = '$_srcKey|$base';
+    if (_previewFor == want) return;
+    _previewFor = want;
+    final gen = ++_gen;
+    unawaited(() async {
+      ui.Image? img;
+      try {
+        img = await _src!.render(base, 640);
+      } catch (_) {}
+      if (!mounted || gen != _gen) {
+        img?.dispose();
+        return;
+      }
+      if (img != null) setState(() => _preview = img);
+    }());
+  }
 
-  /// The example photo with [look] approximated through a colour matrix (the engine renders the real thing).
-  Widget looked(DLook l, {double strength = 1}) {
-    final ph = _example;
-    final s = strength;
-    return ColorFiltered(
-      colorFilter: approxFilter(
-          b: 1 + (l.bright - 1) * s,
-          c: 1 + (l.contrast - 1) * s,
-          s: 1 + (l.sat - 1) * s,
-          gray: l.gray * s,
-          sepia: l.sepia * s,
-          warm: (0.5 - l.py) * 0.8 * s),
-      child: _isSample
-          ? Image.asset('assets/style_sample/sample.jpg', fit: BoxFit.cover, cacheWidth: 600, gaplessPlayback: true)
-          : PhotoArt(ph, cacheWidth: 600),
-    );
+  @override
+  void dispose() {
+    _sw?.dispose();
+    final s = _src;
+    if (s is AssetSwatchSource) unawaited(s.close());
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    _sync();
     final c = context.c;
     return ColoredBox(
       color: c.bg,
       child: Column(children: [
-        const PageBar('风格'),
+        const PageBar('成像'),
         Expanded(child: widget.wide ? _wideBody(context) : _phoneBody(context)),
       ]),
     );
   }
 
-  Widget _chips() {
-    return SizedBox(
-      height: 56,
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: Sp.l),
-        children: [
-          for (final cat in lookCats)
-            Padding(
-              padding: const EdgeInsets.only(right: Sp.s),
-              child: KeyedSubtree(
-                  key: ValueKey('cat-${cat[0]}'),
-                  child: FilterChip32(cat[1], selected: _cat == cat[0], onTap: () => setState(() => _cat = cat[0]))),
-            ),
-        ],
+  // ---------------------------------------------------------------- the preview card
+
+  Widget _picture() {
+    final ph = _photo;
+    final under = ph == null ? Image.asset(kSampleAsset, fit: BoxFit.cover, cacheWidth: 600, gaplessPlayback: true) : PhotoArt(ph, cacheWidth: 600);
+    final img = _preview;
+    return Stack(fit: StackFit.expand, children: [
+      under,
+      AnimatedOpacity(
+        opacity: img == null ? 0 : 1,
+        duration: const Duration(milliseconds: 200),
+        child: img == null ? const SizedBox.shrink() : RawImage(key: const ValueKey('default-image'), image: img, fit: BoxFit.cover, filterQuality: FilterQuality.medium),
       ),
+    ]);
+  }
+
+  String _kindOf(String? id) {
+    if (isModernId(id)) return '现代';
+    final s = app.film.stock(id);
+    return s == null ? '标准' : '胶片 · ${filmGroupNames[s.group]}';
+  }
+
+  Widget _card({double? height}) {
+    final c = context.c;
+    final def = app.settings.defaultBaseId;
+    return Container(
+      key: const ValueKey('default-card'),
+      decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(Rd.card)),
+      clipBehavior: Clip.antiAlias,
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(key: const ValueKey('default-preview'), height: height ?? 190, width: double.infinity, child: _picture()),
+        Padding(
+          padding: const EdgeInsets.all(Sp.l),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(_photo == null ? '新照片默认使用（预览为示例画面）' : '新照片默认使用', style: T.small(c.text2)),
+            const SizedBox(height: 4),
+            Text(baseNameOf(app.film, def), key: const ValueKey('default-name'), style: T.h2(c.text)),
+            Text(_kindOf(def), style: T.small(c.text2)),
+          ]),
+        ),
+      ]),
     );
   }
 
-  Widget _row(DLook l, {required bool selected, required VoidCallback onTap}) {
+  // ---------------------------------------------------------------- the grid
+
+  Widget _tile(String? id, String name, {required bool round, required Color tint, required double size}) {
     final c = context.c;
+    final selected = app.settings.defaultBaseId == id;
     return Semantics(
       inMutuallyExclusiveGroup: true,
       checked: selected,
-      label: '${l.name}，${l.tags}',
+      label: name,
       excludeSemantics: true,
       child: InkWell(
-        key: ValueKey('look-${l.id}'),
-        onTap: onTap,
-        child: Container(
-          constraints: const BoxConstraints(minHeight: 68),
-          padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
-          child: Row(children: [
-            ClipRRect(borderRadius: BorderRadius.circular(Rd.tile), child: SizedBox(width: 52, height: 52, child: looked(l))),
-            const SizedBox(width: Sp.l),
-            Expanded(
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-                Text(l.name, style: T.body17(c.text, w: FontWeight.w500)),
-                Text(l.tags, style: T.cap(c.text2)),
-              ]),
-            ),
-            if (selected) DIcon(DI.check, size: 24, color: c.accent, stroke: 2.4),
-          ]),
+        key: ValueKey('base-${id ?? 'none'}'),
+        borderRadius: BorderRadius.circular(Rd.tile),
+        onTap: () => app.setDefaultBase(id),
+        child: SizedBox(
+          width: size + 16,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(8, 10, 8, 4),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              BaseSwatchTile(image: _sw?.imageOf(id), tint: tint, round: round, selected: selected, c: c, size: size),
+              const SizedBox(height: 8),
+              Text(name, maxLines: 1, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: T.cap(selected ? c.text : c.text2).copyWith(fontWeight: selected ? FontWeight.w600 : FontWeight.w400)),
+            ]),
+          ),
         ),
       ),
     );
   }
 
-  Widget _phoneBody(BuildContext context) {
+  Widget _group(String title, List<Widget> tiles, {String? key}) {
     final c = context.c;
-    final def = lookById(app.settings.defaultLookId);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(Sp.l, Sp.l, Sp.l, 0),
+        child: Text(title, key: key == null ? null : ValueKey(key), style: T.small(c.text2, w: FontWeight.w500)),
+      ),
+      Padding(padding: const EdgeInsets.symmetric(horizontal: Sp.s), child: Wrap(children: tiles)),
+    ]);
+  }
+
+  Widget _grid(double width) {
+    const size = 56.0;
+    final film = app.film;
+    final sections = <Widget>[
+      if (!film.isEmpty)
+        for (final g in FilmGroup.values)
+          if (film.inGroup(g).isNotEmpty)
+            _group(g == FilmGroup.negative ? '胶片 · ${filmGroupNames[g]}' : '${filmGroupNames[g]}', [
+              for (final s in film.inGroup(g)) _tile(s.id, s.name, round: false, tint: dotColorOf(s), size: size),
+            ], key: 'group-${g.name}'),
+      _group('现代', [for (final m in kModernBases) _tile(m.id, m.name, round: true, tint: kModernColor, size: size)], key: 'group-modern'),
+      _group('标准', [_tile(null, '标准', round: false, tint: kSlideColor.withValues(alpha: 0.0), size: size)], key: 'group-none'),
+    ];
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: sections);
+  }
+
+  Widget _imports() {
+    final c = context.c;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const SectionTitle('导入'),
+      // TODO(look import): .xmp via dapple_xmp_to_json (lists unsupported items), .cube LUT, Fujifilm recipes.
+      for (final r in const [('Lightroom 预设（.xmp）', 'xmp'), ('LUT 滤镜（.cube）', 'cube'), ('相机胶片配方', 'fuji')])
+        InkWell(
+          key: ValueKey('import-${r.$2}'),
+          onTap: () => app.showToast('待实现'),
+          child: Container(
+            constraints: const BoxConstraints(minHeight: 56),
+            padding: const EdgeInsets.symmetric(horizontal: Sp.l),
+            child: Row(children: [Expanded(child: Text(r.$1, style: T.body17(c.text)))]),
+          ),
+        ),
+    ]);
+  }
+
+  Widget _phoneBody(BuildContext context) {
     return ListView(
       padding: const EdgeInsets.only(bottom: 120),
       children: [
-        Container(
-          key: const ValueKey('default-card'),
-          margin: const EdgeInsets.symmetric(horizontal: Sp.l),
-          decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(Rd.card)),
-          clipBehavior: Clip.antiAlias,
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            SizedBox(height: 180, width: double.infinity, child: looked(def)),
-            Padding(
-              padding: const EdgeInsets.all(Sp.l),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(_isSample ? '新照片默认使用（预览为示例画面）' : '新照片默认使用', style: T.small(c.text2)),
-                const SizedBox(height: 4),
-                Text(def.name, style: T.h2(c.text)),
-                Text(def.tags, style: T.small(c.text2)),
-              ]),
-            ),
-          ]),
-        ),
-        const SizedBox(height: Sp.s),
-        _chips(),
-        Semantics(
-          container: true,
-          label: '默认风格',
-          child: Column(children: [
-            for (final l in _looks) _row(l, selected: l.id == def.id, onTap: () => app.setDefaultLook(l.id)),
-          ]),
-        ),
-        const SectionTitle('导入'),
-        // TODO(look import): .xmp via dapple_xmp_to_json (lists unsupported items), .cube LUT, Fujifilm recipes.
-        for (final r in const [('Lightroom 预设（.xmp）', 'xmp'), ('LUT 滤镜（.cube）', 'cube'), ('相机胶片配方', 'fuji')])
-          InkWell(
-            key: ValueKey('import-${r.$2}'),
-            onTap: () => app.showToast('待实现'),
-            child: Container(
-              constraints: const BoxConstraints(minHeight: 56),
-              padding: const EdgeInsets.symmetric(horizontal: Sp.l),
-              child: Row(children: [
-                Expanded(child: Text(r.$1, style: T.body17(c.text))),
-                DIcon(DI.plus, size: 22, color: c.text2),
-              ]),
-            ),
-          ),
+        Padding(padding: const EdgeInsets.symmetric(horizontal: Sp.l), child: _card()),
+        Semantics(container: true, label: '默认成像', child: _grid(MediaQuery.sizeOf(context).width)),
+        _imports(),
       ],
     );
   }
 
   Widget _wideBody(BuildContext context) {
-    final c = context.c;
-    final def = lookById(app.settings.defaultLookId);
-    final cur = lookById(_previewId ?? def.id);
-    return Row(children: [
-      SizedBox(
-        width: 280,
-        child: Column(children: [
-          _chips(),
-          Expanded(
-            child: ListView(children: [
-              for (final l in _looks) _row(l, selected: l.id == cur.id, onTap: () => setState(() => _previewId = l.id)),
-            ]),
-          ),
-        ]),
-      ),
+    return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      SizedBox(width: 340, child: Padding(padding: const EdgeInsets.all(Sp.l), child: _card(height: 240))),
       Expanded(
-        child: Padding(
-          padding: const EdgeInsets.all(Sp.l),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Expanded(
-              child: Container(
-                key: const ValueKey('style-preview'),
-                decoration: BoxDecoration(color: c.stage, borderRadius: BorderRadius.circular(Rd.card)),
-                clipBehavior: Clip.antiAlias,
-                width: double.infinity,
-                child: looked(cur, strength: _strength / 100),
-              ),
-            ),
-            const SizedBox(height: Sp.m),
-            Row(children: [
-              Text(cur.name, style: T.h2(c.text)),
-              const SizedBox(width: Sp.s),
-              Text(cur.tags, style: T.small(c.text2)),
-              if (cur.id == def.id) ...[const SizedBox(width: Sp.s), Text('默认', style: T.small(c.accent, w: FontWeight.w500))],
-            ]),
-            DSlider(
-              label: '风格强度',
-              value: _strength,
-              min: 0,
-              max: 100,
-              def: 100,
-              display: '${_strength.round()}%',
-              onChanged: (v) => setState(() => _strength = v),
-            ),
-            Row(children: [
-              Expanded(child: PrimaryButton('用于此照片', height: 48, onPressed: () => _applyToPhoto(cur))),
-              const SizedBox(width: Sp.m),
-              Expanded(child: SecondaryButton('设为默认', height: 48, onPressed: () => app.setDefaultLook(cur.id))),
-            ]),
-          ]),
+        child: ListView(
+          padding: const EdgeInsets.only(bottom: 120),
+          children: [Semantics(container: true, label: '默认成像', child: _grid(0)), _imports()],
         ),
       ),
     ]);
-  }
-
-  void _applyToPhoto(DLook l) {
-    final list = app.editable;
-    if (list.isEmpty) {
-      app.showToast('还没有照片');
-      return;
-    }
-    final ph = list.first;
-    final id = ph.id;
-    app.applyEdit(id, (e) => e.copyWith(look: l.id, lookStrength: _strength, palette: null));
-    app.showToast('已用于「${ph.title}」', actionLabel: '撤销', onAction: () => app.undo(id));
   }
 }

@@ -17,7 +17,7 @@ const double kWideBreakpoint = 600;
 
 const _tabs = [
   ('照片', DI.photos),
-  ('风格', DI.styles),
+  ('成像', DI.styles),
   ('设置', DI.settings),
 ];
 

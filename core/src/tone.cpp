@@ -118,7 +118,7 @@ ToneAnalysis analyzeTone(const SourceImage& source, const CameraProfile& camera,
   EditParams p = look;
   p.toneStrength = 0.f;
   p.toneTarget.clear();
-  p.filmStock.clear();  // the tonal class belongs to the develop render: it must not move with the film look
+  if (!isModernId(p.filmStock)) p.filmStock.clear();  // the tonal class belongs to the develop render: it must not move with the film look (a modern rendering is a develop render)
   return analyzeToneImage(renderProxy(p, camera, proxy));
 }
 

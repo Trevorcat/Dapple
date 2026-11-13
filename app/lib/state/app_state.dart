@@ -16,6 +16,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../model/catalog.dart';
 import '../model/film_catalog.dart';
+import '../model/bases.dart' show baseNameOf;
 import '../model/film_names.dart' show parseFilmSwatches;
 import '../model/params.dart';
 import '../models.dart';
@@ -90,7 +91,7 @@ class AppState extends ChangeNotifier {
   late final PickerIngestSource pickerSource;
 
   /// Phone-camera capture (testing convenience, requirements 4.2.6); tests substitute a fake.
-  CaptureBackend captureBackend = ChannelCaptureBackend();
+  CaptureBackend captureBackend = PlatformServices.current.capture;
   Directory? captureInboxOverride; // tests
   /// Embeds the viewfinder JPEG of a RAW-only capture into its DNG (tests substitute a fake).
   Future<bool> Function(String dng, String jpeg) dngThumbnailEmbedder = DappleSession.embedDngThumbnail;
@@ -551,7 +552,7 @@ class AppState extends ChangeNotifier {
 
   /// Clears every override of the photo (requirements 4.8 "还原为自动结果").
   void restoreAuto(String id) {
-    applyEdit(id, (_) => EditState.empty);
+    applyEdit(id, (_) => freshEdit);
     showToast('已还原为自动结果', actionLabel: '撤销', onAction: () => undo(id));
   }
 
@@ -563,6 +564,29 @@ class AppState extends ChangeNotifier {
       updateSettings((s) => s.defaultLookId = old);
     });
   }
+
+  /// The rendering base new photos start with (默认成像): a film stock id, a modern id, or null = standard. Existing photos keep
+  /// their own base: it is copied into the edit at ingest ([_withDefaultBase]).
+  void setDefaultBase(String? baseId) {
+    final old = settings.defaultBaseId;
+    if (old == baseId) return;
+    EditState.defaultBase = baseId;
+    updateSettings((s) => s.defaultBaseId = baseId);
+    showToast('新照片默认使用「${baseNameOf(film, baseId)}」', actionLabel: '撤销', onAction: () {
+      EditState.defaultBase = old;
+      updateSettings((s) => s.defaultBaseId = old);
+    });
+  }
+
+  /// A photo as it arrives: the default rendering base is its starting edit (the same way the default look is its starting look).
+  Photo _withDefaultBase(Photo ph) {
+    final b = settings.defaultBaseId;
+    if (b != null && ph.edit.film == null) ph.edit = ph.edit.copyWith(film: b);
+    return ph;
+  }
+
+  /// Edit of a photo nobody has touched: empty but for the default base.
+  EditState get freshEdit => settings.defaultBaseId == null ? EditState.empty : EditState.empty.copyWith(film: settings.defaultBaseId);
 
   /// Wire JSON for the engine (requirements chapter 6 keys). The engine's own automatic correction
   /// (legacy EditParams keys, per-photo) is the base; user deltas add to shared numeric keys.
@@ -604,6 +628,7 @@ class AppState extends ChangeNotifier {
     _prefs = await SharedPreferences.getInstance();
     settings = AppSettings(
       defaultLookId: _prefs.getString('defaultLook2') ?? 'std',
+      defaultBaseId: _prefs.getString('defaultBase'),
       toneStrength: _prefs.getDouble('toneStrength') ?? 60,
       autoProcess: _prefs.getBool('autoProcess') ?? true,
       exportLongEdge: _prefs.getInt('exportLongEdge3') ?? 0,
@@ -620,6 +645,7 @@ class AppState extends ChangeNotifier {
       handSide: _prefs.getInt('handSide') ?? 1,
       editorLayout: _prefs.getString('editorLayout') ?? '',
     );
+    EditState.defaultBase = settings.defaultBaseId;
     await _prefs.setString('ftpPass', settings.ftpPass);
     nativeOk = DappleSession.isAvailable;
     if (!nativeOk) nativeError = '原生库未加载';
@@ -716,6 +742,11 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     if (isDemo) return;
     await _prefs.setString('defaultLook2', settings.defaultLookId);
+    if (settings.defaultBaseId == null) {
+      await _prefs.remove('defaultBase');
+    } else {
+      await _prefs.setString('defaultBase', settings.defaultBaseId!);
+    }
     await _prefs.setDouble('toneStrength', settings.toneStrength);
     await _prefs.setBool('autoProcess', settings.autoProcess);
     await _prefs.setInt('exportLongEdge3', settings.exportLongEdge);
@@ -840,7 +871,7 @@ class AppState extends ChangeNotifier {
     var added = false;
     for (final f in files) {
       if (_photos.containsKey(f.id)) continue;
-      _photos[f.id] = Photo(id: f.id, name: f.name, addedMs: f.addedMs, uri: f.uri, path: f.path);
+      _photos[f.id] = _withDefaultBase(Photo(id: f.id, name: f.name, addedMs: f.addedMs, uri: f.uri, path: f.path));
       if (frozen) _held.add(f.id);
       added = true;
     }
@@ -891,7 +922,7 @@ class AppState extends ChangeNotifier {
       previewPath: jpg,
       takenMs: nowMs,
     );
-    _photos[id] = ph;
+    _photos[id] = _withDefaultBase(ph);
     if (jpg == null) _galleryJpegPending.add(id);
     changed();
     _enqueue(id);
@@ -1234,13 +1265,14 @@ class AppState extends ChangeNotifier {
   // ---------------------------------------------------------------- export (publish / save)
   /// Renders a full-quality JPEG of [ph] into the exports cache. [cropOverride] applies a
   /// destination aspect ratio at export time only (requirements 4.11.2).
-  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false}) async {
+  Future<String> exportJpeg(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
+    if (isDemo) return '/demo/${ph.id}.jpg';
     // A Motion Photo made from a video exports as a Motion Photo: the edited still plus the clip rendered with the same edit (film included).
     if (ph.kind == PhotoKind.live && ph.liveSrc != null && !isDemo) {
-      final live = await exportLive(ph, longEdge: longEdge, cropOverride: cropOverride);
+      final live = await exportLive(ph, longEdge: longEdge, cropOverride: cropOverride, stripLocation: stripLocation);
       if (live != null) return live;
     }
-    return exportStill(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr);
+    return exportStill(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr, stripLocation: stripLocation);
   }
 
   final Map<String, Future<double>> _hdrHeadroom = {};
@@ -1267,27 +1299,28 @@ class AppState extends ChangeNotifier {
 
   /// Does the clip of [ph] go through the node graph? (the still has an edit, the automatic correction applies, or a destination crop is asked for)
   bool liveEdited(Photo ph, {String? cropOverride}) => liveClipEdited(
-      userEdited: jsonEncode(ph.edit.toJson()) != jsonEncode(EditState.empty.toJson()),
+      userEdited: jsonEncode(ph.edit.toJson()) != jsonEncode(freshEdit.toJson()),
       autoCorrectionApplied: settings.autoProcess && (ph.correction?.isNotEmpty ?? false),
       cropOverride: cropOverride);
 
   /// The Motion Photo export: the edited still ([exportStill]) + the clip trimmed with [LiveBridge.trim] (with the still's edit when the still is
   /// edited, as recorded otherwise) + the container. Null = the clip could not be produced (source video gone, decoder failure): the caller falls back
   /// to the still alone, as before.
-  Future<String?> exportLive(Photo ph, {int? longEdge, String? cropOverride}) async {
+  Future<String?> exportLive(Photo ph, {int? longEdge, String? cropOverride, bool? stripLocation}) async {
     final src = ph.liveSrc, startMs = ph.liveStartMs, coverMs = ph.liveCoverMs;
     if (src == null || startMs == null || coverMs == null) return null;
     final le = longEdge ?? settings.exportLongEdge;
     final extra = <String, dynamic>{if (cropOverride != null && cropOverride != 'orig') 'crop': cropOverride};
     final wire = wireParams(ph, override: extra);
     final edited = liveEdited(ph, cropOverride: cropOverride);
-    final tag = jsonEncode([wire, le, settings.jpegQuality, edited, startMs, coverMs, ph.liveMute]).hashCode.toRadixString(16);
+    final strip = stripLocation ?? settings.stripLocation;
+    final tag = jsonEncode([wire, le, settings.jpegQuality, edited, startMs, coverMs, ph.liveMute, 'meta1', strip]).hashCode.toRadixString(16);
     final stem = p.basenameWithoutExtension(ph.name).replaceFirst(RegExp(r'_MP$'), '');
     final out = p.join(exports.path, '${stem}_dapple_${tag}_MP.jpg');
     if (await File(out).exists()) return out;
     final clip = p.join(exports.path, '${stem}_dapple_$tag.clip.mp4');
     try {
-      final still = await exportStill(ph, longEdge: longEdge, cropOverride: cropOverride);
+      final still = await exportStill(ph, longEdge: longEdge, cropOverride: cropOverride, stripLocation: strip);
       final edit = editedClipFor(wire: wire, edited: edited, coverMs: coverMs, stillLongEdge: le);
       final t = await LiveBridge.trim(src,
           startMs: startMs,
@@ -1309,25 +1342,67 @@ class AppState extends ChangeNotifier {
   }
 
   /// Renders a full-quality JPEG of the still of [ph] (no clip).
-  Future<String> exportStill(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false}) async {
+  /// [stripLocation] null = the setting "导出时去除位置信息" (default on, requirements 4.11.2: GPS is stripped unless the user keeps it). The file carries
+  /// Exif (camera, exposure, capture time) and an sRGB profile; GPS only when the original has a fix and the location is kept.
+  Future<String> exportStill(Photo ph, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
     final le = longEdge ?? settings.exportLongEdge; // 0 = original size
     final extra = <String, dynamic>{if (cropOverride != null && cropOverride != 'orig') 'crop': cropOverride};
     final params = wireParams(ph, override: extra);
-    final tag = jsonEncode([params, le, settings.jpegQuality, if (hdr) 'uhdr']).hashCode.toRadixString(16);
+    final strip = stripLocation ?? settings.stripLocation;
+    final tag = jsonEncode([params, le, settings.jpegQuality, if (hdr) 'uhdr', 'meta1', strip]).hashCode.toRadixString(16);
     final out = p.join(exports.path, '${p.basenameWithoutExtension(ph.name)}_dapple_$tag.jpg');
     if (await File(out).exists()) return out;
-    final src = await resolveSource(ph);
+    final src = await _resolveWithOriginal(ph);
     try {
       await DappleSession.exportOneShot(src.path, params,
-          full: true, decodeLongEdge: le, outLongEdge: le, quality: settings.jpegQuality, hdr: hdr, outPath: out);
+          full: true,
+          decodeLongEdge: le,
+          outLongEdge: le,
+          quality: settings.jpegQuality,
+          hdr: hdr,
+          exportJson: exportMetaJson(original: src.original, stripLocation: strip),
+          outPath: out);
     } finally {
-      if (src.temp) {
-        try {
-          await File(src.path).delete();
-        } catch (_) {}
-      }
+      await src.cleanup();
     }
     return out;
+  }
+
+  /// The options string of the native export calls (dapple_c.h): Exif source file, location choice, colour space.
+  @visibleForTesting
+  static String exportMetaJson({required String original, required bool stripLocation}) =>
+      jsonEncode({'metaSource': original, 'stripLocation': stripLocation, 'colorSpace': 'srgb'});
+
+  /// [resolveSource] that also names the file the user imported: a HEIC / TIFF / WebP is converted to PNG first and the copy has lost its Exif and GPS,
+  /// so the export reads them from [original]. [cleanup] removes every temporary file.
+  Future<({String path, String original, Future<void> Function() cleanup})> _resolveWithOriginal(Photo ph) async {
+    final r = await _resolveRaw(ph);
+    Future<void> drop(String f) async {
+      try {
+        await File(f).delete();
+      } catch (_) {}
+    }
+
+    final ext = p.extension(r.path).toLowerCase();
+    if (!_convertExts.contains(ext) || !(Platform.isIOS || Platform.isAndroid)) {
+      return (path: r.path, original: r.path, cleanup: () async => r.temp ? drop(r.path) : null);
+    }
+    final dest = p.join(_cache.path, 'src', '${DateTime.now().microsecondsSinceEpoch}_${p.basenameWithoutExtension(r.path)}.png');
+    try {
+      await Directory(p.dirname(dest)).create(recursive: true);
+      final written = await MediaBridge.toPng16(r.path, dest);
+      return (
+        path: written,
+        original: r.path,
+        cleanup: () async {
+          await drop(written);
+          if (r.temp) await drop(r.path);
+        }
+      );
+    } catch (_) {
+      if (r.temp) await drop(r.path);
+      rethrow;
+    }
   }
 
   final Set<String> _saving = {};
@@ -1351,7 +1426,7 @@ class AppState extends ChangeNotifier {
     return ok;
   }
 
-  Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride, bool hdr = false}) async {
+  Future<int> saveToGallery(List<Photo> list, {int? longEdge, String? cropOverride, bool hdr = false, bool? stripLocation}) async {
     var n = 0;
     for (final ph in list) {
       try {
@@ -1359,7 +1434,7 @@ class AppState extends ChangeNotifier {
           n++;
           continue;
         }
-        final f = await exportJpeg(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr);
+        final f = await exportJpeg(ph, longEdge: longEdge, cropOverride: cropOverride, hdr: hdr, stripLocation: stripLocation);
         await MediaBridge.saveToGallery(f, f.endsWith('_MP.jpg') ? '${p.basenameWithoutExtension(ph.name).replaceFirst(RegExp(r'_MP$'), '')}_dapple_MP.jpg' : '${p.basenameWithoutExtension(ph.name)}_dapple.jpg');
         ph.exported = true;
         n++;
@@ -2030,7 +2105,7 @@ class AppState extends ChangeNotifier {
       }
       final ph = Photo(id: f.id, name: f.name, addedMs: f.addedMs, path: f.path, pairedJpeg: pair, previewPath: pair);
       if (frozen) _held.add(f.id);
-      _photos[f.id] = ph;
+      _photos[f.id] = _withDefaultBase(ph);
       added = true;
     }
     if (!added) return;

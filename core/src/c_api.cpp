@@ -7,6 +7,7 @@
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -25,6 +26,7 @@
 #include "engine/nodes/demosaic/demosaic.h"
 #include "dapple/edit_params.h"
 #include "dapple/encode.h"
+#include "exif_writer.h"
 #include "dapple/film.h"
 #include "dapple/film_match.h"
 #include "dapple/look.h"
@@ -307,7 +309,7 @@ EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath 
   params.filmPrintEv = 0.f;
   params.filmSceneX = s->source.meta.asShotIlluminantXy[0];  // film white balance: the scene's as-shot illuminant (0 = unknown)
   params.filmSceneY = s->source.meta.asShotIlluminantXy[1];
-  if (params.filmStock.empty() || std::getenv("DAPPLE_FILM_MATCH_OFF")) return params;
+  if (params.filmStock.empty() || isModernId(params.filmStock) || std::getenv("DAPPLE_FILM_MATCH_OFF")) return params;
   const std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
   // DAPPLE_FILM_MATCH_UNCACHED=1: the match as before section 26 (full key, every solve from scratch, no calibration warm-up): the A/B switch of the drag bench
   const char* ue = std::getenv("DAPPLE_FILM_MATCH_UNCACHED");
@@ -1505,8 +1507,75 @@ int32_t dapple_session_render_tone_previews(DappleSession* session, const char* 
       DAPPLE_ERROR);
 }
 
+namespace {
+// Export options of the *_ex calls: {"metaSource":"<original file>","stripLocation":true,"colorSpace":"srgb","software":"Dapple 1.0"}. Writes the Exif and ICC
+// segments into `jo`: the camera facts of the session (decoder metadata), the capture date, sub-second, offset and GPS read from metaSource (the file the user
+// imported: HEIC / PNG conversions lose them), then the gaps filled from the session. Location only when the file has it and stripLocation is false (default
+// true). False (error set) for a colour space this build cannot produce.
+bool applyExportMeta(DappleSession* s, const char* optionsJson, const Image8& img, JpegOptions& jo) {
+  if (!optionsJson || !optionsJson[0]) return true;  // the plain calls: the bare stream
+  const std::string o = optionsJson;
+  const std::string cs = jsonlite::text(o, "colorSpace", "srgb");
+  if (cs != "srgb") {
+    setError("unsupported export colour space: " + cs);
+    return false;
+  }
+  ExportMeta m;
+  const std::string src = jsonlite::text(o, "metaSource", "");
+  if (!src.empty()) readSourceExif(toPath(src.c_str()), m);
+  if (s) {
+    const ShotMetadata& sm = s->source.meta;
+    if (m.make.empty()) m.make = sm.make;
+    if (m.model.empty()) m.model = sm.model;
+    if (m.lens.empty()) m.lens = sm.lens;
+    if (m.iso <= 0) m.iso = sm.iso;
+    if (m.shutterSeconds <= 0) m.shutterSeconds = sm.shutterSeconds;
+    if (m.aperture <= 0) m.aperture = sm.aperture;
+    if (m.focalLengthMm <= 0) m.focalLengthMm = sm.focalLengthMm;
+    if (m.dateTimeOriginal.empty() && sm.timestamp > 0) {
+      const std::time_t t = std::time_t(sm.timestamp);
+      std::tm tmv{};
+#if defined(_WIN32)
+      gmtime_s(&tmv, &t);
+#else
+      gmtime_r(&t, &tmv);
+#endif
+      char buf[24];
+      std::snprintf(buf, sizeof buf, "%04d:%02d:%02d %02d:%02d:%02d", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+      m.dateTimeOriginal = buf;
+    }
+  }
+  if (jsonlite::boolean(o, "stripLocation", true)) {
+    m.hasGps = false;
+    m.hasAltitude = false;
+    m.hasGpsTime = false;
+    m.gpsDate.clear();
+  }
+  m.software = jsonlite::text(o, "software", "Dapple " DAPPLE_VERSION_STRING);
+  m.width = img.width;
+  m.height = img.height;
+  jo.exifSegment = buildExifSegment(m);
+  jo.iccSegment = buildIccSegment(IccSpace::Srgb);
+  return true;
+}
+
+int32_t exportJpegImpl(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge, int32_t jpeg_quality,
+                       const char* out_path, const char* export_json);
+}  // namespace
+
 int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_json, const char* lut_path,
                                    int32_t out_long_edge, int32_t jpeg_quality, const char* out_path) {
+  return exportJpegImpl(session, params_json, lut_path, out_long_edge, jpeg_quality, out_path, nullptr);
+}
+
+int32_t dapple_session_export_jpeg_ex(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge,
+                                      int32_t jpeg_quality, const char* out_path, const char* export_json) {
+  return exportJpegImpl(session, params_json, lut_path, out_long_edge, jpeg_quality, out_path, export_json ? export_json : "{}");
+}
+
+namespace {
+int32_t exportJpegImpl(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge, int32_t jpeg_quality,
+                       const char* out_path, const char* export_json) {
   return guarded(
       [&]() -> int32_t {
         Image8 img;
@@ -1515,6 +1584,7 @@ int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_js
         const double renderMs = msSince(t0);
         JpegOptions jo;
         if (jpeg_quality > 0) jo.quality = jpeg_quality > 100 ? 100 : jpeg_quality;
+        if (!applyExportMeta(session, export_json, img, jo)) return DAPPLE_ERROR;
         auto r = writeJpeg(img, toPath(out_path), jo);
         stageLog("export_jpeg %dx%d render %.0f ms, encode+write %.0f ms", img.width, img.height, renderMs, msSince(t0) - renderMs);
         if (!r) {
@@ -1525,6 +1595,7 @@ int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_js
       },
       DAPPLE_ERROR);
 }
+}  // namespace
 
 // ---- Ultra HDR (docs/engine/pipeline-architecture.md section 34) ----
 namespace {
@@ -1533,6 +1604,20 @@ bool renderBright(DappleSession* s, const EditParams& params, const char* lutPat
   EditParams p = params;
   p.exposure -= H;
   return renderSessionParams(s, p, lutPath, longEdge, out);
+}
+
+// EV of the modern rendering's white point against the standard curve's 1.0 (0 for any other base): the exposure the bright rendition is lowered by
+// on top of H, so that the picture's own white point sits at SDR white.
+float modernWhiteEv(DappleSession* s, const EditParams& params) {
+  if (!isModernId(params.filmStock) || !(params.filmStrength > 0.f)) return 0.f;
+  if (!s->proxy) {
+    s->proxy = std::make_shared<SourceImage>();
+    s->proxy->sceneReferred = s->source.sceneReferred;
+    s->proxy->linear = resizeToLongEdge(s->source.linear, 256);
+  }
+  Renderer r(params, *s->camera, nullptr);
+  r.setToneProxy(s->proxy.get());
+  return std::log2(std::max(1e-3f, r.modernSdrWhite(s->source)));
 }
 
 struct HdrDecision {
@@ -1544,18 +1629,27 @@ struct HdrDecision {
 // Decides H (requested 0 = from the scene) and renders the bright rendition at `longEdge`.
 bool hdrDecide(DappleSession* s, const EditParams& params, const char* lutPath, int longEdge, float requested, HdrDecision& d) {
   d = HdrDecision{};
-  if (!params.filmStock.empty()) {
+  if (!params.filmStock.empty() && !isModernId(params.filmStock)) {
     d.reason = 2;
     return true;
   }
-  const float room = std::max(0.f, params.exposure + 5.f);  // exposure is clamped to -5 by the Renderer
+  // A modern rendering (section 37): display white is the scene's own white point, not the standard curve's. The bright rendition is the
+  // standard rendering of the same edit with the exposure lowered so that the modern white point sits at 1.0 (and by H more): headroom is
+  // what lies above the white point of THIS picture.
+  EditParams bp = params;
+  if (isModernId(params.filmStock)) {
+    bp.filmStock.clear();
+    bp.filmStrength = 100.f;
+    bp.exposure -= modernWhiteEv(s, params);
+  }
+  const float room = std::max(0.f, bp.exposure + 5.f);  // exposure is clamped to -5 by the Renderer
   const float probeH = std::min(dapple::uhdr::kMaxHeadroomStops, room);
   if (probeH < 0.5f) {
     d.reason = 1;
     return true;
   }
   Image8 probe;
-  if (!renderBright(s, params, lutPath, longEdge, probeH, probe)) return false;
+  if (!renderBright(s, bp, lutPath, longEdge, probeH, probe)) return false;
   d.peak = dapple::uhdr::brightPeak(probe, probeH);
   float H = requested > 0.f ? std::min(dapple::uhdr::kMaxHeadroomStops, std::max(0.5f, requested)) : dapple::uhdr::autoHeadroom(d.peak);
   H = std::min(H, probeH);
@@ -1565,7 +1659,7 @@ bool hdrDecide(DappleSession* s, const EditParams& params, const char* lutPath, 
   }
   d.H = H;
   if (H == probeH) d.bright = std::move(probe);
-  else if (!renderBright(s, params, lutPath, longEdge, H, d.bright)) return false;
+  else if (!renderBright(s, bp, lutPath, longEdge, H, d.bright)) return false;
   return true;
 }
 
@@ -1621,8 +1715,22 @@ int32_t dapple_session_hdr_headroom(DappleSession* session, const char* params_j
       DAPPLE_ERROR);
 }
 
+namespace {
+int32_t exportJpegHdrImpl(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge, int32_t jpeg_quality,
+                          const char* out_path, float headroom_stops, DappleHdrInfo* info, const char* export_json);
+}
 int32_t dapple_session_export_jpeg_hdr(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge,
                                        int32_t jpeg_quality, const char* out_path, float headroom_stops, DappleHdrInfo* info) {
+  return exportJpegHdrImpl(session, params_json, lut_path, out_long_edge, jpeg_quality, out_path, headroom_stops, info, nullptr);
+}
+int32_t dapple_session_export_jpeg_hdr_ex(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge,
+                                          int32_t jpeg_quality, const char* out_path, float headroom_stops, DappleHdrInfo* info,
+                                          const char* export_json) {
+  return exportJpegHdrImpl(session, params_json, lut_path, out_long_edge, jpeg_quality, out_path, headroom_stops, info, export_json ? export_json : "{}");
+}
+namespace {
+int32_t exportJpegHdrImpl(DappleSession* session, const char* params_json, const char* lut_path, int32_t out_long_edge, int32_t jpeg_quality,
+                          const char* out_path, float headroom_stops, DappleHdrInfo* info, const char* export_json) {
   return guarded(
       [&]() -> int32_t {
         if (!session) {
@@ -1635,6 +1743,7 @@ int32_t dapple_session_export_jpeg_hdr(DappleSession* session, const char* param
         if (!renderSessionParams(session, params, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
         JpegOptions jo;
         if (jpeg_quality > 0) jo.quality = jpeg_quality > 100 ? 100 : jpeg_quality;
+        if (!applyExportMeta(session, export_json, img, jo)) return DAPPLE_ERROR;
         auto plain = [&](const HdrDecision& d) -> int32_t {
           auto r = writeJpeg(img, toPath(out_path), jo);
           if (!r) {
@@ -1678,6 +1787,7 @@ int32_t dapple_session_export_jpeg_hdr(DappleSession* session, const char* param
       },
       DAPPLE_ERROR);
 }
+}  // namespace
 
 // ---------------------------------------------------------------------------------------------------------
 // HDR merge, panorama, detection, Motion Photo
@@ -1924,3 +2034,10 @@ char* dapple_motion_photo_validate_json(const char* path) {
 }
 
 }  // extern "C"
+
+// Not part of the C API (not in dapple_c.h): the test suite reads the bright-rendition shift of a modern rendering (EV, see modernWhiteEv).
+extern "C" float dapple_internal_modern_white_ev(DappleSession* session, const char* params_json) {
+  EditParams params;
+  if (!session || !parseParams(params_json, params)) return 0.f;
+  return modernWhiteEv(session, params);
+}

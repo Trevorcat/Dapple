@@ -108,9 +108,8 @@ void main() {
     await pumpDapple(tester, app);
     await tester.pump(_t);
     expect(find.textContaining('预览为示例画面'), findsOneWidget);
-    expect(find.byKey(const ValueKey('look-warm')), findsOneWidget);
+    expect(find.byKey(const ValueKey('base-modern_clean')), findsOneWidget);
     expect(find.byType(Image), findsWidgets); // the bundled sample scene, not a flat placeholder
-    expect(find.descendant(of: find.byKey(const ValueKey('look-warm')), matching: find.byType(ColorFiltered)), findsOneWidget);
     await shot(tester, 'styles_no_photo');
   });
 

@@ -98,7 +98,7 @@ class Renderer {
 
   // Optional tiny (<= 256 px) copy of the source used for the tonal analysis; saves re-scaling the
   // whole source on every call. Must outlive the renderer.
-  void setToneProxy(const SourceImage* proxy) { toneProxy_ = proxy; }
+  void setToneProxy(const SourceImage* proxy) { toneProxy_ = proxy; modernProxy_ = proxy; }
 
   // Everything the lattice depends on (point-wise parameters, camera, LUT identity), without n.
   std::string pointKey() const;
@@ -168,6 +168,9 @@ class Renderer {
   // display-referred or a film stock is selected. Engine only: the old Renderer paths ignore the parameter.
   // `tone`: the frame's 1D tone table (BakedLut::tone); the range the curve shows well is derived from it (null: 8 EV).
   void hdrBind(const SourceImage& source, FramePlan::Hdr& out, const std::vector<float>* tone = nullptr) const;
+  // The post-gain scene luminance that a modern rendering (EditParams::filmStock = modern_*) shows as display white (1 = not modern or no
+  // stretch): the Ultra HDR rendition measures the highlight headroom against it (docs/engine/pipeline-architecture.md section 37).
+  float modernSdrWhite(const SourceImage& source) const;
 
  private:
   struct Curve1D {
@@ -183,6 +186,7 @@ class Renderer {
   float wbGain_[3]{1, 1, 1};
   float toneReach_ = 1.f;
   const SourceImage* toneProxy_ = nullptr;
+  const SourceImage* modernProxy_ = nullptr;  // the same proxy, kept by the bake copies that drop toneProxy_ (scene end points of the modern rendering)
 
   struct PointOp;
   PointOp makePointOp(const SourceImage& source, const BakedLut* reuse) const;

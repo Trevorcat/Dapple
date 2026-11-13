@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:ui' show Offset, Size;
 
+import 'bases.dart';
 import 'film_catalog.dart';
 
 const String kFilmMapAsset = 'assets/film/film_map.json';
@@ -28,8 +29,13 @@ Map<String, Offset> parseFilmMap(String? text) {
 }
 
 class FilmDot {
-  const FilmDot(this.stock, this.character, this.shown, {required this.placed});
-  final FilmStock stock;
+  const FilmDot(this.stock, this.character, this.shown, {required this.placed}) : modern = null;
+  const FilmDot.modern(ModernBase this.modern, this.character, this.shown, {required this.placed}) : stock = null;
+
+  /// The film stock, or null for a modern rendering ([modern]).
+  final FilmStock? stock;
+  final ModernBase? modern;
+  bool get isModern => modern != null;
 
   /// The measured character (x pale..rich, y low..high contrast), or the grid slot when [placed] is false.
   final Offset character;
@@ -39,8 +45,8 @@ class FilmDot {
 
   /// True when the position comes from the file.
   final bool placed;
-  String get id => stock.id;
-  String get name => stock.name;
+  String get id => stock?.id ?? modern!.id;
+  String get name => stock?.name ?? modern!.name;
 }
 
 /// The reference map the nudging works in (dp): the dots are 18 dp, so they keep at least [kFilmDotGap] between centres.
@@ -51,9 +57,19 @@ const double kFilmMapX = 0.38, kFilmMapY = 0.32; // fraction of the map's width 
 Offset _toRef(Offset c) => Offset((0.5 + c.dx * kFilmMapX) * kFilmMapRef.width, (0.5 - c.dy * kFilmMapY) * kFilmMapRef.height);
 Offset _fromRef(Offset p) => Offset((p.dx / kFilmMapRef.width - 0.5) / kFilmMapX, (0.5 - p.dy / kFilmMapRef.height) / kFilmMapY);
 
-/// Places the stocks of [catalog]. Deterministic.
-List<FilmDot> layoutFilmMap(FilmCatalog catalog, Map<String, Offset> positions) {
+/// Where the modern renderings sit when the asset does not name them: a separate cluster in the upper left corner, which no
+/// film stock occupies. These are NOT measured characters (the film map's axes are measured with the film pack): the cluster
+/// reads as "a different family", the order inside it carries no meaning.
+const kModernCluster = {
+  'modern_clean': Offset(-0.80, 0.50),
+  'modern_vivid': Offset(-0.52, 0.74),
+  'modern_soft': Offset(-0.52, 0.32),
+};
+
+/// Places the stocks of [catalog] and the modern renderings. Deterministic.
+List<FilmDot> layoutFilmMap(FilmCatalog catalog, Map<String, Offset> positions, {bool withModern = true}) {
   final stocks = catalog.stocks;
+  final modern = withModern ? kModernBases : const <ModernBase>[];
   final missing = [for (final s in stocks) if (!positions.containsKey(s.id)) s];
   // an automatic grid over the whole map for the stocks the file does not know
   final cols = math.max(1, math.sqrt(missing.length * 1.6).ceil());
@@ -62,7 +78,7 @@ List<FilmDot> layoutFilmMap(FilmCatalog catalog, Map<String, Offset> positions) 
     for (var i = 0; i < missing.length; i++)
       missing[i].id: Offset(cols == 1 ? 0 : -0.85 + 1.7 * (i % cols) / (cols - 1), rows == 1 ? 0 : 0.85 - 1.7 * (i ~/ cols) / (rows - 1)),
   };
-  final ch = [for (final s in stocks) positions[s.id] ?? slot[s.id]!];
+  final ch = [for (final s in stocks) positions[s.id] ?? slot[s.id]!, for (final m in modern) positions[m.id] ?? kModernCluster[m.id]!];
   final p = [for (final c in ch) _toRef(c)];
   // keep the dots inside the margin the four edge icons need (a little beyond the -1..1 square)
   final minX = kFilmMapRef.width * (0.5 - kFilmMapX * 1.12), maxX = kFilmMapRef.width * (0.5 + kFilmMapX * 1.12);
@@ -86,7 +102,10 @@ List<FilmDot> layoutFilmMap(FilmCatalog catalog, Map<String, Offset> positions) 
     }
     if (!moved) break;
   }
-  return [for (var i = 0; i < stocks.length; i++) FilmDot(stocks[i], ch[i], _fromRef(p[i]), placed: positions.containsKey(stocks[i].id))];
+  return [
+    for (var i = 0; i < stocks.length; i++) FilmDot(stocks[i], ch[i], _fromRef(p[i]), placed: positions.containsKey(stocks[i].id)),
+    for (var j = 0; j < modern.length; j++) FilmDot.modern(modern[j], ch[stocks.length + j], _fromRef(p[stocks.length + j]), placed: positions.containsKey(modern[j].id)),
+  ];
 }
 
 /// Smallest distance between two dots in the reference map (tests: no two touch).

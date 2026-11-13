@@ -15,9 +15,11 @@
 #include "dapple/film.h"
 #include "dapple/film_match.h"
 #include "dapple/look.h"
+#include "dapple/modern.h"
 #include "dapple/tone.h"
 #include "look_internal.h"
 #include "parallel.h"
+#include "engine/exec/engine_session.h"
 #include "engine/nodes/film/film_nodes.h"
 #include "frame_kernels.h"
 #include "spatial.h"
@@ -261,6 +263,8 @@ void Renderer::inputGain(const EditParams& params, const CameraProfile& camera, 
 Renderer::Renderer(const EditParams& params, const CameraProfile& camera, const Lut3D* lut)
     : p_(params), camera_(camera), lut_(lut) {
   p_.clamp();
+  // DAPPLE_ENGINE=off (the golden oracle) ignores the modern rendering family, as it ignores `hdr` (section 37)
+  if (isModernId(p_.filmStock) && engine::mode() == engine::Mode::Off) p_.filmStock.clear();
   whiteBalanceGain(p_, wbGain_);
 
   // Each curve = parametric (four regions) followed by the point curve.
@@ -455,6 +459,12 @@ SpatialParams makeSpatial(const EditParams& p, bool scene, const StyleMix& style
   sp.nrLuma = p.nrLuma / 100.f;
   sp.clarity = p.clarity / 100.f;
   sp.texture = p.texture / 100.f;
+  if (const ModernKind mk = modernKind(p.filmStock); mk != ModernKind::None) {  // local contrast of the modern rendering (section 37)
+    const ModernRecipe& r = modernRecipe(mk);
+    const float k = std::clamp(p.filmStrength / 100.f, 0.f, 1.f);
+    sp.clarity = std::clamp((p.clarity + r.clarity * k) / 100.f, -1.f, 1.f);
+    sp.texture = std::clamp((p.texture + r.texture * k) / 100.f, -1.f, 1.f);
+  }
   sp.dehaze = p.dehaze / 100.f;
   sp.grain = std::min(100.f, p.grain + style.grain) / 100.f;
   return sp;
@@ -490,10 +500,28 @@ struct Renderer::PointOp {
   ToneAnalysis analysis;
   bool hasAnalysis = false;
 
-  // Tone: ratio by which the luminance Y of a (post-gain) pixel is scaled; hue-preserving, so the
-  // whole stage is a function of Y alone.
-  float toneRatio(float Y) const {
-    if (!(Y > 1e-7f)) return 1.f;
+  // The modern rendering family (section 37): resolved once per render. `s` = strength 0..1.
+  struct Modern {
+    bool active = false, tone = false;
+    float s = 0.f;
+    float contrast = 1.f, chroma = 1.f, blueDeep = 0.f, skinGuard = 0.f, lift = 0.f, tintA = 0.f, tintB = 0.f;
+    float pb = 0.f, pw = 1.f, shoulderK = 1.f;  // encoded end points (user tone edits applied), shoulder share kept
+    float tm = 0.5f, ym = 0.5f;  // pivot: mid-grey
+  } mod;
+
+  // The user's tone edits (contrast / highlights / shadows / whites / blacks) on the exposure value, without the standard toe and shoulder.
+  float userY(float Y) const {
+    float e = std::log2(std::max(Y, 1e-9f) / kMidGrey);
+    e += 0.45f * contrast * e / (1.f + (e / 4.f) * (e / 4.f));
+    if (hi != 0) e += hi * 1.2f * smoothstep(-0.5f, 2.5f, e);
+    if (sh != 0) e += sh * 1.3f * smoothstep(0.5f, -4.f, e);
+    if (wh != 0) e += wh * 0.7f * smoothstep(1.f, 3.f, e);
+    if (bl != 0) e += bl * 0.9f * smoothstep(-3.f, -6.5f, e);
+    return kMidGrey * std::exp2(e);
+  }
+
+  // The standard tone curve (before the tonal-class move): display-linear luminance of a post-gain luminance.
+  float stdTone(float Y) const {
     float e = std::log2(Y / kMidGrey);
     e += 0.45f * contrast * e / (1.f + (e / 4.f) * (e / 4.f));
     if (scene) e -= kToeStops * smoothstep(kToeStart, kToeEnd, e);
@@ -503,8 +531,79 @@ struct Renderer::PointOp {
     if (bl != 0) e += bl * 0.9f * smoothstep(-3.f, -6.5f, e);
     float Yd = kMidGrey * std::exp2(e);
     if (scene) Yd = shoulder(Yd);
+    return Yd;
+  }
+
+  // The modern tone curve at strength s: end points -> display black / white, mid-grey fixed at its standard value, blended with the
+  // standard curve in encoded display units (so every strength keeps mid-grey and is monotone).
+  float modernTone(float Y, float Ystd) const {
+    const float y1 = modernEncode(userY(Y));
+    const float t = (y1 - mod.pb) / std::max(mod.pw - mod.pb, 1e-4f);
+    const float ym = modernCurve(t, mod.tm, mod.ym, mod.contrast, mod.shoulderK);
+    return modernDecode((1.f - mod.s) * modernEncode(Ystd) + mod.s * ym);
+  }
+
+  // Tone: ratio by which the luminance Y of a (post-gain) pixel is scaled; hue-preserving, so the
+  // whole stage is a function of Y alone.
+  float toneRatio(float Y) const {
+    if (!(Y > 1e-7f)) return 1.f;
+    float Yd = stdTone(Y);
+    if (mod.tone) Yd = modernTone(Y, Yd);
     if (!toneMove.identity) Yd = srgbDecode(toneMove(srgbEncode(Yd)));
     return Yd / Y;
+  }
+
+  static float hueDist(float h, float c) {
+    float d = std::fabs(h - c);
+    return d > 180.f ? 360.f - d : d;
+  }
+
+  // Modern colour, before the user's colour edits: chroma rises in the mid-tones (lightness window), less where the colour is already
+  // strong (soft per-hue ceiling: blues and greens deep, not neon), withheld in the skin window (OKLab hue 52 +- 20 deg, C 0.03 .. 0.2,
+  // L 0.3 .. 0.95: a window of the colour space, no face detection), blue / cyan a little deeper. Hue is never touched.
+  void modernBase(float& L, float& C, float hDeg) const {
+    const float wL = smoothstep(0.10f, 0.42f, L) * (1.f - smoothstep(0.88f, 0.99f, L));
+    const float dSkin = hueDist(hDeg, 52.f) / 20.f;
+    const float wSkin = std::exp(-dSkin * dSkin) * smoothstep(0.02f, 0.05f, C) * (1.f - smoothstep(0.14f, 0.22f, C)) *
+                        smoothstep(0.30f, 0.50f, L) * (1.f - smoothstep(0.92f, 1.0f, L));
+    const float dG = hueDist(hDeg, 142.f) / 30.f, dB = hueDist(hDeg, 264.f) / 26.f;
+    const float wG = std::exp(-dG * dG), wB = std::exp(-dB * dB);
+    const float cap = 0.30f - 0.10f * wG - 0.09f * wB;
+    const float room = 1.f - smoothstep(0.55f * cap, cap, C);
+    C *= 1.f + (mod.chroma - 1.f) * wL * (1.f - mod.skinGuard * wSkin) * room;
+    L -= mod.blueDeep * wB * smoothstep(0.04f, 0.12f, C) * wL;
+    L += mod.lift * wL * smoothstep(0.02f, 0.08f, C);  // colours only: neutral mid-grey stays where the anchor put it
+  }
+
+  // Gamut mapping by chroma compression, in OKLab at constant lightness and hue: kmax = the largest scale of (a, b) that still fits
+  // the sRGB cube (bisection), u = 1 / kmax = how far the colour is towards (u = 1) or beyond (u > 1) the boundary; a smooth knee
+  // maps u to u' (identity up to 0.88, then an exponential approach to 1: nothing is clipped, the gradation of over-saturated colours
+  // survives). The mapping is blended in with the strength; the standard chord below only sees what is left.
+  void modernChromaCompress(float& L, float& a, float& b) const {
+    if (std::hypot(a, b) < 2e-3f) return;
+    L = std::min(L, 1.f);
+    auto fits = [&](float k) {
+      const float lab[3] = {L, k * a, k * b};
+      float r[3];
+      oklabToLinearSrgb(lab, r);
+      return r[0] >= -2e-4f && r[1] >= -2e-4f && r[2] >= -2e-4f && r[0] <= 1.0002f && r[1] <= 1.0002f && r[2] <= 1.0002f;
+    };
+    float kmax = 3.f;
+    if (!fits(kmax)) {
+      float lo = 0.f, hi = 3.f;
+      for (int i = 0; i < 9; ++i) {
+        const float mid = 0.5f * (lo + hi);
+        (fits(mid) ? lo : hi) = mid;
+      }
+      kmax = lo;
+    }
+    constexpr float k0 = 0.88f;
+    const float u = kmax > 1e-4f ? 1.f / kmax : 1e4f;
+    if (u <= k0) return;
+    const float f = (k0 + (1.f - k0) * (1.f - std::exp(-(u - k0) / (1.f - k0)))) / u;
+    const float fs = 1.f - mod.s * (1.f - f);
+    a *= fs;
+    b *= fs;
   }
 
   // `v_in` = scene-linear ProPhoto after white balance and exposure gain (>= 0); e3 = sRGB-encoded
@@ -545,6 +644,7 @@ struct Renderer::PointOp {
       float hDeg = h * 180.f / kPi;
       if (hDeg < 0) hDeg += 360.f;
 
+      if (mod.active) modernBase(L, C, hDeg);
       if (anyHsl && chromaW > 0) {
         float w[kHslBandCount];
         bandWeights(hDeg, w);
@@ -600,12 +700,23 @@ struct Renderer::PointOp {
         b += gS.b * ws + gM.b * wm + gH.b * whl + gG.b;
         L += gS.dl * ws + gM.dl * wm + gH.dl * whl + gG.dl;
       }
+      if (mod.active) {  // saturation roll-off towards white: colour fades with lightness instead of clipping
+        // highlight bias on near-neutral highlights only (hue of a real colour is never touched)
+        const float wT = smoothstep(0.62f, 0.90f, L) * (1.f - smoothstep(0.01f, 0.05f, std::hypot(a, b)));
+        a += mod.tintA * wT;
+        b += mod.tintB * wT;
+        const float fade = 1.f - mod.s * smoothstep(0.94f, 1.0f, L);
+        a *= fade;
+        b *= fade;
+        modernChromaCompress(L, a, b);
+      }
       const float lab2[3] = {L, a, b};
       oklabToLinearSrgb(lab2, rgb);
     }
 
     // ---- gamut map into [0,1] towards same-luminance grey ----
     float Ys = std::clamp(srgbLuma(rgb), 0.f, 1.f);
+
     const float mn = std::min({rgb[0], rgb[1], rgb[2]});
     if (mn < 0.f) {
       const float t = Ys / std::max(1e-7f, Ys - mn);
@@ -696,7 +807,61 @@ Renderer::PointOp Renderer::makePointOp(const SourceImage& source, const BakedLu
     }
   }
 
-  op.colorStage = op.anyHsl || op.anyGrade || op.sat != 0 || op.vib != 0 || matchOn || op.style.active;
+  if (const ModernKind mk = modernKind(p_.filmStock); mk != ModernKind::None && p_.filmStrength > 0.f) {
+    const ModernRecipe& r = modernRecipe(mk);
+    const float s = std::clamp(p_.filmStrength / 100.f, 0.f, 1.f);
+    PointOp::Modern& m = op.mod;
+    m.active = true;
+    m.s = s;
+    m.contrast = r.contrast;
+    m.chroma = 1.f + (r.chroma - 1.f) * s;
+    m.blueDeep = r.blueDeep * s;
+    m.skinGuard = r.skinGuard;
+    m.lift = r.lift * s;
+    m.tintA = r.tintMag * s * std::cos(r.tintHue * kPi / 180.f);
+    m.tintB = r.tintMag * s * std::sin(r.tintHue * kPi / 180.f);
+    {
+      // scene end points from the proxy (or a small sample of the source): white balance and the camera baseline, NOT the user's exposure
+      const SourceImage& img = modernProxy_ ? *modernProxy_ : source;
+      const int W = img.linear.width, H = img.linear.height;
+      const int stride = std::max(1, std::max(W, H) / 256);
+      const float baseGain = std::exp2(scene ? camera_.baselineExposureEv : 0.f);
+      std::vector<float> Y, S;
+      Y.reserve(std::size_t((W / stride + 1) * (H / stride + 1)));
+      S.reserve(Y.capacity());
+      for (int y = 0; y < H; y += stride) {
+        const int y1 = std::min(H - 1, y + stride / 2);
+        for (int x = 0; x < W; x += stride) {
+          const int x1 = std::min(W - 1, x + stride / 2);
+          const float* a = img.linear.row(y1) + 3 * x1;
+          const float v[3] = {a[0] * wbGain_[0] * baseGain, a[1] * wbGain_[1] * baseGain, a[2] * wbGain_[2] * baseGain};
+          Y.push_back(proPhotoLuma(v));
+          const float mx = std::max({v[0], v[1], v[2]}), mn = std::min({v[0], v[1], v[2]});
+          S.push_back(mx > 1e-6f ? (mx - mn) / mx : 0.f);
+        }
+      }
+      const ModernEnds ends = modernEnds(Y.data(), Y.size(), kMidGrey);
+      m.tone = true;
+      m.pb = modernEncode(op.userY(ends.black));
+      m.pw = modernEncode(op.userY(ends.white));
+      {  // where the mass of the picture is (section 37): empty middle -> smaller black pull; mass in the upper / lower tones -> flatter slope
+        std::vector<float> E(Y.size());
+        for (std::size_t i = 0; i < Y.size(); ++i) E[i] = modernEncode(op.userY(Y[i]));
+        const ModernDist d0 = modernDistribution(E.data(), S.data(), E.size(), m.pb, m.pw);
+        m.pb *= 1.f - 0.6f * d0.gap;
+        m.lift *= 1.f - d0.wHi;  // no airy lift on a picture that is already bright
+        m.shoulderK = 1.f - 0.7f * d0.wHi;  // mass in the upper tones: the upper piece stays straight (no lift of the background)
+        m.pw = modernEncode(modernDecode(m.pw) * (1.f + 0.7f * d0.wHi));  // a large bright area keeps headroom above it instead of being driven to white
+        const ModernDist d1 = modernDistribution(E.data(), S.data(), E.size(), m.pb, m.pw);
+        m.contrast = 1.f + (r.contrast - 1.f) * (1.f - 0.85f * std::max(d1.wHi, d1.wLo));
+        if (std::getenv("DAPPLE_MODERN_LOG")) std::fprintf(stderr, "modern: black %.4f white %.4f wHi %.2f wLo %.2f gap %.2f contrast %.3f tm %.3f ym %.3f\n", double(modernDecode(m.pb)), double(modernDecode(m.pw)), double(d1.wHi), double(d1.wLo), double(d0.gap), double(m.contrast), double((modernEncode(op.userY(kMidGrey)) - m.pb) / (m.pw - m.pb)), double(modernEncode(op.stdTone(kMidGrey))));
+      }
+      const float pm = modernEncode(op.userY(kMidGrey));
+      m.tm = (pm - m.pb) / std::max(m.pw - m.pb, 1e-4f);
+      m.ym = modernEncode(op.stdTone(kMidGrey));
+    }
+  }
+  op.colorStage = op.anyHsl || op.anyGrade || op.sat != 0 || op.vib != 0 || matchOn || op.style.active || op.mod.active;
   op.lut = lut_;
   op.lutMix = std::clamp(p_.lutAmount / 100.f, 0.f, 1.f);
   op.fade = op.style.fade;
@@ -705,6 +870,12 @@ Renderer::PointOp Renderer::makePointOp(const SourceImage& source, const BakedLu
   op.green = &green_;
   op.blue = &blue_;
   return op;
+}
+
+float Renderer::modernSdrWhite(const SourceImage& source) const {
+  const PointOp op = makePointOp(source, nullptr);
+  if (!op.mod.tone) return 1.f;
+  return std::pow(std::max(modernDecode(op.mod.pw), 1e-4f), op.mod.s);
 }
 
 // ---- film simulation stage ----------------------------------------------------------------------------------
@@ -1063,12 +1234,20 @@ float hdrShownRange(const std::vector<float>& tone) {
 
 }  // namespace
 
+// The strength of the single-image HDR the frame asks for: the user's `hdr`, at least the modern rendering's own share (section 37).
+static float effectiveHdr(const EditParams& p) {
+  float h = p.hdr;
+  if (const ModernKind mk = modernKind(p.filmStock); mk != ModernKind::None)
+    h = std::max(h, modernRecipe(mk).hdr * std::clamp(p.filmStrength / 100.f, 0.f, 1.f));
+  return h;
+}
+
 // The user's 100 is internal strength 0.65 (round 2 review: the internal 100 greys foliage and darkens shadows); the stored value stays 0..100.
 constexpr float kHdrUserMax = 0.65f;
 
 void Renderer::hdrBind(const SourceImage& source, FramePlan::Hdr& out, const std::vector<float>* tone) const {
   out = FramePlan::Hdr{};
-  if (!(p_.hdr > 0.f) || !source.sceneReferred) return;
+  if (!(effectiveHdr(p_) > 0.f) || !source.sceneReferred) return;
   const FilmRun fr = resolveFilm(p_);
   if (fr.stock && fr.strength > 0.f) return;  // the film branch takes the source before this stage (not implemented there)
   const float expoLog2 = p_.exposure + camera_.baselineExposureEv;
@@ -1077,7 +1256,7 @@ void Renderer::hdrBind(const SourceImage& source, FramePlan::Hdr& out, const std
   const std::shared_ptr<const HdrField> f = hdr::fieldFor(source, wbGain_);
   if (!f) return;
   const float T = tone ? hdrShownRange(*tone) : 8.f;
-  const HdrParams hp = hdr::resolve(*f, kHdrUserMax * std::clamp(p_.hdr, 0.f, 100.f) / 100.f, expoLog2, source.meta.iso, gain, T);
+  const HdrParams hp = hdr::resolve(*f, kHdrUserMax * std::clamp(effectiveHdr(p_), 0.f, 100.f) / 100.f, expoLog2, source.meta.iso, gain, T);
   out.range = hp.hi - hp.lo, out.shown = T;
   if (!hp.active()) return;  // the scene fits the range the tone curve shows: nothing to compress
   out.s = hp.s, out.ev = hp.ev, out.key = hp.key, out.yn = hp.yn, out.yclip = hp.yclip, out.lo = hp.lo, out.hi = hp.hi, out.ls = hp.ls, out.hp = hp.hp;
@@ -1715,7 +1894,7 @@ struct FrameKernels::Impl {
     vig = r.p_.vignette / 100.f;
     useGeo = geo.active || region;
     exactMap = geo.exact && !region;
-    if (r.p_.hdr > 0.f) {
+    if (effectiveHdr(r.p_) > 0.f) {
       std::vector<float> exactTone;
       if (exact) fillToneTable(exactTone, *exactOp);
       r.hdrBind(source, hdr, exact ? &exactTone : &lut->tone);

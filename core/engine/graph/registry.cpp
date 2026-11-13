@@ -32,7 +32,7 @@ NodeRegistry::NodeRegistry() {
   }();
   const ParamMask TONE = P.mask({"contrast", "highlights", "shadows", "whites", "blacks"});
   const ParamMask WB = P.mask({"temp", "tint"});
-  ParamMask COLOUR = P.mask({"vibrance", "saturation", "look", "lookStrength", "palette", "curve_rgb", "curve_r",
+  ParamMask COLOUR = P.mask({"modern", "vibrance", "saturation", "look", "lookStrength", "palette", "curve_rgb", "curve_r",
                              "curve_g", "curve_b", "lutAmount"});
   COLOUR.add(byPrefix(P, "hsl_")).add(byPrefix(P, "gr_")).add(byPrefix(P, "cv_"));
   const ParamMask LOOK = P.mask({"look", "lookStrength", "palette"});
@@ -77,7 +77,7 @@ NodeRegistry::NodeRegistry() {
 
   // The field is a function of the source, the white balance and the exposure (all inherited through the keyed edge from Gain) and of
   // the ISO (ctx.source); the strength is the node's own key.
-  def(NodeType::Hdr, "Hdr", Domain::Image, Footprint::Point, 1, 1, P.mask({"hdr", "ctx.source"}));
+  def(NodeType::Hdr, "Hdr", Domain::Image, Footprint::Point, 1, 1, P.mask({"hdr", "modern", "ctx.source"}));
 
   // ---- tables (always CPU, cached) ---------------------------------------------------------------------------------------
   {
@@ -101,7 +101,7 @@ NodeRegistry::NodeRegistry() {
   }
   {
     ParamMask m = TONE;
-    m.add(P.mask({"toneStrength", "ctx.camera", "ctx.source", "ctx.fastAnalysis"}));
+    m.add(P.mask({"toneStrength", "modern", "ctx.proxy", "ctx.camera", "ctx.source", "ctx.fastAnalysis"})).add(WB);  // WB: the modern end points are measured after the white balance
     NodeDesc& d = def(NodeType::ToneTable, "ToneTable", Domain::Table, Footprint::Global, 0, 1, m);
     d.inputDomain[0] = Domain::Table;  // ToneAnalysisPre when toneStrength > 0
     d.cache = CacheHint::Keep;
@@ -142,7 +142,7 @@ NodeRegistry::NodeRegistry() {
   spatial(NodeType::NRLuma, "NRLuma", Footprint::Window, {"nrLuma", "ctx.noise"}, "box radii scale with the frame (running sums)");
   spatial(NodeType::NRChroma, "NRChroma", Footprint::Window, {"nrColor", "ctx.noise"}, "box on 1/2-grid chroma");
   spatial(NodeType::Dehaze, "Dehaze", Footprint::Composite, {"dehaze"}, "dark channel on a 1/4 grid + global airlight");
-  spatial(NodeType::Detail, "Detail", Footprint::Composite, {"clarity", "texture", "sharpen", "sharpRadius"},
+  spatial(NodeType::Detail, "Detail", Footprint::Composite, {"clarity", "texture", "sharpen", "sharpRadius", "modern"},
           "guided base + detail passes");
   spatial(NodeType::Grain, "Grain", Footprint::Point, {"grain", "ctx.activeParam", "ctx.filmOnly"}, "hash on frame coordinates");
   def(NodeType::Pack8, "Pack8", Domain::Image, Footprint::Sink, 1, 1, ParamMask{});

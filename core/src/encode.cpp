@@ -84,12 +84,34 @@ bool encodeAll(const Image8& image, int quality, std::vector<std::uint8_t>& out)
   out.clear();
   return stbi_write_jpg_to_func(vecSink, &out, image.width, image.height, 3, image.data.data(), quality) != 0;
 }
+
+// Metadata segments around stb's JFIF header: SOI, Exif (APP1), JFIF (APP0), ICC (APP2), then the tables and the scan. Done on the finished stream, so
+// the threaded strip path and the single encode get the same treatment.
+void addSegments(const JpegOptions& o, std::vector<std::uint8_t>& s) {
+  if (o.exifSegment.empty() && o.iccSegment.empty()) return;
+  const bool jfif = s.size() >= 20 && s[2] == 0xFF && s[3] == 0xE0 && s[4] == 0x00 && s[5] == 0x10 && std::memcmp(&s[6], "JFIF", 4) == 0;
+  const std::size_t afterApp0 = jfif ? 20 : 2;
+  std::vector<std::uint8_t> r;
+  r.reserve(s.size() + o.exifSegment.size() + o.iccSegment.size());
+  r.insert(r.end(), s.begin(), s.begin() + 2);
+  r.insert(r.end(), o.exifSegment.begin(), o.exifSegment.end());
+  r.insert(r.end(), s.begin() + 2, s.begin() + std::ptrdiff_t(afterApp0));
+  r.insert(r.end(), o.iccSegment.begin(), o.iccSegment.end());
+  r.insert(r.end(), s.begin() + std::ptrdiff_t(afterApp0), s.end());
+  s.swap(r);
+}
+
+bool encodeWith(const Image8& image, const JpegOptions& o, std::vector<std::uint8_t>& out) {
+  if (!encodeAll(image, o.quality, out)) return false;
+  addSegments(o, out);
+  return true;
+}
 }  // namespace
 
 Result<std::vector<std::uint8_t>> encodeJpeg(const Image8& image, const JpegOptions& options) {
   if (image.width <= 0 || image.height <= 0) return fail("empty image");
   std::vector<std::uint8_t> bytes;
-  if (!encodeAll(image, options.quality, bytes)) return fail("JPEG encode failed");
+  if (!encodeWith(image, options, bytes)) return fail("JPEG encode failed");
   return bytes;
 }
 
@@ -104,7 +126,7 @@ Result<void> writeJpeg(const Image8& image, const std::filesystem::path& path, c
     std::ofstream out(tmp, std::ios::binary);
     if (!out) return fail("Cannot write " + pathToUtf8(path));
     std::vector<std::uint8_t> bytes;
-    const bool ok = encodeAll(image, options.quality, bytes);
+    const bool ok = encodeWith(image, options, bytes);
     if (ok) out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
     out.flush();
     if (!ok || !out) {

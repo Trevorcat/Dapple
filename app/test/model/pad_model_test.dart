@@ -250,7 +250,7 @@ void main() {
       final positions = {
         for (final s in testFilmCatalog.stocks) s.id: Offset(((s.id.hashCode % 100) - 50) / 60, ((s.id.hashCode ~/ 100 % 100) - 50) / 60),
       };
-      final dots = layoutFilmMap(testFilmCatalog, positions);
+      final dots = layoutFilmMap(testFilmCatalog, positions, withModern: false);
       expect(dots.length, testFilmCatalog.stocks.length);
       expect(minDotDistance(dots), greaterThanOrEqualTo(kFilmDotGap - 1.0));
       for (final d in dots) {
@@ -260,7 +260,7 @@ void main() {
     });
 
     test('stocks missing from the file go on an automatic grid, still without touching', () {
-      final dots = layoutFilmMap(testFilmCatalog, const {});
+      final dots = layoutFilmMap(testFilmCatalog, const {}, withModern: false);
       expect(dots.length, testFilmCatalog.stocks.length);
       expect(dots.every((d) => !d.placed), isTrue);
       expect(minDotDistance(dots), greaterThanOrEqualTo(kFilmDotGap - 1.0));
@@ -285,7 +285,7 @@ void main() {
     });
 
     test('the nearest dot is found by drawn position', () {
-      final dots = layoutFilmMap(testFilmCatalog, const {});
+      final dots = layoutFilmMap(testFilmCatalog, const {}, withModern: false);
       final d = dots[3];
       expect(nearestDot(dots, d.shown + const Offset(0.001, 0.001))!.id, d.id);
     });

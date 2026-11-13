@@ -47,7 +47,7 @@ Result<DevelopResult> Developer::develop(const DevelopRequest& req) const {
 
   result.applied.filmSceneX = source->meta.asShotIlluminantXy[0];  // film white balance: the scene's as-shot illuminant
   result.applied.filmSceneY = source->meta.asShotIlluminantXy[1];
-  if (!result.applied.filmStock.empty()) {  // film exposure that keeps the photo's key (film_match.h)
+  if (!result.applied.filmStock.empty() && !isModernId(result.applied.filmStock)) {  // film exposure that keeps the photo's key (film_match.h)
     SourceImage proxy;
     proxy.sceneReferred = source->sceneReferred;
     proxy.linear = resizeToLongEdge(source->linear, 256);

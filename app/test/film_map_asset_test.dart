@@ -8,7 +8,14 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test('film_map.json covers the camera stocks, in range, codes match film_names.dart', () {
-    final m = jsonDecode(File('assets/film/film_map.json').readAsStringSync()) as Map<String, dynamic>;
+    final all = jsonDecode(File('assets/film/film_map.json').readAsStringSync()) as Map<String, dynamic>;
+    // the modern renderings (kind: modern) sit in a separate cluster, not at measured positions
+    final modern = {for (final e in all.entries) if ((e.value as Map)['kind'] == 'modern') e.key: e.value};
+    expect(modern.keys.toSet(), {'modern_clean', 'modern_vivid', 'modern_soft'});
+    for (final v in modern.values) {
+      expect((v as Map)['measured'], isFalse);
+    }
+    final m = {for (final e in all.entries) if (!modern.containsKey(e.key)) e.key: e.value};
     final stocks = kFilmDisplayNames.keys.where((id) => File('../core/data/film/profiles/$id.json').readAsStringSync().contains('"stage": "filming"'));
     expect(m.keys.toSet(), stocks.toSet());
     for (final e in m.entries) {

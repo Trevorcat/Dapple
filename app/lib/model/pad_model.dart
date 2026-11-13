@@ -9,6 +9,7 @@
 import 'dart:math' as math;
 import 'dart:ui' show Offset;
 
+import 'bases.dart';
 import 'catalog.dart';
 import 'params.dart';
 
@@ -95,7 +96,7 @@ PadItem _s(String id, String label, String Function(double) f, {double step = 1}
 
 /// The items (spokes of the radar) of [cat]. [printed]: the stock is a printed negative, so the print warmth / tint
 /// filters exist.
-List<PadItem> padItems(PadCat cat, {bool printed = true}) {
+List<PadItem> padItems(PadCat cat, {bool printed = true, bool modern = false}) {
   switch (cat) {
     case PadCat.light:
       return [
@@ -118,6 +119,8 @@ List<PadItem> padItems(PadCat cat, {bool printed = true}) {
         const PadItem('lookStrength', '风格强度', 0, 100, 100, _pct, kind: ItemKind.look),
       ];
     case PadCat.film:
+      // a modern rendering has the strength only (the rest is the film pack: shoot, print, black, white balance, latitude, grain, halation)
+      if (modern) return [_s('film_strength', '强度', _pct)];
       return [
         _s('film_shoot', '拍摄曝光', _sg100, step: 0.01),
         _s('film_print', '冲印深浅', _sg100, step: 0.01),
@@ -307,7 +310,24 @@ EditState applyPadState(EditState e, PadCat cat, PadState s, PadCtx ctx) {
     }
     out = writeItem(out, it, (r[it.id] ?? it.auto) + (s.off[it.id] ?? 0), ctx);
   }
+  if (cat == PadCat.film && isModernId(out.film)) out = dropFilmOnlyValues(out); // the strip's upper half would write grain etc.
   return withPad(out, cat, s);
+}
+
+/// The film-pack controls mean nothing for a modern rendering: back to their defaults (film_strength stays).
+EditState dropFilmOnlyValues(EditState e) {
+  if (!e.values.keys.any((k) => filmValueKeys.contains(k) && k != 'film_strength')) return e;
+  final m = Map<String, double>.of(e.values)..removeWhere((k, v) => filmValueKeys.contains(k) && k != 'film_strength');
+  return e.copyWith(values: m);
+}
+
+/// [e] with the modern rendering [id] as its base: the film-pack controls and the paper go back to their defaults; the strength
+/// stays, and the film pad keeps its strength strip but not its cursor (both its axes are dead for a modern base).
+EditState withModernBase(EditState e, String id) {
+  final p = Map<String, PadState>.of(e.pads);
+  final pad = p[PadCat.film.name];
+  if (pad != null) p[PadCat.film.name] = PadState(a: pad.a);
+  return dropFilmOnlyValues(e).copyWith(film: id, filmPaper: null, pads: p);
 }
 
 /// Stores [s] (dropping offsets that are zero; a pad at the centre is simply absent).

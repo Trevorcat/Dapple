@@ -283,6 +283,8 @@ static Image8 toImage8(const Dec& d) {
   return im;
 }
 
+extern "C" float dapple_internal_modern_white_ev(DappleSession* session, const char* params_json);
+
 // exports `params` three ways from one session and checks the contract; returns the info
 static DappleHdrInfo exportAndCheck(DappleSession* s, const char* params, int longEdge, const fs::path& dir, const std::string& tag, bool expectGain, Bytes* fileOut = nullptr) {
   const fs::path sdrPath = dir / (tag + "_sdr.jpg"), hdrPath = dir / (tag + "_hdr.jpg");
@@ -325,11 +327,30 @@ static DappleHdrInfo exportAndCheck(DappleSession* s, const char* params, int lo
     char buf[64];
     float e0 = 0.f;
     if (const char* k = std::strstr(params, "\"exposureEv\"")) e0 = float(std::atof(std::strchr(k, ':') + 1));
-    std::snprintf(buf, sizeof buf, "{\"exposureEv\":%.4f}", e0 - info.headroom_stops);
+    // a modern rendering: the bright rendition is the standard rendering lowered so that the picture's own white point sits at SDR white too
+    std::snprintf(buf, sizeof buf, "{\"exposureEv\":%.4f}", e0 - info.headroom_stops - dapple_internal_modern_white_ev(s, params));
     const fs::path brPath = dir / (tag + "_bright.jpg");
     CHECK(dapple_session_export_jpeg(s, buf, "", longEdge, 100, brPath.string().c_str()) == DAPPLE_OK);
     Dec br;
     CHECK(decode(readAll(brPath), 3, br) && br.w == b.w && br.h == b.h);
+    if (b.w == br.w && b.w) {  // colour of the excess: the gain map is one channel, so the displayed highlight is the SDR pixel scaled: its colour is the SDR (family) colour
+      double spread = 0, hueMax = 0;
+      std::size_t n = 0;
+      for (std::size_t k = 0; k < std::size_t(b.w) * b.h; ++k) {
+        const float c[3] = {srgbToLinear(sdrImg.data[3 * k] / 255.f), srgbToLinear(sdrImg.data[3 * k + 1] / 255.f), srgbToLinear(sdrImg.data[3 * k + 2] / 255.f)};
+        const float yS = lumaLin(c), yR = lumaLin(&rec.data[3 * k]);
+        if (yR < 1.4f * yS || yS < 0.2f) continue;
+        float mx = 0.f, mn = 1e9f;
+        for (int q = 0; q < 3; ++q) {
+          const float r = (rec.data[3 * k + q] + 1e-4f) / (c[q] + 1e-4f);
+          mx = std::max(mx, r), mn = std::min(mn, r);
+        }
+        spread += mx / mn - 1.f;
+        hueMax = std::max<double>(hueMax, mx / mn - 1.f);
+        ++n;
+      }
+      std::printf("  %s: colour of the excess, %zu highlight pixels: per-channel ratio rec / SDR differs by %.4f on average, %.4f at most (0 = same colour as the SDR rendition)\n", tag.c_str(), n, n ? spread / double(n) : 0.0, hueMax);
+    }
     if (br.w == b.w) {
       const ImageF ref = hdrLinear(sdrImg, toImage8(br), info.headroom_stops);
       const BlockStats bs = blockStats(rec, ref, sdrImg);
@@ -361,6 +382,23 @@ static void testSession() {
   // film: a print, paper white is the top -> plain JPEG
   const DappleHdrInfo fi = exportAndCheck(se.s, "{\"film\":\"kodak_gold_200\"}", 1200, dir, "film", false);
   CHECK(fi.reason == 2);
+  // a modern rendering is no film: headroom is measured above its own white point (section 37); the base stays the SDR export byte for byte
+  for (const char* id : {"modern_clean", "modern_vivid", "modern_soft"}) {
+    const std::string pj = std::string("{\"film\":\"") + id + "\"}";
+    DappleHdrInfo mp{};
+    CHECK(dapple_session_hdr_headroom(se.s, pj.c_str(), "", &mp) == DAPPLE_OK);
+    CHECK(mp.reason != 2);
+    const DappleHdrInfo me = exportAndCheck(se.s, pj.c_str(), 1200, dir, id, mp.written != 0);
+    std::printf("  %s: written %d reason %d H %.2f peak %.2f gain max %.3f\n", id, me.written, me.reason, double(me.headroom_stops), double(me.peak), double(me.gain_max));
+  }
+  {
+    DappleHdrInfo mp{};
+    const std::string pj = "{\"film\":\"modern_clean\",\"exposureEv\":1.0}";
+    CHECK(dapple_session_hdr_headroom(se.s, pj.c_str(), "", &mp) == DAPPLE_OK);
+    const DappleHdrInfo me = exportAndCheck(se.s, pj.c_str(), 1200, dir, "modern_bright", mp.written != 0);
+    CHECK(me.written != 0);
+    std::printf("  modern_clean +1 EV: written %d H %.2f peak %.2f gain max %.3f\n", me.written, double(me.headroom_stops), double(me.peak), double(me.gain_max));
+  }
   // an explicit headroom of 2 stops on a bright exposure
   DappleHdrInfo info{};
   const fs::path out = dir / "explicit.jpg";

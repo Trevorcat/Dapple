@@ -151,3 +151,9 @@ core/bake_fast_analysis 35e6f8d52f87c342
 hdr/hdr_50 ab7d25c6092a919d:7e3834f605d2526e
 hdr/hdr_100_interactive 277681ef9b98abec:2f09057cf1541aa1
 hdr/hdr_100_exact_clarity f8303039351460f3
+modern/clean af742c21434d6feb:f95e750fbfe927e2
+modern/vivid f1491667930f96ce:8711d4d5d7e0908f
+modern/soft 1d8b88c34013d135:9fe69f866ddc912c
+modern/vivid_interactive f1491667930f96ce:886413d09a7143b9
+modern/clean_55_look_edits dd39b50e5f75b039:044685dc539ba85f
+modern/vivid_exact_clarity 7b8a9c4f1595e929

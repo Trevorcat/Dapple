@@ -9,7 +9,11 @@ import '../../editor/gesture_arbiter.dart';
 import '../../editor/handedness.dart';
 import '../../editor/haptics.dart';
 import '../../editor/window_manager.dart';
+import '../../model/bases.dart';
 import '../../model/film_pad.dart';
+import '../../services/base_swatch_sources.dart';
+import '../../services/base_swatches.dart';
+import '../../models.dart' show Photo;
 import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../services/editor_engine.dart';
@@ -78,6 +82,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
     required this.onSwipe,
     required this.onToggleImmersive,
     this.filmPadFetcher,
+    this.swatchSource,
   }) {
     edits.addListener(_maybeRefreshRanges);
   }
@@ -97,6 +102,31 @@ class EditorController extends ChangeNotifier implements GestureSink {
   /// Tests inject a fake.
   final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
 
+  /// Where the base swatches come from; null = the engine through the photo's session. Tests inject a fake.
+  final SwatchSource Function(String photoId)? swatchSource;
+
+  BaseSwatches? _swatches;
+  String? _swatchesPhoto;
+
+  /// The swatches of the bases on the photo now open (one service per photo; the previous photo's is stopped). Not started:
+  /// call [BaseSwatches.start] (the film pad and the film map do).
+  BaseSwatches get swatches {
+    final pid = id;
+    final cur = _swatches;
+    if (cur != null && _swatchesPhoto == pid && !cur.closed) return cur;
+    cur?.dispose();
+    _swatchesPhoto = pid;
+    final ph = app.photoById(pid);
+    final src = swatchSource?.call(pid) ?? SessionSwatchSource(app, ph ?? Photo(id: pid, name: pid, addedMs: 0));
+    final ids = allBaseIds(app.film);
+    // the current base first, then the modern renderings and the film stocks in the order of the map
+    final first = edit.film;
+    return _swatches = BaseSwatches(source: src, ids: [first, ...ids.where((x) => x != first)]);
+  }
+
+  /// Starts the background swatches (idempotent); the film pad does it as soon as it shows.
+  void warmSwatches() => swatches.start();
+
   final PanelSel sel = PanelSel();
 
   /// Which ends of the film pad axes change the render for the current photo and stock. Everything is effective until
@@ -113,10 +143,12 @@ class EditorController extends ChangeNotifier implements GestureSink {
     if (sig == _rangesSig) return;
     _rangesSig = sig;
     _rangesTimer?.cancel();
-    if (e.film == null) {
+    if (e.film == null || isModernId(e.film)) {
+      // no stock: nothing to ask the engine; a modern rendering has no shoot / print axes, both pad axes are dead
       _rangesGen++;
-      if (filmRanges.value != FilmPadRanges.all) {
-        filmRanges.value = FilmPadRanges.all;
+      final want = e.film == null ? FilmPadRanges.all : FilmPadRanges.inert;
+      if (filmRanges.value != want) {
+        filmRanges.value = want;
         _bump();
       }
       return;
@@ -391,7 +423,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
   /// Items of the open category (the radar's spokes), for the current stock.
   List<PadItem> itemsOf(PadCat cat) {
     final stock = app.film.stock(edit.film);
-    return padItems(cat, printed: stock?.printed ?? true);
+    return padItems(cat, printed: stock?.printed ?? true, modern: isModernId(edit.film));
   }
 
   /// Sets one item (radar / ruler): the pad keeps its position; the item gets an offset.
@@ -459,6 +491,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
     if (edit.film == stockId) return;
     _apply((e) {
       if (stockId == null) return clearFilm(e);
+      if (isModernId(stockId)) return withModernBase(e, stockId);
       return e.copyWith(film: stockId, filmPaper: null);
     });
   }
@@ -772,6 +805,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
     edits.removeListener(_maybeRefreshRanges);
     _rangesTimer?.cancel();
     filmRanges.dispose();
+    _swatches?.dispose();
     _idleTimer?.cancel();
     readout.dispose();
     edits.dispose();

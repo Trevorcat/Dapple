@@ -15,6 +15,7 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 
+import '../../model/bases.dart';
 import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../theme/tokens.dart';
@@ -382,14 +383,16 @@ class _Header extends StatelessWidget {
       if (cat == PadCat.film && !inExtra && !inItems)
         ListenableBuilder(
           listenable: ctl.app.editTick,
-          builder: (context, _) => HeaderButton(key: const ValueKey('film-none'), label: '无', pressed: ctl.edit.film == null, semantics: '不使用胶片', onTap: ctl.stockNone),
+          builder: (context, _) => HeaderButton(key: const ValueKey('film-none'), label: '无', pressed: ctl.edit.film == null, semantics: '不使用胶片或现代成像', onTap: ctl.stockNone),
         ),
       if (cat == PadCat.film && !inExtra && !inItems)
         ListenableBuilder(
           listenable: ctl.app.editTick,
           builder: (context, _) {
-            final s = ctl.app.film.stock(ctl.edit.film);
-            return HeaderButton(key: const ValueKey('stock-button'), label: s?.name ?? '无', chevron: true, pressed: ctl.filmMapOpen, semantics: '选择胶片，当前${s?.name ?? '无'}', onTap: () => ctl.setFilmMap(!ctl.filmMapOpen));
+            final name = ctl.edit.film == null ? '无' : baseNameOf(ctl.app.film, ctl.edit.film);
+            final modern = isModernId(ctl.edit.film);
+            WidgetsBinding.instance.addPostFrameCallback((_) => ctl.warmSwatches()); // the map is one tap away: render its swatches now (idempotent)
+            return HeaderButton(key: const ValueKey('stock-button'), label: name, chevron: true, pressed: ctl.filmMapOpen, semantics: '选择${modern ? '成像' : '胶片'}，当前$name', onTap: () => ctl.setFilmMap(!ctl.filmMapOpen));
           },
         ),
       ListenableBuilder(

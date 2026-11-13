@@ -52,7 +52,7 @@ class _PublishPageState extends State<PublishPage> {
   Preset _preset = presets[0];
   late String _ratio = _preset.defRatio;
   late int _size = _preset.longEdge ?? widget.app.settings.exportLongEdge;
-  late bool _strip = widget.app.settings.stripLocation; // TODO: honour "保留" (engine writes no EXIF today)
+  late bool _strip = widget.app.settings.stripLocation; // "去除位置信息": reaches the export call; GPS is written only when kept and the original has a fix
   bool _split = false;
   int _batch = 0;
   // "HDR 照片" (Ultra HDR gain-map JPEG): offered only when at least one photo has highlights worth encoding; off by default.
@@ -220,12 +220,10 @@ class _PublishPageState extends State<PublishPage> {
     for (var i = 0; i < photos.length; i++) {
       if (cancelled()) return null;
       final ph = photos[i];
-      if (app.isDemo) {
-        out.add('/demo/${ph.id}.jpg');
-      } else if (fallback) {
-        await app.saveToGallery([ph], longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable);
+      if (fallback) {
+        await app.saveToGallery([ph], longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable, stripLocation: _strip);
       } else {
-        out.add(await app.exportJpeg(ph, longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable));
+        out.add(await app.exportJpeg(ph, longEdge: _size, cropOverride: _ratio, hdr: _hdr && _hdrAvailable, stripLocation: _strip));
       }
       progress.value = (i + 1) / photos.length;
     }

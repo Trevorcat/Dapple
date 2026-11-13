@@ -134,11 +134,19 @@ ParamRegistry::ParamRegistry() {
         in.edit.flip = !in.edit.flip;
         return true;
       });
-  add("filmStock", G, [](const ParamInputs& in, Hasher& h) { h.str(in.edit.filmStock); },
+  // film and the modern rendering family share the selector (EditParams::filmStock); each key sees only its own ids
+  add("filmStock", G, [](const ParamInputs& in, Hasher& h) { h.str(isModernId(in.edit.filmStock) ? std::string() : in.edit.filmStock); },
       [](ParamInputs& in, int v) {
         if (!in.ctx.filmLib) return false;  // needs a real stock id
         return perturbString(in.edit.filmStock, v, {"", "kodak_portra_400", "fujifilm_pro_400h"});
       });
+  add("modern", G,
+      [](const ParamInputs& in, Hasher& h) {
+        const ModernKind k = modernKind(in.edit.filmStock);
+        h.i32(int(k));
+        if (k != ModernKind::None) h.f32(in.edit.filmStrength);  // the strength of the base only matters when it is a modern rendering
+      },
+      [](ParamInputs& in, int v) { return perturbString(in.edit.filmStock, v, {"", "modern_clean", "modern_vivid"}); });
   add("filmPaper", G, [](const ParamInputs& in, Hasher& h) { h.str(in.edit.filmPaper); },
       [](ParamInputs& in, int v) { return perturbString(in.edit.filmPaper, v, {"", "none", "kodak_endura_premier"}); });
   add("lutPath", G, [](const ParamInputs& in, Hasher& h) { h.str(in.edit.lutPath); },

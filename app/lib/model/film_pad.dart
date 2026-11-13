@@ -26,6 +26,9 @@ class FilmPadRanges {
   /// Everything effective (no engine answer yet, an old engine, an error).
   static const all = FilmPadRanges();
 
+  /// Nothing effective: a modern rendering has no film-pack axes (shoot, print, black, white balance, latitude).
+  static final FilmPadRanges inert = FilmPadRanges({for (final k in filmPadKeys) k: false}, {for (final k in filmPadKeys) k: false});
+
   final Map<String, bool> _lo, _hi;
 
   /// Scene colour temperature and the stock's reference temperature in kelvin, when the engine reports them.

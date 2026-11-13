@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "dapple/modern.h"
 #include "dapple/result.h"
 
 namespace dapple {

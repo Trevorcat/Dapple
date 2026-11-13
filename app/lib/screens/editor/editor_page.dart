@@ -9,6 +9,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 
+import '../../services/base_swatches.dart' show SwatchSource;
 import '../../editor/handedness.dart';
 import '../../editor/haptics.dart';
 import '../../editor/springs.dart';
@@ -41,7 +42,7 @@ void openEditor(BuildContext context, AppState app, String photoId, {EGroup? ini
 }
 
 class EditorPage extends StatefulWidget {
-  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher, this.initialGroup, this.initialRow, this.initialCollapsed = false, this.initialHold});
+  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher, this.swatchSource, this.initialGroup, this.initialRow, this.initialCollapsed = false, this.initialHold});
   final AppState app;
   final String photoId;
 
@@ -58,6 +59,9 @@ class EditorPage extends StatefulWidget {
 
   /// Test hook: replaces the engine query for the film pads' effective ranges.
   final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
+
+  /// Test hook: where the film map's base swatches come from (default: the engine).
+  final SwatchSource Function(String photoId)? swatchSource;
   @override
   State<EditorPage> createState() => _EditorPageState();
 }
@@ -97,6 +101,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
       onSwipe: _go,
       onToggleImmersive: () => ctl.immersive.value = !ctl.immersive.value,
       filmPadFetcher: widget.filmPadFetcher,
+      swatchSource: widget.swatchSource,
     );
     lastRev = app.editRevision;
     app.addListener(_onApp);

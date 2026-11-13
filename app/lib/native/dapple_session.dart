@@ -674,6 +674,7 @@ class DappleSession {
       int outLongEdge = 0,
       int quality = 92,
       bool hdr = false,
+      String? exportJson,
       required String outPath}) {
     final pj = jsonEncode(params);
     return Isolate.run(() {
@@ -684,9 +685,9 @@ class DappleSession {
       if (s == ffi.nullptr) throw DappleException(_lastError(b));
       try {
         if (hdr) {
-          _exportHdrNative(s.address, pj, lutPath, outLongEdge, quality, outPath);
+          _exportHdrNative(s.address, pj, lutPath, outLongEdge, quality, outPath, exportJson: exportJson);
         } else {
-          _exportNative(s.address, pj, lutPath, outLongEdge, quality, outPath);
+          _exportNative(s.address, pj, lutPath, outLongEdge, quality, outPath, exportJson: exportJson);
         }
       } finally {
         b.sessionClose(s);
@@ -694,42 +695,54 @@ class DappleSession {
     });
   }
 
-  static void _exportNative(int addr, String paramsJson, String? lut, int longEdge, int quality, String outPath) {
+  /// [exportJson] (metadata options: metaSource / stripLocation / colorSpace / software, see dapple_c.h) writes the Exif and ICC segments; null = the bare
+  /// stream (previews, thumbnails). A library without the call writes the bare stream.
+  static void _exportNative(int addr, String paramsJson, String? lut, int longEdge, int quality, String outPath, {String? exportJson}) {
     final b = _b();
     final pp = paramsJson.toNativeUtf8();
     final lp = (lut ?? '').toNativeUtf8();
     final op = outPath.toNativeUtf8();
+    final ej = exportJson?.toNativeUtf8();
     try {
-      final rc = b.sessionExportJpeg(ffi.Pointer.fromAddress(addr), pp, lp, longEdge, quality, op);
+      final ex = b.sessionExportJpegEx;
+      final rc = ex != null && ej != null
+          ? ex(ffi.Pointer.fromAddress(addr), pp, lp, longEdge, quality, op, ej)
+          : b.sessionExportJpeg(ffi.Pointer.fromAddress(addr), pp, lp, longEdge, quality, op);
       if (rc != dappleOk) throw DappleException(_lastError(b));
     } finally {
       malloc.free(pp);
       malloc.free(lp);
       malloc.free(op);
+      if (ej != null) malloc.free(ej);
     }
   }
 
   /// Ultra HDR export (gain-map JPEG). Writes the plain JPEG when the picture has no highlight headroom worth encoding (or the edit is a film
   /// look); the library predating the call exports plain. Returns the headroom the file carries in stops (0 = plain JPEG).
-  static double _exportHdrNative(int addr, String paramsJson, String? lut, int longEdge, int quality, String outPath) {
+  static double _exportHdrNative(int addr, String paramsJson, String? lut, int longEdge, int quality, String outPath, {String? exportJson}) {
     final b = _b();
     final f = b.sessionExportJpegHdr;
     if (f == null) {
-      _exportNative(addr, paramsJson, lut, longEdge, quality, outPath);
+      _exportNative(addr, paramsJson, lut, longEdge, quality, outPath, exportJson: exportJson);
       return 0;
     }
     final pp = paramsJson.toNativeUtf8();
     final lp = (lut ?? '').toNativeUtf8();
     final op = outPath.toNativeUtf8();
+    final ej = exportJson?.toNativeUtf8();
     final info = malloc<ffi.Uint8>(24);
     try {
-      final rc = f(ffi.Pointer.fromAddress(addr), pp, lp, longEdge, quality, op, 0.0, info);
+      final ex = b.sessionExportJpegHdrEx;
+      final rc = ex != null && ej != null
+          ? ex(ffi.Pointer.fromAddress(addr), pp, lp, longEdge, quality, op, 0.0, info, ej)
+          : f(ffi.Pointer.fromAddress(addr), pp, lp, longEdge, quality, op, 0.0, info);
       if (rc != dappleOk) throw DappleException(_lastError(b));
       return _hdrInfo(info).written ? _hdrInfo(info).stops : 0;
     } finally {
       malloc.free(pp);
       malloc.free(lp);
       malloc.free(op);
+      if (ej != null) malloc.free(ej);
       malloc.free(info);
     }
   }
