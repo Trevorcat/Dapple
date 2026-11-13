@@ -112,7 +112,7 @@ class LocalHandlePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (!lc.active || lc.ctl.compare.value) return;
+    if (!lc.active || lc.ctl.compare.value || lc.comparing) return;
     final z = math.max(1.0, zoom.scale);
     final a = lc.sel;
     final s = HandleSpace(lc.map, size);
@@ -201,6 +201,15 @@ class LocalHandlePainter extends CustomPainter {
           default:
             break;
         }
+      }
+    }
+    // 点一下祛斑: the manual heal spots as thin rings, only while the mode is on
+    if (lc.healMode && a != null && a.spots.isNotEmpty) {
+      final k = s.dpPerLE;
+      for (final h in a.spots) {
+        final p = s.local(Offset(h.x, h.y));
+        canvas.drawCircle(p, h.r * k, Paint()..style = PaintingStyle.stroke..strokeWidth = 3 / z..color = const Color(0x59000000));
+        canvas.drawCircle(p, h.r * k, Paint()..style = PaintingStyle.stroke..strokeWidth = 1.4 / z..color = Colors.white);
       }
     }
     // the stroke being painted (before the engine's overlay has it)

@@ -38,14 +38,14 @@ import 'zoom_view.dart';
 import '../../services/perf_probe.dart';
 
 /// Opens the viewer / editor on [photoId] (full-screen route; the global navigation is hidden).
-void openEditor(BuildContext context, AppState app, String photoId, {EGroup? initialGroup, String? initialRow, bool initialCollapsed = false, String? initialHold}) {
+void openEditor(BuildContext context, AppState app, String photoId, {EGroup? initialGroup, String? initialRow, bool initialCollapsed = false, String? initialHold, (double, double, double)? initialZoom}) {
   OpenTiming.tap();
   Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => EditorPage(app: app, photoId: photoId, initialGroup: initialGroup, initialRow: initialRow, initialCollapsed: initialCollapsed, initialHold: initialHold)));
+      builder: (_) => EditorPage(app: app, photoId: photoId, initialGroup: initialGroup, initialRow: initialRow, initialCollapsed: initialCollapsed, initialHold: initialHold, initialZoom: initialZoom)));
 }
 
 class EditorPage extends StatefulWidget {
-  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher, this.lookSwatchSource, this.initialGroup, this.initialRow, this.initialCollapsed = false, this.initialHold, this.localAi});
+  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher, this.lookSwatchSource, this.initialGroup, this.initialRow, this.initialCollapsed = false, this.initialHold, this.localAi, this.initialZoom});
   final AppState app;
   final String photoId;
 
@@ -62,6 +62,9 @@ class EditorPage extends StatefulWidget {
 
   /// Test hook: the AI masks service of 局部 (null = the engine's when the native library is there).
   final LocalAi? localAi;
+
+  /// Debug link: (scale, x, y) zooms the photo to [scale] about the screen point (x, y as fractions of the screen) once it is shown.
+  final (double, double, double)? initialZoom;
 
   /// Test hook: replaces the engine query for the film pads' effective ranges.
   final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
@@ -121,6 +124,17 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     engine.attach(ph, neighbors: _neighborsOf(id));
     WidgetsBinding.instance.addPostFrameCallback((_) => OpenTiming.mark('editor_first_frame'));
     if (widget.initialGroup != null || widget.initialHold != null) WidgetsBinding.instance.addPostFrameCallback((_) => _applyInitial());
+    final iz = widget.initialZoom;
+    if (iz != null) {
+      Future<void>.delayed(const Duration(milliseconds: 1500), () {
+        final s = _env?.size;
+        if (!mounted || s == null) return;
+        final f = Offset(s.width * iz.$2, s.height * iz.$3);
+        zoom.scaleStart(f);
+        zoom.scaleUpdate(f, iz.$1);
+        zoom.scaleEnd(Offset.zero);
+      });
+    }
     if (widget.resamplePointers) {
       GestureBinding.instance.resamplingEnabled = true;
       _resampling = true;

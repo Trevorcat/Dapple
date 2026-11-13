@@ -118,6 +118,14 @@ void paintLocalGlyph(Canvas canvas, Rect r, LocalGlyph g, Color color, {double s
       canvas.drawCircle(c, s * 0.24, line);
       canvas.drawArc(Rect.fromCircle(center: c, radius: s * 0.4), -2.4, 1.1, false, line);
       canvas.drawArc(Rect.fromCircle(center: c, radius: s * 0.4), 0.7, 1.1, false, line);
+    case LocalGlyph.portrait:
+      // a face with a small sparkle: retouching, not selecting
+      canvas.drawOval(Rect.fromCenter(center: c.translate(-s * 0.06, s * 0.04), width: s * 0.5, height: s * 0.62), line);
+      canvas.drawCircle(c.translate(-s * 0.15, -s * 0.02), s * 0.03, fill);
+      canvas.drawCircle(c.translate(s * 0.03, -s * 0.02), s * 0.03, fill);
+      final sp = c.translate(s * 0.3, -s * 0.28);
+      canvas.drawLine(sp.translate(0, -s * 0.11), sp.translate(0, s * 0.11), line);
+      canvas.drawLine(sp.translate(-s * 0.11, 0), sp.translate(s * 0.11, 0), line);
     case LocalGlyph.raster:
       canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromCenter(center: c, width: s * 0.7, height: s * 0.7), Radius.circular(s * 0.14)), line);
       canvas.drawCircle(c, s * 0.12, fill);

@@ -30,7 +30,7 @@ abstract class LocalAi {
   /// Re-creates the missing planes (disk cache, else recomputation); returns how many are still missing (-1 = could not run).
   Future<int> ensure(Photo p, String paramsJson);
 
-  AiPlanePreview? preview(String id);
+  AiPlanePreview? preview(String id, {int longEdge = 128});
 
   /// Frees model memory ([all]: everything, memory pressure / leaving the editor).
   void release({bool all = false});
@@ -57,7 +57,7 @@ class NoLocalAi implements LocalAi {
   @override
   Future<int> ensure(Photo p, String paramsJson) async => -1;
   @override
-  AiPlanePreview? preview(String id) => null;
+  AiPlanePreview? preview(String id, {int longEdge = 128}) => null;
   @override
   void release({bool all = false}) {}
 }
@@ -129,7 +129,7 @@ class EngineLocalAi implements LocalAi {
   }
 
   @override
-  AiPlanePreview? preview(String id) => _ai.preview(id);
+  AiPlanePreview? preview(String id, {int longEdge = 128}) => _ai.preview(id, longEdge: longEdge);
 
   @override
   void release({bool all = false}) => _ai.release(all: all);

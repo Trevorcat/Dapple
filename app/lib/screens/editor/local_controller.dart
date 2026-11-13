@@ -19,6 +19,7 @@ import '../../model/local_adjust.dart';
 import '../../model/local_kinds.dart';
 import '../../model/local_pad.dart';
 import '../../model/pad_model.dart';
+import '../../model/portrait.dart';
 import '../../model/params.dart';
 import '../../native/local_bindings.dart';
 import '../../models.dart' show Photo;
@@ -44,6 +45,9 @@ enum LocalBody {
 
   /// 人物: the parts the analysis found, to pick one or several.
   aiParts,
+
+  /// 人像: the portrait chips (also shown whenever a portrait area is selected).
+  portrait,
 }
 
 /// What a finger on the photo is moving.
@@ -316,6 +320,7 @@ class LocalController extends ChangeNotifier {
       case LocalPlace.aiPlane:
       case LocalPlace.aiTap:
       case LocalPlace.aiDepth:
+      case LocalPlace.aiPortrait:
         return null; // AI kinds go through chooseKind (the analysis makes their planes)
     }
   }
@@ -355,7 +360,7 @@ class LocalController extends ChangeNotifier {
   int get deviceTasks => (avail?.available ?? false) ? avail!.tasks : 0;
 
   Set<String> get absentKinds => {
-        if ((aiDone & AiBits.person) != 0 && !personFound) 'background',
+        if ((aiDone & AiBits.person) != 0 && !personFound) ...['background', 'portrait'],
         if ((aiDone & AiBits.sky) != 0 && !skyFound) 'sky',
       };
 
@@ -377,6 +382,9 @@ class LocalController extends ChangeNotifier {
 
   void _aiPhotoCheck() {
     if (_aiPhoto == ctl.id) return;
+    _faceBoxes.clear();
+    _portraitFacesDirty = true;
+    healMode = false;
     _aiPhoto = ctl.id;
     cancelAnalysis();
     aiDone = 0;
@@ -433,6 +441,11 @@ class LocalController extends ChangeNotifier {
     } else if (r != null && r.state == 'error') {
       _toast('没能分析这张照片');
       aiPending = null;
+    }
+    if (r != null && (tasks & (AiBits.person | AiBits.faces)) != 0) _portraitFacesDirty = true;
+    if (portraitWaiting && (aiDone & (AiBits.person | AiBits.faces)) == (AiBits.person | AiBits.faces)) {
+      portraitWaiting = false;
+      _portraitReady();
     }
     final pending = aiPending;
     if (pending != null && (aiDone & pending.aiTasks) == pending.aiTasks) {
@@ -494,9 +507,291 @@ class LocalController extends ChangeNotifier {
         }
       case LocalPlace.aiTap:
         _newTapArea(mode);
+      case LocalPlace.aiPortrait:
+        openPortrait();
       default:
         break;
     }
+  }
+
+  // ------------------------------------------------------------ 人像 (docs/design/local-adjustments.md section 9.1)
+
+  /// The portrait panel waits for the person / face analysis.
+  bool portraitWaiting = false;
+  bool _portraitFacesDirty = true;
+  List<PortraitFace> _faces = const [];
+
+  /// Manual heal: taps on the photo add / remove spots of the skin area (rings drawn while on).
+  bool healMode = false;
+  int healSize = 1;
+
+  /// 对比 is held: the photo without any local area.
+  bool comparing = false;
+
+  /// The faces of the analysis (with their scale from the eye / iris planes).
+  List<PortraitFace> get portraitFaces {
+    if (_portraitFacesDirty) {
+      _portraitFacesDirty = false;
+      final base = facesOf(aiPlanes.keys);
+      final iods = <int, double>{};
+      for (final f in base) {
+        iods[f.n] = _iodOf(f);
+      }
+      _faces = facesOf(aiPlanes.keys, iods: iods);
+    }
+    return _faces;
+  }
+
+  double _iodOf(PortraitFace f) {
+    for (final k in const ['iris', 'eyes']) {
+      final pl = aiPlanes['f${f.n}:$k'];
+      final pv = pl == null ? null : ai.preview(pl.id, longEdge: 512);
+      if (pv != null) {
+        final v = iodFromPlane(pv.rgba, pv.width, pv.height);
+        if (v > 0) return v;
+      }
+    }
+    final pl = aiPlanes['f${f.n}:face'];
+    final pv = pl == null ? null : ai.preview(pl.id, longEdge: 256);
+    return pv == null ? 0 : iodFromFaceOval(pv.rgba, pv.width, pv.height);
+  }
+
+  /// Faces with eye features (the face selector appears when there are several).
+  List<PortraitFace> get frontalFaces => [for (final f in portraitFaces) if (f.frontal) f];
+
+  List<PortraitChip> get portraitChips => availableChips(aiPlanes.keys.toSet(), portraitFaces);
+
+  bool get portraitAnalysed => (aiDone & (AiBits.person | AiBits.faces)) == (AiBits.person | AiBits.faces);
+
+  /// The chip of the selected area (null: not a portrait area).
+  PortraitChip? get selChip {
+    final a = sel;
+    return a == null ? null : portraitOf(a)?.$1.chip;
+  }
+
+  bool get selIsPortrait => selChip != null;
+
+  bool chipOn(PortraitChip c) => specOf(c).areas.any((ar) => list.indexOf(ar.id) >= 0);
+
+  /// 人像 on the shape card: the analysis once, then the chips; the first time the mild default set is applied (one undo step).
+  void openPortrait() {
+    body = LocalBody.portrait;
+    if (portraitAnalysed) {
+      _portraitReady();
+    } else {
+      portraitWaiting = true;
+      startAnalysis(AiBits.person | AiBits.faces);
+    }
+    _changed();
+  }
+
+  void _portraitReady() {
+    if (!personFound) {
+      _aiNotify();
+      return;
+    }
+    final any = portraitSpecs.any((s) => chipOn(s.chip));
+    if (!any) {
+      final chips = [for (final c in portraitChips) if (specOf(c).onByDefault) c];
+      _setChips(chips, fill: true);
+    }
+    _aiNotify();
+  }
+
+  String? _planeId(String key) => aiPlanes[key]?.id;
+
+  /// Creates (or re-links, same ids: never duplicates) the areas of [chips] for [faces] (null = every face). One undo step.
+  ///
+  /// [fill]: the default set; chips are added in [kPortraitPriority] order while the edit's 12 planes last (a group photo gets skin,
+  /// shine, under-eye ... before the per-face extras), and what does not fit is left off.
+  bool _setChips(List<PortraitChip> chips, {Set<int>? faces, bool fill = false}) {
+    if (chips.isEmpty) return false;
+    final fs = portraitFaces;
+    final all = {for (final f in fs) f.n};
+    if (fill) {
+      // which chips fit, filled by priority; then made in the card's order (one edit)
+      var t = list;
+      final fits = <PortraitChip>{};
+      for (final c in kPortraitPriority) {
+        if (!chips.contains(c)) continue;
+        var u = t;
+        for (final ar in specOf(c).areas) {
+          final mask = portraitMask(ar, fs, faces ?? all, _planeId);
+          if (mask.isEmpty || u.indexOf(ar.id) >= 0) continue;
+          u = u.add(LocalAdjustment(id: ar.id, mask: mask));
+        }
+        if (u.rasterPlanes <= kMaxRasterComponents && u.length <= kMaxLocalAdjustments) {
+          t = u;
+          fits.add(c);
+        }
+      }
+      if (fits.length < chips.length) _toast('人物、天空、点选这类最多 $kMaxRasterComponents 块');
+      return _setChips([for (final c in chips) if (fits.contains(c)) c], faces: faces);
+    }
+    var l = list;
+    String? firstId;
+    var skipped = 0;
+    final order = chips;
+    for (final c in order) {
+      final before = l;
+      final firstBefore = firstId;
+      for (final ar in specOf(c).areas) {
+        final sel = faces ?? all;
+        final mask = portraitMask(ar, fs, sel, _planeId);
+        if (mask.isEmpty) continue;
+        final face = portraitFaceScale(fs, sel);
+        final i = l.indexOf(ar.id);
+        if (i >= 0) {
+          l = l.replace(i, l.items[i].copyWith(mask: mask, face: face, on: true));
+        } else {
+          if (l.length >= kMaxLocalAdjustments) {
+            _toast('最多 $kMaxLocalAdjustments 个区域');
+            return false;
+          }
+          l = l.add(applyLocalUi(LocalAdjustment(id: ar.id, name: portraitName(ar.id), mask: mask, face: face), LocalUi.centre));
+        }
+        firstId ??= ar.id;
+      }
+      if (fill && l.rasterPlanes > kMaxRasterComponents) {
+        l = before; // this chip does not fit: the ones before it stay
+        firstId = firstBefore;
+        skipped++;
+      }
+    }
+    if (l.rasterPlanes > kMaxRasterComponents || identical(l, list)) {
+      if (!identical(l, list) || skipped > 0) _toast('人物、天空、点选这类最多 $kMaxRasterComponents 块');
+      return false;
+    }
+    final next = l;
+    ctl.app.applyEdit(ctl.id, (e) => e.copyWith(local: next));
+    if (firstId != null) {
+      selId = firstId;
+      selComp = 0;
+    }
+    flash();
+    _changed();
+    return true;
+  }
+
+  /// A chip: off -> its areas appear (and the first is selected); on but another chip selected -> select it; on and selected -> its areas go.
+  void tapChip(PortraitChip c) {
+    final spec = specOf(c);
+    if (!chipOn(c)) {
+      _setChips([c]);
+      return;
+    }
+    if (selChip != c) {
+      selId = spec.areas.firstWhere((ar) => list.indexOf(ar.id) >= 0).id;
+      selComp = 0;
+      flash();
+      _changed();
+      return;
+    }
+    final ids = {for (final ar in spec.areas) ar.id};
+    final pid = ctl.id;
+    ctl.app.applyEdit(pid, (e) => e.copyWith(local: LocalList([for (final a in e.local.items) if (!ids.contains(a.id)) a])));
+    if (healMode && c == PortraitChip.skin) healMode = false;
+    _changed();
+    ctl.app.showToast('已去掉${spec.label}', actionLabel: '撤销', onAction: () => ctl.app.undo(pid));
+  }
+
+  /// The face selector: the selected chip applies to face [n] or not (at least one face stays).
+  void toggleFace(int n) {
+    final c = selChip, a = sel;
+    if (c == null || a == null) return;
+    final cur = facesOfMask(a, portraitFaces);
+    final next = {...cur};
+    if (!next.remove(n)) next.add(n);
+    if (next.isEmpty) return;
+    _setChips([c], faces: next);
+  }
+
+  Set<int> get selFaces {
+    final a = sel;
+    return a == null ? const {} : facesOfMask(a, portraitFaces);
+  }
+
+  final Map<int, Rect?> _faceBoxes = {};
+
+  /// Where face [n] is in the picture on screen (frame-normalised, a little wider than the oval), for its thumbnail.
+  Rect? faceBox(int n) {
+    if (_faceBoxes.containsKey(n)) return _faceBoxes[n];
+    final pl = aiPlanes['f$n:face'];
+    final pv = pl == null ? null : ai.preview(pl.id, longEdge: 128);
+    Rect? r;
+    if (pv != null) {
+      var x0 = pv.width, y0 = pv.height, x1 = -1, y1 = -1;
+      for (var y = 0; y < pv.height; y++) {
+        for (var x = 0; x < pv.width; x++) {
+          if (pv.rgba[(y * pv.width + x) * 4] < 96) continue;
+          x0 = math.min(x0, x);
+          x1 = math.max(x1, x);
+          y0 = math.min(y0, y);
+          y1 = math.max(y1, y);
+        }
+      }
+      if (x1 > x0 && y1 > y0) {
+        final a = map.toFrame(Offset(x0 / pv.width, y0 / pv.height)), b = map.toFrame(Offset((x1 + 1) / pv.width, (y1 + 1) / pv.height));
+        final box = Rect.fromPoints(a, b);
+        final side = math.max(box.width, box.height) * 1.2;
+        r = Rect.fromCenter(center: box.center, width: side, height: side);
+      }
+    }
+    return _faceBoxes[n] = r;
+  }
+
+  // ---- manual heal
+
+  void setHealMode(bool v) {
+    healMode = v;
+    tick.value++;
+    _changed();
+  }
+
+  void setHealSize(int i) {
+    healSize = i.clamp(0, 3);
+    _changed();
+  }
+
+  bool get _healing => healMode && sel != null && portraitOf(sel!)?.$2.id == 'pt-skin';
+
+  /// A tap in heal mode: on a spot it removes it, elsewhere it adds one (radius from the face). One undo step.
+  void healTap(Offset local) {
+    final a = sel;
+    if (a == null) return;
+    final s = space;
+    final uv = s.photo(local);
+    final le = s.map.toLE(uv);
+    final spots = [...a.spots];
+    final hit = spots.lastIndexWhere((h) => (s.map.toLE(Offset(h.x, h.y)) - le).distance <= math.max(h.r, 8 / (s.dpPerLE * zoomScale)));
+    if (hit >= 0) {
+      spots.removeAt(hit);
+    } else {
+      if (spots.length >= kMaxHealSpots) {
+        _toast('每个区域最多 $kMaxHealSpots 个点');
+        return;
+      }
+      spots.add(HealSpot(uv.dx, uv.dy, healRadius(a.face, healSize)));
+    }
+    final i = selIndex;
+    ctl.app.applyEdit(ctl.id, (e) => e.copyWith(local: e.local.replace(i, e.local.items[i].copyWith(spots: spots))));
+    ctl.haptics.fire(HapticKind.detent);
+    tick.value++;
+    _changed();
+  }
+
+  // ---- before / after
+
+  /// 对比 held: the photo renders without every local area (all areas together: a retouch is the sum of its chips).
+  void setComparing(bool v) {
+    if (comparing == v) return;
+    comparing = v;
+    ctl.engine.hideLocal = v;
+    ctl.engine.edited();
+    if (v) overlayOn.value = false;
+    tick.value++;
+    _updateVis();
+    notifyListeners();
   }
 
   MaskComponent _raster(String id, MaskOp op, {bool depth = false}) =>
@@ -922,6 +1217,10 @@ class LocalController extends ChangeNotifier {
     _moved = false;
     _begun = false;
     _start = c;
+    if (_healing) {
+      _grab = _Grab.tap; // heal mode: a tap adds / removes a spot, nothing else moves
+      return;
+    }
     switch (c.kind) {
       case MaskKindId.linear:
         _grab = _hitLinear(c, p);
@@ -1057,7 +1356,9 @@ class LocalController extends ChangeNotifier {
       return;
     }
     if (!_moved && g == _Grab.tap) {
-      if (tapPart) {
+      if (_healing) {
+        healTap(p);
+      } else if (tapPart) {
         aiTap(p);
       } else {
         unawaited(pick(p));
@@ -1184,7 +1485,7 @@ class LocalController extends ChangeNotifier {
 
   void _updateVis() {
     final a = sel;
-    final want = active && a != null && !padDragging && (peek || shaping || _now < _showUntil || !a.hasEffect);
+    final want = active && a != null && !padDragging && !comparing && !healMode && (peek || shaping || _now < _showUntil || !a.hasEffect);
     if (overlayOn.value != want) overlayOn.value = want;
     _setStale(_sigNow() != _overlayFor);
     if (want) _wantOverlay();
@@ -1319,6 +1620,10 @@ class LocalController extends ChangeNotifier {
 
   /// Back key: a card in the panel closes first.
   bool handleBack() {
+    if (healMode) {
+      setHealMode(false);
+      return true;
+    }
     if (active && body != LocalBody.pads) {
       if (body == LocalBody.aiParts) cancelAnalysis();
       showBody(LocalBody.pads);
@@ -1332,6 +1637,32 @@ class LocalController extends ChangeNotifier {
   late final LocalPadSource lightPad = LocalPadSource(this, PadCat.light);
   late final LocalPadSource colorPad = LocalPadSource(this, PadCat.color);
   late final LocalItemSource items = LocalItemSource(this);
+
+  /// The itemised view of a portrait area: its recipe's ops (to the recipe's maxima), and for 肤质 the heal sensitivity.
+  List<PadItem> portraitItems() {
+    final a = sel;
+    final pt = a == null ? null : portraitOf(a);
+    if (pt == null) return const [];
+    String label(String k) => switch (k) {
+          'smooth' => '磨皮',
+          'even' => '匀肤',
+          'redness' => '去红',
+          'heal' => '祛斑',
+          'texture' => '纹理',
+          'undereye' => '去黑眼圈',
+          'shine' => '去油光',
+          'whiten' => pt.$2.id == 'pt-teeth' ? '牙齿美白' : '眼白提亮',
+          'clarity' => '眼神',
+          'saturation' => pt.$2.id == 'pt-lips' ? '唇色' : '虹膜饱和度',
+          'facelight' => '面部补光',
+          _ => localOpByKey[k]?.label ?? k,
+        };
+    return [
+      for (final o in pt.$2.ops)
+        PadItem(o.key, label(o.key), o.key == 'texture' ? -o.max : 0, o.max, o.def, (v) => o.key == 'texture' ? fmtValue(Fmt.signed, v) : fmtValue(Fmt.plain, v)),
+      if (pt.$2.id == 'pt-skin') PadItem('sens', '祛斑灵敏度', 0, 100, 25, (v) => fmtValue(Fmt.plain, v)),
+    ];
+  }
 
   /// The itemised view's items of [group] (light, color, detail).
   List<PadItem> itemsOf(String group) => [
@@ -1436,14 +1767,15 @@ class LocalItemSource extends ItemSource {
   Listenable get changes => Listenable.merge([lc.ctl.app.editTick, lc]);
 
   @override
-  double actual(PadItem it) => lc.sel?.op(it.id) ?? 0;
+  double actual(PadItem it) => it.id == 'sens' ? (lc.sel?.sens ?? 25) : (lc.sel?.op(it.id) ?? 0);
 
   @override
   double implied(PadItem it) {
     final a = lc.sel;
     if (a == null) return 0;
+    if (it.id == 'sens') return 25;
     final s = localOpByKey[it.id]!;
-    return (localRecipe(localUiOf(a))[it.id] ?? 0).clamp(s.min, s.max).toDouble();
+    return (recipeOf(a, localUiOf(a))[it.id] ?? 0).clamp(s.min, s.max).toDouble();
   }
 
   @override
@@ -1454,7 +1786,8 @@ class LocalItemSource extends ItemSource {
   }
 
   @override
-  void set(PadItem it, double v) => lc._writeSel((a) => setLocalItem(a, it.id, v));
+  void set(PadItem it, double v) =>
+      lc._writeSel((a) => it.id == 'sens' ? a.copyWith(sens: v.clamp(0.0, 100.0).roundToDouble()) : setLocalItem(a, it.id, v.clamp(it.min, it.max).toDouble()));
 
   @override
   void end() {

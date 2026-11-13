@@ -4,6 +4,7 @@
 import 'dart:math' as math;
 
 import 'local_adjust.dart';
+import 'portrait.dart';
 
 /// Engine strength (0..100) of the strip position [a]: 0 at the bottom, 100 from the middle up.
 double localStrengthOf(double a) => 100 * math.min(1.0, a * 2);
@@ -35,19 +36,39 @@ double _clampOp(String key, double v) {
 LocalUi localUiOf(LocalAdjustment a) {
   final u = a.ui;
   if (u != null) return u;
+  final pt = portraitOf(a);
+  if (pt != null) {
+    // a portrait area without pad state: the strip in the middle, what differs from the default recipe as offsets
+    final r = portraitRecipe(pt.$2, 0.5);
+    final off = <String, double>{};
+    for (final k in {...a.ops.keys, ...r.keys}) {
+      final d = a.op(k) - (r[k] ?? 0);
+      if (d.abs() > 1e-9) off[k] = d;
+    }
+    return LocalUi(off: off);
+  }
   return LocalUi(a: (a.strength / 200).clamp(0.0, 0.5), off: Map<String, double>.of(a.ops));
+}
+
+/// The recipe of [a] at the pad state [u]: a portrait area's chip recipe (the strip scales it), else the light / colour pads.
+Map<String, double> recipeOf(LocalAdjustment a, LocalUi u) {
+  final pt = portraitOf(a);
+  return pt == null ? localRecipe(u) : portraitRecipe(pt.$2, u.a);
 }
 
 /// [a] with the pad state [u]: ops = recipe + offsets (clamped, zeros dropped), strength from the strip.
 LocalAdjustment applyLocalUi(LocalAdjustment a, LocalUi u) {
-  final r = localRecipe(u);
+  final pt = portraitOf(a);
+  final r = recipeOf(a, u);
   final ops = <String, double>{};
   for (final s in localOpSpecs) {
-    final v = _clampOp(s.key, (r[s.key] ?? 0) + (u.off[s.key] ?? 0));
+    var v = _clampOp(s.key, (r[s.key] ?? 0) + (u.off[s.key] ?? 0));
+    if (pt != null) v = v.clamp(localOpByKey[s.key]!.min, portraitMax(pt.$2, s.key)).toDouble(); // the recipe's maxima
     if (v.abs() > 1e-9) ops[s.key] = _round(v);
   }
   final off = {for (final e in u.off.entries) if (e.value.abs() > 1e-9) e.key: e.value};
-  return a.copyWith(ops: ops, strength: _round(localStrengthOf(u.a)), ui: u.copyWith(off: off));
+  // a portrait chip's strip scales its recipe; the engine strength stays 100
+  return a.copyWith(ops: ops, strength: pt != null ? 100 : _round(localStrengthOf(u.a)), ui: u.copyWith(off: off));
 }
 
 /// Values sent to the engine are kept to 0.01 (the JSON stays short; no visible step).
@@ -57,8 +78,9 @@ double _round(double v) => (v * 100).roundToDouble() / 100;
 /// op's offset.
 LocalAdjustment setLocalItem(LocalAdjustment a, String key, double v) {
   final u = localUiOf(a);
-  final r = localRecipe(u);
-  final c = _clampOp(key, v);
+  final r = recipeOf(a, u);
+  final pt = portraitOf(a);
+  final c = pt == null ? _clampOp(key, v) : v.clamp(localOpByKey[key]!.min, portraitMax(pt.$2, key)).toDouble();
   final off = Map<String, double>.of(u.off)..[key] = c - (r[key] ?? 0);
   return applyLocalUi(a, u.copyWith(off: off));
 }

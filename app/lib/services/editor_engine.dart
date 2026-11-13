@@ -419,6 +419,9 @@ class EditorEngine extends ChangeNotifier {
 
   /// Call after the photo's edit state changed. Renders immediately (no debounce); a burst of calls
   /// (or an explicit drag) switches to interactive frames, the full-quality frame follows when it stops.
+  /// 局部's 对比 is held: frames render without the edit's local areas.
+  bool hideLocal = false;
+
   void edited() {
     if (!live) return;
     final now = _clock.elapsedMilliseconds;
@@ -461,6 +464,7 @@ class EditorEngine extends ChangeNotifier {
         if (s == null || myGen != _gen) break;
         final interactive = _interactiveNow;
         final params = app.wireParams(ph);
+        if (hideLocal) params.remove('local'); // 局部's 对比: the photo without its local areas
         final rung = quality.rung;
         final editUs = _editUs; // newest edit this frame contains
         if (_gpuActive) {

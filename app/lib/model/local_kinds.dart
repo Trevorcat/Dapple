@@ -25,10 +25,13 @@ enum LocalPlace {
 
   /// AI: the depth plane; a near-far band is chosen on the tool strip.
   aiDepth,
+
+  /// AI: 人像, the portrait chips (one-tap retouch areas on the face planes).
+  aiPortrait,
 }
 
 /// The glyph drawn for a kind (local_glyphs.dart).
-enum LocalGlyph { linear, radial, brush, luminance, color, subject, sky, person, depth, raster, background, tap }
+enum LocalGlyph { linear, radial, brush, luminance, color, subject, sky, person, depth, raster, background, tap, portrait }
 
 /// AiTask bits (app/lib/native/ai_bindings.dart), repeated here so the model needs no native import.
 abstract final class AiBits {
@@ -61,7 +64,7 @@ class LocalKind {
   /// it, so the selection visibly follows the drag. Shape kinds hide a stale overlay (their handles show the shape).
   final bool overlayFollowsStale;
 
-  bool get ai => place == LocalPlace.aiParts || place == LocalPlace.aiPlane || place == LocalPlace.aiTap || place == LocalPlace.aiDepth;
+  bool get ai => place == LocalPlace.aiParts || place == LocalPlace.aiPlane || place == LocalPlace.aiTap || place == LocalPlace.aiDepth || place == LocalPlace.aiPortrait;
 
   /// A range kind (tone / colour) added to an area that already has a shape LIMITS it (intersect) instead of adding to it. AI planes behave
   /// as shapes.
@@ -74,6 +77,7 @@ const List<LocalKind> localKinds = [
   LocalKind('brush', '画笔', MaskKindId.brush, LocalGlyph.brush, LocalPlace.paint),
   LocalKind('luminance', '明暗', MaskKindId.luminance, LocalGlyph.luminance, LocalPlace.sample, overlayFollowsStale: true),
   LocalKind('color', '颜色', MaskKindId.color, LocalGlyph.color, LocalPlace.sample, overlayFollowsStale: true),
+  LocalKind('portrait', '人像', MaskKindId.raster, LocalGlyph.portrait, LocalPlace.aiPortrait, aiTasks: AiBits.person | AiBits.faces),
   LocalKind('person', '人物', MaskKindId.raster, LocalGlyph.person, LocalPlace.aiParts, aiTasks: AiBits.person | AiBits.faces),
   LocalKind('background', '背景', MaskKindId.raster, LocalGlyph.background, LocalPlace.aiPlane, aiKey: 'background', aiTasks: AiBits.person),
   LocalKind('tap', '点选', MaskKindId.raster, LocalGlyph.tap, LocalPlace.aiTap, aiKey: 'tap', aiTasks: AiBits.tapPrepare),
@@ -143,6 +147,6 @@ String? limitFor(LocalList list, LocalKind k, {int? index, int n = 1}) {
   if (index == null && list.length >= kMaxLocalAdjustments) return '最多 $kMaxLocalAdjustments 个区域';
   if (index != null && list.items[index].mask.length + n > kMaxMaskComponents) return '每个区域最多 $kMaxMaskComponents 块';
   if (k.engine == MaskKindId.brush && list.countKind(MaskKindId.brush) + n > kMaxBrushComponents) return '画笔最多 $kMaxBrushComponents 个';
-  if (k.engine == MaskKindId.raster && list.countKind(MaskKindId.raster) + n > kMaxRasterComponents) return '人物、天空、点选这类最多 $kMaxRasterComponents 块';
+  if (k.engine == MaskKindId.raster && list.rasterPlanes + n > kMaxRasterComponents) return '人物、天空、点选这类最多 $kMaxRasterComponents 块';
   return null;
 }

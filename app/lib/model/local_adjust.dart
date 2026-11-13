@@ -14,7 +14,11 @@ import 'dart:typed_data';
 /// Engine limits (local_adjust.h).
 const int kMaxLocalAdjustments = 16;
 const int kMaxMaskComponents = 8;
-const int kMaxRasterComponents = 4;
+/// Distinct raster planes per edit (the engine counts a plane used twice once; section 43.5 raised it from 4).
+const int kMaxRasterComponents = 12;
+
+/// Manual heal spots per adjustment (section 43.3).
+const int kMaxHealSpots = 64;
 const int kMaxBrushComponents = 8;
 const int kMaxBrushPoints = 100000;
 
@@ -93,6 +97,15 @@ const List<LocalOpSpec> localOpSpecs = [
   LocalOpSpec('sharpen', -100, 100, '锐化', 'detail'),
   LocalOpSpec('noise', 0, 100, '降噪', 'detail'),
   LocalOpSpec('dehaze', -100, 100, '去雾', 'detail'),
+  // portrait retouch (docs/engine/pipeline-architecture.md section 43): shown in the itemised view of portrait areas only
+  LocalOpSpec('smooth', 0, 100, '磨皮', 'portrait'),
+  LocalOpSpec('even', 0, 100, '匀肤', 'portrait'),
+  LocalOpSpec('redness', 0, 100, '去红', 'portrait'),
+  LocalOpSpec('undereye', 0, 100, '去黑眼圈', 'portrait'),
+  LocalOpSpec('shine', 0, 100, '去油光', 'portrait'),
+  LocalOpSpec('facelight', 0, 100, '面部补光', 'portrait'),
+  LocalOpSpec('whiten', 0, 100, '提亮', 'portrait'),
+  LocalOpSpec('heal', 0, 100, '祛斑', 'portrait'),
 ];
 final Map<String, LocalOpSpec> localOpByKey = {for (final s in localOpSpecs) s.key: s};
 
@@ -456,6 +469,36 @@ class LocalUi {
   }
 }
 
+// ------------------------------------------------------------------------------------------------ heal spots
+
+/// A manual heal spot: photo-normalised centre, radius in long-edge units (0.0005..0.02), optional source offset (within 4 radii).
+class HealSpot {
+  const HealSpot(this.x, this.y, this.r, {this.dx, this.dy});
+  final double x, y, r;
+  final double? dx, dy;
+  bool get hasSource => dx != null && dy != null;
+
+  static HealSpot? fromJson(Object? j) {
+    if (j is! List || j.length < 3 || j.take(math.min(5, j.length)).any((v) => v is! num)) return null;
+    final x = _fix(j[0], -1, 2, 0.5), y = _fix(j[1], -1, 2, 0.5), r = _fix(j[2], 0.0005, 0.02, 0.01);
+    if (j.length < 5) return HealSpot(x, y, r);
+    var dx = _fix(j[3], -0.08, 0.08, 0), dy = _fix(j[4], -0.08, 0.08, 0);
+    final d = math.sqrt(dx * dx + dy * dy);
+    if (d > 4 * r) {
+      dx *= 4 * r / d;
+      dy *= 4 * r / d;
+    }
+    return HealSpot(x, y, r, dx: dx, dy: dy);
+  }
+
+  List<Object> toJson() => [jnum(x), jnum(y), jnum(r), if (hasSource) ...[jnum(dx!), jnum(dy!)]];
+
+  bool same(HealSpot o) => x == o.x && y == o.y && r == o.r && dx == o.dx && dy == o.dy;
+}
+
+/// The retouch ops (an item using one, or a face / sensitivity, makes the list "v": 2).
+const Set<String> retouchOps = {'smooth', 'even', 'redness', 'undereye', 'shine', 'facelight', 'whiten', 'heal'};
+
 // ------------------------------------------------------------------------------------------------ adjustment
 
 class LocalAdjustment {
@@ -469,10 +512,24 @@ class LocalAdjustment {
     this.ops = const {},
     this.ui,
     this.extra,
+    this.face = 0,
+    this.sens = 25,
+    this.spots = const [],
+    this.extraOps,
   });
 
   /// Item keys this build does not know (an engine addition): written back verbatim.
   final Map<String, Object?>? extra;
+
+  /// Portrait retouch (section 43): the face scale (inter-ocular distance / photo long edge, 0 = unknown), the heal sensitivity
+  /// (0..100, default 25), the manual heal spots.
+  final double face, sens;
+  final List<HealSpot> spots;
+
+  /// Ops of "adjust" this build does not know: written back verbatim after the known ones.
+  final Map<String, Object?>? extraOps;
+
+  bool get usesRetouch => ops.keys.any(retouchOps.contains) || face > 0 || sens != 25 || spots.isNotEmpty;
 
   final String id, name;
   final bool on, invert;
@@ -491,7 +548,18 @@ class LocalAdjustment {
 
   bool get hasEffect => strength > 0 && ops.entries.any((e) => e.key != 'color_hue' && e.value != 0);
 
-  LocalAdjustment copyWith({String? id, String? name, bool? on, bool? invert, double? strength, List<MaskComponent>? mask, Map<String, double>? ops, Object? ui = _keep}) =>
+  LocalAdjustment copyWith(
+          {String? id,
+          String? name,
+          bool? on,
+          bool? invert,
+          double? strength,
+          List<MaskComponent>? mask,
+          Map<String, double>? ops,
+          Object? ui = _keep,
+          double? face,
+          double? sens,
+          List<HealSpot>? spots}) =>
       LocalAdjustment(
         id: id ?? this.id,
         name: name ?? this.name,
@@ -502,6 +570,10 @@ class LocalAdjustment {
         ops: ops ?? this.ops,
         ui: identical(ui, _keep) ? this.ui : ui as LocalUi?,
         extra: extra,
+        face: face ?? this.face,
+        sens: sens ?? this.sens,
+        spots: spots ?? this.spots,
+        extraOps: extraOps,
       );
   static const Object _keep = Object();
 
@@ -519,6 +591,7 @@ class LocalAdjustment {
       }
     }
     final ops = <String, double>{};
+    final extraOps = <String, Object?>{};
     final ad = j['adjust'];
     if (ad is Map) {
       for (final s in localOpSpecs) {
@@ -526,6 +599,24 @@ class LocalAdjustment {
         if (v is num) {
           final x = _fix(v, s.min, s.max, 0);
           if (x != 0) ops[s.key] = x;
+        }
+      }
+      for (final e in ad.entries) {
+        if (e.key is String && !localOpByKey.containsKey(e.key)) extraOps[e.key as String] = e.value;
+      }
+    }
+    var face = 0.0, sens = 25.0;
+    final spots = <HealSpot>[];
+    final rt = j['retouch'];
+    if (rt is Map) {
+      face = _fix(rt['face'], 0, 1, 0);
+      if (face > 0 && face < 0.002) face = 0.002;
+      sens = _fix(rt['sens'], 0, 100, 25);
+      final sp = rt['spots'];
+      if (sp is List) {
+        for (final e in sp) {
+          final h = HealSpot.fromJson(e);
+          if (h != null && spots.length < kMaxHealSpots) spots.add(h);
         }
       }
     }
@@ -539,6 +630,10 @@ class LocalAdjustment {
       mask: mask.length > kMaxMaskComponents ? mask.sublist(0, kMaxMaskComponents) : mask,
       ops: ops,
       ui: readUi ? LocalUi.fromJson(j['ui']) : null,
+      face: face,
+      sens: sens,
+      spots: spots,
+      extraOps: extraOps.isEmpty ? null : extraOps,
       extra: () {
         final x = <String, Object?>{
           for (final e in j.entries)
@@ -549,7 +644,7 @@ class LocalAdjustment {
     );
   }
 
-  static const _itemKeys = {'id', 'name', 'on', 'invert', 'strength', 'mask', 'adjust', 'ui'};
+  static const _itemKeys = {'id', 'name', 'on', 'invert', 'strength', 'mask', 'adjust', 'retouch', 'ui'};
 
   /// Engine key order: id, name (when set), on (when off), invert (when set), strength, mask, adjust (non-zero, registry order).
   Map<String, Object?> toJson({bool withUi = false}) => {
@@ -562,7 +657,14 @@ class LocalAdjustment {
         'adjust': {
           for (final s in localOpSpecs)
             if ((ops[s.key] ?? 0) != 0) s.key: jnum(ops[s.key]!),
+          ...?extraOps,
         },
+        if (face > 0 || sens != 25 || spots.isNotEmpty)
+          'retouch': {
+            if (face > 0) 'face': jnum(face),
+            if (sens != 25) 'sens': jnum(sens),
+            if (spots.isNotEmpty) 'spots': [for (final s in spots) s.toJson()],
+          },
         ...?extra,
         if (withUi && ui != null) 'ui': ui!.toJson(),
       };
@@ -574,6 +676,11 @@ class LocalAdjustment {
     if (!ops.entries.every((e) => o.ops[e.key] == e.value)) return false;
     if ((ui == null) != (o.ui == null) || (ui != null && !ui!.same(o.ui!))) return false;
     if (!_deepEq(extra ?? const {}, o.extra ?? const {})) return false;
+    if (face != o.face || sens != o.sens || spots.length != o.spots.length) return false;
+    for (var i = 0; i < spots.length; i++) {
+      if (!spots[i].same(o.spots[i])) return false;
+    }
+    if (!_deepEq(extraOps ?? const {}, o.extraOps ?? const {})) return false;
     for (var i = 0; i < mask.length; i++) {
       if (!mask[i].same(o.mask[i])) return false;
     }
@@ -596,6 +703,23 @@ class LocalList {
   LocalAdjustment? byId(String id) {
     final i = indexOf(id);
     return i < 0 ? null : items[i];
+  }
+
+  /// Distinct raster planes of the edit (the engine's cap counts a plane used twice once; an empty tap part counts as one).
+  int get rasterPlanes {
+    final refs = <String>{};
+    var empty = 0;
+    for (final a in items) {
+      for (final m in a.mask) {
+        if (m.kind != MaskKindId.raster) continue;
+        if (m.ref.isEmpty) {
+          empty++;
+        } else {
+          refs.add(m.ref);
+        }
+      }
+    }
+    return refs.length + empty;
   }
 
   /// Components of a kind over the whole edit (the engine's per-edit caps).
@@ -621,10 +745,13 @@ class LocalList {
   }
 
   /// What the engine reads (no "ui"); null when the list is empty (the key is then left out).
-  Map<String, Object?>? toEngineJson() => items.isEmpty ? null : {'v': 1, 'items': [for (final a in items) a.toJson()]};
+  /// "v": 2 when an item uses portrait retouch (as the engine writes it), else 1.
+  int get version => items.any((a) => a.usesRetouch) ? 2 : 1;
+
+  Map<String, Object?>? toEngineJson() => items.isEmpty ? null : {'v': version, 'items': [for (final a in items) a.toJson()]};
 
   /// What the app persists (with each item's pad state).
-  Map<String, Object?>? toAppJson() => items.isEmpty ? null : {'v': 1, 'items': [for (final a in items) a.toJson(withUi: true)]};
+  Map<String, Object?>? toAppJson() => items.isEmpty ? null : {'v': version, 'items': [for (final a in items) a.toJson(withUi: true)]};
 
   bool same(LocalList o) {
     if (identical(this, o) || identical(items, o.items)) return true;

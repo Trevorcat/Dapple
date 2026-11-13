@@ -5,7 +5,7 @@
 // (group: an EGroup name, the panel's categories being light / color / style (= 胶片) / effects (= 质地) / crop; row: the panel
 // layer - items, map, curve, hsl, grade, paper; "look":"warm" selects a style; "pad":{"light":[x,y,a]} sets a pad state before opening (x, y in -1..1,
 // a in 0..1, 0.5 = 100 %); "hold":"light" shows the hold popup; all optional; {"close":true} goes back to the library; {"purgeCaptures":true} removes the
-// in-app capture test shots from the library; {"import":["dbg/a.jpg"]} imports files pushed under the external files folder, removed again by purgeCaptures).
+// in-app capture test shots from the library; {"zoom":[scale,x,y]} zooms about a screen point; {"import":["dbg/a.jpg"]} imports files pushed under the external files folder, removed again by purgeCaptures).
 // The file is read once a second and deleted when it has been applied. Release builds never start this.
 import 'dart:async';
 import 'dart:convert';
@@ -116,7 +116,9 @@ class DebugOpen {
         }
       }
       if (!ctx.mounted) return;
-      openEditor(ctx, app, photo.id, initialGroup: g, initialRow: j['row'] as String?, initialCollapsed: j['collapsed'] == true, initialHold: j['hold'] as String?);
+      final z = j['zoom'];
+      final zoom = z is List && z.length >= 3 ? ((z[0] as num).toDouble(), (z[1] as num).toDouble(), (z[2] as num).toDouble()) : null;
+      openEditor(ctx, app, photo.id, initialGroup: g, initialRow: j['row'] as String?, initialCollapsed: j['collapsed'] == true, initialHold: j['hold'] as String?, initialZoom: zoom);
     } catch (e) {
       debugPrint('debug_open failed: $e');
     }

@@ -3,6 +3,8 @@
 // missing planes and their repair, memory release, and the model JSON of an AI area (docs/design/local-adjustments.md section 9).
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:dapple/model/local_adjust.dart';
 import 'package:dapple/model/local_kinds.dart';
@@ -21,6 +23,18 @@ const photoHash = '0123456789abcdef';
 String planeId(String k) => 'ai:$photoHash:$k';
 
 AiPlane plane(String k, {int face = 0, String group = 'person'}) => AiPlane(id: planeId(k), key: k, label: k, group: group, face: face, w: 64, h: 64, cached: false);
+
+AiPlanePreview grayPreview(int w, int h, bool Function(int x, int y) on) {
+  final b = Uint8List(w * h * 4);
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      final i = (y * w + x) * 4;
+      b[i] = b[i + 1] = b[i + 2] = on(x, y) ? 255 : 0;
+      b[i + 3] = 255;
+    }
+  }
+  return AiPlanePreview(w, h, b);
+}
 
 AiJobResult result({bool person = true, bool sky = false, int faces = 0, List<AiPlane> planes = const [], String state = 'done'}) => AiJobResult(
       state: state,
@@ -67,6 +81,19 @@ class FakeLocalAi implements LocalAi {
   bool ensureFixes = false;
   int ensureCalls = 0, missingCalls = 0, prepareTaps = 0;
   final releases = <bool>[];
+
+  /// Synthetic plane previews by plane id (gray RGBA): [setFace] fills the eyes / iris and the face oval of a face.
+  final previews = <String, AiPlanePreview>{};
+  void setFace(int n, {required double iod, double cx = 0.5, double cy = 0.4, int w = 128, int h = 96, bool eyes = true, bool iris = true, bool oval = true}) {
+    bool blob(int x, int y, double bx, double by) => (x - bx).abs() <= 2 && (y - by).abs() <= 2;
+    final ex = iod * w / 2, ox = cx * w, oy = cy * h;
+    if (eyes) previews[planeId('f$n:eyes')] = grayPreview(w, h, (x, y) => blob(x, y, ox - ex, oy) || blob(x, y, ox + ex, oy));
+    if (iris) previews[planeId('f$n:iris')] = grayPreview(w, h, (x, y) => blob(x, y, ox - ex, oy) || blob(x, y, ox + ex, oy));
+    if (oval) {
+      final rx = iod * w / 0.42 / 2, ry = rx * 1.3;
+      previews[planeId('f$n:face')] = grayPreview(w, h, (x, y) => math.pow((x - ox) / rx, 2) + math.pow((y - oy) / ry, 2) <= 1);
+    }
+  }
 
   StreamController<AiProgress> get last => _ctrls.last;
 
@@ -132,7 +159,7 @@ class FakeLocalAi implements LocalAi {
   }
 
   @override
-  AiPlanePreview? preview(String id) => null;
+  AiPlanePreview? preview(String id, {int longEdge = 128}) => previews[id];
 
   @override
   void release({bool all = false}) => releases.add(all);

@@ -2,6 +2,7 @@
 // the two pads, the itemised view, the shape card, the area's actions) and the tool strip that floats on the photo's bottom edge for
 // the "where" of brushes and ranges. No scrolling lists, no second-level menus: a card replaces the body in place and closes itself.
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
@@ -9,6 +10,7 @@ import '../../model/local_adjust.dart';
 import '../../model/local_kinds.dart';
 import '../../model/local_pad.dart';
 import '../../model/pad_model.dart';
+import '../../model/portrait.dart';
 import '../../services/local_ai.dart' show AiPlane;
 import '../../theme/tokens.dart';
 import 'editor_controller.dart';
@@ -32,29 +34,29 @@ class LocalHeader extends StatelessWidget {
     final c = context.c;
     final lc = ctl.local;
     final a = lc.sel;
+    final portrait = lc.body == LocalBody.portrait || (lc.body == LocalBody.pads && lc.selIsPortrait);
     final title = switch (lc.body) {
       LocalBody.addPart => '加一块',
       LocalBody.subPart => '减一块',
-      _ => '局部',
+      _ => portrait ? '人像' : '局部',
     };
-    final inCard = lc.body != LocalBody.pads && (!lc.list.isEmpty || lc.body == LocalBody.aiParts);
+    final inCard = lc.body != LocalBody.pads && lc.body != LocalBody.portrait && (!lc.list.isEmpty || lc.body == LocalBody.aiParts);
     final parts = lc.body == LocalBody.aiParts && lc.personFound && lc.aiRunning == 0;
     final buttons = <Widget>[
       if (inCard)
-        HeaderButton(key: const ValueKey('local-back'), label: '返回', onTap: () {
-          if (lc.body == LocalBody.aiParts) lc.cancelAnalysis();
-          lc.showBody(LocalBody.pads);
-        }),
+        HeaderButton(
+          key: const ValueKey('local-back'),
+          label: '返回',
+          onTap: () {
+            if (lc.body == LocalBody.aiParts) lc.cancelAnalysis();
+            lc.showBody(LocalBody.pads);
+          },
+        ),
       // the parts card's one action sits where the eye goes for "done" (the chips keep the whole body)
       if (parts)
         Opacity(
           opacity: lc.partPick.isEmpty ? 0.38 : 1,
-          child: HeaderButton(
-            key: const ValueKey('parts-add'),
-            label: lc.partMode == LocalBody.subPart ? '减去' : '添加',
-            pressed: lc.partPick.isNotEmpty,
-            onTap: lc.addPickedParts,
-          ),
+          child: HeaderButton(key: const ValueKey('parts-add'), label: lc.partMode == LocalBody.subPart ? '减去' : '添加', pressed: lc.partPick.isNotEmpty, onTap: lc.addPickedParts),
         )
       else if (!inCard && a != null) ...[
         ListenableBuilder(
@@ -70,6 +72,8 @@ class LocalHeader extends StatelessWidget {
             );
           },
         ),
+        // press and hold: the photo without the local areas (the photo's own long-press is the handles' in 局部)
+        CompareButton(lc: lc),
         HeaderButton(key: const ValueKey('items-button'), label: '分项', pressed: ctl.itemised, onTap: () => ctl.setItemised(!ctl.itemised)),
       ],
     ];
@@ -82,16 +86,28 @@ class LocalHeader extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 14),
         child: side
-            ? Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Row(children: [Text(title, key: const ValueKey('header-title'), style: titleStyle), const Spacer(), for (final b in buttons) ...[const SizedBox(width: 6), b]]),
-                SizedBox(height: 26, child: chips),
-              ])
-            : Row(children: [
-                Text(title, key: const ValueKey('header-title'), style: titleStyle),
-                const SizedBox(width: 10),
-                Expanded(child: chips),
-                for (final b in buttons) ...[const SizedBox(width: 6), b],
-              ]),
+            ? Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Text(title, key: const ValueKey('header-title'), style: titleStyle),
+                      const Spacer(),
+                      for (final b in buttons) ...[const SizedBox(width: 6), b],
+                    ],
+                  ),
+                  SizedBox(height: 26, child: chips),
+                ],
+              )
+            : Row(
+                children: [
+                  Text(title, key: const ValueKey('header-title'), style: titleStyle),
+                  const SizedBox(width: 10),
+                  Expanded(child: chips),
+                  for (final b in buttons) ...[const SizedBox(width: 6), b],
+                ],
+              ),
       ),
     );
   }
@@ -107,22 +123,37 @@ class LocalChips extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final items = lc.list.items;
-    return LayoutBuilder(builder: (context, cons) {
-      final n = items.length + 1;
-      final full = compact ? 26.0 : 32.0;
-      // shrink to fit (tighter gaps first), never below 26; beyond that (16 areas on a narrow screen) the row scrolls
-      final gap = full * n + 6.0 * (n - 1) <= cons.maxWidth ? 6.0 : 4.0;
-      final side = ((cons.maxWidth - gap * (n - 1)) / n).clamp(compact ? 24.0 : 26.0, full).toDouble();
-      final row = Row(mainAxisSize: MainAxisSize.min, children: [
-        _AddChip(lc: lc, size: side),
-        for (var i = 0; i < items.length; i++) ...[SizedBox(width: gap), _AreaChip(lc: lc, index: i, size: side)],
-      ]);
-      final fits = side * n + gap * (n - 1) <= cons.maxWidth + 0.5;
-      return Align(
-        alignment: Alignment.centerLeft,
-        child: fits ? row : SingleChildScrollView(scrollDirection: Axis.horizontal, child: row),
-      );
-    });
+    // the portrait areas are one chip (人像): their chips live in the portrait panel
+    final shown = <int>[];
+    var portraitShown = false;
+    for (var i = 0; i < items.length; i++) {
+      if (portraitOf(items[i]) != null) {
+        if (portraitShown) continue;
+        portraitShown = true;
+      }
+      shown.add(i);
+    }
+    return LayoutBuilder(
+      builder: (context, cons) {
+        final n = shown.length + 1;
+        final full = compact ? 26.0 : 32.0;
+        // shrink to fit (tighter gaps first), never below 26; beyond that (16 areas on a narrow screen) the row scrolls
+        final gap = full * n + 6.0 * (n - 1) <= cons.maxWidth ? 6.0 : 4.0;
+        final side = ((cons.maxWidth - gap * (n - 1)) / n).clamp(compact ? 24.0 : 26.0, full).toDouble();
+        final row = Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _AddChip(lc: lc, size: side),
+            for (final i in shown) ...[SizedBox(width: gap), _AreaChip(lc: lc, index: i, size: side)],
+          ],
+        );
+        final fits = side * n + gap * (n - 1) <= cons.maxWidth + 0.5;
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: fits ? row : SingleChildScrollView(scrollDirection: Axis.horizontal, child: row),
+        );
+      },
+    );
   }
 }
 
@@ -181,8 +212,9 @@ class _AreaChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = context.c;
     final a = lc.list.items[index];
-    final selected = a.id == lc.selId;
-    final glyph = a.mask.isEmpty ? LocalGlyph.raster : kindOfComponent(a.mask.first).glyph;
+    final portrait = portraitOf(a) != null;
+    final selected = a.id == lc.selId || (portrait && lc.selIsPortrait);
+    final glyph = portraitOf(a) != null ? LocalGlyph.portrait : (a.mask.isEmpty ? LocalGlyph.raster : kindOfComponent(a.mask.first).glyph);
     final fg = selected ? c.accent : c.text;
     final label = '区域 ${index + 1}，${a.mask.isEmpty ? '' : kindOfComponent(a.mask.first).label}${a.mask.length > 1 ? '，${a.mask.length} 块' : ''}${a.invert ? '，反选' : ''}';
     return Semantics(
@@ -191,11 +223,11 @@ class _AreaChip extends StatelessWidget {
       label: label,
       hint: selected ? '再点一次显示操作，按住查看范围' : null,
       excludeSemantics: true,
-      onTap: () => lc.select(a.id),
+      onTap: () => lc.select(portrait && lc.selIsPortrait ? lc.selId! : a.id),
       child: GestureDetector(
         key: ValueKey('local-chip-$index'),
         behavior: HitTestBehavior.opaque,
-        onTap: () => lc.select(a.id),
+        onTap: () => lc.select(portrait && lc.selIsPortrait ? lc.selId! : a.id),
         onLongPressStart: (_) {
           if (!selected) lc.select(a.id);
           lc.setPeek(true);
@@ -212,21 +244,36 @@ class _AreaChip extends StatelessWidget {
               borderRadius: BorderRadius.circular(size * 0.3),
               border: selected ? Border.all(color: c.accent, width: 1.5) : null,
             ),
-            child: Stack(children: [
-              Center(child: LocalGlyphIcon(glyph, size: size * 0.62, color: fg)),
-              if (a.mask.length > 1)
-                Positioned(right: 1.5, bottom: 1, child: Text('+', style: TextStyle(fontSize: size * 0.32, height: 1, fontWeight: FontWeight.w700, color: fg))),
-              if (a.invert)
-                Positioned(
-                  left: 3,
-                  bottom: 3,
-                  child: Container(
-                    width: size * 0.22,
-                    height: size * 0.22,
-                    decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: fg, width: 1), gradient: LinearGradient(colors: [fg, fg, Colors.transparent, Colors.transparent], stops: const [0, 0.5, 0.5, 1])),
-                  ),
+            child: Stack(
+              children: [
+                Center(
+                  child: LocalGlyphIcon(glyph, size: size * 0.62, color: fg),
                 ),
-            ]),
+                if (a.mask.length > 1)
+                  Positioned(
+                    right: 1.5,
+                    bottom: 1,
+                    child: Text(
+                      '+',
+                      style: TextStyle(fontSize: size * 0.32, height: 1, fontWeight: FontWeight.w700, color: fg),
+                    ),
+                  ),
+                if (a.invert)
+                  Positioned(
+                    left: 3,
+                    bottom: 3,
+                    child: Container(
+                      width: size * 0.22,
+                      height: size * 0.22,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(color: fg, width: 1),
+                        gradient: LinearGradient(colors: [fg, fg, Colors.transparent, Colors.transparent], stops: const [0, 0.5, 0.5, 1]),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
         ),
       ),
@@ -246,6 +293,7 @@ class LocalBodyView extends StatelessWidget {
     final lc = ctl.local;
     // the empty state IS the first step: the shape card
     if (lc.body == LocalBody.aiParts) return AiPartsCard(lc: lc);
+    if (lc.body == LocalBody.portrait && !ctl.itemised) return PortraitPanel(ctl: ctl);
     if (lc.list.isEmpty || lc.body == LocalBody.addArea) return ShapeCard(lc: lc, mode: LocalBody.addArea);
     switch (lc.body) {
       case LocalBody.addPart:
@@ -255,28 +303,49 @@ class LocalBodyView extends StatelessWidget {
         return AreaActions(lc: lc);
       case LocalBody.aiParts:
         return AiPartsCard(lc: lc);
+      case LocalBody.portrait:
       case LocalBody.pads:
       case LocalBody.addArea:
         break;
     }
     if (ctl.itemised) return LocalItemised(ctl: ctl);
+    if (lc.selIsPortrait) return PortraitPanel(ctl: ctl);
     final strip = StrengthStrip(ctl: ctl, cat: PadCat.light, source: lc.lightPad, label: '区域强度');
     final light = PadFace(key: const ValueKey('local-pad-light'), ctl: ctl, cat: PadCat.light, source: lc.lightPad);
     final color = PadFace(key: const ValueKey('local-pad-color'), ctl: ctl, cat: PadCat.color, source: lc.colorPad);
-    return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      strip,
-      const SizedBox(width: 10),
-      // the two pads side by side or stacked, whichever keeps them closer to square (a squat pad crowds its edge icons)
-      Expanded(
-        child: LayoutBuilder(builder: (context, cons) {
-          double off(double a) => (math.log(a)).abs();
-          final row = off(((cons.maxWidth - 8) / 2) / cons.maxHeight), col = off(cons.maxWidth / ((cons.maxHeight - 8) / 2));
-          return col < row
-              ? Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [Expanded(child: light), const SizedBox(height: 8), Expanded(child: color)])
-              : Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [Expanded(child: light), const SizedBox(width: 8), Expanded(child: color)]);
-        }),
-      ),
-    ]);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        strip,
+        const SizedBox(width: 10),
+        // the two pads side by side or stacked, whichever keeps them closer to square (a squat pad crowds its edge icons)
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, cons) {
+              double off(double a) => (math.log(a)).abs();
+              final row = off(((cons.maxWidth - 8) / 2) / cons.maxHeight), col = off(cons.maxWidth / ((cons.maxHeight - 8) / 2));
+              return col < row
+                  ? Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Expanded(child: light),
+                        const SizedBox(height: 8),
+                        Expanded(child: color),
+                      ],
+                    )
+                  : Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Expanded(child: light),
+                        const SizedBox(width: 8),
+                        Expanded(child: color),
+                      ],
+                    );
+            },
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -293,62 +362,85 @@ class ShapeCard extends StatelessWidget {
     final c = context.c;
     final kinds = lc.offered;
     final rows = <List<LocalKind>>[
-      [for (final k in kinds) if (!k.ai) k],
-      [for (final k in kinds) if (k.ai) k],
+      [
+        for (final k in kinds)
+          if (!k.ai) k,
+      ],
+      [
+        for (final k in kinds)
+          if (k.ai) k,
+      ],
     ]..removeWhere((r) => r.isEmpty);
-    return LayoutBuilder(builder: (context, cons) {
-      final perRow = rows.fold<int>(1, (n, r) => math.max(n, r.length));
-      final tileW = math.min(84.0, (cons.maxWidth - 8 * (perRow - 1)) / perRow);
-      final tileH = math.max(56.0, math.min(84.0, (cons.maxHeight - 8 * (rows.length - 1)) / rows.length));
-      Widget tile(LocalKind k) {
-        final running = lc.runningFor(k);
-        return Semantics(
-          button: true,
-          label: '${k.label}${k.note == null ? '' : '（${k.note}）'}${running ? '，分析中，再点一次取消' : ''}',
-          excludeSemantics: true,
-          child: GestureDetector(
-            key: ValueKey('kind-${k.id}'),
-            behavior: HitTestBehavior.opaque,
-            onTap: () => lc.chooseKind(k, mode),
-            child: Container(
-              width: tileW,
-              height: tileH,
-              decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(16)),
-              child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                SizedBox(
-                  width: 36,
-                  height: 32,
-                  child: Stack(alignment: Alignment.center, children: [
-                    Opacity(opacity: running ? 0.35 : 1, child: LocalGlyphIcon(k.glyph, size: 28, color: c.text)),
-                    if (running)
-                      SizedBox(
-                        key: ValueKey('kind-progress-${k.id}'),
-                        width: 26,
-                        height: 26,
-                        child: CircularProgressIndicator(value: lc.aiProgress <= 0 ? null : lc.aiProgress, strokeWidth: 2.5, color: c.accent, backgroundColor: c.track),
+    return LayoutBuilder(
+      builder: (context, cons) {
+        final perRow = rows.fold<int>(1, (n, r) => math.max(n, r.length));
+        final tileW = math.min(84.0, (cons.maxWidth - 8 * (perRow - 1)) / perRow);
+        final tileH = math.max(56.0, math.min(84.0, (cons.maxHeight - 8 * (rows.length - 1)) / rows.length));
+        Widget tile(LocalKind k) {
+          final running = lc.runningFor(k);
+          return Semantics(
+            button: true,
+            label: '${k.label}${k.note == null ? '' : '（${k.note}）'}${running ? '，分析中，再点一次取消' : ''}',
+            excludeSemantics: true,
+            child: GestureDetector(
+              key: ValueKey('kind-${k.id}'),
+              behavior: HitTestBehavior.opaque,
+              onTap: () => lc.chooseKind(k, mode),
+              child: Container(
+                width: tileW,
+                height: tileH,
+                decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(16)),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    SizedBox(
+                      width: 36,
+                      height: 32,
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          Opacity(
+                            opacity: running ? 0.35 : 1,
+                            child: LocalGlyphIcon(k.glyph, size: 28, color: c.text),
+                          ),
+                          if (running)
+                            SizedBox(
+                              key: ValueKey('kind-progress-${k.id}'),
+                              width: 26,
+                              height: 26,
+                              child: CircularProgressIndicator(value: lc.aiProgress <= 0 ? null : lc.aiProgress, strokeWidth: 2.5, color: c.accent, backgroundColor: c.track),
+                            ),
+                        ],
                       ),
-                  ]),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(k.label, maxLines: 1, style: T.cap(c.text2)),
+                    if (k.note != null) Text(k.note!, maxLines: 1, style: T.mini(c.text2.withValues(alpha: 0.7))),
+                  ],
                 ),
-                const SizedBox(height: 4),
-                Text(k.label, maxLines: 1, style: T.cap(c.text2)),
-                if (k.note != null) Text(k.note!, maxLines: 1, style: T.mini(c.text2.withValues(alpha: 0.7))),
-              ]),
+              ),
             ),
+          );
+        }
+
+        return Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (var i = 0; i < rows.length; i++) ...[
+                if (i > 0) const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    for (var j = 0; j < rows[i].length; j++) ...[if (j > 0) const SizedBox(width: 8), tile(rows[i][j])],
+                  ],
+                ),
+              ],
+            ],
           ),
         );
-      }
-
-      return Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          for (var i = 0; i < rows.length; i++) ...[
-            if (i > 0) const SizedBox(height: 8),
-            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-              for (var j = 0; j < rows[i].length; j++) ...[if (j > 0) const SizedBox(width: 8), tile(rows[i][j])],
-            ]),
-          ],
-        ]),
-      );
-    });
+      },
+    );
   }
 }
 
@@ -363,28 +455,40 @@ class AiPartsCard extends StatelessWidget {
     final c = context.c;
     if (lc.aiRunning != 0 && (lc.aiDone & AiBits.person) == 0) {
       return Center(
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          SizedBox(
-            key: const ValueKey('parts-progress'),
-            width: 28,
-            height: 28,
-            child: CircularProgressIndicator(value: lc.aiProgress <= 0 ? null : lc.aiProgress, strokeWidth: 3, color: c.accent, backgroundColor: c.track),
-          ),
-          const SizedBox(width: 12),
-          Text('正在找人', style: T.body(c.text2)),
-          const SizedBox(width: 16),
-          HeaderButton(key: const ValueKey('parts-cancel'), label: '取消', onTap: () {
-            lc.cancelAnalysis();
-            lc.showBody(lc.list.isEmpty ? LocalBody.addArea : LocalBody.pads);
-          }),
-        ]),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              key: const ValueKey('parts-progress'),
+              width: 28,
+              height: 28,
+              child: CircularProgressIndicator(value: lc.aiProgress <= 0 ? null : lc.aiProgress, strokeWidth: 3, color: c.accent, backgroundColor: c.track),
+            ),
+            const SizedBox(width: 12),
+            Text('正在找人', style: T.body(c.text2)),
+            const SizedBox(width: 16),
+            HeaderButton(
+              key: const ValueKey('parts-cancel'),
+              label: '取消',
+              onTap: () {
+                lc.cancelAnalysis();
+                lc.showBody(lc.list.isEmpty ? LocalBody.addArea : LocalBody.pads);
+              },
+            ),
+          ],
+        ),
       );
     }
     if ((lc.aiDone & AiBits.person) != 0 && !lc.personFound) {
-      return Center(child: Text('没找到人', key: const ValueKey('parts-none'), style: T.body(c.text2)));
+      return Center(
+        child: Text('没找到人', key: const ValueKey('parts-none'), style: T.body(c.text2)),
+      );
     }
     final planes = lc.partPlanes;
-    final people = [for (final p in planes) if (p.face == 0) p];
+    final people = [
+      for (final p in planes)
+        if (p.face == 0) p,
+    ];
     final byFace = <int, List<AiPlane>>{};
     for (final p in planes) {
       if (p.face > 0) byFace.putIfAbsent(p.face, () => []).add(p);
@@ -392,7 +496,9 @@ class AiPartsCard extends StatelessWidget {
     Widget chip(AiPlane p) {
       final on = lc.partPick.contains(p.key);
       // a chip as wide as its word (PanelChip fills a loose width)
-      return IntrinsicWidth(child: PanelChip(key: ValueKey('part-${p.key}'), label: partLabel(p.key) ?? p.label, selected: on, onTap: () => lc.togglePart(p.key)));
+      return IntrinsicWidth(
+        child: PanelChip(key: ValueKey('part-${p.key}'), label: partLabel(p.key) ?? p.label, selected: on, onTap: () => lc.togglePart(p.key)),
+      );
     }
 
     final rows = <Widget>[
@@ -400,16 +506,21 @@ class AiPartsCard extends StatelessWidget {
       for (final e in byFace.entries)
         Padding(
           padding: const EdgeInsets.only(top: 8),
-          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Padding(
-              padding: const EdgeInsets.only(top: 9, right: 6),
-              child: Text(byFace.length > 1 ? '脸 ${e.key}' : '脸', style: T.cap(c.text2)),
-            ),
-            Expanded(child: Wrap(spacing: 6, runSpacing: 6, children: [for (final p in e.value) chip(p)])),
-          ]),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(top: 9, right: 6),
+                child: Text(byFace.length > 1 ? '脸 ${e.key}' : '脸', style: T.cap(c.text2)),
+              ),
+              Expanded(child: Wrap(spacing: 6, runSpacing: 6, children: [for (final p in e.value) chip(p)])),
+            ],
+          ),
         ),
     ];
-    return SingleChildScrollView(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: rows));
+    return SingleChildScrollView(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: rows),
+    );
   }
 }
 
@@ -424,10 +535,7 @@ class AreaActions extends StatelessWidget {
     final a = lc.sel;
     final full = a != null && a.mask.length >= kMaxMaskComponents;
     final acts = <(String, IconData, VoidCallback, bool)>[
-      if (lc.selIsAi) ...[
-        ('涂抹补充', Icons.brush_outlined, () => lc.brushFix(add: true), false),
-        ('涂抹擦除', Icons.auto_fix_off_outlined, () => lc.brushFix(add: false), false),
-      ],
+      if (lc.selIsAi) ...[('涂抹补充', Icons.brush_outlined, () => lc.brushFix(add: true), false), ('涂抹擦除', Icons.auto_fix_off_outlined, () => lc.brushFix(add: false), false)],
       ('加一块', Icons.add_circle_outline, () => full ? lc.ctl.app.showToast('每个区域最多 $kMaxMaskComponents 块') : lc.showBody(LocalBody.addPart), false),
       ('减一块', Icons.remove_circle_outline, () => full ? lc.ctl.app.showToast('每个区域最多 $kMaxMaskComponents 块') : lc.showBody(LocalBody.subPart), false),
       ('反选', Icons.flip_outlined, lc.invertArea, false),
@@ -436,35 +544,45 @@ class AreaActions extends StatelessWidget {
       if (a != null && a.mask.length > 1) ('去掉这块', Icons.layers_clear_outlined, () => lc.removePart(lc.selComp), false),
       ('删除', Icons.delete_outline, lc.deleteArea, true),
     ];
-    return LayoutBuilder(builder: (context, cons) {
-      final perRow = acts.length > 5 ? (acts.length / 2).ceil() : acts.length;
-      final w = math.min(84.0, (cons.maxWidth - 8 * (perRow - 1)) / perRow);
-      return Center(
-        child: Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
-          for (final x in acts)
-            Semantics(
-              button: true,
-              label: x.$1,
-              excludeSemantics: true,
-              child: GestureDetector(
-                key: ValueKey('act-${x.$1}'),
-                behavior: HitTestBehavior.opaque,
-                onTap: x.$3,
-                child: Container(
-                  width: w,
-                  height: 72 + math.max(0.0, MediaQuery.textScalerOf(context).scale(12) / 12 - 1) * 26,
-                  decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(16)),
-                  child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    Icon(x.$2, size: 24, color: x.$4 ? c.danger : c.text),
-                    const SizedBox(height: 6),
-                    Text(x.$1, style: T.cap(x.$4 ? c.danger : c.text2)),
-                  ]),
+    return LayoutBuilder(
+      builder: (context, cons) {
+        final perRow = acts.length > 5 ? (acts.length / 2).ceil() : acts.length;
+        final w = math.min(84.0, (cons.maxWidth - 8 * (perRow - 1)) / perRow);
+        return Center(
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            alignment: WrapAlignment.center,
+            children: [
+              for (final x in acts)
+                Semantics(
+                  button: true,
+                  label: x.$1,
+                  excludeSemantics: true,
+                  child: GestureDetector(
+                    key: ValueKey('act-${x.$1}'),
+                    behavior: HitTestBehavior.opaque,
+                    onTap: x.$3,
+                    child: Container(
+                      width: w,
+                      height: 72 + math.max(0.0, MediaQuery.textScalerOf(context).scale(12) / 12 - 1) * 26,
+                      decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(16)),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(x.$2, size: 24, color: x.$4 ? c.danger : c.text),
+                          const SizedBox(height: 6),
+                          Text(x.$1, style: T.cap(x.$4 ? c.danger : c.text2)),
+                        ],
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-            ),
-        ]),
-      );
-    });
+            ],
+          ),
+        );
+      },
+    );
   }
 }
 
@@ -476,21 +594,43 @@ class LocalItemised extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final lc = ctl.local;
+    if (lc.selIsPortrait) {
+      // a portrait chip: its own few parameters, one radar (no groups)
+      final items = lc.portraitItems();
+      final sel = ctl.selItem.clamp(0, items.length - 1);
+      return Column(
+        children: [
+          Expanded(
+            child: RadarView(key: ValueKey('local-radar-${lc.selId}'), ctl: ctl, cat: PadCat.light, items: items, selected: sel, onSelect: ctl.selectItem, source: lc.items),
+          ),
+          const SizedBox(height: 6),
+          ItemRuler(ctl: ctl, cat: PadCat.light, item: items[sel], source: lc.items),
+        ],
+      );
+    }
     final items = lc.itemsOf(lc.itemGroup);
     final sel = ctl.selItem.clamp(0, items.length - 1);
     const groups = [('light', '光线'), ('color', '颜色'), ('detail', '质地')];
-    return Column(children: [
-      Row(children: [
-        for (var i = 0; i < groups.length; i++) ...[
-          if (i > 0) const SizedBox(width: 6),
-          Expanded(child: PanelChip(key: ValueKey('local-group-${groups[i].$1}'), label: groups[i].$2, selected: lc.itemGroup == groups[i].$1, compact: true, onTap: () => lc.setItemGroup(groups[i].$1))),
-        ],
-      ]),
-      const SizedBox(height: 4),
-      Expanded(child: RadarView(key: ValueKey('local-radar-${lc.itemGroup}'), ctl: ctl, cat: PadCat.light, items: items, selected: sel, onSelect: ctl.selectItem, source: lc.items)),
-      const SizedBox(height: 6),
-      ItemRuler(ctl: ctl, cat: PadCat.light, item: items[sel], source: lc.items),
-    ]);
+    return Column(
+      children: [
+        Row(
+          children: [
+            for (var i = 0; i < groups.length; i++) ...[
+              if (i > 0) const SizedBox(width: 6),
+              Expanded(
+                child: PanelChip(key: ValueKey('local-group-${groups[i].$1}'), label: groups[i].$2, selected: lc.itemGroup == groups[i].$1, compact: true, onTap: () => lc.setItemGroup(groups[i].$1)),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 4),
+        Expanded(
+          child: RadarView(key: ValueKey('local-radar-${lc.itemGroup}'), ctl: ctl, cat: PadCat.light, items: items, selected: sel, onSelect: ctl.selectItem, source: lc.items),
+        ),
+        const SizedBox(height: 6),
+        ItemRuler(ctl: ctl, cat: PadCat.light, item: items[sel], source: lc.items),
+      ],
+    );
   }
 }
 
@@ -509,7 +649,13 @@ class LocalDockGlyphPainter extends CustomPainter {
     final box = Rect.fromLTWH(1, (size.height - g) / 2, g, g);
     paintLocalGlyph(canvas, box, glyph, color, stroke: 1.5);
     if (count > 1) {
-      final tp = TextPainter(text: TextSpan(text: '$count', style: TextStyle(fontSize: 9, height: 1, fontWeight: FontWeight.w700, color: color)), textDirection: TextDirection.ltr)..layout();
+      final tp = TextPainter(
+        text: TextSpan(
+          text: '$count',
+          style: TextStyle(fontSize: 9, height: 1, fontWeight: FontWeight.w700, color: color),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
       tp.paint(canvas, Offset(box.right + 2, box.top - 1));
     }
   }
@@ -533,9 +679,12 @@ class LocalToolStrip extends StatelessWidget {
       listenable: Listenable.merge([ctl.wm, ctl.edits, ctl.app.editTick, lc]),
       builder: (context, _) {
         final a = lc.sel, m = lc.comp;
-        if (!lc.active || a == null || m == null || lc.body != LocalBody.pads || ctl.compare.value) return const SizedBox.shrink();
+        if (!lc.active || a == null || m == null || (lc.body != LocalBody.pads && !(lc.body == LocalBody.portrait && lc.selIsPortrait)) || ctl.compare.value) {
+          return const SizedBox.shrink();
+        }
         final c = context.c;
-        final parts = a.mask.length > 1;
+        // a portrait area's parts are its recipe's business (the simplified view): no parts row
+        final parts = a.mask.length > 1 && portraitOf(a) == null;
         final children = <Widget>[];
         if (parts) {
           for (var i = 0; i < a.mask.length; i++) {
@@ -544,6 +693,7 @@ class LocalToolStrip extends StatelessWidget {
           }
         }
         Widget? tool;
+        final pt = portraitOf(a);
         switch (m.kind) {
           case MaskKindId.brush:
             tool = _BrushTools(lc: lc);
@@ -555,16 +705,23 @@ class LocalToolStrip extends StatelessWidget {
             final k = kindOfComponent(m).id;
             if (lc.missingRefs.contains(m.ref) || lc.repairing) {
               tool = _Reanalyse(lc: lc);
+            } else if (pt != null && pt.$2.id == 'pt-skin') {
+              tool = _HealTools(lc: lc);
+            } else if (pt != null) {
+              tool = null;
             } else if (k == 'tap') {
               tool = _TapTools(lc: lc);
             } else if (k == 'depth') {
-              tool = Row(mainAxisSize: MainAxisSize.min, children: [
-                Text('近', style: T.mini(c.text2)),
-                const SizedBox(width: 4),
-                _RangeBar(lc: lc, hue: false, depth: true),
-                const SizedBox(width: 4),
-                Text('远', style: T.mini(c.text2)),
-              ]);
+              tool = Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('近', style: T.mini(c.text2)),
+                  const SizedBox(width: 4),
+                  _RangeBar(lc: lc, hue: false, depth: true),
+                  const SizedBox(width: 4),
+                  Text('远', style: T.mini(c.text2)),
+                ],
+              );
             } else {
               tool = null;
             }
@@ -587,7 +744,10 @@ class LocalToolStrip extends StatelessWidget {
               boxShadow: const [BoxShadow(color: Color(0x33000000), blurRadius: 12, offset: Offset(0, 3))],
             ),
             // several parts plus the brush tools can exceed a narrow photo: the strip scales down rather than overflow
-            child: FittedBox(fit: BoxFit.scaleDown, child: Row(mainAxisSize: MainAxisSize.min, children: children)),
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Row(mainAxisSize: MainAxisSize.min, children: children),
+            ),
           ),
         );
       },
@@ -615,22 +775,39 @@ class _PartChip extends StatelessWidget {
       label: '${index == 0 ? '' : (m.op == MaskOp.subtract ? '减去 ' : (m.op == MaskOp.intersect ? '限定 ' : '加上 '))}${k.label}',
       excludeSemantics: true,
       onTap: () => lc.selectPart(index),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        GestureDetector(
-          key: ValueKey('local-part-$index'),
-          behavior: HitTestBehavior.opaque,
-          onTap: () => lc.selectPart(index),
-          child: Container(
-            width: 36,
-            height: 36,
-            decoration: BoxDecoration(color: selected ? c.accentSoft : c.chip, shape: BoxShape.circle, border: selected ? Border.all(color: c.accent, width: 1.5) : null),
-            child: Stack(children: [
-              Center(child: LocalGlyphIcon(k.glyph, size: 20, color: fg)),
-              if (sign.isNotEmpty) Positioned(left: 4, top: 2, child: Text(sign, style: TextStyle(fontSize: 11, height: 1, fontWeight: FontWeight.w700, color: fg))),
-            ]),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          GestureDetector(
+            key: ValueKey('local-part-$index'),
+            behavior: HitTestBehavior.opaque,
+            onTap: () => lc.selectPart(index),
+            child: Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: selected ? c.accentSoft : c.chip,
+                shape: BoxShape.circle,
+                border: selected ? Border.all(color: c.accent, width: 1.5) : null,
+              ),
+              child: Stack(
+                children: [
+                  Center(child: LocalGlyphIcon(k.glyph, size: 20, color: fg)),
+                  if (sign.isNotEmpty)
+                    Positioned(
+                      left: 4,
+                      top: 2,
+                      child: Text(
+                        sign,
+                        style: TextStyle(fontSize: 11, height: 1, fontWeight: FontWeight.w700, color: fg),
+                      ),
+                    ),
+                ],
+              ),
+            ),
           ),
-        ),
-      ]),
+        ],
+      ),
     );
   }
 }
@@ -642,53 +819,53 @@ class _BrushTools extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.c;
-    return Row(mainAxisSize: MainAxisSize.min, children: [
-      for (var i = 0; i < LocalController.brushRadiiDp.length; i++)
-        Semantics(
-          button: true,
-          selected: lc.brushSize == i,
-          label: const ['细', '中', '粗', '很粗'][i],
-          excludeSemantics: true,
-          child: GestureDetector(
-            key: ValueKey('brush-size-$i'),
-            behavior: HitTestBehavior.opaque,
-            onTap: () => lc.setBrushSize(i),
-            child: SizedBox(
-              width: 40,
-              height: 44,
-              child: Center(
-                child: Container(
-                  width: 6.0 + i * 5,
-                  height: 6.0 + i * 5,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: lc.brushSize == i ? c.accent : c.text2.withValues(alpha: 0.55),
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (var i = 0; i < LocalController.brushRadiiDp.length; i++)
+          Semantics(
+            button: true,
+            selected: lc.brushSize == i,
+            label: const ['细', '中', '粗', '很粗'][i],
+            excludeSemantics: true,
+            child: GestureDetector(
+              key: ValueKey('brush-size-$i'),
+              behavior: HitTestBehavior.opaque,
+              onTap: () => lc.setBrushSize(i),
+              child: SizedBox(
+                width: 40,
+                height: 44,
+                child: Center(
+                  child: Container(
+                    width: 6.0 + i * 5,
+                    height: 6.0 + i * 5,
+                    decoration: BoxDecoration(shape: BoxShape.circle, color: lc.brushSize == i ? c.accent : c.text2.withValues(alpha: 0.55)),
                   ),
                 ),
               ),
             ),
           ),
-        ),
-      Container(width: 1, height: 24, color: c.sep, margin: const EdgeInsets.symmetric(horizontal: 4)),
-      Semantics(
-        button: true,
-        toggled: lc.erase,
-        label: '擦除',
-        excludeSemantics: true,
-        child: GestureDetector(
-          key: const ValueKey('brush-erase'),
-          behavior: HitTestBehavior.opaque,
-          onTap: () => lc.setErase(!lc.erase),
-          child: Container(
-            width: 40,
-            height: 32,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(color: lc.erase ? c.accent : null, borderRadius: BorderRadius.circular(16)),
-            child: CustomPaint(size: const Size(20, 20), painter: _EraserPainter(lc.erase ? Colors.white : c.text)),
+        Container(width: 1, height: 24, color: c.sep, margin: const EdgeInsets.symmetric(horizontal: 4)),
+        Semantics(
+          button: true,
+          toggled: lc.erase,
+          label: '擦除',
+          excludeSemantics: true,
+          child: GestureDetector(
+            key: const ValueKey('brush-erase'),
+            behavior: HitTestBehavior.opaque,
+            onTap: () => lc.setErase(!lc.erase),
+            child: Container(
+              width: 40,
+              height: 32,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(color: lc.erase ? c.accent : null, borderRadius: BorderRadius.circular(16)),
+              child: CustomPaint(size: const Size(20, 20), painter: _EraserPainter(lc.erase ? Colors.white : c.text)),
+            ),
           ),
         ),
-      ),
-    ]);
+      ],
+    );
   }
 }
 
@@ -702,7 +879,13 @@ class _EraserPainter extends CustomPainter {
     canvas.rotate(-math.pi / 4);
     final r = Rect.fromCenter(center: Offset.zero, width: s.width * 0.9, height: s.height * 0.45);
     final rr = RRect.fromRectAndRadius(r, const Radius.circular(3));
-    canvas.drawRRect(rr, Paint()..style = PaintingStyle.stroke..strokeWidth = 1.5..color = color);
+    canvas.drawRRect(
+      rr,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5
+        ..color = color,
+    );
     canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTRB(r.left, r.top, r.left + r.width * 0.4, r.bottom), const Radius.circular(3)), Paint()..color = color);
     canvas.restore();
   }
@@ -842,12 +1025,18 @@ class _RangePainter extends CustomPainter {
         canvas.drawRect(Rect.fromLTRB(l, bar.top, r, bar.bottom), clear);
         final fadeL = Rect.fromLTRB(l - s, bar.top, l, bar.bottom), fadeR = Rect.fromLTRB(r, bar.top, r + s, bar.bottom);
         if (s > 0.5) {
-          canvas.drawRect(fadeL, Paint()
-            ..blendMode = BlendMode.dstOut
-            ..shader = const LinearGradient(colors: [Color(0x00000000), Color(0xFF000000)]).createShader(fadeL));
-          canvas.drawRect(fadeR, Paint()
-            ..blendMode = BlendMode.dstOut
-            ..shader = const LinearGradient(colors: [Color(0xFF000000), Color(0x00000000)]).createShader(fadeR));
+          canvas.drawRect(
+            fadeL,
+            Paint()
+              ..blendMode = BlendMode.dstOut
+              ..shader = const LinearGradient(colors: [Color(0x00000000), Color(0xFF000000)]).createShader(fadeL),
+          );
+          canvas.drawRect(
+            fadeR,
+            Paint()
+              ..blendMode = BlendMode.dstOut
+              ..shader = const LinearGradient(colors: [Color(0xFF000000), Color(0x00000000)]).createShader(fadeR),
+          );
         }
       }
       canvas.restore();
@@ -865,7 +1054,13 @@ class _RangePainter extends CustomPainter {
     }
     band(a, b, soft);
     canvas.restore();
-    canvas.drawRRect(rr, Paint()..style = PaintingStyle.stroke..strokeWidth = 1..color = const Color(0x33000000));
+    canvas.drawRRect(
+      rr,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..color = const Color(0x33000000),
+    );
     // the two end handles
     for (final t in [a, b]) {
       var x = (t % 1 + 1) % 1 * w;
@@ -932,32 +1127,40 @@ class _TapTools extends StatelessWidget {
     }
 
     final hasTaps = (lc.comp?.ref ?? '').isNotEmpty;
-    return Row(mainAxisSize: MainAxisSize.min, children: [
-      Container(
-        padding: const EdgeInsets.all(2),
-        decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(18)),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [seg(true), seg(false)]),
-      ),
-      const SizedBox(width: 8),
-      Semantics(
-        button: true,
-        enabled: hasTaps,
-        label: '撤销上一下',
-        excludeSemantics: true,
-        child: GestureDetector(
-          key: const ValueKey('tap-undo'),
-          behavior: HitTestBehavior.opaque,
-          onTap: hasTaps ? lc.undoTap : null,
-          child: SizedBox(width: 40, height: 44, child: Icon(Icons.undo, size: 20, color: hasTaps ? c.text : c.text2.withValues(alpha: 0.4))),
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(2),
+          decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(18)),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [seg(true), seg(false)]),
         ),
-      ),
-      SizedBox(
-        width: 28,
-        child: lc.tapBusy
-            ? SizedBox(key: const ValueKey('tap-busy'), width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.5, color: c.accent))
-            : const SizedBox.shrink(),
-      ),
-    ]);
+        const SizedBox(width: 8),
+        Semantics(
+          button: true,
+          enabled: hasTaps,
+          label: '撤销上一下',
+          excludeSemantics: true,
+          child: GestureDetector(
+            key: const ValueKey('tap-undo'),
+            behavior: HitTestBehavior.opaque,
+            onTap: hasTaps ? lc.undoTap : null,
+            child: SizedBox(width: 40, height: 44, child: Icon(Icons.undo, size: 20, color: hasTaps ? c.text : c.text2.withValues(alpha: 0.4))),
+          ),
+        ),
+        SizedBox(
+          width: 28,
+          child: lc.tapBusy
+              ? SizedBox(
+                  key: const ValueKey('tap-busy'),
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2.5, color: c.accent),
+                )
+              : const SizedBox.shrink(),
+        ),
+      ],
+    );
   }
 }
 
@@ -970,13 +1173,301 @@ class _Reanalyse extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = context.c;
     if (lc.repairing) {
-      return Row(mainAxisSize: MainAxisSize.min, children: [
-        SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2.5, color: c.accent)),
-        const SizedBox(width: 8),
-        Text('正在重新分析', style: T.cap(c.text2)),
-        const SizedBox(width: 6),
-      ]);
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2.5, color: c.accent)),
+          const SizedBox(width: 8),
+          Text('正在重新分析', style: T.cap(c.text2)),
+          const SizedBox(width: 6),
+        ],
+      );
     }
     return HeaderButton(key: const ValueKey('ai-reanalyse'), label: '重新分析', icon: null, onTap: lc.reanalyse);
+  }
+}
+
+// ------------------------------------------------------------------ 人像
+
+/// Press and hold: the photo without the local areas, released: back. One control for every area (the photo's own long-press belongs to
+/// the handles while 局部 is open).
+class CompareButton extends StatelessWidget {
+  const CompareButton({super.key, required this.lc});
+  final LocalController lc;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    return Semantics(
+      button: true,
+      label: '按住对比',
+      excludeSemantics: true,
+      onTap: () {
+        lc.setComparing(true);
+        Future<void>.delayed(const Duration(milliseconds: 900), () => lc.setComparing(false));
+      },
+      child: Listener(
+        key: const ValueKey('local-compare'),
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: (_) => lc.setComparing(true),
+        onPointerUp: (_) => lc.setComparing(false),
+        onPointerCancel: (_) => lc.setComparing(false),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Container(
+            height: 32,
+            padding: const EdgeInsets.symmetric(horizontal: 11),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(color: lc.comparing ? c.accent : c.bg, borderRadius: BorderRadius.circular(16)),
+            child: Text('对比', maxLines: 1, style: T.cap(lc.comparing ? Colors.white : c.text, w: FontWeight.w500)),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The simple portrait panel: the strip of the selected chip on the left (bottom 0, middle = the recommended default, top = the recipe's
+/// maximum) and the chips; a face selector only when several frontal faces exist. 分项 shows the chip's parameters.
+class PortraitPanel extends StatelessWidget {
+  const PortraitPanel({super.key, required this.ctl});
+  final EditorController ctl;
+
+  static IconData iconOf(PortraitChip c) => switch (c) {
+    PortraitChip.skin => Icons.face_retouching_natural,
+    PortraitChip.undereye => Icons.visibility_outlined,
+    PortraitChip.shine => Icons.flare,
+    PortraitChip.teeth => Icons.sentiment_very_satisfied_outlined,
+    PortraitChip.eyes => Icons.remove_red_eye_outlined,
+    PortraitChip.lips => Icons.favorite_border,
+    PortraitChip.light => Icons.wb_sunny_outlined,
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final lc = ctl.local;
+    if (!lc.portraitAnalysed) {
+      if (lc.aiRunning == 0 && !lc.portraitWaiting) WidgetsBinding.instance.addPostFrameCallback((_) => lc.openPortrait());
+      return Center(
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              key: const ValueKey('portrait-progress'),
+              width: 28,
+              height: 28,
+              child: CircularProgressIndicator(value: lc.aiProgress <= 0 ? null : lc.aiProgress, strokeWidth: 3, color: c.accent, backgroundColor: c.track),
+            ),
+            const SizedBox(width: 12),
+            Text('正在找人', style: T.body(c.text2)),
+            const SizedBox(width: 16),
+            HeaderButton(
+              key: const ValueKey('portrait-cancel'),
+              label: '取消',
+              onTap: () {
+                lc.cancelAnalysis();
+                lc.portraitWaiting = false;
+                lc.showBody(lc.list.isEmpty ? LocalBody.addArea : LocalBody.pads);
+              },
+            ),
+          ],
+        ),
+      );
+    }
+    if (!lc.personFound) {
+      return Center(child: Text('没找到人', key: const ValueKey('portrait-none'), style: T.body(c.text2)));
+    }
+    final chips = lc.portraitChips;
+    final selChip = lc.selChip;
+    final faces = lc.frontalFaces;
+    Widget chip(PortraitChip pc, double w, double h) {
+      final on = lc.chipOn(pc), selected = on && selChip == pc;
+      final spec = specOf(pc);
+      return Semantics(
+        button: true,
+        toggled: on,
+        selected: selected,
+        label: spec.label,
+        hint: selected ? '再点一次去掉' : null,
+        excludeSemantics: true,
+        child: GestureDetector(
+          key: ValueKey('chip-${pc.name}'),
+          behavior: HitTestBehavior.opaque,
+          onTap: () => lc.tapChip(pc),
+          child: Container(
+            width: w,
+            height: h,
+            decoration: BoxDecoration(
+              color: on ? c.accentSoft : c.bg,
+              borderRadius: BorderRadius.circular(14),
+              border: selected ? Border.all(color: c.accent, width: 1.5) : null,
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(iconOf(pc), size: 22, color: on ? c.accent : c.text2),
+                const SizedBox(height: 3),
+                Text(spec.label, style: T.cap(on ? c.accent : c.text2, w: on ? FontWeight.w600 : FontWeight.w400)),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        StrengthStrip(key: ValueKey('portrait-strip-${lc.selId}'), ctl: ctl, cat: PadCat.light, source: lc.lightPad, label: selChip == null ? '强度' : '${specOf(selChip).label}强度'),
+        const SizedBox(width: 10),
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, cons) {
+              // every chip in view: four to a row (seven chips = two rows), the tiles shrink with the panel, never scroll away
+              const gap = 6.0;
+              final cols = math.min(4, math.max(1, chips.length));
+              final rows = (chips.length / cols).ceil();
+              final faceRow = faces.length > 1 && selChip != null ? 50.0 : 0.0;
+              final w = ((cons.maxWidth - gap * (cols - 1)) / cols).clamp(40.0, 80.0).toDouble();
+              final h = ((cons.maxHeight - faceRow - gap * (rows - 1)) / rows).clamp(40.0, 60.0).toDouble();
+              return SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(spacing: gap, runSpacing: gap, children: [for (final pc in chips) chip(pc, w, h)]),
+                    if (faces.length > 1 && selChip != null) ...[
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          for (final f in faces) ...[_FaceThumb(lc: lc, face: f, on: lc.selFaces.contains(f.n)), const SizedBox(width: 8)],
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// A detected face as a small round crop of the picture on screen; the ring says the selected chip applies to it.
+class _FaceThumb extends StatelessWidget {
+  const _FaceThumb({required this.lc, required this.face, required this.on});
+  final LocalController lc;
+  final PortraitFace face;
+  final bool on;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final img = lc.ctl.engine.image;
+    final box = lc.faceBox(face.n);
+    return Semantics(
+      button: true,
+      toggled: on,
+      label: '脸 ${face.n}',
+      excludeSemantics: true,
+      child: GestureDetector(
+        key: ValueKey('face-${face.n}'),
+        onTap: () => lc.toggleFace(face.n),
+        child: Container(
+          width: 40,
+          height: 40,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(color: on ? c.accent : c.sep, width: on ? 2.5 : 1),
+          ),
+          child: ClipOval(
+            child: Opacity(
+              opacity: on ? 1 : 0.45,
+              child: img == null || box == null ? Center(child: Text('${face.n}', style: T.cap(c.text2))) : CustomPaint(painter: _CropPainter(img, box)),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CropPainter extends CustomPainter {
+  _CropPainter(this.img, this.box);
+  final ui.Image img;
+  final Rect box; // frame-normalised
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final src = Rect.fromLTRB(box.left * img.width, box.top * img.height, box.right * img.width, box.bottom * img.height);
+    canvas.drawImageRect(img, src, Offset.zero & size, Paint()..filterQuality = FilterQuality.medium);
+  }
+
+  @override
+  bool shouldRepaint(_CropPainter o) => o.img != img || o.box != box;
+}
+
+/// 肤质's tool: 点一下祛斑 (taps on the photo add / remove heal spots; rings show while it is on) and the spot size.
+class _HealTools extends StatelessWidget {
+  const _HealTools({required this.lc});
+  final LocalController lc;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Semantics(
+          button: true,
+          toggled: lc.healMode,
+          label: '点一下祛斑',
+          excludeSemantics: true,
+          child: GestureDetector(
+            key: const ValueKey('heal-mode'),
+            behavior: HitTestBehavior.opaque,
+            onTap: () => lc.setHealMode(!lc.healMode),
+            child: Container(
+              height: 32,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(color: lc.healMode ? c.accent : c.bg, borderRadius: BorderRadius.circular(16)),
+              child: Text('点一下祛斑', style: T.cap(lc.healMode ? Colors.white : c.text, w: FontWeight.w500)),
+            ),
+          ),
+        ),
+        if (lc.healMode) ...[
+          const SizedBox(width: 4),
+          for (var i = 0; i < 4; i++)
+            Semantics(
+              button: true,
+              selected: lc.healSize == i,
+              label: const ['小', '中', '大', '很大'][i],
+              excludeSemantics: true,
+              child: GestureDetector(
+                key: ValueKey('heal-size-$i'),
+                behavior: HitTestBehavior.opaque,
+                onTap: () => lc.setHealSize(i),
+                child: SizedBox(
+                  width: 34,
+                  height: 44,
+                  child: Center(
+                    child: Container(
+                      width: 6.0 + i * 4,
+                      height: 6.0 + i * 4,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(color: lc.healSize == i ? c.accent : c.text2, width: 1.5),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ],
+    );
   }
 }

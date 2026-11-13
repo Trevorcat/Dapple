@@ -27,7 +27,47 @@ const rasterIn =
 const rasterEngineOut =
     r'{"v":1,"items":[{"id":"d","strength":100,"mask":[{"kind":"raster","op":"add","ref":"ai:0123456789abcdef:depth","refine":50,"lo":5,"hi":35.5,"feather":12},{"kind":"raster","op":"intersect","ref":"ai:0123456789abcdef:f1:lips","refine":60}],"adjust":{"exposure":10}}]}';
 
+/// The engine's writer (HEAD, section 43) reading a portrait retouch edit with an unknown op ("glow"), an unknown item key ("future"), a
+/// heal sensitivity and two manual spots (the second with a source offset beyond its limits: clamped), and a teeth area.
+const retouchIn =
+    r'{"v":2,"items":[{"id":"pt-skin","name":"portrait:skin","strength":100,"mask":[{"kind":"raster","op":"add","ref":"ai:0123456789abcdef:faceskin","refine":50},{"kind":"raster","op":"subtract","ref":"ai:0123456789abcdef:f1:lips","refine":50}],"adjust":{"texture":10,"smooth":30,"even":25,"redness":30,"heal":50,"glow":7},"retouch":{"face":0.0812,"sens":40,"spots":[[0.41,0.33,0.004],[0.5,0.5,0.03,0.2,0]]},"future":true},{"id":"pt-teeth","strength":100,"mask":[{"kind":"raster","op":"add","ref":"ai:0123456789abcdef:f1:teeth","refine":50}],"adjust":{"whiten":30},"retouch":{"face":0.0812}}]}';
+const retouchEngineOut =
+    r'{"v":2,"items":[{"id":"pt-skin","name":"portrait:skin","strength":100,"mask":[{"kind":"raster","op":"add","ref":"ai:0123456789abcdef:faceskin","refine":50},{"kind":"raster","op":"subtract","ref":"ai:0123456789abcdef:f1:lips","refine":50}],"adjust":{"texture":10,"smooth":30,"even":25,"redness":30,"heal":50,"glow":7},"retouch":{"face":0.0812,"sens":40,"spots":[[0.41,0.33,0.004],[0.5,0.5,0.02,0.08,0]]},"future":true},{"id":"pt-teeth","strength":100,"mask":[{"kind":"raster","op":"add","ref":"ai:0123456789abcdef:f1:teeth","refine":50}],"adjust":{"whiten":30},"retouch":{"face":0.0812}}]}';
+const spotsOnlyEngineOut = r'{"v":2,"items":[{"id":"s","strength":100,"mask":[],"adjust":{},"retouch":{"spots":[[0.2,0.3,0.004]]}}]}';
+
 void main() {
+  group('portrait retouch (v2)', () {
+    test('read like the engine, written byte for byte like the engine (unknown op and item key kept)', () {
+      final l = LocalList.fromJson(jsonDecode(retouchIn));
+      expect(jsonEncode(l.toEngineJson()), retouchEngineOut);
+      expect(jsonEncode(LocalList.fromJson(jsonDecode(retouchEngineOut)).toEngineJson()), retouchEngineOut);
+      final skin = l.items.first;
+      expect(skin.face, 0.0812);
+      expect(skin.sens, 40);
+      expect(skin.spots, hasLength(2));
+      expect(skin.spots[1].r, 0.02);
+      expect(skin.spots[1].dx, closeTo(0.08, 1e-9));
+      expect(skin.op('smooth'), 30);
+      expect(l.version, 2);
+    });
+
+    test('spots alone make v2 too; an edit without retouch stays v1', () {
+      expect(jsonEncode(LocalList.fromJson(jsonDecode(spotsOnlyEngineOut)).toEngineJson()), spotsOnlyEngineOut);
+      expect(LocalList.fromJson(jsonDecode(capiRadial)).version, 1);
+    });
+
+    test('at most 64 spots; the raster cap is 12', () {
+      final many = {
+        'id': 'h',
+        'retouch': {
+          'spots': [for (var i = 0; i < 80; i++) [0.1, 0.1, 0.004]],
+        },
+      };
+      expect(LocalList.fromJson([many]).items.first.spots, hasLength(kMaxHealSpots));
+      expect(kMaxRasterComponents, 12);
+    });
+  });
+
   group('raster range and unknown keys', () {
     test('the range of a raster part travels; identity is not written (as the engine)', () {
       final l = LocalList.fromJson(jsonDecode(rasterEngineOut));
@@ -207,7 +247,7 @@ void main() {
 
     test('AI kinds follow the device and the analysis', () {
       expect(offeredKinds(deviceTasks: AiBits.person | AiBits.faces | AiBits.sky | AiBits.tapPrepare).map((k) => k.id),
-          ['linear', 'radial', 'brush', 'luminance', 'color', 'person', 'background', 'tap', 'sky']);
+          ['linear', 'radial', 'brush', 'luminance', 'color', 'portrait', 'person', 'background', 'tap', 'sky']);
       expect(offeredKinds(deviceTasks: 31, absent: {'background', 'sky'}).map((k) => k.id), contains('person'));
       expect(offeredKinds(deviceTasks: 31, absent: {'background', 'sky'}).map((k) => k.id), isNot(contains('sky')));
       expect(offeredKinds(deviceTasks: 31).map((k) => k.id), contains('depth'));
@@ -229,7 +269,12 @@ void main() {
 
     test('the AI ranges: shapes, not limits', () {
       expect(opForNew(kindById('person'), first: false, subtract: false), MaskOp.add);
-      expect(limitFor(LocalList([for (var i = 0; i < 3; i++) LocalAdjustment(id: '$i', mask: const [MaskComponent(kind: MaskKindId.raster)])]), kindById('sky'), n: 2), isNotNull);
+      LocalList rasters(int n) => LocalList([for (var i = 0; i < n; i++) LocalAdjustment(id: '$i', mask: [MaskComponent(kind: MaskKindId.raster, ref: 'ai:0123456789abcdef:p$i')])]);
+      expect(limitFor(rasters(11), kindById('sky'), n: 2), isNotNull);
+      expect(limitFor(rasters(10), kindById('sky'), n: 2), isNull);
+      // the engine counts distinct planes: the same plane twice is one
+      final twice = LocalList([for (var i = 0; i < 12; i++) LocalAdjustment(id: '$i', mask: const [MaskComponent(kind: MaskKindId.raster, ref: 'ai:0123456789abcdef:faceskin')])]);
+      expect(twice.rasterPlanes, 1);
     });
 
     test('combine rule: shapes add, ranges limit, 减 subtracts', () {
