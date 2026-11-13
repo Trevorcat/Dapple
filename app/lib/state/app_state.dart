@@ -855,15 +855,81 @@ class AppState extends ChangeNotifier {
     return to;
   }
 
-  Future<void> importFromPicker() async {
-    if (isDemo) return;
-    try {
-      final files = await pickerSource.pick();
-      _addIncoming(files);
-      if (files.isEmpty) showToast('没有导入任何文件');
-    } catch (e) {
-      showToast('导入失败');
+  /// True while picked originals are being copied into the app (large RAWs take a while); the home screen shows a status bar.
+  bool importing = false;
+
+  /// Replaces the native picker (tests). Gets the source ("photos" / "files") and the ids already in the library.
+  Future<List<PickedItem>> Function(String source, List<String> known)? pickBackend;
+
+  /// The library id a picked [key] already has, if any (the scan's ids are `ph:ASSET:RESOURCE` on iOS, `ms:ID` on Android).
+  String? _existingFor(String key) {
+    if (_photos.containsKey(key)) return key;
+    if (key.startsWith('ph:')) {
+      for (final id in _photos.keys) {
+        if (id.startsWith('$key:')) return id;
+      }
     }
+    return null;
+  }
+
+  /// "从相册选择" / "从文件选择": the system picker (several photos), the originals are copied into the inbox and developed like any
+  /// arrival. A photo that is already in the library is not added again. Returns the id of the photo to open when exactly one was
+  /// chosen (it may be the existing one), else null. Cancelling is silent; failures and skipped files get a plain message.
+  Future<String?> importFromPicker({String source = 'photos'}) async {
+    if (importing || (isDemo && pickBackend == null)) return null;
+    importing = true;
+    notifyListeners();
+    try {
+      final known = _photos.keys.toList();
+      final items = await (pickBackend?.call(source, known) ?? pickerSource.pickItems(source: source, known: known));
+      if (items.isEmpty) return null;
+      final fresh = <IncomingFile>[];
+      var dups = 0, unsupported = 0, failed = 0;
+      String? only;
+      for (final it in items) {
+        final existing = _existingFor(it.key);
+        if (existing != null) {
+          dups++;
+          only = existing;
+          _discard(it.file?.path);
+        } else if (it.error == 'unsupported') {
+          unsupported++;
+        } else if (it.file == null) {
+          failed++;
+        } else if (!fresh.any((f) => f.id == it.file!.id)) {
+          fresh.add(it.file!);
+          only = it.file!.id;
+        }
+      }
+      _addIncoming(fresh);
+      if (fresh.isNotEmpty && frozen) releaseNew(); // a pick is the user's own action: show it now
+      final notes = <String>[
+        if (unsupported > 0) '$unsupported 个文件不是支持的照片格式，已跳过',
+        if (failed > 0) '$failed 张没能读取，请再试一次',
+        if (dups > 0 && fresh.isEmpty) (dups == 1 ? '这张已经在照片里' : '所选照片已经都在照片里'),
+      ];
+      if (notes.isNotEmpty) showToast(notes.join('；'));
+      return items.length == 1 ? only : null;
+    } catch (e) {
+      showToast('导入失败，请再试一次');
+      return null;
+    } finally {
+      importing = false;
+      notifyListeners();
+    }
+  }
+
+  /// Tests: puts a bare photo with [id] into the library.
+  @visibleForTesting
+  void simulatePhotoForTest(String id) {
+    _photos[id] = Photo(id: id, name: id, addedMs: 1, status: PhotoStatus.done);
+  }
+
+  void _discard(String? path) {
+    if (path == null) return;
+    try {
+      File(path).deleteSync();
+    } catch (_) {}
   }
 
   /// Test / demo helper: a new photo arrives (held when the grid is frozen).

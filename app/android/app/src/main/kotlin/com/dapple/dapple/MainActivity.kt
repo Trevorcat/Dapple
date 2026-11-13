@@ -31,6 +31,7 @@ class MainActivity : FlutterActivity() {
     private val live by lazy { LiveBridge(applicationContext) }
     private var viewPlugin: DappleViewPlugin? = null
     private var capturePlugin: CapturePlugin? = null
+    private var pickPlugin: PhotoPickPlugin? = null
 
     private val extensions = listOf("arw", "raf", "dng", "jpg", "jpeg")
 
@@ -40,6 +41,7 @@ class MainActivity : FlutterActivity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (capturePlugin?.onActivityResult(requestCode, resultCode, data) == true) return
+        if (pickPlugin?.onActivityResult(requestCode, resultCode, data) == true) return
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
     }
@@ -56,6 +58,9 @@ class MainActivity : FlutterActivity() {
 
         // In-app camera capture (CaptureActivity.kt): testing convenience
         capturePlugin = CapturePlugin(this, messenger)
+
+        // "从相册选择" / "从文件选择": system photo picker and document picker (PhotoPickPlugin.kt), same channel and result rows as iOS
+        pickPlugin = PhotoPickPlugin(this, messenger)
 
         // Editor landmark haptics (requirements 4.15.9): View.performHapticFeedback with the
         // finest constant the OS offers. Numeric values so this compiles against any compileSdk.

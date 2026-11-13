@@ -19,6 +19,7 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
     private var events: FlutterEventSink?
     private var pickResult: FlutterResult?
     private var pickDest: String = ""
+    private var pickKnown: Set<String> = []
     private let io = DispatchQueue(label: "dapple.photos.io", qos: .userInitiated)
 
     private static var viewPlugin: DappleViewPlugin?
@@ -222,6 +223,7 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
             guard pickResult == nil, let vc = topViewController() else { return result(FlutterError(code: "busy", message: "picker not available", details: nil)) }
             pickResult = result
             pickDest = (a["dest"] as? String) ?? NSTemporaryDirectory()
+            pickKnown = Set((a["known"] as? [String]) ?? [])
             var cfg = PHPickerConfiguration(photoLibrary: PHPhotoLibrary.shared())
             cfg.selectionLimit = 0
             cfg.filter = .images
@@ -238,6 +240,7 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         picker.dismiss(animated: true)
         let cb = pickResult
         let dest = pickDest
+        let known = pickKnown
         pickResult = nil
         let group = DispatchGroup()
         let lock = NSLock()
@@ -248,20 +251,39 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
             let ids = p.registeredTypeIdentifiers
             // RAW first (DNG / ProRAW / camera RAW), then JPEG, then whatever image type is there
             let tid = ids.first(where: { UTType($0)?.conforms(to: .rawImage) == true }) ?? ids.first(where: { UTType($0)?.conforms(to: .jpeg) == true }) ?? ids.first(where: { UTType($0)?.conforms(to: .image) == true })
-            guard let type = tid else { continue }
+            // Identity: the Photos asset id, the same one the automatic scan builds its ids from ("ph:<id>:<resource>"), so a photo that is
+            // already in the library is recognised and not copied again.
+            let aid = r.assetIdentifier
+            let key = aid.map { "ph:\($0)" } ?? "imp:\(p.suggestedName ?? "photo")_\(n)"
+            let stem0 = p.suggestedName ?? "photo"
+            if known.contains(where: { $0 == key || $0.hasPrefix(key + ":") }) {
+                lock.lock(); out.append(["key": key, "name": stem0, "dup": true]); lock.unlock()
+                continue
+            }
+            guard let type = tid else { lock.lock(); out.append(["key": key, "name": stem0, "dup": false, "error": "unsupported"]); lock.unlock(); continue }
             group.enter()
             p.loadFileRepresentation(forTypeIdentifier: type) { url, _ in
                 defer { group.leave() }
-                guard let url = url else { return }
+                guard let url = url else {
+                    lock.lock(); out.append(["key": key, "name": stem0, "dup": false, "error": "copy"]); lock.unlock()
+                    return
+                }
                 let ut = UTType(type)
                 let ext = url.pathExtension.isEmpty ? (ut?.preferredFilenameExtension ?? "bin") : url.pathExtension
                 let stem = (p.suggestedName ?? url.deletingPathExtension().lastPathComponent)
                 let keep = ut?.conforms(to: .rawImage) == true || ut?.conforms(to: .jpeg) == true
                 let finalPath = "\(dest)/\(Int(Date().timeIntervalSince1970 * 1000) + n)_\(stem).\(keep ? ext : "jpg")"
                 if keep { try? FileManager.default.copyItem(at: url, to: URL(fileURLWithPath: finalPath)) }
-                else if !Self.convertToJpeg(src: url.path, dst: finalPath) { return }
+                else if !Self.convertToJpeg(src: url.path, dst: finalPath) {
+                    lock.lock(); out.append(["key": key, "name": stem0, "dup": false, "error": "copy"]); lock.unlock()
+                    return
+                }
                 let size = ((try? FileManager.default.attributesOfItem(atPath: finalPath))?[.size] as? NSNumber)?.intValue ?? 0
-                lock.lock(); out.append(["name": (finalPath as NSString).lastPathComponent, "path": finalPath, "size": size]); lock.unlock()
+                if size == 0 {
+                    lock.lock(); out.append(["key": key, "name": stem0, "dup": false, "error": "copy"]); lock.unlock()
+                    return
+                }
+                lock.lock(); out.append(["key": key, "name": (finalPath as NSString).lastPathComponent, "dup": false, "path": finalPath, "size": size]); lock.unlock()
             }
         }
         group.notify(queue: .main) { cb?(out) }

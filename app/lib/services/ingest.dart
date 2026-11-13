@@ -1,9 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
-import 'package:path/path.dart' as p;
 
 /// A file offered by an ingest source. Either [uri] (content://) or [path] is set.
 class IncomingFile {
@@ -95,43 +93,45 @@ class PickerIngestSource implements IngestSource {
   @override
   Stream<void> get changes => const Stream.empty();
 
-  /// Shows the picker and returns the imported copies.
-  Future<List<IncomingFile>> pick() async {
-    if (Platform.isIOS) return _pickPhotos();
-    final res = await FilePicker.pickFiles(type: FileType.any);
-    if (res.isEmpty) return const [];
+  /// Shows the picker and returns the imported copies (no duplicates, no failures).
+  Future<List<IncomingFile>> pick() async => [for (final i in await pickItems()) ?i.file];
+
+  /// Shows the system picker ([source] "photos" = album, "files" = document picker, Android only) and copies the originals into
+  /// [inboxDir]. One entry per chosen item, in the order of the native side: a copy, an item that is already in the library
+  /// ([known] holds the ids of the library; nothing is copied for those), or a failure. Cancelled = empty list.
+  Future<List<PickedItem>> pickItems({String source = 'photos', Iterable<String> known = const []}) async {
+    if (!Platform.isAndroid && !Platform.isIOS) return const [];
     await inboxDir.create(recursive: true);
-    final out = <IncomingFile>[];
+    final rows = await _photos.invokeListMethod<Map>('pick', {'dest': inboxDir.path, 'source': source, 'known': known.toList()});
     final now = DateTime.now().millisecondsSinceEpoch;
-    for (final f in res) {
-      final src = f.path;
-      if (src == null) continue;
-      final ext = p.extension(f.name).toLowerCase();
-      if (!const ['.arw', '.raf', '.dng', '.jpg', '.jpeg'].contains(ext)) continue;
-      final dest = p.join(inboxDir.path, '${now + out.length}_${f.name}');
-      await File(src).copy(dest);
-      out.add(IncomingFile(
-          id: 'imp:${now + out.length}_${f.name}',
-          name: f.name,
-          addedMs: now + out.length,
-          path: dest,
-          size: await File(dest).length()));
-    }
-    return out;
+    return [for (final r in rows ?? const <Map>[]) PickedItem.fromRow(r.cast<String, dynamic>(), now)];
   }
 }
 
 const MethodChannel _photos = MethodChannel('dapple/photos');
 
-extension on PickerIngestSource {
-  /// iOS: the system photo picker (PHPicker, out of process, no permission needed); the originals (RAW first) are copied into [inboxDir].
-  Future<List<IncomingFile>> _pickPhotos() async {
-    await inboxDir.create(recursive: true);
-    final rows = await _photos.invokeListMethod<Map>('pick', {'dest': inboxDir.path});
-    final now = DateTime.now().millisecondsSinceEpoch;
-    return [
-      for (final r in rows ?? const <Map>[])
-        IncomingFile(id: 'imp:${r['name']}', name: r['name'] as String, addedMs: now, path: r['path'] as String, size: (r['size'] as num?)?.toInt() ?? 0)
-    ];
+/// One item the user chose in the system picker. [file] is the copy in the inbox (null for a duplicate or a failure);
+/// [key] is the library id it gets (the scan's id of the same photo when there is one).
+class PickedItem {
+  PickedItem({required this.key, required this.name, this.dup = false, this.file, this.error});
+  final String key;
+  final String name;
+  final bool dup;
+  final IncomingFile? file;
+
+  /// "unsupported" (not a JPEG / RAW the app can develop) or "copy" (reading or copying the original failed).
+  final String? error;
+
+  factory PickedItem.fromRow(Map<String, dynamic> r, int nowMs) {
+    final key = r['key'] as String? ?? 'imp:${r['name']}';
+    final name = r['name'] as String? ?? '照片';
+    final path = r['path'] as String?;
+    return PickedItem(
+      key: key,
+      name: name,
+      dup: r['dup'] == true,
+      error: r['error'] as String?,
+      file: path == null ? null : IncomingFile(id: key, name: name, addedMs: nowMs, path: path, size: (r['size'] as num?)?.toInt() ?? 0),
+    );
   }
 }

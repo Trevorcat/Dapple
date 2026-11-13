@@ -9,6 +9,7 @@ import '../../widgets/icons.dart';
 import '../../widgets/photo_art.dart';
 import 'capture_flow.dart';
 import 'conn_card.dart';
+import 'import_flow.dart';
 import '../tools/launcher.dart';
 import 'photo_tile.dart';
 
@@ -90,6 +91,7 @@ class _HomePageState extends State<HomePage> {
         // wide layouts show the status in the title row; the card only appears when something needs attention
         if (!widget.wide || app.connState != ConnState.connected) SliverToBoxAdapter(child: ConnCard(app: app)),
         if (app.hasBackgroundJob) SliverToBoxAdapter(child: _TaskBar(job: app.job!)),
+        if (app.importing) const SliverToBoxAdapter(child: _ImportBar()),
         if (!app.isEmpty && !app.selectMode) SliverToBoxAdapter(child: _EntryCards(app: app)),
         if (app.isEmpty)
           SliverFillRemaining(hasScrollBody: false, child: _Empty(app: app))
@@ -159,6 +161,10 @@ class _TopBar extends StatelessWidget {
             key: const ValueKey('capture-button'),
             child: DIconButton(DI.camera, label: '拍照', onPressed: () => captureAndEdit(context, app)),
           ),
+        KeyedSubtree(
+          key: const ValueKey('import-button'),
+          child: DIconButton(DI.plus, label: '从相册选择', onPressed: () => importMenu(context, app)),
+        ),
         if (!app.isEmpty)
           KeyedSubtree(
             key: const ValueKey('select-toggle'),
@@ -253,6 +259,33 @@ class _TaskBar extends StatelessWidget {
             Text('${job.percent}%', style: T.body(c.onSecContainer, tabular: true)),
           ]),
         ),
+      ),
+    );
+  }
+}
+
+/// Shown while picked originals are copied into the app (a large RAW takes a few seconds).
+class _ImportBar extends StatelessWidget {
+  const _ImportBar();
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    return Semantics(
+      liveRegion: true,
+      container: true,
+      label: '正在导入所选照片',
+      child: Container(
+        key: const ValueKey('import-bar'),
+        constraints: const BoxConstraints(minHeight: 44),
+        margin: const EdgeInsets.fromLTRB(Sp.l, Sp.s, Sp.l, 0),
+        padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
+        decoration: BoxDecoration(color: c.secContainer, borderRadius: BorderRadius.circular(Rd.card)),
+        child: Row(children: [
+          Spinner(size: 18, color: c.onSecContainer),
+          const SizedBox(width: Sp.m),
+          Expanded(child: Text('正在导入所选照片…', style: T.body(c.onSecContainer, w: FontWeight.w500))),
+        ]),
       ),
     );
   }
@@ -363,13 +396,26 @@ class _Empty extends StatelessWidget {
         DIcon(DI.camera, size: 48, color: c.text2, stroke: 1.6),
         const SizedBox(height: Sp.m),
         Text('还没有照片', style: T.body17(c.text, w: FontWeight.w500)),
+        const SizedBox(height: Sp.xs),
+        Text('从相册选几张，或用相机传输', style: T.small(c.text2)),
         const SizedBox(height: Sp.l),
         SizedBox(
-          width: 160,
+          width: 200,
+          child: KeyedSubtree(
+              key: const ValueKey('empty-import'),
+              child: PrimaryButton('从相册选择', height: 48, onPressed: () => importAndEdit(context, app))),
+        ),
+        const SizedBox(height: Sp.s),
+        SizedBox(
+          width: 200,
           child: KeyedSubtree(
               key: const ValueKey('empty-connect'),
-              child: PrimaryButton('连接相机', height: 44, onPressed: () => app.connectAction())),
+              child: SecondaryButton('连接相机', height: 48, onPressed: () => app.connectAction())),
         ),
+        if (canPickFiles)
+          KeyedSubtree(
+              key: const ValueKey('empty-import-files'),
+              child: TextAction('从文件选择', onPressed: () => importAndEdit(context, app, source: 'files'))),
         const SizedBox(height: 96),
       ]),
     );
