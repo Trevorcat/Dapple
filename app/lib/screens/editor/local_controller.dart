@@ -9,6 +9,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart';
 
@@ -20,6 +21,8 @@ import '../../model/local_pad.dart';
 import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../native/local_bindings.dart';
+import '../../models.dart' show Photo;
+import '../../services/local_ai.dart';
 import 'editor_controller.dart';
 import 'itemised_view.dart' show ItemSource;
 import 'pad_widgets.dart' show PadSource;
@@ -36,20 +39,26 @@ enum LocalBody {
   addPart,
   subPart,
 
-  /// The selected area's actions (加一块 / 减一块 / 反选 / 复制 / 删除).
+  /// The selected area's actions (加一块 / 减一块 / 反选 / 复制 / 删除; AI areas also 涂抹补充 / 涂抹擦除).
   actions,
+
+  /// 人物: the parts the analysis found, to pick one or several.
+  aiParts,
 }
 
 /// What a finger on the photo is moving.
 enum _Grab { none, linKnob, linMid, lin0, lin1, linNew, radKnob, radSize, radRing, radMove, radNew, brush, tap }
 
 class LocalController extends ChangeNotifier {
-  LocalController(this.ctl) {
+  LocalController(this.ctl, {LocalAi? ai}) : ai = ai ?? const NoLocalAi() {
     ctl.app.editTick.addListener(_onEdit);
     ctl.wm.addListener(_onWm);
   }
 
   final EditorController ctl;
+
+  /// The AI masks service (a fake in tests).
+  final LocalAi ai;
 
   // ------------------------------------------------------------ selection and panel state
 
@@ -228,6 +237,8 @@ class LocalController extends ChangeNotifier {
     if (k == 0) mask[0] = mask[0].copyWith(op: MaskOp.add);
     ctl.app.applyEdit(ctl.id, (e) => e.copyWith(local: e.local.replace(selIndex, a.copyWith(mask: mask))));
     selComp = math.min(selComp, mask.length - 1);
+    body = LocalBody.pads;
+    flash();
     _changed();
   }
 
@@ -301,10 +312,439 @@ class LocalController extends ChangeNotifier {
           return MaskComponent(kind: MaskKindId.luminance, op: op, lo: lo.roundToDouble(), hi: (lo + 30).roundToDouble(), lumFeather: 10);
         }
         return MaskComponent(kind: MaskKindId.color, op: op, hue: (smp?.hue ?? 230).roundToDouble(), range: 25, hueFeather: 20, satMin: 10);
-      case LocalPlace.external:
-        return null; // a later round: the provider makes the raster plane
+      case LocalPlace.aiParts:
+      case LocalPlace.aiPlane:
+      case LocalPlace.aiTap:
+      case LocalPlace.aiDepth:
+        return null; // AI kinds go through chooseKind (the analysis makes their planes)
     }
   }
+
+  // ------------------------------------------------------------ AI kinds (docs/design/local-adjustments.md section 9)
+
+  /// What the device can do (null until asked).
+  AiAvailability? avail;
+  bool _availAsked = false;
+
+  /// The analysis of the photo now open: which task bits are done, which run, the progress of the running job.
+  String _aiPhoto = '';
+  int aiDone = 0, aiRunning = 0, _aiQueued = 0;
+  double aiProgress = 0;
+  StreamSubscription<AiProgress>? _aiSub;
+  final Map<String, AiPlane> aiPlanes = {};
+  bool personFound = false, skyFound = false;
+  int faces = 0;
+
+  /// A tile waiting for the analysis (天空 / 背景 / 远近) and whether it becomes a new area or a part.
+  LocalKind? aiPending;
+  LocalBody _pendingMode = LocalBody.addArea;
+
+  /// 人物: the part keys picked in the parts card, and where they go.
+  final Set<String> partPick = {};
+  LocalBody partMode = LocalBody.addArea;
+
+  /// Tap select: add (true) or subtract the next tap; a tap is being computed.
+  bool tapAdd = true, tapBusy = false;
+  String _tapSessionRef = '';
+  Future<void> _tapChain = Future.value();
+
+  /// "ai:" ids of this edit that are not in the raster store (the tool strip shows 重新分析); a repair runs.
+  final Set<String> missingRefs = {};
+  bool repairing = false;
+
+  int get deviceTasks => (avail?.available ?? false) ? avail!.tasks : 0;
+
+  Set<String> get absentKinds => {
+        if ((aiDone & AiBits.person) != 0 && !personFound) 'background',
+        if ((aiDone & AiBits.sky) != 0 && !skyFound) 'sky',
+      };
+
+  /// The kinds the shape card offers now.
+  List<LocalKind> get offered => offeredKinds(deviceTasks: deviceTasks, absent: absentKinds);
+
+  /// The tile of [k] shows the progress ring.
+  bool runningFor(LocalKind k) =>
+      k.ai && aiRunning != 0 && ((aiRunning & k.aiTasks) != 0) && (aiPending?.id == k.id || (k.place == LocalPlace.aiParts && aiPending == null));
+
+  void _askAvail() {
+    if (_availAsked) return;
+    _availAsked = true;
+    ai.prepare().then((a) {
+      avail = a;
+      _aiNotify();
+    });
+  }
+
+  void _aiPhotoCheck() {
+    if (_aiPhoto == ctl.id) return;
+    _aiPhoto = ctl.id;
+    cancelAnalysis();
+    aiDone = 0;
+    aiPlanes.clear();
+    personFound = skyFound = false;
+    faces = 0;
+    _tapSessionRef = '';
+    missingRefs.clear();
+  }
+
+  /// Starts the analysis of [tasks] (what is not done yet; one job at a time, the rest queued).
+  void startAnalysis(int tasks) {
+    _aiPhotoCheck();
+    final want = tasks & deviceTasks & ~aiDone & ~AiBits.tapPrepare;
+    if (want == 0) return;
+    if (aiRunning != 0) {
+      _aiQueued |= want & ~aiRunning;
+      return;
+    }
+    final p = ctl.app.photoById(ctl.id);
+    if (p == null) return;
+    aiRunning = want;
+    aiProgress = 0;
+    _aiNotify();
+    _aiSub = ai.run(p, want).listen((e) {
+      aiProgress = e.progress;
+      final r = e.result;
+      if (r != null) _aiFinished(want, r);
+      _aiNotify();
+    }, onDone: () {
+      if (aiRunning == want) _aiFinished(want, null);
+    });
+  }
+
+  /// Test hook: jobs started.
+  int debugAiRuns = 0;
+
+  void _aiFinished(int tasks, AiJobResult? r) {
+    _aiSub = null;
+    aiRunning = 0;
+    debugAiRuns++;
+    if (kDebugMode) {
+      debugPrint('local ai: tasks $tasks -> ${r?.state} ${r?.totalMs.round()} ms, ${r?.planes.length} planes, person ${r?.personFound}, faces ${r?.faces}, sky ${r?.skyFound}, '
+          'groups ${r?.groups.map((g) => '${g.group}:${g.state}:${g.ms.round()}').join(' ')}');
+    }
+    if (r != null && r.state != 'cancelled' && r.state != 'error') {
+      aiDone |= tasks;
+      for (final pl in r.planes) {
+        aiPlanes[pl.key] = pl;
+      }
+      if ((tasks & AiBits.person) != 0) personFound = r.personFound;
+      if ((tasks & AiBits.faces) != 0) faces = r.faces;
+      if ((tasks & AiBits.sky) != 0) skyFound = r.skyFound;
+    } else if (r != null && r.state == 'error') {
+      _toast('没能分析这张照片');
+      aiPending = null;
+    }
+    final pending = aiPending;
+    if (pending != null && (aiDone & pending.aiTasks) == pending.aiTasks) {
+      aiPending = null;
+      _createAiPlane(pending, _pendingMode);
+    }
+    final q = _aiQueued;
+    _aiQueued = 0;
+    if (q != 0) startAnalysis(q);
+    _aiNotify();
+  }
+
+  void cancelAnalysis() {
+    final had = _aiSub != null;
+    _aiSub?.cancel();
+    _aiSub = null;
+    aiRunning = 0;
+    _aiQueued = 0;
+    aiPending = null;
+    if (had) _aiNotify();
+  }
+
+  void _aiNotify() {
+    notifyListeners();
+    ctl.edits.value++;
+  }
+
+  /// A tile of the shape card: [mode] addArea, addPart or subPart.
+  Future<void> chooseKind(LocalKind k, LocalBody mode) async {
+    if (!k.ai) {
+      if (mode == LocalBody.addArea) return addArea(k);
+      return addPart(k, subtract: mode == LocalBody.subPart);
+    }
+    _aiPhotoCheck();
+    if (aiPending?.id == k.id && aiRunning != 0) {
+      cancelAnalysis(); // a second tap on a running tile stops it
+      return;
+    }
+    final lim = limitFor(list, k, index: mode == LocalBody.addArea || selIndex < 0 ? null : selIndex);
+    if (lim != null) {
+      _toast(lim);
+      return;
+    }
+    switch (k.place) {
+      case LocalPlace.aiParts:
+        partPick.clear();
+        partMode = mode;
+        body = LocalBody.aiParts;
+        startAnalysis(k.aiTasks);
+        _changed();
+      case LocalPlace.aiPlane:
+      case LocalPlace.aiDepth:
+        if ((aiDone & k.aiTasks) == k.aiTasks) {
+          _createAiPlane(k, mode);
+        } else {
+          aiPending = k;
+          _pendingMode = mode;
+          startAnalysis(k.aiTasks);
+        }
+      case LocalPlace.aiTap:
+        _newTapArea(mode);
+      default:
+        break;
+    }
+  }
+
+  MaskComponent _raster(String id, MaskOp op, {bool depth = false}) =>
+      MaskComponent(kind: MaskKindId.raster, op: op, ref: id, refine: 50, lo: 0, hi: depth ? 30 : 100, lumFeather: 10);
+
+  /// Adds [comps] as a new area ([mode] addArea) or as parts of the selected one. One undo step.
+  void _addComps(List<MaskComponent> comps, LocalBody mode, {bool on = true}) {
+    if (comps.isEmpty) return;
+    if (mode == LocalBody.addArea || selIndex < 0) {
+      final id = _newId();
+      ctl.app.applyEdit(ctl.id, (e) => e.copyWith(local: e.local.add(LocalAdjustment(id: id, on: on, mask: comps, ui: LocalUi.centre))));
+      selId = id;
+      selComp = 0;
+    } else {
+      final i = selIndex, a = sel!;
+      ctl.app.applyEdit(ctl.id, (e) => e.copyWith(local: e.local.replace(i, a.copyWith(mask: [...a.mask, ...comps]))));
+      selComp = a.mask.length;
+    }
+    body = LocalBody.pads;
+    flash();
+    _changed();
+  }
+
+  void _createAiPlane(LocalKind k, LocalBody mode) {
+    final pl = aiPlanes[k.aiKey];
+    if (pl == null) {
+      _toast(k.id == 'sky' ? '没找到天空' : (k.id == 'background' ? '没找到人' : '没能分析这张照片'));
+      return;
+    }
+    final first = mode == LocalBody.addArea || sel == null;
+    _addComps([_raster(pl.id, opForNew(k, first: first, subtract: mode == LocalBody.subPart), depth: k.place == LocalPlace.aiDepth)], mode);
+  }
+
+  /// The parts the analysis found, in the card's order: person parts, then per face its features.
+  List<AiPlane> get partPlanes {
+    const order = ['person', 'faceskin', 'bodyskin', 'hair', 'clothes'];
+    const faceOrder = ['eyes', 'iris', 'sclera', 'lips', 'brows', 'teeth'];
+    final out = <AiPlane>[
+      for (final k in order)
+        if (aiPlanes[k] != null) aiPlanes[k]!,
+    ];
+    for (var f = 1; f <= 4; f++) {
+      for (final k in faceOrder) {
+        final pl = aiPlanes['f$f:$k'];
+        if (pl != null) out.add(pl);
+      }
+    }
+    return out;
+  }
+
+  void togglePart(String key) {
+    if (!partPick.remove(key)) {
+      final lim = limitFor(list, kindById('person'), index: partMode == LocalBody.addArea || selIndex < 0 ? null : selIndex, n: partPick.length + 1);
+      if (lim != null) {
+        _toast(lim);
+        return;
+      }
+      partPick.add(key);
+    }
+    _changed();
+  }
+
+  /// The picked parts become one area (or parts of the selected one): their planes added together.
+  void addPickedParts() {
+    final keys = [for (final pl in partPlanes) if (partPick.contains(pl.key)) pl.key];
+    if (keys.isEmpty) return;
+    final first = partMode == LocalBody.addArea || sel == null;
+    final sub = partMode == LocalBody.subPart;
+    final comps = <MaskComponent>[
+      for (var i = 0; i < keys.length; i++) _raster(aiPlanes[keys[i]]!.id, first || !sub ? MaskOp.add : MaskOp.subtract),
+    ];
+    partPick.clear();
+    _addComps(comps, partMode);
+  }
+
+  // ---- tap select
+
+  /// 点选: a new part whose plane comes with the first tap (an area stays off until then: an export never asks for a plane that does not exist).
+  void _newTapArea(LocalBody mode) {
+    final p = ctl.app.photoById(ctl.id);
+    if (p == null) return;
+    tapAdd = true;
+    _tapSessionRef = '';
+    _tapChain = _tapChain.then((_) => ai.resetTaps(p)).then((_) {});
+    ai.prepareTap(p);
+    final first = mode == LocalBody.addArea || sel == null;
+    final op = first ? MaskOp.add : (mode == LocalBody.subPart ? MaskOp.subtract : MaskOp.add);
+    _addComps([MaskComponent(kind: MaskKindId.raster, op: op, ref: '')], mode, on: !first);
+  }
+
+  bool get tapPart {
+    final c = comp;
+    return c != null && c.kind == MaskKindId.raster && kindOfComponent(c).id == 'tap';
+  }
+
+  void setTapAdd(bool v) {
+    tapAdd = v;
+    _changed();
+  }
+
+  /// A tap on the photo with a tap-select part selected: the object there is added (or subtracted); one undo step per tap.
+  void aiTap(Offset local) {
+    final c = comp, p = ctl.app.photoById(ctl.id);
+    if (c == null || p == null) return;
+    final uv = space.photo(local);
+    pickedAt = local;
+    tick.value++;
+    final add = tapAdd, areaId = selId, k = selComp;
+    tapBusy = true;
+    _aiNotify();
+    _tapChain = _tapChain.then((_) async {
+      final ref = _refOf(areaId, k);
+      await _tapSessionTo(p, ref);
+      final sw = Stopwatch()..start();
+      final r = await ai.tap(p, uv.dx, uv.dy, add: add);
+      if (kDebugMode) debugPrint('local ai: tap ${sw.elapsedMilliseconds} ms (engine ${r.ms.round()} ms) ok ${r.ok}');
+      if (r.ok && r.id.isNotEmpty) {
+        _tapSessionRef = r.id;
+        _setTapRef(areaId, k, r.id);
+      } else {
+        _tapSessionRef = '';
+        _toast('没选到');
+      }
+    }).whenComplete(() {
+      tapBusy = false;
+      _aiNotify();
+    });
+  }
+
+  /// The engine keeps one tap session per photo: it is put back to [ref]'s taps when another part used it meanwhile.
+  Future<void> _tapSessionTo(Photo p, String ref) async {
+    if (_tapSessionRef == ref) return;
+    await ai.resetTaps(p);
+    for (final t in tapsOfId(ref)) {
+      await ai.tap(p, t.$1, t.$2, add: t.$3);
+    }
+    _tapSessionRef = ref;
+  }
+
+  String _refOf(String? areaId, int k) {
+    if (areaId == null) return '';
+    final a = list.byId(areaId);
+    return a == null || k >= a.mask.length ? '' : a.mask[k].ref;
+  }
+
+  /// Takes the last tap back (one undo step).
+  void undoTap() {
+    final c = comp, p = ctl.app.photoById(ctl.id);
+    if (c == null || p == null || c.ref.isEmpty) return;
+    final areaId = selId, k = selComp;
+    tapBusy = true;
+    _aiNotify();
+    _tapChain = _tapChain.then((_) async {
+      await _tapSessionTo(p, _refOf(areaId, k));
+      final r = await ai.undoTap(p);
+      _tapSessionRef = r.id;
+      _setTapRef(areaId, k, r.id);
+    }).whenComplete(() {
+      tapBusy = false;
+      _aiNotify();
+    });
+  }
+
+  void _setTapRef(String? areaId, int k, String id) {
+    if (areaId == null) return;
+    ctl.app.applyEdit(ctl.id, (e) {
+      final i = e.local.indexOf(areaId);
+      if (i < 0) return e;
+      final a = e.local.items[i];
+      if (k >= a.mask.length) return e;
+      final na = a.withComponent(k, a.mask[k].copyWith(ref: id));
+      // the area is on while every tap part has a plane (an empty tap part must not ask the export for a plane)
+      final ready = na.mask.every((m) => m.kind != MaskKindId.raster || m.ref.isNotEmpty);
+      return e.copyWith(local: e.local.replace(i, na.copyWith(on: ready)));
+    });
+    flash();
+    ctl.haptics.fire(HapticKind.detent);
+  }
+
+  // ---- brush correction of an AI area
+
+  /// 涂抹补充 ([add]) / 涂抹擦除: a brush part of the selected area that adds to / removes from it; selected, ready to paint.
+  Future<void> brushFix({required bool add}) async {
+    final a = sel;
+    if (a == null) return;
+    final op = add ? MaskOp.add : MaskOp.subtract;
+    erase = false;
+    for (var i = 1; i < a.mask.length; i++) {
+      if (a.mask[i].kind == MaskKindId.brush && a.mask[i].op == op) {
+        selComp = i;
+        body = LocalBody.pads;
+        flash();
+        _changed();
+        return;
+      }
+    }
+    await addPart(kindById('brush'), subtract: !add);
+  }
+
+  /// The selected area is made of AI planes.
+  bool get selIsAi => sel?.mask.any((m) => m.kind == MaskKindId.raster) ?? false;
+
+  // ---- missing planes
+
+  List<String> get _aiRefs => [
+        for (final a in list.items)
+          for (final m in a.mask)
+            if (m.kind == MaskKindId.raster && m.ref.startsWith('ai:')) m.ref,
+      ];
+
+  /// After opening an edit: planes not in the store are re-created (disk cache first); what is still missing shows 重新分析.
+  Future<void> checkMissing({bool repair = true}) async {
+    final p = ctl.app.photoById(ctl.id);
+    if (p == null || _aiRefs.isEmpty) {
+      if (missingRefs.isNotEmpty) {
+        missingRefs.clear();
+        _aiNotify();
+      }
+      return;
+    }
+    final pj = jsonEncode(ctl.app.wireParams(p));
+    var miss = await ai.missing(p, pj);
+    if (miss.isNotEmpty && repair) {
+      repairing = true;
+      _aiNotify();
+      await ai.ensure(p, pj);
+      miss = await ai.missing(p, pj);
+      repairing = false;
+    }
+    missingRefs
+      ..clear()
+      ..addAll(miss.map((m) => m.id));
+    _maskSig = '';
+    _overlayFor = '';
+    _aiNotify();
+  }
+
+  bool areaMissing(LocalAdjustment a) => a.mask.any((m) => missingRefs.contains(m.ref));
+
+  /// 重新分析: the missing planes of the edit, once more.
+  Future<void> reanalyse() async {
+    await checkMissing();
+    final a = sel;
+    if (a != null && areaMissing(a)) _toast('没能重新分析');
+  }
+
+  /// Memory pressure / leaving the editor: the models and the tap encoder go.
+  void releaseAi() => ai.release(all: true);
 
   // ------------------------------------------------------------ geometry
 
@@ -500,6 +940,8 @@ class LocalController extends ChangeNotifier {
       case MaskKindId.luminance:
       case MaskKindId.color:
         _grab = _Grab.tap;
+      case MaskKindId.raster:
+        _grab = tapPart ? _Grab.tap : _Grab.none;
       default:
         _grab = _Grab.none;
     }
@@ -611,7 +1053,11 @@ class LocalController extends ChangeNotifier {
       return;
     }
     if (!_moved && g == _Grab.tap) {
-      unawaited(pick(p));
+      if (tapPart) {
+        aiTap(p);
+      } else {
+        unawaited(pick(p));
+      }
       return;
     }
     _finishGesture();
@@ -803,8 +1249,12 @@ class LocalController extends ChangeNotifier {
       if (a) {
         _ensureSel();
         _refreshMap();
+        _askAvail();
+        _aiPhotoCheck();
+        unawaited(checkMissing());
         flash();
       } else {
+        cancelAnalysis();
         overlayOn.value = false;
         _endAll();
       }
@@ -838,12 +1288,15 @@ class LocalController extends ChangeNotifier {
     overlay.value?.dispose();
     overlay.value = null;
     pickedAt = null;
+    _aiPhotoCheck();
+    if (active) unawaited(checkMissing());
     _onEdit();
   }
 
   /// Back key: a card in the panel closes first.
   bool handleBack() {
     if (active && body != LocalBody.pads) {
+      if (body == LocalBody.aiParts) cancelAnalysis();
       showBody(LocalBody.pads);
       return true;
     }
@@ -865,6 +1318,7 @@ class LocalController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _aiSub?.cancel();
     ctl.app.editTick.removeListener(_onEdit);
     ctl.wm.removeListener(_onWm);
     _visTimer?.cancel();

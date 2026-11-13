@@ -20,7 +20,49 @@ const clampOut = r'{"v":1,"items":[{"id":"a","strength":100,"mask":[{"kind":"rad
 /// tests/engine/local_capi_tests.cpp line 70.
 const capiRadial = r'{"v":1,"items":[{"id":"r","strength":100,"mask":[{"kind":"radial","op":"add","cx":0.2,"cy":0.25,"rx":0.12,"ry":0.12,"angle":0,"feather":20}],"adjust":{"exposure":40}}]}';
 
+/// The engine (HEAD writer, section 41) reading a raster range and an identity range plus unknown keys: it writes the range only when it is
+/// not the identity and drops what it does not know.
+const rasterIn =
+    r'{"v":1,"items":[{"id":"d","strength":100,"mask":[{"kind":"raster","op":"add","ref":"ai:0123456789abcdef:depth","refine":50,"lo":5,"hi":35.5,"feather":12},{"kind":"raster","op":"intersect","ref":"ai:0123456789abcdef:f1:lips","refine":60,"lo":0,"hi":100,"feather":20,"newkey":3}],"adjust":{"exposure":10},"future":{"a":1}}]}';
+const rasterEngineOut =
+    r'{"v":1,"items":[{"id":"d","strength":100,"mask":[{"kind":"raster","op":"add","ref":"ai:0123456789abcdef:depth","refine":50,"lo":5,"hi":35.5,"feather":12},{"kind":"raster","op":"intersect","ref":"ai:0123456789abcdef:f1:lips","refine":60}],"adjust":{"exposure":10}}]}';
+
 void main() {
+  group('raster range and unknown keys', () {
+    test('the range of a raster part travels; identity is not written (as the engine)', () {
+      final l = LocalList.fromJson(jsonDecode(rasterEngineOut));
+      expect(jsonEncode(l.toEngineJson()), rasterEngineOut);
+      final d = l.items.first.mask.first;
+      expect([d.lo, d.hi, d.lumFeather], [5, 35.5, 12]);
+      expect(d.hasRange, isTrue);
+      expect(l.items.first.mask[1].hasRange, isFalse);
+    });
+
+    test('keys this build does not know are kept verbatim (component and item), the known ones written like the engine', () {
+      final l = LocalList.fromJson(jsonDecode(rasterIn));
+      final out = jsonDecode(jsonEncode(l.toEngineJson())) as Map;
+      final item = (out['items'] as List).first as Map;
+      expect(item['future'], {'a': 1});
+      final lips = (item['mask'] as List)[1] as Map;
+      expect(lips['newkey'], 3);
+      expect(lips.containsKey('lo'), isFalse);
+      // stripped of the unknown keys, the bytes are the engine's
+      item.remove('future');
+      lips.remove('newkey');
+      expect(jsonEncode(out), rasterEngineOut);
+      // and a second round trip is stable
+      final again = LocalList.fromJson(jsonDecode(jsonEncode(l.toEngineJson())));
+      expect(jsonEncode(again.toEngineJson()), jsonEncode(l.toEngineJson()));
+    });
+
+    test('an unknown key survives an edit of the component', () {
+      final l = LocalList.fromJson(jsonDecode(rasterIn));
+      final c = l.items.first.mask[1].copyWith(refine: 70);
+      expect(c.toJson()['newkey'], 3);
+      expect(c.toJson()['refine'], 70);
+    });
+  });
+
   group('engine JSON round trip', () {
     test('rich edit: byte-identical', () {
       final l = LocalList.fromJson(jsonDecode(engineRich));
@@ -32,8 +74,11 @@ void main() {
       expect(jsonEncode(LocalList.fromJson(jsonDecode(capiRadial)).toEngineJson()), capiRadial);
     });
 
-    test('clamping and a newer version read like the engine', () {
-      expect(jsonEncode(LocalList.fromJson(jsonDecode(clampIn)).toEngineJson()), clampOut);
+    test('clamping and a newer version read like the engine (its unknown key "future" kept verbatim)', () {
+      final out = jsonDecode(jsonEncode(LocalList.fromJson(jsonDecode(clampIn)).toEngineJson())) as Map;
+      final comp = ((out['items'] as List).first['mask'] as List).first as Map;
+      expect(comp.remove('future'), 1);
+      expect(jsonEncode(out), clampOut);
     });
 
     test('fields land where the engine puts them', () {
@@ -56,7 +101,7 @@ void main() {
       expect(b.strokes[0].count, 21);
       expect(b.strokes[1].erase, isTrue);
       expect(l.items[3].mask[1].ref, 'subject:p1:0');
-      expect(kindOfComponent(l.items[3].mask[1]).id, 'subject');
+      expect(kindOfComponent(l.items[3].mask[1]).id, 'raster'); // not an "ai:" id: a generic plane
     });
 
     test('a bare array of items, caps 16 / 8', () {
@@ -158,7 +203,33 @@ void main() {
   group('kinds registry', () {
     test('five kinds offered, AI kinds kept hidden until a provider exists', () {
       expect(pickableKinds.map((k) => k.id), ['linear', 'radial', 'brush', 'luminance', 'color']);
-      expect(localKinds.where((k) => k.place == LocalPlace.external).every((k) => !k.visible), isTrue);
+    });
+
+    test('AI kinds follow the device and the analysis', () {
+      expect(offeredKinds(deviceTasks: AiBits.person | AiBits.faces | AiBits.sky | AiBits.tapPrepare).map((k) => k.id),
+          ['linear', 'radial', 'brush', 'luminance', 'color', 'person', 'background', 'tap', 'sky']);
+      expect(offeredKinds(deviceTasks: 31, absent: {'background', 'sky'}).map((k) => k.id), contains('person'));
+      expect(offeredKinds(deviceTasks: 31, absent: {'background', 'sky'}).map((k) => k.id), isNot(contains('sky')));
+      expect(offeredKinds(deviceTasks: 31).map((k) => k.id), contains('depth'));
+    });
+
+    test('a stored AI plane tells its kind and part', () {
+      MaskComponent r(String ref) => MaskComponent(kind: MaskKindId.raster, ref: ref);
+      expect(kindOfComponent(r('ai:0123456789abcdef:hair')).id, 'person');
+      expect(kindOfComponent(r('ai:0123456789abcdef:f2:lips')).id, 'person');
+      expect(kindOfComponent(r('ai:0123456789abcdef:background')).id, 'background');
+      expect(kindOfComponent(r('ai:0123456789abcdef:tap:+412,531;-200,700')).id, 'tap');
+      expect(kindOfComponent(r('ai:0123456789abcdef:depth')).id, 'depth');
+      expect(kindOfComponent(r('')).id, 'tap'); // a tap area before its first tap
+      expect(partLabel('f1:iris'), '虹膜');
+      expect(partLabel('faceskin'), '脸部皮肤');
+      expect(partLabel('f1:face'), isNull);
+      expect(aiPlaneKey('ai:0123456789abcdef:f1:lips'), 'f1:lips');
+    });
+
+    test('the AI ranges: shapes, not limits', () {
+      expect(opForNew(kindById('person'), first: false, subtract: false), MaskOp.add);
+      expect(limitFor(LocalList([for (var i = 0; i < 3; i++) LocalAdjustment(id: '$i', mask: const [MaskComponent(kind: MaskKindId.raster)])]), kindById('sky'), n: 2), isNotNull);
     });
 
     test('combine rule: shapes add, ranges limit, 减 subtracts', () {

@@ -5,7 +5,7 @@
 // (group: an EGroup name, the panel's categories being light / color / style (= 胶片) / effects (= 质地) / crop; row: the panel
 // layer - items, map, curve, hsl, grade, paper; "look":"warm" selects a style; "pad":{"light":[x,y,a]} sets a pad state before opening (x, y in -1..1,
 // a in 0..1, 0.5 = 100 %); "hold":"light" shows the hold popup; all optional; {"close":true} goes back to the library; {"purgeCaptures":true} removes the
-// in-app capture test shots from the library).
+// in-app capture test shots from the library; {"import":["dbg/a.jpg"]} imports files pushed under the external files folder, removed again by purgeCaptures).
 // The file is read once a second and deleted when it has been applied. Release builds never start this.
 import 'dart:async';
 import 'dart:convert';
@@ -49,6 +49,30 @@ class DebugOpen {
         final sess = await DappleSession.open(out, longEdge: 2048);
         debugPrint('debug_open: engine info ${await sess.info()}');
         await sess.close();
+        return;
+      }
+      final imp = j['import'];
+      if (imp is List) {
+        // {"import":["dbg/p1.jpg", ...]} (paths under the external files folder, pushed with adb): imported like a pick from the photo picker.
+        // Their ids start with "cap:" so {"purgeCaptures":true} removes them (and their files) again.
+        final now = DateTime.now().millisecondsSinceEpoch;
+        final items = <PickedItem>[
+          for (final x in imp.whereType<String>())
+            if (File(p.join(dir.path, x)).existsSync())
+              PickedItem(
+                key: 'cap:dbg:${p.basename(x)}',
+                name: p.basename(x),
+                file: IncomingFile(id: 'cap:dbg:${p.basename(x)}', name: p.basename(x), addedMs: now, path: p.join(dir.path, x), size: File(p.join(dir.path, x)).lengthSync()),
+              ),
+        ];
+        final old = app.pickBackend;
+        app.pickBackend = (_, _) async => items;
+        try {
+          await app.importFromPicker();
+        } finally {
+          app.pickBackend = old;
+        }
+        debugPrint('debug_open: imported ${items.length}');
         return;
       }
       final nav = app.navigatorKey.currentState;

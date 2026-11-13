@@ -30,6 +30,7 @@ import 'pad_panel.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart';
 import 'gesture_surface.dart';
+import '../../services/local_ai.dart';
 import 'local_layer.dart';
 import 'local_panel.dart' show LocalToolStrip;
 import 'sync_dialog.dart';
@@ -44,7 +45,7 @@ void openEditor(BuildContext context, AppState app, String photoId, {EGroup? ini
 }
 
 class EditorPage extends StatefulWidget {
-  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher, this.lookSwatchSource, this.initialGroup, this.initialRow, this.initialCollapsed = false, this.initialHold});
+  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher, this.lookSwatchSource, this.initialGroup, this.initialRow, this.initialCollapsed = false, this.initialHold, this.localAi});
   final AppState app;
   final String photoId;
 
@@ -59,6 +60,9 @@ class EditorPage extends StatefulWidget {
   /// Debug link / tests: shows the hold popup of this pad category (name) without a finger.
   final String? initialHold;
 
+  /// Test hook: the AI masks service of 局部 (null = the engine's when the native library is there).
+  final LocalAi? localAi;
+
   /// Test hook: replaces the engine query for the film pads' effective ranges.
   final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
 
@@ -68,7 +72,7 @@ class EditorPage extends StatefulWidget {
   State<EditorPage> createState() => _EditorPageState();
 }
 
-class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
+class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, WidgetsBindingObserver {
   AppState get app => widget.app;
   late String id = widget.photoId;
   late final EditorEngine engine = EditorEngine(app);
@@ -104,8 +108,10 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
       onToggleImmersive: () => ctl.immersive.value = !ctl.immersive.value,
       filmPadFetcher: widget.filmPadFetcher,
       lookSwatchSource: widget.lookSwatchSource,
+      localAi: widget.localAi ?? (app.sessions.available ? EngineLocalAi(app) : const NoLocalAi()),
     );
     lastRev = app.editRevision;
+    WidgetsBinding.instance.addObserver(this);
     app.addListener(_onApp);
     app.editTick.addListener(_onApp);
     wm.addListener(_onWm);
@@ -124,6 +130,8 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
   @override
   void dispose() {
     if (_resampling) GestureBinding.instance.resamplingEnabled = false;
+    WidgetsBinding.instance.removeObserver(this);
+    ctl.local.releaseAi(); // leaving the editor: the models and the tap encoder go
     app.removeListener(_onApp);
     app.editTick.removeListener(_onApp);
     wm.removeListener(_onWm);
@@ -166,6 +174,10 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin {
     }
     if (widget.initialCollapsed) wm.setCollapsed(g, true);
   }
+
+  /// The system is short of memory: the AI models (and the tap encoder) are freed now instead of after their idle time.
+  @override
+  void didHaveMemoryPressure() => ctl.local.releaseAi();
 
   void _onApp() {
     if (!mounted) return;

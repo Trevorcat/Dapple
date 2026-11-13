@@ -18,6 +18,7 @@ import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../services/editor_engine.dart';
 import '../../state/app_state.dart';
+import '../../services/local_ai.dart' show LocalAi;
 import 'local_controller.dart';
 import 'zoom_view.dart';
 
@@ -84,9 +85,10 @@ class EditorController extends ChangeNotifier implements GestureSink {
     required this.onToggleImmersive,
     this.filmPadFetcher,
     this.lookSwatchSource,
+    LocalAi? localAi,
   }) {
     edits.addListener(_maybeRefreshRanges);
-    local = LocalController(this);
+    local = LocalController(this, ai: localAi);
   }
 
   /// 局部: areas, the photo's "editing an area" mode, the overlay (docs/design/local-adjustments.md).

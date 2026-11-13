@@ -97,6 +97,27 @@ void paintLocalGlyph(Canvas canvas, Rect r, LocalGlyph g, Color color, {double s
         final w = s * (0.8 - i * 0.2);
         canvas.drawLine(Offset(c.dx - w / 2, r.bottom - s * (0.18 + i * 0.22)), Offset(c.dx + w / 2, r.bottom - s * (0.18 + i * 0.22)), line);
       }
+    case LocalGlyph.background:
+      // everything but the person: a shaded frame with the person left out
+      final frame = RRect.fromRectAndRadius(Rect.fromCenter(center: c, width: s * 0.84, height: s * 0.76), Radius.circular(s * 0.12));
+      final person = Path()
+        ..addOval(Rect.fromCircle(center: c.translate(0, -s * 0.1), radius: s * 0.12))
+        ..moveTo(c.dx - s * 0.24, frame.bottom)
+        ..quadraticBezierTo(c.dx, c.dy - s * 0.02, c.dx + s * 0.24, frame.bottom)
+        ..close();
+      final shade = Path()
+        ..addRRect(frame)
+        ..addPath(person, Offset.zero)
+        ..fillType = PathFillType.evenOdd;
+      canvas.drawPath(shade, Paint()..color = color.withValues(alpha: 0.3));
+      canvas.drawRRect(frame, line);
+      canvas.drawPath(person, line);
+    case LocalGlyph.tap:
+      // a finger tip on an object: a ring with a dot and two ripples
+      canvas.drawCircle(c, s * 0.1, fill);
+      canvas.drawCircle(c, s * 0.24, line);
+      canvas.drawArc(Rect.fromCircle(center: c, radius: s * 0.4), -2.4, 1.1, false, line);
+      canvas.drawArc(Rect.fromCircle(center: c, radius: s * 0.4), 0.7, 1.1, false, line);
     case LocalGlyph.raster:
       canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromCenter(center: c, width: s * 0.7, height: s * 0.7), Radius.circular(s * 0.14)), line);
       canvas.drawCircle(c, s * 0.12, fill);

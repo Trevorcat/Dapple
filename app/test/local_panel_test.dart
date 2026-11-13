@@ -7,6 +7,7 @@ import 'package:dapple/model/params.dart';
 import 'package:dapple/screens/editor/editor_page.dart';
 import 'package:dapple/screens/editor/local_controller.dart';
 import 'package:dapple/screens/editor/local_layer.dart';
+import 'package:dapple/services/local_ai.dart' show LocalAi;
 import 'package:dapple/state/app_state.dart';
 import 'package:dapple/theme/tokens.dart';
 import 'package:flutter/material.dart';
@@ -27,17 +28,19 @@ class Rig {
 }
 
 /// The editor on a demo photo with the 局部 panel open.
-Future<Rig> openLocal(WidgetTester t, {Size phys = phonePhys, double dpr = phoneDpr, bool dark = false}) async {
+Future<Rig> openLocal(WidgetTester t,
+    {Size phys = phonePhys, double dpr = phoneDpr, bool dark = false, LocalAi? ai, void Function(AppState app, String id)? before}) async {
   setView(t, phys, dpr);
   await loadTestFonts();
   final app = AppState.demo();
   final id = app.photos.firstWhere((p) => p.title == '外滩夕阳' && p.id.startsWith('d')).id;
+  before?.call(app, id);
   await t.pumpWidget(MaterialApp(
     debugShowCheckedModeBanner: false,
     theme: buildTheme(Brightness.light),
     darkTheme: buildTheme(Brightness.dark),
     themeMode: dark ? ThemeMode.dark : ThemeMode.light,
-    home: EditorPage(app: app, photoId: id, resamplePointers: false, initialGroup: EGroup.local),
+    home: EditorPage(app: app, photoId: id, resamplePointers: false, initialGroup: EGroup.local, localAi: ai),
   ));
   await settle(t, 8);
   final lc = t.widget<LocalPhotoLayer>(find.byType(LocalPhotoLayer)).lc;
@@ -338,7 +341,7 @@ void main() {
       expect(r.lc.selId, area(r, 1).id);
     });
 
-    testWidgets('加一块 opens the card and adds a part; 去掉这一块 removes it again', (t) async {
+    testWidgets('加一块 opens the card and adds a part; 去掉这块 (actions) removes the selected one', (t) async {
       final r = await openLocal(t);
       await addViaCard(t, 'radial');
       await tapKey(t, 'local-chip-0');
@@ -348,8 +351,10 @@ void main() {
       expect(area(r).mask, hasLength(2));
       expect(area(r).mask[1].op, MaskOp.add);
       expect(key('local-part-1'), findsOneWidget);
-      await tapKey(t, 'local-part-remove');
+      await tapKey(t, 'local-chip-0');
+      await tapKey(t, 'act-去掉这块');
       expect(area(r).mask, hasLength(1));
+      expect(area(r).mask.first.kind, MaskKindId.radial);
     });
   });
 

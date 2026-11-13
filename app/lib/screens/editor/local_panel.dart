@@ -9,6 +9,7 @@ import '../../model/local_adjust.dart';
 import '../../model/local_kinds.dart';
 import '../../model/local_pad.dart';
 import '../../model/pad_model.dart';
+import '../../services/local_ai.dart' show AiPlane;
 import '../../theme/tokens.dart';
 import 'editor_controller.dart';
 import 'itemised_view.dart';
@@ -36,11 +37,26 @@ class LocalHeader extends StatelessWidget {
       LocalBody.subPart => '减一块',
       _ => '局部',
     };
-    final inCard = lc.body != LocalBody.pads && !lc.list.isEmpty;
+    final inCard = lc.body != LocalBody.pads && (!lc.list.isEmpty || lc.body == LocalBody.aiParts);
+    final parts = lc.body == LocalBody.aiParts && lc.personFound && lc.aiRunning == 0;
     final buttons = <Widget>[
       if (inCard)
-        HeaderButton(key: const ValueKey('local-back'), label: '返回', onTap: () => lc.showBody(LocalBody.pads))
-      else if (a != null) ...[
+        HeaderButton(key: const ValueKey('local-back'), label: '返回', onTap: () {
+          if (lc.body == LocalBody.aiParts) lc.cancelAnalysis();
+          lc.showBody(LocalBody.pads);
+        }),
+      // the parts card's one action sits where the eye goes for "done" (the chips keep the whole body)
+      if (parts)
+        Opacity(
+          opacity: lc.partPick.isEmpty ? 0.38 : 1,
+          child: HeaderButton(
+            key: const ValueKey('parts-add'),
+            label: lc.partMode == LocalBody.subPart ? '减去' : '添加',
+            pressed: lc.partPick.isNotEmpty,
+            onTap: lc.addPickedParts,
+          ),
+        )
+      else if (!inCard && a != null) ...[
         ListenableBuilder(
           listenable: ctl.app.editTick,
           builder: (context, _) {
@@ -229,6 +245,7 @@ class LocalBodyView extends StatelessWidget {
   Widget build(BuildContext context) {
     final lc = ctl.local;
     // the empty state IS the first step: the shape card
+    if (lc.body == LocalBody.aiParts) return AiPartsCard(lc: lc);
     if (lc.list.isEmpty || lc.body == LocalBody.addArea) return ShapeCard(lc: lc, mode: LocalBody.addArea);
     switch (lc.body) {
       case LocalBody.addPart:
@@ -236,6 +253,8 @@ class LocalBodyView extends StatelessWidget {
         return ShapeCard(lc: lc, mode: lc.body);
       case LocalBody.actions:
         return AreaActions(lc: lc);
+      case LocalBody.aiParts:
+        return AiPartsCard(lc: lc);
       case LocalBody.pads:
       case LocalBody.addArea:
         break;
@@ -261,7 +280,9 @@ class LocalBodyView extends StatelessWidget {
   }
 }
 
-/// The kinds as large glyph tiles with one word each (not a text list). From the registry: adding a kind is a data change.
+/// The kinds as large glyph tiles with one word each (not a text list), from the registry: the shapes on the first row, the AI kinds the
+/// device can do (and the analysis did not rule out) on the second. An AI tile shows a determinate ring while its analysis runs; a second
+/// tap on it cancels.
 class ShapeCard extends StatelessWidget {
   const ShapeCard({super.key, required this.lc, required this.mode});
   final LocalController lc;
@@ -270,49 +291,125 @@ class ShapeCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.c;
-    final kinds = pickableKinds;
+    final kinds = lc.offered;
+    final rows = <List<LocalKind>>[
+      [for (final k in kinds) if (!k.ai) k],
+      [for (final k in kinds) if (k.ai) k],
+    ]..removeWhere((r) => r.isEmpty);
     return LayoutBuilder(builder: (context, cons) {
-      // one row when it fits, else two (five kinds now; more later stay on two rows)
-      final perRow = cons.maxWidth / kinds.length >= 58 ? kinds.length : (kinds.length / 2).ceil();
+      final perRow = rows.fold<int>(1, (n, r) => math.max(n, r.length));
       final tileW = math.min(84.0, (cons.maxWidth - 8 * (perRow - 1)) / perRow);
-      final tile = math.min(tileW, cons.maxHeight / ((kinds.length / perRow).ceil()) - 8);
-      return Center(
-        child: Wrap(
-          alignment: WrapAlignment.center,
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            for (final k in kinds)
-              Semantics(
-                button: true,
-                label: k.label,
-                excludeSemantics: true,
-                child: GestureDetector(
-                  key: ValueKey('kind-${k.id}'),
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () {
-                    if (mode == LocalBody.addArea) {
-                      lc.addArea(k);
-                    } else {
-                      lc.addPart(k, subtract: mode == LocalBody.subPart);
-                    }
-                  },
-                  child: Container(
-                    width: tileW,
-                    height: math.max(56.0, tile),
-                    decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(16)),
-                    child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                      LocalGlyphIcon(k.glyph, size: 30, color: c.text),
-                      const SizedBox(height: 6),
-                      Text(k.label, style: T.cap(c.text2)),
-                    ]),
-                  ),
+      final tileH = math.max(56.0, math.min(84.0, (cons.maxHeight - 8 * (rows.length - 1)) / rows.length));
+      Widget tile(LocalKind k) {
+        final running = lc.runningFor(k);
+        return Semantics(
+          button: true,
+          label: '${k.label}${k.note == null ? '' : '（${k.note}）'}${running ? '，分析中，再点一次取消' : ''}',
+          excludeSemantics: true,
+          child: GestureDetector(
+            key: ValueKey('kind-${k.id}'),
+            behavior: HitTestBehavior.opaque,
+            onTap: () => lc.chooseKind(k, mode),
+            child: Container(
+              width: tileW,
+              height: tileH,
+              decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(16)),
+              child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                SizedBox(
+                  width: 36,
+                  height: 32,
+                  child: Stack(alignment: Alignment.center, children: [
+                    Opacity(opacity: running ? 0.35 : 1, child: LocalGlyphIcon(k.glyph, size: 28, color: c.text)),
+                    if (running)
+                      SizedBox(
+                        key: ValueKey('kind-progress-${k.id}'),
+                        width: 26,
+                        height: 26,
+                        child: CircularProgressIndicator(value: lc.aiProgress <= 0 ? null : lc.aiProgress, strokeWidth: 2.5, color: c.accent, backgroundColor: c.track),
+                      ),
+                  ]),
                 ),
-              ),
+                const SizedBox(height: 4),
+                Text(k.label, maxLines: 1, style: T.cap(c.text2)),
+                if (k.note != null) Text(k.note!, maxLines: 1, style: T.mini(c.text2.withValues(alpha: 0.7))),
+              ]),
+            ),
+          ),
+        );
+      }
+
+      return Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          for (var i = 0; i < rows.length; i++) ...[
+            if (i > 0) const SizedBox(height: 8),
+            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              for (var j = 0; j < rows[i].length; j++) ...[if (j > 0) const SizedBox(width: 8), tile(rows[i][j])],
+            ]),
           ],
-        ),
+        ]),
       );
     });
+  }
+}
+
+/// 人物: the parts the analysis found, as small chips to pick one or several; one button adds them as one area. While the analysis runs: a
+/// determinate ring and 取消; no person: a plain sentence and nothing to pick.
+class AiPartsCard extends StatelessWidget {
+  const AiPartsCard({super.key, required this.lc});
+  final LocalController lc;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    if (lc.aiRunning != 0 && (lc.aiDone & AiBits.person) == 0) {
+      return Center(
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          SizedBox(
+            key: const ValueKey('parts-progress'),
+            width: 28,
+            height: 28,
+            child: CircularProgressIndicator(value: lc.aiProgress <= 0 ? null : lc.aiProgress, strokeWidth: 3, color: c.accent, backgroundColor: c.track),
+          ),
+          const SizedBox(width: 12),
+          Text('正在找人', style: T.body(c.text2)),
+          const SizedBox(width: 16),
+          HeaderButton(key: const ValueKey('parts-cancel'), label: '取消', onTap: () {
+            lc.cancelAnalysis();
+            lc.showBody(lc.list.isEmpty ? LocalBody.addArea : LocalBody.pads);
+          }),
+        ]),
+      );
+    }
+    if ((lc.aiDone & AiBits.person) != 0 && !lc.personFound) {
+      return Center(child: Text('没找到人', key: const ValueKey('parts-none'), style: T.body(c.text2)));
+    }
+    final planes = lc.partPlanes;
+    final people = [for (final p in planes) if (p.face == 0) p];
+    final byFace = <int, List<AiPlane>>{};
+    for (final p in planes) {
+      if (p.face > 0) byFace.putIfAbsent(p.face, () => []).add(p);
+    }
+    Widget chip(AiPlane p) {
+      final on = lc.partPick.contains(p.key);
+      // a chip as wide as its word (PanelChip fills a loose width)
+      return IntrinsicWidth(child: PanelChip(key: ValueKey('part-${p.key}'), label: partLabel(p.key) ?? p.label, selected: on, onTap: () => lc.togglePart(p.key)));
+    }
+
+    final rows = <Widget>[
+      Wrap(spacing: 6, runSpacing: 6, children: [for (final p in people) chip(p)]),
+      for (final e in byFace.entries)
+        Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 9, right: 6),
+              child: Text(byFace.length > 1 ? '脸 ${e.key}' : '脸', style: T.cap(c.text2)),
+            ),
+            Expanded(child: Wrap(spacing: 6, runSpacing: 6, children: [for (final p in e.value) chip(p)])),
+          ]),
+        ),
+    ];
+    return SingleChildScrollView(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: rows));
   }
 }
 
@@ -327,14 +424,21 @@ class AreaActions extends StatelessWidget {
     final a = lc.sel;
     final full = a != null && a.mask.length >= kMaxMaskComponents;
     final acts = <(String, IconData, VoidCallback, bool)>[
+      if (lc.selIsAi) ...[
+        ('涂抹补充', Icons.brush_outlined, () => lc.brushFix(add: true), false),
+        ('涂抹擦除', Icons.auto_fix_off_outlined, () => lc.brushFix(add: false), false),
+      ],
       ('加一块', Icons.add_circle_outline, () => full ? lc.ctl.app.showToast('每个区域最多 $kMaxMaskComponents 块') : lc.showBody(LocalBody.addPart), false),
       ('减一块', Icons.remove_circle_outline, () => full ? lc.ctl.app.showToast('每个区域最多 $kMaxMaskComponents 块') : lc.showBody(LocalBody.subPart), false),
       ('反选', Icons.flip_outlined, lc.invertArea, false),
       ('复制', Icons.content_copy_outlined, lc.duplicateArea, false),
+      // the selected part (chosen on the tool strip) goes; the area stays
+      if (a != null && a.mask.length > 1) ('去掉这块', Icons.layers_clear_outlined, () => lc.removePart(lc.selComp), false),
       ('删除', Icons.delete_outline, lc.deleteArea, true),
     ];
     return LayoutBuilder(builder: (context, cons) {
-      final w = math.min(84.0, (cons.maxWidth - 8 * (acts.length - 1)) / acts.length);
+      final perRow = acts.length > 5 ? (acts.length / 2).ceil() : acts.length;
+      final w = math.min(84.0, (cons.maxWidth - 8 * (perRow - 1)) / perRow);
       return Center(
         child: Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
           for (final x in acts)
@@ -447,6 +551,23 @@ class LocalToolStrip extends StatelessWidget {
             tool = _RangeBar(lc: lc, hue: false);
           case MaskKindId.color:
             tool = _RangeBar(lc: lc, hue: true);
+          case MaskKindId.raster:
+            final k = kindOfComponent(m).id;
+            if (lc.missingRefs.contains(m.ref) || lc.repairing) {
+              tool = _Reanalyse(lc: lc);
+            } else if (k == 'tap') {
+              tool = _TapTools(lc: lc);
+            } else if (k == 'depth') {
+              tool = Row(mainAxisSize: MainAxisSize.min, children: [
+                Text('近', style: T.mini(c.text2)),
+                const SizedBox(width: 4),
+                _RangeBar(lc: lc, hue: false, depth: true),
+                const SizedBox(width: 4),
+                Text('远', style: T.mini(c.text2)),
+              ]);
+            } else {
+              tool = null;
+            }
           default:
             tool = null;
         }
@@ -465,7 +586,8 @@ class LocalToolStrip extends StatelessWidget {
               borderRadius: BorderRadius.circular(24),
               boxShadow: const [BoxShadow(color: Color(0x33000000), blurRadius: 12, offset: Offset(0, 3))],
             ),
-            child: Row(mainAxisSize: MainAxisSize.min, children: children),
+            // several parts plus the brush tools can exceed a narrow photo: the strip scales down rather than overflow
+            child: FittedBox(fit: BoxFit.scaleDown, child: Row(mainAxisSize: MainAxisSize.min, children: children)),
           ),
         );
       },
@@ -508,19 +630,6 @@ class _PartChip extends StatelessWidget {
             ]),
           ),
         ),
-        // the selected part can be removed
-        if (selected)
-          Semantics(
-            button: true,
-            label: '去掉这一块',
-            excludeSemantics: true,
-            child: GestureDetector(
-              key: const ValueKey('local-part-remove'),
-              behavior: HitTestBehavior.opaque,
-              onTap: () => lc.removePart(index),
-              child: SizedBox(width: 28, height: 40, child: Icon(Icons.close, size: 16, color: c.text2)),
-            ),
-          ),
       ]),
     );
   }
@@ -604,9 +713,12 @@ class _EraserPainter extends CustomPainter {
 
 /// A tone (dark -> light) or hue band with the selected range raised; drag an end to resize it, the middle to move it.
 class _RangeBar extends StatefulWidget {
-  const _RangeBar({required this.lc, required this.hue});
+  const _RangeBar({required this.lc, required this.hue, this.depth = false});
   final LocalController lc;
   final bool hue;
+
+  /// A near (left) - far (right) band of the depth plane (same lo / hi / feather as the tone band).
+  final bool depth;
 
   @override
   State<_RangeBar> createState() => _RangeBarState();
@@ -675,7 +787,7 @@ class _RangeBarState extends State<_RangeBar> {
     final m = lc.comp!;
     return Semantics(
       slider: true,
-      label: widget.hue ? '颜色范围' : '明暗范围',
+      label: widget.hue ? '颜色范围' : (widget.depth ? '远近范围' : '明暗范围'),
       value: widget.hue ? '${m.hue.round()}° ± ${m.range.round()}°' : '${m.lo.round()} – ${m.hi.round()}',
       child: SizedBox(
         width: w,
@@ -686,7 +798,7 @@ class _RangeBarState extends State<_RangeBar> {
           onEnd: _end,
           child: CustomPaint(
             key: ValueKey(widget.hue ? 'hue-bar' : 'tone-bar'),
-            painter: _RangePainter(widget.hue, m, c.text, c.surface),
+            painter: _RangePainter(widget.hue, m, c.text, c.surface, depth: widget.depth),
           ),
         ),
       ),
@@ -695,8 +807,8 @@ class _RangeBarState extends State<_RangeBar> {
 }
 
 class _RangePainter extends CustomPainter {
-  _RangePainter(this.hue, this.m, this.ink, this.card);
-  final bool hue;
+  _RangePainter(this.hue, this.m, this.ink, this.card, {this.depth = false});
+  final bool hue, depth;
   final MaskComponent m;
   final Color ink, card;
 
@@ -711,7 +823,9 @@ class _RangePainter extends CustomPainter {
       final colors = [for (var i = 0; i <= 12; i++) oklabHueColor(i * 30.0)];
       canvas.drawRect(bar, Paint()..shader = LinearGradient(colors: colors).createShader(bar));
     } else {
-      canvas.drawRect(bar, Paint()..shader = const LinearGradient(colors: [Color(0xFF0B0B0C), Color(0xFFF7F7F5)]).createShader(bar));
+      // tones: dark -> light; distance: near (warm, strong) -> far (hazy blue), as an air-perspective hint
+      final cols = depth ? const [Color(0xFF6B4A33), Color(0xFFB9A58F), Color(0xFFCFDCE8)] : const [Color(0xFF0B0B0C), Color(0xFFF7F7F5)];
+      canvas.drawRect(bar, Paint()..shader = LinearGradient(colors: cols).createShader(bar));
     }
     // dim what is not selected (the soft edge drawn as a fade)
     // what is not selected fades toward the card (light, not a dark veil)
@@ -785,4 +899,84 @@ Color oklabHueColor(double hueDeg) {
   }
 
   return Color.fromARGB(255, enc(r), enc(g), enc(bl));
+}
+
+/// 点选: add / subtract the next tap, take the last tap back; a ring while a tap is computed (the photo stays usable).
+class _TapTools extends StatelessWidget {
+  const _TapTools({required this.lc});
+  final LocalController lc;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    Widget seg(bool add) {
+      final on = lc.tapAdd == add;
+      return Semantics(
+        button: true,
+        selected: on,
+        label: add ? '点一下加上' : '点一下去掉',
+        excludeSemantics: true,
+        child: GestureDetector(
+          key: ValueKey(add ? 'tap-add' : 'tap-sub'),
+          behavior: HitTestBehavior.opaque,
+          onTap: () => lc.setTapAdd(add),
+          child: Container(
+            width: 44,
+            height: 32,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(color: on ? c.accent : null, borderRadius: BorderRadius.circular(16)),
+            child: Icon(add ? Icons.add : Icons.remove, size: 20, color: on ? Colors.white : c.text),
+          ),
+        ),
+      );
+    }
+
+    final hasTaps = (lc.comp?.ref ?? '').isNotEmpty;
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      Container(
+        padding: const EdgeInsets.all(2),
+        decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(18)),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [seg(true), seg(false)]),
+      ),
+      const SizedBox(width: 8),
+      Semantics(
+        button: true,
+        enabled: hasTaps,
+        label: '撤销上一下',
+        excludeSemantics: true,
+        child: GestureDetector(
+          key: const ValueKey('tap-undo'),
+          behavior: HitTestBehavior.opaque,
+          onTap: hasTaps ? lc.undoTap : null,
+          child: SizedBox(width: 40, height: 44, child: Icon(Icons.undo, size: 20, color: hasTaps ? c.text : c.text2.withValues(alpha: 0.4))),
+        ),
+      ),
+      SizedBox(
+        width: 28,
+        child: lc.tapBusy
+            ? SizedBox(key: const ValueKey('tap-busy'), width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.5, color: c.accent))
+            : const SizedBox.shrink(),
+      ),
+    ]);
+  }
+}
+
+/// A plane of this area is not in the store and could not be re-created on its own: one button tries again.
+class _Reanalyse extends StatelessWidget {
+  const _Reanalyse({required this.lc});
+  final LocalController lc;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    if (lc.repairing) {
+      return Row(mainAxisSize: MainAxisSize.min, children: [
+        SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2.5, color: c.accent)),
+        const SizedBox(width: 8),
+        Text('正在重新分析', style: T.cap(c.text2)),
+        const SizedBox(width: 6),
+      ]);
+    }
+    return HeaderButton(key: const ValueKey('ai-reanalyse'), label: '重新分析', icon: null, onTap: lc.reanalyse);
+  }
 }

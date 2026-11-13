@@ -212,8 +212,12 @@ class MaskComponent {
   final String ref;
   final double refine;
 
-  /// Unknown kinds: the component's JSON as read (written back verbatim).
+  /// Unknown kinds: the component's JSON as read (written back verbatim). Known kinds: the keys this build does not know (an engine
+  /// addition), written back verbatim after the known ones, so a round trip never loses them.
   final Map<String, Object?>? raw;
+
+  /// raster: a range on the plane value (depth bands): `lo` / `hi` / `feather` share the luminance fields; identity = 0..100.
+  bool get hasRange => lo > 0 || hi < 100;
 
   MaskComponent copyWith({
     MaskOp? op,
@@ -274,6 +278,11 @@ class MaskComponent {
     final kindStr = j['kind'] is String ? j['kind'] as String : '';
     final kind = maskKindOf(kindStr);
     if (kind == MaskKindId.unknown) return MaskComponent(kind: kind, raw: Map<String, Object?>.from(j));
+    final known = _knownKeys[kind]!;
+    final extra = <String, Object?>{
+      for (final e in j.entries)
+        if (e.key is String && !known.contains(e.key)) e.key as String: e.value,
+    };
     final ops = j['op'];
     final op = ops == 'subtract' ? MaskOp.subtract : (ops == 'intersect' ? MaskOp.intersect : MaskOp.add);
     double c(String k, double lo, double hi, double def) => _fix(j[k], lo, hi, def);
@@ -291,7 +300,7 @@ class MaskComponent {
         if (b != null) strokes.add(b);
       }
     }
-    final isLum = kind == MaskKindId.luminance, isCol = kind == MaskKindId.color;
+    final isLum = kind == MaskKindId.luminance || kind == MaskKindId.raster, isCol = kind == MaskKindId.color;
     final hue0 = _fmod(_fmod(c('hue', -3600, 3600, 0), 360) + 360, 360);
     return MaskComponent(
       kind: kind,
@@ -318,8 +327,19 @@ class MaskComponent {
       strokes: strokes,
       ref: j['ref'] is String ? (j['ref'] as String).substring(0, math.min(128, (j['ref'] as String).length)) : '',
       refine: c('refine', 0, 100, 50),
+      raw: extra.isEmpty ? null : extra,
     );
   }
+
+  static const _common = {'kind', 'op', 'invert'};
+  static final Map<MaskKindId, Set<String>> _knownKeys = {
+    MaskKindId.linear: {..._common, 'x0', 'y0', 'x1', 'y1'},
+    MaskKindId.radial: {..._common, 'cx', 'cy', 'rx', 'ry', 'angle', 'feather'},
+    MaskKindId.luminance: {..._common, 'lo', 'hi', 'feather'},
+    MaskKindId.color: {..._common, 'hue', 'range', 'feather', 'satMin'},
+    MaskKindId.brush: {..._common, 'strokes'},
+    MaskKindId.raster: {..._common, 'ref', 'refine', 'lo', 'hi', 'feather'},
+  };
 
   /// The engine's writer (local_adjust.cpp writeComponent): kind, op, invert when set, then the kind's own fields.
   Map<String, Object?> toJson() {
@@ -355,8 +375,15 @@ class MaskComponent {
       case MaskKindId.raster:
         o['ref'] = ref;
         o['refine'] = jnum(refine);
+        if (hasRange) o.addAll({'lo': jnum(lo), 'hi': jnum(hi), 'feather': jnum(lumFeather)});
       case MaskKindId.unknown:
         break;
+    }
+    final extra = raw;
+    if (extra != null) {
+      for (final e in extra.entries) {
+        o.putIfAbsent(e.key, () => e.value);
+      }
     }
     return o;
   }
@@ -370,6 +397,7 @@ class MaskComponent {
     if (lo != o.lo || hi != o.hi || lumFeather != o.lumFeather) return false;
     if (hue != o.hue || range != o.range || hueFeather != o.hueFeather || satMin != o.satMin) return false;
     if (ref != o.ref || refine != o.refine || strokes.length != o.strokes.length) return false;
+    if (!_deepEq(raw ?? const {}, o.raw ?? const {})) return false;
     for (var i = 0; i < strokes.length; i++) {
       if (!strokes[i].same(o.strokes[i])) return false;
     }
@@ -440,7 +468,11 @@ class LocalAdjustment {
     this.mask = const [],
     this.ops = const {},
     this.ui,
+    this.extra,
   });
+
+  /// Item keys this build does not know (an engine addition): written back verbatim.
+  final Map<String, Object?>? extra;
 
   final String id, name;
   final bool on, invert;
@@ -469,6 +501,7 @@ class LocalAdjustment {
         mask: mask ?? this.mask,
         ops: ops ?? this.ops,
         ui: identical(ui, _keep) ? this.ui : ui as LocalUi?,
+        extra: extra,
       );
   static const Object _keep = Object();
 
@@ -506,8 +539,17 @@ class LocalAdjustment {
       mask: mask.length > kMaxMaskComponents ? mask.sublist(0, kMaxMaskComponents) : mask,
       ops: ops,
       ui: readUi ? LocalUi.fromJson(j['ui']) : null,
+      extra: () {
+        final x = <String, Object?>{
+          for (final e in j.entries)
+            if (e.key is String && !_itemKeys.contains(e.key)) e.key as String: e.value,
+        };
+        return x.isEmpty ? null : x;
+      }(),
     );
   }
+
+  static const _itemKeys = {'id', 'name', 'on', 'invert', 'strength', 'mask', 'adjust', 'ui'};
 
   /// Engine key order: id, name (when set), on (when off), invert (when set), strength, mask, adjust (non-zero, registry order).
   Map<String, Object?> toJson({bool withUi = false}) => {
@@ -521,6 +563,7 @@ class LocalAdjustment {
           for (final s in localOpSpecs)
             if ((ops[s.key] ?? 0) != 0) s.key: jnum(ops[s.key]!),
         },
+        ...?extra,
         if (withUi && ui != null) 'ui': ui!.toJson(),
       };
 
@@ -530,6 +573,7 @@ class LocalAdjustment {
     if (mask.length != o.mask.length || ops.length != o.ops.length) return false;
     if (!ops.entries.every((e) => o.ops[e.key] == e.value)) return false;
     if ((ui == null) != (o.ui == null) || (ui != null && !ui!.same(o.ui!))) return false;
+    if (!_deepEq(extra ?? const {}, o.extra ?? const {})) return false;
     for (var i = 0; i < mask.length; i++) {
       if (!mask[i].same(o.mask[i])) return false;
     }
