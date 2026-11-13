@@ -34,6 +34,15 @@ layout(binding = 5, rgba16f) uniform writeonly image2D uD;
 layout(binding = 6, rgba8) uniform writeonly image2D uOut8;
 layout(binding = 7, std430) readonly buffer Hdr { float hdrg[]; };
 
+#ifdef LOCAL
+// local adjustments, stage L (docs/engine/pipeline-architecture.md section 40)
+#define LB_DESC 8
+#define LB_PLANES 9
+#define LB_AUX0 10
+#define LB_AUX1 11
+#include "local.glsl"
+#endif
+
 // ---- single-image HDR: twin of hdr::apply / hdr::gainEv (core/src/hdr_field.cpp) -----------------------------------------------------
 float hdrSmooth(float a, float b, float x) {
   const float t = clamp((x - a) / (b - a), 0.0, 1.0);
@@ -179,8 +188,21 @@ void main() {
     if (GEO == 1) v = srcAt(int(floor(sx)), int(floor(sy)));
     else v = sampleCubic(sx, sy);
   }
+#ifdef LOCAL
+  const vec3 vSrc = v;  // the pre-gain source value: the raster guide
+#endif
   v = max(v * u.gain.xyz, vec3(0.0));
   if (HDR) v = hdrApply(v, hdrUV);
+#ifdef LOCAL
+  {
+    vec4 K0, K1;
+    localApply(v, hdrUV, vSrc, K0, K1);
+    if (LOCALW) {
+      imageStore(uAux0, p, K0);
+      imageStore(uAux1, p, K1);
+    }
+  }
+#endif
 
   const float Y = dot(v, vec3(0.2880402, 0.7118741, 0.0000857));
   if (Y > 1e-7) {

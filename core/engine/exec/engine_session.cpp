@@ -14,6 +14,7 @@
 #endif
 
 #include "engine/exec/cpu_executor.h"
+#include "local_eval.h"
 #include "engine/plan/plan.h"
 
 namespace dapple::engine::filmnode {
@@ -179,6 +180,21 @@ EngineSession::EngineSession() : id_(g_nextId.fetch_add(1)) {
 
 namespace {
 
+// Local adjustments (docs section 40): the LocalDetail halo and the amount planes of a frame.
+void localRequest(PlanRequest& rq, const local::Frame* lf) {
+  if (!lf || !lf->anyWindow) return;
+  rq.localHalo = local::detailRadii(*lf, rq.scale).halo;
+  local::AuxTarget t;
+  rq.localAux = local::auxLayout(*lf, t);
+}
+
+// The resolved local adjustments of a GPU frame (the CPU frames get theirs from FrameKernels). Film frames: none in v1 (40.7).
+void bindLocal(FramePlan& fp, const Renderer& r, const SourceImage& src, bool interactive) {
+  if (r.params().local.empty()) return;
+  fp.local = local::bind(r.params().local, src, interactive);
+  fp.localDetail = fp.local && fp.local->anyWindow;
+}
+
 // What the planner needs besides the graph: frame size, neighbourhood amounts after quality / region / film.
 PlanRequest makeRequest(const FrameKernels& fk, ExecMode mode, int tile, std::size_t budget, int channels) {
   PlanRequest rq;
@@ -200,6 +216,7 @@ PlanRequest makeRequest(const FrameKernels& fk, ExecMode mode, int tile, std::si
   rq.vignette = fk.vignetteActive();
   rq.useGeo = fk.useGeo();
   rq.outChannels = channels;
+  localRequest(rq, fk.localFrame());
   return rq;
 }
 
@@ -232,6 +249,7 @@ PlanRequest requestFromFrame(const FramePlan& fp, ExecMode mode, int tile, std::
   rq.vignette = fp.vignette != 0.f;
   rq.useGeo = fp.useGeo;
   rq.outChannels = 4;
+  localRequest(rq, fp.local.get());
   return rq;
 }
 
@@ -368,6 +386,10 @@ std::string executorStatsJson() {
       first = false;
     }
   }
+  const local::Counters lc = local::counters();  // local adjustments (docs section 40): plane builds / cache hits
+  j += "},\"local\":{\"binds\":" + std::to_string(lc.binds) + ",\"brushBuilds\":" + std::to_string(lc.brushBuilds) +
+       ",\"brushPrefixHits\":" + std::to_string(lc.brushPrefixHits) + ",\"rasterBuilds\":" + std::to_string(lc.rasterBuilds) +
+       ",\"guideBuilds\":" + std::to_string(lc.guideBuilds) + ",\"planeHits\":" + std::to_string(lc.planeHits);
   return j + "}}";
 }
 
@@ -461,6 +483,7 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   fo.spatial = SpatialQuality::Full;
   FramePlan fp = renderer.framePlan(W, H, src.sceneReferred, fo);
   if (!fp.supported) return 1;
+  bindLocal(fp, renderer, src, false);
   ParamInputs in;
   in.edit = params;
   in.frame.exact = true;
@@ -962,6 +985,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
   }
   FramePlan fp = job.renderer.framePlan(rw, rh, job.src.sceneReferred, job.fastOptions);
   job.renderer.hdrBind(job.src, fp.hdr, &bake.tone);  // single-image HDR: the field comes from the CPU source (a pure function of source + white balance)
+  bindLocal(fp, job.renderer, job.src, job.fastOptions.spatial == SpatialQuality::Interactive);
   if (job.resizeSharpen > 0.f && (rw < job.store->width() || rh < job.store->height())) fp.resizeSharpen = job.resizeSharpen;  // adds the Detail node
   if (!fp.supported) {
     ++stats_.gpuUnsupported;
@@ -1073,6 +1097,7 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
   FramePlan fp = e.renderer.framePlan(rw, rh, e.image.sceneReferred, fj.fastOptions);
   e.renderer.hdrBind(e.image, fp.hdr, &bake->tone);
   if (!fp.supported) return bail(1, "unsupported on the GPU: " + fp.why);
+  bindLocal(fp, e.renderer, e.image, false);
   fp.resizeSharpen = down ? e.resizeSharpen : 0.f;
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);
   if (const ValidationResult v = g.validate(); !v.ok) return bail(-1, "engine graph: " + v.error);

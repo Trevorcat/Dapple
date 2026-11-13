@@ -145,6 +145,7 @@ void EditParams::clamp() {
   if (filmPaper.size() > 64) filmPaper.clear();
   rotate = ((rotate % 360) + 360) % 360;
   rotate = (rotate + 45) / 90 * 90 % 360;
+  clampLocal(local);
 }
 
 EditParams& EditParams::operator+=(const EditParams& d) {
@@ -177,6 +178,10 @@ EditParams& EditParams::operator+=(const EditParams& d) {
     hasPalette = true;
     paletteX = d.paletteX;
     paletteY = d.paletteY;
+  }
+  if (!d.local.empty()) {  // both sets apply: the delta's adjustments follow this edit's own
+    local.insert(local.end(), d.local.begin(), d.local.end());
+    clampLocal(local);
   }
   return *this;
 }
@@ -226,6 +231,10 @@ std::string writeJson(const EditParams& p, bool diffOnly) {
   std::string cs = curves.str();
   if (first && !cs.empty()) cs.erase(0, 1);  // leading comma
   o << cs;
+  if (!p.local.empty()) {
+    o << ((first && cs.empty()) ? "\n  " : ",\n  ");
+    o << "\"local\": " << localToJson(p.local);
+  }
   o << "\n}\n";
   return o.str();
 }

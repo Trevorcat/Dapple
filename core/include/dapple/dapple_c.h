@@ -166,6 +166,31 @@ DAPPLE_API int32_t dapple_session_base_previews(DappleSession* session, const ch
 /* Lock-free, any thread: stops the base_previews call in flight on this session (see above). A no-op when none runs. */
 DAPPLE_API void dapple_session_base_previews_cancel(DappleSession* session);
 
+/* ---- Local adjustments through masks (docs/engine/pipeline-architecture.md section 40). Additive. ----
+ * The adjustments travel in the params JSON under "local" ({"v":1,"items":[...]}); every render / export call honours them
+ * (DAPPLE_ENGINE=off ignores them). Mask coordinates are the photo's own normalised space (before crop / rotate / straighten / flip).
+ *
+ * Raster masks (AI masks, depth): a single-channel 8-bit plane referenced by id from a "raster" component. The store is process-wide
+ * (exports, other sessions and the batch previews see the same id), at most 32 planes; planes above 1024 px long edge are
+ * area-downsampled. stride = bytes per row (0 = w). Replacing an id changes the content key: frames re-render. */
+DAPPLE_API int32_t dapple_mask_raster_set(const char* id, int32_t w, int32_t h, const uint8_t* bytes, int32_t stride);
+DAPPLE_API int32_t dapple_mask_raster_remove(const char* id);
+/* 1 when the id is in the store (re-supply it after an app restart before rendering an edit that uses it), else 0. */
+DAPPLE_API int32_t dapple_mask_raster_has(const char* id);
+/* The mask of local adjustment `index` (position in the "local" items) of params_json, as an RGBA image (r = g = b = mask 0..255,
+ * a = 255) for the UI's overlay: over the edit's output frame (crop / rotate applied) at long_edge (<= 0: 1024), or, with flags bit 0,
+ * over the whole photo in its own orientation. Disabled adjustments and adjustments without ops are shown too. Release with
+ * dapple_free_image. */
+DAPPLE_API int32_t dapple_session_mask_preview(DappleSession* session, const char* params_json, int32_t index, int32_t long_edge, int32_t flags,
+                                              DappleImage* out);
+/* Maps a point between the edit's output frame rendered at long_edge (pixels, x right, y down) and the photo's normalised space of the
+ * masks. direction 0: frame (x, y) -> photo (u, v); 1: photo (x, y) -> frame (u, v). Points outside the frame map too (affine). */
+DAPPLE_API int32_t dapple_session_map_point(DappleSession* session, const char* params_json, int32_t long_edge, float x, float y,
+                                           int32_t direction, float* u, float* v);
+/* What the luminance / colour range components see at photo point (u, v) under params_json (global white balance, exposure, HDR):
+ * {"L":0..100,"hue":0..360,"sat":..} (sat in the units of the "satMin" range / 0.25 * 100). Free with dapple_free_string. */
+DAPPLE_API char* dapple_session_mask_sample_json(DappleSession* session, const char* params_json, float u, float v);
+
 /* ---- Sessions: decode once, render many times (slider dragging) ---- */
 
 /* Decodes `path`. long_edge > 0 downsizes the working image once after

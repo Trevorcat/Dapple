@@ -51,6 +51,10 @@ struct Run {
   ImageF* img = nullptr;        // persistent frame (single-tile plans)
   bool imgValid = false;
   std::size_t done = 0;         // window nodes already applied to the persistent frame
+  // local adjustments (docs section 40): the amount planes LocalLinear writes for the work window and LocalDetail reads
+  local::AuxTarget aux;
+  std::vector<float> auxBuf;
+  int auxPlanes = 0;
 
   Run(const Plan& p, ExecEnv& e, ExecStats* s)
       : plan(p), env(e), stats(s), fk(e.fk), W(e.fk.width()), H(e.fk.height()) {}
@@ -58,10 +62,20 @@ struct Run {
   bool cancelled() const { return env.cancel.cancelled(); }
 
   // ---- binding ------------------------------------------------------------------------------------------------------------
+  // sizes the amount planes for a work window (no-op when the frame has no LocalDetail)
+  void auxWindow(int x0, int y0, int w, int h) {
+    if (auxPlanes == 0) return;
+    aux.ox = x0, aux.oy = y0, aux.w = w, aux.h = h;
+    aux.plane = std::size_t(w) * h;
+    if (auxBuf.size() < aux.plane * std::size_t(auxPlanes)) auxBuf.resize(aux.plane * std::size_t(auxPlanes));
+    aux.data = auxBuf.data();
+  }
+
   bool bind(const Stage& sweep) {
     FrameEnv fe;
     fe.fk = &fk;
     fe.film = film;
+    fe.aux = auxPlanes ? &aux : nullptr;
     for (NodeId id : sweep.groups[0].nodes)
       if (env.graph.nodes()[id].type == NodeType::Blend) fe.blendFollows = true;
     head.clear();
@@ -146,6 +160,7 @@ struct Run {
     t.frameH = H;
     t.dehaze = dehaze.get();
     t.guided = guided.get();
+    t.aux = auxPlanes ? &aux : nullptr;
     for (std::size_t i = from; i < to; ++i) {
       if (cancelled()) return Status::Cancelled;
       const Status st = wins[i].impl->tile(t, wins[i].r.bytes);
@@ -218,6 +233,7 @@ struct Run {
     if (single) {
       if (!imgValid) {
         img = film ? film : &frameBuf.get(W, H);
+        auxWindow(0, 0, W, H);
         if (st.groups[0].nodes.empty() == false) runHead(0, 0, W, H, img);
         if (cancelled()) return Status::Cancelled;
         scratch.yValid = false;
@@ -261,6 +277,7 @@ struct Run {
         if (tileBuf.data.size() < std::size_t(rw) * rh * 3) tileBuf.data.resize(std::size_t(rw) * rh * 3);
         tileBuf.width = rw;
         tileBuf.height = rh;
+        auxWindow(x0, y0, rw, rh);
         runHead(x0, y0, rw, rh, &tileBuf);
         if (cancelled()) return Status::Cancelled;
         scratch.yValid = false;
@@ -354,6 +371,7 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
   CancelScope scope(env.cancel.current, env.cancel.mine);
   Run r(plan, env, stats);
   r.single = plan.grid.nx == 1 && plan.grid.ny == 1;
+  if (const local::Frame* lf = env.fk.localFrame(); lf && env.graph.find(NodeType::LocalDetail)) r.auxPlanes = local::auxLayout(*lf, r.aux);
   if (env.cancel.cancelled()) return Status::Cancelled;
 
   // the last TileSweep lists every window node
@@ -365,14 +383,15 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
   // film: a whole-frame node before the sweeps (the streaming path finishes the frame by itself)
   for (const Stage& s : plan.stages) {
     if (s.kind != StageKind::FilmFrame) continue;
-    if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF && !env.fk.spatial().any()) {
+    if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF && !env.fk.spatial().any() && !env.fk.localFrame()) {
       if (env.fk.streamFilm(env.out)) {
         if (stats) stats->streamed = true;
         return Status::Ok;
       }
     }
     r.film = &r.filmScratch.get(r.W, r.H);
-    if (!env.fk.runFilm(*r.film)) return Status::Unsupported;  // the caller renders the frame with the legacy renderer
+    r.auxWindow(0, 0, r.W, r.H);  // local adjustments: the film input pass writes the stage-W amounts of the whole frame
+    if (!env.fk.runFilm(*r.film, r.auxPlanes ? &r.aux : nullptr)) return Status::Unsupported;  // the caller renders the frame with the legacy renderer
     env.fk.finalizeSpatial();
     if (env.cancel.cancelled()) return Status::Cancelled;
   }

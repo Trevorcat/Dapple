@@ -19,6 +19,7 @@
 // process singletons.
 #include "../../deterministic.h"
 #include "../../../core/src/c_api.cpp"
+#include "local_eval.h"
 
 #include <chrono>
 #include <algorithm>
@@ -581,6 +582,111 @@ std::vector<Scenario> buildScenarios(const std::string& cubePath, bool haveFilm)
     add("vivid_exact_clarity", [](EditParams& p) { p.filmStock = "modern_vivid"; p.clarity = 20.f; p.exposure = -0.4f; }, X);
     out.push_back(std::move(s));
   }
+
+  // local adjustments through masks (docs/engine/pipeline-architecture.md section 40): engine only, like hdr / modern (the old Renderer ignores
+  // them). Every component kind and every op; the raster plane is synthetic (a soft vertical edge), put into the process-wide store here.
+  {
+    std::vector<std::uint8_t> ras(96 * 64);
+    for (int y = 0; y < 64; ++y)
+      for (int x = 0; x < 96; ++x) ras[std::size_t(y) * 96 + x] = std::uint8_t(std::clamp(int(255.f * (0.5f + 0.5f * std::tanh((40.f - x) / 2.f))), 0, 255));
+    dapple::local::rasterSet("golden_edge", 96, 64, ras.data(), 96);
+    Scenario s;
+    s.name = "local";
+    auto add = [&](const char* label, auto&& edit, int flags) {
+      Frame f;
+      f.label = label;
+      f.p = b;
+      f.p.sharpen = 0.f;
+      f.p.nrColor = 0.f;
+      edit(f.p);
+      f.flags = flags;
+      f.longEdge = 420;
+      s.frames.push_back(f);
+    };
+    auto radial = [](float cx, float cy, float r, float feather) {
+      MaskComponent m;
+      m.kind = MaskKind::Radial;
+      m.cx = cx, m.cy = cy, m.rx = r, m.ry = r * 0.7f, m.angle = 25.f, m.feather = feather;
+      return m;
+    };
+    auto gradientSky = [](EditParams& p) {
+      LocalAdjustment a;
+      a.id = "sky";
+      MaskComponent m;
+      m.kind = MaskKind::Linear;
+      m.x0 = 0.5f, m.y0 = 0.f, m.x1 = 0.5f, m.y1 = 0.6f;
+      a.mask.push_back(m);
+      a.ops.v[kLoExposure] = -0.9f;
+      a.ops.v[kLoHighlights] = -40.f;
+      a.ops.v[kLoTemp] = -15.f;
+      p.local.push_back(a);
+    };
+    auto subject = [&](EditParams& p, bool window) {
+      LocalAdjustment a;
+      a.id = "subject";
+      a.mask.push_back(radial(0.55f, 0.6f, 0.2f, 60.f));
+      a.ops.v[kLoExposure] = 0.6f;
+      a.ops.v[kLoShadows] = 30.f;
+      a.ops.v[kLoSaturation] = 15.f;
+      if (window) a.ops.v[kLoClarity] = 35.f, a.ops.v[kLoTexture] = -30.f;
+      p.local.push_back(a);
+    };
+    add("gradient_radial", [&](EditParams& p) { gradientSky(p); subject(p, false); }, A);
+    add("ranges_brush_detail_interactive", [&](EditParams& p) {
+      LocalAdjustment a;
+      a.id = "bright";
+      MaskComponent l;
+      l.kind = MaskKind::Luminance;
+      l.lo = 50.f, l.hi = 100.f, l.lumFeather = 12.f;
+      a.mask.push_back(l);
+      MaskComponent c;
+      c.kind = MaskKind::Colour;
+      c.op = MaskOp::Subtract;
+      c.hue = 140.f, c.hueRange = 40.f, c.satMin = 10.f;
+      a.mask.push_back(c);
+      a.ops.v[kLoDehaze] = 35.f;
+      a.ops.v[kLoContrast] = 20.f;
+      p.local.push_back(a);
+      LocalAdjustment br;
+      br.id = "brush";
+      MaskComponent m;
+      m.kind = MaskKind::Brush;
+      BrushStroke st;
+      st.size = 0.05f, st.hardness = 30.f, st.flow = 90.f;
+      for (int i = 0; i <= 12; ++i) st.pts.push_back(0.2f + 0.05f * i), st.pts.push_back(0.75f - 0.02f * i);
+      m.strokes.push_back(st);
+      br.mask.push_back(m);
+      br.ops.v[kLoSharpen] = 50.f;
+      br.ops.v[kLoNoise] = 40.f;
+      br.ops.v[kLoVibrance] = 30.f;
+      br.ops.v[kLoColorHue] = 30.f;
+      br.ops.v[kLoColorSat] = 30.f;
+      p.local.push_back(br);
+    }, I | A);
+    add("all_exact", [&](EditParams& p) {
+      gradientSky(p);
+      subject(p, true);
+      LocalAdjustment r;
+      r.id = "raster";
+      MaskComponent m;
+      m.kind = MaskKind::Raster;
+      m.ref = "golden_edge";
+      m.refine = 60.f;
+      r.mask.push_back(m);
+      r.mask.push_back(radial(0.2f, 0.3f, 0.1f, 0.f));
+      r.mask.back().op = MaskOp::Intersect;
+      r.mask.back().invert = true;
+      r.ops.v[kLoWhites] = 25.f;
+      r.ops.v[kLoBlacks] = -20.f;
+      r.ops.v[kLoTint] = 10.f;
+      r.ops.v[kLoDehaze] = -25.f;
+      r.strength = 70.f;
+      p.local.push_back(r);
+      p.clarity = 10.f;
+    }, X);
+    add("crop_rotate_detail", [&](EditParams& p) { subject(p, true); p.crop = "4:5"; p.rotate = 90; p.straighten = 3.f; p.flip = true; }, A);
+    out.push_back(std::move(s));
+  }
   return out;
 }
 
@@ -899,7 +1005,7 @@ int selfcheck(bool haveFilm) {
     ++bad;
   }
   for (std::size_t i = 0; i < std::min(off.size(), full.size()); ++i)
-    if (off[i].name != full[i].name || (off[i].hash != full[i].hash && off[i].name.rfind("hdr/", 0) != 0 && off[i].name.rfind("modern/", 0) != 0)) {  // hdr/, modern/: engine-only parameters
+    if (off[i].name != full[i].name || (off[i].hash != full[i].hash && off[i].name.rfind("hdr/", 0) != 0 && off[i].name.rfind("modern/", 0) != 0 && off[i].name.rfind("local/", 0) != 0)) {  // hdr/, modern/, local/: engine-only parameters
       std::printf("MISMATCH %s: off %s full %s\n", off[i].name.c_str(), off[i].hash.c_str(), full[i].hash.c_str());
       ++bad;
     }
@@ -1132,7 +1238,7 @@ int main(int argc, char** argv) {
       const auto r = runAll(haveFilm);
       int bad = 0;
       for (const GoldenHash& x : r) {
-        if (m == "off" && (x.name.rfind("hdr/", 0) == 0 || x.name.rfind("modern/", 0) == 0)) continue;  // engine-only parameter: the old Renderer path ignores it (record: append the full-mode hashes by hand)
+        if (m == "off" && (x.name.rfind("hdr/", 0) == 0 || x.name.rfind("modern/", 0) == 0 || x.name.rfind("local/", 0) == 0)) continue;  // engine-only parameter: the old Renderer path ignores it (record: append the full-mode hashes by hand)
         const auto it = want.find(x.name);
         if (it == want.end()) {
           std::printf("[%s] NEW (not in corpus) %s %s\n", m.c_str(), x.name.c_str(), x.hash.c_str());

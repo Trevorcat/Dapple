@@ -125,6 +125,8 @@ struct PointNode {
   LutBind lut;
   int W, Hh, ox, oy;  // working image size and its origin in the picture
   Epilogue ep;
+  // local adjustments (docs section 40): descriptor and plane store SSBOs (point_local when >= 0), the stage-W amount images (or -1)
+  H ldesc = -1, lplanes = -1, aux0 = -1, aux1 = -1;
 };
 bool recordPoint(GpuRecorder& r, const PointNode& n, H D);
 
@@ -148,6 +150,24 @@ struct DetailNode {
   Epilogue ep;
 };
 bool recordDetail(GpuRecorder& r, const DetailNode& n, H D);
+
+// LocalDetail (local adjustments, stage W): returns the new working image (D itself when it is the last pass), -1 on error
+struct LocalDetailNode {
+  const FramePlan* plan;
+  int W, Hh, ox, oy;
+  H aux0, aux1;  // the amounts the point pass wrote
+  Epilogue ep;
+};
+H recordLocalDetail(GpuRecorder& r, const LocalDetailNode& n, H D);
+// The scene input of a film frame with the local adjustments applied (stage L; geometry gather included), RGBA32F `out` of n.W x n.Hh at
+// (n.ox, n.oy); writes the stage-W amounts into aux0 / aux1 when both are >= 0.
+struct LocalFilmInNode {
+  const FramePlan* plan;
+  SourceBind src;
+  int W, Hh, ox, oy;
+  H ldesc, lplanes, aux0, aux1;
+};
+bool recordLocalFilmIn(GpuRecorder& r, const LocalFilmInNode& n, H out);
 
 // Lanczos-3 resize planning and passes
 struct SrcWin {

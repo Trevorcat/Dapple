@@ -136,6 +136,8 @@ enum class NodeType : std::uint16_t {
   FilmPrintExposure,   // enlarger diffusion path: film density -> linear paper exposure (frame-sized planes)
   FilmEnlargerBlur,    // enlarger diffusion path: Gaussian mixtures of the paper exposure
   Hdr,                 // single-image HDR: smooth gain field from the bilateral base layer, after Gain, before the tone stage (core/src/hdr_field.h)
+  LocalLinear,         // local adjustments, stage L: masks + scene-linear ops after Gain / Hdr, before the tone stage (docs section 40)
+  LocalDetail,         // local adjustments, stage W: clarity / texture / sharpen / noise / dehaze by mask, after Detail (docs section 40)
   Count
 };
 constexpr int kNodeTypeCount = int(NodeType::Count);

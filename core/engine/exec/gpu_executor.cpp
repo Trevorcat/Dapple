@@ -5,6 +5,7 @@
 #include "engine/nodes/film/frame_trace.h"
 #include "engine/exec/gpu_executor.h"
 #include "hdr_field.h"
+#include "local_eval.h"
 #include "determinism.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -307,10 +308,18 @@ struct DeviceSolve {
 // Node types a GPU plan may contain (everything else makes the plan Unsupported, 5.9).
 bool headNodeOk(NodeType t) {
   return t == NodeType::Resize || t == NodeType::Geometry || t == NodeType::Gain || t == NodeType::Hdr || t == NodeType::ToneColour || t == NodeType::ToneColourExact ||
-         t == NodeType::Vignette;
+         t == NodeType::Vignette || t == NodeType::LocalLinear;
 }
 bool windowNodeOk(NodeType t) {
-  return t == NodeType::NRLuma || t == NodeType::NRChroma || t == NodeType::Dehaze || t == NodeType::Detail || t == NodeType::Grain;
+  return t == NodeType::NRLuma || t == NodeType::NRChroma || t == NodeType::Dehaze || t == NodeType::Detail || t == NodeType::Grain ||
+         t == NodeType::LocalDetail;
+}
+bool planHasType(const GpuRun& in, NodeType t) {
+  for (const Stage& st : in.plan.stages)
+    for (const Group& g : st.groups)
+      for (NodeId id : g.nodes)
+        if (id < in.graph.nodes().size() && in.graph.nodes()[id].type == t) return true;
+  return false;
 }
 
 // The graph handles and resolved blocks of one job (a frame, or one tile of one sweep).
@@ -330,6 +339,8 @@ class Executor final : public IGpuExecutor {
   explicit Executor(std::shared_ptr<Context> c) : ctx_(std::move(c)) {
     epoch_ = ctx_->epoch();
     tables_.setLimit(NodeType::Hdr, 2);
+    tables_.setLimit(NodeType::LocalLinear, 2);  // local adjustments: plane stores (docs section 40)
+    tables_.setLimit(NodeType::LocalDetail, 4);  // local adjustments: descriptor blocks
     tables_.setLimit(NodeType::ColourLattice, 2);  // the two lattices of an interactive and a final frame
     solves_.setLimit(NodeType::Dehaze, 2);  // the 1/4 grids of the last frames (a slider that does not touch the solve keeps hitting)
     solves_.setLimit(NodeType::Detail, 2);
@@ -411,6 +422,10 @@ class Executor final : public IGpuExecutor {
   hal::ImageH* resizedSource(int w, int h);
   std::shared_ptr<DeviceTables> ensureTables(const GpuRun& in);
   std::shared_ptr<DeviceHdr> ensureHdr(const GpuRun& in);
+  // A read-only SSBO with `bytes` of `data`, kept in tables_ under (slot, key) (local adjustments: descriptors, plane store)
+  std::shared_ptr<DeviceHdr> ensureBuffer(NodeType slot, std::uint64_t key, const void* data, std::size_t bytes);
+  // Local adjustments of the frame: descriptor + plane store SSBOs (both null when the frame has none; false on a device error)
+  bool ensureLocal(const GpuRun& in, std::shared_ptr<DeviceHdr>& desc, std::shared_ptr<DeviceHdr>& planes);
   LutBind lutBind(GpuGraph& g, const DeviceTables& t);
   // Film frames (section 20): arguments of the film nodes from the FramePlan, device tables of their bake
   bool filmResolve(const GpuRun& in, filmnode::FilmResolved& r);
@@ -631,6 +646,66 @@ std::shared_ptr<DeviceHdr> Executor::ensureHdr(const GpuRun& in) {
   e.bytes = bytes;
   tables_.put(NodeType::Hdr, std::move(e));
   return t;
+}
+
+std::shared_ptr<DeviceHdr> Executor::ensureBuffer(NodeType slot, std::uint64_t key64, const void* data, std::size_t bytes) {
+  Hasher hk;
+  hk.u64(key64);
+  hk.u64(bytes);
+  const Hash128 key = hk.finish();
+  if (ResultCache::Entry* e = tables_.findLru(slot, key)) return std::static_pointer_cast<DeviceHdr>(e->payload);
+  const std::size_t n = bytes;
+  bytes = std::max<std::size_t>((bytes + 15) / 16 * 16, 16);
+  auto t = std::shared_ptr<DeviceHdr>(new DeviceHdr, [](DeviceHdr* p) {
+    if (p->ctx && p->epoch == p->ctx->epoch()) {
+      hal::Device& d = p->ctx->core().dev();
+      d.waitIdle();
+      d.destroy(p->buf);
+    }
+    delete p;
+  });
+  t->ctx = ctx_;
+  t->epoch = epoch_;
+  hal::Status s = dev().createBuffer({bytes, hal::MemKind::DeviceLocal, true}, &t->buf);
+  if (s != hal::Status::Ok) return failStatus(s, ""), nullptr;
+  auto cl = dev().begin();
+  if (!cl) return failStatus(hal::Status::Timeout, ""), nullptr;
+  std::string err;
+  if (!core().ensureStaging(cl->slot(), (bytes + 255) / 256 * 256, err)) return fail(GpuFailure::Transient, err), nullptr;
+  auto& sr = core().slot(cl->slot());
+  std::memset(sr.staging.mapped, 0, bytes);
+  std::memcpy(static_cast<std::uint8_t*>(sr.staging.mapped), data, n);
+  GpuGraph g(dev(), core().pool());
+  g.copyBufferToBuffer(sr.staging, g.externalBuf(t->buf), bytes, 0);
+  hal::FenceH f;
+  s = runGraph(dev(), g, *cl, &f, err);
+  if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
+  if (s != hal::Status::Ok) return failStatus(s, err), nullptr;
+  ResultCache::Entry e;
+  e.key = e.family = key;
+  e.payload = t;
+  e.bytes = bytes;
+  tables_.put(slot, std::move(e));
+  return t;
+}
+
+bool Executor::ensureLocal(const GpuRun& in, std::shared_ptr<DeviceHdr>& desc, std::shared_ptr<DeviceHdr>& planes) {
+  desc.reset();
+  planes.reset();
+  const local::Frame* f = in.frame.local.get();
+  if (!f || !(planHasType(in, NodeType::LocalLinear) || in.plan.hasFilm)) return true;  // film frames: stage L on the film input (40.7)
+  desc = ensureBuffer(NodeType::LocalDetail, f->descKey, f->desc.data(), f->desc.size() * sizeof(float));
+  if (!desc) return false;
+  Hasher hk;  // the store is built (copied out of the plane cache) only on a miss
+  hk.u64(f->planesKey);
+  hk.u64(std::uint64_t(std::max(1, f->planeFloats)) * sizeof(float));
+  if (ResultCache::Entry* e = tables_.findLru(NodeType::LocalLinear, hk.finish())) {
+    planes = std::static_pointer_cast<DeviceHdr>(e->payload);
+    return true;
+  }
+  const std::vector<float> store = local::planeStore(*f);
+  planes = ensureBuffer(NodeType::LocalLinear, f->planesKey, store.data(), store.size() * sizeof(float));
+  return planes != nullptr;
 }
 
 LutBind Executor::lutBind(GpuGraph& g, const DeviceTables& t) {
@@ -892,6 +967,9 @@ struct Executor::Walk {
 
   H D = -1, o8 = -1;
   int ran = 0;
+  // local adjustments (docs section 40): descriptor + plane store SSBOs, the stage-W amount images of the job
+  H ldesc = -1, lplanes = -1, aux0 = -1, aux1 = -1;
+  bool needAux = false;
   H col = -1, yy = -1, dc = -1, ab = -1;  // whole mode: the 1/4 grids and the solves
   Epilogue ep;
   // film frame (section 20)
@@ -937,6 +1015,16 @@ struct Executor::Walk {
   // the film input: the resident source, or its geometry gather (rotate / straighten / crop) at the frame size; -1 on error
   H filmInput() {
     H in = src.img;
+    if (P.local && ldesc >= 0 && lplanes >= 0) {  // local adjustments, stage L, on the film's scene input (docs section 40.7): gather + ops in one pass
+      if (needAux && aux0 < 0) {
+        aux0 = r.tr(kF16, P.outW, P.outH);
+        aux1 = r.tr(kF16, P.outW, P.outH);
+      }
+      const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.outW), std::uint32_t(P.outH));
+      const LocalFilmInNode ln{&P, src, P.outW, P.outH, 0, 0, ldesc, lplanes, needAux ? aux0 : -1, needAux ? aux1 : -1};
+      if (!recordLocalFilmIn(r, ln, g)) return -1;
+      return g;
+    }
     if (P.useGeo) {
       struct U {
         std::int32_t a[4], b[4];
@@ -1002,6 +1090,8 @@ struct Executor::Walk {
     mainPlan = P;
     mainPlan.vignette = 0.f;
     PointNode pn{&mainPlan, src, lut, W, Hh, ox, oy, Epilogue{}};
+    pn.ldesc = ldesc;  // the normal branch of a blend gets the same local adjustments (its amounts were written by the film input pass)
+    pn.lplanes = lplanes;
     GpuPorts ports;
     const H M = r.tr(kF16, W, Hh);
     ports.out[0] = M;
@@ -1066,6 +1156,10 @@ struct Executor::Walk {
       o8 = r.tr(kU8, r.W, r.H_);
     }
     const int ox = work.x0, oy = work.y0, W = r.W, Hh = r.H_;
+    if (needAux && aux0 < 0) {
+      aux0 = r.tr(kF16, W, Hh);
+      aux1 = r.tr(kF16, W, Hh);
+    }
     for (int gi = ran; gi < int(st.groups.size()); ++gi) {
       const Group& g = st.groups[std::size_t(gi)];
       Epilogue e = ep;
@@ -1099,9 +1193,14 @@ struct Executor::Walk {
         case NodeType::Geometry:
         case NodeType::Gain:
         case NodeType::Hdr:
+        case NodeType::LocalLinear:
         case NodeType::ToneColour:
         case NodeType::Vignette:
           new (&rs.point) PointNode{&P, src, lut, W, Hh, ox, oy, e};
+          rs.point.ldesc = ldesc;
+          rs.point.lplanes = lplanes;
+          rs.point.aux0 = needAux ? aux0 : -1;
+          rs.point.aux1 = needAux ? aux1 : -1;
           res = &rs.point;
           ports.out[0] = D;
           impl = gpuImplFor(NodeType::ToneColour);  // the point recipe, whichever node of the chain comes first (Resize has no record function of its own)
@@ -1131,6 +1230,14 @@ struct Executor::Walk {
           res = &rs.dt;
           ports.in[0] = D;
           break;
+        }
+        case NodeType::LocalDetail: {
+          if (aux0 < 0) return r.err = "LocalDetail without the amounts of the point pass", false;
+          const LocalDetailNode ln{&P, W, Hh, ox, oy, aux0, aux1, e};
+          const H nd = recordLocalDetail(r, ln, D);
+          if (nd < 0) return false;
+          D = nd;
+          continue;
         }
         default: return r.err = "node without a record function", false;
       }
@@ -1234,6 +1341,8 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
     HD = ensureHdr(in);
     if (!HD) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
   }
+  std::shared_ptr<DeviceHdr> LDsc, LPl;
+  if (!ensureLocal(in, LDsc, LPl)) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
   const double uploadMs = msSince(t0);
   if (in.cancel.cancelled()) return fail(GpuFailure::None, "cancelled"), Status::Cancelled;
 
@@ -1261,6 +1370,11 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   w.src.img = g.external(*S);
   if (L) w.lut = lutBind(g, *L);
   if (HD) w.lut.hdr = g.externalBuf(HD->buf);
+  if (LDsc && LPl) {
+    w.ldesc = g.externalBuf(LDsc->buf);
+    w.lplanes = g.externalBuf(LPl->buf);
+    w.needAux = planHasType(in, NodeType::LocalDetail);
+  }
   if (DF) {
     w.fres = &fres;
     w.ftab = &DF->gt;
@@ -1401,6 +1515,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   if (tile + 2 * R.halo > maxDim) return fail(GpuFailure::Unsupported, "device image limit too small for the halo"), Status::Unsupported;
 
   const bool filmFrame = in.plan.hasFilm;
+  if (filmFrame && planHasType(in, NodeType::LocalDetail))  // the stage-W amounts of a film frame come from its whole-frame input pass
+    return fail(GpuFailure::Unsupported, "tiled film export with local detail ops (docs section 40.7): CPU executor"), Status::Unsupported;
   std::shared_ptr<DeviceTables> L;
   if (!filmFrame || planHasBlend(in)) {  // a film frame needs the colour lattice only for the blend with the normal branch
     L = ensureTables(in);
@@ -1411,6 +1527,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     HD = ensureHdr(in);
     if (!HD) return bad(Status::Internal);
   }
+  std::shared_ptr<DeviceHdr> LDsc, LPl;
+  if (!ensureLocal(in, LDsc, LPl)) return bad(Status::Internal);
   std::shared_ptr<DeviceFilm> DF;
   std::shared_ptr<DeviceDisplay> DD;
   filmnode::FilmResolved fres;
@@ -1487,6 +1605,10 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     wp.fres = &fres;
     wp.ftab = &DF->gt;
     wp.fplan = &DF->pr;
+    if (LDsc && LPl) {
+      wp.ldesc = g.externalBuf(LDsc->buf);
+      wp.lplanes = g.externalBuf(LPl->buf);
+    }
     filmnode::FilmPre pre;
     if (!wp.filmPrePass(pre)) {
       const bool unsup = perr.rfind("film GPU:", 0) == 0;
@@ -1596,6 +1718,11 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     w.work = work;
     if (L) w.lut = lutBind(g, *L);
     if (HD) w.lut.hdr = g.externalBuf(HD->buf);
+    if (LDsc && LPl) {
+      w.ldesc = g.externalBuf(LDsc->buf);
+      w.lplanes = g.externalBuf(LPl->buf);
+      w.needAux = planHasType(in, NodeType::LocalDetail);
+    }
     if (filmFrame) {
       w.fres = &fres;
       w.ftab = &DF->gt;

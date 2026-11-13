@@ -48,3 +48,13 @@ Gates: `film_nodes.*` (CPU, `film_nodes.fx` for the two effects) and `film_gpu.p
 ## Demosaic node (core/engine/nodes/demosaic, docs/engine/pipeline-architecture.md section 32)
 
 RAW mosaic -> linear working RGB: `decodeRawMosaic` (dapple/mosaic.h) returns the 16-bit mosaic with CFA, black / white, multipliers, matrix; `demosaic::demosaic` (CPU, std::thread tiles + halo, region of interest) and `demosaic::GpuDemosaic` (single-source GLSL `shaders/demosaic_*.comp`, Vulkan / GLES 3.1 / Metal) run the same Bayer (gradient-weighted Hamilton-Adams) and X-Trans (directional green + guide-weighted colour differences + median) kernels; `MosaicCache` caches the mosaic and the demosaiced picture by file content hash. Not yet a graph node: planner / executor / C API wiring is the hunk list in 32.9. Tests `demosaic.*` (ctest), evaluation against LibRaw `dapple_demosaic_eval file --out build/demosaic --gpu 1024 --proxy --cache`.
+
+## Local adjustments (docs/engine/pipeline-architecture.md section 40)
+
+`EditParams::local` (dapple/local_adjust.h, JSON key `"local"`) -> `local::bind` (core/src/local_eval.{h,cpp}) resolves the list for a frame
+(`FramePlan::local`, `FrameKernels::localFrame`): analytic components + low-resolution photo-space planes (brush coverage, raster guided-filter
+coefficients; process-wide plane cache keyed by content). Nodes: `LocalLinear` (point, after `Gain`/`Hdr`: masks + scene-linear ops, writes the
+stage-W amounts into aux planes; GPU = `point.comp` built with `LOCAL` -> `point_local`, code in `shaders/local.glsl`) and `LocalDetail` (window,
+after `Detail`; `shaders/local_detail.comp`, CPU `local::detailWindow`). Film frames: stage L on the film's scene input (`FrameKernels::runFilm`,
+`shaders/local_film_in.comp`). New op = a row in `localOps()` + its arithmetic in local_eval.cpp and the GLSL twins. Tests: `dapple_local_tests`
+(ctest `engine.local_*`), golden `local/*`.

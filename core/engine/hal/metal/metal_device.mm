@@ -83,7 +83,7 @@ struct MPipeline {
   MTLSize tg{16, 16, 1};
 };
 
-constexpr int kMaxBind = 8;
+constexpr int kMaxBind = 12;  // bindings after the uniform block (point_local: 11; GLES has 12 slots too)
 constexpr int kMaxSegments = 120;  // compute segments per command buffer when profiling (2 samples each, 256 sample buffer)
 
 // One command buffer's pass timing (profile only): the compute encoders of the part, one per labelled pass.
@@ -666,6 +666,7 @@ Status MetalCmd::dispatch(std::uint32_t gx, std::uint32_t gy, std::uint32_t gz) 
   if (err_ != Status::Ok) return err_;
   if (!pl_ || !haveParams_) return fail(Status::InvalidArgument), Status::InvalidArgument;
   const int nb = int(pl_->bindings.size());
+  if (nb > kMaxBind) return fail(Status::InvalidArgument), d_.fail("too many bindings in " + pl_->name, Status::InvalidArgument), Status::InvalidArgument;
   for (int i = 0; i < nb; ++i)
     if (!bound_[i].img && !bound_[i].buf)
       return fail(Status::InvalidArgument), d_.fail("unbound slot in dispatch of " + pl_->name, Status::InvalidArgument), Status::InvalidArgument;

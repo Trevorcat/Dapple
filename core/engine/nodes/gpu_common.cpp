@@ -1,6 +1,7 @@
 // Recorder helpers shared by the GPU node implementations: pipelines, working images, separable filters (box / weight
 // table / minimum, O(1) running-sum box), area downscale, radii of the spatial stages. Ported from phase-1 frame.cpp.
 #include "engine/nodes/gpu_common.h"
+#include "local_eval.h"
 
 #include <algorithm>
 #include <cmath>
@@ -211,6 +212,7 @@ SpatialRadii spatialRadii(const FramePlan& P, float resizeSharpen) {
     }
   }
   r.halo = (haloL + haloC + haloD + 8 + 3) / 4 * 4;
+  if (P.local && P.localDetail) r.halo += local::detailRadii(*P.local, scale).halo;  // LocalDetail (docs section 40), after the Detail stage
   return r;
 }
 

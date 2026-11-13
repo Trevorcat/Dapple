@@ -41,6 +41,8 @@
 #include "sysperf.h"
 #include "dapple/xmp_preset.h"
 #include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
+#include "frame_kernels.h"
+#include "local_eval.h"
 #include "engine/nodes/film/film_async.h"
 #include "engine/nodes/film/frame_trace.h"
 #include "color.h"
@@ -660,6 +662,164 @@ char* dapple_gpu_status_json(void) {
 #else
   return dupString("{\"compiled\":false,\"enabled\":false,\"available\":false}");
 #endif
+}
+
+// ---- local adjustments (docs/engine/pipeline-architecture.md section 40) ----------------------------------------------------------------
+int32_t dapple_mask_raster_set(const char* id, int32_t w, int32_t h, const uint8_t* bytes, int32_t stride) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!id || !bytes || !local::rasterSet(id, w, h, bytes, stride)) {
+          setError("mask raster: bad arguments (id, 1..8192 px, bytes)");
+          return DAPPLE_ERROR;
+        }
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+int32_t dapple_mask_raster_remove(const char* id) { return id && local::rasterRemove(id) ? DAPPLE_OK : DAPPLE_ERROR; }
+int32_t dapple_mask_raster_has(const char* id) { return id && local::rasterHas(id) ? 1 : 0; }
+
+namespace {
+// The source of a mask query at long_edge (the session's scaled copy, kept by the Resize cache) and the edit's kernels on it (exact path:
+// the same geometry, gain and HDR as a frame).
+struct MaskView {
+  std::shared_ptr<const SourceImage> hold;
+  const SourceImage* src = nullptr;
+  std::unique_ptr<Renderer> renderer;
+  std::unique_ptr<FrameKernels> fk;
+};
+bool maskView(DappleSession* s, const EditParams& params, int longEdge, MaskView& mv) {
+  if (longEdge <= 0) longEdge = 1024;
+  mv.hold = s->engine.resizedSource(s->source, longEdge, false);
+  mv.src = mv.hold ? mv.hold.get() : &s->source;
+  if (mv.src->linear.empty()) return false;
+  mv.renderer = std::make_unique<Renderer>(params, *s->camera, nullptr);
+  FastOptions fo;
+  fo.spatial = SpatialQuality::Off;
+  mv.fk = std::make_unique<FrameKernels>(*mv.renderer, *mv.src, nullptr, fo);
+  return mv.fk->valid();
+}
+}  // namespace
+
+int32_t dapple_session_mask_preview(DappleSession* s, const char* params_json, int32_t index, int32_t long_edge, int32_t flags, DappleImage* out) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!s || !out) {
+          setError("null argument");
+          return DAPPLE_ERROR;
+        }
+        *out = DappleImage{0, 0, nullptr};
+        EditParams params;
+        if (!parseParams(params_json, params)) return DAPPLE_ERROR;
+        if (index < 0 || index >= int(params.local.size())) {
+          setError("mask preview: no local adjustment at that index");
+          return DAPPLE_ERROR;
+        }
+        if (flags & 1) {  // the photo in its own orientation
+          params.crop = "orig";
+          params.rotate = 0;
+          params.straighten = 0.f;
+          params.flip = false;
+        }
+        std::lock_guard<std::mutex> lk(s->mtx);
+        MaskView mv;
+        if (!maskView(s, params, long_edge, mv)) {
+          setError("mask preview: no source");
+          return DAPPLE_ERROR;
+        }
+        const std::shared_ptr<const local::Frame> f = local::bind(params.local, *mv.src, false, true);
+        const int w = mv.fk->width(), h = mv.fk->height();
+        auto* px = static_cast<std::uint8_t*>(std::malloc(std::size_t(w) * h * 4));
+        if (!px) {
+          setError("out of memory");
+          return DAPPLE_ERROR;
+        }
+        parallelFor(h, [&](int y) {
+          std::vector<std::uint8_t> row(std::size_t(w), 0);
+          if (f) local::maskRow(*f, *mv.fk, index, y, row.data());
+          std::uint8_t* o = px + std::size_t(y) * w * 4;
+          for (int x = 0; x < w; ++x) o[4 * x] = o[4 * x + 1] = o[4 * x + 2] = row[std::size_t(x)], o[4 * x + 3] = 255;
+        });
+        out->width = w;
+        out->height = h;
+        out->rgba = px;
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+int32_t dapple_session_map_point(DappleSession* s, const char* params_json, int32_t long_edge, float x, float y, int32_t direction, float* u, float* v) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!s || !u || !v) {
+          setError("null argument");
+          return DAPPLE_ERROR;
+        }
+        EditParams params;
+        if (!parseParams(params_json, params)) return DAPPLE_ERROR;
+        params.local.clear();
+        std::lock_guard<std::mutex> lk(s->mtx);
+        MaskView mv;
+        if (!maskView(s, params, long_edge, mv)) {
+          setError("map point: no source");
+          return DAPPLE_ERROR;
+        }
+        // the frame -> photo mapping is affine (rotate 90, straighten, flip, crop): from three probes of srcUV at pixel centres
+        float u0, v0, ux, vx, uy, vy;
+        mv.fk->srcUV(0, 0, u0, v0);
+        mv.fk->srcUV(1, 0, ux, vx);
+        mv.fk->srcUV(0, 1, uy, vy);
+        const double a = ux - u0, b = uy - u0, c = vx - v0, d = vy - v0;  // (u, v) = (u0, v0) + [a b; c d] (px - 0.5, py - 0.5)
+        if (direction == 0) {
+          *u = float(u0 + a * (x - 0.5) + b * (y - 0.5));
+          *v = float(v0 + c * (x - 0.5) + d * (y - 0.5));
+        } else {
+          const double det = a * d - b * c;
+          if (std::fabs(det) < 1e-20) {
+            setError("map point: degenerate geometry");
+            return DAPPLE_ERROR;
+          }
+          const double du = x - u0, dv = y - v0;
+          *u = float((d * du - b * dv) / det + 0.5);
+          *v = float((-c * du + a * dv) / det + 0.5);
+        }
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+char* dapple_session_mask_sample_json(DappleSession* s, const char* params_json, float u, float v) {
+  return guarded(
+      [&]() -> char* {
+        if (!s) {
+          setError("null session");
+          return nullptr;
+        }
+        EditParams params;
+        if (!parseParams(params_json, params)) return nullptr;
+        params.crop = "orig";
+        params.rotate = 0;
+        params.straighten = 0.f;
+        params.flip = false;
+        params.local.clear();
+        std::lock_guard<std::mutex> lk(s->mtx);
+        MaskView mv;
+        if (!maskView(s, params, 1024, mv)) {
+          setError("mask sample: no source");
+          return nullptr;
+        }
+        const int x = std::clamp(int(u * float(mv.fk->width())), 0, mv.fk->width() - 1), y = std::clamp(int(v * float(mv.fk->height())), 0, mv.fk->height() - 1);
+        float px[3];
+        mv.fk->sourceRow(px, 1, x, y);
+        mv.fk->gain(px, 1);
+        mv.fk->hdrBlock(px, 1, x, y);
+        float L = 0, hue = 0, sat = 0;
+        local::sampleRange(px, L, hue, sat);
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "{\"L\":%.2f,\"hue\":%.1f,\"sat\":%.2f}", L, hue, std::min(sat / 0.25f * 100.f, 400.f));
+        return dupString(buf);
+      },
+      static_cast<char*>(nullptr));
 }
 
 void dapple_free_image(DappleImage* image) {

@@ -49,6 +49,8 @@ Halo Planner::windowHalo(NodeType t, const PlanRequest& rq) {
       }
       return {h, h};
     }
+    case NodeType::LocalDetail:
+      return {rq.localHalo, rq.localHalo};
     default:
       return {0, 0};
   }
@@ -62,7 +64,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
 
   // ---- classify -------------------------------------------------------------------------------------------------------
   Group tables{GroupKind::Table, {}, {}};
-  const NodeInstance *nResize = nullptr, *nGeo = nullptr, *nGain = nullptr, *nHdr = nullptr, *nTone = nullptr, *nFilm = nullptr,
+  const NodeInstance *nResize = nullptr, *nGeo = nullptr, *nGain = nullptr, *nHdr = nullptr, *nLocal = nullptr, *nTone = nullptr, *nFilm = nullptr,
                      *nDisp = nullptr, *nBlend = nullptr, *nVig = nullptr, *nPack = nullptr;
   std::vector<const NodeInstance*> windows;
   std::vector<NodeId> filmChain;
@@ -76,6 +78,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
       case NodeType::Geometry: nGeo = &n; break;
       case NodeType::Gain: nGain = &n; break;
       case NodeType::Hdr: nHdr = &n; break;
+      case NodeType::LocalLinear: nLocal = &n; break;
       case NodeType::ToneColour:
       case NodeType::ToneColourExact: nTone = &n; break;
       case NodeType::FilmSim: nFilm = &n; break;
@@ -99,6 +102,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
       case NodeType::NRChroma:
       case NodeType::Dehaze:
       case NodeType::Detail:
+      case NodeType::LocalDetail:
       case NodeType::Grain: windows.push_back(&n); break;
       case NodeType::Pack8: nPack = &n; break;
       case NodeType::LegacyRender:
@@ -154,6 +158,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
     head.nodes.push_back(nGeo ? nGeo->id : (nResize ? nResize->id : 0));
     head.nodes.push_back(nGain->id);
     if (nHdr) head.nodes.push_back(nHdr->id);
+    if (nLocal) head.nodes.push_back(nLocal->id);
     if (nTone) head.nodes.push_back(nTone->id);
   }
   if (nDisp) head.nodes.push_back(nDisp->id);
@@ -217,7 +222,7 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
   } else {
     // bytes per window pixel of a tile: float RGB image + luminance/work planes of the spatial stages (measured in the
     // executor: ~7 float planes) + the head chain's row buffers
-    const std::size_t bpp = windows.empty() ? 0 : 3 * 4 + 6 * 4 + 4;
+    const std::size_t bpp = windows.empty() ? 0 : 3 * 4 + 6 * 4 + 4 + std::size_t(rq.localAux) * 4 + (rq.localAux ? 4 * 4 : 0);
     int t = 4096;
     while (t > 256) {
       const std::size_t side = std::size_t(t) + 2 * std::size_t(std::max(allHalo.x, allHalo.y));
@@ -304,10 +309,12 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
   } else if (singleTile) {
     p.allocs.push_back({"frame float", fullPx * 12, firstSweep, last});
     p.allocs.push_back({"luma/work planes", fullPx * 4 * 5, firstSweep, last});
+    if (rq.localAux) p.allocs.push_back({"local aux + band planes", fullPx * 4 * std::size_t(rq.localAux + 4), firstSweep, last});
   } else {
     const std::size_t side = std::size_t(p.grid.tile) + 2 * std::size_t(std::max(allHalo.x, allHalo.y));
     p.allocs.push_back({"tile float", side * side * 12, firstSweep, last});
     p.allocs.push_back({"tile luma/work planes", side * side * 4 * 6, firstSweep, last});
+    if (rq.localAux) p.allocs.push_back({"tile local aux + band planes", side * side * 4 * std::size_t(rq.localAux + 4), firstSweep, last});
     p.allocs.push_back({"1/4 grids", (fullPx / 16) * (12 + 4 + 8) + 64, firstSweep, last});
   }
   for (const Alloc& a : p.allocs) p.peakCpuBytes += a.bytes;

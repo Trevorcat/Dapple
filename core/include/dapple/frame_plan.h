@@ -11,6 +11,7 @@ namespace dapple {
 
 class Lut3D;
 struct HdrField;  // core/src/hdr_field.h
+namespace local { struct Frame; }  // core/src/local_eval.h
 
 struct FramePlan {
   bool supported = true;      // false: the CPU path must render this frame (reason in `why`)
@@ -74,6 +75,11 @@ struct FramePlan {
     float lutMix = 0.f;          // 0..1
     std::uint64_t lutId = 0;     // Lut3D::contentId()
   } display;
+  // Local adjustments (docs/engine/pipeline-architecture.md section 40): the resolved list of the frame (null = none). The point pass evaluates the
+  // masks and the scene-linear ops after `gain` / HDR; `localDetail` = the frame has the window ops (LocalDetail node).
+  std::shared_ptr<const local::Frame> local;
+  bool localDetail = false;
+
   bool anySpatial() const {
     return nrLuma > 0 || nrColor > 0 || dehaze != 0 || clarity != 0 || texture != 0 || sharpen > 0 || grain > 0;
   }

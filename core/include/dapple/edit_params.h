@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "dapple/local_adjust.h"
 #include "dapple/modern.h"
 #include "dapple/result.h"
 
@@ -151,6 +152,10 @@ struct EditParams {
   // Optional creative look (3D LUT, .cube); applied in sRGB at the end.
   std::string lutPath;
   float lutAmount = 100.f;  // 0..100
+
+  // Local adjustments through masks (dapple/local_adjust.h, docs/engine/pipeline-architecture.md section 40): JSON key "local".
+  // Ignored by the old Renderer (DAPPLE_ENGINE=off).
+  std::vector<LocalAdjustment> local;
 
   // Brings every value into its legal range (NaN -> default, unknown crop -> "orig", rotate to a
   // multiple of 90, unknown look -> "std"). toJson/fromJson and the renderer call it.

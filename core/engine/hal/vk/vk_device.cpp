@@ -72,7 +72,7 @@ struct VPipeline {
 
 constexpr std::size_t kParamRing = 512 * 1024;
 constexpr std::size_t kUboRange = 256;
-constexpr int kMaxBind = 8;
+constexpr int kMaxBind = 12;  // bindings after the uniform block (point_local: 11; GLES has 12 slots too)
 
 struct Slot {
   VkCommandBuffer cb = VK_NULL_HANDLE;
@@ -885,6 +885,7 @@ Status VkCmd::dispatch(std::uint32_t gx, std::uint32_t gy, std::uint32_t gz) {
   if (err_ != Status::Ok) return err_;
   if (!pl_ || !haveParams_) return fail(Status::InvalidArgument), Status::InvalidArgument;
   const int nb = int(pl_->bindings.size());
+  if (nb > kMaxBind) return fail(Status::InvalidArgument), d_.fail("too many bindings in " + pl_->name, Status::InvalidArgument), Status::InvalidArgument;
   std::vector<std::uint64_t> ids;
   ids.reserve(std::size_t(nb) + 2);
   ids.push_back(reinterpret_cast<std::uint64_t>(pl_));

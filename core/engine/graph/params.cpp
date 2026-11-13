@@ -257,6 +257,20 @@ ParamRegistry::ParamRegistry() {
   add("ctx.keepGrain", D, [](const ParamInputs& in, Hasher& h) { h.boolean(in.keepGrain); }, nullptr);
   add("ctx.activeParam", C, [](const ParamInputs& in, Hasher& h) { h.str(in.frame.activeParam); },
       [](ParamInputs& in, int v) { return perturbString(in.frame.activeParam, v, {"", "grain", "exposure"}); });
+  // local adjustments (docs/engine/pipeline-architecture.md section 40): the whole list (incl. the content of referenced raster planes)
+  add("local", G, [](const ParamInputs& in, Hasher& h) { h.u64(localHash(in.edit.local)); },
+      [](ParamInputs& in, int v) {
+        LocalAdjustment a;
+        a.id = v ? "p1" : "p0";
+        MaskComponent m;
+        m.kind = MaskKind::Radial;
+        m.cx = v ? 0.3f : 0.6f;
+        a.mask.push_back(m);
+        a.ops.v[kLoExposure] = v ? -0.7f : 0.9f;
+        a.ops.v[kLoClarity] = v ? 40.f : 0.f;
+        in.edit.local.assign(1, a);
+        return true;
+      });
   if (keys_.size() > kMaxKeys) throw std::logic_error("too many ParamKeys");
 }
 

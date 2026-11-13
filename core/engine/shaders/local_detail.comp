@@ -1,0 +1,89 @@
+#version 450
+// Local adjustments, stage W (docs/engine/pipeline-architecture.md section 40): clarity, texture, sharpen, noise reduction and dehaze
+// by mask, after the Detail stage. The per-pixel amounts were written by the point pass (point_local: aux images), the band planes
+// come from separable passes before this one (fine box Bf, very fine box Bs) and the guided-filter base from the window's 1/4 grid
+// (gf_ab). Twin of local::detailWindow (core/src/local_eval.cpp). Reads D through a sampler and writes a new image (no read-write rgba16f).
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device
+#include "common.glsl"
+layout(constant_id = 0) const bool GUIDED = false;
+layout(constant_id = 1) const bool FINE = false;
+layout(constant_id = 2) const bool VFINE = false;
+
+layout(std140, binding = 0) uniform P {
+  ivec4 dims;  // w, h, picture origin x, y
+  ivec4 low;   // lw, lh
+  vec4 grain;  // amp, period
+} u;
+layout(binding = 1) uniform sampler2D uIn;
+layout(binding = 2) uniform sampler2D uAux0;
+layout(binding = 3) uniform sampler2D uAux1;
+layout(binding = 4) uniform sampler2D uBf;
+layout(binding = 5) uniform sampler2D uBs;
+layout(binding = 6) uniform sampler2D uAb;
+layout(binding = 7, rgba16f) uniform writeonly image2D uOut;
+layout(binding = 8, rgba8) uniform writeonly image2D uOut8;
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.dims.x || p.y >= u.dims.y) return;
+  const ivec2 q = p + u.dims.zw;
+  vec3 c = texelFetch(uIn, p, 0).rgb;
+  const vec4 K0 = texelFetch(uAux0, p, 0);
+  const float Kd = texelFetch(uAux1, p, 0).x;
+  const float Y = lumaOf(c);
+  float base = Y;
+  if (GUIDED) {
+    int x0, x1, y0, y1;
+    float tx, ty;
+    lowAxis(p.x, 4, u.low.x, x0, x1, tx);
+    lowAxis(p.y, 4, u.low.y, y0, y1, ty);
+    const vec2 a = mix(mix(texelFetch(uAb, ivec2(x0, y0), 0).xy, texelFetch(uAb, ivec2(x1, y0), 0).xy, tx),
+                       mix(texelFetch(uAb, ivec2(x0, y1), 0).xy, texelFetch(uAb, ivec2(x1, y1), 0).xy, tx), ty);
+    base = a.x * Y + a.y;
+  }
+  const float bf = FINE ? texelFetch(uBf, p, 0).r : Y;
+  const float bs = VFINE ? texelFetch(uBs, p, 0).r : Y;
+  float dY = 0.0;
+  if (K0.x != 0.0) {
+    const float g = clamp(K0.x, -2.0, 2.0);
+    const float gg = g > 0.0 ? g * 1.1 : g * 0.85;
+    const float mid = 0.4 + 0.6 * (1.0 - (2.0 * Y - 1.0) * (2.0 * Y - 1.0));
+    dY += gg * (Y - base) * mid;
+  }
+  if (K0.y != 0.0) {
+    const float t = clamp(K0.y, -2.0, 2.0), d = Y - bf;
+    dY += t > 0.0 ? t * 1.5 * d / (1.0 + 10.0 * abs(d)) : t * 0.9 * d;
+  }
+  if (K0.z != 0.0) {
+    const float s = clamp(K0.z, -1.0, 2.0), d = Y - bs;
+    if (s > 0.0) {
+      const float a = abs(d);
+      dY += s * 1.5 * d * (0.15 / (0.15 + a)) * (a / (a + 0.0025));
+    } else {
+      dY += s * d;
+    }
+  }
+  if (K0.w > 0.0) {
+    const float kn = min(K0.w, 1.0), d = Y - bf;
+    const float s2 = (0.004 + 0.02 * kn) * (0.004 + 0.02 * kn);
+    dY -= kn * d * s2 / (s2 + d * d);
+  }
+  c += vec3(dY);
+  if (Kd != 0.0) {
+    const float kd = clamp(Kd, -1.0, 1.0);
+    if (kd > 0.0) {
+      const float mn = max(0.0, min(c.r, min(c.g, c.b)));
+      const float V = clamp(mn * (base / max(Y, 1e-3)), 0.0, 1.0);
+      const float a = min(0.9 * kd, 0.95) * V;
+      c = (c - vec3(a)) / (1.0 - a);
+    } else {
+      const float veil = 0.6 * base + 0.35, t = -0.6 * kd;
+      c += (vec3(veil) - c) * t;
+    }
+  }
+  c = clamp(c, vec3(0.0), vec3(1.0));
+  if (GRAIN) c = grainApply(c, q, u.grain.x, u.grain.y);
+  if (LAST) imageStore(uOut8, p, pack8(c));
+  else imageStore(uOut, p, h16v(vec4(c, 1.0)));
+}

@@ -10,6 +10,7 @@
 
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session.h"
+#include "local_eval.h"
 #include "parallel.h"
 
 namespace dapple::engine {
@@ -29,6 +30,10 @@ struct WinRes {
   SpatialParams sp;
   float scale;
 };
+struct LocalRes {
+  const FrameKernels* fk;
+  const local::AuxTarget* aux;
+};
 static_assert(sizeof(WinRes) <= kMaxResolvedBytes && sizeof(DispRes) <= kMaxResolvedBytes, "resolved block too large");
 
 // ---- point block fragments ---------------------------------------------------------------------------------------------
@@ -46,6 +51,10 @@ void blkHdr(const void* r, float* px, int n, const PixelPos& pos) {
   static_cast<const PtRes*>(r)->fk->hdrBlock(px, n, pos.x, pos.y);
 }
 void blkToneColour(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->toneColour(px, n); }
+void blkLocal(const void* r, float* px, int n, const PixelPos& pos) {
+  const auto* l = static_cast<const LocalRes*>(r);
+  if (const local::Frame* f = l->fk->localFrame()) local::linearBlock(*f, *l->fk, px, n, pos.x, pos.y, l->aux);
+}
 void blkVignette(const void* r, float* px, int n, const PixelPos& pos) {
   static_cast<const PtRes*>(r)->fk->vignette(px, n, pos.x, pos.y);
 }
@@ -84,6 +93,15 @@ Status tileDetail(CpuTile& t, const void* r) {
   if (!(p.clarity != 0.f || p.texture != 0.f || p.sharpen > 0.f)) return Status::Ok;
   if (p.clarity != 0.f && !t.guided) return Status::Internal;
   stageDetail(*t.img, *t.scratch, p, w->scale, t.guided, t.ox, t.oy, t.frameW, t.frameH);
+  return Status::Ok;
+}
+Status tileLocalDetail(CpuTile& t, const void* r) {
+  const auto* w = static_cast<const WinRes*>(r);
+  const local::Frame* f = w->fk->localFrame();
+  if (!f || !f->anyWindow) return Status::Ok;
+  if (!t.aux || !t.aux->data || t.aux->ox != t.ox || t.aux->oy != t.oy || t.aux->w != t.img->width || t.aux->h != t.img->height)
+    return Status::Internal;  // the amounts must come from the head chain of this very window
+  local::detailWindow(*f, *t.img, *t.aux, t.frameW, t.frameH, w->scale);
   return Status::Ok;
 }
 Status tileGrain(CpuTile& t, const void* r) {
@@ -187,6 +205,8 @@ const CpuImpl kGain{nullptr, blkGain, nullptr, nullptr};
 const CpuImpl kHdr{nullptr, blkHdr, nullptr, nullptr};
 const CpuImpl kToneColour{nullptr, blkToneColour, nullptr, nullptr};
 const CpuImpl kVignette{nullptr, blkVignette, nullptr, nullptr};
+const CpuImpl kLocalLinear{nullptr, blkLocal, nullptr, nullptr};
+const CpuImpl kLocalDetail{nullptr, nullptr, tileLocalDetail, nullptr};
 const CpuImpl kDisplay{nullptr, blkDisplay, nullptr, nullptr};
 const CpuImpl kBlend{nullptr, blkBlend, nullptr, nullptr};
 const CpuImpl kNRLuma{nullptr, nullptr, tileNRLuma, nullptr};
@@ -211,6 +231,8 @@ const CpuImpl* cpuImpl(NodeType t) {
     case NodeType::ToneColour:
     case NodeType::ToneColourExact: return &kToneColour;
     case NodeType::Vignette: return &kVignette;
+    case NodeType::LocalLinear: return &kLocalLinear;
+    case NodeType::LocalDetail: return &kLocalDetail;
     case NodeType::DisplayStages: return &kDisplay;
     case NodeType::Blend: return &kBlend;
     case NodeType::NRLuma: return &kNRLuma;
@@ -238,10 +260,14 @@ bool bindResolved(NodeType t, const FrameEnv& env, Resolved& out) {
     case NodeType::NRChroma:
     case NodeType::Dehaze:
     case NodeType::Detail:
+    case NodeType::LocalDetail:
     case NodeType::Grain:
       new (out.bytes) WinRes{env.fk, env.fk->spatial(), env.fk->spatialScale()};  // read after the film outcome is known
       return true;
     case NodeType::Pack8: return true;
+    case NodeType::LocalLinear:
+      new (out.bytes) LocalRes{env.fk, env.aux};
+      return true;
     default:
       if (!cpuImpl(t) || (!cpuImpl(t)->block && !cpuImpl(t)->tile)) return false;  // table nodes bake, they are not bound per frame
       new (out.bytes) PtRes{env.fk};

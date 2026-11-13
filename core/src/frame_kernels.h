@@ -14,6 +14,7 @@
 #include "spatial.h"
 
 namespace dapple {
+namespace local { struct Frame; struct AuxTarget; }
 
 class FrameKernels {
  public:
@@ -54,12 +55,21 @@ class FrameKernels {
   void blend(float* main, const float* film, int n) const;  // main += strength * (film - main)
   void vignette(float* px, int n, int x0, int y) const;
 
+  // ---- local adjustments (docs/engine/pipeline-architecture.md section 40) --------------------------------------------------------
+  // Source position of output pixel (x, y), normalised by the source size (the photo space of the masks).
+  void srcUV(int x, int y, float& u, float& v) const;
+  // The pre-gain source value of output pixels x0 .. x0 + n - 1 of row y (copyRow or fetchRow).
+  void sourceRow(float* px, int n, int x0, int y) const;
+  // The resolved local adjustments of this frame (null: none).
+  const local::Frame* localFrame() const;
+
   // ---- film (super-node until the film engineer's nodes land) -----------------------------------------------------------
   // Streaming path (full-strength film, 8-bit target, no neighbourhood stage): renders the whole frame into rgba.
   bool streamFilm(std::uint8_t* rgba);
   // FilmSim: the film render of the whole frame into `F` (display-encoded, unclamped). False: film unavailable, the frame
   // takes the normal path (then needNormal() is true).
-  bool runFilm(ImageF& F);
+  // Local adjustments (docs section 40.7): stage L is applied to the film's scene input; `aux` (whole frame) receives the stage-W amounts.
+  bool runFilm(ImageF& F, const local::AuxTarget* aux = nullptr);
   bool filmOk() const;
   bool needNormal() const;       // the normal (tone + colour) branch contributes to the output
 

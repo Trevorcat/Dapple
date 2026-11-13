@@ -2,6 +2,9 @@
 # Keep identical to the list used by the Vulkan backend; the authoritative one is the GPU engineer's.
 set(DAPPLE_GPU_SHADERS
   "point|point.comp||SBSSII"
+  "point_local|point.comp|LOCAL=1|SBSSIIBBBII"
+  "local_detail|local_detail.comp||SSSSSSII"
+  "local_film_in|local_film_in.comp||SIBBII"
   "sep_d2y|sepconv.comp|IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
   "sep_d2y_v|sepconv.comp|BIGV=1,IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
   "sep_d2y_s|sepconv.comp|SMALL=1,IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"

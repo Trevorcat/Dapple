@@ -1,0 +1,88 @@
+#version 450
+// Local adjustments, stage L for a film frame (docs/engine/pipeline-architecture.md section 40.7): the film's scene input with the local
+// adjustments applied, like dodging and burning the scene before it is exposed. Geometry gather of the source (as film_src.comp / point.comp),
+// the white balance x exposure gain of the frame, the masks + scene-linear ops of local.glsl, back to the pre-gain domain the film nodes
+// take (they apply the gain themselves); RGBA32F. Also writes the stage-W amounts (aux images) when the frame has window ops.
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+layout(constant_id = 0) const int GEO = 0;  // 0 identity, 1 exact index mapping, 2 Catmull-Rom
+
+layout(std140, binding = 0) uniform P {
+  vec4 gain;
+  ivec4 a;     // srcW, srcH, dW, dH
+  ivec4 b;     // bound source image origin x, y; origin of this window in the picture x, y
+  vec4 geoA;   // cs, sn, fw, fh
+  vec4 geoB;   // ox0, oy0, stepX, stepY
+  vec4 geoC;   // fullW, fullH
+  ivec4 c;     // rot, flip
+} u;
+layout(binding = 1) uniform sampler2D uSrc;
+layout(binding = 2, rgba32f) uniform writeonly image2D uOut;
+#define LB_DESC 3
+#define LB_PLANES 4
+#define LB_AUX0 5
+#define LB_AUX1 6
+#include "local.glsl"
+
+vec3 srcAt(int x, int y) { return texelFetch(uSrc, ivec2(clamp(x, 0, u.a.x - 1), clamp(y, 0, u.a.y - 1)) - u.b.xy, 0).rgb; }
+void cubicW(float t, out float w[4]) {
+  const float t2 = t * t, t3 = t2 * t;
+  w[0] = -0.5 * t3 + t2 - 0.5 * t;
+  w[1] = 1.5 * t3 - 2.5 * t2 + 1.0;
+  w[2] = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
+  w[3] = 0.5 * t3 - 0.5 * t2;
+}
+vec3 sampleCubic(float x, float y) {
+  x -= 0.5;
+  y -= 0.5;
+  const float fxl = floor(x), fyl = floor(y);
+  const int ix = int(fxl), iy = int(fyl);
+  float wx[4], wy[4];
+  cubicW(x - fxl, wx);
+  cubicW(y - fyl, wy);
+  vec3 o = vec3(0.0);
+  for (int j = 0; j < 4; ++j) {
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < 4; ++i) acc += wx[i] * srcAt(ix - 1 + i, iy - 1 + j);
+    o += wy[j] * acc;
+  }
+  return max(o, vec3(0.0));
+}
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.a.z || p.y >= u.a.w) return;
+  const ivec2 q = p + u.b.zw;
+  vec3 v;
+  vec2 uv = (vec2(q) + 0.5) / vec2(u.a.xy);
+  if (GEO == 0) {
+    v = texelFetch(uSrc, q - u.b.xy, 0).rgb;
+  } else {
+    const float pxf = u.geoB.x + (float(q.x) + 0.5) * u.geoB.z;
+    const float pyf = u.geoB.y + (float(q.y) + 0.5) * u.geoB.w;
+    float uu = pxf - u.geoC.x * 0.5;
+    const float vv = pyf - u.geoC.y * 0.5;
+    if (u.c.y != 0) uu = -uu;
+    const float fx = uu * u.geoA.x + vv * u.geoA.y + u.geoA.z * 0.5;
+    const float fy = -uu * u.geoA.y + vv * u.geoA.x + u.geoA.w * 0.5;
+    float sx, sy;
+    const float sW = float(u.a.x), sH = float(u.a.y);
+    if (u.c.x == 0) { sx = fx; sy = fy; }
+    else if (u.c.x == 1) { sx = fy; sy = sH - fx; }
+    else if (u.c.x == 2) { sx = sW - fx; sy = sH - fy; }
+    else { sx = sW - fy; sy = fx; }
+    uv = vec2(sx, sy) / vec2(u.a.xy);
+    if (GEO == 1) v = srcAt(int(floor(sx)), int(floor(sy)));
+    else v = sampleCubic(sx, sy);
+  }
+  const vec3 vSrc = v;
+  const vec3 g = max(u.gain.xyz, vec3(1e-20));
+  v = max(v * g, vec3(0.0));
+  vec4 K0, K1;
+  localApply(v, uv, vSrc, K0, K1);
+  if (LOCALW) {
+    imageStore(uAux0, p, K0);
+    imageStore(uAux1, p, K1);
+  }
+  imageStore(uOut, p, vec4(v / g, 1.0));
+}

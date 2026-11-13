@@ -22,6 +22,7 @@
 #include "engine/exec/engine_session.h"
 #include "engine/nodes/film/film_nodes.h"
 #include "frame_kernels.h"
+#include "local_eval.h"
 #include "spatial.h"
 
 namespace dapple {
@@ -1934,6 +1935,7 @@ struct FrameKernels::Impl {
   std::optional<Renderer::PointOp> exactOp;
   bool filmRan = false, filmOkV = false, valid = false;
   float pitch = 1.f;
+  std::shared_ptr<const local::Frame> local;  // local adjustments (docs/engine/pipeline-architecture.md section 40); null for film frames in v1
 
   Impl(const Renderer& rr, const SourceImage& src, const BakedLut* lut, const FastOptions& o)
       : r(rr), source(src), in(src.linear), lutp(lut), exact(lut == nullptr), opt(o) {
@@ -1976,6 +1978,7 @@ struct FrameKernels::Impl {
       hdrP.s = hdr.s, hdrP.ev = hdr.ev, hdrP.key = hdr.key, hdrP.yn = hdr.yn, hdrP.yclip = hdr.yclip;
       hdrP.lo = hdr.lo, hdrP.hi = hdr.hi, hdrP.ls = hdr.ls, hdrP.hp = hdr.hp;
     }
+    if (!r.p_.local.empty()) local = local::bind(r.p_.local, source, opt.spatial == SpatialQuality::Interactive);
     valid = true;
   }
 
@@ -2065,8 +2068,17 @@ FramePlan FrameKernels::framePlan() const {
   fp.sharpRadius = m.sp.sharpRadius;
   fp.grain = m.sp.grain;
   fp.spatialScale = spatialScale();
+  fp.local = m.local;
+  fp.localDetail = m.local && m.local->anyWindow;
   return fp;
 }
+
+void FrameKernels::srcUV(int x, int y, float& u, float& v) const { impl_->srcUV(x, y, u, v); }
+void FrameKernels::sourceRow(float* px, int n, int x0, int y) const {
+  if (impl_->useGeo) fetchRow(px, n, x0, y);
+  else copyRow(px, n, x0, y);
+}
+const local::Frame* FrameKernels::localFrame() const { return impl_->local.get(); }
 
 void FrameKernels::copyRow(float* px, int n, int x0, int y) const {
   std::memcpy(px, impl_->in.row(y) + 3 * std::size_t(x0), std::size_t(n) * 3 * sizeof(float));
@@ -2209,7 +2221,7 @@ bool FrameKernels::streamFilm(std::uint8_t* rgba) {
   return lease->renderRows(m.in, w, h, gainEv, resampled ? fetchTramp : nullptr, &fetchRowFn, tramp, &sink);
 }
 
-bool FrameKernels::runFilm(ImageF& F) {
+bool FrameKernels::runFilm(ImageF& F, const local::AuxTarget* aux) {
   Impl& m = *impl_;
   m.filmRan = true;
   if (!m.fr.stock) return false;
@@ -2222,10 +2234,33 @@ bool FrameKernels::runFilm(ImageF& F) {
   }
   const SpatialQuality q = m.exact ? (m.opt.spatial == SpatialQuality::Off ? SpatialQuality::Off : SpatialQuality::Full)
                                    : m.opt.spatial;
+  const local::Frame* lf = m.local.get();
   m.filmOkV = runFilmStage(
-      m.r.p_, m.fr, g, m.in, m.useGeo, w, h, m.pitch, q,
+      m.r.p_, m.fr, g, m.in, m.useGeo || lf, w, h, m.pitch, q,
       [&](int y, float* row) {
-        for (int x = 0; x < w; ++x) m.fetchPixel(x, y, row + 3 * x);
+        if (m.useGeo) {
+          for (int x = 0; x < w; ++x) m.fetchPixel(x, y, row + 3 * x);
+        } else {
+          std::memcpy(row, m.in.row(y), std::size_t(w) * 3 * sizeof(float));
+        }
+        if (!lf) return;
+        // local adjustments, stage L, on the film's scene input (docs section 40.7): in the gained domain, back to the film's input domain
+        const bool wantK = aux && aux->data && lf->anyWindow;
+        float K[kLocalWindowSlots];
+        for (int x = 0; x < w; ++x) {
+          float* p = row + 3 * x;
+          const float src[3] = {p[0], p[1], p[2]};
+          float lin[3] = {std::max(0.f, p[0] * g[0]), std::max(0.f, p[1] * g[1]), std::max(0.f, p[2] * g[2])};
+          float u, v;
+          m.srcUV(x, y, u, v);
+          local::applyLinear(*lf, u, v, src, lin, wantK ? K : nullptr);
+          for (int c = 0; c < 3; ++c) p[c] = g[c] > 0.f ? lin[c] / g[c] : 0.f;
+          if (wantK) {
+            const std::size_t o = std::size_t(y - aux->oy) * aux->w + std::size_t(x - aux->ox);
+            for (int k = 0; k < kLocalWindowSlots; ++k)
+              if (aux->slot[k] >= 0) aux->data[std::size_t(aux->slot[k]) * aux->plane + o] = K[k];
+          }
+        }
       },
       F, &m.opt);
   return m.filmOkV;

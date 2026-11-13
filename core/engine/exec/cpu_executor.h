@@ -15,6 +15,7 @@
 #include "engine/graph/node.h"
 #include "engine/plan/plan.h"
 #include "frame_kernels.h"
+#include "local_eval.h"
 #include "spatial.h"
 
 namespace dapple::engine {
@@ -39,6 +40,8 @@ struct CpuTile {
   Rect interior;
   std::uint8_t* out8 = nullptr;
   int outChannels = 4;
+  // LocalDetail: the per-pixel amounts LocalLinear wrote for this window (docs/engine/pipeline-architecture.md section 40)
+  const local::AuxTarget* aux = nullptr;
 };
 
 // What a node binds its resolved block to for one frame (nodes/main/cpu_nodes.cpp).
@@ -46,6 +49,7 @@ struct FrameEnv {
   const FrameKernels* fk = nullptr;
   const ImageF* film = nullptr;   // FilmSim output plane (whole frame), null when there is no film branch
   bool blendFollows = false;      // DisplayStages feeds a Blend (else it replaces the pixel value)
+  const local::AuxTarget* aux = nullptr;  // LocalLinear: where the stage-W amounts of the work window go (null: none)
 };
 
 constexpr std::size_t kMaxResolvedBytes = 128;

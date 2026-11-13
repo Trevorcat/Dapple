@@ -4,6 +4,8 @@ add_library(dapple_core STATIC
   src/developer.cpp
   src/edit_params.cpp
   src/edit_params_json.cpp
+  src/local_adjust.cpp
+  src/local_eval.cpp
   src/encode.cpp
   src/exif_writer.cpp
   src/image.cpp

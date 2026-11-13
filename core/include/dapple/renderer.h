@@ -84,6 +84,7 @@ class FrameKernels;  // engine block fragments of the per-pixel pipeline (src/fr
 class Renderer {
   friend class FrameKernels;
  public:
+  const EditParams& params() const { return p_; }
   // `lut` may be null. It must outlive the renderer.
   Renderer(const EditParams& params, const CameraProfile& camera, const Lut3D* lut);
 

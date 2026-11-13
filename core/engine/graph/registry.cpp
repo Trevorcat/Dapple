@@ -79,6 +79,15 @@ NodeRegistry::NodeRegistry() {
   // the ISO (ctx.source); the strength is the node's own key.
   def(NodeType::Hdr, "Hdr", Domain::Image, Footprint::Point, 1, 1, P.mask({"hdr", "modern", "ctx.source"}));
 
+  // Local adjustments (docs section 40): the list is their own key; the masks read the source (ranges, raster guide) and the frame geometry.
+  {
+    ParamMask m = FRAME;
+    m.add(P.mask({"local", "ctx.source", "ctx.quality"}));
+    NodeDesc& d = def(NodeType::LocalLinear, "LocalLinear", Domain::Image, Footprint::Point, 1, 1, m);
+    d.usesGeometry = true;
+    d.haloNote = "point: analytic masks + low-resolution photo-space planes (brush, raster guided-filter coefficients)";
+  }
+
   // ---- tables (always CPU, cached) ---------------------------------------------------------------------------------------
   {
     ParamMask m = COLOUR;
@@ -145,13 +154,15 @@ NodeRegistry::NodeRegistry() {
   spatial(NodeType::Detail, "Detail", Footprint::Composite, {"clarity", "texture", "sharpen", "sharpRadius", "modern"},
           "guided base + detail passes");
   spatial(NodeType::Grain, "Grain", Footprint::Point, {"grain", "ctx.activeParam", "ctx.filmOnly"}, "hash on frame coordinates");
+  spatial(NodeType::LocalDetail, "LocalDetail", Footprint::Window, {"local"},
+          "fine boxes + guided base on the window's 1/4 grid (local clarity / texture / sharpen / noise / dehaze amounts from the aux planes)");
   def(NodeType::Pack8, "Pack8", Domain::Image, Footprint::Sink, 1, 1, ParamMask{});
 
   // ---- film (super-node until b4) ---------------------------------------------------------------------------------------
   {
     ParamMask m = FRAME;
     m.add(WB).add(P.mask({"exposure", "filmStock", "filmPaper", "film_exp", "film_warmth", "film_tint", "film_grain",
-                          "film_halation", "ctx.filmKeyEv", "ctx.filmPrintEv", "film_black", "film_wb", "ctx.filmScene", "ctx.camera", "ctx.source", "ctx.filmLib", "ctx.quality", "ctx.filmActive"}));
+                          "film_halation", "ctx.filmKeyEv", "ctx.filmPrintEv", "film_black", "film_wb", "ctx.filmScene", "ctx.camera", "ctx.source", "ctx.filmLib", "ctx.quality", "ctx.filmActive", "local"}));
     NodeDesc& d = def(NodeType::FilmSim, "FilmSim", Domain::Image, Footprint::Super, 1, 1, m);
     d.usesGeometry = true;
     d.haloNote = "spectral film simulator incl. halation / DIR / grain / scan";
@@ -182,7 +193,7 @@ NodeRegistry::NodeRegistry() {
   {
     // gain (white balance x exposure x film exposure) is folded into the input matrix
     ParamMask m = WB;
-    m.add(P.mask({"exposure", "film_exp", "ctx.filmKeyEv", "ctx.camera", "ctx.source", "ctx.filmLib"}));
+    m.add(P.mask({"exposure", "film_exp", "ctx.filmKeyEv", "ctx.camera", "ctx.source", "ctx.filmLib", "local", "ctx.quality"}));  // local: stage L on the scene input (40.7)
     NodeDesc& d = def(NodeType::FilmExposure, "FilmExposure", Domain::Image, Footprint::Point, 2, 2, m);
     d.inputDomain[0] = Domain::Image;
     d.inputDomain[1] = Domain::Table;  // FilmTableRaw

@@ -36,6 +36,9 @@ endif()
 set(_SH "${PROJECT_SOURCE_DIR}/core/engine/shaders")
 set(DAPPLE_GPU_SHADERS
   "point|point.comp||SBSSIIB"
+  "point_local|point.comp|LOCAL=1|SBSSIIBBBII"
+  "local_detail|local_detail.comp||SSSSSSII"
+  "local_film_in|local_film_in.comp||SIBBII"
   "sep_d2y|sepconv.comp|IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
   "sep_d2y_v|sepconv.comp|BIGV=1,IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
   "sep_d2y_s|sepconv.comp|SMALL=1,IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
@@ -93,7 +96,7 @@ foreach(_entry ${DAPPLE_GPU_SHADERS})
             "${_SH}/${_src}" -o "${_spv}"
     COMMAND ${CMAKE_COMMAND} -DSPV=${_spv} -DOUT=${_h} -DNAME=g_${_name}_spv
             -P "${_SH}/cmake/embed_spv.cmake"
-    DEPENDS "${_SH}/${_src}" "${_SH}/common.glsl"
+    DEPENDS "${_SH}/${_src}" "${_SH}/common.glsl" "${_SH}/local.glsl"
             "${_SH}/cmake/embed_spv.cmake"
     COMMENT "glslc ${_name} (${_src})")
   list(APPEND _spv_headers "${_h}")
@@ -116,7 +119,7 @@ if(DAPPLE_GLES)
 endif()
 add_library(dapple_gpu STATIC
   ${_E}/hal/hal.cpp ${_E}/hal/select.cpp ${_E}/hal/vk/vk_device.cpp ${_E}/exec/gpu_scheduler.cpp ${_E}/exec/gpu_executor.cpp ${_E}/exec/gpu_context.cpp
-  ${_E}/nodes/gpu_common.cpp ${_E}/nodes/point/gpu.cpp ${_E}/nodes/nr/gpu.cpp ${_E}/nodes/dehaze/gpu.cpp ${_E}/nodes/detail/gpu.cpp
+  ${_E}/nodes/gpu_common.cpp ${_E}/nodes/point/gpu.cpp ${_E}/nodes/nr/gpu.cpp ${_E}/nodes/dehaze/gpu.cpp ${_E}/nodes/detail/gpu.cpp ${_E}/nodes/local/gpu.cpp
   ${_E}/nodes/resize/gpu.cpp ${_E}/nodes/gpu_nodes.cpp ${DAPPLE_FILM_GPU_SOURCES} ${DAPPLE_DEMOSAIC_GPU_SOURCES}
   src/parity.cpp src/gpu_bench.cpp ${_spv_headers})
 if(TARGET dapple_hal_gles)
