@@ -188,6 +188,11 @@ void scenePlacement(const FilmLatitude& lat, const SceneStats& st, float ev, flo
 void setFilmCalibrationDisk(const std::string& dir, const std::string& salt);
 float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper,
                         float deltaEv = 0.f);
+// The previous way of computing it, uncached: a patch through a freshly baked simulator per probe of the solve (a table bake each). Reference for the tests.
+float filmPrintConstantBaked(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper, float deltaEv = 0.f);
+// Computes (memory + disk cache) the constants of every EV bucket a film_shoot drag can reach (-3.5 .. +3.5 in 0.5 EV steps, 15 buckets) with one model.
+// Returns the number of buckets evaluated (0 when all were cached, and for a slide: no constant). Used by the first-launch prebake.
+int filmPrintConstantsPrefill(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper);
 // The same for a negative whose film EV was moved by `deltaEv` from the shared exposure: the lab prints a denser / thinner
 // negative down / up (calibrated on a 0.5 EV grid and interpolated).
 float filmPrintConstantAt(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper,
@@ -267,7 +272,7 @@ FilmPrintRange filmPrintRange(const std::shared_ptr<const film::FilmLibrary>& li
 
 // Stage B: the print EV (|ev| <= kFilmMaxPrintEv) at which printL(ev), the median L* of the print, equals `target` clamped into
 // `range`. Fills printEv / keyL / printL / paper range / printBound / printEvals of `info`.
-float solvePrintEv(const std::function<float(float)>& printL, float target, const FilmPrintRange& range, FilmMatchInfo* info = nullptr);
+float solvePrintEv(const std::function<float(float)>& printL, float target, const FilmPrintRange& range, FilmMatchInfo* info = nullptr, float tolerance = 0.35f);
 
 // The paper-to-screen mapping of stage C (scanner white / black correction of the film model: the print's white and black
 // reference map to display white / black, the print exposure keeps mid-grey where it was) is on in the develop pipeline when

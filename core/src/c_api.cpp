@@ -638,9 +638,9 @@ void dapple_gpu_configure(const char* cache_dir, const char* app_version, const 
 #ifdef DAPPLE_HAVE_GPU
   dapple::engine::gpu::configure(cache_dir ? cache_dir : "", app_version ? app_version : "", fingerprint ? fingerprint : "");
 #else
-  (void)cache_dir;
-  (void)app_version;
-  (void)fingerprint;
+  // CPU-only build: the same cache directory still holds the film tables and the print-exposure constants (the prebake persists them there)
+  if (cache_dir && cache_dir[0])
+    dapple::engine::filmnode::setFilmTableDisk((fs::path(cache_dir) / "film_tables").string(), std::string(app_version ? app_version : "") + "|" + (fingerprint ? fingerprint : ""));
 #endif
 }
 

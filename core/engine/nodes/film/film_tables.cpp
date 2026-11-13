@@ -1313,7 +1313,7 @@ namespace {
 struct PrebakeState {
   std::atomic<bool> running{false};
   std::atomic<int> done{0}, total{0};
-  std::atomic<long long> rawUs{0}, curvesUs{0}, printUs{0};
+  std::atomic<long long> rawUs{0}, curvesUs{0}, printUs{0}, constUs{0};
   std::atomic<bool> finished{false};
 };
 PrebakeState& prebake() {
@@ -1369,6 +1369,12 @@ void startFilmPrebake() {
           cachedTable(printsCoarseLru(), hc.finish(), bakePrintScanCoarseDisk, r);
           st.printUs += us();
           planOf(r);
+          // the image-independent print-exposure constants of the stock (15 EV buckets, one film model): the first selection of a stock then reads a file
+          // instead of calibrating (about a second per stock); a slide has none
+          dapple::sys::yieldToInteraction(60000);
+          const auto t2 = Clock::now();
+          dapple::filmPrintConstantsPrefill(lib, id, paper);
+          st.constUs += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t2).count();
         }
         st.done.fetch_add(1);
       }
@@ -1381,9 +1387,9 @@ void startFilmPrebake() {
 void filmPrebakeStatus(char* buf, int n) {
   PrebakeState& s = prebake();
   const int d = std::max(1, s.done.load());
-  std::snprintf(buf, std::size_t(n), "{\"done\":%d,\"total\":%d,\"finished\":%s,\"running\":%s,\"rawMs\":%.1f,\"curvesMs\":%.1f,\"coarsePrintMs\":%.1f}", s.done.load(),
+  std::snprintf(buf, std::size_t(n), "{\"done\":%d,\"total\":%d,\"finished\":%s,\"running\":%s,\"rawMs\":%.1f,\"curvesMs\":%.1f,\"coarsePrintMs\":%.1f,\"printConstMs\":%.1f}", s.done.load(),
                 s.total.load(), s.finished.load() ? "true" : "false", s.running.load() ? "true" : "false", s.rawUs.load() / 1000.0 / d, s.curvesUs.load() / 1000.0 / d,
-                s.printUs.load() / 1000.0 / d);
+                s.printUs.load() / 1000.0 / d, s.constUs.load() / 1000.0 / d);
 }
 
 bool stockTablesReady(const FilmResolved& r) {

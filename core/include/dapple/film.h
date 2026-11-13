@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -321,6 +322,11 @@ class FilmSimulator {
   // cache-resident blocks to time them individually.
   bool renderStaged(const ImageF& linearProPhoto, ImageF& out, FilmTimings* t = nullptr) const;
 
+  // Direct evaluation of uniform patches (linear ProPhoto rgb) at chosen print exposure multipliers without baking tables (`body` gets the evaluator: display
+  // sRGB-encoded colour, not clamped). Builds only the model (the raw LUT is cached); the simulator's own state is untouched. Used by the print-exposure
+  // calibration of film_match.cpp.
+  using UniformEval = std::function<void(const double rgb[3], double printExposure, double out[3])>;
+  bool probeUniform(const FilmParams& p, const std::function<void(const UniformEval&)>& body, std::string* err = nullptr);
   // Single pixel, double precision, no tables: the slow reference path (test oracle).
   void renderPixelDirect(const double rgb[3], double out[3]) const;
   // Single pixel through the baked float tables (the same kernel the image path uses).

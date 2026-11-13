@@ -648,6 +648,16 @@ void runScenario(const Scenario& sc, std::uint32_t seed, std::vector<GoldenHash>
       Fnv a;
       if (an) a.bytes(an, std::strlen(an));
       r.hash = hex(h.h) + (an ? ":" + hex(a.h) : "");
+      if (const char* dd = std::getenv("DAPPLE_GOLDEN_DUMP")) {  // raw RGBA8 of every frame (name with '/' -> '_'), for `dapple_golden diff`
+        std::string fn = r.name;
+        for (char& c : fn) if (c == '/') c = '_';
+        std::error_code ec;
+        fs::create_directories(dd, ec);
+        std::ofstream o(fs::path(dd) / (fn + ".rgba"), std::ios::binary);
+        const std::int32_t wh[2] = {im.width, im.height};
+        o.write(reinterpret_cast<const char*>(wh), sizeof wh);
+        o.write(reinterpret_cast<const char*>(im.rgba), std::streamsize(std::size_t(im.width) * im.height * 4));
+      }
     }
     dapple_free_image(&im);
     dapple_free_string(an);
@@ -1031,6 +1041,34 @@ int main(int argc, char** argv) {
     }
     if (!film) std::fputs("note: film pack not loaded, film scenarios skipped\n", stderr);
     return selfcheck(film);
+  }
+  if (argc >= 4 && std::string(argv[1]) == "diff") {  // diff <dirA> <dirB>: mean / max display-level difference per dumped frame (DAPPLE_GOLDEN_DUMP)
+    int changed = 0;
+    for (const auto& e : fs::directory_iterator(argv[2])) {
+      const fs::path b = fs::path(argv[3]) / e.path().filename();
+      if (e.path().extension() != ".rgba" || !fs::exists(b)) continue;
+      std::ifstream fa(e.path(), std::ios::binary), fb(b, std::ios::binary);
+      std::vector<unsigned char> da((std::istreambuf_iterator<char>(fa)), {}), db((std::istreambuf_iterator<char>(fb)), {});
+      if (da.size() != db.size() || da.size() < 8) {
+        std::printf("%-40s size differs\n", e.path().stem().string().c_str());
+        ++changed;
+        continue;
+      }
+      double sum = 0;
+      int mx = 0;
+      std::size_t n = 0, nd = 0;
+      for (std::size_t i = 8; i < da.size(); ++i) {
+        if ((i - 8) % 4 == 3) continue;
+        const int d = std::abs(int(da[i]) - int(db[i]));
+        sum += d, mx = std::max(mx, d), ++n, nd += d != 0;
+      }
+      if (nd) {
+        ++changed;
+        std::printf("%-40s mean %.4f  max %d  differing samples %zu of %zu\n", e.path().stem().string().c_str(), sum / double(n), mx, nd, n);
+      }
+    }
+    std::printf("%d frame(s) differ\n", changed);
+    return 0;
   }
   if (argc < 3) {
     std::fputs("usage: dapple_golden record|verify <corpus.txt> [off|full ...]\n", stderr);

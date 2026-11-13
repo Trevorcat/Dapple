@@ -718,6 +718,68 @@ bool FilmSimulator::renderStaged(const ImageF& in, ImageF& out, FilmTimings* t) 
   return false;
 }
 
+bool FilmSimulator::probeUniform(const FilmParams& p, const std::function<void(const UniformEval&)>& body, std::string* err) try {
+  Impl& s = *impl_;
+  std::unique_lock<std::shared_mutex> wr(s.stateMutex);
+  if (!p.validate(err)) return false;
+  const FilmStock* film = s.lib->find(p.film);
+  if (!film || film->isPrintMedium()) {
+    if (err) *err = "unknown film stock '" + p.film + "'";
+    return false;
+  }
+  const bool scan = p.io.scanFilm || p.paper == "none";
+  const FilmStock* paper = nullptr;
+  if (!scan) {
+    paper = s.lib->find(p.paper);
+    if (!paper || !paper->isPrintMedium()) {
+      if (err) *err = "unknown print stock '" + p.paper + "'";
+      return false;
+    }
+  }
+  FilmParams eff = p;
+  if (scan) eff.io.scanFilm = true;
+  digest(eff, *film);
+  const UpsampleTable& up = s.lib->upsample();
+  if (up.n < 2) return false;
+  Spec iRef;
+  if (!illuminant(film->referenceIlluminant, iRef)) return false;
+  double wx, wy;
+  xyOfXyz(illuminantXyz(iRef), wx, wy);
+  const Mat3 mIn = mul(adaptationMatrix(cat16(), kD50x, kD50y, wx, wy), prophotoToXyz());
+  const Key rk = rawKey(eff);
+  auto it = s.rawCache.find(rk);
+  if (it == s.rawCache.end()) {
+    RawLutParams rp;
+    rp.window = eff.settings.applyWindow;
+    rp.surface = eff.settings.applySurface;
+    rp.gamut = eff.io.inputGamutCompress;
+    rp.knee[0] = eff.io.inputKnee.threshold;
+    rp.knee[1] = eff.io.inputKnee.limit;
+    rp.knee[2] = eff.io.inputKnee.power;
+    for (int i = 0; i < 3; ++i) {
+      rp.uv[i] = eff.camera.filterUv[i];
+      rp.ir[i] = eff.camera.filterIr[i];
+    }
+    if (s.rawCache.size() > 6) s.rawCache.clear();
+    it = s.rawCache.emplace(rk, bakeRawLut(*film, up, rp, iRef, wx, wy, mIn)).first;
+  }
+  FilmModel model(*film, paper, eff, up, s.lib->cmax(), it->second);
+  if (!model.ok()) {
+    if (err) *err = model.error();
+    return false;
+  }
+  const UniformEval eval = [&model](const double rgb[3], double pe, double out[3]) {
+    model.setPrintExposure(pe);
+    const Vec3 o = model.render({rgb[0], rgb[1], rgb[2]});
+    for (int c = 0; c < 3; ++c) out[c] = o[c];
+  };
+  body(eval);
+  return true;
+} catch (...) {
+  if (err) *err = "film probe failed";
+  return false;
+}
+
 void FilmSimulator::renderPixelDirect(const double rgb[3], double out[3]) const {
   const Vec3 o = impl_->model->render({rgb[0], rgb[1], rgb[2]});
   for (int i = 0; i < 3; ++i) out[i] = o[i];

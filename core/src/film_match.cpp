@@ -389,7 +389,7 @@ FilmPrintRange filmPrintRange(const std::shared_ptr<const film::FilmLibrary>& li
   return {};
 }
 
-float solvePrintEv(const std::function<float(float)>& printL, float target, const FilmPrintRange& range, FilmMatchInfo* info) {
+float solvePrintEv(const std::function<float(float)>& printL, float target, const FilmPrintRange& range, FilmMatchInfo* info, float tolerance) {
   FilmMatchInfo local;
   FilmMatchInfo& m = info ? *info : local;
   float t = target;
@@ -401,7 +401,7 @@ float solvePrintEv(const std::function<float(float)>& printL, float target, cons
     else if (t < range.loL) t = range.loL, bound = PrintBound::PaperBlack;
   }
   // L* rises monotonically with the print EV but not linearly (paper toe / shoulder): bracket, then Illinois regula falsi
-  const float tol = 0.35f;
+  const float tol = tolerance;
   int evals = 0;
   auto f = [&](float e) {
     ++evals;
@@ -604,47 +604,16 @@ void setFilmCalibrationDisk(const std::string& dir, const std::string& salt) {
   c.dir = dir, c.salt = salt;
 }
 
-float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId,
-                        float deltaEv) try {
-  static std::mutex mtx;
-  static std::map<std::string, float> cache;
-  if (!lib) return 0.f;
-  const film::FilmStock* st = lib->find(filmId);
-  if (!st || st->isPrintMedium()) return 0.f;
-  const bool scan = paperId == "none" || !lib->find(paperId);
-  const std::string key = filmId + "|" + (scan ? std::string("none") : paperId) + "|" + std::to_string(std::uintptr_t(lib.get())) +
-                          (filmPaperMappingEnabled() ? "|m" : "") + (filmPaperMapStretchesBlack() ? "b" : "") + "|d" + std::to_string(int(std::lround(deltaEv * 1000.f)));
-  {
-    std::lock_guard<std::mutex> lock(mtx);
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
-  }
-  if (scan) {  // the clear film is display white (the paper mapping): a lamp constant would only dim it, the slide is what it is
-    std::lock_guard<std::mutex> lock(mtx);
-    cache[key] = 0.f;
-    return 0.f;
-  }
-  std::string calibDir;
-  std::string dkey = key;  // the disk key without the library pointer (the pack content hash is in the file name instead)
-  {
-    const std::string ps = std::to_string(std::uintptr_t(lib.get()));
-    const auto pp = dkey.find("|" + ps);
-    if (pp != std::string::npos) dkey.erase(pp + 1, ps.size());
-  }
-  const std::string calibFile = calibPath(dkey, calibDir);
-  if (!calibFile.empty()) {
-    float dv = 0.f;
-    if (calibLoad(calibFile, dkey, dv)) {
-      std::lock_guard<std::mutex> lock(mtx);
-      cache[key] = dv;
-      return dv;
-    }
-  }
+namespace {
+// Reference calibration, kept for the tests and DAPPLE_FILM_CALIB_BAKED=1: an 8 x 8 grey patch through a freshly baked simulator for every probe of the solve.
+float calibrateBaked(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId, float deltaEv) {
+  const film::FilmStock* st = lib ? lib->find(filmId) : nullptr;
+  if (!st || st->isPrintMedium() || paperId == "none" || !lib->find(paperId)) return 0.f;
   const FilmPrintRange range = filmPrintRange(lib, filmId, paperId);
   if (!range.ok) return 0.f;
   film::FilmParams fp;
   fp.film = filmId;
-  fp.paper = scan ? std::string("none") : paperId;
+  fp.paper = paperId;
   fp.camera.autoExposure = false;
   applyFilmPaperMapping(fp);
   fp.disableSpatialAndStochastic();
@@ -664,14 +633,163 @@ float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, con
   // mid grey: L* 50 relative to the paper white as displayed (Y = 0.184 * white Y)
   const float target = lightnessOfY(double(kFilmGreyCard) * double(range.yWhite));
   FilmPrintRange open;  // no limits: this is a calibration, not a target
-  FilmMatchInfo mi;
-  const float ev = solvePrintEv(patch, target, open, &mi);
-  std::lock_guard<std::mutex> lock(mtx);
-  cache[key] = ev;
-  if (!calibFile.empty()) std::thread([calibFile, dkey, ev] { calibStore(calibFile, dkey, ev); }).detach();
-  return ev;
+  return solvePrintEv(patch, target, open, nullptr);
+}
+
+// The calibration by direct evaluation of the film model: the display colour of the one grey pixel (the 8 x 8 patch is uniform) at each probed print exposure,
+// the model built once for all the requested EV buckets (a table bake per probe took 190 ms on a phone and ~400 ms per bucket on the desktop; the model
+// alone is built once and a probe costs microseconds). The solve runs to a tight tolerance because probes are free.
+bool calibrateDirect(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId, const std::vector<float>& deltas,
+                     std::vector<float>& out) {
+  out.assign(deltas.size(), 0.f);
+  const film::FilmStock* st = lib ? lib->find(filmId) : nullptr;
+  if (!st || st->isPrintMedium() || paperId == "none" || !lib->find(paperId)) return false;
+  const FilmPrintRange range = filmPrintRange(lib, filmId, paperId);
+  if (!range.ok) return false;
+  film::FilmParams fp;
+  fp.film = filmId;
+  fp.paper = paperId;
+  fp.camera.autoExposure = false;
+  applyFilmPaperMapping(fp);
+  fp.disableSpatialAndStochastic();
+  film::FilmSimulator sim(lib);
+  const float conv = st->positive() ? kFilmReversalBiasEv : kFilmNegativeBiasEv;
+  const float target = lightnessOfY(double(kFilmGreyCard) * double(range.yWhite));
+  FilmPrintRange open;
+  return sim.probeUniform(fp, [&](const film::FilmSimulator::UniformEval& eval) {
+    for (std::size_t k = 0; k < deltas.size(); ++k) {
+      const double g = double(kFilmGreyCard) * std::exp2(double(conv + deltas[k]));
+      const double rgb[3] = {g, g, g};
+      auto patch = [&](float printEv) -> float {
+        double o[3];
+        eval(rgb, std::exp2(-double(printEv)), o);
+        ImageF px(1, 1);
+        for (int c = 0; c < 3; ++c) px.data[c] = float(o[c]);
+        return medianLightness(px);
+      };
+      out[k] = solvePrintEv(patch, target, open, nullptr, 0.02f);
+    }
+  });
+}
+
+std::mutex gCalMtx;
+std::map<std::string, float> gCalMem;
+// "|v2": direct-evaluation constants (the on-disk files of the baked calibration have other keys and are never read)
+std::string calibKeyOf(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId, float deltaEv, bool scan) {
+  return filmId + "|" + (scan ? std::string("none") : paperId) + "|" + std::to_string(std::uintptr_t(lib.get())) + (filmPaperMappingEnabled() ? "|m" : "") +
+         (filmPaperMapStretchesBlack() ? "b" : "") + "|d" + std::to_string(int(std::lround(deltaEv * 1000.f))) + "|v2";
+}
+std::string diskKeyOf(const std::string& key, const std::shared_ptr<const film::FilmLibrary>& lib) {  // without the library pointer (the pack hash is in the file name)
+  std::string dkey = key;
+  const std::string ps = std::to_string(std::uintptr_t(lib.get()));
+  const auto pp = dkey.find("|" + ps);
+  if (pp != std::string::npos) dkey.erase(pp + 1, ps.size());
+  return dkey;
+}
+// DAPPLE_FILM_CALIB_BAKED=1: the previous table-bake calibration, one bucket per miss, no prefill (A/B switch of the bench, golden hashes of before)
+bool bakedCalibration() {
+  static const bool baked = [] {
+    const char* e = std::getenv("DAPPLE_FILM_CALIB_BAKED");
+    return e && e[0] && e[0] != '0';
+  }();
+  return baked;
+}
+// The buckets a film_shoot drag can reach (+-3 EV, the constant interpolates to the next bucket): the order of the prewarm, outward from 0.
+std::vector<float> reachableBuckets() {
+  std::vector<float> d;
+  for (int i = 0; i < 15; ++i) d.push_back(i == 0 ? 0.f : (i & 1 ? 0.5f : -0.5f) * float((i + 1) / 2));
+  return d;
+}
+
+// Fills memory and disk with the constants of the requested buckets and returns the number of buckets that had to be evaluated. One model serves them all.
+int ensureConstants(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId, const std::vector<float>& deltas) {
+  std::vector<std::string> keys(deltas.size());
+  std::vector<std::size_t> need;
+  for (std::size_t i = 0; i < deltas.size(); ++i) {
+    keys[i] = calibKeyOf(lib, filmId, paperId, deltas[i], false);
+    {
+      std::lock_guard<std::mutex> lock(gCalMtx);
+      if (gCalMem.count(keys[i])) continue;
+    }
+    std::string dir;
+    const std::string dkey = diskKeyOf(keys[i], lib), f = calibPath(dkey, dir);
+    float v = 0.f;
+    if (!f.empty() && calibLoad(f, dkey, v)) {
+      std::lock_guard<std::mutex> lock(gCalMtx);
+      gCalMem[keys[i]] = v;
+    } else {
+      need.push_back(i);
+    }
+  }
+  if (need.empty()) return 0;
+  std::vector<float> want, res;
+  for (std::size_t i : need) want.push_back(deltas[i]);
+  bool ok;
+  if (bakedCalibration()) {
+    for (float d : want) res.push_back(calibrateBaked(lib, filmId, paperId, d));
+    ok = true;
+  } else {
+    ok = calibrateDirect(lib, filmId, paperId, want, res);
+  }
+  if (!ok) return 0;
+  std::vector<std::pair<std::string, float>> disk;
+  {
+    std::lock_guard<std::mutex> lock(gCalMtx);
+    for (std::size_t k = 0; k < need.size(); ++k) {
+      gCalMem[keys[need[k]]] = res[k];
+      disk.push_back({keys[need[k]], res[k]});
+    }
+  }
+  std::string dir;
+  if (!calibPath("probe", dir).empty())  // the disk cache is configured: one detached writer for the whole set
+    std::thread([disk, lib] {
+      for (const auto& kv : disk) {
+        std::string d;
+        const std::string dkey = diskKeyOf(kv.first, lib);
+        const std::string f = calibPath(dkey, d);
+        if (!f.empty()) calibStore(f, dkey, kv.second);
+      }
+    }).detach();
+  return int(need.size());
+}
+}  // namespace
+
+float filmPrintConstantBaked(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId, float deltaEv) {
+  return calibrateBaked(lib, filmId, paperId, deltaEv);
+}
+
+float filmPrintConstant(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId,
+                        float deltaEv) try {
+  if (!lib) return 0.f;
+  const film::FilmStock* st = lib->find(filmId);
+  if (!st || st->isPrintMedium()) return 0.f;
+  const bool scan = paperId == "none" || !lib->find(paperId);
+  if (scan) return 0.f;  // the clear film is display white (the paper mapping): a lamp constant would only dim it, the slide is what it is
+  const std::string key = calibKeyOf(lib, filmId, paperId, deltaEv, false);
+  {
+    std::lock_guard<std::mutex> lock(gCalMtx);
+    auto it = gCalMem.find(key);
+    if (it != gCalMem.end()) return it->second;
+  }
+  // a miss: every bucket a drag of this stock can reach is evaluated with the one model (about the cost of one bucket), the rest stay for later
+  std::vector<float> deltas = reachableBuckets();
+  bool listed = false;
+  for (float d : deltas) listed |= std::fabs(d - deltaEv) < 1e-4f;
+  if (!listed || bakedCalibration()) deltas = {deltaEv};
+  ensureConstants(lib, filmId, paperId, deltas);
+  std::lock_guard<std::mutex> lock(gCalMtx);
+  auto it = gCalMem.find(key);
+  return it != gCalMem.end() ? it->second : 0.f;
 } catch (...) {
   return 0.f;
+}
+
+int filmPrintConstantsPrefill(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId) try {
+  const film::FilmStock* st = lib ? lib->find(filmId) : nullptr;
+  if (!st || st->isPrintMedium() || paperId == "none" || !lib->find(paperId) || bakedCalibration()) return 0;
+  return ensureConstants(lib, filmId, paperId, reachableBuckets());
+} catch (...) {
+  return 0;
 }
 
 float filmPrintConstantAt(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId,

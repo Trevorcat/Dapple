@@ -2758,6 +2758,102 @@ void testSpatialKernelExp() {
   CHECK(worstRel < 1e-5);
 }
 
+// The print-exposure constants (filmPrintConstant): the direct model evaluation equals the table-baked calibration it replaced within a stated tolerance for every
+// stock + default paper, a slide has none, and the disk copy written by one library object is read by another without evaluating anything.
+void testPrintConstants() {
+  auto lib = library();
+  CHECK(lib != nullptr);
+  if (!lib) return;
+  // disk round trip: the constants written for one library object are found by another one (the disk key has no library pointer)
+  const fs::path dir = fs::temp_directory_path() / "dapple_calib_test";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  setFilmCalibrationDisk(dir.string(), "test");
+  const std::string id = "kodak_ektar_100", paper = film::defaultPaperFor(*lib, id);
+  const int first = filmPrintConstantsPrefill(lib, id, paper);
+  CHECK(first == 15);
+  CHECK(filmPrintConstantsPrefill(lib, id, paper) == 0);
+  int files = 0;
+  for (int i = 0; i < 200 && files < 15; ++i) {  // the writer is a detached thread
+    files = 0;
+    if (fs::exists(dir))
+      for (const auto& e : fs::directory_iterator(dir)) files += e.path().extension() == ".bin";
+    if (files < 15) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  CHECK(files == 15);
+  std::string err;
+  const char* envPack = std::getenv("DAPPLE_TEST_PACK");
+  const fs::path pack = envPack ? fs::path(envPack) : kData / "dapple.dfp";
+  auto lib2 = fs::exists(pack) ? FilmLibrary::loadPack(pack, &err) : FilmLibrary::loadJsonDir(kData / "profiles", &err);
+  CHECK(lib2 != nullptr);
+  if (lib2) {
+    CHECK(filmPrintConstantsPrefill(lib2, id, paper) == 0);  // all 15 from disk
+    CHECK(filmPrintConstant(lib2, id, paper, 0.f) == filmPrintConstant(lib, id, paper, 0.f));
+  }
+  double worst = 0;
+  std::string worstId;
+  int n = 0;
+  const bool all = std::getenv("DAPPLE_PRINT_CONST_ALL") != nullptr;  // every one of the 15 buckets (minutes), else five of them
+  std::vector<float> buckets = {-3.f, -1.f, 0.f, 0.5f, 2.5f};
+  if (all) buckets = {0.f, 0.5f, -0.5f, 1.f, -1.f, 1.5f, -1.5f, 2.f, -2.f, 2.5f, -2.5f, 3.f, -3.f, 3.5f, -3.5f};
+  for (const std::string& id : lib->names()) {
+    const FilmStock* st = lib->find(id);
+    if (!st || st->isPrintMedium()) continue;
+    const std::string paper = film::defaultPaperFor(*lib, id);
+    if (paper.empty() || paper == "none") {
+      CHECK(filmPrintConstant(lib, id, paper, 0.f) == 0.f);  // a slide / scan: no constant
+      continue;
+    }
+    double w = 0;
+    for (float d : buckets) {
+      const float fast = filmPrintConstant(lib, id, paper, d), ref = filmPrintConstantBaked(lib, id, paper, d);
+      w = std::max(w, double(std::fabs(fast - ref)));
+      ++n;
+    }
+    std::printf("  %-26s max |dEV| %.4f\n", id.c_str(), w);
+    if (w > worst) worst = w, worstId = id;
+  }
+  std::printf("  print constants: %d (stock, bucket) pairs, worst |dEV| %.4f (%s)\n", n, worst, worstId.c_str());
+  CHECK(worst < 0.06);  // the baked solve stops within 0.35 L* of the target (~0.025 EV in the mids) and the direct one within 0.02 L*
+  // what the difference does to a picture: the same colourful frame printed with either constant, in 8-bit levels of the display encoding
+  {
+    double maxLv = 0, sum = 0;
+    std::size_t cnt = 0;
+    for (const char* sid : {"kodak_portra_800_push2", "kodak_ektar_100", "fujifilm_pro_400h"}) {
+      const std::string sp = film::defaultPaperFor(*lib, sid);
+      ImageF in(96, 64);
+      for (int y = 0; y < in.height; ++y)
+        for (int x = 0; x < in.width; ++x) {
+          float* q = in.row(y) + 3 * x;
+          const float t = float(x) / float(in.width - 1), u = float(y) / float(in.height - 1);
+          q[0] = 0.02f + 0.9f * t * t, q[1] = 0.02f + 0.8f * u, q[2] = 0.02f + 0.7f * (1.f - t) * (0.3f + u);
+        }
+      ImageF outs[2];
+      for (int v = 0; v < 2; ++v) {
+        FilmParams fpv;
+        fpv.film = sid;
+        fpv.paper = sp;
+        fpv.camera.autoExposure = false;
+        applyFilmPaperMapping(fpv);
+        fpv.disableSpatialAndStochastic();
+        const float pc = v == 0 ? filmPrintConstant(lib, sid, sp, 0.f) : filmPrintConstantBaked(lib, sid, sp, 0.f);
+        fpv.enlarger.printExposure = std::exp2(-double(pc));
+        FilmSimulator simv(lib);
+        CHECK(simv.setParams(fpv));
+        CHECK(simv.render(in, outs[v]));
+      }
+      for (std::size_t i = 0; i < outs[0].data.size(); ++i) {
+        const double d = std::fabs(std::clamp(outs[0].data[i], 0.f, 1.f) - std::clamp(outs[1].data[i], 0.f, 1.f)) * 255.0;
+        maxLv = std::max(maxLv, d), sum += d, ++cnt;
+      }
+    }
+    std::printf("  frame printed with either constant (3 stocks, bucket 0): mean %.3f, max %.2f levels\n", sum / double(cnt), maxLv);
+    CHECK(maxLv < 1.5);
+  }
+  setFilmCalibrationDisk("", "");
+  fs::remove_all(dir, ec);
+}
+
 void testLibraryErrors() {
   // a failed lazy load is reported, not swallowed
   film::setLibraryPathLazy(fs::path("definitely") / "not" / "there.dfp");
@@ -2805,7 +2901,8 @@ int main(int argc, char** argv) {
                      {"concurrency", "concurrent acquireSimulator + setParams/render", testConcurrency},
                      {"pool_exceptions", "thread pool rethrows job exceptions", testPoolExceptions},
                      {"kernel_exp", "polynomial exp error bounds (spatial kernels)", testSpatialKernelExp},
-                     {"library_errors", "library load errors are reported", testLibraryErrors}};
+                     {"library_errors", "library load errors are reported", testLibraryErrors},
+                     {"print_const", "print-exposure constants: direct evaluation vs table bake, disk round trip", testPrintConstants}};
   // `dapple_film_tests` runs everything; `dapple_film_tests <id>...` runs the named tests (one ctest entry each);
   // `--list` prints the ids.
   std::vector<std::string> only;

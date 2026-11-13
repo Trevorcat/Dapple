@@ -57,7 +57,7 @@ endif()
 set(DAPPLE_FILM_TEST_IDS profiles colorimetry upsample grey spec_vectors baked_vs_direct dir_params render_paths
     smoke_all gauss_mixture spatial_plans grain_stats spatial_render glare_enlarger spatial_extras editparams_json
     develop_film film_match c_api validation strong_guarantee robust_render render_rows pack_format cache_keys concurrency
-    pool_exceptions kernel_exp library_errors)
+    pool_exceptions kernel_exp library_errors print_const)
 foreach(id IN LISTS DAPPLE_FILM_TEST_IDS)
   add_test(NAME film.${id} COMMAND dapple_film_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(film.${id} PROPERTIES TIMEOUT 300)
@@ -389,3 +389,8 @@ else()
 endif()
 add_test(NAME wide_gamut COMMAND dapple_wide_tests)
 set_tests_properties(wide_gamut PROPERTIES TIMEOUT 300)
+
+# Choosing a never-seen film stock: time to its exact frame, cold install vs after the first-launch prebake (print-exposure constants included)
+add_executable(dapple_stock_switch_bench engine/stock_switch_bench.cpp)
+target_link_libraries(dapple_stock_switch_bench PRIVATE dapple)
+target_include_directories(dapple_stock_switch_bench PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
