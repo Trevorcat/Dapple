@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
   int crops = 4, threads = 0;
   bool bil = false, noRef = false, cache = false;
   int atX = -1, atY = -1, atS = 4, gpuTile = 0;
-  bool proxyTiming = false, gpuOnly = false;
+  bool proxyTiming = false, gpuOnly = false, noReadback = false;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--out" && i + 1 < argc) outDir = argv[++i];
@@ -193,6 +193,7 @@ int main(int argc, char** argv) {
     else if (a == "--cache") cache = true;
     else if (a == "--proxy") proxyTiming = true;
     else if (a == "--gpu-only") gpuOnly = true;
+    else if (a == "--no-readback") noReadback = true;
     else if (a == "--gpu" && i + 1 < argc) gpuTile = std::atoi(argv[++i]);
     else if (a == "--at" && i + 1 < argc) std::sscanf(argv[++i], "%d,%d,%d", &atX, &atY, &atS);
   }
@@ -253,9 +254,9 @@ int main(int argc, char** argv) {
           gpu->run(d, {0, 0, m.width, m.height}, nullptr, 0, gpuTile, &st);
           if (st.totalMs < best) best = st.totalMs, bestPrep = st.prepMs, bestGpu = st.gpuMs;
         }
-        std::vector<float> rb(std::size_t(m.width) * m.height * 3);
+        std::vector<float> rb(noReadback ? 1 : std::size_t(m.width) * m.height * 3);
         t = Clock::now();
-        gpu->run(d, {0, 0, m.width, m.height}, rb.data(), std::size_t(m.width) * 3, gpuTile, &st);
+        gpu->run(d, {0, 0, m.width, m.height}, noReadback ? nullptr : rb.data(), std::size_t(m.width) * 3, gpuTile, &st);
         std::printf("  GPU %s tile %d (%d tiles): compute-only %.0f ms (host window build %.0f, device %.0f) | with read-back to host %.0f ms (conversion %.0f) | device memory %.0f MB | %s\n", half ? "RGBA16F" : "RGBA32F", gpuTile, st.tiles, best, bestPrep, bestGpu, msSince(t), st.readbackMs,
                     devMB, sel.device->caps().name.c_str());
         if (half) {  // the visible region at 1:1 (1920 x 1080 of the sensor, no orientation), read back to the host
@@ -305,6 +306,15 @@ int main(int argc, char** argv) {
       return 1;
     }
     ref = std::move(sr->linear);
+    if (std::getenv("DEMO_VS_LIBRAW1")) {  // ours := LibRaw's own 1-pass Markesteijn (user_qual 2): how far a 1-pass method of that family is from the 3-pass reference
+#if defined(_WIN32)
+      _putenv_s("DAPPLE_USER_QUAL", "2");
+#else
+      setenv("DAPPLE_USER_QUAL", "2", 1);
+#endif
+      auto s1 = makeLibRawDecoder()->decode(path, o);
+      if (s1) ours = std::move(s1->linear);
+    }
   }
   std::printf("  demosaic %.0f ms (%d threads), libraw full decode %.0f ms%s\n", tDemo, threads ? threads : int(std::thread::hardware_concurrency()), tRef, bil ? "" : "");
   if (noRef) {
@@ -361,6 +371,23 @@ int main(int argc, char** argv) {
     for (int y = blocks[i].y; y < blocks[i].y + B; ++y)
       for (int x = blocks[i].x; x < blocks[i].x + B; ++x) det.push_back(float(dE2000(toLab(ours.row(y) + 3 * x, g), toLab(ref.row(y) + 3 * x, g))));
   Stats sDet = statsOf(det);
+  if (std::getenv("DEMO_TOP")) {  // the worst pixels of the detail blocks
+    struct Px { float de; int x, y; };
+    std::vector<Px> worst;
+    for (std::size_t i = 0; i < std::min(nTop, blocks.size()); ++i)
+      for (int y = blocks[i].y; y < blocks[i].y + B; ++y)
+        for (int x = blocks[i].x; x < blocks[i].x + B; ++x) {
+          const float de = float(dE2000(toLab(ours.row(y) + 3 * x, g), toLab(ref.row(y) + 3 * x, g)));
+          if (de > 20.f) worst.push_back({de, x, y});
+        }
+    std::sort(worst.begin(), worst.end(), [](const Px& a, const Px& b) { return a.de > b.de; });
+    std::printf("  %zu pixels with dE > 20 in the detail blocks of %zu\n", worst.size(), det.size());
+    for (std::size_t i = 0; i < std::min<std::size_t>(worst.size(), 12); ++i) {
+      const float* p = ours.row(worst[i].y) + 3 * worst[i].x;
+      const float* q = ref.row(worst[i].y) + 3 * worst[i].x;
+      std::printf("   (%d,%d) dE %.0f ours %.3f %.3f %.3f libraw %.3f %.3f %.3f\n", worst[i].x, worst[i].y, worst[i].de, p[0], p[1], p[2], q[0], q[1], q[2]);
+    }
+  }
   // highlight pixels: luma of the reference above 0.9 of white: hue shift (our chroma vs reference) and fraction of magenta cast pixels
   std::vector<float> hl;
   for (int y = 0; y < H; y += 3)
@@ -369,6 +396,16 @@ int main(int argc, char** argv) {
       if (std::max({q[0], q[1], q[2]}) >= 0.98f) hl.push_back(float(dE2000(toLab(ours.row(y) + 3 * x, g), toLab(q, g))));
     }
   Stats sHl = statsOf(hl);
+  if (const char* dp = std::getenv("DEMO_CTR")) {  // DEMO_CTR=x,y : 9 x 9 scaled mosaic values (camera WB) with the colour letter, then ours / libraw RGB of the centre
+    int px = 0, py = 0;
+    std::sscanf(dp, "%d,%d", &px, &py);
+    const demosaic::Desc dd = demosaic::makeDesc(m);
+    for (int y = py - 4; y <= py + 4; ++y) {
+      for (int x = px - 4; x <= px + 4; ++x) std::printf(" %c%.3f", "RGB"[dd.cfa3[(y % dd.period) * dd.period + x % dd.period]], demosaic::scaleSample(dd, x, y));
+      std::printf("\n");
+    }
+    std::printf("  centre ours %.3f %.3f %.3f  libraw %.3f %.3f %.3f\n", ours.row(py)[3 * px], ours.row(py)[3 * px + 1], ours.row(py)[3 * px + 2], ref.row(py)[3 * px], ref.row(py)[3 * px + 1], ref.row(py)[3 * px + 2]);
+  }
   if (const char* dp = std::getenv("DEMO_PIX")) {  // DEMO_PIX=x,y : 12 x 6 pixels around it: scaled mosaic sample, ours, libraw (G channel and the sample's own channel)
     int px = 0, py = 0;
     std::sscanf(dp, "%d,%d", &px, &py);
@@ -473,6 +510,10 @@ int main(int argc, char** argv) {
         toSrgb8(b, g, &sheet[(std::size_t(y) * sw * 2 + sw + x) * 3]);
       }
     writeJpeg(outDir + "/" + tag + "_sheet.jpg", sheet, sw * 2, sh);
+    if (auto pv = extractEmbeddedPreview(path, 600)) {  // the camera's own rendering of this frame, for a colour check by eye
+      std::filesystem::create_directories(outDir);
+      writeJpeg(outDir + "/" + tag + "_preview.jpg", pv->data, pv->width, pv->height);
+    }
     // 200 % crops of the most detailed blocks: LibRaw | node | difference x4 (+ bilinear when asked)
     const int cw = 96, chh = 96;
     for (int i = 0; i < crops && std::size_t(i) < blocks.size(); ++i) {

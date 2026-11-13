@@ -1,45 +1,143 @@
 #version 450
-// X-Trans demosaic (6 x 6 pattern). MODE 0: green plane (directional interpolation through the nearest greens of four directions, weighted by the
-// agreement of the two greens, plus a Laplacian term). MODE 1: red / blue colour differences of the ROI + 1 ring (guide-weighted over 5 x 5).
-// MODE 2: 3 x 3 median of the differences, matrix, output. Mirrors demosaic_cpu.cpp xtransTile.
+// X-Trans demosaic, candidate directions + homogeneity selection (demosaic_cpu.cpp xtransTileCand mirrors this statement by statement).
+//   MODE 0: green candidate of each of the 4 directions (H, V, D1, D2): nearest greens along the direction + directional Laplacian.
+//   MODE 1: red / blue colour differences per direction: guide-weighted mean of the unclipped samples within one pixel of the line along the direction.
+//   MODE 2: derivative map of every candidate in a cube-root colour space (+ a penalty for candidates that interpolated across a clipped green).
+//   MODE 3: (ROI + 1 ring) homogeneity over 3 x 3, mean of the best candidates -> (green, red - green, blue - green), written over the difference buffer.
+//   MODE 4: 3 x 3 median of the two colour differences, matrix, output.
+// No constant arrays and no dynamic indexing of vectors (ANGLE's HLSL output asserts on array constructors, MSL does not swizzle dynamically).
 #extension GL_GOOGLE_include_directive : enable
 layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
 #include "demosaic_common.glsl"
 #include "common.glsl"
-#if MODE == 0
+#if MODE <= 3
 layout(binding = 1, std430) readonly buffer Sb { float S[]; };
-layout(binding = 2, std430) writeonly buffer Gb { float G[]; };
-#elif MODE == 1
-layout(binding = 1, std430) readonly buffer Sb { float S[]; };
-layout(binding = 2, std430) readonly buffer Gb { float G[]; };
-layout(binding = 3, std430) writeonly buffer Db { vec2 D[]; };
-#else
-layout(binding = 1, std430) readonly buffer Gb { float G[]; };
-layout(binding = 2, std430) readonly buffer Db { vec2 D[]; };
-layout(binding = 3, OUT_FMT) uniform writeonly image2D uOut;
 #endif
-const float kEpsX = 0.004, kEpsG = 0.002, kLap = 0.25;
-const int H = 6;
-const int DX[4] = int[4](1, 0, 1, 1);
-const int DY[4] = int[4](0, 1, 1, -1);
-const float LEN[4] = float[4](1.0, 1.0, 1.41421356, 1.41421356);
+#if MODE == 0
+layout(binding = 2, std430) writeonly buffer Gb { vec4 G4[]; };
+#elif MODE == 1
+layout(binding = 2, std430) readonly buffer Gb { vec4 G4[]; };
+layout(binding = 3, std430) writeonly buffer Db { vec4 Dv[]; };
+#elif MODE == 2
+layout(binding = 2, std430) readonly buffer Gb { vec4 G4[]; };
+layout(binding = 3, std430) readonly buffer Db { vec4 Dv[]; };
+layout(binding = 4, std430) writeonly buffer Hb { vec4 D4[]; };
+#elif MODE == 3
+layout(binding = 2, std430) readonly buffer Gb { vec4 G4[]; };
+layout(binding = 3, std430) buffer Db { vec4 Dv[]; };  // each invocation reads and then overwrites only its own pixel's two vec4
+layout(binding = 4, std430) readonly buffer Hb { vec4 D4[]; };
+#else
+layout(binding = 1, std430) readonly buffer Cb { vec4 Dv[]; };
+layout(binding = 2, OUT_FMT) uniform writeonly image2D uOut;
+#endif
+const float kLapD = 0.25, kGuide = 0.02, kThrF = 1.5, kThrA = 2e-4, kClip = 0.995, kClipPen = 0.3;
+const int kTie = 1;
+const int H = 9;
+const float kClipSim = 4.0;
+
+ivec2 dv(int dir) { return dir == 0 ? ivec2(1, 0) : (dir == 1 ? ivec2(0, 1) : (dir == 2 ? ivec2(1, 1) : ivec2(1, -1))); }
+float dlen(int dir) { return dir >= 2 ? 1.41421356 : 1.0; }
+float comp(vec4 v, int d) { return d == 0 ? v.x : (d == 1 ? v.y : (d == 2 ? v.z : v.w)); }
 
 int nearestGreen(int i, int j, int dir, int sg) {
+  const ivec2 e = dv(dir);
   for (int q = 1; q <= 3; ++q)
-    if (colAt(i + sg * q * DX[dir], j + sg * q * DY[dir], 6) == 1) return q;
+    if (colAt(i + sg * q * e.x, j + sg * q * e.y, 6) == 1) return q;
   return 0;
 }
 
-#if MODE == 2
-float med9(float a0, float a1, float a2, float a3, float a4, float a5, float a6, float a7, float a8) {
-  float a[9] = float[9](a0, a1, a2, a3, a4, a5, a6, a7, a8);
-  for (int i = 1; i < 9; ++i) {
-    const float v = a[i];
-    int j = i - 1;
-    while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; --j; }
-    a[j + 1] = v;
+#if MODE == 0
+float greenCand(int k, int i, int j, int c, int dir, int ww) {
+  if (c == 1) return S[k];
+  const ivec2 e = dv(dir);
+  const int st = e.y * ww + e.x;
+  const int km = nearestGreen(i, j, dir, -1), kp = nearestGreen(i, j, dir, 1);
+  const float gm = S[k - km * st], gp = S[k + kp * st];
+  const float lm = float(km) * dlen(dir), lp = float(kp) * dlen(dir);
+  float g = (lp * gm + lm * gp) / (lm + lp);
+  float cs = 0.0;
+  int cn = 0;
+  for (int q = -3; q <= 3; ++q) {
+    if (q == 0) continue;
+    if (colAt(i + q * e.x, j + q * e.y, 6) == c) { cs += S[k + q * st]; ++cn; }
   }
-  return a[4];
+  if (cn > 0) g += kLapD * (S[k] - cs / float(cn));
+  return min(max(g, min(gm, gp)), max(gm, gp));
+}
+#endif
+
+#if MODE == 1
+vec2 chromaDiff(int k, int i, int j, int c, int dir, int ww) {
+  const ivec2 e = dv(dir);
+  const float g = comp(G4[k], dir);
+  const float ln = dlen(dir);
+  float dr = 0.0, db = 0.0;
+  for (int t = 0; t < 2; ++t) {
+    const int ct = t * 2;
+    float res;
+    if (c == ct) {
+      res = S[k] - g;
+    } else {
+      float num = 0.0, den = 0.0, numC = 0.0, denC = 0.0;  // unclipped / clipped samples (see demosaic_cpu.cpp for the rule)
+      for (int v = -3; v <= 3; ++v)
+        for (int uu = -3; uu <= 3; ++uu) {
+          const int r2 = uu * uu + v * v;
+          if (r2 == 0 || r2 > 10) continue;
+          const float perp = abs(float(uu * e.y - v * e.x)) / ln;
+          if (perp > 1.01) continue;
+          if (colAt(i + uu, j + v, 6) != ct) continue;
+          const int q = k + v * ww + uu;
+          const float gq = comp(G4[q], dir);
+          const float w = 1.0 / (float(r2) * (1.0 + perp * perp) * (kGuide + abs(gq - g)));
+          if (S[q] >= kClip) { numC += w * (S[q] - gq); denC += w; }
+          else { num += w * (S[q] - gq); den += w; }
+        }
+      res = den > 0.0 ? num / den : (denC >= kClipSim ? numC / denC : 0.0);
+    }
+    if (t == 0) dr = res; else db = res;
+  }
+  return vec2(dr, db);
+}
+#endif
+
+#if MODE == 2 || MODE == 3
+vec3 candCube(int k, int c, int dir) {
+  const float g = comp(G4[k], dir);
+  vec3 rgb = vec3(c == 0 ? S[k] : g + comp(Dv[2 * k], dir), g, c == 2 ? S[k] : g + comp(Dv[2 * k + 1], dir));
+  rgb = clamp(rgb, vec3(0.0), vec3(1.0));
+  const vec3 o = vec3(dot(u.m0.xyz, rgb), dot(u.m1.xyz, rgb), dot(u.m2.xyz, rgb));
+  return pow(max(o, vec3(0.0)), vec3(1.0 / 3.0));
+}
+float deriv(int k, int i, int j, int c, int cl, int cr, int cu, int cd, int dir, int ww) {
+  // one call site of candCube in a loop (the unrolled version of 5 x 4 inlined calls took minutes to compile on ANGLE / SwiftShader)
+  vec3 c0 = vec3(0.0);
+  float sum = 0.0;
+  for (int n = 0; n < 5; ++n) {
+    const int off = n == 0 ? 0 : (n == 1 ? -1 : (n == 2 ? 1 : (n == 3 ? -ww : ww)));
+    const int cc = n == 0 ? c : (n == 1 ? cl : (n == 2 ? cr : (n == 3 ? cu : cd)));
+    const vec3 cn = candCube(k + off, cc, dir);
+    if (n == 0) c0 = cn;
+    else { const vec3 df = c0 - cn; sum += dot(df, df); }
+  }
+  if (c != 1) {
+    const ivec2 e = dv(dir);
+    const int st = e.y * ww + e.x;
+    const int km = nearestGreen(i, j, dir, -1), kp = nearestGreen(i, j, dir, 1);
+    if (S[k - km * st] >= kClip || S[k + kp * st] >= kClip) sum += kClipPen;
+  }
+  return sum;
+}
+#endif
+
+#if MODE == 4
+float med9(float a0, float a1, float a2, float a3, float a4, float a5, float a6, float a7, float a8) {
+  // exact median of nine by a sorting network (19 compare-exchanges), no arrays
+  float t;
+#define SWP(x, y) t = min(x, y); y = max(x, y); x = t;
+  SWP(a1, a2) SWP(a4, a5) SWP(a7, a8) SWP(a0, a1) SWP(a3, a4) SWP(a6, a7) SWP(a1, a2) SWP(a4, a5) SWP(a7, a8)
+  SWP(a0, a3) SWP(a5, a8) SWP(a4, a7) SWP(a3, a6) SWP(a1, a4) SWP(a2, a5) SWP(a4, a7) SWP(a4, a2) SWP(a6, a4) SWP(a4, a2)
+#undef SWP
+  return a4;
 }
 #endif
 
@@ -48,85 +146,76 @@ void main() {
   const int ww = u.dims.x, wh = u.dims.y, rw = u.dims.z, rh = u.dims.w;
 #if MODE == 0
   if (q.x >= ww || q.y >= wh) return;
-  const int i = q.x, j = q.y;
-  const int k = j * ww + i;
-  if (i < 3 || j < 3 || i >= ww - 3 || j >= wh - 3) { G[k] = 0.0; return; }
+  const int i = q.x, j = q.y, k = j * ww + i;
+  if (i < 3 || j < 3 || i >= ww - 3 || j >= wh - 3) { G4[k] = vec4(0.0); return; }
   const int c = colAt(i, j, 6);
-  if (c == 1) { G[k] = S[k]; return; }
-  float num = 0.0, den = 0.0;
+  vec4 gr = vec4(0.0);
   for (int dir = 0; dir < 4; ++dir) {
-    const int km = nearestGreen(i, j, dir, -1), kp = nearestGreen(i, j, dir, 1);
-    if (km == 0 || kp == 0) continue;
-    const int st = DY[dir] * ww + DX[dir];
-    const float gm = S[k - km * st], gp = S[k + kp * st];
-    const float lm = float(km) * LEN[dir], lp = float(kp) * LEN[dir];
-    const float est = (lp * gm + lm * gp) / (lm + lp);
-    const float w = 1.0 / (sq(kEpsG + abs(gm - gp)) * sq(lm + lp));
-    num += w * est;
-    den += w;
+    const float g = greenCand(k, i, j, c, dir, ww);
+    if (dir == 0) gr.x = g; else if (dir == 1) gr.y = g; else if (dir == 2) gr.z = g; else gr.w = g;
   }
-  if (den > 0.0) {
-    float gest = num / den;
-    float cs = 0.0, cw = 0.0, gmin = 1e9, gmax = -1e9;
-    for (int v = -3; v <= 3; ++v)
-      for (int uu = -3; uu <= 3; ++uu) {
-        if (uu == 0 && v == 0) continue;
-        const int pc = colAt(i + uu, j + v, 6);
-        const float sv = S[k + v * ww + uu];
-        if (pc == c && uu * uu + v * v <= 10) {
-          const float w = 1.0 / float(uu * uu + v * v);
-          cs += w * sv;
-          cw += w;
-        } else if (pc == 1 && uu * uu + v * v <= 8) {
-          gmin = min(gmin, sv);
-          gmax = max(gmax, sv);
-        }
-      }
-    if (cw > 0.0 && gmax >= gmin) gest = min(max(gest + kLap * (S[k] - cs / cw), gmin), gmax);
-    G[k] = gest;
-  } else {
-    float s = 0.0;
-    int n = 0;
-    for (int v = -1; v <= 1; ++v)
-      for (int uu = -1; uu <= 1; ++uu)
-        if ((uu != 0 || v != 0) && colAt(i + uu, j + v, 6) == 1) { s += S[k + v * ww + uu]; ++n; }
-    G[k] = n > 0 ? s / float(n) : S[k];
-  }
+  G4[k] = gr;
 #elif MODE == 1
-  const int x = q.x - 1, y = q.y - 1;  // ROI + 1 ring
-  if (x >= rw + 1 || y >= rh + 1) return;
-  const int cw = rw + 2;
-  const int i = x + H, j = y + H;
-  const int k = j * ww + i;
+  if (q.x >= ww || q.y >= wh) return;
+  const int i = q.x, j = q.y, k = j * ww + i;
+  if (i < 6 || j < 6 || i >= ww - 6 || j >= wh - 6) { Dv[2 * k] = vec4(0.0); Dv[2 * k + 1] = vec4(0.0); return; }
   const int c = colAt(i, j, 6);
-  const float g = G[k];
-  vec2 dd;
-  for (int t = 0; t < 2; ++t) {
-    const int ct = t * 2;
-    if (c == ct) { dd[t] = S[k] - g; continue; }
-    float num = 0.0, den = 0.0;
-    for (int v = -2; v <= 2; ++v)
-      for (int uu = -2; uu <= 2; ++uu) {
-        if (colAt(i + uu, j + v, 6) != ct) continue;
-        const int qq = k + v * ww + uu;
-        const float gd = kEpsX + abs(G[qq] - g);
-        const float w = 1.0 / (float(uu * uu + v * v) * gd * gd);
-        num += w * (S[qq] - G[qq]);
-        den += w;
-      }
-    dd[t] = den > 0.0 ? num / den : 0.0;
+  vec4 dr4 = vec4(0.0), db4 = vec4(0.0);
+  for (int dir = 0; dir < 4; ++dir) {
+    const vec2 a = chromaDiff(k, i, j, c, dir, ww);
+    if (dir == 0) { dr4.x = a.x; db4.x = a.y; } else if (dir == 1) { dr4.y = a.x; db4.y = a.y; } else if (dir == 2) { dr4.z = a.x; db4.z = a.y; } else { dr4.w = a.x; db4.w = a.y; }
   }
-  D[(y + 1) * cw + x + 1] = dd;
+  Dv[2 * k] = dr4;
+  Dv[2 * k + 1] = db4;
+#elif MODE == 2
+  if (q.x >= ww || q.y >= wh) return;
+  const int i = q.x, j = q.y, k = j * ww + i;
+  if (i < 7 || j < 7 || i >= ww - 7 || j >= wh - 7) { D4[k] = vec4(0.0); return; }
+  const int c = colAt(i, j, 6);
+  const int cl = colAt(i - 1, j, 6), cr = colAt(i + 1, j, 6), cu = colAt(i, j - 1, 6), cd = colAt(i, j + 1, 6);
+  vec4 dres = vec4(0.0);
+  for (int dir = 0; dir < 4; ++dir) {
+    const float v = deriv(k, i, j, c, cl, cr, cu, cd, dir, ww);
+    if (dir == 0) dres.x = v; else if (dir == 1) dres.y = v; else if (dir == 2) dres.z = v; else dres.w = v;
+  }
+  D4[k] = dres;
+#elif MODE == 3
+  const int x = q.x - 1, y = q.y - 1;
+  if (x >= rw + 1 || y >= rh + 1) return;
+  const int i = x + H, j = y + H, k = j * ww + i;
+  int h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+  for (int v = -1; v <= 1; ++v)
+    for (int uu = -1; uu <= 1; ++uu) {
+      const vec4 dd = D4[k + v * ww + uu];
+      const float m = min(min(dd.x, dd.y), min(dd.z, dd.w));
+      const float thr = m * kThrF + kThrA;
+      h0 += dd.x <= thr ? 1 : 0;
+      h1 += dd.y <= thr ? 1 : 0;
+      h2 += dd.z <= thr ? 1 : 0;
+      h3 += dd.w <= thr ? 1 : 0;
+    }
+  const int hmax = max(max(h0, h1), max(h2, h3));
+  const int c = colAt(i, j, 6);
+  vec3 acc = vec3(0.0);
+  float cnt = 0.0;
+  const vec4 g4 = G4[k], dr4 = Dv[2 * k], db4 = Dv[2 * k + 1];
+  for (int dir = 0; dir < 4; ++dir) {
+    const int hd = dir == 0 ? h0 : (dir == 1 ? h1 : (dir == 2 ? h2 : h3));
+    if (hd < hmax - kTie) continue;
+    const float g = comp(g4, dir);
+    acc += vec3(c == 0 ? S[k] : g + comp(dr4, dir), g, c == 2 ? S[k] : g + comp(db4, dir));
+    cnt += 1.0;
+  }
+  const vec3 m = acc / cnt;  // (red, green, blue) means
+  Dv[2 * k] = vec4(m.y, clamp(m.x, 0.0, 1.0) - clamp(m.y, 0.0, 1.0), clamp(m.z, 0.0, 1.0) - clamp(m.y, 0.0, 1.0), 0.0);
 #else
   if (q.x >= rw || q.y >= rh) return;
-  const int cw = rw + 2;
-  const int kc = (q.y + 1) * cw + q.x + 1;
   const int k = (q.y + H) * ww + q.x + H;
-  const float g = G[k];
-  vec2 d0 = D[kc - cw - 1], d1 = D[kc - cw], d2 = D[kc - cw + 1], d3 = D[kc - 1], d4 = D[kc], d5 = D[kc + 1], d6 = D[kc + cw - 1], d7 = D[kc + cw], d8 = D[kc + cw + 1];
-  const float mr = med9(d0.x, d1.x, d2.x, d3.x, d4.x, d5.x, d6.x, d7.x, d8.x);
-  const float mb = med9(d0.y, d1.y, d2.y, d3.y, d4.y, d5.y, d6.y, d7.y, d8.y);
-  const vec3 o = finishRgb(vec3(g + mr, g, g + mb));
+  const float g = clamp(Dv[2 * k].x, 0.0, 1.0);
+  const vec4 n0 = Dv[2 * (k - ww - 1)], n1 = Dv[2 * (k - ww)], n2 = Dv[2 * (k - ww + 1)], n3 = Dv[2 * (k - 1)], n4 = Dv[2 * k], n5 = Dv[2 * (k + 1)], n6 = Dv[2 * (k + ww - 1)], n7 = Dv[2 * (k + ww)], n8 = Dv[2 * (k + ww + 1)];
+  const float mr = med9(n0.y, n1.y, n2.y, n3.y, n4.y, n5.y, n6.y, n7.y, n8.y);
+  const float mb = med9(n0.z, n1.z, n2.z, n3.z, n4.z, n5.z, n6.z, n7.z, n8.z);
+  const vec3 o = finishRgb(clamp(vec3(g + mr, g, g + mb), vec3(0.0), vec3(1.0)));
 #ifdef OUT16
   imageStore(uOut, q + u.io.yz, h16v(vec4(o, 1.0)));
 #else

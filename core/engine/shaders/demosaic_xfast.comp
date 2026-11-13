@@ -1,0 +1,136 @@
+#version 450
+// X-Trans demosaic (6 x 6 pattern). MODE 0: green plane (directional interpolation through the nearest greens of four directions, weighted by the
+// agreement of the two greens, plus a Laplacian term). MODE 1: red / blue colour differences of the ROI + 1 ring (guide-weighted over 5 x 5).
+// MODE 2: 3 x 3 median of the differences, matrix, output. Mirrors demosaic_cpu.cpp xtransTile (the fast tier, xtMode 0).
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+#include "demosaic_common.glsl"
+#include "common.glsl"
+#if MODE == 0
+layout(binding = 1, std430) readonly buffer Sb { float S[]; };
+layout(binding = 2, std430) writeonly buffer Gb { float G[]; };
+#elif MODE == 1
+layout(binding = 1, std430) readonly buffer Sb { float S[]; };
+layout(binding = 2, std430) readonly buffer Gb { float G[]; };
+layout(binding = 3, std430) writeonly buffer Db { vec2 D[]; };
+#else
+layout(binding = 1, std430) readonly buffer Gb { float G[]; };
+layout(binding = 2, std430) readonly buffer Db { vec2 D[]; };
+layout(binding = 3, OUT_FMT) uniform writeonly image2D uOut;
+#endif
+const float kEpsX = 0.004, kEpsG = 0.002, kLap = 0.25;
+const int H = 6;
+const int DX[4] = int[4](1, 0, 1, 1);
+const int DY[4] = int[4](0, 1, 1, -1);
+const float LEN[4] = float[4](1.0, 1.0, 1.41421356, 1.41421356);
+
+int nearestGreen(int i, int j, int dir, int sg) {
+  for (int q = 1; q <= 3; ++q)
+    if (colAt(i + sg * q * DX[dir], j + sg * q * DY[dir], 6) == 1) return q;
+  return 0;
+}
+
+#if MODE == 2
+float med9(float a0, float a1, float a2, float a3, float a4, float a5, float a6, float a7, float a8) {
+  float a[9] = float[9](a0, a1, a2, a3, a4, a5, a6, a7, a8);
+  for (int i = 1; i < 9; ++i) {
+    const float v = a[i];
+    int j = i - 1;
+    while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; --j; }
+    a[j + 1] = v;
+  }
+  return a[4];
+}
+#endif
+
+void main() {
+  const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+  const int ww = u.dims.x, wh = u.dims.y, rw = u.dims.z, rh = u.dims.w;
+#if MODE == 0
+  if (q.x >= ww || q.y >= wh) return;
+  const int i = q.x, j = q.y;
+  const int k = j * ww + i;
+  if (i < 3 || j < 3 || i >= ww - 3 || j >= wh - 3) { G[k] = 0.0; return; }
+  const int c = colAt(i, j, 6);
+  if (c == 1) { G[k] = S[k]; return; }
+  float num = 0.0, den = 0.0;
+  for (int dir = 0; dir < 4; ++dir) {
+    const int km = nearestGreen(i, j, dir, -1), kp = nearestGreen(i, j, dir, 1);
+    if (km == 0 || kp == 0) continue;
+    const int st = DY[dir] * ww + DX[dir];
+    const float gm = S[k - km * st], gp = S[k + kp * st];
+    const float lm = float(km) * LEN[dir], lp = float(kp) * LEN[dir];
+    const float est = (lp * gm + lm * gp) / (lm + lp);
+    const float w = 1.0 / (sq(kEpsG + abs(gm - gp)) * sq(lm + lp));
+    num += w * est;
+    den += w;
+  }
+  if (den > 0.0) {
+    float gest = num / den;
+    float cs = 0.0, cw = 0.0, gmin = 1e9, gmax = -1e9;
+    for (int v = -3; v <= 3; ++v)
+      for (int uu = -3; uu <= 3; ++uu) {
+        if (uu == 0 && v == 0) continue;
+        const int pc = colAt(i + uu, j + v, 6);
+        const float sv = S[k + v * ww + uu];
+        if (pc == c && uu * uu + v * v <= 10) {
+          const float w = 1.0 / float(uu * uu + v * v);
+          cs += w * sv;
+          cw += w;
+        } else if (pc == 1 && uu * uu + v * v <= 8) {
+          gmin = min(gmin, sv);
+          gmax = max(gmax, sv);
+        }
+      }
+    if (cw > 0.0 && gmax >= gmin) gest = min(max(gest + kLap * (S[k] - cs / cw), gmin), gmax);
+    G[k] = gest;
+  } else {
+    float s = 0.0;
+    int n = 0;
+    for (int v = -1; v <= 1; ++v)
+      for (int uu = -1; uu <= 1; ++uu)
+        if ((uu != 0 || v != 0) && colAt(i + uu, j + v, 6) == 1) { s += S[k + v * ww + uu]; ++n; }
+    G[k] = n > 0 ? s / float(n) : S[k];
+  }
+#elif MODE == 1
+  const int x = q.x - 1, y = q.y - 1;  // ROI + 1 ring
+  if (x >= rw + 1 || y >= rh + 1) return;
+  const int cw = rw + 2;
+  const int i = x + H, j = y + H;
+  const int k = j * ww + i;
+  const int c = colAt(i, j, 6);
+  const float g = G[k];
+  vec2 dd;
+  for (int t = 0; t < 2; ++t) {
+    const int ct = t * 2;
+    if (c == ct) { dd[t] = S[k] - g; continue; }
+    float num = 0.0, den = 0.0;
+    for (int v = -2; v <= 2; ++v)
+      for (int uu = -2; uu <= 2; ++uu) {
+        if (colAt(i + uu, j + v, 6) != ct) continue;
+        const int qq = k + v * ww + uu;
+        const float gd = kEpsX + abs(G[qq] - g);
+        const float w = 1.0 / (float(uu * uu + v * v) * gd * gd);
+        num += w * (S[qq] - G[qq]);
+        den += w;
+      }
+    dd[t] = den > 0.0 ? num / den : 0.0;
+  }
+  D[(y + 1) * cw + x + 1] = dd;
+#else
+  if (q.x >= rw || q.y >= rh) return;
+  const int cw = rw + 2;
+  const int kc = (q.y + 1) * cw + q.x + 1;
+  const int k = (q.y + H) * ww + q.x + H;
+  const float g = G[k];
+  vec2 d0 = D[kc - cw - 1], d1 = D[kc - cw], d2 = D[kc - cw + 1], d3 = D[kc - 1], d4 = D[kc], d5 = D[kc + 1], d6 = D[kc + cw - 1], d7 = D[kc + cw], d8 = D[kc + cw + 1];
+  const float mr = med9(d0.x, d1.x, d2.x, d3.x, d4.x, d5.x, d6.x, d7.x, d8.x);
+  const float mb = med9(d0.y, d1.y, d2.y, d3.y, d4.y, d5.y, d6.y, d7.y, d8.y);
+  const vec3 o = finishRgb(vec3(g + mr, g, g + mb));
+#ifdef OUT16
+  imageStore(uOut, q + u.io.yz, h16v(vec4(o, 1.0)));
+#else
+  imageStore(uOut, q + u.io.yz, vec4(o, 1.0));
+#endif
+#endif
+}

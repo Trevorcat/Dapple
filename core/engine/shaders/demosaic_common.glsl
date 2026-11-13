@@ -11,8 +11,9 @@ layout(std140, binding = 0) uniform P {
 } u;
 
 int colAt(int i, int j, int period) {  // colour of window pixel (i, j): 0 R, 1 G, 2 B
-  const int ph = ((j + u.org.y) % period) * period + ((i + u.org.x) % period);
-  return int((u.cfa[ph >> 4] >> uint((ph & 15) * 2)) & 3u);
+  const int ph = ((j + u.org.y + 12) % period) * period + ((i + u.org.x + 12) % period);  // +12: callers may pass coordinates down to -3 (12 is a multiple of both periods)
+  const uint w = ph < 16 ? u.cfa.x : (ph < 32 ? u.cfa.y : u.cfa.z);  // explicit select: no dynamic index into a uniform vector (ANGLE / MSL)
+  return int((w >> uint((ph & 15) * 2)) & 3u);
 }
 float clamp01(float x) { return min(max(x, 0.0), 1.0); }
 float sq(float x) { return x * x; }

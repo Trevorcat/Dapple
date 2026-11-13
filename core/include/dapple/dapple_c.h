@@ -153,6 +153,13 @@ DAPPLE_API int32_t dapple_session_render_tone_previews(DappleSession* session, c
 /* Decodes `path`. long_edge > 0 downsizes the working image once after
  * decoding (e.g. 2048 for on-screen editing). NULL on error. */
 DAPPLE_API DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t long_edge);
+/* A rectangle (x0, y0, x1, y1) of the oriented, cropped full-resolution picture of a RAW file at 1:1 (pixels of the picture dapple_session_info_json
+ * reports as sensorWidth x sensorHeight), demosaiced from the cached mosaic (GPU when enabled). The session is an ordinary one (render, export) whose
+ * source is that rectangle, with the exposure anchor of the whole picture. NULL (dapple_last_error says why) for files without a mosaic path (JPEG,
+ * sRAW, linear DNG ...) and lens-warped DNGs: use dapple_session_open then. Additive. */
+DAPPLE_API DappleSession* dapple_session_open_region(const char* path, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+/* Cancels the region open in flight (a newer dapple_session_open_region does the same): the cancelled call returns NULL ("region open: cancelled"). */
+DAPPLE_API void dapple_region_cancel(void);
 DAPPLE_API void dapple_session_close(DappleSession* session);
 
 /* Metadata JSON (same schema as dapple_probe_json) of the opened file. */
@@ -247,6 +254,11 @@ DAPPLE_API char* dapple_perf_info_json(void);
  * Returns 0 on success. Pass fn = NULL to remove the callback registered with the same user pointer. */
 typedef void (*DappleRepaintFn)(void* user);
 DAPPLE_API int32_t dapple_set_repaint_callback(DappleRepaintFn fn, void* user);
+
+/* Wave 8: call on pointer-down in the editor, before the first parameter change. Renders the newest interactive frame again for at most burst_ms (150 is
+ * a good value) on a background thread so the GPU clock that fell during a pause is up for the first real frame; ends early when a real frame is requested.
+ * Costs power only while a finger is down. No-op when no interactive frame was rendered yet. */
+DAPPLE_API int32_t dapple_session_touch_hint(DappleSession* session, int32_t burst_ms);
 
 /* Frame engine diagnostics (DAPPLE_ENGINE: default full; off = the old Renderer path, golden oracle / A/B): {"engine":"off|full","frames":N,
  * "fullHits":N,"latticeReuse":N,"latticeBake":N,...}; free with dapple_free_string. Additive. */

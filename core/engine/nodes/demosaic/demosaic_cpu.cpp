@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -14,7 +15,9 @@ constexpr float kEps = 0.002f;    // discriminator floor of the Bayer weights (1
 constexpr float kEpsX = 0.004f;   // guide floor of the X-Trans chroma weights
 constexpr float kEpsG = 0.002f;   // discriminator floor of the X-Trans green weights
 constexpr float kXLap = 0.25f;    // weight of the Laplacian term of the X-Trans green (0.5 is the Hamilton-Adams value; 0.25 measured better, 31.x)
-constexpr int kXR = 2;            // radius of the X-Trans chroma neighbourhood
+constexpr int kXR = 2;
+constexpr int kClipSkip = 0;      // fast tier: 1 = ignore clipped samples in the colour differences (measured: no gain)
+constexpr float kShrink = 0.f;
 constexpr int kXMed = 1;          // 3 x 3 median of the colour differences (1 = on)
 inline float sq(float x) { return x * x; }
 inline float clamp01(float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
@@ -179,12 +182,13 @@ void xtransTile(const Desc& d, const float* S, Rect roi, float* out, std::size_t
           for (int u = -kXR; u <= kXR; ++u) {
             if (d.cfa3[phase(i + u, j + v)] != ct) continue;
             const std::size_t q = k + std::ptrdiff_t(v) * ww + u;
+            if (kClipSkip && S[q] >= 0.995f) continue;
             const float gd = kEpsX + std::fabs(G[q] - g);
             const float w = 1.f / (float(u * u + v * v) * gd * gd);
             num += w * (S[q] - G[q]);
             den += w;
           }
-        dd[t] = den > 0.f ? num / den : 0.f;
+        dd[t] = den > 0.f ? num / den * (kShrink > 0.f ? den / (den + kShrink) : 1.f) : 0.f;
       }
       DR[std::size_t(y + 1) * cw + x + 1] = dd[0];
       DB[std::size_t(y + 1) * cw + x + 1] = dd[1];
@@ -208,6 +212,227 @@ void xtransTile(const Desc& d, const float* S, Rect roi, float* out, std::size_t
       rgb[1] = g;
       rgb[0] = g + (kXMed ? med9(&DR[kc], cw) : DR[kc]);
       rgb[2] = g + (kXMed ? med9(&DB[kc], cw) : DB[kc]);
+      for (int q = 0; q < 3; ++q) rgb[q] = clamp01(rgb[q]);
+      float* px = o + 3 * x;
+      for (int r = 0; r < 3; ++r) {
+        const float v = d.m[r * 3] * rgb[0] + d.m[r * 3 + 1] * rgb[1] + d.m[r * 3 + 2] * rgb[2];
+        px[r] = d.clampOut ? clamp01(v) : v;
+      }
+    }
+  }
+}
+
+// ---- X-Trans, candidate directions + homogeneity selection (the Markesteijn idea, derived independently) -------------------------------------
+// 1. per direction d (H, V, D1, D2) a green plane: the two nearest greens along d (every non-green phase has both within 3 steps), blended by
+//    distance, plus a directional Laplacian term (the sample's excess over its own colour along d).
+// 2. per direction the colour differences red - green, blue - green of every pixel: the guide-weighted mean of the unclipped samples of that colour
+//    lying within one pixel of the line through the pixel along d (never from a clipped sample; none left: neutral).
+// 3. every direction is one RGB candidate; a derivative map in a cube-root colour space (sum of squared differences to the 4 neighbours) says how smooth
+//    the candidate is; the homogeneity of a candidate at p is the number of pixels of the 3 x 3 around p where its derivative is within a factor of the
+//    best candidate's; the result is the mean of the candidates with the highest homogeneity.
+constexpr float kThrF = 1.5f;   // a candidate is homogeneous at a pixel when its derivative is within this factor of the best candidate
+constexpr float kThrA = 2e-4f;  // plus this absolute slack (cube-root colour units squared)
+constexpr float kLapD = 0.25f;  // weight of the directional Laplacian term of the green candidates
+constexpr float kGuide = 0.02f; // floor of the guide weight of the colour differences
+constexpr int kHomTie = 1;      // candidates within this many homogeneity counts of the best are averaged
+constexpr float kClip = 0.995f;
+constexpr float kClipSim = 4.f;  // similarity mass (sum of guide weights) a clipped neighbourhood needs to be trusted
+constexpr int kXtMed = 1;        // 3 x 3 median of the final colour differences
+constexpr float kClipPen = 0.3f; // derivative penalty of a candidate that interpolated across a clipped green
+
+// cube root of a non-negative float, 2 Newton steps from a bit-trick start (relative error ~1e-6); the GPU kernel uses pow(x, 1/3)
+inline float fastCbrt(float x) {
+  if (x <= 0.f) return 0.f;
+  std::uint32_t i;
+  std::memcpy(&i, &x, 4);
+  i = i / 3 + 0x2a514067u;
+  float y;
+  std::memcpy(&y, &i, 4);
+  y = y - (y * y * y - x) / (3.f * y * y);
+  y = y - (y * y * y - x) / (3.f * y * y);
+  return y;
+}
+
+struct XtTaps {  // per phase, direction and colour (red / blue): the samples within one pixel of the line along the direction, and the own-colour samples for the Laplacian
+  struct Tap { std::int8_t u, v; float gw; };
+  Tap t[36][4][2][12];
+  std::int8_t n[36][4][2];
+  struct Lap { std::int8_t q; };
+  std::int8_t lap[36][4][6];
+  std::int8_t nlap[36][4];
+  XtTaps(const Desc& d) {
+    static const int dx[4] = {1, 0, 1, 1}, dy[4] = {0, 1, 1, -1};
+    static const float len[4] = {1.f, 1.f, 1.41421356f, 1.41421356f};
+    for (int ph = 0; ph < 36; ++ph)
+      for (int dir = 0; dir < 4; ++dir) {
+        for (int c = 0; c < 2; ++c) {
+          int cnt = 0;
+          for (int v = -3; v <= 3; ++v)
+            for (int u = -3; u <= 3; ++u) {
+              const int r2 = u * u + v * v;
+              if (r2 == 0 || r2 > 10) continue;
+              const float perp = std::fabs(float(u * dy[dir] - v * dx[dir])) / len[dir];
+              if (perp > 1.01f) continue;
+              if (d.cfa3[pmod(ph / 6 + v, 6) * 6 + pmod(ph % 6 + u, 6)] != c * 2) continue;
+              if (cnt < 12) t[ph][dir][c][cnt++] = {std::int8_t(u), std::int8_t(v), 1.f / (float(r2) * (1.f + perp * perp))};
+            }
+          n[ph][dir][c] = std::int8_t(cnt);
+        }
+        int nl = 0;
+        const int col = d.cfa3[ph];
+        for (int q = -3; q <= 3; ++q)
+          if (q && d.cfa3[pmod(ph / 6 + q * dy[dir], 6) * 6 + pmod(ph % 6 + q * dx[dir], 6)] == col) lap[ph][dir][nl++] = std::int8_t(q);
+        nlap[ph][dir] = std::int8_t(nl);
+      }
+  }
+};
+
+void xtransTileCand(const Desc& d, const float* S, Rect roi, float* out, std::size_t stride) {
+  static const int dx[4] = {1, 0, 1, 1}, dy[4] = {0, 1, 1, -1};
+  static const float len[4] = {1.f, 1.f, 1.41421356f, 1.41421356f};
+  const XtTables T(d);
+  const XtTaps TP(d);
+  const int H = kHaloXTransCand, rw = roi.w(), rh = roi.h(), ww = rw + 2 * H, wh = rh + 2 * H;
+  const int ox = pmod(roi.x0 - H, 6), oy = pmod(roi.y0 - H, 6);
+  auto phase = [&](int i, int j) { return ((j + oy) % 6) * 6 + ((i + ox) % 6); };
+  const std::size_t N = std::size_t(ww) * wh;
+  thread_local std::vector<float> G4, DD, D4, CC, SG, SRB;
+  G4.assign(4 * N, 0.f), DD.assign(8 * N, 0.f), D4.assign(4 * N, 0.f), CC.assign(12 * N, 0.f);
+  // 1. directional green
+  for (int j = 3; j < wh - 3; ++j)
+    for (int i = 3; i < ww - 3; ++i) {
+      const std::size_t k = std::size_t(j) * ww + i;
+      const int ph = phase(i, j), c = d.cfa3[ph];
+      const float* p = S + k;
+      for (int dir = 0; dir < 4; ++dir) {
+        if (c == 1) {
+          G4[4 * k + dir] = *p;
+          continue;
+        }
+        const int km = T.k[ph][dir][0], kp = T.k[ph][dir][1];
+        const std::ptrdiff_t st = std::ptrdiff_t(dy[dir]) * ww + dx[dir];
+        const float gm = p[-km * st], gp = p[kp * st];
+        const float lm = float(km) * len[dir], lp = float(kp) * len[dir];
+        float g = (lp * gm + lm * gp) / (lm + lp);
+        const int nl = TP.nlap[ph][dir];
+        if (nl) {
+          float cs = 0.f;
+          for (int a = 0; a < nl; ++a) cs += p[TP.lap[ph][dir][a] * st];
+          g += kLapD * (*p - cs / float(nl));
+        }
+        G4[4 * k + dir] = std::min(std::max(g, std::min(gm, gp)), std::max(gm, gp));
+      }
+    }
+  // 2. directional colour differences (red, blue): [8 k + 4 t + dir]
+  for (int j = 6; j < wh - 6; ++j)
+    for (int i = 6; i < ww - 6; ++i) {
+      const std::size_t k = std::size_t(j) * ww + i;
+      const int ph = phase(i, j), c = d.cfa3[ph];
+      for (int dir = 0; dir < 4; ++dir) {
+        const float g = G4[4 * k + dir];
+        for (int t = 0; t < 2; ++t) {
+          float res;
+          if (c == t * 2) {
+            res = S[k] - g;
+          } else {
+            float num = 0.f, den = 0.f, numC = 0.f, denC = 0.f;  // unclipped / clipped samples
+            const int nt = TP.n[ph][dir][t];
+            for (int a = 0; a < nt; ++a) {
+              const XtTaps::Tap& tp = TP.t[ph][dir][t][a];
+              const std::size_t q = k + std::ptrdiff_t(tp.v) * ww + tp.u;
+              const float gq = G4[4 * q + dir];
+              const float w = tp.gw / (kGuide + std::fabs(gq - g));
+              if (S[q] >= kClip) numC += w * (S[q] - gq), denC += w;
+              else num += w * (S[q] - gq), den += w;
+            }
+            // colour differences from unclipped samples only; clipped ones count only inside a clipped region (similar green), see 32.3
+            res = den > 0.f ? num / den : (denC >= kClipSim ? numC / denC : 0.f);
+          }
+          DD[8 * k + 4 * t + dir] = res;
+        }
+      }
+    }
+  // candidate colours in the cube-root space: CC[12 k + 3 dir + channel]
+  for (int j = 6; j < wh - 6; ++j)
+    for (int i = 6; i < ww - 6; ++i) {
+      const std::size_t k = std::size_t(j) * ww + i;
+      const int c = d.cfa3[phase(i, j)];
+      for (int dir = 0; dir < 4; ++dir) {
+        const float g = G4[4 * k + dir];
+        float rgb[3] = {c == 0 ? S[k] : g + DD[8 * k + dir], g, c == 2 ? S[k] : g + DD[8 * k + 4 + dir]};
+        for (int q = 0; q < 3; ++q) rgb[q] = clamp01(rgb[q]);
+        for (int r = 0; r < 3; ++r) CC[12 * k + 3 * dir + r] = fastCbrt(d.m[r * 3] * rgb[0] + d.m[r * 3 + 1] * rgb[1] + d.m[r * 3 + 2] * rgb[2]);
+      }
+    }
+  // 3. derivative maps
+  for (int j = 7; j < wh - 7; ++j)
+    for (int i = 7; i < ww - 7; ++i) {
+      const std::size_t k = std::size_t(j) * ww + i;
+      const int ph = phase(i, j);
+      for (int dir = 0; dir < 4; ++dir) {
+        const float* c0 = &CC[12 * k + 3 * dir];
+        float sum = 0.f;
+        const std::ptrdiff_t off[4] = {-1, 1, -std::ptrdiff_t(ww), std::ptrdiff_t(ww)};
+        for (int n = 0; n < 4; ++n) {
+          const float* cn = &CC[12 * std::size_t(std::ptrdiff_t(k) + off[n]) + 3 * dir];
+          sum += sq(c0[0] - cn[0]) + sq(c0[1] - cn[1]) + sq(c0[2] - cn[2]);
+        }
+        if (d.cfa3[ph] != 1) {  // a candidate that interpolated across a clipped green is a poor one
+          const int km = T.k[ph][dir][0], kp = T.k[ph][dir][1];
+          const std::ptrdiff_t st = std::ptrdiff_t(dy[dir]) * ww + dx[dir];
+          if (S[k - km * st] >= kClip || S[k + kp * st] >= kClip) sum += kClipPen;
+        }
+        D4[4 * k + dir] = sum;
+      }
+    }
+  // 4. homogeneity selection on the ROI + 1 ring: the mean of the best candidates as green and two colour differences
+  const int cw = rw + 2, ch = rh + 2;
+  SG.resize(std::size_t(cw) * ch), SRB.resize(2 * SG.size());
+  for (int y = -1; y <= rh; ++y)
+    for (int x = -1; x <= rw; ++x) {
+      const int i = x + H, j = y + H;
+      const std::size_t k = std::size_t(j) * ww + i;
+      int hm[4] = {0, 0, 0, 0};
+      for (int v = -1; v <= 1; ++v)
+        for (int u = -1; u <= 1; ++u) {
+          const std::size_t q = k + std::ptrdiff_t(v) * ww + u;
+          const float m = std::min(std::min(D4[4 * q], D4[4 * q + 1]), std::min(D4[4 * q + 2], D4[4 * q + 3]));
+          const float thr = m * kThrF + kThrA;
+          for (int dir = 0; dir < 4; ++dir) hm[dir] += D4[4 * q + dir] <= thr;
+        }
+      const int hmax = std::max(std::max(hm[0], hm[1]), std::max(hm[2], hm[3]));
+      float g = 0.f, r = 0.f, b2 = 0.f;
+      int cnt = 0;
+      const int c = d.cfa3[phase(i, j)];
+      for (int dir = 0; dir < 4; ++dir) {
+        if (hm[dir] < hmax - kHomTie) continue;
+        const float gd = G4[4 * k + dir];
+        g += gd;
+        r += c == 0 ? S[k] : gd + DD[8 * k + dir];
+        b2 += c == 2 ? S[k] : gd + DD[8 * k + 4 + dir];
+        ++cnt;
+      }
+      g /= float(cnt), r /= float(cnt), b2 /= float(cnt);
+      const std::size_t o2 = std::size_t(y + 1) * cw + x + 1;
+      SG[o2] = g;
+      SRB[2 * o2] = clamp01(r) - clamp01(g);
+      SRB[2 * o2 + 1] = clamp01(b2) - clamp01(g);
+    }
+  // 5. 3 x 3 median of the two colour differences (the isolated colour speckle of an estimate at a one-pixel feature is an outlier, an edge is not), matrix, output
+  auto med9 = [&](std::size_t o2, int ch2) {
+    float a[9];
+    int n = 0;
+    for (int v = -1; v <= 1; ++v)
+      for (int u = -1; u <= 1; ++u) a[n++] = SRB[2 * (std::ptrdiff_t(o2) + v * cw + u) + ch2];
+    std::nth_element(a, a + 4, a + 9);
+    return a[4];
+  };
+  for (int y = 0; y < rh; ++y) {
+    float* o = out + std::size_t(y) * stride;
+    for (int x = 0; x < rw; ++x) {
+      const std::size_t o2 = std::size_t(y + 1) * cw + x + 1;
+      const float g = clamp01(SG[o2]);
+      float rgb[3] = {g + (kXtMed ? med9(o2, 0) : SRB[2 * o2]), g, g + (kXtMed ? med9(o2, 1) : SRB[2 * o2 + 1])};
       for (int q = 0; q < 3; ++q) rgb[q] = clamp01(rgb[q]);
       float* px = o + 3 * x;
       for (int r = 0; r < 3; ++r) {
@@ -243,19 +468,50 @@ float scaleSample(const Desc& d, int x, int y) {
 
 void demosaicWindow(const Desc& d, const float* S, Rect roi, float* out, std::size_t strideFloats) {
   if (d.cfa == Cfa::Bayer) bayerTile(d, S, roi, out, strideFloats);
+  else if (d.xtMode >= 1) xtransTileCand(d, S, roi, out, strideFloats);
   else xtransTile(d, S, roi, out, strideFloats);
 }
 
 namespace {
+constexpr float kHotTau = 0.1f, kHotMaxNeighbour = 0.9f;
+
+// Isolated hot sample: well above every same-colour neighbour within 3 pixels while those neighbours are far from clipping (a real highlight has bright neighbours).
+// Replaced by the trimmed mean (without the largest and the smallest) of the neighbours.
+void hotFilter(const Desc& d, const std::vector<float>& W, int ww, int wh, int E, int ox, int oy, std::vector<float>& S, int iw, int ih) {
+  for (int j = 0; j < ih; ++j)
+    for (int i = 0; i < iw; ++i) {
+      const int wi = i + E, wj = j + E;
+      const float v = W[std::size_t(wj) * ww + wi];
+      float out = v;
+      if (v > kHotTau) {
+        const int c = d.cfa3[((wj + oy) % d.period) * d.period + ((wi + ox) % d.period)];
+        float sum = 0.f, mx = -1.f, mn = 2.f;
+        int n = 0;
+        for (int dv = -3; dv <= 3; ++dv)
+          for (int du = -3; du <= 3; ++du) {
+            if ((du == 0 && dv == 0) || du * du + dv * dv > 10) continue;
+            if (d.cfa3[((wj + dv + oy + 12) % d.period) * d.period + ((wi + du + ox + 12) % d.period)] != c) continue;
+            const float q = W[std::size_t(wj + dv) * ww + wi + du];
+            sum += q, mx = std::max(mx, q), mn = std::min(mn, q), ++n;
+          }
+        if (n >= 4 && v > mx + kHotTau && mx < kHotMaxNeighbour) out = (sum - mx - mn) / float(n - 2);
+      }
+      S[std::size_t(j) * iw + i] = out;
+    }
+  (void)wh;
+}
+
 void buildWindow(const Desc& d, Rect roi, std::vector<float>& S) {
-  const int H = haloOf(d), ww = roi.w() + 2 * H, wh = roi.h() + 2 * H;
-  S.resize(std::size_t(ww) * wh);
+  const int E = hotExtra(d), H = haloOf(d) + E, ww = roi.w() + 2 * H, wh = roi.h() + 2 * H;
+  std::vector<float> Wbig;
+  std::vector<float>& S0 = E ? Wbig : S;
+  S0.resize(std::size_t(ww) * wh);
   std::vector<int> xs(ww);
   for (int i = 0; i < ww; ++i) xs[i] = mapCoord(roi.x0 - H + i, d.width, d.cfa);
   const int P = d.period;
   for (int j = 0; j < wh; ++j) {
     const int ay = roi.y0 - H + j, y = mapCoord(ay, d.height, d.cfa);
-    float* row = S.data() + std::size_t(j) * ww;
+    float* row = S0.data() + std::size_t(j) * ww;
     const std::uint16_t* src = d.data + std::size_t(y) * d.width;
     for (int i = 0; i < ww; ++i) {
       // the sample comes from the mapped pixel; the colour phase and the black table phase from the window position (what the GPU kernel sees)
@@ -265,6 +521,11 @@ void buildWindow(const Desc& d, Rect roi, std::vector<float>& S) {
       const float v = std::max(float(src[xs[i]]) - blk, 0.f) * d.wb[c4] * d.invSpan;
       row[i] = std::min(v, 1.f);
     }
+  }
+  if (E) {
+    const int iw = roi.w() + 2 * (H - E), ih = roi.h() + 2 * (H - E);
+    S.resize(std::size_t(iw) * ih);
+    hotFilter(d, S0, ww, wh, E, pmod(roi.x0 - H, d.period), pmod(roi.y0 - H, d.period), S, iw, ih);
   }
 }
 
@@ -281,6 +542,7 @@ void runTiles(const Desc& d, Rect roi, int threads, int tile, F&& tileFn) {
     for (;;) {
       const std::size_t t = next.fetch_add(1);
       if (t >= tiles.size()) break;
+      if (d.cancelCur && d.cancelCur->load(std::memory_order_relaxed) != d.cancelMine) break;
       tileFn(tiles[t], S);
     }
   };

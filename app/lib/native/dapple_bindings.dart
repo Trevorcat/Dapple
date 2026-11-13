@@ -59,6 +59,8 @@ typedef _PerfConf1 = ffi.Void Function(ffi.Int32);
 typedef _PerfConf1D = void Function(int);
 typedef _Info0 = ffi.Pointer<Utf8> Function();
 typedef _Info0D = ffi.Pointer<Utf8> Function();
+typedef _TouchHint = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>, ffi.Int32);
+typedef _TouchHintD = int Function(ffi.Pointer<DappleSessionStruct>, int);
 typedef _PerfConf = ffi.Void Function(ffi.Int32, ffi.Int32);
 typedef _PerfConfD = void Function(int, int);
 typedef _ThermalFn = ffi.Float Function(ffi.Int32);
@@ -71,6 +73,10 @@ typedef _IsSupported = ffi.Int32 Function(ffi.Pointer<Utf8>);
 typedef _IsSupportedD = int Function(ffi.Pointer<Utf8>);
 typedef _Open = ffi.Pointer<DappleSessionStruct> Function(ffi.Pointer<Utf8>, ffi.Int32, ffi.Int32);
 typedef _OpenD = ffi.Pointer<DappleSessionStruct> Function(ffi.Pointer<Utf8>, int, int);
+typedef _OpenRegion = ffi.Pointer<DappleSessionStruct> Function(ffi.Pointer<Utf8>, ffi.Int32, ffi.Int32, ffi.Int32, ffi.Int32);
+typedef _OpenRegionD = ffi.Pointer<DappleSessionStruct> Function(ffi.Pointer<Utf8>, int, int, int, int);
+typedef _VoidFn = ffi.Void Function();
+typedef _VoidFnD = void Function();
 typedef _Close = ffi.Void Function(ffi.Pointer<DappleSessionStruct>);
 typedef _CloseD = void Function(ffi.Pointer<DappleSessionStruct>);
 typedef _Cancel = ffi.Int32 Function(ffi.Pointer<DappleSessionStruct>);
@@ -190,6 +196,7 @@ class DappleBindings {
         perfConfigure = lib.providesSymbol('dapple_perf_configure')
             ? lib.lookupFunction<_PerfConf, _PerfConfD>('dapple_perf_configure')
             : null,
+        touchHint = lib.providesSymbol('dapple_session_touch_hint') ? lib.lookupFunction<_TouchHint, _TouchHintD>('dapple_session_touch_hint') : null,
         threadBackground = lib.providesSymbol('dapple_thread_background')
             ? lib.lookupFunction<_PerfConf1, _PerfConf1D>('dapple_thread_background')
             : null,
@@ -227,6 +234,10 @@ class DappleBindings {
         mergeAvailable = lib.providesSymbol('dapple_merge_available')
             ? lib.lookupFunction<_MergeAvail, _MergeAvailD>('dapple_merge_available')
             : null,
+        sessionOpenRegion = lib.providesSymbol('dapple_session_open_region')
+            ? lib.lookupFunction<_OpenRegion, _OpenRegionD>('dapple_session_open_region')
+            : null,
+        regionCancel = lib.providesSymbol('dapple_region_cancel') ? lib.lookupFunction<_VoidFn, _VoidFnD>('dapple_region_cancel') : null,
         sessionOpenMerged = lib.providesSymbol('dapple_session_open_merged')
             ? lib.lookupFunction<_OpenMerged, _OpenMergedD>('dapple_session_open_merged')
             : null,
@@ -282,6 +293,7 @@ class DappleBindings {
   final _RenderFrameD? sessionRenderFrame;
   final _PerfConfD? perfConfigure;
   final _PerfConf1D? threadBackground;
+  final _TouchHintD? touchHint; // dapple_session_touch_hint: keep-warm burst on pointer-down (wave 8)
   final _ThermalFnD? thermalHeadroom;
   final _Info0D? perfInfoJson;
   final _Info? sessionAnalyzeJson;
@@ -297,6 +309,8 @@ class DappleBindings {
   final _EmbedThumbD? dngEmbedThumbnail;
   final _MergeAvailD? mergeAvailable;
   final _OpenMergedD? sessionOpenMerged;
+  final _OpenRegionD? sessionOpenRegion;
+  final _VoidFnD? regionCancel;
   final _SaveLinearD? sessionSaveLinear;
   final _DetectD? detectSequences;
   final _CStrArg? videoProbeJson;

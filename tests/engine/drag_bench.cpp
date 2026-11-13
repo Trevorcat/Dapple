@@ -146,6 +146,49 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (filter == "touchmove") {  // touch-down -> first movement delays after a 3 s pause, hint burst 80 ms (wave 8)
+    auto frame = [&](int i, double* ms) {
+      char js[200];
+      std::snprintf(js, sizeof js, "{\"film\":\"kodak_portra_400\",\"film_latitude\":%.3f}", 60.0 + double(i) * 1.0);
+      DappleFrameRequest rq{};
+      rq.size = sizeof rq;
+      rq.long_edge = le;
+      rq.flags = DAPPLE_FRAME_INTERACTIVE;
+      rq.active_param = "film_latitude";
+      DappleImage img{};
+      const auto t0 = Clk::now();
+      const bool ok = dapple_session_render_frame(s, js, nullptr, &rq, &img, nullptr) == DAPPLE_OK;
+      *ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+      dapple_free_image(&img);
+      return ok;
+    };
+    double ms = 0;
+    for (int i = 0; i < 40; ++i)
+      if (!frame(i % 30, &ms)) return 1;
+    dapple_session_touch_hint(s, -1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    for (int hint = 0; hint < 2; ++hint)
+      for (int delay : {0, 30, 60, 100}) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+        const auto tDown = Clk::now();
+        if (hint) dapple_session_touch_hint(s, 80);
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        std::vector<double> t;
+        for (int i = 0; i < 30; ++i) {
+          if (!frame(i, &ms)) return 1;
+          t.push_back(ms);
+        }
+        std::vector<double> rest(t.begin() + 10, t.end());
+        std::sort(rest.begin(), rest.end());
+        double sum10 = 0;
+        for (int i = 0; i < 10; ++i) sum10 += t[std::size_t(i)];
+        std::printf("  touch-to-move %3d ms, hint %s: first frame %5.1f ms, frames 1-10 mean %5.1f ms, 11-30 median %5.1f ms | first 6:", delay, hint ? "on " : "off", t[0], sum10 / 10.0, rest[rest.size() / 2]);
+        for (int i = 0; i < 6; ++i) std::printf(" %.0f", t[std::size_t(i)]);
+        std::printf("\n");
+        (void)tDown;
+      }
+    return 0;
+  }
   if (filter == "idlegap") {  // the first frames of a drag after a pause, without / with the touch hint (wave 8)
     auto frame = [&](int i, double* ms) {
       char js[200];

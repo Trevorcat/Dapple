@@ -2,6 +2,8 @@
 //   dapple_demosaic_tests <id> ...   ids: flat edges zoneplate tiles threads cache gpu_parity gpu_tiles gpu_real (see --list)
 // Synthetic scenes have a known answer; "real" tests use the public sample files under build/rawsamples when present (exit 77 = skipped).
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -19,7 +21,9 @@
 #include "engine/nodes/demosaic/demosaic_desc.h"
 #include "engine/nodes/demosaic/demosaic_session.h"
 #ifdef DAPPLE_HAVE_GPU
+#include "engine/exec/gpu_runtime.h"
 #include "engine/hal/select.h"
+#include "engine/nodes/demosaic/demosaic_backend.h"
 #include "engine/nodes/demosaic/demosaic_gpu.h"
 #endif
 
@@ -243,6 +247,69 @@ void testHotPixel() {
   }
 }
 
+#ifdef DAPPLE_HAVE_GPU
+std::unique_ptr<hal::Device> makeDevice(std::string& why);
+double meanDe(const std::vector<float>& a, const std::vector<float>& b, double* p99, double* maxAbs);
+#endif
+
+// Optional isolated-outlier filter on the mosaic: a hot sample at any site disappears, a clipped highlight blob is untouched, tiles agree with the whole frame.
+void testHotFilter() {
+  for (Cfa c : {Cfa::Bayer, Cfa::XTrans}) {
+    for (int phase = 0; phase < 3; ++phase) {
+      Synth s(64, 64, c, flatScene(64, 64, 0.3f, 0.3f, 0.3f));
+      int hx = 30, hy = 30;
+      for (int k = 0; k < 36; ++k) {
+        const int x = 30 + k % 6, y = 30 + k / 6;
+        if (s.d.cfa3[(y % s.d.period) * s.d.period + x % s.d.period] == phase) { hx = x, hy = y; break; }
+      }
+      s.raw[std::size_t(hy) * s.w + hx] = 16383;
+      s.d.hot = true;
+      const auto out = run(s.d, {0, 0, s.w, s.h});
+      int n = 0;
+      for (std::size_t i = 0; i < out.size(); ++i) n += std::fabs(out[i] - 0.3f) > 0.02f;
+      std::printf("  hot filter %s at a %c site: affected values %d\n", c == Cfa::Bayer ? "bayer " : "xtrans", "RGB"[phase], n);
+      CHECK(n == 0, "hot sample survived the filter (%d values)", n);
+    }
+    // a clipped 6 x 6 blob in a dark field must not be filtered
+    std::vector<float> t = flatScene(64, 64, 0.1f, 0.1f, 0.1f);
+    for (int y = 28; y < 34; ++y)
+      for (int x = 28; x < 34; ++x) t[(std::size_t(y) * 64 + x) * 3] = t[(std::size_t(y) * 64 + x) * 3 + 1] = t[(std::size_t(y) * 64 + x) * 3 + 2] = 1.f;
+    Synth b(64, 64, c, t);
+    const auto off = run(b.d, {0, 0, 64, 64});
+    b.d.hot = true;
+    const auto on = run(b.d, {0, 0, 64, 64});
+    CHECK(off == on, "the filter changed a real (clipped) highlight");
+    // tiles with the filter on
+    Synth z(150, 130, c, zoneScene(150, 130));
+    z.d.hot = true;
+    const auto whole = run(z.d, {0, 0, z.w, z.h}, 1);
+    const Rect r{13, 21, 97, 88};
+    const auto part = run(z.d, r, 2);
+    int bad = 0;
+    for (int y = r.y0; y < r.y1; ++y)
+      for (int x = r.x0; x < r.x1; ++x)
+        for (int ch = 0; ch < 3; ++ch) bad += part[(std::size_t(y - r.y0) * r.w() + (x - r.x0)) * 3 + ch] != whole[(std::size_t(y) * z.w + x) * 3 + ch];
+    CHECK(bad == 0, "tiles differ with the hot filter on: %d", bad);
+#ifdef DAPPLE_HAVE_GPU
+    std::string why;
+    if (auto dev = makeDevice(why)) {
+      std::string err;
+      auto gpu = GpuDemosaic::create(*dev, false, err);
+      Synth g(150, 130, c, zoneScene(150, 130));
+      g.d.hot = true;
+      g.raw[60 * 150 + 61] = 16383;
+      const auto cpu = run(g.d, {0, 0, g.w, g.h});
+      std::vector<float> gp(cpu.size());
+      CHECK(gpu->run(g.d, {0, 0, g.w, g.h}, gp.data(), std::size_t(g.w) * 3, 64) == hal::Status::Ok, "gpu hot run");
+      double mx = 0;
+      for (std::size_t i = 0; i < cpu.size(); ++i) mx = std::max(mx, double(std::fabs(cpu[i] - gp[i])));
+      std::printf("  hot filter gpu vs cpu %s: max abs %.2e\n", c == Cfa::Bayer ? "bayer " : "xtrans", mx);
+      CHECK(mx < 2e-3, "gpu / cpu differ with the hot filter on: %.2e", mx);
+    }
+#endif
+  }
+}
+
 // Clipped highlights: a blob whose red and blue are clipped (scaled 1.0) while green is not (0.62): the data is magenta there and the node, like
 // LibRaw with highlight = 0, must reproduce exactly that (no extra hue shift or ringing from interpolating across the clipped samples), and
 // nothing may leave [0, 1].
@@ -276,6 +343,162 @@ void testClip() {
     CHECK(bad == 0, "colour shift inside a clipped highlight: %d pixels", bad);
   }
 }
+
+// ---- wiring: the decoder's mosaic path (decodeFullFromMosaic / decodeRawRegion), real sample files, exit 77 when none is present ----
+#if defined(_WIN32)
+void setEnvVar(const char* k, const char* v) { _putenv_s(k, v); }
+#else
+void setEnvVar(const char* k, const char* v) { setenv(k, v, 1); }
+#endif
+
+std::vector<std::filesystem::path> sampleFiles() {
+  std::vector<std::filesystem::path> v;
+  for (const char* f : {"build/rawsamples/Fujifilm/X-S10/Fujifilm-X-S10-compressed.RAF", "build/rawsamples/Canon/EOS-R10/IMG_4361.CR3", "build/rawsamples/Sony/ILCE-7M5/full_compressed.ARW",
+                        "build/rawsamples/Nikon/D850/Nikon-D850-14bit-lossless-compressed.NEF", "build/rawsamples/Google/Pixel-7-Pro/PXL_20221204_063131635.dng"})
+    if (std::filesystem::exists(f)) v.push_back(f);
+  return v;
+}
+
+int testWireRegion() {
+  const auto files = sampleFiles();
+  if (files.empty()) return 77;
+  setEnvVar("DAPPLE_ANCHOR", "off");
+  for (const auto& f : files) {
+    std::string why;
+    auto full = decodeFullFromMosaic(f, {}, &why);
+    if (!full) {
+      std::printf("  %s: not on the mosaic path (%s)\n", f.filename().string().c_str(), why.c_str());
+      continue;
+    }
+    const ImageF& im = full->linear;
+    if (auto probe = decodeRawRegion(f, 0, 0, 32, 32, {}, &why); !probe && why.find("OpcodeList3") != std::string::npos) {
+      std::printf("  %s: lens-warped DNG, a region is refused as designed (%s)\n", f.filename().string().c_str(), why.c_str());
+      continue;
+    }
+    long bad = 0, px = 0;
+    unsigned seed = 11;
+    auto rnd = [&](int n) { seed = seed * 1664525u + 1013904223u; return int((seed >> 8) % unsigned(std::max(1, n))); };
+    for (int k = 0; k < 6; ++k) {
+      const int w = 16 + rnd(900), h = 16 + rnd(700), x0 = k == 0 ? 0 : rnd(im.width - w), y0 = k == 1 ? im.height - h : rnd(im.height - h);
+      auto reg = decodeRawRegion(f, x0, y0, x0 + w, y0 + h, {}, &why);
+      CHECK(bool(reg), "region open failed: %s", why.c_str());
+      if (!reg) continue;
+      CHECK(reg->linear.width == w && reg->linear.height == h, "region size %dx%d", reg->linear.width, reg->linear.height);
+      for (int y = 0; y < h && reg->linear.height == h; ++y)
+        for (int x = 0; x < w; ++x)
+          for (int c = 0; c < 3; ++c) bad += reg->linear.row(y)[3 * x + c] != im.row(y0 + y)[3 * (x0 + x) + c], ++px;
+    }
+    std::printf("  %s: 6 regions against the full open, %ld values, %ld differing\n", f.filename().string().c_str(), px, bad);
+    CHECK(bad == 0, "a region differs from the same rectangle of the full open (%ld values)", bad);
+  }
+  return g_fail ? 1 : 0;
+}
+
+int testWireAnchor() {
+  const auto files = sampleFiles();
+  if (files.empty()) return 77;
+  setEnvVar("DAPPLE_ANCHOR", "on");
+  double worst = 0;
+  for (const auto& f : files) {
+    clearMosaicCache();
+    std::string why;
+    setEnvVar("DAPPLE_DEMOSAIC", "on");
+    auto m = decodeFullFromMosaic(f, {}, &why);
+    setEnvVar("DAPPLE_DEMOSAIC", "off");  // the RGB path, LibRaw does everything
+    DecodeOptions o;
+    o.quality = DecodeQuality::Full;
+    auto r = makeLibRawDecoder()->decode(f, o);
+    setEnvVar("DAPPLE_DEMOSAIC", "on");
+    if (!m || !r) {
+      std::printf("  %s: skipped (%s)\n", f.filename().string().c_str(), m ? "RGB decode failed" : why.c_str());
+      continue;
+    }
+    const double d = std::fabs(double(m->meta.exposureAnchorEv) - double(r->meta.exposureAnchorEv));
+    worst = std::max(worst, d);
+    std::printf("  %s: anchor mosaic path %+.3f EV (tier %d) RGB path %+.3f EV (tier %d), difference %.4f EV\n", f.filename().string().c_str(), m->meta.exposureAnchorEv, m->meta.exposureAnchorTier, r->meta.exposureAnchorEv, r->meta.exposureAnchorTier, d);
+    CHECK(m->meta.exposureAnchorTier == r->meta.exposureAnchorTier, "anchor tier differs");
+    CHECK(d <= 0.02, "anchor differs by %.4f EV", d);
+  }
+  std::printf("  worst difference %.4f EV\n", worst);
+  return g_fail ? 1 : 0;
+}
+
+int testWireCache() {
+  const auto files = sampleFiles();
+  if (files.empty()) return 77;
+  setEnvVar("DAPPLE_ANCHOR", "off");
+  clearMosaicCache();
+  unsigned long long h0, m0, h1, m1, h2, m2;
+  mosaicCacheCounters(&h0, &m0);
+  std::string why;
+  auto t0 = std::chrono::steady_clock::now();
+  auto a = decodeRawRegion(files[0], 100, 100, 600, 500, {}, &why);
+  const double ms1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  mosaicCacheCounters(&h1, &m1);
+  t0 = std::chrono::steady_clock::now();
+  auto b = decodeRawRegion(files[0], 700, 300, 1200, 700, {}, &why);
+  const double ms2 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  auto c = decodeFullFromMosaic(files[0], {}, &why);
+  mosaicCacheCounters(&h2, &m2);
+  CHECK(a && b && c, "decode failed: %s", why.c_str());
+  CHECK(m1 == m0 + 1 && h1 == h0, "first open must decode once");
+  CHECK(m2 == m1 && h2 == h1 + 2, "re-opens (region, full) must be served from the cache: hits %llu misses %llu", h2 - h1, m2 - m1);
+  std::printf("  first region open %.0f ms (decompress + demosaic), second region %.0f ms (cached mosaic), then a full open: %llu hits, %llu new decodes\n", ms1, ms2, h2 - h1, m2 - m1);
+  return g_fail ? 1 : 0;
+}
+
+int testWireCancel() {
+  const char* f = "build/rawsamples/Fujifilm/X-T50/DSCF0119.RAF";
+  if (!std::filesystem::exists(f)) return 77;
+  setEnvVar("DAPPLE_ANCHOR", "off");
+  std::string why;
+  decodeRawRegion(f, 0, 0, 64, 64, {}, &why);  // the mosaic is cached now: only the demosaic is timed
+  std::atomic<std::uint64_t> gen{1};
+  {
+    std::atomic<std::uint64_t> other{2};  // already cancelled before it starts
+    auto r = decodeRawRegion(f, 0, 0, 3000, 2000, {}, &why, &other, 1);
+    CHECK(!r && why == "cancelled", "a cancelled open must fail with 'cancelled' (%s)", why.c_str());
+  }
+  auto t0 = std::chrono::steady_clock::now();
+  std::thread th([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    gen.store(2);
+  });
+  auto r = decodeRawRegion(f, 0, 0, 7752, 5178, {}, &why, &gen, 1);  // the whole frame on this thread pool: seconds without the cancel
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  th.join();
+  CHECK(!r, "the open was not cancelled");
+  CHECK(ms < 800.0, "cancel took %.0f ms to take effect", ms);
+  std::printf("  cancelled a whole-frame open after 30 ms: returned after %.0f ms (%s)\n", ms, why.c_str());
+  return g_fail ? 1 : 0;
+}
+
+#ifdef DAPPLE_HAVE_GPU
+// the decoder's GPU path: backend installed (own device), runtime switch on; a region and the full picture against the CPU node
+int testWireGpu() {
+  const auto files = sampleFiles();
+  if (files.empty()) return 77;
+  std::string why;
+  if (!makeDevice(why)) return 77;
+  setEnvVar("DAPPLE_ANCHOR", "off");
+  engine::gpu::setRuntimeEnabled(1);
+  for (const auto& f : {files[0], files[1]}) {
+    clearMosaicCache();
+    demosaic::setGpuBackend(nullptr);
+    auto cpu = decodeRawRegion(f, 300, 200, 1500, 1100, {}, &why);
+    demosaic::installGpuBackend();
+    auto gpu = decodeRawRegion(f, 300, 200, 1500, 1100, {}, &why);
+    CHECK(cpu && gpu, "decode failed %s", why.c_str());
+    if (!cpu || !gpu) continue;
+    double p99, mx;
+    const double mean = meanDe(gpu->linear.data, cpu->linear.data, &p99, &mx);
+    std::printf("  %s: GPU backend vs CPU node on a 1200 x 900 region: mean dE2000 %.4f p99 %.4f max abs %.2e\n", f.filename().string().c_str(), mean, p99, mx);
+    CHECK(mean <= 0.1 && p99 <= 1.0, "decoder GPU path off the CPU node");
+  }
+  demosaic::setGpuBackend(nullptr);
+  return g_fail ? 1 : 0;
+}
+#endif
 
 void testZonePlate() {
   for (Cfa c : {Cfa::Bayer, Cfa::XTrans}) {
@@ -497,7 +720,7 @@ int testGpuReal() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::vector<std::string> all = {"flat", "edges", "zoneplate", "hotpixel", "clip", "tiles", "threads", "cache", "gpu_parity", "gpu_tiles", "gpu_real"};
+  const std::vector<std::string> all = {"flat", "edges", "zoneplate", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_cache", "wire_cancel", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu"};
   std::vector<std::string> ids;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--list") {
@@ -506,7 +729,7 @@ int main(int argc, char** argv) {
     }
     ids.push_back(argv[i]);
   }
-  if (ids.empty()) ids = {"flat", "edges", "zoneplate", "hotpixel", "clip", "tiles", "threads", "cache"};
+  if (ids.empty()) ids = {"flat", "edges", "zoneplate", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache"};
   int rc = 0;
   for (const auto& id : ids) {
     std::printf("[%s]\n", id.c_str());
@@ -516,13 +739,19 @@ int main(int argc, char** argv) {
     else if (id == "zoneplate") testZonePlate();
     else if (id == "hotpixel") testHotPixel();
     else if (id == "clip") testClip();
+    else if (id == "hotfilter") testHotFilter();
     else if (id == "tiles") testTiles();
     else if (id == "threads") testThreads();
     else if (id == "cache") testCache();
+    else if (id == "wire_region") { const int r = testWireRegion(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "wire_anchor") { const int r = testWireAnchor(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "wire_cache") { const int r = testWireCache(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "wire_cancel") { const int r = testWireCancel(); if (r == 77 && g_fail == before) return 77; }
 #ifdef DAPPLE_HAVE_GPU
     else if (id == "gpu_parity") { const int r = testGpuParity(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "gpu_tiles") { const int r = testGpuTiles(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "gpu_real") { const int r = testGpuReal(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "wire_gpu") { const int r = testWireGpu(); if (r == 77 && g_fail == before) return 77; }
 #else
     else if (id.rfind("gpu_", 0) == 0) return 77;
 #endif

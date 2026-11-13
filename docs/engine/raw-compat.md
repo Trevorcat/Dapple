@@ -252,3 +252,19 @@ Fuji DR modes: `raw format` now carries `DR<n>, exposure mid-point shift <x>` fr
 | Sony lens-correction data in ARW | **not examined**: no ARW was opened for the maker tables this round; the A6700 corner darkening is unchanged. Per the instruction no undocumented table was guessed. |
 | Old-pipeline re-pointing patches | **not done** (time): docs/engine/old-pipeline-removal.md still has the list and the order. |
 | Anchor, references, dark frames | see pipeline-architecture.md 29.1 |
+
+
+## Demosaic node coverage (demosaic engineer, 2026-11-13; docs/engine/pipeline-architecture.md section 32)
+
+`decodeRawMosaic` (core/src/decoders/libraw_mosaic.inc) returns the sensor mosaic for the files the Demosaic node covers; everything else answers `cfa == None` with a reason and keeps using `ImageDecoder::decode` (the RGB path, unchanged, also the quality reference). Result on the 45 public sample files (`dapple_demosaic_eval`, build/demosaic/*.log):
+
+| Group | Files | Mosaic path |
+|---|---|---|
+| Bayer 2 x 2, any maker | Sony ARW (A7M4, A7M5, A7RM4, A6700), Canon CR2 / CR3 (6D II, R5, R6 II, R10), Nikon NEF (D850 x2, Z8 x2 incl. HE), Fujifilm X-A7, Olympus / OM ORF (E-M1 III, OM-1 x2), Pentax PEF / DNG (K-1 II x2, K-3 III), Leica M10 / Q2, Pixel 6 / 7 Pro DNG, iPhone XS DNG, OnePlus, Xiaomi x2, Realme DNG | yes |
+| X-Trans 6 x 6 | Fujifilm X-T50 x3, X-S10 x2 (compressed, lossless compressed) | yes (X-Trans quality caveat: 32.5) |
+| No mosaic needed | Canon 5D IV CR2 / 6D II sRAW (3-colour), Leica M Monochrom, Pentax K-3 III Monochrome, iPhone 12 Pro ProRAW, Galaxy S23 / S23 Ultra (LinearRaw) | no: `no colour filter array`, RGB path (already cheap) |
+| JPEG XL DNG | Galaxy S25-class SM-S901E | no: libjxl path |
+| `zero_is_bad` | Panasonic DC-GH6, DC-S5 x2 | no: LibRaw removes the zero pixels itself, RGB path |
+| DNG with AsShotWhiteXY only | Pixel 8 Pro | no: see below |
+
+**Finding for the owner of the RGB path (engine-gaps):** for DNGs that record only AsShotWhiteXY (Pixel 8 Pro) `decode()` sets `params.user_mul` from the white point, but LibRaw's `scale_colors` then runs its automatic white balance (cam_mul is empty, `use_camera_wb` falls back to picture statistics because `LIBRAW_RAWOPTIONS_CAMERAWB_FALLBACK_TO_DAYLIGHT` is not set) and overwrites `user_mul`. Measured: node with the white-point multipliers against the RGB path, channel means R 1.093, G 1.000, B 1.052, dE2000 6.0 mean (a visible magenta cast in the contact sheet `build/demosaic/Google_Pixel-8-Pro_*_sheet.jpg`: the RGB path on the left is the neutral one). Either the white-point multipliers are wrong (the colour matrix LibRaw uses is a single matrix, not the illuminant-interpolated one of the DNG model) or the RGB path ignores them; until that is decided the mosaic path refuses these files so colour does not change. A one-line fix on the RGB side would be `params.use_auto_wb = 0` together with `cam_mul` set from the multipliers, after which the node can take the file.

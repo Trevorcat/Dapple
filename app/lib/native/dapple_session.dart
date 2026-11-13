@@ -261,6 +261,41 @@ class DappleSession {
     return DappleSession._(addr);
   }
 
+  /// True when the native library can open a rectangle of a RAW picture at 1:1 (dapple_session_open_region).
+  static bool get hasRegions => DappleBindings.instanceOrNull?.sessionOpenRegion != null;
+
+  /// A rectangle [x0, y0, x1, y1) of the oriented full-resolution picture at its native resolution (RAW files with a mosaic path; throws
+  /// DappleException otherwise: use [open]). The session's source is that rectangle; render it with a region relative to it. A newer call (or
+  /// [cancelRegion]) cancels the one in flight, which then throws.
+  static Future<DappleSession> openRegion(String path, int x0, int y0, int x1, int y1, {bool background = true}) async {
+    final addr = await Isolate.run(() {
+      final b = _b();
+      final cp = path.toNativeUtf8();
+      if (background) b.threadBackground?.call(1);
+      try {
+        final s = b.sessionOpenRegion!(cp, x0, y0, x1, y1);
+        if (s == ffi.nullptr) throw DappleException(_lastError(b));
+        return s.address;
+      } finally {
+        if (background) b.threadBackground?.call(0);
+        malloc.free(cp);
+      }
+    });
+    return DappleSession._(addr);
+  }
+
+  /// Keep-warm hint (`dapple_session_touch_hint`): call on pointer-down, before the first parameter change. [burstMs] > 0: a short GPU burst so the clock that
+  /// fell during a pause is up for the first drag frame; < 0: the "prepare" form (once per photo, idle). False when the library lacks the symbol.
+  static bool touchHint(int sessionAddress, int burstMs) {
+    final f = DappleBindings.instanceOrNull?.touchHint;
+    if (f == null || sessionAddress == 0) return false;
+    f(ffi.Pointer.fromAddress(sessionAddress), burstMs);
+    return true;
+  }
+
+  /// Cancels the region open in flight (pan / zoom moved on).
+  static void cancelRegion() => DappleBindings.instanceOrNull?.regionCancel?.call();
+
   Future<T> _serial<T>(Future<T> Function() op) {
     final c = Completer<T>();
     _tail = _tail.then((_) async {

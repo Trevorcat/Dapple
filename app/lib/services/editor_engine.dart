@@ -206,11 +206,21 @@ class EditorEngine extends ChangeNotifier {
   /// grain-family slider is dragged (14 Q8). Cleared when the last gesture ends.
   String? _activeParam;
 
+  /// Length of the keep-warm burst on pointer-down, ms (80: shorter than a human touch-down-to-move, longer than the governor's step-up).
+  static const int touchHintBurstMs = 80;
+  int _hintPreparedFor = 0;
+
   void beginInteraction({String? activeParam}) {
     if (activeParam != null) _activeParam = activeParam;
     _drag++;
     _idle?.cancel();
-    if (_drag == 1) PerfProbe.dragging = true;
+    if (_drag == 1) {
+      PerfProbe.dragging = true;
+      // wave 8: keep-warm hint before the first parameter change (every control that drives live frames goes through here); the burst lifts the GPU clock
+      // that fell during the pause (first drag frame 18-21 ms -> 5 ms, then 4 ms instead of 10 ms on a mid-range phone); no-op on the CPU path.
+      final a = _gpu?.boundSession;
+      if (a != null && a != 0) DappleSession.touchHint(a, touchHintBurstMs);
+    }
   }
 
   // Thermal headroom (AThermal_getThermalHeadroom, a binder call that the platform rate-limits to ~1/s) is
@@ -231,6 +241,12 @@ class EditorEngine extends ChangeNotifier {
     if (_drag > 0) _drag--;
     if (_drag == 0) {
       _activeParam = null;
+      // the "prepare" form once per photo, now that an interactive frame exists and the finger is up: builds the burst-size plans so the next touch costs nothing
+      final pa = _gpu?.boundSession;
+      if (pa != null && pa != 0 && pa != _hintPreparedFor) {
+        _hintPreparedFor = pa;
+        DappleSession.touchHint(pa, -1);
+      }
       _releaseMs = _clock.elapsedMilliseconds;
       PerfProbe.dragging = false;
       _scheduleFinal(delay: releaseDelay);

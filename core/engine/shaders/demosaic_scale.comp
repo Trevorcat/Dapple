@@ -9,14 +9,36 @@ layout(binding = 2, std430) readonly buffer Tab { float tab[]; };
 layout(binding = 3, std430) writeonly buffer Sb { float S[]; };
 layout(constant_id = 0) const int PERIOD = 2;
 
+const float kHotTau = 0.1, kHotMaxNeighbour = 0.9;
+
+// scaled value of the sample at window position (x, y) (inner window coordinates, the staging window has u.io.w extra samples on every side)
+float scaledAt(ivec2 p) {
+  const uint idx = uint((p.y + u.io.w) * u.io.x + (p.x + u.io.w));
+  const float raw = float((mos[idx >> 1] >> ((idx & 1u) * 16u)) & 0xFFFFu);
+  const int c4 = int(tab[((p.y + u.org.y + 12) % PERIOD) * PERIOD + ((p.x + u.org.x + 12) % PERIOD)]);
+  const int br = int(tab[37]), bc = int(tab[38]);
+  const float blk = tab[40 + ((p.y + u.org.w + 3 * br) % br) * bc + ((p.x + u.org.z + 3 * bc) % bc)];
+  const float wbc = c4 == 0 ? u.wb.x : (c4 == 1 ? u.wb.y : (c4 == 2 ? u.wb.z : u.wb.w));
+  return min(max(raw - blk, 0.0) * wbc * u.sc.x, 1.0);
+}
+
 void main() {
   const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
   if (p.x >= u.dims.x || p.y >= u.dims.y) return;
-  const uint idx = uint(p.y * u.io.x + p.x);
-  const float raw = float((mos[idx >> 1] >> ((idx & 1u) * 16u)) & 0xFFFFu);
-  const int c4 = int(tab[((p.y + u.org.y) % PERIOD) * PERIOD + ((p.x + u.org.x) % PERIOD)]);
-  const int br = int(tab[37]), bc = int(tab[38]);
-  const float blk = tab[40 + ((p.y + u.org.w) % br) * bc + ((p.x + u.org.z) % bc)];
-  const float v = max(raw - blk, 0.0) * u.wb[c4] * u.sc.x;
-  S[p.y * u.dims.x + p.x] = min(v, 1.0);
+  const float v = scaledAt(p);
+  float outv = v;
+  if (u.sc.z > 0.5 && v > kHotTau) {  // isolated hot sample filter (demosaic_cpu.cpp hotFilter)
+    const int c = colAt(p.x, p.y, PERIOD);
+    float sum = 0.0, mx = -1.0, mn = 2.0;
+    int n = 0;
+    for (int dv = -3; dv <= 3; ++dv)
+      for (int du = -3; du <= 3; ++du) {
+        if ((du == 0 && dv == 0) || du * du + dv * dv > 10) continue;
+        if (colAt(p.x + du, p.y + dv, PERIOD) != c) continue;
+        const float q = scaledAt(p + ivec2(du, dv));
+        sum += q; mx = max(mx, q); mn = min(mn, q); ++n;
+      }
+    if (n >= 4 && v > mx + kHotTau && mx < kHotMaxNeighbour) outv = (sum - mx - mn) / float(n - 2);
+  }
+  S[p.y * u.dims.x + p.x] = outv;
 }

@@ -122,12 +122,9 @@ Result<MosaicImage> decodeRawMosaic(const std::filesystem::path& path, const Dec
   float pre[4] = {0, 0, 0, 0};
   const auto& C = raw->imgdata.color;
   BlackNorm bn = normalizeBlack(*raw, bayer);
-  if (whiteXy) {
-    // The RGB path sets params.user_mul from the white point for these DNGs (Pixel 8 Pro), but LibRaw's scale_colors then runs its automatic white
-    // balance (cam_mul is empty and use_camera_wb falls back to the picture statistics) and overwrites user_mul: measured on the Pixel 8 Pro sample the
-    // RGB path's red / blue are 0.92 / 0.95 of what the multipliers say. Until the owner of that path decides which one is meant, this file keeps
-    // going through the RGB path (the oracle) rather than silently changing colour.
-    return none("DNG with AsShotWhiteXY only: the RGB path's multipliers are overridden by LibRaw's automatic white balance (see pipeline-architecture.md 32.9)");
+  if (whiteXy) {  // the file's white point (the RGB path now honours it too: use_camera_wb is off for these files)
+    for (int c = 0; c < 3; ++c) pre[c] = m.meta.asShotWb[c];
+    pre[3] = m.meta.asShotWb[1];
   } else {
     if (!(C.cam_mul[0] > 0.00001f)) return none("no as-shot white balance in the file (LibRaw would estimate one from the picture)");
     unsigned sum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -200,7 +197,11 @@ Result<MosaicImage> decodeRawMosaic(const std::filesystem::path& path, const Dec
       corr.skipped.push_back("exception");
     }
   }
+  m.dngBaselineEv = id.dng_version != 0 && C.dng_levels.baseline_exposure > -50.f && C.dng_levels.baseline_exposure < 16.f
+                        ? C.dng_levels.baseline_exposure + (std::isfinite(dngBaselineOffsetEv(path)) ? dngBaselineOffsetEv(path) : 0.f)
+                        : std::numeric_limits<float>::quiet_NaN();  // as decode() computes it
   m.dngCorrections = corr.summary();
+  m.fixedBadPixels = m.dngCorrections.find("FixBadPixels") != std::string::npos;
   // the mosaic itself
   m.width = S.width, m.height = S.height, m.flip = fileFlip;
   m.cfa = xtrans ? CfaKind::XTrans : CfaKind::Bayer;
@@ -254,8 +255,149 @@ ImageF finishMosaicRgb(const MosaicImage& m, ImageF rgb, std::string* correction
       corr.skipped.push_back("exception in geometry");
     }
   }
-  rgb = rotateFlip(rgb, m.flip);
+  if (m.flip == 3 || m.flip == 5 || m.flip == 6) rgb = rotateFlip(rgb, m.flip);  // no copy for the upright case (480 MB at 40 MP)
   if (corrections) *corrections = corr.summary();
   return rgb;
 }
 
+
+// ---- the full decode and the region decode through the Demosaic node -----------------------------------------------------------------------------
+namespace {
+demosaic::MosaicCache& mosaicCache() {
+  static demosaic::MosaicCache cache(std::size_t(700) << 20);
+  return cache;
+}
+
+bool mosaicPathEnabled() {  // read every time (cheap): tests switch it
+  const char* e = std::getenv("DAPPLE_DEMOSAIC");
+  return !(e && (std::strcmp(e, "off") == 0 || std::strcmp(e, "0") == 0 || std::strcmp(e, "libraw") == 0));
+}
+
+// The exposure anchor of a file, computed once from the cropped, oriented half-size picture of its mosaic (binned, no interpolation, 0.2 - 0.4 s) and the
+// same preview / reference logic as the RGB path; the full decode and every region of the file share it, so a detail region renders at the exposure of
+// the proxy. Matches the RGB path's anchor (computed on the full picture) within 0.02 EV on the sample set (test `mosaic_anchor`).
+std::mutex g_anchorMu;
+std::map<std::pair<std::uint64_t, std::uint64_t>, ShotMetadata>& anchorStore() {
+  static std::map<std::pair<std::uint64_t, std::uint64_t>, ShotMetadata> m;
+  return m;
+}
+
+void copyAnchor(ShotMetadata& dst, const ShotMetadata& a) {
+  dst.exposureAnchorTier = a.exposureAnchorTier;
+  dst.exposureAnchorEv = a.exposureAnchorEv;
+  dst.exposureAnchorConfidence = a.exposureAnchorConfidence;
+  dst.exposureAnchorNote = a.exposureAnchorNote;
+  dst.exposureAnchorSource = a.exposureAnchorSource;
+  dst.exposureAnchorPreviewEv = a.exposureAnchorPreviewEv;
+  dst.exposureAnchorStatsEv = a.exposureAnchorStatsEv;
+  dst.exposureAnchorHasDng = a.exposureAnchorHasDng;
+  dst.exposureAnchorDngEv = a.exposureAnchorDngEv;
+}
+
+void attachMosaicAnchor(ShotMetadata& meta, const MosaicImage& m, const std::filesystem::path& path, const DecodeOptions& options, std::future<Result<Image8>>* emb) {
+  if (!anchorEnabled()) return;
+  // cached per file only when nothing outside the file can change the answer: no explicit reference image and no sibling camera JPEG (RAW+JPEG)
+  bool cacheable = options.referenceImage.empty();
+  for (const char* ext : {".jpg", ".JPG", ".jpeg", ".JPEG"}) {
+    std::filesystem::path sib = path;
+    sib.replace_extension(ext);
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(sib, ec)) cacheable = false;
+  }
+  const std::pair<std::uint64_t, std::uint64_t> key{m.key[0], m.key[1]};
+  if (cacheable) {
+    std::lock_guard<std::mutex> lk(g_anchorMu);
+    auto it = anchorStore().find(key);
+    if (it != anchorStore().end()) {
+      copyAnchor(meta, it->second);
+      return;
+    }
+  }
+  SourceImage tmp;
+  tmp.meta = meta;
+  tmp.linear = demosaic::binnedOriented(m);
+  attachExposureAnchor(tmp, path, options, m.dngBaselineEv, emb);
+  copyAnchor(meta, tmp.meta);
+  if (!cacheable) return;
+  std::lock_guard<std::mutex> lk(g_anchorMu);
+  anchorStore()[key] = tmp.meta;
+}
+
+void logMosaicRefusal(const std::string& reason) {  // once per reason
+  static std::mutex mu;
+  static std::set<std::string> seen;
+  std::lock_guard<std::mutex> lk(mu);
+  if (seen.insert(reason).second) std::fprintf(stderr, "dapple: RAW decoded by LibRaw (mosaic path not used): %s\n", reason.c_str());
+}
+}  // namespace
+
+void clearMosaicCache() {
+  mosaicCache().clear();
+  std::lock_guard<std::mutex> lk(g_anchorMu);
+  anchorStore().clear();
+}
+
+void mosaicCacheCounters(unsigned long long* hits, unsigned long long* misses) {
+  const demosaic::CacheStats s = mosaicCache().stats();
+  if (hits) *hits = s.mosaicHits;
+  if (misses) *misses = s.mosaicMisses;
+}
+
+Result<SourceImage> decodeFullFromMosaic(const std::filesystem::path& path, const DecodeOptions& options, std::string* reason) {
+  auto refuse = [&](const std::string& why) {
+    if (reason) *reason = why;
+    logMosaicRefusal(why);
+    return Result<SourceImage>(fail(why));
+  };
+  if (!mosaicPathEnabled()) {
+    if (reason) *reason = "DAPPLE_DEMOSAIC=off";
+    return fail("mosaic path disabled");
+  }
+  std::future<Result<Image8>> embedded;  // the embedded preview decode overlaps the decompression and the demosaic, as in decode()
+  if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::async, [&path] { return extractEmbeddedPreview(path, 0); });
+  auto mr = mosaicCache().mosaic(path, options);
+  if (!mr) {
+    if (embedded.valid()) embedded.wait();
+    return refuse(mr.error().message);
+  }
+  const std::shared_ptr<const MosaicImage> m = *mr;
+  if (m->cfa == CfaKind::None) {
+    if (embedded.valid()) embedded.wait();
+    return refuse(m->reason);
+  }
+  SourceImage out;
+  out.meta = m->meta;
+  out.sceneReferred = true;
+  std::string corr;
+  out.linear = demosaic::demosaicFull(*m, 0, &corr);
+  out.meta.dngCorrections = m->dngCorrections.empty() ? corr : (corr.empty() ? m->dngCorrections : m->dngCorrections + ", " + corr);
+  suppressShadowChroma(out.linear);
+  attachMosaicAnchor(out.meta, *m, path, options, &embedded);
+  return out;
+}
+
+Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, int y0, int x1, int y1, const DecodeOptions& options, std::string* reason,
+                                    const std::atomic<std::uint64_t>* cancelCur, std::uint64_t cancelMine) {
+  auto refuse = [&](const std::string& why) {
+    if (reason) *reason = why;
+    return Result<SourceImage>(fail(why));
+  };
+  if (!mosaicPathEnabled()) return refuse("DAPPLE_DEMOSAIC=off");
+  std::future<Result<Image8>> embedded;
+  const bool needAnchor = anchorEnabled();
+  if (needAnchor && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::deferred, [&path] { return extractEmbeddedPreview(path, 0); });
+  auto mr = mosaicCache().mosaic(path, options);
+  if (!mr) return refuse(mr.error().message);
+  const std::shared_ptr<const MosaicImage> m = *mr;
+  if (m->cfa == CfaKind::None) return refuse(m->reason);
+  if (!m->opcodeList3.empty()) return refuse("OpcodeList3 (lens warp): the region needs the whole frame");
+  SourceImage out;
+  out.meta = m->meta;
+  out.sceneReferred = true;
+  out.linear = demosaic::demosaicOrientedRegion(*m, x0, y0, x1, y1, 0, cancelCur, cancelMine);
+  if (cancelCur && cancelCur->load() != cancelMine) return refuse("cancelled");
+  if (out.linear.empty()) return refuse("empty region");
+  out.meta.dngCorrections = m->dngCorrections;
+  attachMosaicAnchor(out.meta, *m, path, options, embedded.valid() ? &embedded : nullptr);
+  return out;
+}

@@ -42,23 +42,22 @@ void main() {
   const int k = j * ww + i;
   const int c = colAt(i, j, 2);
   const float g = G[k];
-  vec3 rgb;
+  vec3 rgb = vec3(0.0, g, 0.0);
   if (c == 1) {
-    const int hc = colAt(i - 1, j, 2);
+    const bool hRed = colAt(i - 1, j, 2) == 0;  // the horizontal neighbours are red (else blue), explicit selects instead of a dynamic swizzle
     const float dh = 0.5 * ((S[k - 1] - G[k - 1]) + (S[k + 1] - G[k + 1]));
     const float dv = 0.5 * ((S[k - ww] - G[k - ww]) + (S[k + ww] - G[k + ww]));
-    rgb.y = g;
-    rgb[hc] = g + dh;
-    rgb[2 - hc] = g + dv;
+    rgb.x = g + (hRed ? dh : dv);
+    rgb.z = g + (hRed ? dv : dh);
   } else {
-    rgb.y = g;
-    rgb[c] = S[k];
     const float d1 = 0.5 * ((S[k - ww + 1] - G[k - ww + 1]) + (S[k + ww - 1] - G[k + ww - 1]));
     const float d2 = 0.5 * ((S[k - ww - 1] - G[k - ww - 1]) + (S[k + ww + 1] - G[k + ww + 1]));
     const float g1 = abs(G[k - ww + 1] - g) + abs(G[k + ww - 1] - g);
     const float g2 = abs(G[k - ww - 1] - g) + abs(G[k + ww + 1] - g);
     const float w1 = 1.0 / sq(kEps + g1), w2 = 1.0 / sq(kEps + g2);
-    rgb[2 - c] = g + (w1 * d1 + w2 * d2) / (w1 + w2);
+    const float other = g + (w1 * d1 + w2 * d2) / (w1 + w2);
+    rgb.x = c == 0 ? S[k] : other;  // red sample keeps itself, a blue sample gets the interpolated red
+    rgb.z = c == 2 ? S[k] : other;
   }
   const vec3 o = finishRgb(rgb);
 #ifdef OUT16

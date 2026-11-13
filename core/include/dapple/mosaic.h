@@ -2,8 +2,10 @@
 // RAW mosaic output of the decoder (docs/engine/pipeline-architecture.md section 31): the sensor samples before any demosaic, with
 // everything the Demosaic node needs to turn them into linear ProPhoto RGB. The RGB path of ImageDecoder::decode stays as the oracle
 // and the fallback; this is the "decompress only" half of it.
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -31,6 +33,8 @@ struct MosaicImage {
   std::vector<std::uint8_t> opcodeList3;  // raw DNG OpcodeList3 payload (WarpRectilinear ...), applies to the demosaiced image; empty = none
   float exposureGain = 1.f;            // 1 for camera files
   ShotMetadata meta;                   // as ImageDecoder::decode fills it, except the exposure anchor (needs RGB: attach from the proxy)
+  float dngBaselineEv = std::numeric_limits<float>::quiet_NaN();  // DNG BaselineExposure (+ offset), NaN = none (input of the exposure anchor)
+  bool fixedBadPixels = false;         // the DNG opcodes already fixed bad pixels on the mosaic: the optional hot-sample filter stays off
   std::string dngCorrections;          // opcodes applied to the mosaic
   std::string reason;                  // cfa == None / unsupported: why
   std::uint64_t key[2] = {0, 0};       // content hash of the file + the decode options (head, tail, size): the cache key
@@ -48,5 +52,21 @@ Result<MosaicImage> decodeRawMosaic(const std::filesystem::path& path, const Dec
 // OpcodeList3 (WarpRectilinear, ...) of the mosaic image, then the default crop, then the file orientation, on a full-frame RGB image
 // (ProPhoto, the output of the Demosaic node for the whole active area). Same order as the RGB path.
 ImageF finishMosaicRgb(const MosaicImage& m, ImageF rgb, std::string* corrections = nullptr);
+
+// The same SourceImage that ImageDecoder::decode(path, {Full}) produces (linear ProPhoto, oriented, cropped, shadow chroma floor, exposure anchor), but through
+// the mosaic: LibRaw only decompresses, the Demosaic node (GPU when the C API installed a backend and the runtime switch is on, else the CPU node) does the
+// rest. The mosaic comes from a process-wide MosaicCache (re-opening a photo does not decompress again). On refusal (no mosaic path for this file, switch
+// DAPPLE_DEMOSAIC=off) the result is an error and `reason` says why: the caller takes the RGB path.
+Result<SourceImage> decodeFullFromMosaic(const std::filesystem::path& path, const DecodeOptions& options, std::string* reason = nullptr);
+
+// A rectangle (x0, y0, x1, y1) of the oriented, cropped full-resolution picture at 1:1, from the cached mosaic. The exposure anchor is the one of the whole
+// picture (cached per file) so a detail region renders at the same exposure as the proxy. Refuses files with an OpcodeList3 warp (use the full decode).
+Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, int y0, int x1, int y1, const DecodeOptions& options, std::string* reason = nullptr,
+                                    const std::atomic<std::uint64_t>* cancelCur = nullptr, std::uint64_t cancelMine = 0);
+
+// Drops the process-wide mosaic cache (memory pressure, tests).
+void clearMosaicCache();
+// Entries the cache served without decoding / decoded (tests).
+void mosaicCacheCounters(unsigned long long* hits, unsigned long long* misses);
 
 }  // namespace dapple

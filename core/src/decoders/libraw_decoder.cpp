@@ -15,13 +15,17 @@
 #include <optional>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <set>
 
 #include <stb_image.h>
 
 #include "dapple/illuminant.h"
 #include "dapple/decoder.h"
 #include "dapple/mosaic.h"
+#include "engine/nodes/demosaic/demosaic_session.h"
 #include "decoders/dng_illuminant.h"
 #include "decoders/dng_jxl.h"
 #include "decoders/dng_opcodes.h"
@@ -92,12 +96,9 @@ bool dngDefaultCrop(const LibRaw& raw, int& x0, int& y0, int& w, int& h) {
   return true;
 }
 
-bool anchorEnabled() {  // DAPPLE_ANCHOR=off: the profile's baselineExposureEv only (A/B)
-  static const bool on = [] {
-    const char* e = std::getenv("DAPPLE_ANCHOR");
-    return !(e && (std::strcmp(e, "off") == 0 || std::strcmp(e, "0") == 0));
-  }();
-  return on;
+bool anchorEnabled() {  // DAPPLE_ANCHOR=off: the profile's baselineExposureEv only (A/B); read on every call (tests switch it)
+  const char* e = std::getenv("DAPPLE_ANCHOR");
+  return !(e && (std::strcmp(e, "off") == 0 || std::strcmp(e, "0") == 0));
 }
 
 // DNG BaselineExposureOffset (tag 51109, SRATIONAL, 1.7+), which LibRaw does not expose: read from the first IFD; NaN = absent.
@@ -681,6 +682,10 @@ class LibRawDecoder final : public ImageDecoder {
   }
 
   Result<SourceImage> decode(const std::filesystem::path& path, const DecodeOptions& options) const override {
+    if (options.quality == DecodeQuality::Full) {  // the Demosaic node: LibRaw only decompresses (core/src/decoders/libraw_mosaic.inc, docs 32); refusals fall through
+      std::string why;
+      if (auto r = decodeFullFromMosaic(path, options, &why)) return r;
+    }
     PathDatastream stream(path);
     if (!stream.valid()) return fail("Cannot open " + pathToUtf8(path));
 
@@ -712,8 +717,12 @@ class LibRawDecoder final : public ImageDecoder {
     timer.mark("unpack (file read + decompression)");
     double wxy[2] = {0, 0};
     ShotMetadata meta = readMetadata(*raw, readDngWhiteXy(path, wxy) ? wxy : nullptr);  // before processing alters sizes/filters
-    if (meta.illuminantSource == "dng-whitexy")  // the file has no AsShotNeutral: use the multipliers of its white point
+    if (meta.illuminantSource == "dng-whitexy") {  // the file has no AsShotNeutral: use the multipliers of its white point
       for (int c = 0; c < 3; ++c) raw->imgdata.params.user_mul[c] = meta.asShotWb[c];
+      // LibRaw's scale_colors runs its automatic white balance when use_camera_wb is set and cam_mul is empty (as here) and overwrites user_mul:
+      // without this line the white point was ignored (Pixel 8 Pro: red / blue 0.92 / 0.95 of the intended multipliers, docs 32.9)
+      raw->imgdata.params.use_camera_wb = 0;
+    }
     raw->imgdata.params.user_mul[3] = meta.illuminantSource == "dng-whitexy" ? meta.asShotWb[1] : 0.f;
     // DNG opcode lists (phone DNGs): LibRaw does not apply them. OpcodeList2 (GainMap lens shading, FixVignetteRadial) acts on the
     // mosaic here, before LibRaw demosaics; OpcodeList3 (WarpRectilinear, ...) and the default crop act on the demosaiced image below.

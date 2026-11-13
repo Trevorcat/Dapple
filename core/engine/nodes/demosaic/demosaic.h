@@ -10,6 +10,7 @@
 //         green-guided weighted average of the colour differences of the 5 x 5 neighbourhood. Halo 6.
 // Both are written from published descriptions (Hamilton and Adams 1997, the colour-difference / gradient-weighting family; Markesteijn's
 // idea of directional green + colour difference) and share no code with RawTherapee / darktable (GPL) or LibRaw's demosaic.
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -37,12 +38,18 @@ struct Desc {
   float invSpan = 1.f / 65535.f;  // 1 / (white - common black)
   float wb[4] = {1.f, 1.f, 1.f, 1.f};
   float m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};  // white-balanced camera RGB -> output RGB, row major
+  int xtMode = 1;                 // X-Trans: 0 = fast (green + guided differences + median), 1 = candidate directions with homogeneity selection
+  bool hot = false;               // isolated hot-sample filter on the mosaic (same-colour neighbours, clip aware); needs 3 more samples of window on each side
+  const std::atomic<std::uint64_t>* cancelCur = nullptr;  // latest-wins cancellation (engine CancelToken pattern): the work stops between tiles when *cancelCur != cancelMine
+  std::uint64_t cancelMine = 0;
   bool clampOut = true;           // clip the output to [0, 1] like LibRaw's 16-bit output
 };
 
-constexpr int kHaloBayer = 4, kHaloXTrans = 6;
+constexpr int kHaloBayer = 4, kHaloXTrans = 6, kHaloXTransCand = 9;
 inline int halo(Cfa c) { return c == Cfa::Bayer ? kHaloBayer : kHaloXTrans; }
-inline int haloOf(const Desc& d) { return halo(d.cfa); }
+constexpr int kHotMargin = 3;
+inline int hotExtra(const Desc& d) { return d.hot ? kHotMargin : 0; }
+inline int haloOf(const Desc& d) { return d.cfa == Cfa::Bayer ? kHaloBayer : (d.xtMode >= 1 ? kHaloXTransCand : kHaloXTrans); }
 
 // Coordinate mapping that keeps the CFA phase: Bayer reflects (i -> -i, 2n - 2 - i), X-Trans repeats with the period.
 int mapCoord(int i, int n, Cfa c);

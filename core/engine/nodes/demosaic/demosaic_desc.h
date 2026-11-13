@@ -1,5 +1,6 @@
 #pragma once
 // MosaicImage (decoder output) -> demosaic::Desc (what the node reads).
+#include <cstdlib>
 #include <cstring>
 
 #include "dapple/mosaic.h"
@@ -17,6 +18,10 @@ inline Desc makeDesc(const MosaicImage& m) {
   }
   d.width = m.width, d.height = m.height;
   d.data = m.data.data();
+  static const bool hotEnv = [] { const char* e = std::getenv("DAPPLE_DEMOSAIC_HOT"); return e && e[0] == '1'; }();
+  d.hot = hotEnv && !m.fixedBadPixels;  // optional isolated-hot-sample filter (off by default; off when the file's opcodes fixed bad pixels)
+  static const bool fast = [] { const char* e = std::getenv("DAPPLE_DEMOSAIC_XFAST"); return e && e[0] == '1'; }();
+  d.xtMode = fast ? 0 : 1;
   d.blackRows = m.blackRows, d.blackCols = m.blackCols;
   d.black = m.black.data();
   d.invSpan = 1.f / (m.white - m.blackMin);

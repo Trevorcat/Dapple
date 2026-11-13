@@ -19,6 +19,7 @@
 #include "dapple/auto_adjust.h"
 #include "dapple/camera.h"
 #include "dapple/decoder.h"
+#include "dapple/mosaic.h"
 #include "dapple/edit_params.h"
 #include "dapple/encode.h"
 #include "dapple/film.h"
@@ -37,6 +38,7 @@
 #include "color.h"
 #ifdef DAPPLE_HAVE_GPU
 #include "engine/exec/gpu_runtime.h"  // optional GPU executor (core/gpu): runtime flag, status; frames go through EngineSession
+#include "engine/nodes/demosaic/demosaic_backend.h"  // GPU Demosaic backend for the decoder (own device, docs 32)
 #endif
 
 #ifndef DAPPLE_VERSION_STRING
@@ -75,6 +77,13 @@ struct DappleSession {
   std::string asyncLut, asyncKey;
   bool asyncHave = false, asyncRunning = false;
   std::atomic<int> matchBusy{0};
+  // touch hint (dapple_session_touch_hint): the newest interactive frame request, rendered again in a short burst on touch-down
+  std::mutex hintMtx;
+  std::string hintJson, hintLut, hintActive;
+  DappleFrameRequest hintRq{};
+  bool hintHave = false;
+  std::atomic<std::uint64_t> frameSeq{0};
+  std::atomic<bool> hintRunning{false};
   ~DappleSession() {
     for (int i = 0; i < 5000 && matchBusy.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -90,6 +99,7 @@ using namespace dapple;
 namespace fs = std::filesystem;
 
 thread_local std::string g_lastError;
+thread_local bool tlHintFrame = false;  // set on the touch-hint worker: its frames are not real frames
 
 void setError(std::string message) { g_lastError = std::move(message); }
 
@@ -679,6 +689,9 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         }
         DecodeOptions opts;
         opts.quality = quality == DAPPLE_QUALITY_FULL ? DecodeQuality::Full : DecodeQuality::Preview;
+#ifdef DAPPLE_HAVE_GPU
+        if (opts.quality == DecodeQuality::Full) dapple::demosaic::installGpuBackend();  // the decoder's Demosaic node uses the GPU when the runtime switch is on
+#endif
         auto src = decoder->decode(p, opts);
         if (!src) {
           setError(src.error().message);
@@ -687,6 +700,33 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         auto session = std::make_unique<DappleSession>();
         session->source = std::move(*src);
         if (long_edge > 0) session->source.linear = resizeToLongEdge(session->source.linear, long_edge);
+        session->cameraOwned = dapple::effectiveCamera(cameras(), session->source.meta);
+        session->camera = &session->cameraOwned;
+        return session.release();
+      },
+      nullptr);
+}
+
+static std::atomic<std::uint64_t> g_regionGen{0};  // latest wins: a new region open (or dapple_region_cancel) cancels the one in flight
+
+void dapple_region_cancel(void) { g_regionGen.fetch_add(1); }
+
+DappleSession* dapple_session_open_region(const char* path, int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+  const std::uint64_t ticket = g_regionGen.fetch_add(1) + 1;
+  return guarded(
+      [&]() -> DappleSession* {
+        const fs::path p = toPath(path);
+#ifdef DAPPLE_HAVE_GPU
+        dapple::demosaic::installGpuBackend();
+#endif
+        std::string why;
+        auto src = dapple::decodeRawRegion(p, x0, y0, x1, y1, DecodeOptions{}, &why, &g_regionGen, ticket);
+        if (!src) {
+          setError("region open: " + why);
+          return nullptr;
+        }
+        auto session = std::make_unique<DappleSession>();
+        session->source = std::move(*src);
         session->cameraOwned = dapple::effectiveCamera(cameras(), session->source.meta);
         session->camera = &session->cameraOwned;
         return session.release();
@@ -1003,6 +1043,48 @@ int32_t dapple_session_render(DappleSession* session, const char* params_json, c
       DAPPLE_ERROR);
 }
 
+// Touch hint (wave 8): on pointer-down the editor calls this before the first parameter change. A short burst of the newest interactive frame is rendered on a
+// background thread (the same frames a drag renders, results dropped) so the GPU clock that fell during the pause is up when the first real frame arrives;
+// the burst ends at `burst_ms` or as soon as a real frame is requested. It runs only while a finger is down (one burst per call, never two at once).
+int32_t dapple_session_touch_hint(DappleSession* session, int32_t burst_ms) {
+  if (!session || burst_ms == 0) return DAPPLE_OK;
+  const bool prepareOnly = burst_ms < 0;  // one burst-size frame: builds the plans of that size now (idle), so the first real burst does not
+  bool expected = false;
+  if (!session->hintRunning.compare_exchange_strong(expected, true)) return DAPPLE_OK;
+  std::string json, lut, active;
+  DappleFrameRequest rq{};
+  {
+    std::lock_guard<std::mutex> hl(session->hintMtx);
+    if (!session->hintHave) {
+      session->hintRunning.store(false);
+      return DAPPLE_OK;
+    }
+    json = session->hintJson, lut = session->hintLut, active = session->hintActive;
+    rq = session->hintRq;
+  }
+  rq.flags |= DAPPLE_FRAME_INTERACTIVE;
+  {  // the burst renders a larger frame than the drag does (DAPPLE_HINT_SCALE, default 3x the long edge): the GPU has to be close to saturated for its governor to step up
+    const char* e = std::getenv("DAPPLE_HINT_SCALE");
+    const double sc = e ? std::atof(e) : 3.0;
+    if (sc > 0.0 && rq.long_edge > 0) rq.long_edge = std::max<std::int32_t>(rq.long_edge, std::int32_t(double(rq.long_edge) * sc));
+  }
+  session->matchBusy.fetch_add(1);  // the session destructor waits for the worker
+  std::thread([session, json, lut, active, rq, burst_ms, prepareOnly]() mutable {
+    tlHintFrame = true;
+    const std::uint64_t seq0 = session->frameSeq.load();
+    const auto t0 = std::chrono::steady_clock::now();
+    rq.active_param = active.empty() ? nullptr : active.c_str();
+    do {
+      DappleImage img{};
+      if (dapple_session_render_frame(session, json.c_str(), lut.empty() ? nullptr : lut.c_str(), &rq, &img, nullptr) != DAPPLE_OK) break;
+      dapple_free_image(&img);
+    } while (!prepareOnly && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() < double(burst_ms) && session->frameSeq.load() == seq0);
+    session->hintRunning.store(false);
+    session->matchBusy.fetch_sub(1);
+  }).detach();
+  return DAPPLE_OK;
+}
+
 int32_t dapple_session_render_frame(DappleSession* session, const char* params_json, const char* lut_path,
                                     const DappleFrameRequest* request, DappleImage* out, char** analysis_json) {
   return guarded(
@@ -1023,6 +1105,19 @@ int32_t dapple_session_render_frame(DappleSession* session, const char* params_j
           const std::size_t n = request->size > 0 ? std::min<std::size_t>(std::size_t(request->size), sizeof rq) : sizeof rq;
           std::memcpy(&rq, request, n);
           rq.size = std::int32_t(sizeof rq);
+        }
+        if (!tlHintFrame) {  // a real frame: remembered for the touch hint, and it ends a running burst
+          session->frameSeq.fetch_add(1, std::memory_order_relaxed);
+          if ((rq.flags & DAPPLE_FRAME_INTERACTIVE) && params_json) {
+            std::lock_guard<std::mutex> hl(session->hintMtx);
+            session->hintJson = params_json;
+            session->hintLut = lut_path ? lut_path : "";
+            session->hintActive = rq.active_param ? rq.active_param : "";
+            session->hintRq = rq;
+            session->hintRq.active_param = nullptr;
+            session->hintRq.external = nullptr;
+            session->hintHave = true;
+          }
         }
         bool ok = false;
         if (rq.flags & DAPPLE_FRAME_BACKGROUND) {

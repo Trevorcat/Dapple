@@ -3,11 +3,27 @@
 #include <algorithm>
 #include <cstring>
 
+#include "engine/nodes/demosaic/demosaic_backend.h"
 #include "engine/nodes/demosaic/demosaic_desc.h"
 
 namespace dapple::demosaic {
 
 namespace {
+GpuBackend* g_backend = nullptr;
+
+// GPU when a backend is installed and usable, else the CPU node. `usedGpu` (optional) says which one ran.
+void runNode(const Desc& d, Rect roi, float* out, std::size_t stride, int threads, bool* usedGpu = nullptr) {
+  if (usedGpu) *usedGpu = false;
+  if (GpuBackend* b = g_backend) {
+    std::string why;
+    if (b->available(why) && b->run(d, roi, out, stride, why)) {
+      if (usedGpu) *usedGpu = true;
+      return;
+    }
+  }
+  demosaic(d, roi, out, stride, threads);
+}
+
 ImageF rotateFlipImg(const ImageF& in, int flip) {
   if (flip != 3 && flip != 5 && flip != 6) return in;
   const int W = in.width, H = in.height;
@@ -23,6 +39,9 @@ ImageF rotateFlipImg(const ImageF& in, int flip) {
   return out;
 }
 }  // namespace
+
+void setGpuBackend(GpuBackend* b) { g_backend = b; }
+GpuBackend* gpuBackend() { return g_backend; }
 
 void orientedSize(const MosaicImage& m, int* w, int* h) {
   const int cw = m.hasCrop ? m.cropW : m.width, ch = m.hasCrop ? m.cropH : m.height;
@@ -51,20 +70,22 @@ bool mosaicRectOf(const MosaicImage& m, int x0, int y0, int x1, int y1, Rect* ou
   return true;
 }
 
-ImageF demosaicOrientedRegion(const MosaicImage& m, int x0, int y0, int x1, int y1, int threads) {
+ImageF demosaicOrientedRegion(const MosaicImage& m, int x0, int y0, int x1, int y1, int threads, const std::atomic<std::uint64_t>* cancelCur, std::uint64_t cancelMine) {
   Rect r;
   if (!mosaicRectOf(m, x0, y0, x1, y1, &r)) return {};
-  const Desc d = makeDesc(m);
+  Desc d = makeDesc(m);
+  d.cancelCur = cancelCur, d.cancelMine = cancelMine;
   ImageF tmp(r.w(), r.h());
-  demosaic(d, r, tmp.data.data(), std::size_t(r.w()) * 3, threads);
+  runNode(d, r, tmp.data.data(), std::size_t(r.w()) * 3, threads);
+  if (cancelCur && cancelCur->load() != cancelMine) return {};  // cancelled: the pixels are partial
   return rotateFlipImg(tmp, m.flip);
 }
 
-ImageF demosaicFull(const MosaicImage& m, int threads) {
+ImageF demosaicFull(const MosaicImage& m, int threads, std::string* corrections) {
   const Desc d = makeDesc(m);
   ImageF rgb(m.width, m.height);
-  demosaic(d, {0, 0, m.width, m.height}, rgb.data.data(), std::size_t(m.width) * 3, threads);
-  return finishMosaicRgb(m, std::move(rgb));
+  runNode(d, {0, 0, m.width, m.height}, rgb.data.data(), std::size_t(m.width) * 3, threads);
+  return finishMosaicRgb(m, std::move(rgb), corrections);
 }
 
 ImageF binnedHalf(const MosaicImage& m) {
@@ -88,6 +109,20 @@ ImageF binnedHalf(const MosaicImage& m) {
       for (int r = 0; r < 3; ++r) px[r] = std::clamp(d.m[r * 3] * rgb[0] + d.m[r * 3 + 1] * rgb[1] + d.m[r * 3 + 2] * rgb[2], 0.f, 1.f);
     }
   return out;
+}
+
+ImageF binnedOriented(const MosaicImage& m) {
+  ImageF h = binnedHalf(m);
+  const int bs = m.cfa == CfaKind::XTrans ? 3 : 2;
+  if (m.hasCrop) {
+    const int cx = m.cropX / bs, cy = m.cropY / bs, cw = std::min(m.cropW / bs, h.width - cx), ch = std::min(m.cropH / bs, h.height - cy);
+    if (cw > 0 && ch > 0) {
+      ImageF c(cw, ch);
+      for (int y = 0; y < ch; ++y) std::memcpy(c.row(y), h.row(cy + y) + std::size_t(cx) * 3, std::size_t(cw) * 3 * sizeof(float));
+      h = std::move(c);
+    }
+  }
+  return rotateFlipImg(h, m.flip);
 }
 
 // ---- cache ---------------------------------------------------------------------------------------------------------------------

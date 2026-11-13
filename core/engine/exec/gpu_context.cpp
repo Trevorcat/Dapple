@@ -544,8 +544,31 @@ void measureFilmV3(const std::shared_ptr<Context>& ctx, const char* stock, std::
   // interactive size of the editor (AdaptiveQuality) instead of stepping down through slow frames.
   float msPerMpx = 0.f;
   {
-    const SourceImage isrc = dapple::gpu::makeTestImage(960, 640);
+    const SourceImage isrc = dapple::gpu::makeTestImage(480, 320);  // a drag-sized frame: the cost per megapixel is not constant (960x640 measured 58 ms/Mpx, 480x320 26-44 on the same phone)
     MemorySourceStore istore(isrc);
+    {  // the state a drag runs in: the app's touch hint lifts the clock before the first frame, so the seed is measured after a burst of saturating frames, not at the idle clock
+      const SourceImage bsrc = dapple::gpu::makeTestImage(1440, 960);
+      MemorySourceStore bstore(bsrc);
+      const auto b0 = Clk::now();
+      int bframes = 0;
+      do {
+        EditParams p;
+        p.filmStock = stock;
+        Renderer r(p, cam, nullptr);
+        FastOptions fo;
+        fo.spatial = SpatialQuality::Interactive;
+        FrameJob job{p, r, bsrc, nullptr, cam, nullptr, {}, {}, {}};
+        job.request.bakeSize = 33;
+        job.request.interactive = true;
+        job.fastOptions = fo;
+        job.store = &bstore;
+        FrameResult res;
+        const bool ok = es.renderFrame(job, res);
+        std::free(res.rgba);
+        if (!ok) break;
+        ++bframes;
+      } while (bframes < 6 || std::chrono::duration<double, std::milli>(Clk::now() - b0).count() < 300.0);  // the first frame builds the plans: several saturating frames after it
+    }
     double best = 1e30, prev1 = 0, prev2 = 0;
     for (int rep = 0; rep < 14; ++rep) {  // until the last three agree within 15 %: the GPU clock has ramped (a drag runs hot)
       EditParams p;
