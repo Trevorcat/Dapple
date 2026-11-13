@@ -33,6 +33,7 @@
 #include "file_util.h"
 #include "color.h"
 #include "parallel.h"
+#include "decoders/jpeg_dc.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
 #elif defined(__APPLE__)
@@ -716,7 +717,7 @@ class LibRawDecoder final : public ImageDecoder {
     timer.start();
     timer.mark("open (file read of headers, identify)");
     std::future<Result<Image8>> embeddedPreview;  // for the exposure anchor: the full-size JPEG decode (0.25 - 0.8 s) overlaps the demosaic
-    if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embeddedPreview = std::async(std::launch::async, [&path] { return extractEmbeddedPreview(path, 0); });
+    if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embeddedPreview = std::async(std::launch::async, [&path] { return extractEmbeddedPreviewForAnchor(path); });
     if (int rc = raw->unpack(); rc != LIBRAW_SUCCESS)
       return fail("LibRaw unpack failed: " + std::string(libraw_strerror(rc)));
     timer.mark("unpack (file read + decompression)");
@@ -867,7 +868,7 @@ Image8 rotate90(const Image8& src, bool clockwise) {
 
 }  // namespace
 
-Result<Image8> extractEmbeddedPreview(const std::filesystem::path& rawPath, int longEdge) {
+static Result<Image8> extractPreviewImpl(const std::filesystem::path& rawPath, int longEdge, bool forAnchor) {
   PathDatastream stream(rawPath);
   if (!stream.valid()) return fail("Cannot open " + pathToUtf8(rawPath));
   auto raw = std::make_unique<LibRaw>();
@@ -879,15 +880,29 @@ Result<Image8> extractEmbeddedPreview(const std::filesystem::path& rawPath, int 
   if (th.tformat != LIBRAW_THUMBNAIL_JPEG || !th.thumb || th.tlength == 0)
     return fail("Embedded preview is not a JPEG");
   int w = 0, h = 0, n = 0;
-  std::unique_ptr<stbi_uc, void (*)(void*)> px(
-      stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(th.thumb), int(th.tlength), &w, &h, &n, 3),
-      stbi_image_free);
-  if (!px) return fail("Preview decode failed: " + std::string(stbi_failure_reason()));
-
   Image8 img;
+  bool reduced = false;
+  if (forAnchor) {
+    const char* fe = std::getenv("DAPPLE_ANCHOR_FAST");
+    const bool off = fe && std::strcmp(fe, "off") == 0;
+    int jw = 0, jh = 0;
+    JpegDcImage dc;
+    if (!off && jpegSize(reinterpret_cast<const std::uint8_t*>(th.thumb), th.tlength, jw, jh) && std::max(jw, jh) >= 2048 &&
+        decodeJpegDcScale(reinterpret_cast<const std::uint8_t*>(th.thumb), th.tlength, dc)) {
+      w = dc.width, h = dc.height;
+      img.data = std::move(dc.rgb);
+      reduced = true;
+    }
+  }
+  if (!reduced) {
+    std::unique_ptr<stbi_uc, void (*)(void*)> px(
+        stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(th.thumb), int(th.tlength), &w, &h, &n, 3),
+        stbi_image_free);
+    if (!px) return fail("Preview decode failed: " + std::string(stbi_failure_reason()));
+    img.data.assign(px.get(), px.get() + std::size_t(w) * h * 3);
+  }
   img.width = w;
   img.height = h;
-  img.data.assign(px.get(), px.get() + std::size_t(w) * h * 3);
 
   // Embedded previews usually keep sensor orientation; rotate when the file
   // says portrait but the preview is landscape.
@@ -908,6 +923,10 @@ Result<Image8> extractEmbeddedPreview(const std::filesystem::path& rawPath, int 
   }
   return img;
 }
+
+Result<Image8> extractEmbeddedPreview(const std::filesystem::path& rawPath, int longEdge) { return extractPreviewImpl(rawPath, longEdge, false); }
+
+Result<Image8> extractEmbeddedPreviewForAnchor(const std::filesystem::path& rawPath) { return extractPreviewImpl(rawPath, 0, true); }
 
 #include "decoders/libraw_mosaic.inc"  // decodeRawMosaic (Demosaic node input), docs/engine/pipeline-architecture.md section 32
 

@@ -21,6 +21,7 @@ add_library(dapple_core STATIC
   src/ultrahdr.cpp
   src/xmp_preset.cpp
   src/decoders/jpeg_decoder.cpp
+  src/decoders/jpeg_dc.cpp
   src/colour_space.cpp
   src/decoders/libraw_decoder.cpp
   src/decoders/dng_opcodes.cpp

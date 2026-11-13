@@ -101,7 +101,7 @@ ExposureAnchor computeExposureAnchor(const std::filesystem::path& raw, const Ima
 
   // ---- tier 1: the embedded preview ----
   bool tier1 = false;
-  Result<Image8> prev = reference ? Result<Image8>(*reference) : embedded ? Result<Image8>(*embedded) : extractEmbeddedPreview(raw, 0);
+  Result<Image8> prev = reference ? Result<Image8>(*reference) : embedded ? Result<Image8>(*embedded) : extractEmbeddedPreviewForAnchor(raw);
   if (!prev) {
     a.note = "no embedded preview";
   } else if (std::max(prev->width, prev->height) < kMinPreviewEdge) {

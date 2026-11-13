@@ -235,6 +235,11 @@ add_executable(dapple_drag_bench engine/drag_bench.cpp)
 target_link_libraries(dapple_drag_bench PRIVATE dapple)
 target_include_directories(dapple_drag_bench PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
 
+# The editor decode stages through the C API (open, 2x detail, 1:1 regions, export), for device timing without the app
+add_executable(dapple_stage_bench engine/stage_bench.cpp)
+target_link_libraries(dapple_stage_bench PRIVATE dapple)
+target_include_directories(dapple_stage_bench PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
+
 # Cached film exposure match: exact equals the uncached solve, interpolation during a print drag, lean key (section 26.2)
 add_executable(dapple_match_cache_tests engine/match_cache_tests.cpp)
 target_link_libraries(dapple_match_cache_tests PRIVATE dapple_core)

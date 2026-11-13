@@ -510,7 +510,13 @@ class EditorEngine extends ChangeNotifier {
     final primePhoto = photo;
     if (myGen == _gen && !_dirty && !_interactiveNow && _zoom <= detailMinZoom && primePhoto != null) {
       _primeTimer?.cancel(); // idle warm-up of the 1:1 path (SessionCache.primeRegion), once per photo
-      _primeTimer = Timer(const Duration(milliseconds: 1500), () => unawaited(app.sessions.primeRegion(primePhoto)));
+      _primeTimer = Timer(const Duration(milliseconds: 1500), () {
+        if (_interactiveNow || _dirty) {
+          _primeTimer = Timer(const Duration(milliseconds: 1500), () => unawaited(app.sessions.primeRegion(primePhoto))); // a drag is on: wait once more
+          return;
+        }
+        unawaited(app.sessions.primeRegion(primePhoto));
+      });
     }
     // the before/after picture is not needed to show or edit: render it once things are idle (it shares the
     // session with the drag frames, so it must never start in the middle of a drag)

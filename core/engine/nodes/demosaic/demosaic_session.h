@@ -29,9 +29,9 @@ ImageF demosaicOrientedRegion(const MosaicImage& m, int x0, int y0, int x1, int 
 // The whole picture: demosaic + OpcodeList3 + crop + orientation (the export path; GPU callers use the GPU variant of the same node).
 ImageF demosaicFull(const MosaicImage& m, int threads = 0, std::string* corrections = nullptr);
 // Half-size picture from the mosaic by 2 x 2 / 3 x 3 binning (no interpolation), the editor's proxy: same maths as LibRaw's half_size.
-ImageF binnedHalf(const MosaicImage& m);
+ImageF binnedHalf(const MosaicImage& m, int step = 1);  // step > 1: every step-th block in x and y only (statistics)
 // The same, cropped (DNG default crop) and oriented like the full picture: the picture the exposure anchor is computed from (no OpcodeList3).
-ImageF binnedOriented(const MosaicImage& m);
+ImageF binnedOriented(const MosaicImage& m, int step = 1);
 
 struct CacheStats {
   std::uint64_t mosaicHits = 0, mosaicMisses = 0, fullHits = 0, fullMisses = 0, evictions = 0;

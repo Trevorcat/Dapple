@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "engine/nodes/demosaic/demosaic_backend.h"
+#include "parallel.h"
 #include "engine/nodes/demosaic/demosaic_desc.h"
 
 namespace dapple::demosaic {
@@ -88,34 +89,46 @@ ImageF demosaicFull(const MosaicImage& m, int threads, std::string* corrections)
   return finishMosaicRgb(m, std::move(rgb), corrections);
 }
 
-ImageF binnedHalf(const MosaicImage& m) {
+ImageF binnedHalf(const MosaicImage& m, int step) {
   const Desc d = makeDesc(m);
   const int P = m.period;
   const int bs = m.cfa == CfaKind::XTrans ? 3 : 2;
-  const int ow = m.width / bs, oh = m.height / bs;
+  step = std::max(step, 1);
+  const int ow = (m.width / bs + step - 1) / step, oh = (m.height / bs + step - 1) / step;
   ImageF out(ow, oh);
-  for (int y = 0; y < oh; ++y)
-    for (int x = 0; x < ow; ++x) {
+  parallelRows(oh, [&](int yo) {  // rows are independent: 40 MP took 3 s on one core of a 2019 phone
+    const int y = yo * step;
+    int rowPh[3], rowBl[3];  // per row of the block: CFA row, black-table row
+    for (int v = 0; v < bs; ++v) rowPh[v] = ((y * bs + v) % P) * P, rowBl[v] = ((y * bs + v) % d.blackRows) * d.blackCols;
+    int px0 = 0, bx0 = 0;  // x * bs modulo the CFA period / the black table width, kept incrementally (no division per sample)
+    for (int xo = 0; xo < ow; ++xo, px0 = (px0 + bs * step) % P, bx0 = (bx0 + bs * step) % d.blackCols) {
+      const int x = xo * step;
       float s[3] = {0, 0, 0}, n[3] = {0, 0, 0};
-      for (int v = 0; v < bs; ++v)
-        for (int u = 0; u < bs; ++u) {
-          const int sx = x * bs + u, sy = y * bs + v;
-          const int c = d.cfa3[(sy % P) * P + (sx % P)];
-          s[c] += scaleSample(d, sx, sy), n[c] += 1.f;
+      for (int v = 0; v < bs; ++v) {
+        const std::uint16_t* row = d.data + std::size_t(y * bs + v) * d.width + std::size_t(x) * bs;
+        for (int u = 0; u < bs; ++u) {  // identical arithmetic and order to scaleSample()
+          const int ph = rowPh[v] + (px0 + u >= P ? px0 + u - P : px0 + u);
+          const float blk = d.black[rowBl[v] + (bx0 + u) % d.blackCols];
+          const float val = std::min(std::max(float(row[u]) - blk, 0.f) * d.wb[d.cfa4[ph]] * d.invSpan, 1.f);
+          const int c = d.cfa3[ph];
+          s[c] += val, n[c] += 1.f;
         }
+      }
       float rgb[3];
       for (int c = 0; c < 3; ++c) rgb[c] = n[c] > 0 ? s[c] / n[c] : 0.f;
-      float* px = out.row(y) + 3 * x;
+      float* px = out.row(yo) + 3 * xo;
       for (int r = 0; r < 3; ++r) px[r] = std::clamp(d.m[r * 3] * rgb[0] + d.m[r * 3 + 1] * rgb[1] + d.m[r * 3 + 2] * rgb[2], 0.f, 1.f);
     }
+  });
   return out;
 }
 
-ImageF binnedOriented(const MosaicImage& m) {
-  ImageF h = binnedHalf(m);
+ImageF binnedOriented(const MosaicImage& m, int step) {
+  step = std::max(step, 1);
+  ImageF h = binnedHalf(m, step);
   const int bs = m.cfa == CfaKind::XTrans ? 3 : 2;
   if (m.hasCrop) {
-    const int cx = m.cropX / bs, cy = m.cropY / bs, cw = std::min(m.cropW / bs, h.width - cx), ch = std::min(m.cropH / bs, h.height - cy);
+    const int cx = m.cropX / bs / step, cy = m.cropY / bs / step, cw = std::min(m.cropW / bs / step, h.width - cx), ch = std::min(m.cropH / bs / step, h.height - cy);
     if (cw > 0 && ch > 0) {
       ImageF c(cw, ch);
       for (int y = 0; y < ch; ++y) std::memcpy(c.row(y), h.row(cy + y) + std::size_t(cx) * 3, std::size_t(cw) * 3 * sizeof(float));

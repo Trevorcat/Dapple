@@ -50,6 +50,9 @@ class ImageDecoder {
 // produced). Oriented upright and scaled to `longEdge` (0 = native size).
 // Used for calibration and as an instant placeholder in the app.
 Result<Image8> extractEmbeddedPreview(const std::filesystem::path& rawPath, int longEdge);
+// The embedded preview for statistics (the exposure anchor): a JPEG of 2048 px or more is read at 1/8 scale (block means from the DC coefficients,
+// core/src/decoders/jpeg_dc.h), so a 40 MP preview costs about 0.1 s instead of 4 s on a phone. DAPPLE_ANCHOR_FAST=off decodes in full.
+Result<Image8> extractEmbeddedPreviewForAnchor(const std::filesystem::path& rawPath);
 
 // A JPEG as an upright 8-bit sRGB image (EXIF orientation applied), for reference renderings.
 Result<Image8> loadReferenceJpeg(const std::filesystem::path& path);

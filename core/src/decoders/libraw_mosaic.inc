@@ -323,8 +323,21 @@ void attachMosaicAnchor(ShotMetadata& meta, const MosaicImage& m, const std::fil
   }
   SourceImage tmp;
   tmp.meta = meta;
-  tmp.linear = demosaic::binnedOriented(m);
+  const auto ta0 = std::chrono::steady_clock::now();
+  const char* fastEnv = std::getenv("DAPPLE_ANCHOR_FAST");
+  tmp.linear = demosaic::binnedOriented(m, fastEnv && std::strcmp(fastEnv, "off") == 0 || std::max(m.width, m.height) < 4096 ? 1 : 2);  // statistics on a 192 px grid: every 2nd block (an odd step aliased with the CFA period on one sample)
+  const auto ta1 = std::chrono::steady_clock::now();
   attachExposureAnchor(tmp, path, options, m.dngBaselineEv, emb);
+  {
+    char ln[160];
+    std::snprintf(ln, sizeof ln, "anchor %s: binning %.0f ms, preview + statistics %.0f ms", pathToUtf8(path.filename()).c_str(), std::chrono::duration<double, std::milli>(ta1 - ta0).count(),
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta1).count());
+#if defined(__ANDROID__)
+    __android_log_write(ANDROID_LOG_INFO, "dapple_demosaic", ln);
+#elif defined(__APPLE__)
+    os_log(OS_LOG_DEFAULT, "dapple_demosaic: %{public}s", ln);
+#endif
+  }
   copyAnchor(meta, tmp.meta);
   if (!cacheable) return;
   std::lock_guard<std::mutex> lk(g_anchorMu);
@@ -362,7 +375,7 @@ Result<SourceImage> decodeFullFromMosaic(const std::filesystem::path& path, cons
     return fail("mosaic path disabled");
   }
   std::future<Result<Image8>> embedded;  // the embedded preview decode overlaps the decompression and the demosaic, as in decode()
-  if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::async, [&path] { return extractEmbeddedPreview(path, 0); });
+  if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::async, [&path] { return extractEmbeddedPreviewForAnchor(path); });
   auto mr = mosaicCache().mosaic(path, options);
   if (!mr) {
     if (embedded.valid()) embedded.wait();
@@ -393,7 +406,7 @@ Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, i
   if (!mosaicPathEnabled()) return refuse("DAPPLE_DEMOSAIC=off");
   std::future<Result<Image8>> embedded;
   const bool needAnchor = anchorEnabled();
-  if (needAnchor && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::deferred, [&path] { return extractEmbeddedPreview(path, 0); });
+  if (needAnchor && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::deferred, [&path] { return extractEmbeddedPreviewForAnchor(path); });
   const auto tr0 = std::chrono::steady_clock::now();
   auto mr = mosaicCache().mosaic(path, options);
   if (!mr) return refuse(mr.error().message);
