@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart' show debugPrint;
 
 import '../models.dart';
 import '../native/dapple_session.dart';
@@ -124,6 +125,7 @@ class SessionCache {
   // The visible rectangle at the picture's native resolution, demosaiced from the cached mosaic (GPU where enabled): one region at a time, a newer request
   // cancels the one in flight and replaces the session, the memory is that of one rectangle (<= regionMaxPx on the long edge, 3200 x 2400 x 12 B = 92 MB).
   static const regionMaxPx = 3200;
+  static const regionMaxEdge = 4800; // a portrait phone zoomed on a landscape photo sees a tall, narrow rectangle (1600 x 3400 at 4x): the cap is on the area, 92 MB
   final Set<String> _noRegion = {}; // photos the native side refused (JPEG, sRAW, lens-warped DNG ...): half-resolution detail only
   String? _regionId;
   Future<({DappleSession session, ui.Rect rect})?>? _region;
@@ -144,12 +146,18 @@ class SessionCache {
   /// A session whose source is [frac] (normalised rect of the picture) at 1:1, plus the normalised rect it really covers. Null when the region is larger
   /// than [regionMaxPx] (use [detail]), the file has no region path, or the open failed / was cancelled by a newer request.
   Future<({DappleSession session, ui.Rect rect})?> regionDetail(Photo ph, ui.Rect frac) async {
-    if (!available || ph.demo != null || !DappleSession.hasRegions || _noRegion.contains(ph.id)) return null;
+    if (!available || ph.demo != null || !DappleSession.hasRegions || _noRegion.contains(ph.id)) {
+      debugPrint('dapple region: not offered (available $available, symbol ${DappleSession.hasRegions}, refused earlier ${_noRegion.contains(ph.id)})');
+      return null;
+    }
     final fs = await fullSize(ph);
     if (fs == null) return null;
     final x0 = (frac.left * fs.w).floor().clamp(0, fs.w - 1), y0 = (frac.top * fs.h).floor().clamp(0, fs.h - 1);
     final x1 = (frac.right * fs.w).ceil().clamp(x0 + 1, fs.w), y1 = (frac.bottom * fs.h).ceil().clamp(y0 + 1, fs.h);
-    if (x1 - x0 > regionMaxPx || y1 - y0 > regionMaxPx) return null;
+    if (x1 - x0 > regionMaxEdge || y1 - y0 > regionMaxEdge || (x1 - x0) * (y1 - y0) > regionMaxPx * 2400) {
+      debugPrint('dapple region: ${x1 - x0} x ${y1 - y0} px is larger than the region cap ($regionMaxPx x 2400 px, edge $regionMaxEdge), half-resolution detail instead');
+      return null;
+    }
     final src = await _resolve(ph);
     if (src == null) return null;
     DappleSession.cancelRegion(); // a pan / zoom moved on: stop the one in flight
@@ -162,12 +170,35 @@ class SessionCache {
     return f;
   }
 
+  final Set<String> _primed = {};
+
+  /// Idle warm-up of the true-resolution path, once per photo: opens a 256 x 256 region at the centre, which makes the engine decompress the whole RAW
+  /// into its mosaic cache, bring up the GPU demosaic (and the one-off speed verdict on a new device) and compute the exposure anchor, all of which
+  /// the first pinch-zoom would otherwise wait for (about 8 s on a 2019 phone). Background priority; skipped once a real region was asked for.
+  Future<void> primeRegion(Photo ph) async {
+    if (!available || ph.demo != null || !ph.isRaw || !DappleSession.hasRegions || _noRegion.contains(ph.id) || _region != null) return;
+    if (!_primed.add(ph.id)) return;
+    final t = Stopwatch()..start();
+    try {
+      final fs = await fullSize(ph);
+      final src = await _resolve(ph);
+      if (fs == null || src == null || _region != null) return;
+      final x0 = fs.w ~/ 2 - 128, y0 = fs.h ~/ 2 - 128;
+      final s = await DappleSession.openRegion(src.path, x0, y0, x0 + 256, y0 + 256);
+      await s.close();
+      debugPrint('dapple region: warm-up done in ${t.elapsedMilliseconds} ms');
+    } catch (e) {
+      _primed.remove(ph.id); // cancelled by a real request or failed: nothing to keep
+    }
+  }
+
   Future<({DappleSession session, ui.Rect rect})?> _openRegion(Photo ph, String path, int x0, int y0, int x1, int y1, ui.Rect rect) async {
     try {
       final s = await DappleSession.openRegion(path, x0, y0, x1, y1);
       return (session: s, rect: rect);
     } catch (e) {
       final m = '$e';
+      debugPrint('dapple region: open failed: $m');
       if (!m.contains('cancelled')) _noRegion.add(ph.id); // refused for this file: do not ask again
       return null;
     }

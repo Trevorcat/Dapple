@@ -4,6 +4,7 @@
 #include "file_util.h"
 
 #include <atomic>
+#include <cstdarg>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +39,11 @@
 #include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
 #include "engine/nodes/film/film_async.h"
 #include "color.h"
+#if defined(__ANDROID__)
+#include <android/log.h>
+#elif defined(__APPLE__)
+#include <os/log.h>
+#endif
 #ifdef DAPPLE_HAVE_GPU
 #include "engine/exec/gpu_runtime.h"  // optional GPU executor (core/gpu): runtime flag, status; frames go through EngineSession
 #include "engine/nodes/demosaic/demosaic_backend.h"  // GPU Demosaic backend for the decoder (own device, docs 32)
@@ -680,6 +686,26 @@ int32_t dapple_is_supported_file(const char* path) {
   return guarded([&]() -> int32_t { return decoders().find(toPath(path)) != nullptr ? 1 : 0; }, 0);
 }
 
+// One-line stage log (field diagnostics): tag dapple_engine on Android, os_log on Apple, stderr elsewhere.
+static void stageLog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void stageLog(const char* fmt, ...) {
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  std::vsnprintf(buf, sizeof buf, fmt, ap);
+  va_end(ap);
+#if defined(__ANDROID__)
+  __android_log_write(ANDROID_LOG_INFO, "dapple_engine", buf);
+#elif defined(__APPLE__)
+  os_log(OS_LOG_DEFAULT, "dapple_engine: %{public}s", buf);
+#else
+  std::fprintf(stderr, "dapple_engine: %s\n", buf);
+#endif
+}
+static double msSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
 DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t long_edge) {
   return guarded(
       [&]() -> DappleSession* {
@@ -694,6 +720,7 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
 #ifdef DAPPLE_HAVE_GPU
         if (opts.quality == DecodeQuality::Full) dapple::demosaic::installGpuBackend();  // the decoder's Demosaic node uses the GPU when the runtime switch is on
 #endif
+        const auto t0 = std::chrono::steady_clock::now();
         auto src = decoder->decode(p, opts);
         if (!src) {
           setError(src.error().message);
@@ -701,7 +728,10 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         }
         auto session = std::make_unique<DappleSession>();
         session->source = std::move(*src);
+        const double decodeMs = msSince(t0);
         if (long_edge > 0) session->source.linear = resizeToLongEdge(session->source.linear, long_edge);
+        stageLog("session_open %s quality=%s decoded %dx%d in %.0f ms, long_edge %d total %.0f ms", pathToUtf8(p.filename()).c_str(),
+                 opts.quality == DecodeQuality::Full ? "full" : "preview", session->source.linear.width, session->source.linear.height, decodeMs, long_edge, msSince(t0));
         session->cameraOwned = dapple::effectiveCamera(cameras(), session->source.meta);
         session->camera = &session->cameraOwned;
         return session.release();
@@ -722,7 +752,10 @@ DappleSession* dapple_session_open_region(const char* path, int32_t x0, int32_t 
         dapple::demosaic::installGpuBackend();
 #endif
         std::string why;
+        const auto t0 = std::chrono::steady_clock::now();
         auto src = dapple::decodeRawRegion(p, x0, y0, x1, y1, DecodeOptions{}, &why, &g_regionGen, ticket);
+        stageLog("session_open_region %s %dx%d at %d,%d: %s in %.0f ms", pathToUtf8(p.filename()).c_str(), x1 - x0, y1 - y0, x0, y0,
+                 src ? "ok" : why.c_str(), msSince(t0));
         if (!src) {
           setError("region open: " + why);
           return nullptr;
@@ -1419,10 +1452,13 @@ int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_js
   return guarded(
       [&]() -> int32_t {
         Image8 img;
+        const auto t0 = std::chrono::steady_clock::now();
         if (!renderSession(session, params_json, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
+        const double renderMs = msSince(t0);
         JpegOptions jo;
         if (jpeg_quality > 0) jo.quality = jpeg_quality > 100 ? 100 : jpeg_quality;
         auto r = writeJpeg(img, toPath(out_path), jo);
+        stageLog("export_jpeg %dx%d render %.0f ms, encode+write %.0f ms", img.width, img.height, renderMs, msSince(t0) - renderMs);
         if (!r) {
           setError(r.error().message);
           return DAPPLE_ERROR;

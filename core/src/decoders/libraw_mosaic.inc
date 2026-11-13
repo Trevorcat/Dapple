@@ -230,9 +230,17 @@ Result<MosaicImage> decodeRawMosaic(const std::filesystem::path& path, const Dec
   if (copyH != m.height || copyW != m.width) return none("raw buffer smaller than the active area");
   parallelRows(m.height, [&](int y) { std::memcpy(&m.data[std::size_t(y) * m.width], src + (std::size_t(y) + S.top_margin) * pitch + S.left_margin, std::size_t(m.width) * 2); });
   raw->recycle();
-  if (timing) {
+  {  // one-line stage log (field diagnostics): the decompress of the whole frame, once per photo and mosaic-cache entry
     const auto t2 = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "mosaic-timing %s unpack %.0f ms, copy %.0f ms\n", path.filename().string().c_str(), std::chrono::duration<double, std::milli>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t1).count());
+    char ln[200];
+    std::snprintf(ln, sizeof ln, "mosaic %s %dx%d unpack %.0f ms, copy %.0f ms", pathToUtf8(path.filename()).c_str(), m.width, m.height,
+                  std::chrono::duration<double, std::milli>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t1).count());
+#if defined(__ANDROID__)
+    __android_log_write(ANDROID_LOG_INFO, "dapple_demosaic", ln);
+#elif defined(__APPLE__)
+    os_log(OS_LOG_DEFAULT, "dapple_demosaic: %{public}s", ln);
+#endif
+    if (timing) std::fprintf(stderr, "dapple_demosaic: %s\n", ln);
   }
   return m;
 }
@@ -386,11 +394,13 @@ Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, i
   std::future<Result<Image8>> embedded;
   const bool needAnchor = anchorEnabled();
   if (needAnchor && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::deferred, [&path] { return extractEmbeddedPreview(path, 0); });
+  const auto tr0 = std::chrono::steady_clock::now();
   auto mr = mosaicCache().mosaic(path, options);
   if (!mr) return refuse(mr.error().message);
   const std::shared_ptr<const MosaicImage> m = *mr;
   if (m->cfa == CfaKind::None) return refuse(m->reason);
   if (!m->opcodeList3.empty()) return refuse("OpcodeList3 (lens warp): the region needs the whole frame");
+  const auto tr1 = std::chrono::steady_clock::now();
   SourceImage out;
   out.meta = m->meta;
   out.sceneReferred = true;
@@ -398,6 +408,18 @@ Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, i
   if (cancelCur && cancelCur->load() != cancelMine) return refuse("cancelled");
   if (out.linear.empty()) return refuse("empty region");
   out.meta.dngCorrections = m->dngCorrections;
+  const auto tr2 = std::chrono::steady_clock::now();
   attachMosaicAnchor(out.meta, *m, path, options, embedded.valid() ? &embedded : nullptr);
+  {  // one-line stage log: mosaic fetch (decompress when not cached), demosaic of the region, exposure anchor
+    const auto tr3 = std::chrono::steady_clock::now();
+    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    char ln[200];
+    std::snprintf(ln, sizeof ln, "region %s: mosaic %.0f ms, demosaic %.0f ms, anchor %.0f ms", pathToUtf8(path.filename()).c_str(), ms(tr0, tr1), ms(tr1, tr2), ms(tr2, tr3));
+#if defined(__ANDROID__)
+    __android_log_write(ANDROID_LOG_INFO, "dapple_demosaic", ln);
+#elif defined(__APPLE__)
+    os_log(OS_LOG_DEFAULT, "dapple_demosaic: %{public}s", ln);
+#endif
+  }
   return out;
 }

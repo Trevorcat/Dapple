@@ -311,6 +311,7 @@ class EditorEngine extends ChangeNotifier {
     _tileGen++;
     _detailGen++;
     _detailTimer?.cancel();
+    _primeTimer?.cancel();
     _originalTimer?.cancel();
     _prefetchTimer?.cancel();
     _idle?.cancel();
@@ -506,6 +507,11 @@ class EditorEngine extends ChangeNotifier {
       return;
     }
     if (myGen == _gen && !_dirty && !_interactiveNow && _zoom > detailMinZoom) _scheduleDetail();
+    final primePhoto = photo;
+    if (myGen == _gen && !_dirty && !_interactiveNow && _zoom <= detailMinZoom && primePhoto != null) {
+      _primeTimer?.cancel(); // idle warm-up of the 1:1 path (SessionCache.primeRegion), once per photo
+      _primeTimer = Timer(const Duration(milliseconds: 1500), () => unawaited(app.sessions.primeRegion(primePhoto)));
+    }
     // the before/after picture is not needed to show or edit: render it once things are idle (it shares the
     // session with the drag frames, so it must never start in the middle of a drag)
     if (myGen == _gen && !_dirty && !_interactiveNow && original == null) {
@@ -792,6 +798,8 @@ class EditorEngine extends ChangeNotifier {
   Timer? _originalTimer;
 
   // ---- zoom detail ----------------------------------------------------------------------------------
+  Timer? _primeTimer;
+
   void _scheduleDetail() {
     _detailTimer?.cancel();
     _detailTimer = Timer(detailDelay, () => unawaited(_renderDetail()));
@@ -847,7 +855,8 @@ class EditorEngine extends ChangeNotifier {
       // True resolution first (RAW files): the visible rectangle at the picture's native pixels, one region at a time. Only for edits that act on pixels
       // alone: crop / rotate / flip / straighten / vignette refer to the whole picture, so they keep the half-resolution detail session below.
       final wp = app.wireParams(ph);
-      if (_regionNeutral(wp)) {
+      final neutral = _regionNeutral(wp);
+      if (neutral) {
         final rd = await app.sessions.regionDetail(ph, region);
         if (gen != _detailGen || myGen != _gen) return;
         if (rd != null) {
@@ -864,6 +873,7 @@ class EditorEngine extends ChangeNotifier {
             im.dispose();
             return;
           }
+          debugPrint('dapple detail: 1:1 region ${r.width.toStringAsFixed(3)} x ${r.height.toStringAsFixed(3)} of the picture, zoom ${_zoom.toStringAsFixed(1)}');
           detail?.dispose();
           detail = im;
           detailRect = region;
@@ -872,6 +882,7 @@ class EditorEngine extends ChangeNotifier {
           return;
         }
       }
+      debugPrint('dapple detail: half-resolution session (${neutral ? 'no region: larger than the region cap, refused or cancelled' : 'region skipped, the edit has crop / rotate / flip / vignette'}) zoom ${_zoom.toStringAsFixed(1)}');
       final ds = await app.sessions.detail(ph); // decodes lazily the first time (about a second)
       if (ds == null || gen != _detailGen || myGen != _gen) return;
       final frame = await ds.renderFrame(app.wireParams(ph), region: region, regionLongEdge: out, analysis: false, background: true);

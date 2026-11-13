@@ -33,6 +33,11 @@
 #include "file_util.h"
 #include "color.h"
 #include "parallel.h"
+#if defined(__ANDROID__)
+#include <android/log.h>
+#elif defined(__APPLE__)
+#include <os/log.h>
+#endif
 
 namespace dapple {
 
