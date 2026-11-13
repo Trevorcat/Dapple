@@ -62,7 +62,11 @@ struct FaceFeatures {
   bool open = false;      // mouthOpen >= kMouthOpen and the inner polygon holds visible teeth
   Plane face;             // always (oval)
   Plane eyes, iris, sclera, lips, teeth, brows;  // frontal faces only (teeth: open mouth with bright low-chroma pixels inside)
+  Plane undereye;         // frontal faces only: the crescent below each eye (portrait retouch, docs/engine/pipeline-architecture.md 43.4)
+  float iod = 0;          // inter-ocular distance (iris centres 468 / 473), pixels of the input image
 };
+// The under-eye crescents of a face (docs section 43.4), eyes = the lid-opening plane it is clipped by (may be empty).
+Plane underEyePlane(const FaceMesh& m, int w, int h, const Plane& eyes);
 constexpr float kFrontalYawDeg = 28.f;
 constexpr float kMouthOpen = 0.10f;
 // rgb may be null (the teeth plane is then the inner mouth polygon of an open mouth, unrefined).
@@ -112,7 +116,7 @@ ParsedId parseId(const std::string& id);
 std::string makeId(const std::string& photo, const std::string& key);
 
 // ---- cache files ----------------------------------------------------------------------------------------------------------------------
-constexpr int kEpoch = 3;  // algorithm version: bump when a builder changes (old cache files are then misses)
+constexpr int kEpoch = 4;  // algorithm version: bump when a builder changes (old cache files are then misses)
 struct SetEntry {
   std::string key;  // "hair", "f1:lips" ...
   Plane plane;

@@ -101,6 +101,8 @@ inline fd::Plane planeOf(const ImageView& v, int c) {
 // Workspace of the whole-frame nodes (FilmBlurExposure / FilmDirField). A frame driver that owns its own workspace sets this
 // (thread-local) so concurrent frames do not serialise on the process-wide one.
 extern thread_local fd::Arena* g_frameArena;
+// The process-wide workspace of the whole-frame nodes, freed (memory trim before a streaming export). Bytes returned.
+std::size_t releaseNodeWorkspace();
 
 // ---- node run functions (film_cpu.cpp) ------------------------------------------------------------------------------------------
 Status runExposure(const CpuCtx&, const void*, std::span<const ImageView>, std::span<const ImageView>);

@@ -32,10 +32,16 @@ Mode envMode();
 // Bytes an export may still allocate on this device: the process's own headroom where the OS reports it (iOS os_proc_available_memory), else a
 // conservative share of the memory available to the system (Android / Linux MemAvailable * 0.5, desktop * 0.5), minus a reserve for the app.
 // DAPPLE_EXPORT_BUDGET_MB overrides (tests).
-std::size_t budgetBytes();
+std::size_t budgetBytes(std::string* how = nullptr);
+// Releases what an export can do without before the budget is taken: the cached mosaics / pictures of other photos, the frame-sized film
+// workspaces of earlier renders. Bytes released (what the process may then reuse; the OS footprint drops when the allocator returns them).
+std::size_t trimForExport(const std::uint64_t keepMosaic[2]);
 // What the whole-frame path adds on top of the session for a W x H RAW picture: the float source (12 B/px), the 8-bit output (3 B/px), the
 // executor tiles and the encoder (~4 B/px); a film edit adds its frame planes (~55 B/px).
 std::size_t predictWholePeak(int W, int H, bool film);
+// The whole decode of a RAW the band path cannot read (LibRaw processes it: raw + its 16-bit image + the memory image + the float picture,
+// ~30 B/px measured on a 12 MP linear DNG).
+std::size_t predictWholeDecodePeak(int W, int H);
 // At a FULL open: open lazily (keep the mosaic, no float picture)? `why` says on what grounds (log line).
 bool openLazy(int W, int H, std::string* why = nullptr);
 
@@ -57,6 +63,21 @@ class BandSource {
   double demosaicMs() const { return ms_; }
   std::size_t peakWindowBytes() const { return peakBytes_; }
   void release() { ImageF().data.swap(win_.data), win_ = ImageF(); }
+  // Rows [y0, y1), columns [x0, x1) out of a cached full-width band (at least kBandRows rows; demosaiced when the rect is not inside the
+  // band of the previous call): what a row of GPU tiles reads. Pointer into the band, valid until the next call; pitch = width * 3.
+  static constexpr int kBandRows = 768;
+  const float* rows(int x0, int y0, int x1, int y1, std::size_t& pitchFloats);
+
+  // Row cache (section 42.8): demosaiced full-width rows kept up to `budget` bytes, so that the render reuses what the analysis pass made
+  // instead of demosaicing it again. The analysis pass runs bottom to top and offers its rows (keep()); when the cache is full the lowest
+  // rows give way (the render starts at the top). A window whose rows are all cached is copied out of the cache.
+  void setCacheBudget(std::size_t bytes) { cacheBudget_ = bytes; }
+  void keep(const ImageF& rowsOfWindow, int y0, int ya, int yb);  // rows [ya, yb) of a full-width window starting at row y0
+  void applyShadowFloorToCache();                                  // the floor was decided after the rows were kept
+  void dropCache();
+  std::size_t cacheBytes() const { return cacheBytes_; }
+  std::uint64_t cacheHits() const { return cacheHits_; }
+  int cachedRows() const;
 
  private:
   std::shared_ptr<const MosaicImage> m_;
@@ -67,6 +88,15 @@ class BandSource {
   std::uint64_t cancelMine_ = 0, windows_ = 0;
   double ms_ = 0;
   std::size_t peakBytes_ = 0;
+  int rowsY0_ = 0;  // first row of the cached band of rows()
+  struct Block {
+    int y0 = 0, y1 = 0;
+    std::vector<float> px;  // (y1 - y0) full-width rows
+  };
+  std::vector<Block> cache_;  // disjoint, any order
+  std::size_t cacheBudget_ = 0, cacheBytes_ = 0;
+  std::uint64_t cacheHits_ = 0;
+  bool fromCache(int x0, int y0, int x1, int y1);
 };
 
 // SourceStore over a BandSource (the GPU executor's streamed tiles ask it for one window per tile).
@@ -108,7 +138,8 @@ struct Analyses {
   }
 };
 // One pass over the picture in full-width bands (two when the shadow floor applies: the decision needs the whole picture first). `meta` gives the
-// metadata / scene flag of the reductions. progress(fraction) false = cancel. False on cancel / failure (`err`).
+// metadata / scene flag of the reductions. progress(fraction) false = cancel. False on cancel / failure (`err`). With a row cache budget on `src`
+// and no raster guide (whose area sums must run top to bottom) the pass runs bottom to top and leaves its top rows in the cache.
 bool analyse(BandSource& src, const SourceImage& meta, const Wants& want, Analyses& out, const std::function<bool(float)>& progress, std::string* err);
 
 // A SourceImage with the picture's size and metadata and no pixels (ImageF data empty): what a streamed render is handed.

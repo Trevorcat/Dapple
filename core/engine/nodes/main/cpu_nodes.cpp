@@ -24,6 +24,7 @@ struct DispRes {
   const FrameKernels* fk;
   const ImageF* film;
   bool replace;
+  const int* row0;  // streaming export: frame row of the film band's first row (null: the whole frame)
 };
 struct WinRes {
   const FrameKernels* fk;
@@ -64,7 +65,7 @@ thread_local float t_side[256 * 3];  // display-staged film pixels waiting for t
 void blkDisplay(const void* r, float* px, int n, const PixelPos& pos) {
   const auto* d = static_cast<const DispRes*>(r);
   float* dst = d->replace ? px : t_side;
-  std::memcpy(dst, d->film->row(pos.y) + 3 * std::size_t(pos.x), std::size_t(n) * 3 * sizeof(float));
+  std::memcpy(dst, d->film->row(pos.y - (d->row0 ? *d->row0 : 0)) + 3 * std::size_t(pos.x), std::size_t(n) * 3 * sizeof(float));
   d->fk->displayStages(dst, n);
 }
 void blkBlend(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->blend(px, t_side, n); }
@@ -101,7 +102,7 @@ Status tileLocalDetail(CpuTile& t, const void* r) {
   if (!f || !f->anyWindow) return Status::Ok;
   if (!t.aux || !t.aux->data || t.aux->ox != t.ox || t.aux->oy != t.oy || t.aux->w != t.img->width || t.aux->h != t.img->height)
     return Status::Internal;  // the amounts must come from the head chain of this very window
-  local::detailWindow(*f, *t.img, *t.aux, t.frameW, t.frameH, w->scale);
+  local::detailWindow(*f, *t.img, *t.aux, t.frameW, t.frameH, w->scale, w->fk);
   return Status::Ok;
 }
 Status tileGrain(CpuTile& t, const void* r) {
@@ -254,7 +255,7 @@ const CpuImpl* cpuImpl(NodeType t) {
 bool bindResolved(NodeType t, const FrameEnv& env, Resolved& out) {
   switch (t) {
     case NodeType::DisplayStages:
-      new (out.bytes) DispRes{env.fk, env.film, !env.blendFollows};
+      new (out.bytes) DispRes{env.fk, env.film, !env.blendFollows, env.filmRow0};
       return true;
     case NodeType::NRLuma:
     case NodeType::NRChroma:

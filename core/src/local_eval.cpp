@@ -17,6 +17,7 @@
 #endif
 
 #include "frame_kernels.h"
+#include "local_retouch.h"
 #include "parallel.h"
 
 namespace dapple::local {
@@ -243,9 +244,32 @@ std::shared_ptr<const Plane> guideGrid(const SourceImage& src, const GuideKey& g
 }
 
 // Fast guided filter with a colour guide (He, Sun, Tang 2010/2013; He, Sun 2015): coefficients (a.rgb, b) of q = a . I + b on the grid.
-std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& src, const GuideKey& gk, float sx, float sy, bool interactive,
-                                         float refine, const MaskComponent& mc) {
-  const int cap = interactive ? 512 : 1024;
+// The guide's own statistics of a refinement solve (box means of I and I I^T, 9 channels): identical for every plane of the photo that uses the same
+// grid and radius, so they are solved once and shared (cached by the guide grid and the radius).
+std::shared_ptr<const Plane> guideStats(const Plane& G, int r) {
+  const std::uint64_t key = mix64(mix64(G.key, 0x57A75), std::uint64_t(r));
+  if (auto p = cache().find(key)) return p;
+  const int gw = G.w, gh = G.h;
+  const std::size_t N = std::size_t(gw) * gh;
+  std::vector<std::vector<float>> m(9, std::vector<float>(N));
+  for (std::size_t k = 0; k < N; ++k) {
+    const float* I = G.data.data() + k * 3;
+    m[0][k] = I[0], m[1][k] = I[1], m[2][k] = I[2];
+    m[3][k] = I[0] * I[0], m[4][k] = I[0] * I[1], m[5][k] = I[0] * I[2], m[6][k] = I[1] * I[1], m[7][k] = I[1] * I[2], m[8][k] = I[2] * I[2];
+  }
+  for (auto& pln : m) boxMeanN(pln, gw, gh, r);
+  auto pl = std::make_shared<Plane>();
+  pl->w = gw, pl->h = gh, pl->ch = 9, pl->key = key;
+  pl->data.resize(N * 9);
+  for (std::size_t k = 0; k < N; ++k)
+    for (int c = 0; c < 9; ++c) pl->data[k * 9 + std::size_t(c)] = m[std::size_t(c)][k];
+  std::shared_ptr<const Plane> out = pl;
+  cache().put(key, out);
+  return out;
+}
+
+std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& src, const GuideKey& gk, float sx, float sy, int cap, float refine,
+                                         const MaskComponent& mc) {
   const int gl = std::clamp(std::max(ra.w, ra.h), 64, cap);
   const int gw = std::max(8, int(std::lround(gl * sx))), gh = std::max(8, int(std::lround(gl * sy)));
   std::uint64_t key = mix64(mix64(ra.hash, gk.key), std::uint64_t(gw) << 32 | std::uint32_t(gh));
@@ -288,28 +312,31 @@ std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& sr
     // tuned on the step-edge test (local_tests raster: a 256 px mask up to 3 low-res px off lands within 0.5 px of the image edge)
     const int r = std::max(1, int(std::lround(float(gl) * (0.012f + 0.03f * refine / 100.f))));
     const float eps = 5e-4f;
-    // 13 means: I (3), p, I p (3), I I^T (6)
-    std::vector<std::vector<float>> m(13, std::vector<float>(N));
+    // 13 means: I (3), p, I p (3), I I^T (6); the 9 of the guide alone are shared by every plane of the photo (guideStats)
+    const std::shared_ptr<const Plane> GS = guideStats(*G, r);
+    std::vector<std::vector<float>> m(13);
+    for (int c : {3, 4, 5, 6}) m[std::size_t(c)].resize(N);
     parallelFor(int(gh), [&](int j) {
       for (int i = 0; i < gw; ++i) {
         const std::size_t k = std::size_t(j) * gw + i;
         const float* I = G->data.data() + k * 3;
         const float p = P[k];
-        m[0][k] = I[0], m[1][k] = I[1], m[2][k] = I[2], m[3][k] = p;
+        m[3][k] = p;
         m[4][k] = I[0] * p, m[5][k] = I[1] * p, m[6][k] = I[2] * p;
-        m[7][k] = I[0] * I[0], m[8][k] = I[0] * I[1], m[9][k] = I[0] * I[2], m[10][k] = I[1] * I[1], m[11][k] = I[1] * I[2], m[12][k] = I[2] * I[2];
       }
     });
-    for (auto& pln : m) boxMeanN(pln, gw, gh, r);
+    for (int c : {3, 4, 5, 6}) boxMeanN(m[std::size_t(c)], gw, gh, r);
+    const int gsMap[13] = {0, 1, 2, -1, -1, -1, -1, 3, 4, 5, 6, 7, 8};  // channel of m[c] in GS
     std::vector<std::vector<float>> ab(4, std::vector<float>(N));
     parallelFor(int(gh), [&](int j) {
       for (int i = 0; i < gw; ++i) {
         const std::size_t k = std::size_t(j) * gw + i;
-        const double mI[3] = {m[0][k], m[1][k], m[2][k]}, mp = m[3][k];
-        const double cIp[3] = {m[4][k] - mI[0] * mp, m[5][k] - mI[1] * mp, m[6][k] - mI[2] * mp};
-        double S[3][3] = {{m[7][k] - mI[0] * mI[0] + eps, m[8][k] - mI[0] * mI[1], m[9][k] - mI[0] * mI[2]},
-                          {0, m[10][k] - mI[1] * mI[1] + eps, m[11][k] - mI[1] * mI[2]},
-                          {0, 0, m[12][k] - mI[2] * mI[2] + eps}};
+        auto M = [&](int c) { return double(gsMap[c] >= 0 ? GS->data[k * 9 + std::size_t(gsMap[c])] : m[std::size_t(c)][k]); };
+        const double mI[3] = {M(0), M(1), M(2)}, mp = M(3);
+        const double cIp[3] = {M(4) - mI[0] * mp, M(5) - mI[1] * mp, M(6) - mI[2] * mp};
+        double S[3][3] = {{M(7) - mI[0] * mI[0] + eps, M(8) - mI[0] * mI[1], M(9) - mI[0] * mI[2]},
+                          {0, M(10) - mI[1] * mI[1] + eps, M(11) - mI[1] * mI[2]},
+                          {0, 0, M(12) - mI[2] * mI[2] + eps}};
         S[1][0] = S[0][1], S[2][0] = S[0][2], S[2][1] = S[1][2];
         // inverse of the symmetric 3x3
         const double c00 = S[1][1] * S[2][2] - S[1][2] * S[2][1], c01 = S[0][2] * S[2][1] - S[0][1] * S[2][2],
@@ -544,14 +571,16 @@ void writeDesc(Frame& f) {
     b[0] = float(A.nc), b[1] = A.invert ? 1.f : 0.f, b[2] = A.weight, b[3] = float(A.c0);
     for (int k = 0; k < 12; ++k) b[4 + k] = A.lin[k];
     b[16] = A.tintRgb[0], b[17] = A.tintRgb[1], b[18] = A.tintRgb[2], b[19] = A.hasLinear ? 1.f : 0.f;
-    for (int k = 0; k < kLocalWindowSlots; ++k) b[20 + k] = A.win[k];
+    for (int k = 0; k < kLocalWindowSlots; ++k) b[20 + k] = A.win[k];  // b[20..27]: amount channels
   }
   for (std::size_t c = 0; c < f.comp.size(); ++c) {
     const Comp& C = f.comp[c];
     float* b = V(8 + 256 + 4 * int(c));
-    b[0] = float(C.kind), b[1] = float(C.op), b[2] = C.invert ? 1.f : 0.f, b[3] = float(C.planeOffset);
+    // plane offset as (offset / 4096, offset % 4096): exact in floats beyond 2^24 floats of planes (12 raster grids + 8 brushes)
+    b[0] = float(C.kind), b[1] = float(C.op), b[2] = C.invert ? 1.f : 0.f, b[3] = float(C.planeOffset >> 12);
     for (int k = 0; k < 8; ++k) b[4 + k] = C.p[k];
     if (C.plane) b[12] = float(C.plane->w), b[13] = float(C.plane->h), b[14] = float(C.plane->ch);
+    b[15] = float(C.planeOffset & 4095);
   }
   std::uint64_t h = 0xDE5C;
   for (float x : f.desc) h = mixf(h, x);
@@ -668,6 +697,29 @@ Counters counters() {
   return c;
 }
 void resetPlaneCache() { cache().clear(); }
+void guideSample(const SourceImage& src, int i, int j, float px[3]) {
+  const ImageF& im = src.linear;
+  int x, y;
+  guideSamplePos(im.width, im.height, i, j, x, y);
+  const float* p = nullptr;
+  if (const GuideCapture* cap = guideCaptureFor(im)) p = cap->samples.data() + 3 * std::size_t(j * 64 + i);
+  else if (im.data.size() >= std::size_t(im.width) * im.height * 3) p = im.row(y) + 3 * std::size_t(x);
+  if (!p) {  // a size-only source without a capture (streaming export of an edit without raster refinement): mid grey
+    px[0] = px[1] = px[2] = 0.18f;
+    return;
+  }
+  px[0] = p[0], px[1] = p[1], px[2] = p[2];
+}
+std::shared_ptr<const Plane> planeCacheFind(std::uint64_t key) { return cache().find(key); }
+void planeCachePut(std::uint64_t key, std::shared_ptr<const Plane> p) { cache().put(key, std::move(p)); }
+void boxRepeat(std::vector<float>& d, int w, int h, int ch, int r) { boxRep(d, w, h, ch, r); }
+std::shared_ptr<const Plane> guideGridOf(const SourceImage& src, int gw, int gh, float& ref, std::uint64_t& key) {
+  if (src.linear.width <= 0 || src.linear.height <= 0) return nullptr;
+  const GuideKey gk = guideKeyOf(src);
+  ref = gk.ref;
+  key = gk.key;
+  return guideGrid(src, gk, gw, gh);
+}
 
 // ---- streaming export capture (section 42) -------------------------------------------------------------------------------------------
 void guideSamplePos(int W, int H, int i, int j, int& x, int& y) {
@@ -677,6 +729,17 @@ void guideSamplePos(int W, int H, int i, int j, int& x, int& y) {
 void guideCellSpan(int j, int n, int N, int& a, int& b) {
   a = int(std::floor(double(j) * N / n));
   b = std::min(N, std::max(a + 1, int(std::floor(double(j + 1) * N / n))));
+}
+int rasterGridCap(const std::vector<LocalAdjustment>& list, bool interactive) {
+  // the refinement grid's long edge: 1024 (exact) / 512 (interactive) up to 4 raster components (unchanged edits), smaller when many are active so
+  // the coefficient grids stay within the bound of section 40.4 (12 x 640^2 x 16 B = 79 MB)
+  std::vector<std::string> refs;  // distinct planes: a plane used by several components counts once
+  for (const LocalAdjustment& a : list)
+    for (const MaskComponent& m : a.mask)
+      if (m.kind == MaskKind::Raster && !m.ref.empty() && std::find(refs.begin(), refs.end(), m.ref) == refs.end()) refs.push_back(m.ref);
+  const int n = int(refs.size());
+  const int cap = n <= 4 ? 1024 : n <= 8 ? 768 : 640;
+  return interactive ? std::min(cap, 512) : cap;
 }
 std::vector<std::pair<int, int>> guideGridSizes(const std::vector<LocalAdjustment>& list, int W, int H, bool interactive) {
   std::vector<std::pair<int, int>> out;
@@ -688,10 +751,20 @@ std::vector<std::pair<int, int>> guideGridSizes(const std::vector<LocalAdjustmen
       if (m.kind != MaskKind::Raster || m.refine <= 0.f) continue;
       const std::shared_ptr<const Raster> ra = rasterGet(m.ref);
       if (!ra) continue;
-      const int gl = std::clamp(std::max(ra->w, ra->h), 64, interactive ? 512 : 1024);  // rasterPlane's grid
+      const int gl = std::clamp(std::max(ra->w, ra->h), 64, rasterGridCap(list, interactive));  // rasterPlane's grid
       const std::pair<int, int> s{std::max(8, int(std::lround(gl * sx))), std::max(8, int(std::lround(gl * sy)))};
       if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
     }
+  // portrait retouch (docs section 43): the grid the heal spots are detected / searched on
+  for (const LocalAdjustment& a : list) {
+    if (!a.enabled || a.strength <= 0.f) continue;
+    bool search = a.ops.v[kLoHeal] > 0.f && !a.mask.empty();
+    for (const HealSpot& hs : a.spots) search = search || !hs.src;
+    if (!search) continue;
+    const int G = healGridLong(a, W, H);
+    const std::pair<int, int> s{std::max(8, int(std::lround(float(G) * sx))), std::max(8, int(std::lround(float(G) * sy)))};
+    if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+  }
   return out;
 }
 void setGuideCapture(const GuideCapture* c) { tlGuide = c; }
@@ -703,16 +776,25 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
   const int W = src.linear.width, H = src.linear.height, L = std::max(W, H);
   f->sx = float(W) / float(L);
   f->sy = float(H) / float(L);
+  f->srcLong = float(L);
   GuideKey gk;
   bool gkDone = false;
   int nRaster = 0, nBrush = 0;
+  const int rasterCap = rasterGridCap(list, interactive);
+  std::vector<std::string> rasterRefs;
+  std::vector<std::pair<std::uint64_t, int>> planeAt;  // plane key -> offset in the store: a plane used by several components is stored once
   std::uint64_t pk = 0x91A4E5;
+  float iodMin = 0.f;
   for (std::size_t ai = 0; ai < list.size(); ++ai) {
     const LocalAdjustment& a = list[ai];
-    if (a.mask.empty()) continue;
     if (!preview && (!a.enabled || a.strength <= 0.f)) continue;
+    const bool heal = !preview && (a.ops.v[kLoHeal] > 0.f || !a.spots.empty());
+    if (a.mask.empty()) {  // manual heal spots need no mask
+      if (heal && !a.spots.empty()) healSpotsOf(a, *f, -1, src, retouchIodOf(a, *f, -1, src), f->spots);
+      continue;
+    }
     const bool lin = a.ops.anyLinear() && !preview, win = a.ops.anyWindow() && !preview;
-    if (!lin && !win && !preview) continue;
+    if (!lin && !win && !heal && !preview) continue;
     Adj A;
     A.srcIndex = int(ai);
     A.invert = a.invert;
@@ -724,10 +806,11 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
     A.lin[4] = v[kLoWhites] / 100.f, A.lin[5] = v[kLoBlacks] / 100.f;
     A.lin[6] = v[kLoTemp], A.lin[7] = v[kLoTint];
     A.lin[8] = v[kLoSaturation] / 100.f, A.lin[9] = v[kLoVibrance] / 100.f, A.lin[10] = v[kLoColorSat] / 100.f;
+    A.lin[11] = v[kLoWhiten] / 100.f;
     if (A.lin[10] > 0.f) tintColour(v[kLoColorHue], A.tintRgb);
     A.hasLinear = lin;
-    A.win[0] = v[kLoClarity] / 100.f, A.win[1] = v[kLoTexture] / 100.f, A.win[2] = v[kLoSharpen] / 100.f;
-    A.win[3] = v[kLoNoise] / 100.f, A.win[4] = v[kLoDehaze] / 100.f;
+    if (win)
+      for (int k = 0; k < kLocalWindowOps; ++k) A.wop[k] = v[std::size_t(kLocalWindowFirst + k)] / 100.f;
     for (const MaskComponent& m : a.mask) {
       Comp c;
       c.op = int(m.op);
@@ -765,9 +848,12 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
           break;
         case MaskKind::Raster: {
           c.kind = kCRaster;
-          if (++nRaster > kMaxRasterComponents) {
-            logOncePerKey("local adjustments: more than 4 raster components in one edit, the extra ones are ignored");
-            break;
+          if (std::find(rasterRefs.begin(), rasterRefs.end(), m.ref) == rasterRefs.end()) {  // the cap counts distinct planes
+            if (++nRaster > kMaxRasterComponents) {
+              logOncePerKey("local adjustments: more than 12 raster planes in one edit, the extra ones are ignored");
+              break;
+            }
+            rasterRefs.push_back(m.ref);
           }
           const std::shared_ptr<const Raster> ra = rasterGet(m.ref);
           if (!ra) {
@@ -777,31 +863,78 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
           if (!gkDone) {
             gk = guideKeyOf(src);
             gkDone = true;
+            f->guideRef = gk.ref;
           }
-          c.plane = rasterPlane(*ra, src, gk, f->sx, f->sy, interactive, m.refine, m);
+          c.plane = rasterPlane(*ra, src, gk, f->sx, f->sy, rasterCap, m.refine, m);
           f->anyRaster = true;
           break;
         }
         default: continue;  // unknown kinds evaluate to nothing
       }
       if (c.plane) {
-        c.planeOffset = f->planeFloats;
-        f->planeFloats += int(c.plane->data.size());
+        int off = -1;
+        for (const auto& e : planeAt)
+          if (e.first == c.plane->key) off = e.second;
+        if (off < 0) {
+          off = f->planeFloats;
+          f->planeFloats += int(c.plane->data.size());
+          planeAt.push_back({c.plane->key, off});
+        }
+        c.planeOffset = off;
         pk = mix64(pk, c.plane->key);
       }
       f->comp.push_back(c);
     }
     A.nc = int(f->comp.size()) - A.c0;
-    if (A.nc == 0) continue;
+    if (A.nc == 0) {
+      if (heal && !a.spots.empty()) healSpotsOf(a, *f, -1, src, retouchIodOf(a, *f, -1, src), f->spots);
+      continue;
+    }
+    f->adj.push_back(A);
+    const int self = int(f->adj.size()) - 1;
+    // portrait retouch (docs section 43): the scale of the frame's retouch planes (the smallest face) and the heal spots
+    bool rtW = false;
+    for (int k = kLocalRetouchFirst; k <= kLoFaceLight; ++k) rtW = rtW || v[std::size_t(k)] != 0.f;
+    if (rtW || heal) {
+      const float iod = retouchIodOf(a, *f, self, src);
+      if (rtW) iodMin = iodMin > 0.f ? std::min(iodMin, iod) : iod;
+      if (heal) healSpotsOf(a, *f, self, src, iod, f->spots);
+    }
+    if (!lin && !win && !preview) {  // heal only: nothing to evaluate per pixel
+      f->adj.pop_back();
+      f->comp.resize(std::size_t(A.c0));
+      continue;
+    }
     f->anyLinear |= lin;
     if (win)
-      for (int k = 0; k < kLocalWindowSlots; ++k)
-        if (A.win[k] != 0.f) f->winUsed[k] = true;
+      for (int k = 0; k < kLocalWindowOps; ++k)
+        if (A.wop[k] != 0.f) f->winUsed[k] = true;
     f->anyWindow |= win;
-    f->needGuided |= A.win[0] != 0.f || A.win[4] != 0.f;
-    f->adj.push_back(A);
   }
-  if (f->adj.empty()) return nullptr;
+  f->iod = iodMin > 0.f ? iodMin : 0.06f;
+  // amount channels: the legacy identity without a retouch op (bit-identical frames), else the used ops packed (docs section 43)
+  for (int k = kLocalLegacyWindowOps; k < kLocalWindowOps; ++k) f->retouchW |= f->winUsed[k];
+  for (int k = 0; k < kLocalLegacyWindowOps; ++k) f->legacyW |= f->winUsed[k];
+  if (!f->retouchW) {
+    for (int c = 0; c < kLocalLegacyWindowOps; ++c) f->chanOp[c] = kLocalWindowFirst + c;
+  } else {
+    int n = 0;
+    for (int k = 0; k < kLocalWindowOps; ++k) {
+      if (!f->winUsed[k]) continue;
+      if (n < kLocalWindowSlots) {
+        f->chanOp[n++] = kLocalWindowFirst + k;
+      } else {
+        f->winUsed[k] = false;
+        logOncePerKey("local adjustments: more than 8 different window ops in one edit, the extra ones are ignored");
+      }
+    }
+  }
+  for (Adj& A : f->adj) {
+    for (int c = 0; c < kLocalWindowSlots; ++c) A.win[c] = f->chanOp[c] >= 0 ? A.wop[f->chanOp[c] - kLocalWindowFirst] : 0.f;
+    f->needGuided |= (f->winUsed[0] && A.wop[0] != 0.f) || (f->winUsed[4] && A.wop[4] != 0.f);
+  }
+  if (!f->spots.empty()) f->anyWindow = true;
+  if (f->adj.empty() && f->spots.empty()) return nullptr;
   if (f->anyRaster && gkDone) f->guideRef = gk.ref;
   f->planesKey = mix64(pk, std::uint64_t(f->planeFloats));
   writeDesc(*f);
@@ -812,7 +945,7 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
 std::vector<float> planeStore(const Frame& f) {
   std::vector<float> out(std::size_t(std::max(1, f.planeFloats)), 0.f);
   for (const Comp& c : f.comp)
-    if (c.plane) std::memcpy(out.data() + c.planeOffset, c.plane->data.data(), c.plane->bytes());
+    if (c.plane) std::memcpy(out.data() + c.planeOffset, c.plane->data.data(), c.plane->bytes());  // shared planes: the same bytes again
   return out;
 }
 
@@ -881,6 +1014,19 @@ void applyLinear(const Frame& f, float u, float v, const float src[3], float px[
       const float t = l[10] * wa;
       for (int c = 0; c < 3; ++c) px[c] *= 1.f + (A.tintRgb[c] - 1.f) * t;
     }
+    if (l[11] > 0.f) {  // whiten (teeth, eye whites; docs section 43): warm chroma out, a capped lift
+      const float t = std::min(l[11] * wa, 1.f);
+      float Lr, hue, sat;
+      rangeOf(px, Lr, hue, sat);
+      const float hw = sstep(0.f, 20.f, hue) * (1.f - sstep(115.f, 140.f, hue));
+      const float Y = px[0] * kLumaPP[0] + px[1] * kLumaPP[1] + px[2] * kLumaPP[2];
+      const float s = 1.f - 0.7f * t * hw;
+      for (int c = 0; c < 3; ++c) px[c] = std::max(Y + (px[c] - Y) * s, 0.f);
+      if (Y > 1e-9f) {
+        const float Y2 = std::min(Y * std::exp2(0.5f * t), std::max(Y, kWhitenCeiling));
+        for (int c = 0; c < 3; ++c) px[c] *= Y2 / Y;
+      }
+    }
   }
 }
 
@@ -904,7 +1050,11 @@ void linearBlock(const Frame& f, const FrameKernels& fk, float* px, int n, int x
 
 int auxLayout(const Frame& f, AuxTarget& t) {
   int n = 0;
-  for (int k = 0; k < kLocalWindowSlots; ++k) t.slot[k] = f.winUsed[k] ? n++ : -1;
+  for (int c = 0; c < kLocalWindowSlots; ++c) {
+    const int op = f.chanOp[c];
+    t.slot[c] = op >= 0 && f.winUsed[op - kLocalWindowFirst] ? n++ : -1;
+  }
+  if (n == 0 && f.anyWindow) t.slot[0] = n++;  // heal spots only: one (zero) plane, the window node needs its amounts
   return n;
 }
 
@@ -917,12 +1067,34 @@ DetailRadii detailRadii(const Frame& f, float scale) {
   r.guided = f.needGuided;
   int h = std::max(2 * r.rt + 2, r.rs + 1);
   if (r.guided) h = std::max(h, 4 * (2 * r.rg + 2) + 4);
-  r.halo = (h + 3) / 4 * 4;
+  if (!f.retouchW && f.spots.empty()) {
+    r.halo = (h + 3) / 4 * 4;
+    r.haloLegacy = r.halo;
+    return r;
+  }
+  // portrait retouch (docs section 43): heal, then the retouch planes, then the legacy ops, each reading the previous one's result
+  r.haloLegacy = f.legacyW ? h : 0;
+  const float ppu = haloPpu(f, scale);
+  r.haloRetouch = f.retouchW ? retouchPlanesHalo(retouchRadii(f.iod * ppu)) : 0;
+  r.haloHeal = healHalo(f, ppu);
+  r.halo = (r.haloLegacy + r.haloRetouch + r.haloHeal + 3) / 4 * 4;
   return r;
 }
 
-void detailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, int fw, int fh, float scale) {
+void detailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, int fw, int fh, float scale, const FrameKernels* fk) {
   (void)fw, (void)fh;
+  if (f.retouchW || !f.spots.empty()) {
+    if (!fk) {
+      logOncePerKey("local adjustments: portrait retouch without the frame geometry, skipped");
+    } else {
+      retouchDetailWindow(f, img, aux, scale, fk->framePlan());
+    }
+    if (!f.legacyW) return;
+  }
+  legacyDetailWindow(f, img, aux, scale);
+}
+
+void legacyDetailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float scale) {
   const int w = img.width, h = img.height;
   const std::size_t N = std::size_t(w) * h;
   const DetailRadii R = detailRadii(f, scale);
@@ -992,8 +1164,11 @@ void detailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, int fw, int
     float* p = img.row(y);
     for (int x = 0; x < w; ++x) {
       const std::size_t i = std::size_t(y) * w + x;
-      float K[kLocalWindowSlots];
-      for (int k = 0; k < kLocalWindowSlots; ++k) K[k] = aux.slot[k] >= 0 ? aux.data[std::size_t(aux.slot[k]) * aux.plane + i] : 0.f;
+      float K[kLocalLegacyWindowOps] = {0.f, 0.f, 0.f, 0.f, 0.f};  // legacy op amounts from their channels
+      for (int c = 0; c < kLocalWindowSlots; ++c) {
+        const int k = f.chanOp[c] - kLocalWindowFirst;
+        if (k >= 0 && k < kLocalLegacyWindowOps && aux.slot[c] >= 0) K[k] = aux.data[std::size_t(aux.slot[c]) * aux.plane + i];
+      }
       const float Yv = Y[i];
       float dY = 0.f;
       if (K[0] != 0.f) {

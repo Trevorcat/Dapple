@@ -38,6 +38,8 @@
 #include "engine/exec/engine_session.h"
 #include "engine/nodes/demosaic/demosaic_session.h"
 #include "export_stream.h"
+#include "dapple/film.h"
+#include "engine/nodes/film/film_node_internal.h"
 #include "local_eval.h"
 #include "mem_probe.h"
 
@@ -110,6 +112,13 @@ static const std::vector<Preset>& presets() {
   static const std::vector<Preset> p = {
       {"std", "{}"},
       {"film", R"({"film":"kodak_portra_400","film_grain":100,"film_halation":100})"},
+      {"film_slide", R"({"film":"fujifilm_velvia_100","film_grain":100,"film_halation":100})"},
+      {"film_cine", R"({"film":"kodak_vision3_500t","film_grain":100,"film_halation":100})"},
+      {"film_local_geo", R"({"film":"kodak_portra_400","film_grain":100,"film_halation":100,"crop":"4:3","rot":90,"straighten":5,"local":{"v":1,"items":[)"
+                         R"({"id":"a","strength":100,"mask":[{"kind":"radial","op":"add","cx":0.3,"cy":0.6,"rx":0.2,"ry":0.15,"angle":20,"feather":40}],"adjust":{"exposure":30,"clarity":40}},)"
+                         R"({"id":"f","strength":100,"mask":[{"kind":"raster","ref":"stream_r","refine":60}],"adjust":{"exposure":-15}}]}})"},
+      {"film_uhdr", R"({"film":"kodak_portra_400","film_grain":100})", true, false},
+      {"film_p3", R"({"film":"kodak_vision3_500t"})", false, true},
       {"modern", R"({"film":"modern_vivid","film_strength":100})"},
       {"hdr", R"({"hdr":80,"exposure":10})"},
       {"detail", R"({"clarity":60,"texture":40,"sharpen":80,"nrLuma":40,"nrColor":40,"dehaze":30})"},
@@ -364,6 +373,7 @@ static bool wholeRender(const SourceImage& src, const EditParams& p, int tile, I
 
 static void testSynthetic() {
   setRaster();
+  setEnv("DAPPLE_EXPORT_STREAM_TILE", "512");  // the band height as given (no widening for a large halo): the same tiles as the whole render
   auto m = makeMosaic(6000, 4000, false);
   const LazyFull z = lazyOf(m);
   const SourceImage whole = materializeFull(z);
@@ -475,7 +485,7 @@ static Image8 decodeJpeg(const std::vector<std::uint8_t>& b) {
 
 // Open FULL + export one preset. Returns the C API code.
 static int exportOnce(const std::string& raw, const Preset& p, const std::string& out, double* ms = nullptr, mem::Sampler* smp = nullptr, bool* streaming = nullptr) {
-  if (std::strstr(p.params, "\"film\":\"kodak")) loadFilm();
+  if (std::strstr(p.params, "\"film\":\"kodak") || std::strstr(p.params, "\"film\":\"fuji")) loadFilm();
   if (std::strstr(p.params, "raster")) setRaster();
   const auto t0 = Clock::now();
   if (smp) smp->stage("open");
@@ -523,6 +533,8 @@ static int testCapi() {
   fs::create_directories(dir);
   const char* only = std::getenv("DAPPLE_STREAM_TEST_PRESETS");  // comma list (default: all)
   setEnv("DAPPLE_ENGINE_TILE", "512");  // the whole-frame CPU path at the band height: identical tiling, so identical pixels are expected
+  setEnv("DAPPLE_EXPORT_STREAM_TILE", "512");
+  setEnv("DAPPLE_FILM_TILES", "1");     // the whole-frame film export in the same tiles (it runs whole by default: section 42.6)
   for (const Preset& p : presets()) {
     if (only && !std::strstr(only, p.id)) continue;
     const fs::path a = dir / (std::string(p.id) + "_whole.jpg"), b = dir / (std::string(p.id) + "_stream.jpg");
@@ -543,6 +555,8 @@ static int testCapi() {
     CHECK(same || (d.sizeOk && d.maxCode == 0));  // identical pixels; bytes may differ only in a gain map rounding (not expected)
   }
   setEnv("DAPPLE_ENGINE_TILE", nullptr);
+  setEnv("DAPPLE_EXPORT_STREAM_TILE", nullptr);
+  setEnv("DAPPLE_FILM_TILES", nullptr);
   setEnv("DAPPLE_EXPORT_STREAM", nullptr);
   return 0;
 }
@@ -581,6 +595,81 @@ static int testCancel() {
   return 0;
 }
 
+// ---- policy: the budget fallback and the trim before an export --------------------------------------------------------------------------
+static int testPolicy() {
+  // 1. the available-memory query fails: a budget from the physical memory, within [256 MB, 1 GB]
+  setEnv("DAPPLE_EXPORT_AVAILABLE_FAILS", "1");
+  std::string how;
+  const std::size_t b = xstream::budgetBytes(&how);
+  setEnv("DAPPLE_EXPORT_AVAILABLE_FAILS", nullptr);
+  std::printf("  available() failing: budget %.0f MB (%s); physical %.0f MB\n", double(b) / 1048576.0, how.c_str(), double(mem::physical()) / 1048576.0);
+  CHECK(how.find("physical") != std::string::npos && b >= (std::size_t(256) << 20) && b <= (std::size_t(1) << 30));
+  std::string how2;
+  const std::size_t b2 = xstream::budgetBytes(&how2);
+  std::printf("  available() working: budget %.0f MB (%s), available %.0f MB\n", double(b2) / 1048576.0, how2.c_str(), double(mem::available()) / 1048576.0);
+  CHECK(how2 == "available memory" && b2 > 0);
+  // 2. a RAW the band path cannot read (linear DNG) that does not fit is refused cleanly at the open (auto mode)
+  const fs::path lin = root() / "build/rawsamples/Apple/iPhone-12-Pro/IMG_1361.DNG";
+  if (fs::exists(lin)) {
+    setEnv("DAPPLE_EXPORT_STREAM", "auto");
+    setEnv("DAPPLE_EXPORT_BUDGET_MB", "300");
+    DappleSession* sl = dapple_session_open(lin.string().c_str(), DAPPLE_QUALITY_FULL, 0);
+    const std::string e = sl ? "" : dapple_last_error();
+    std::printf("  12 MP linear DNG, budget 300 MB: %s\n", sl ? "opened (WRONG)" : e.c_str());
+    CHECK(!sl && e.find("cannot be read in bands") != std::string::npos);
+    if (sl) dapple_session_close(sl);
+    setEnv("DAPPLE_EXPORT_BUDGET_MB", "600");
+    sl = dapple_session_open(lin.string().c_str(), DAPPLE_QUALITY_FULL, 0);
+    CHECK(sl != nullptr);
+    if (sl) dapple_session_close(sl);
+    setEnv("DAPPLE_EXPORT_BUDGET_MB", nullptr);
+    setEnv("DAPPLE_EXPORT_STREAM", nullptr);
+  }
+  // 3. an edit the open did not foresee: a plain-sized FULL session (whole frame) exporting a film stock that does not fit switches to bands
+  if (const fs::path xr = sampleRaw(); !xr.empty()) {
+    loadFilm();
+    const fs::path out = root() / "build" / "exp-out" / "demote.jpg";
+    fs::create_directories(out.parent_path());
+    setEnv("DAPPLE_EXPORT_STREAM", "auto");
+    setEnv("DAPPLE_EXPORT_BUDGET_MB", "600");  // a plain 26 MP export fits (472 MB), a film one does not
+    DappleSession* sd = dapple_session_open(xr.string().c_str(), DAPPLE_QUALITY_FULL, 0);
+    CHECK(sd && dapple_session_is_streaming(sd) == 0);
+    if (sd) {
+      CHECK(dapple_session_export_jpeg(sd, R"({"film":"kodak_portra_400"})", nullptr, 0, 92, out.string().c_str()) == DAPPLE_OK);
+      std::printf("  whole-frame session + film edit over budget: %s\n", dapple_session_is_streaming(sd) == 1 ? "switched to bands" : "NOT switched");
+      CHECK(dapple_session_is_streaming(sd) == 1);
+      dapple_session_close(sd);
+    }
+    setEnv("DAPPLE_EXPORT_BUDGET_MB", nullptr);
+    setEnv("DAPPLE_EXPORT_STREAM", nullptr);
+  }
+  // 4. the trim: another photo's cached mosaic is released, this photo's is kept
+  const fs::path a = root() / "build/rawsamples/Sony/ILCE-6700/DSC00002.ARW", c = sampleRaw();
+  if (!fs::exists(a) || c.empty()) {
+    std::printf("  SKIP trim: samples missing\n");
+    return 77;
+  }
+  DappleSession* sa = dapple_session_open(a.string().c_str(), DAPPLE_QUALITY_PREVIEW, 1024);  // caches the mosaic of a
+  CHECK(sa != nullptr);
+  if (sa) dapple_session_close(sa);
+  std::string why;
+  auto z = openFullLazy(c, DecodeOptions{}, &why);  // the mosaic of c
+  CHECK(bool(z));
+  if (!z) return 1;
+  unsigned long long hits0 = 0, miss0 = 0, hits1 = 0, miss1 = 0;
+  mosaicCacheCounters(&hits0, &miss0);
+  const std::size_t f0 = mem::footprint();
+  const std::size_t freed = xstream::trimForExport(z->mosaic->key);
+  const std::size_t f1 = mem::footprint();
+  auto again = openFullLazy(c, DecodeOptions{}, &why);  // still cached
+  mosaicCacheCounters(&hits1, &miss1);
+  std::printf("  trim released %.0f MB of cache (footprint %.0f -> %.0f MB); this photo's mosaic still cached: %s\n", double(freed) / 1048576.0, double(f0) / 1048576.0,
+              double(f1) / 1048576.0, hits1 > hits0 && miss1 == miss0 ? "yes" : "NO");
+  CHECK(freed >= std::size_t(20) << 20);  // the 33 MP mosaic of a (66 MB)
+  CHECK(hits1 > hits0 && miss1 == miss0);
+  return 0;
+}
+
 // ---- mem (one measurement per process) ---------------------------------------------------------------------------------------------------
 static int cmdMem(int argc, char** argv) {
   if (argc < 4) {
@@ -614,7 +703,169 @@ static int cmdMem(int argc, char** argv) {
   return rc == DAPPLE_OK ? 0 : 1;
 }
 
+// ---- mixbands: film Gaussian mixtures in row bands == the whole-plane mixtures, bit for bit ---------------------------------------------
+static int BANDH = 256;
+static void testMixBands() {
+  if (const char* e = std::getenv("BANDH")) BANDH = std::atoi(e);
+  loadFilm();
+  namespace fd = dapple::film::detail;
+  const fd::SpatialKernels& K = fd::selectSpatialKernels();
+  for (float fscale : {0.25f, 1.f, 4.f})
+  for (const auto& sz : {std::pair<int, int>{3001, 2003}, std::pair<int, int>{1333, 2777}}) {
+    const int W = sz.first, H = sz.second;
+    engine::filmnode::FilmFrameArgs fa;
+    const auto lib = film::defaultLibrary();
+    fa.lib = lib.get(), fa.stock = "kodak_portra_400", fa.paper = "kodak_portra_endura", fa.w = W, fa.h = H;
+    fa.formatScale = fscale;  // a 61 MP pixel pitch on a smaller frame: the wide components reach level 5+
+    engine::filmnode::FilmResolved r;
+    CHECK(engine::filmnode::filmFrameResolved(fa, r));
+    const auto pd = engine::filmnode::planOf(r);
+    std::vector<float> src(std::size_t(W) * H), half(std::size_t((W + 1) / 2) * ((H + 1) / 2));
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x) src[std::size_t(y) * W + x] = 0.3f + 0.2f * std::sin(x * 0.013f + y * 0.007f) + float(hash32(std::uint32_t(x * 7919 + y * 104729)) & 1023) * 1e-4f;
+    for (std::size_t i = 0; i < half.size(); ++i) half[i] = src[i];
+    struct Case { const fd::Mixture* m; bool half; const char* n; };
+    const Case cases[] = {{&pd->plan.halo[0], false, "halo R"}, {&pd->plan.halo[2], false, "halo B"}, {&pd->plan.dir[0], true, "dir (half)"}};
+    for (const Case& c : cases) {
+      if (c.half && !fd::mixtureFitsHalf(*c.m)) continue;  // the film runs a half-resolution DIR field only for such mixtures (FilmPlanData::dirHalf)
+      fd::Arena arena;
+      const int iw = c.half ? (W + 1) / 2 : W, ih = c.half ? (H + 1) / 2 : H;
+      const float* in = c.half ? half.data() : src.data();
+      fd::Plane ip{const_cast<float*>(in), iw, ih, iw};
+      std::vector<float> whole(std::size_t(W) * H), band(std::size_t(W) * H, -1.f);
+      fd::Plane op{whole.data(), W, H, W};
+      if (c.half) fd::applyMixtureHalf(K, arena, ip, op, *c.m);
+      else fd::applyMixture(K, arena, ip, op, *c.m);
+      {  // the whole-plane function is deterministic (a second run gives the same bits)
+        std::vector<float> again(whole.size());
+        fd::Plane op2{again.data(), W, H, W};
+        fd::Arena arena2;
+        if (c.half) fd::applyMixtureHalf(K, arena2, ip, op2, *c.m);
+        else fd::applyMixture(K, arena2, ip, op2, *c.m);
+        const bool det = std::memcmp(again.data(), whole.data(), whole.size() * 4) == 0;
+        if (!det) std::printf("    whole-plane %s is NOT deterministic\n", c.n);
+        CHECK(det);
+      }
+      fd::MixtureBands mb;
+      mb.setup(*c.m, W, H, c.half);
+      auto rowAt = [&](int y) -> const float* { return in + std::size_t(y) * iw; };
+      if (mb.needsPrepare())
+        for (int y = 0; y < ih; y += 301) mb.feed(K, y, std::min(ih, y + 301), rowAt);
+      CHECK(mb.prepared());
+      int maxIn = 0;
+      for (int a = 0; a < H; a += BANDH) {
+        const int b = std::min(H, a + BANDH);
+        int ia, ib;
+        mb.inputRange(a, b, ia, ib);
+        maxIn = std::max(maxIn, ib - ia);
+        mb.rows(K, a, b, [&](int y) -> const float* { CHECK(y >= ia && y < ib); return rowAt(y); }, [&](int y) { return band.data() + std::size_t(y) * W; });
+      }
+      const bool same = std::memcmp(whole.data(), band.data(), whole.size() * 4) == 0;
+      if (!same) {
+        double md = 0;
+        int fy = -1, fx = -1;
+        for (int y = 0; y < H; ++y)
+          for (int x = 0; x < W; ++x) {
+            const double d = std::fabs(double(whole[std::size_t(y) * W + x]) - band[std::size_t(y) * W + x]);
+            if (std::memcmp(&whole[std::size_t(y) * W + x], &band[std::size_t(y) * W + x], 4) != 0 && fy < 0) fy = y, fx = x;
+            md = std::max(md, d);
+          }
+        std::printf("    max |diff| %.3g, first at (%d, %d): whole %.6g band %.6g\n", md, fx, fy, whole[std::size_t(fy) * W + fx], band[std::size_t(fy) * W + fx]);
+      }
+      std::printf("  %dx%d %-10s: bands of 256 rows read <= %d input rows, levels kept %.1f MB: %s\n", W, H, c.n, maxIn, double(mb.wholeBytes()) / 1048576.0,
+                  same ? "bit-identical" : "DIFFERENT");
+      CHECK(same);
+    }
+  }
+}
+
+// ---- filmbands: the film in row bands == runFilmFrame of the whole frame, bit for bit ------------------------------------------------
+static void testFilmBands() {
+  loadFilm();
+  const auto lib = film::defaultLibrary();
+  struct S {
+    const char* stock;
+    const char* paper;
+  };
+  const S stocks[] = {{"kodak_portra_400", "kodak_portra_endura"}, {"fujifilm_velvia_100", "none"}, {"kodak_vision3_500t", "kodak_2383"}};
+  for (const S& st : stocks)
+    for (float fscale : {1.f, 3.f}) {
+      const int W = 2400, H = 1601;
+      engine::filmnode::FilmFrameArgs a;
+      a.lib = lib.get(), a.stock = st.stock, a.paper = st.paper, a.w = W, a.h = H, a.formatScale = fscale;
+      a.gain[0] = 1.8f, a.gain[1] = 1.f, a.gain[2] = 1.4f;
+      a.quality = 2, a.grainPct = 100, a.halationPct = 100;
+      std::vector<float> in(std::size_t(W) * H * 3), whole(in.size()), band(in.size(), -1.f);
+      for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+          const float u = float(x) / W, v = float(y) / H, n = float(hash32(std::uint32_t(x) * 73856093u ^ std::uint32_t(y) * 19349663u) & 255) / 2550.f;
+          float* p = in.data() + (std::size_t(y) * W + x) * 3;
+          p[0] = 0.02f + 0.5f * u * u + n, p[1] = 0.03f + 0.4f * v + n, p[2] = 0.02f + 0.3f * (1 - u) * v + n;
+          if ((u - 0.6f) * (u - 0.6f) + (v - 0.4f) * (v - 0.4f) < 0.002f) p[0] = p[1] = p[2] = 4.f;  // a highlight: halation
+        }
+      CHECK(engine::filmnode::renderFilmFrame(a, in.data(), std::size_t(W) * 3, whole.data(), std::size_t(W) * 3));
+      engine::filmnode::FilmBands fb;
+      std::string why;
+      int inRows = 0;
+      const bool ok = fb.init(a, [&](int y0, int y1, float* rgb) {
+        if (!rgb) return true;  // prefetch of the source rows: nothing to do here
+        inRows += y1 - y0;
+        std::memcpy(rgb, in.data() + std::size_t(y0) * W * 3, std::size_t(y1 - y0) * W * 3 * 4);
+        return true;
+      }, &why);
+      CHECK(ok);
+      if (!ok) {
+        std::printf("  %s: %s\n", st.stock, why.c_str());
+        continue;
+      }
+      const int pre = inRows;
+      for (int y = 0; y < H; y += 200) CHECK(fb.rows(y, std::min(H, y + 200), band.data() + std::size_t(y) * W * 3, std::size_t(W) * 3));
+      const bool same = std::memcmp(whole.data(), band.data(), whole.size() * 4) == 0;
+      std::size_t ndiff = 0;
+      for (std::size_t i = 0; i < whole.size(); ++i) ndiff += std::memcmp(&whole[i], &band[i], 4) != 0;
+      std::printf("  %-20s format x%.0f %dx%d: %d pre-pass(es) (%.1f input frames), render read %.2f input frames, kept %.1f MB: %s (%zu values differ)\n", st.stock,
+                  double(fscale), W, H, fb.passes(), double(pre) / H, double(inRows - pre) / H, double(fb.keptBytes()) / 1048576.0, same ? "bit-identical" : "DIFFERENT", ndiff);
+      CHECK(same);
+    }
+}
+
+// ---- filmplan (diagnostics): the spatial plan of a stock at a frame size -------------------------------------------------------------
+static int cmdFilmPlan(int argc, char** argv) {
+  loadFilm();
+  const char* stock = argc > 2 ? argv[2] : "kodak_portra_400";
+  const char* paper = argc > 3 ? argv[3] : "kodak_portra_endura";
+  const int w = argc > 4 ? std::atoi(argv[4]) : 9504, h = argc > 5 ? std::atoi(argv[5]) : 6336;
+  engine::filmnode::FilmFrameArgs a;
+  const auto lib = film::defaultLibrary();
+  a.lib = lib.get();
+  a.stock = stock;
+  a.paper = paper;
+  a.w = w, a.h = h;
+  engine::filmnode::FilmResolved r;
+  if (!engine::filmnode::filmFrameResolved(a, r)) {
+    std::printf("cannot resolve %s / %s\n", stock, paper);
+    return 1;
+  }
+  const auto pd = engine::filmnode::planOf(r);
+  const auto& pl = pd->plan;
+  std::printf("%s / %s %dx%d: err '%s' boost %d preMix %d haloMix %d dir %d dirHalf %d split %d scanStage %d glare %d Hs %d Hg %d Hd %d grain %d\n", stock, paper,
+              w, h, pd->error.c_str(), pl.boost, pl.preMix, pl.haloMix, pl.dirDiffuse, pd->dirHalf, pd->split, pd->scanStage, pl.glare, pd->Hs, pd->Hg, pd->Hd,
+              pl.grain.active);
+  auto pm = [](const char* n, const film::detail::Mixture* m) {
+    for (int c = 0; c < 3; ++c) {
+      std::printf("  %s[%d] w0 %.3f:", n, c, m[c].w0);
+      for (const auto& g : m[c].comps) std::printf(" (w %.3f s %.1f)", g.w, g.sigma);
+      std::printf("\n");
+    }
+  };
+  if (pl.preMix) pm("pre", pl.pre);
+  if (pl.haloMix) pm("halo", pl.halo);
+  if (pl.dirDiffuse) pm("dir", pl.dir);
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::strcmp(argv[1], "filmplan") == 0) return cmdFilmPlan(argc, argv);
   if (argc >= 2 && std::strcmp(argv[1], "mem") == 0) return cmdMem(argc, argv);
   if (argc < 2) {
     std::printf("usage: dapple_export_stream_tests <region|reductions|encoder|synthetic|peak|capi|cancel> | mem <raw> <preset> ...\n");
@@ -626,10 +877,13 @@ int main(int argc, char** argv) {
   if (id == "region") testRegion();
   else if (id == "reductions") testReductions();
   else if (id == "encoder") testEncoder();
+  else if (id == "mixbands") testMixBands();
+  else if (id == "filmbands") testFilmBands();
   else if (id == "synthetic") testSynthetic();
   else if (id == "peak") testPeak();
   else if (id == "capi") rc = testCapi();
   else if (id == "cancel") rc = testCancel();
+  else if (id == "policy") rc = testPolicy();
   else {
     std::printf("unknown test %s\n", id.c_str());
     return 2;

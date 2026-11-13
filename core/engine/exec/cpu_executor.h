@@ -52,6 +52,7 @@ struct FrameEnv {
   const ImageF* film = nullptr;   // FilmSim output plane (whole frame), null when there is no film branch
   bool blendFollows = false;      // DisplayStages feeds a Blend (else it replaces the pixel value)
   const local::AuxTarget* aux = nullptr;  // LocalLinear: where the stage-W amounts of the work window go (null: none)
+  const int* filmRow0 = nullptr;          // streaming export: frame row of film's first row (the film plane is a band)
 };
 
 constexpr std::size_t kMaxResolvedBytes = 128;
@@ -81,6 +82,12 @@ struct ExecEnv {
   // return aborts the run (Status::Cancelled). Film plans are not run this way (Unsupported).
   std::function<bool(int x0, int y0, int x1, int y1)> prepare;
   std::function<bool(int y0, int y1)> bandDone;
+  // Streaming export of a film frame (section 42.6): filmBegin replaces the whole-frame film stage (the film's pre-passes; false = render
+  // the frame whole), filmRows(y0, y1, out) renders rows of the film plane before the head reads them, filmAux fills the stage-W amounts of
+  // a work window (the local adjustments of a film frame come from its input pass).
+  std::function<bool()> filmBegin;
+  std::function<bool(int y0, int y1, ImageF& out)> filmRows;
+  std::function<bool(int x0, int y0, int x1, int y1, const local::AuxTarget& aux)> filmAux;
 };
 
 class CpuExecutor {

@@ -2401,7 +2401,7 @@ The foundation the AI masks (subject / sky / person parts / tap-to-select, `docs
 * Content keys: one ParamKey `local` (hash of the list incl. the raster planes' content hashes); `LocalLinear` / `LocalDetail` declare it, nothing else does, so the colour lattice, tone table, film tables and tone analysis are not rebuilt by a local edit. The frame-global solves (dehaze, global clarity) inherit it through their input (their input image changed: correct, as for any upstream edit).
 * **Plane cache** (process-wide, LRU, 96 MB): brush planes keyed by (stroke list, plane size), raster coefficients by (raster content, guide key, grid, refine); the guide key hashes the source size and a 64 x 64 sample of its pixels. Dragging a local or a global slider re-uses every plane (counters `brushBuilds`, `rasterBuilds`, `planeHits` in `dapple_engine_stats_json`); editing one brush re-rasterises only that component, and appending a stroke re-uses the plane of the strokes before it (prefix key) and draws the new stroke only.
 * GPU: the plane store is uploaded once per plane-set key (2 kept), the descriptors (< 12 KB) once per descriptor key.
-* **Bound:** 16 adjustments x 8 components; a brush plane <= 2048 x 2048 x 4 B = 16 MB, a raster coefficient grid <= 1024 x 1024 x 16 B = 16 MB; at most 4 raster and 8 brush components per edit (extra ones evaluate to 0, logged once): worst case 192 MB of planes for a pathological edit, typical (1 brush + 1 raster) 20 - 30 MB, cache budget 96 MB (older edits' planes go first). Per frame: aux planes 5 floats / pixel of the work window (CPU, only with stage-W ops, part of the tile budget), 2 RGBA16F on the GPU. Raster store: at most 64 planes / 96 MB (section 41), 1024 px long edge (larger inputs are area-downsampled), 8 bit.
+* **Bound:** 16 adjustments x 8 components; a brush plane <= 2048 x 2048 x 4 B = 16 MB, a raster coefficient grid <= 1024 x 1024 x 16 B = 16 MB; at most **12 raster** (4 until section 43) and 8 brush components per edit (extra ones evaluate to 0, logged once). Raster sharing: one refinement solve per distinct (plane, refine, range) and frame, cached and stored once in the GPU plane store however many components and adjustments use it; the guide statistics (box means of I and I I^T: 9 of the 13 box passes) are solved once per guide grid and radius and shared by every plane of the photo (`guideStats`), so a plane costs only its own 4 cross terms; the grid long edge drops with the number of raster components: 1024 up to 4 (old edits unchanged), 768 up to 8, 640 up to 12 (interactive tier 512 always). Worst case: rasters 12 x 640^2 x 16 B = 79 MB (+ guide statistics 640^2 x 36 B = 15 MB, shared) and brushes 8 x 16 MB = 128 MB: 222 MB for a pathological edit (was 192 MB); a 12-mask portrait without brushes 79 + 15 MB at export, 50 + 9 MB interactive; typical (1 brush + 1 raster) 20 - 30 MB, cache budget 96 MB (older edits' planes go first). Per frame: aux planes up to 8 floats / pixel of the work window (CPU, only the used channels, part of the tile budget; 5 before section 43), 2 RGBA16F on the GPU. Component descriptors carry the plane offset as (offset / 4096, offset % 4096), exact beyond 2^24 floats of planes. Raster store: at most 64 planes / 96 MB (section 41), 1024 px long edge (larger inputs are area-downsampled), 8 bit.
 
 ### 40.5 C API (additive)
 
@@ -2415,7 +2415,7 @@ Local adjustments travel inside the params JSON (`"local"`). New calls: `dapple_
 4. Range masks: `dapple_session_mask_sample_json(session, params, u, v)` at the tapped point gives L* / hue / saturation to seed the range.
 5. AI / depth masks: run the model, `dapple_mask_raster_set(id, w, h, bytes, stride)` (8 bit; stored at <= 1024 px), reference the id in a `raster` component; persist the PNG with the edit and re-supply it on open (`dapple_mask_raster_has`).
 6. Overlay: `dapple_session_mask_preview(session, params, index, long_edge, flags, &img)` (flags bit 0: photo space instead of the output frame); the app tints it red.
-7. Limits to show: 16 adjustments, 8 components, 4 rasters / 8 brushes per edit.
+7. Limits to show: 16 adjustments, 8 components, 12 rasters / 8 brushes per edit (`kMaxRasterComponents`, raised from 4 in section 43).
 
 ### 40.7 As built
 
@@ -2541,7 +2541,7 @@ A full-resolution export of a 26 MP X-S10 RAF was killed for memory on the iPhon
 
 ### 42.4 Not done / known costs
 
-* **Film stocks are not streamed**: the film branch's whole-frame stage (Gaussian mixtures of halation / camera blur, the DIR field, the highlight boost maximum) reads the whole frame (CPU and GPU). On a lazy session a film edit takes the whole-frame path when it fits the budget, else fails cleanly ("this edit needs the whole picture in memory ...", nothing written) instead of being killed. Next step: row-streaming mixtures with a ring buffer of 2r rows (exact), or out-of-core frame planes.
+* ~~Film stocks are not streamed~~: done in round 2, see 42.6.
 * Time: the streamed CPU export demosaics once for the analyses and once per sweep (2-3x a whole-frame demosaic), ~1.5-2x the whole-frame export on the desktop; local adjustments with clarity / dehaze (large LocalDetail halo) cost more (the halo is recomputed per 512-row band). Auto mode streams only when the whole frame does not fit, so phones with the memory keep the old speed.
 * DNG files with an OpcodeList3 warp and non-mosaic files (linear DNG, JPEG XL DNG, sRAW, ...) are not opened lazily (the whole-frame path as before).
 * AI-mask calls on a lazy FULL session (not used by the app) see an empty picture until something materialises it; an export whose raster plane is missing materialises it first (re-creating the plane needs the picture).
@@ -2564,3 +2564,182 @@ On this phone `auto` keeps the whole-frame path (the 61 MP prediction, 1.1 GB, i
 M1 (macOS, `mem ... std`, peak phys_footprint MB / ms; off / on): 26 MP CPU 554 / 2333 vs 130 / 3948, Metal 802 / 1917 vs 175 / 2418; 40 MP CPU 793 / 3542 vs 162 / 6292, Metal 869 / 2066 vs 212 / 3492; 61 MP CPU 1082 / 4189 vs 243 / 5406, Metal 1185 / 1052 vs 270 / 1576. region / encoder / reductions / synthetic pass; C API std / hdr / detail / geo / local / Ultra HDR byte-identical on CPU and Metal.
 
 iPhones (autotest export, editor session open, no film; limit = footprint + os_proc_available_memory at the export start, ~1.85 GB on the XR): XR auto: 26 MP whole-frame (prediction under budget) peak 1178 MB, 0.7 s; 40 MP streamed peak 750 MB, 14.5 s (7.0 s analysis pass + 6.8 s GPU demosaic of the windows); 61 MP streamed peak 858 MB, 3.4 s. XR with `DAPPLE_EXPORT_STREAM=off`: 26 MP 1170 MB, 40 MP 1329 MB, 61 MP maxRss 988 MB, all completed (no jetsam in this round: the earlier kill was not reproduced with this build). iPhone X: auto kept the whole-frame path for all three files (all completed: 0.7 / 1.4 / 3.1 s; maxRss ~1.05 GB); its stage log carried no footprint / available values, to be checked (`os_proc_available_memory` on iOS 16.7, mem_probe.h).
+
+### 42.6 Film stocks in bands (round 2)
+
+The film branch was the one that could not stream (4.4 GB at 61 MP). It now runs in bands on the CPU, bit-identical to `runFilmFrame` (`FilmBands`, `core/engine/nodes/film/film_frame.cpp`; `MixtureBands`, `core/src/film_spatial.cpp`). Per stage:
+
+| Stage | Support | How it streams |
+|---|---|---|
+| film input (geometry, local stage L) | point (through the geometry) | rows from the band source windows (column chunks when straightened) |
+| FilmExposure | point | per row |
+| highlight boost | the maximum of the whole frame | not streamed (FilmFx only, the app never sets it): whole frame / clean refusal |
+| camera diffusion (pre), scatter + halation (halo) mixtures | Gaussian mixtures, sigma up to ~30 px at 61 MP | the existing pyramid: components with sigma >= ~4 px run on box-pyramid level k (radius <= 16 px of level k). Levels >= 2 (1/16 of the pixels and less) are built once by a streamed pre-pass over the input and kept (only the level-2 accumulator: ~0.25 B/px per channel); levels 0 / 1 are evaluated per band from the input rows of the band plus their halo. Same code (`combineRows`, the old `levelCombine` generalised to row ranges), same arithmetic per pixel |
+| DIR inhibitor field | half-resolution mixture, sigma up to 150 px | the same, on the half-resolution DIR input built from E2 rows (one pre-pass over E2) |
+| develop, grain, print / scan, glare, scan blur / unsharp | tiles with small halos (grain: absolute-coordinate hash + seed; glare: same) | the very tiles of runFilmFrame (`filmTile`, shared), over the band's rows |
+| enlarger diffusion filter | whole-frame blur after the grain | not streamed (FilmFx only) |
+| local adjustments | stage L on the film input; stage-W amounts of a film frame | stage L per pixel in the input rows; the amounts of each work window recomputed (`FrameKernels::filmStreamAux`) instead of a whole-frame aux plane |
+
+The CPU executor asks for the film rows of each tile row (`ExecEnv::filmRows`), the film plane is a band (`DispRes::row0`). Film bands are 256 rows (the E / E2 / DIR band planes are full width). The GPU executor keeps a film frame resident (frame-sized E2 / q images), so a streamed film edit renders its film on the CPU also when the GPU is on.
+
+Equality: `export_stream.mixbands` (the mixtures, 3 sizes x 3 pixel pitches, full and half resolution), `export_stream.filmbands` (runFilmFrame vs FilmBands, Portra 400 / Velvia 100 / Vision3 500T, grain 100 + halation, two pitches): bit-identical. C API (real X-S10 RAF), stream on vs the whole-frame export at the same tiles (`DAPPLE_FILM_TILES=1`): Portra 400, Velvia 100, Vision3 500T, Portra + crop / rot 90 / straighten + radial and raster local adjustments, Vision3 + Display P3, Portra + Ultra HDR (plain JPEG as before: film has no headroom) byte-identical on the CPU and with the GPU executor on (SwiftShader). The default whole-frame film export runs Whole (one tile); against it the band export differs only by the tile variance of the stages after the film (NR chroma, sharpen): at most 15 codes on ~0.1 % of the pixels of the X-S10 Portra export.
+
+Found on the way: `applyMixtureHalf` reads its output as input when a component has sigma < 3 (non-deterministic): unreachable today (the DIR field takes the half-resolution path only when every sigma >= 3.2, `mixtureFitsHalf`); the tiled whole-frame film path mixed the whole-frame stage-W amounts with per-tile windows (fixed: the window's part is copied).
+
+### 42.7 Policy, trim, non-mosaic files (round 2)
+
+* The decision is taken at the FULL open after a trim: the mosaic cache keeps only this photo's mosaic, the film frame workspaces left by earlier renders are freed, idle AI models are released (`dapple_ai_release(0)`); the log line `session_open <f>: trim before the export decision released N MB ...; whole-frame peak P MB vs budget Q MB (<how>) -> stream | whole frame` shows it. GPU pools are already trimmed to their budget after every run.
+* The open cannot know the edit: a plain-sized FULL session (whole frame chosen) whose export brings a film stock (~55 B/px more) gives its float picture back and exports in bands when the whole frame would not fit (`demoteToStream`, log `export: whole frame needs N MB more ... the session switches to bands`; test `export_stream.policy`). This is what killed the first XR film run of round 2 (whole open, then a 26 MP film export).
+* Budget: `os_proc_available_memory` (iOS) / MemAvailable (Android) x share, minus 96 MB. When the query fails (returns 0), a quarter of the physical memory minus half of what the process holds, clamped to [256 MB, 1 GB] (test `export_stream.policy`; `DAPPLE_EXPORT_AVAILABLE_FAILS` simulates it).
+* Stage log lines are 640 characters now (the memory figures at their end were cut at 255).
+* Non-mosaic RAWs (linear DNG such as ProRAW, JPEG XL DNG, sRAW) and OpcodeList3 warps decode whole through LibRaw: measured 30 B/px at the open (raw + LibRaw's 16-bit image + the memory image + the float picture), 41 B/px at the peak of a plain export, 82 B/px with a film stock (12 MP iPhone DNG: 360 / 504 / 1007 MB). A 48 MP ProRAW needs ~1.4 GB to open and ~2 GB to export: above a 3 GB iPhone's headroom. With `auto`, such a file is now refused cleanly at the open when 30 B/px exceed the budget ("this WxH RAW cannot be read in bands ..."), instead of a kill. Limit on a 3 GB iPhone (budget ~600 MB): about 20 MP for these files. Streaming them (keep LibRaw's 16-bit output, 6 B/px, convert per band; the LibRaw decode itself still peaks at ~20 B/px) is not done.
+
+### 42.8 Cost (round 2)
+
+* Row cache: one band source per export (`DappleSession::bands`); the analysis pass runs bottom to top and keeps its demosaiced rows up to half the budget, the render starts at the top and copies whole windows out of the cache instead of demosaicing them again (`export_stream CPU ... N windows demosaiced, M from the row cache`). The analysis reductions do not depend on the order (each output row from its complete footprint); a raster guide (area sums in top-to-bottom order) keeps the old order. With room for the whole picture the streamed export costs about one demosaic like the whole-frame one.
+* GPU: the tiles of one row of tiles read one full-width band (`BandSource::rows`, one demosaic call per tile row instead of one per tile).
+* Wide halos (local clarity / dehaze: ~400 px at 61 MP): the band height grows to 2 x halo (max 1024): 61 MP local adjustments 77 s -> 28 s (whole frame 28 s).
+* Analysis bands of 512 rows.
+
+Redmi (CPU, `mem`, total s = open + export; MB above the process start; "budget 600" emulates a 3 GB iPhone: row cache ~130-290 MB):
+
+| | whole | bands, cache full (MemAvailable budget) | bands, budget 600 MB | bands, no cache (round 2 start) |
+|---|---|---|---|---|
+| 40 MP X-T50 std | 11.6 s / 852 | 16.1 s / 666 | 20.4 s / 540 | 22.9 s / 267 |
+| 40 MP detail | 21.5 s / 920 | 24.2 s / 704 | 45.7 s / 580 | 52.1 s / 307 |
+| 40 MP film | 16.5 s / 2874 | 37.1 s / 825 | 51.5 s / 616 | 62.7 s / 389 |
+| 61 MP A7R IV std | 15.4 s / 1161 | 13.9 s / 942 | 13.3 s / 528 | 14.7 s / 248 |
+| 61 MP detail | 32.3 s / 1269 | 36.2 s / 1001 | 37.9 s / 588 | 40.9 s / 308 |
+| 61 MP film | 17.6 s / 4066 | 26.7 s / 1161 | 29.7 s / 582 | 31.3 s / 469 |
+
+The 1.5x target holds for Bayer files and with room for the cache; X-Trans files on a tight budget stay at 1.7-3x (the CPU X-Trans demosaic is the cost, and each sweep of a clarity / dehaze edit and the film's pre-pass read the picture again).
+
+M1 (round 2, `mem`, peak phys_footprint MB / total s; whole -> bands): 26 MP std CPU 551 / 2.4 -> 132 / 3.8, Metal 803 / 1.5 -> 212 / 2.2; film CPU 1862 / 3.1 -> 157 / 8.8, Metal 2505 / 2.6 -> 191 / 5.4. 40 MP std CPU 794 / 3.7 -> 162 / 6.2, Metal 868 / 2.1 -> 217 / 3.1; film CPU 2832 / 4.9 -> 230 / 13.9, Metal 3768 / 3.3 -> 267 / 8.5. 61 MP std CPU 1080 / 4.2 -> 243 / 5.4, Metal 1196 / 1.0 -> 261 / 1.6; film CPU 4295 / 4.2 -> 274 / 7.8, Metal 4312 / 4.2 -> 292 / 7.9 (these M1 runs predate the row cache). Every M1 unit test passes; C API equality on the CPU: all 12 presets byte-identical; with Metal: the non-film presets byte-identical, the film presets differ: the whole-frame film export runs the film on Metal (GPU film parity, up to 52 codes), the band export runs it on the CPU (a GPU film in bands is not done: the GPU film keeps frame-sized E2 / q images).
+* GPU tiles of a quarter-turned picture (a row of output tiles reads a column of the source) read their own window instead of a full-width band (Metal geo 8.7 s -> SwiftShader check 10.4 -> 4.2 s).
+
+## 43. Portrait retouch as local operations (imaging engineer, 2026-11-14)
+
+Natural, photographic retouching on the local-adjustment machinery of section 40: every retouch op is a local op with a strength, applied through whatever mask its adjustment has (normally an AI plane of section 41; any mask works). Classical image processing only (no network, no generative fill; `docs/research/portrait-retouch.md` 0, 1a, 4). Skin texture is kept **by construction**: no op ever writes the high band. No face reshaping.
+
+### 43.1 Bands and the scale
+
+* **Display-referred luminance** `Y` (sRGB luma of the encoded window, as `LocalDetail`), chroma `Cr = R - Y`, `Cb = B - Y` (encoded values: perceptual enough for "toward the skin", and exactly invertible).
+* **Three bands**: `H = Y - L_f` (pores, fine hair, fine lines: never touched), `M = L_f - L_c` (blemishes, mottling, blotches), `L_c` (face shading and contours).
+  * `L_f`: 2 box passes of radius `r_f = 1 %` of the inter-ocular distance (iod; a pore is 0.2 - 0.4 % of it, a blemish 3 - 8 %), full resolution.
+  * `L_c`: guided filter (He, Sun, Tang) on the window's 1/4 grid (the clarity machinery of Detail / LocalDetail: `down` + `sep` + `gf_ab`), box radius `0.12 iod / 4`, eps `0.04^2`, applied to `L_f` (`L_c = a L_f + b`, so `M` has no `H` content). Edge-preserving: jaw, hairline, eyes, nostrils stay in `L_c`; locally linear shading too (a guided filter keeps ramps exactly).
+  * **Skin reference** `S`: normalised convolution on the 1/4 grid (2 box passes, radius `0.20 iod / 4`) of `(Y, Cr, Cb)` weighted by `w = (clamp(k_smooth + k_even + k_red + k_shine) + 0.02) (1 - k_undereye)`: the mean of the *selected skin* around the pixel (the under-eye region excluded, so it is lifted toward the cheek; without a skin adjustment the 2 % term makes it the plain neighbourhood).
+* **Scale = the face, not pixels.** Every radius is a fraction of the iod in frame pixels: `iod_px = face x ppu`, `face` = iod / photo long edge (per adjustment, JSON `retouch.face`, filled by the app from the AI face metadata: `faces.list[i].iod` of `dapple_ai_job_json`, new in this round), `ppu` = frame pixels per photo long edge (the frame's affine geometry, `local::frameAffine`, capped by the halo's `max(2048 scale, source long edge)`). A 61 MP head-shot (iod ~1100 px) and a face in a landscape (iod 40 px) get the same retouch relative to the face. One scale per frame: the smallest `face` of the adjustments with retouch window ops. Fallback when `face` is 0: from the mask's area on the 64 x 64 guide samples (face skin of one face ~3.8 iod^2, an under-eye pair ~0.2, a face oval ~4.6); with no mask information 0.06. Box radii are capped at 64 (the `sep` limit): above iod ~2100 frame px the coarse radii stop growing.
+
+### 43.2 Operations (registry rows `localOps()`; strength 0..100 each; `k` = mask x strength x op / 100 per pixel)
+
+| Op (key) | Stage | Rule |
+|---|---|---|
+| 磨皮 `smooth` | W | `Y -= min(0.92, 0.9 k_s + 0.4 k_e) g(M) M`, `g = 1 / (1 + (M / 0.08)^2)` (strong edges are left alone). The high band is untouched; the 纹理 amount is the existing `texture` op in the same adjustment (it runs after the retouch, on the retouched image). |
+| 匀肤 `even` | W | chroma `(Cr, Cb) += 0.65 k_e far (S - (Cr, Cb))`, `far = 1 - sstep(0.08, 0.16, |c - S_c|)` (colours far from skin, e.g. a glasses frame or lips the mask leaks onto, are left alone; also for redness and under-eye); luminance: 0.4 x the smoothing of `M` (shares the term above). Mean skin colour and `L_c` shading kept. |
+| 去红 `redness` | W | only pixels redder than the skin: `e = 0.95 dCr + 0.31 dCb` (d = pixel - S), `c -= 0.75 k_r far sstep(0.008, 0.04, e) d`. |
+| 去黑眼圈 `undereye` | W | `Y += 0.8 k_u clamp(S_Y - L_f, 0, 0.25)` (the low band lifted toward the surrounding skin, so texture rides on top), chroma pulled 0.7 k_u toward S (blue / purple cast). Mask: the AI plane `f<N>:undereye` (43.4). |
+| 去油光 `shine` | W | `e = L_f - S_Y`; weight `sg = sstep(0.01, 0.12, e) (1 - 0.6 sstep(0.6, 1.3, |c| / |S_c|))` (brighter than the skin, more when paler; smooth and monotone so a highlight's shoulder gets no ring); `Y -= 0.5 k_h sg max(e, 0)`; chroma 0.8 k_h sg toward the skin's chroma scaled to the new lightness (`S_c Y' / S_Y`): a shine becomes lit skin, not a grey patch. |
+| 面部补光 `facelight` | W | luminance gain `G = 1 + 0.45 k_l (1 - sstep(0.15, 0.75, L_c))`, chroma by `sqrt(G)` (a dodge from the coarse base: contrast and hue kept; a plain RGB gain pushed dark skin orange); warm / cool = the existing `temp` op in the same adjustment. |
+| 牙齿 / 眼白 `whiten` | L | scene-linear after the global gain: warm chroma out (`1 - 0.7 t w(hue)`, OKLab hue 0 .. 140 degrees), lift `+0.5 t` EV, **ceiling** `0.18 x 2^1.4` (the lift never takes a pixel above it; brighter pixels are not lifted). |
+| 祛斑 `heal` | bind | automatic spots in the mask (43.3), amount = their opacity. Manual spots: `retouch.spots`. |
+| 眼神 / 唇色 | presets | eye clarity = iris mask: `clarity 25, saturation 10` (catchlights are not protected); lips: `saturation` / `color_hue + color_sat` on the lip mask. No new kernel. |
+
+### 43.3 Spot healing
+
+* **Detection** (bind time, CPU, photo space, cached): the photo area-averaged to a grid of long edge 1024 (2048 when `face < 0.07`; the raster guide grids, so the streaming export captures it: `guideGridSizes` lists it), restricted to the mask's extent. `l = log2 Y` and `r = 0.5 log2(R/G)` of the scene-linear grid (exposure / white-balance invariant). Three scales `sigma = 1.6, 2.6, 4.2 %` iod; DoG ratio 2; score `s = max(0, -DoG(l)) + 0.5 max(0, DoG(r))` (darker and / or redder blobs); normalised by the local RMS of the clipped band over well-inside skin (radius 0.35 iod), `z = s / max(rms, 0.012)`. Spot = local maximum with `s >= 0.045` (~3 %), mask >= 0.5, `z >= z0`, `z0 = 5.6 - 0.04 x sensitivity` (default sensitivity 25 -> 4.6). **Freckle rule**: z is divided by `1 + 0.4 (n - 2)` with n = candidates within 0.3 iod, so a field of similar spots (freckles, coarse pores) is not "healed" at the default; sensitivity 100 removes them. Non-maximum suppression, at most 96 spots an adjustment, radius `2.4 sigma`, opacity = amount x strength x mask x confidence.
+* **Source**: 16 candidate offsets (8 directions x 2.5 / 3.5 radii); valid when the source disc is inside the mask (mean >= 0.6), holds no blob (`max z < z0 / 2`) and no other spot; cost = low-band difference (`l` and `r` at 5 % iod) to the ring around the spot + texture-energy ratio + distance; deterministic order. PatchMatch was rejected (Adobe patents); this is a plain directional search.
+* **Fill** (window pass `local_heal.comp`, CPU `healWindow`): `fill = I(p + o) + D(p)`, `D` = Shepard inverse-distance interpolation of the mismatch of 16 ring samples at 1.15 R (3 x 3 means at stride R / 6) between the spot and its source: the healing-brush idea (Georgiev 2004; US 6,587,592 expired) with an explicit membrane instead of a Poisson solve. Opacity `alpha (1 - sstep(0.6 R, R, d))`. Every spot reads the pass input; spots composite in list order (manual first). Spots are frame-global (photo space, mapped through the frame's affine geometry), so the pass is deterministic and tile-exact.
+* **Manual spots**: `retouch.spots = [[x, y, r], [x, y, r, dx, dy], ...]` (photo-normalised centre, radius in long-edge units 0.0005 .. 0.02, optional source offset within 4 radii; without one the engine searches like above). At most 64 an adjustment; healed whatever the mask (the spot is its own mask), opacity = strength.
+
+### 43.4 Under-eye plane (AI service, `aimask::underEyePlane`, id `ai:<photo>:f<N>:undereye`, 眼下)
+
+Frontal faces. Lower lid chains (mesh 33, 7, 163, 144, 145, 153, 154, 155, 133 and 263, 249, 390, 373, 374, 380, 381, 382, 362, outer to inner corner), "down" = perpendicular to the iris line (468 - 473) toward the mouth. Upper edge = lid + 3.5 % iod (lashes stay out), lower edge = lid + (3.5 + 24 sin(pi t')^0.7) % iod, `t' = t^1.357` (deepest at t = 0.6, toward the inner corner), 24 samples by arc length, even-odd fill, gaussian edge sigma 3.5 % iod, minus the lid opening. `kEpoch` 3 -> 4 (cached plane files are rebuilt). The faces JSON gains `iod` (fraction of the rendition's long edge = of the photo's) per face.
+
+### 43.5 Engine integration
+
+* **Registry**: `kLoSmooth .. kLoFaceLight` (stage W, contiguous after the legacy ops), `kLoWhiten` (stage L, `lin[11]` = `l2.w` of the descriptor), `kLoHeal` (stage `Heal`). `LocalAdjustment` gains `face`, `healSens`, `spots`, and `extraOps` / `extraKeys` (unknown ops and item keys are kept verbatim and written back: a newer edit survives an older build).
+* **JSON**: inside `"local"`; ops in `"adjust"`, the rest in `"retouch": {"face", "sens", "spots"}` (only when not default). `"v": 2` when an item uses them, else the old `v: 1` text byte for byte; the content hash of edits without retouch is unchanged. Older readers ignore the new keys (they read only what they know).
+* **Raster masks per edit: 12** (was 4; section 40.4 restates the bound). A retouch uses skin, under-eye, teeth, sclera, iris, lips, face, hair. The app's `app/lib/model/local_adjust.dart` constant is still 4 (UI engineer).
+* **Amount channels.** The window ops get per-pixel amounts through the two RGBA16F aux images (8 channels). Without a retouch op the channel layout is the legacy identity (channel c = op c, bit-identical frames). With one, the used window ops are packed in op order (`Frame::chanOp`; the shaders take the map in their uniform block); at most 8 different window ops in one edit (a typical retouch uses 7: texture + six retouch ops), extra ones are dropped with a log line.
+* **LocalDetail order**: heal pass -> retouch planes + combine (`local_rt_down`, `sep`, `gf_ab`, `local_retouch`) -> the legacy window ops (on the retouched image). A frame without retouch ops runs exactly the old passes. The pass that ends the pipeline carries the epilogue (grain, RGBA8).
+* **Halo** (`detailRadii`, used by the GPU tiles and the CPU planner): `heal + retouch + legacy`, each reading the previous one's output: heal `max(|o| + 2.15 R + stride) + 2`, retouch `max(2 r_f + 2, 4 (2 r_c + 2) + 4, 4 (2 r_s + 2) + 4)`, in pixels at `ppu = max(2048 scale, source long edge)`. Window origins stay multiples of 4, so interior pixels equal the whole frame. Typical: 24 MP portrait, face 0.12 -> iod ~720 px -> retouch halo ~300 px.
+* **Shared planes**: computed once per window for all adjustments (one `L_f`, one `L_c`, one `S`), not per adjustment.
+* **Exports**: band export (section 42) needs no change: the planes are window-local with a declared halo (like local clarity), the heal grid and the iod estimate read the guide capture (`guideGridSizes` lists the heal grid; `guideSample`). Cost: each 512-row band recomputes the halo (as for local clarity / dehaze). A frame-global 1/4-grid solve of `L_c` and `S` (like the global clarity `GuidedSolve`) would remove that halo; it needs an executor hunk (an extra frame-global solve slot for LocalDetail in `cpu_executor` / `gpu_executor`): not done.
+* **Interactive tier**: the same kernels on the preview frame; radii follow the face, so the preview converges to the export (bound 43.7).
+* `DAPPLE_ENGINE=off`: the old Renderer never reads `local` (tested). Edits without retouch: golden corpus unchanged.
+* **Files**: `core/src/local_retouch.{h,cpp}` (new), `local_eval.{h,cpp}`, `local_adjust.cpp`, `core/include/dapple/local_adjust.h`, shaders `local_heal.comp`, `local_rt_down.comp`, `local_retouch.comp` (new), `local.glsl`, `local_detail.comp`, `nodes/local/gpu.cpp`; one-line hunks: `nodes/main/cpu_nodes.cpp` (LocalDetail passes its FrameKernels for the geometry), `nodes/gpu_nodes.cpp` (shader names), shader lists, `core/CMakeLists.txt`; AI: `ai_masks_build.cpp`, `ai_masks.h`, `ai_masks.cpp` (plane entry, label, `iod`). Tests `tests/engine/retouch_tests.cpp` (ctest `engine.retouch_*`), golden frames `local/retouch_ops`, `local/retouch_crop_exact`, evidence tool `tests/engine/retouch_sheets.cpp`, masks script `scripts/retouch/make_masks.py`.
+
+### 43.6 UI contract (app/lib owns the UI)
+
+1. A retouch adjustment = an ordinary local adjustment: `mask` = the AI plane(s) as `raster` components (skin: `f1:faceskin`-derived `fN:face` ∩ `faceskin` minus eyes / brows / lips, or the person plane `faceskin`; under-eye: `f1:undereye`; teeth `f1:teeth`; eye whites `f1:sclera`; iris `f1:iris`; lips `f1:lips`; face light `f1:face`), `adjust` = the op values, `retouch.face` = `iod` of that face from the faces JSON (**always pass it**; the area fallback is coarse).
+2. Sliders: 磨皮 smooth, 纹理 texture (-/+), 匀肤 even, 去红 redness, 祛斑 heal (+ "灵敏度" sens), 去黑眼圈 undereye, 去油光 shine, 面部补光 facelight (+ temp), 牙齿美白 / 眼白提亮 whiten, 眼神 (clarity + saturation on iris), 唇色 (saturation / colour on lips). Recommended defaults and caps: 43.8.
+3. Tap-to-heal: map the tap with `dapple_session_map_point` to photo space, append `[x, y, r]` (r ~ 0.6 x the blemish radius / long edge, default 0.004) to `retouch.spots` of a heal adjustment (mask may be empty); a drag from the spot sets `[x, y, r, dx, dy]`.
+4. Several faces: one set of adjustments per face (each with its own `face`); the frame's planes use the smallest face.
+
+### 43.7 Measurements (desktop, RTX 4060 Ti, llvm-mingw clang -O3, `build/retouch-gpu`)
+
+* **Tests** (`dapple_retouch_tests`, ctest `engine.retouch_*`; synthetic 4:5 portrait with shading, pores, mottling, red blotches, three blemishes, under-eye crescents and a forehead shine; AI-like raster masks):
+  * `json`: round trip byte-identical, `v: 2` only with retouch, a `v: 1` edit unchanged; unknown ops (`glow`, an object op) and item keys written back verbatim; clamping (radius 0.02, offset <= 4 radii, sensitivity, `face`).
+  * `bands`: `L_c + M + H = Y` max error 0; smoothing 50 / 100: the high band changes by 1.8 % / 3.6 % of its RMS, the mid band is reduced 40 % / 78 %; amount 0 is bit-exact.
+  * `scale`: the same face at 1000 and 2000 px (the larger result area-averaged): difference / change = 0.085 smooth, 0.049 even, 0.065 under-eye, 0.056 shine, 0.026 face light (bound 0.25).
+  * `blobs`: clean skin + one blemish (3 % iod, 11 % darker and redder): found (z 8.2), source 2.5 radii away; 60 freckles of the same size and contrast: 1 spot at the default sensitivity 25, 27 at 100.
+  * `heal`: 3 of 3 synthetic blemishes found, no false spot; centre minus ring -12.3 .. -13.0 levels -> -1.2 .. -1.4; two renders identical; CPU tiles 96 / 200 vs whole max 1 code (1 - 2 bytes); manual + automatic spots under crop 4:5 + straighten 3: tile 128 vs whole max 1 code.
+  * `whiten`: 42 colours x lightness: nothing above max(input, ceiling); a yellow tooth +0.50 EV, blue / green 0.70 -> 0.91; blue pixels keep their colour.
+  * `identity`: strength 0 = bit-identical to no local; the old Renderer ignores retouch ops; a legacy edit keeps the identity channel layout; the full retouch edit packs 7 channels.
+  * `tiles`: CPU tiled (96, 256) vs whole with every retouch op + heal + texture, plain / crop + rotate 90 + straighten 4 + flip / + global and local clarity: max 1 code, <= 4 bytes of 1.4 - 2.4 M.
+  * `interactive`: 1080 interactive frame vs the 2000 px exact frame area-averaged: mean 0.250 levels with the retouch vs 0.236 without.
+  * `undereye`: the plane builder on a synthetic mesh: 253 inside both crescents, 0 above the lid, at the mouth and 35 px below.
+  * `rasters` (section 40.4): 12 distinct 1024 px planes in 12 adjustments + one plane used twice: 13 components, 12 solves, store 60.0 MB exact (cap 640) / 38.4 MB interactive (512); all 12 bands evaluate; tile 200 vs whole max 1 code.
+  * `parity` (RTX 4060 Ti, Vulkan): each op at 100, all ops, all under geometry, interactive, with global clarity / dehaze, 12 raster masks (exact and interactive), at 640 x 800 and 1200 x 1500: mean dE2000 <= 0.052, p99 <= 0.86, max 1.47; GPU tiled export (192 px) vs one tile: 0 differing bytes.
+  * Golden: the 161 old frames unchanged (off and full); new `local/retouch_ops`, `local/retouch_crop_exact`. `engine.local_*` unchanged (raster edge errors 2.84 / 0.09 / 0.07 px as in 40.8). Full ctest of `build/retouch-gpu`: 232 of 232 passed.
+
+* **Bench** (`dapple_retouch_tests bench`; one adjustment with a raster mask on a 4800 x 6000 synthetic portrait; GPU = wall ms incl. readback, median of 7; CPU = CpuExecutor; a quiet run, earlier runs under load were up to 2x slower):
+
+| op | GPU 1080 interactive | GPU 28.8 MP | CPU 1080 interactive | CPU exact 28.8 MP |
+|---|---|---|---|---|
+| none (raster mask + exposure) | 1.3 | 40.6 | 6.4 | 457 |
+| smooth / even / redness / under-eye / shine / face light (each alone) | 1.65 - 1.72 | 48.8 - 50.6 | 15.3 - 16.8 | 1068 - 1119 |
+| whiten (stage L) | 1.4 | 38.8 | 7.5 | 459 |
+| heal auto (3 spots) | 1.5 | 50.9 | 11.4 | 566 |
+| all (6 retouch ops + texture + heal + manual spot, 3 adjustments) | 2.0 | 62.1 | 37.0 | 4261 |
+| 12 raster masks, exposure each | 8.4 | 60.7 | 33.5 | 2022 |
+
+  Added cost of the retouch: +0.4 ms at 1080 and +9 - 10 ms at 28.8 MP on this GPU, whatever the number of retouch ops (they share one set of planes); CPU +9 ms at 1080, +0.6 s exact at 28.8 MP per op set, dominated by the halo of the coarse planes (iod 960 px -> ~400 px per 512 px tile; 43.9). 12 raster masks cost 8.4 ms GPU / 33.5 ms CPU per 1080 interactive frame (planes cached; 12 x 16 plane reads per pixel in the point pass).
+
+### 43.8 Evidence and verdict (CC0 portraits, masks from `scripts/retouch/make_masks.py`, sheets `build/retouch/`)
+
+Masks: `scripts/retouch/make_masks.py` (the MediaPipe reference of section 41 in the project venv; face skin = selfie class 3 x oval minus grown eyes, brows, lips and the mouth interior), fed through `dapple_mask_raster_set`; sheets by `tests/engine/retouch_sheets.cpp` in `build/retouch/`: `<name>_ops.jpg` / `_opsface.jpg` (rows smooth, even, redness, undereye, shine, facelight, heal, whiten; columns original | 50 | 100), `_crops.jpg` (200 % cheek: original | smooth 50 | smooth 100 | defaults), `_defaults.jpg`, `_bands.jpg/.txt`. Portraits: p1 (light, glasses, stubble), p2 (dark), p3 (glasses, three-quarter, faint freckles), p5 (dark, headscarf), p6 (medium, middle-aged). The CC0 set has no older face with deep wrinkles and no face with real blemishes.
+
+Band RMS of smooth 100 on the 256 px full-resolution cheek crop: change of the high band / its RMS = 0.038 (p1), 0.041 (p2), 0.037 (p3), 0.017 (p5), 0.051 (p6): pores and fine hair stay; the change is in the low / mid band (RMS 1.7 - 2.5 levels).
+
+* **p1**: smooth 100 keeps pores, stubble and the crow's feet; no halo at the frame, jaw or hairline. The skin mask covers the glasses frame: the first version turned the green frame tan under even 50 / 100; the `far` guard fixed it. Redness 100 slightly dull.
+* **p2**: texture kept at 100, shading intact. Fixed during this round: shine left a pale ring on the nose tip (non-monotone compression + a sharp saturation gate) and face light pushed the skin orange (RGB gain); both now natural at 50, visible but acceptable at 100. Even 100 flattens and greys dark skin a little.
+* **p3**: wrinkles and freckles survive smooth 100 and heal; no halo at the glasses; whiten 100 turns yellow teeth white and slightly glowing (50 is right).
+* **p5**: natural at every op's 50; no teeth mask (closed mouth), whiten acts on the sclera only.
+* **p6**: smoothing evens the red blotches on the cheek; the fine lines under the eye and on the cheek are kept at 100 (they soften, never disappear). The defaults read a little paler (redness + even take some of the cheek's warmth).
+* **Heal** found 0 - 8 spots per face (log `heal detection ... N spot(s)`); on these clean head-shots its effect is visible only at 200 %; it never touched freckles, moles, brows, lashes or frames at the default sensitivity.
+* **Recommended defaults (mild preset) / maximum to allow**: smooth 30 / 100 (never plastic), texture 0 (+10 after strong smoothing), even 25 / 60, redness 30 / 70, heal 50 at sensitivity 25 / 100 (sensitivity above ~60 removes freckles: the user's choice), under-eye 40 / 80, shine 30 / 80, face light 0 (off) / 60, whiten 30 / 60 (teeth glow above), eye clarity 25 + iris saturation 10, lips saturation 10.
+
+### 43.9 Not done
+
+* **No phone run** (Adreno / Mali / Apple); the three shaders are in the GLES list (lint at check-all) but ran only on desktop Vulkan. No Metal compile here.
+* **Not frame-global**: `L_c` and `S` are per window with a large halo (~400 px at 28.8 MP): the CPU exact export of a big head-shot costs ~0.6 s more and the band export (section 42) recomputes the halo per band. A frame-global 1/4-grid solve (like `GuidedSolve` of global clarity) needs an executor hunk in `cpu_executor` / `gpu_executor` (a LocalDetail solve slot filled once per frame before the tiles, handed to `detailWindow` / `recordLocalDetail`): described, not done (files of the streaming-export round). Coarse box radii stop at 64 grid px (iod > ~2100 frame px).
+* **One retouch scale per frame** (the smallest face): with faces of very different size the larger ones are retouched at the smaller face's scale.
+* **Heal detection** on a 1024 photo grid (2048 for faces under 7 % of the long edge): blemishes under ~2 grid px (tiny faces) are missed; range components of the mask are evaluated without the global white balance / exposure at bind time; freckles vs blemishes is a crowding rule, not semantics (a blemish among freckles stays at the default). Manual-spot source search matches the low band only.
+* CPU retouch kernels are scalar (no SIMD).
+* App side (UI engineer): `app/lib/model/local_adjust.dart` `kMaxRasterComponents` is still 4 (engine: 12), the retouch panel, tap-to-heal and presets (43.6). The AI service has no ready skin-minus-features plane; the UI composes it with subtract components and must subtract the mouth interior too (`teeth` or the inner lip polygon).
+* Heal on real blemishes and wrinkle softening on an older face are untested (no such CC0 portrait).
+
+iPhones (round 2 build, autotest: editor session open, export of the full-resolution file; limit measured on the XR: 1850 MB per-process, JetsamEvent of the killed round-2 first run; open + export in s, peak phys_footprint MB):
+
+| | XR | X |
+|---|---|---|
+| 26 MP X-S10 film (whole open, switched to bands at the export) | 1.9 + 10.9 s, 1138 | 5.0 + 12.8 s, 1121 |
+| 40 MP X-T50 film (bands) | 0.1 + 28.8 s, 1171 | 0.1 + 34.0 s, 1154 |
+| 61 MP A7R IV film (bands) | 0.03 + 31.1 s, 1133 | 0.03 + 29.5 s, 1131 |
+| 26 MP plain (whole frame: fits) | 2.3 + 0.7 s, 1164 | 2.6 + 0.8 s, 1192 |
+| 40 MP plain (bands) / whole frame (forced) | 0.1 + 7.9 s, 1063 / 3.3 + 1.4 s, 1330 | 0.1 + 9.8 s, 1093 / 4.0 + 1.4 s, 1297 |
+| 61 MP plain (bands) / whole frame (forced) | 0.04 + 3.6 s, 1091 / 1.1 + 2.0 s, - | 0.04 + 4.6 s, 1130 / 1.0 + 2.0 s, 1729 |
+| film, whole frame forced (DAPPLE_EXPORT_STREAM=off) | dies after the open (26 MP) | dies after the open (26 MP) |
+
+The trim before the decision released 6 / 50 / 77 MB (the mosaics of the previously opened files). The budget lines read e.g. "whole-frame peak 1105 MB vs budget 577 MB (available memory) -> stream" on both phones (os_proc_available_memory works on iOS 16.7 and 18.7; the round-1 X log lines were cut at 255 characters).

@@ -271,6 +271,15 @@ void Arena::reset() {
   cur_ = 0;
 }
 
+std::size_t Arena::freeAll() {
+  AlignedAlloc<float> al;
+  std::size_t b = 0;
+  for (Chunk& c : chunks_) b += c.cap * 4, al.deallocate(c.p, c.cap);
+  chunks_.clear();
+  cur_ = 0;
+  return b;
+}
+
 std::size_t Arena::capacityBytes() const {
   std::size_t s = 0;
   for (const Chunk& c : chunks_) s += c.cap * 4;
@@ -289,20 +298,25 @@ struct LevelComp {
 
 // dst = w0 * src + sum_k comps_k G * src + up2(upPlane). Processed in 2D tiles (256 x 64 + halo) so the source window,
 // the horizontal-pass buffer and the accumulator stay in L2; every pixel of src is read and of dst written once.
-void levelCombine(const SpatialKernels& K, const Plane& src, const Plane& dst, double w0, const std::vector<LevelComp>& comps,
-                  const Plane* up) {
-  const int W = src.w, H = src.h;
+// Generic over where the rows live (streaming export, section 42.6): srcRow(y) / upRow(j) return rows of the W x H source / the lw x lh
+// low plane by absolute index (already inside the plane: the reflection is applied here), dstRow(y) the output row; rows [ya, yb) of
+// dst are computed. Every output pixel is the same arithmetic on the same values whatever the rows range, so a band equals the
+// corresponding rows of the whole plane.
+template <class SrcRow, class UpRow, class DstRow>
+void combineRows(const SpatialKernels& K, SrcRow&& srcRow, int W, int H, DstRow&& dstRow, int ya, int yb, double w0, const std::vector<LevelComp>& comps,
+                 UpRow&& upRow, bool hasUp, int lw, int lh) {
   int R = 0;
   for (const auto& c : comps) R = std::max(R, c.r);
   const int TW = 256, TH = R > 16 ? 128 : 64;
-  const int ntx = (W + TW - 1) / TW, nty = (H + TH - 1) / TH;
+  const int ntx = (W + TW - 1) / TW, nty = (yb - ya + TH - 1) / TH;
+  if (nty <= 0) return;
   parallelFor(
       ntx * nty,
       [&](int ti) {
         thread_local Scratch sS, sT, sDt;
         thread_local std::vector<float> tmp;
         const int tx = ti % ntx, ty = ti / ntx;
-        const int x0 = tx * TW, x1 = std::min(W, x0 + TW), y0 = ty * TH, y1 = std::min(H, y0 + TH);
+        const int x0 = tx * TW, x1 = std::min(W, x0 + TW), y0 = ya + ty * TH, y1 = std::min(yb, y0 + TH);
         const int nx = x1 - x0, ny = y1 - y0;
         const int wS = nx + 2 * R, hS = ny + 2 * R;
         const std::ptrdiff_t sS_ = (wS + 15) & ~15, sD = (nx + 15) & ~15;
@@ -315,7 +329,7 @@ void levelCombine(const SpatialKernels& K, const Plane& src, const Plane& dst, d
         for (int sy = 0; sy < hS; ++sy) {
           const bool needRow = comps.size() > 0 || w0 != 0.0;
           if (!needRow) break;
-          const float* s = src.row(reflectIdx(y0 - R + sy, H));
+          const float* s = srcRow(reflectIdx(y0 - R + sy, H));
           float* d = S + sy * sS_;
           for (int i = 0; i < lo; ++i) d[i] = s[reflectIdx(gx0 + i, W)];
           std::memcpy(d + lo, s + gx0 + lo, std::size_t(hi - lo) * 4);
@@ -326,8 +340,7 @@ void levelCombine(const SpatialKernels& K, const Plane& src, const Plane& dst, d
           if (w0 != 0.0) K.scaleRow(s, Dt + y * sD, nx, float(w0));
           else std::memset(Dt + y * sD, 0, std::size_t(nx) * 4);
         }
-        if (up) {
-          const int lw = up->w, lh = up->h;
+        if (hasUp) {
           const int ilo = x0 / 2, ihi = (x1 - 1) / 2;
           const int cnt = ihi - ilo + 5;  // low columns ilo-2 .. ihi+2
           if (int(tmp.size()) < cnt + 8) tmp.resize(cnt + 8);
@@ -338,7 +351,7 @@ void levelCombine(const SpatialKernels& K, const Plane& src, const Plane& dst, d
             const int gy = y0 + y, j = gy >> 1;
             const int base = (gy & 1) ? j - 1 : j - 2;
             const float* rows[4];
-            for (int t = 0; t < 4; ++t) rows[t] = up->row(reflectIdx(base + t, lh));
+            for (int t = 0; t < 4; ++t) rows[t] = upRow(reflectIdx(base + t, lh));
             float* t0 = tmp.data();  // t0[k] <-> low column ilo - 2 + k
             K.lerpRows(rows[0] + jlo, rows[1] + jlo, rows[2] + jlo, rows[3] + jlo, (gy & 1) ? wOdd : wEven,
                        t0 + (jlo - (ilo - 2)), jhi - jlo + 1);
@@ -356,9 +369,16 @@ void levelCombine(const SpatialKernels& K, const Plane& src, const Plane& dst, d
           for (int y = 0; y < ny; ++y)
             K.firCol(T + std::ptrdiff_t(y + r) * sD, sD, Dt + y * sD, nx, c.wv.data(), r, 1);
         }
-        for (int y = 0; y < ny; ++y) std::memcpy(dst.row(y0 + y) + x0, Dt + y * sD, std::size_t(nx) * 4);
+        for (int y = 0; y < ny; ++y) std::memcpy(dstRow(y0 + y) + x0, Dt + y * sD, std::size_t(nx) * 4);
       },
       1);
+}
+
+void levelCombine(const SpatialKernels& K, const Plane& src, const Plane& dst, double w0, const std::vector<LevelComp>& comps,
+                  const Plane* up) {
+  combineRows(
+      K, [&](int y) -> const float* { return src.row(y); }, src.w, src.h, [&](int y) { return dst.row(y); }, 0, src.h, w0, comps,
+      [&](int j) -> const float* { return up->row(j); }, up != nullptr, up ? up->w : 0, up ? up->h : 0);
 }
 
  void downPlane(const Plane& src, const Plane& dst) {
@@ -384,14 +404,19 @@ void gaussianBlurPlane(const SpatialKernels& K, const Plane& src, const Plane& d
 }
 
 namespace {
-// src: full-resolution input (null when `half` is given); half: input already box-averaged to half resolution.
-void mixImpl(const SpatialKernels& K, Arena& arena, const Plane* src, const Plane* half, const Plane& dst, const Mixture& mix,
-             double kMinLowSigma) {
+// The pyramid plan of a mixture on a W x H output: per-level components, the identity weight, the deepest level.
+struct LevelPlan {
+  double w0 = 1.0;
+  std::vector<std::vector<LevelComp>> per;
+  int maxLevel = 0;
+};
+LevelPlan planLevels(const Mixture& mix, int W, int H, bool half, double kMinLowSigma) {
+  LevelPlan lp;
   double w0 = mix.w0;
   // pyramid depth available
   int avail = 0;
   {
-    int w = dst.w, h = dst.h;
+    int w = W, h = H;
     while (avail < 14) {
       const int nw = (w + 1) / 2, nh = (h + 1) / 2;
       if (nw < 2 || nh < 2) break;
@@ -443,6 +468,19 @@ void mixImpl(const SpatialKernels& K, Arena& arena, const Plane* src, const Plan
     per[k].push_back(std::move(lc));
     maxLevel = std::max(maxLevel, k);
   }
+  lp.w0 = w0;
+  lp.per = std::move(per);
+  lp.maxLevel = maxLevel;
+  return lp;
+}
+
+// src: full-resolution input (null when `half` is given); half: input already box-averaged to half resolution.
+void mixImpl(const SpatialKernels& K, Arena& arena, const Plane* src, const Plane* half, const Plane& dst, const Mixture& mix,
+             double kMinLowSigma) {
+  const LevelPlan lp = planLevels(mix, dst.w, dst.h, half != nullptr, kMinLowSigma);
+  const double w0 = lp.w0;
+  const std::vector<std::vector<LevelComp>>& per = lp.per;
+  const int maxLevel = lp.maxLevel;
   if (maxLevel == 0) {
     levelCombine(K, *src, dst, w0, per[0], nullptr);
     return;
@@ -480,6 +518,203 @@ bool mixtureFitsHalf(const Mixture& mix) {
 
 void applyMixtureHalf(const SpatialKernels& K, Arena& arena, const Plane& half, const Plane& dst, const Mixture& mix) {
   mixImpl(K, arena, nullptr, &half, dst, mix, 1.6);
+}
+
+// ---- a mixture in row bands (streaming export, docs/engine/pipeline-architecture.md 42.6) -------------------------------------------
+namespace {
+// [lo, hi) of the rows reflectIdx maps [a, b) to (n rows)
+void reflectSpan(int a, int b, int n, int& lo, int& hi) {
+  lo = n, hi = 0;
+  if (a >= 0 && b <= n) {
+    lo = a, hi = b;
+    return;
+  }
+  for (int y = a; y < b; ++y) {
+    const int r = reflectIdx(y, n);
+    lo = std::min(lo, r), hi = std::max(hi, r + 1);
+  }
+}
+}  // namespace
+
+struct MixtureBands::Impl {
+  LevelPlan lp;
+  int W = 0, H = 0;
+  bool half = false;
+  std::vector<int> lw, lh;  // level dims
+  // streamed pass (levels >= 2): P1 rows from the input, P2 accumulated whole
+  int fed = 0, p1Next = 0, p2Next = 0;
+  std::vector<float> prevIn, prevP1, p1Row;
+  int prevInIdx = -1, prevP1Idx = -1;
+  std::vector<float> P2;
+  std::vector<float> L2;  // the result of levels >= 2 (what level 1 upsamples), whole
+  bool ready = false;
+
+  int R(int k) const {
+    int r = 0;
+    if (k < int(lp.per.size()))
+      for (const auto& c : lp.per[k]) r = std::max(r, c.r);
+    return r;
+  }
+  bool level0Reads() const { return !half && (lp.w0 != 0.0 || !lp.per[0].empty()); }
+  // L1 rows the up-sampling of output rows [a, b) reads
+  void l1Span(int a, int b, int& la, int& lb) const {
+    la = lh[1], lb = 0;
+    for (int gy = a; gy < b; ++gy) {
+      const int j = gy >> 1, base = (gy & 1) ? j - 1 : j - 2;
+      for (int t = 0; t < 4; ++t) {
+        const int r = reflectIdx(base + t, lh[1]);
+        la = std::min(la, r), lb = std::max(lb, r + 1);
+      }
+    }
+  }
+  // P1 rows level 1 reads for L1 rows [la, lb) (none when level 1 has no component)
+  bool p1Span(int la, int lb, int& pa, int& pb) const {
+    if (lp.per[1].empty()) return false;
+    reflectSpan(la - R(1), lb + R(1), lh[1], pa, pb);
+    return true;
+  }
+};
+
+MixtureBands::MixtureBands() : m_(std::make_unique<Impl>()) {}
+MixtureBands::~MixtureBands() = default;
+MixtureBands::MixtureBands(MixtureBands&&) noexcept = default;
+MixtureBands& MixtureBands::operator=(MixtureBands&&) noexcept = default;
+
+void MixtureBands::setup(const Mixture& mix, int W, int H, bool half) {
+  Impl& m = *m_;
+  m = Impl{};
+  m.W = W, m.H = H, m.half = half;
+  m.lp = planLevels(mix, W, H, half, half ? 1.6 : 2.0);
+  m.lw.assign(std::size_t(m.lp.maxLevel + 1), 0);
+  m.lh.assign(m.lw.size(), 0);
+  m.lw[0] = W, m.lh[0] = H;
+  for (int k = 1; k <= m.lp.maxLevel; ++k) m.lw[std::size_t(k)] = (m.lw[std::size_t(k - 1)] + 1) / 2, m.lh[std::size_t(k)] = (m.lh[std::size_t(k - 1)] + 1) / 2;
+  m.ready = m.lp.maxLevel < 2;
+}
+int MixtureBands::inputW() const { return m_->half ? (m_->W + 1) / 2 : m_->W; }
+int MixtureBands::inputH() const { return m_->half ? (m_->H + 1) / 2 : m_->H; }
+bool MixtureBands::needsPrepare() const { return m_->lp.maxLevel >= 2; }
+bool MixtureBands::prepared() const { return m_->ready; }
+std::size_t MixtureBands::wholeBytes() const { return (m_->L2.capacity() + m_->P2.capacity()) * sizeof(float); }
+
+void MixtureBands::feed(const SpatialKernels& K, int y0, int y1, const std::function<const float*(int)>& rowAt) {
+  Impl& m = *m_;
+  if (m.ready || y0 != m.fed) return;
+  const int w1 = m.lw[1], h1 = m.lh[1], w2 = m.lw[2], h2 = m.lh[2];
+  if (m.P2.empty()) m.P2.assign(std::size_t(w2) * h2, 0.f), m.p1Row.assign(std::size_t(w1), 0.f), m.prevP1.assign(std::size_t(w1), 0.f);
+  const int inW = inputW();
+  auto inRow = [&](int y) -> const float* { return y >= y0 && y < y1 ? rowAt(y) : (y == m.prevInIdx ? m.prevIn.data() : nullptr); };
+  auto p2Feed = [&](const float* p1, int i) {  // a P1 row arrived: emit the P2 rows it completes
+    for (;;) {
+      if (m.p2Next >= h2) return;
+      const int a = std::min(2 * m.p2Next, h1 - 1), b = std::min(2 * m.p2Next + 1, h1 - 1);
+      if (b > i) break;
+      const float* ra = a == i ? p1 : (a == m.prevP1Idx ? m.prevP1.data() : nullptr);
+      const float* rb = b == i ? p1 : (b == m.prevP1Idx ? m.prevP1.data() : nullptr);
+      if (!ra || !rb) return;
+      K.down2Row(ra, rb, m.P2.data() + std::size_t(m.p2Next) * w2, w2, w1);
+      ++m.p2Next;
+    }
+    std::memcpy(m.prevP1.data(), p1, std::size_t(w1) * 4);
+    m.prevP1Idx = i;
+  };
+  if (m.half) {
+    for (int y = y0; y < y1; ++y) p2Feed(rowAt(y), y);
+  } else {
+    while (m.p1Next < h1) {
+      const int a = std::min(2 * m.p1Next, m.H - 1), b = std::min(2 * m.p1Next + 1, m.H - 1);
+      if (b >= y1) break;
+      const float* ra = inRow(a);
+      const float* rb = inRow(b);
+      if (!ra || !rb) break;
+      K.down2Row(ra, rb, m.p1Row.data(), w1, m.W);
+      p2Feed(m.p1Row.data(), m.p1Next);
+      ++m.p1Next;
+    }
+    if (y1 > y0) {
+      m.prevIn.assign(rowAt(y1 - 1), rowAt(y1 - 1) + inW);
+      m.prevInIdx = y1 - 1;
+    }
+  }
+  m.fed = y1;
+  if (m.fed < inputH() || m.p2Next < h2) return;
+  // levels >= 2, whole: the pyramid and the accumulators of mixImpl, keeping L2 only
+  const int maxL = m.lp.maxLevel;
+  std::vector<std::vector<float>> P(std::size_t(maxL + 1)), L(std::size_t(maxL + 1));
+  P[2] = std::move(m.P2);
+  auto plane = [&](std::vector<float>& v, int k) {
+    Plane p;
+    p.p = v.data(), p.w = m.lw[std::size_t(k)], p.h = m.lh[std::size_t(k)], p.stride = p.w;
+    return p;
+  };
+  for (int k = 3; k <= maxL; ++k) {
+    P[std::size_t(k)].assign(std::size_t(m.lw[std::size_t(k)]) * m.lh[std::size_t(k)], 0.f);
+    downPlane(plane(P[std::size_t(k - 1)], k - 1), plane(P[std::size_t(k)], k));
+  }
+  for (int k = maxL; k >= 2; --k) {
+    L[std::size_t(k)].assign(std::size_t(m.lw[std::size_t(k)]) * m.lh[std::size_t(k)], 0.f);
+    const Plane up = k < maxL ? plane(L[std::size_t(k + 1)], k + 1) : Plane{};
+    levelCombine(K, plane(P[std::size_t(k)], k), plane(L[std::size_t(k)], k), 0.0, m.lp.per[std::size_t(k)], k < maxL ? &up : nullptr);
+    P[std::size_t(k)].clear(), P[std::size_t(k)].shrink_to_fit();
+    if (k + 1 <= maxL) L[std::size_t(k + 1)].clear(), L[std::size_t(k + 1)].shrink_to_fit();
+  }
+  m.L2 = std::move(L[2]);
+  std::vector<float>().swap(m.prevIn), std::vector<float>().swap(m.prevP1), std::vector<float>().swap(m.p1Row);
+  m.ready = true;
+}
+
+void MixtureBands::inputRange(int a, int b, int& ia, int& ib) const {
+  const Impl& m = *m_;
+  ia = inputH(), ib = 0;
+  if (m.level0Reads()) {
+    int lo, hi;
+    reflectSpan(a - m.R(0), b + m.R(0), m.H, lo, hi);
+    ia = std::min(ia, lo), ib = std::max(ib, hi);
+  }
+  if (m.lp.maxLevel >= 1) {
+    int la, lb, pa, pb;
+    m.l1Span(a, b, la, lb);
+    if (m.p1Span(la, lb, pa, pb)) {
+      if (m.half) {
+        ia = std::min(ia, pa), ib = std::max(ib, pb);
+      } else {
+        ia = std::min(ia, std::min(2 * pa, m.H - 1)), ib = std::max(ib, std::min(2 * (pb - 1) + 1, m.H - 1) + 1);
+      }
+    }
+  }
+  if (ib <= ia) ia = ib = std::max(0, std::min(a, inputH()));
+}
+
+void MixtureBands::rows(const SpatialKernels& K, int a, int b, const std::function<const float*(int)>& rowAt, const std::function<float*(int)>& outRow) const {
+  const Impl& m = *m_;
+  if (m.lp.maxLevel == 0) {
+    combineRows(K, rowAt, m.W, m.H, outRow, a, b, m.lp.w0, m.lp.per[0], [](int) -> const float* { return nullptr; }, false, 0, 0);
+    return;
+  }
+  const int w1 = m.lw[1], h1 = m.lh[1];
+  int la, lb, pa = 0, pb = 0;
+  m.l1Span(a, b, la, lb);
+  const bool needP1 = m.p1Span(la, lb, pa, pb);
+  std::vector<float> P1, L1(std::size_t(w1) * std::size_t(std::max(lb - la, 0)), 0.f);
+  if (needP1 && !m.half) {
+    P1.assign(std::size_t(w1) * (pb - pa), 0.f);
+    parallelFor(
+        pb - pa,
+        [&](int k) {
+          const int i = pa + k;
+          K.down2Row(rowAt(std::min(2 * i, m.H - 1)), rowAt(std::min(2 * i + 1, m.H - 1)), P1.data() + std::size_t(k) * w1, w1, m.W);
+        },
+        4);
+  }
+  auto p1Row = [&](int i) -> const float* { return m.half ? rowAt(i) : P1.data() + std::size_t(i - pa) * w1; };
+  const bool up2 = m.lp.maxLevel >= 2;
+  combineRows(
+      K, p1Row, w1, h1, [&](int j) { return L1.data() + std::size_t(j - la) * w1; }, la, lb, 0.0, m.lp.per[1],
+      [&](int j) -> const float* { return m.L2.data() + std::size_t(j) * (up2 ? m.lw[2] : 1); }, up2, up2 ? m.lw[2] : 0, up2 ? m.lh[2] : 0);
+  static const std::vector<LevelComp> none;
+  combineRows(
+      K, [&](int y) -> const float* { return m.half ? nullptr : rowAt(y); }, m.W, m.H, outRow, a, b, m.half ? 0.0 : m.lp.w0, m.half ? none : m.lp.per[0],
+      [&](int j) -> const float* { return L1.data() + std::size_t(j - la) * w1; }, true, w1, h1);
 }
 
 // ---- plan ----------------------------------------------------------------------------------------------------------------

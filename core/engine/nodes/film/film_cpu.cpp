@@ -105,6 +105,13 @@ struct ArenaLease {
   fd::Arena* arena = nullptr;
   std::unique_lock<std::mutex> lock;
 };
+}  // namespace
+std::size_t releaseNodeWorkspace() {
+  Workspace& ws = workspace();
+  std::unique_lock<std::mutex> l(ws.m, std::try_to_lock);
+  return l.owns_lock() ? ws.arena.freeAll() : 0;
+}
+namespace {
 ArenaLease leaseArena() {
   ArenaLease l;
   if (g_frameArena) {

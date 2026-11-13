@@ -7,7 +7,9 @@
 //
 // Block convention: `px` = n pixels of interleaved float RGB (3 floats per pixel), n <= 256 in the executor.
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 
 #include "dapple/frame_plan.h"
 #include "dapple/renderer.h"
@@ -83,6 +85,14 @@ class FrameKernels {
   // the window, with the same clamping to the source edges as the whole picture, so the pixels are identical. Not for the film branch.
   void sourceRect(int x0, int y0, int x1, int y1, int& sx0, int& sy0, int& sx1, int& sy1) const;
   void setSourceWindow(const ImageF* win, int ox, int oy);
+  // The film branch in bands (section 42.6). setSourceProvider: how the kernels obtain the source window of a rect themselves (it ends in
+  // setSourceWindow). filmStreamBegin replaces runFilm: the film's picture-wide pre-passes (false + why: not streamable, render whole);
+  // filmStreamRows: rows [y0, y1) of the film plane F into `out` (w x (y1 - y0), display-encoded, unclamped), bit-identical to runFilm's;
+  // filmStreamAux: the local adjustments' stage-W amounts of a rect of a film frame (what runFilm writes into the whole-frame aux).
+  void setSourceProvider(std::function<bool(int x0, int y0, int x1, int y1)> fn);
+  bool filmStreamBegin(std::string* why = nullptr);
+  bool filmStreamRows(int y0, int y1, ImageF& out);
+  bool filmStreamAux(int x0, int y0, int x1, int y1, const local::AuxTarget& aux);
 
  private:
   struct Impl;

@@ -56,6 +56,11 @@ struct Run {
   std::vector<float> auxBuf;
   int auxPlanes = 0;
   int outRow0 = 0;              // streaming export: frame row of env.out's first row (the band in flight)
+  std::vector<float> filmAux;   // a tiled film frame: the stage-W amounts of the whole frame (runFilm's), copied into each work window
+  local::AuxTarget filmAuxAt;
+  ImageF filmBand;              // streaming export of a film frame: rows [filmY0, filmY1) of the film plane
+  int filmY0 = 0, filmY1 = 0;
+  bool filmStream = false;
 
   Run(const Plan& p, ExecEnv& e, ExecStats* s)
       : plan(p), env(e), stats(s), fk(e.fk), W(e.fk.width()), H(e.fk.height()) {}
@@ -76,6 +81,7 @@ struct Run {
     FrameEnv fe;
     fe.fk = &fk;
     fe.film = film;
+    fe.filmRow0 = filmStream ? &filmY0 : nullptr;
     fe.aux = auxPlanes ? &aux : nullptr;
     for (NodeId id : sweep.groups[0].nodes)
       if (env.graph.nodes()[id].type == NodeType::Blend) fe.blendFollows = true;
@@ -208,7 +214,23 @@ struct Run {
   }
 
   // ---- streaming export hooks (section 42) ------------------------------------------------------------------------------------------
-  bool prepare(int x0, int y0, int x1, int y1) { return !env.prepare || env.prepare(x0, y0, x1, y1); }
+  bool prepare(int x0, int y0, int x1, int y1) {
+    if (!filmAux.empty() && auxPlanes && aux.data) {  // the window's part of the whole-frame amounts
+      for (int k = 0; k < auxPlanes; ++k)
+        for (int y = y0; y < y1; ++y)
+          std::memcpy(aux.data + std::size_t(k) * aux.plane + std::size_t(y - aux.oy) * aux.w + std::size_t(x0 - aux.ox),
+                      filmAux.data() + std::size_t(k) * filmAuxAt.plane + std::size_t(y) * filmAuxAt.w + std::size_t(x0), std::size_t(x1 - x0) * sizeof(float));
+    }
+    if (filmStream) {  // the film rows of the rect, the stage-W amounts of its window; the source only when the normal branch is read
+      if (filmBand.height == 0 || y0 < filmY0 || y1 > filmY1) {
+        if (!env.filmRows || !env.filmRows(y0, y1, filmBand)) return false;
+        filmY0 = y0, filmY1 = y1;
+      }
+      if (auxPlanes && aux.data && env.filmAux && !env.filmAux(x0, y0, x1, y1, aux)) return false;
+      if (!fk.needNormal()) return true;
+    }
+    return !env.prepare || env.prepare(x0, y0, x1, y1);
+  }
   void bandBegin(int y0) {
     if (env.bandDone) outRow0 = y0;
   }
@@ -404,7 +426,14 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
   // film: a whole-frame node before the sweeps (the streaming path finishes the frame by itself)
   for (const Stage& s : plan.stages) {
     if (s.kind != StageKind::FilmFrame) continue;
-    if (env.prepare) return Status::Unsupported;  // streaming export (section 42): the film branch reads the whole frame
+    if (env.prepare) {  // streaming export: the film in bands (section 42.6), rows rendered as the sweeps need them
+      if (!env.filmBegin || !env.filmBegin()) return Status::Unsupported;
+      r.filmStream = true;
+      r.film = &r.filmBand;
+      env.fk.finalizeSpatial();
+      if (env.cancel.cancelled()) return Status::Cancelled;
+      continue;
+    }
     if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF && !env.fk.spatial().any() && !env.fk.localFrame()) {
       if (env.fk.streamFilm(env.out)) {
         if (stats) stats->streamed = true;
@@ -414,6 +443,10 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
     r.film = &r.filmScratch.get(r.W, r.H);
     r.auxWindow(0, 0, r.W, r.H);  // local adjustments: the film input pass writes the stage-W amounts of the whole frame
     if (!env.fk.runFilm(*r.film, r.auxPlanes ? &r.aux : nullptr)) return Status::Unsupported;  // the caller renders the frame with the legacy renderer
+    if (r.auxPlanes && !r.single) {  // the sweeps size the amount planes per work window: keep the whole frame's apart
+      r.filmAuxAt = r.aux;
+      r.filmAux.assign(r.auxBuf.begin(), r.auxBuf.begin() + std::ptrdiff_t(r.aux.plane * std::size_t(r.auxPlanes)));
+    }
     env.fk.finalizeSpatial();
     if (env.cancel.cancelled()) return Status::Cancelled;
   }

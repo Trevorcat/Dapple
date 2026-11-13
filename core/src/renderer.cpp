@@ -1054,6 +1054,40 @@ film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, Spatial
 // ProPhoto; when the frame is a resampling of it (geometry / region) `fetch(y, row)` produces row y (w * 3 floats,
 // >= 0), otherwise `src` is passed on as it is. `gain` = white balance x exposure, folded into the input matrix.
 // `pitch` = size of an output pixel in source pixels (spatial effects are defined in film-frame micrometres).
+// The arguments of the film nodes for a w x h frame of a srcW x srcH source (runFilmStage, and the streamed film of FrameKernels).
+engine::filmnode::FilmFrameArgs filmNodeArgs(const EditParams& p, const FilmRun& run, const float gain[3], int srcW, int srcH, int w, int h, float pitch,
+                                             SpatialQuality q, const FastOptions* fo) {
+  const float formatScale = pitch * float(std::max(w, h)) / float(std::max(srcW, srcH));
+  engine::filmnode::FilmFrameArgs a;
+  a.lib = run.lib.get();
+  a.stock = p.filmStock.c_str();
+  a.paper = run.paper.c_str();
+  for (int c = 0; c < 3; ++c) a.gain[c] = gain[c];
+  a.filmExposure = p.filmExposure + p.filmKeyEv;
+  a.printEv = p.filmPrintEv;
+  a.black = p.filmBlack;
+  {
+    double sx, sy, sd;
+    filmInputAdaptation(p, &sx, &sy, &sd);
+    a.sceneX = float(sx), a.sceneY = float(sy), a.adapt = float(sd);
+  }
+  a.warmth = p.filmWarmth;
+  a.tint = p.filmTint;
+  a.grainPct = p.filmGrain;
+  a.halationPct = p.filmHalation;
+  a.formatScale = formatScale;
+  a.w = w;
+  a.h = h;
+  a.quality = q == SpatialQuality::Off ? 0 : (q == SpatialQuality::Interactive ? 1 : 2);
+  if (fo) {
+    a.keepGrain = fo->keepGrain;
+    a.coarse = fo->coarseFilm;
+    a.fullLongEdge = fo->fullLongEdge;
+    a.frameIndex = fo->frameIndex;
+  }
+  return a;
+}
+
 template <class Fetch>
 bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], const ImageF& src, bool resample, int w,
                   int h, float pitch, SpatialQuality q, Fetch&& fetch, ImageF& out, const FastOptions* fo = nullptr) {
@@ -1063,33 +1097,7 @@ bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], 
   const float gainEv[3] = {gain[0] * evGain, gain[1] * evGain, gain[2] * evGain};
   if (engine::filmnode::enabled()) {
     // the film as engine nodes (core/engine/nodes/film): byte-identical with the FilmSimulator below
-    engine::filmnode::FilmFrameArgs a;
-    a.lib = run.lib.get();
-    a.stock = p.filmStock.c_str();
-    a.paper = run.paper.c_str();
-    for (int c = 0; c < 3; ++c) a.gain[c] = gain[c];
-    a.filmExposure = p.filmExposure + p.filmKeyEv;
-    a.printEv = p.filmPrintEv;
-    a.black = p.filmBlack;
-    {
-      double sx, sy, sd;
-      filmInputAdaptation(p, &sx, &sy, &sd);
-      a.sceneX = float(sx), a.sceneY = float(sy), a.adapt = float(sd);
-    }
-    a.warmth = p.filmWarmth;
-    a.tint = p.filmTint;
-    a.grainPct = p.filmGrain;
-    a.halationPct = p.filmHalation;
-    a.formatScale = formatScale;
-    a.w = w;
-    a.h = h;
-    a.quality = q == SpatialQuality::Off ? 0 : (q == SpatialQuality::Interactive ? 1 : 2);
-    if (fo) {
-      a.keepGrain = fo->keepGrain;
-      a.coarse = fo->coarseFilm;
-      a.fullLongEdge = fo->fullLongEdge;
-      a.frameIndex = fo->frameIndex;
-    }
+    const engine::filmnode::FilmFrameArgs a = filmNodeArgs(p, run, gain, src.width, src.height, w, h, pitch, q, fo);
     ScratchImage nodeScratch;
     const ImageF* nin = &src;
     if (resample) {
@@ -1981,6 +1989,8 @@ struct FrameKernels::Impl {
   std::shared_ptr<const local::Frame> local;  // local adjustments (docs/engine/pipeline-architecture.md section 40); null for film frames in v1
   const ImageF* win = nullptr;  // streaming export (section 42): the source pixels of the rect in flight; `in` then carries the size only
   int winX = 0, winY = 0;
+  std::function<bool(int, int, int, int)> sourceFn;              // streaming export: asks for the source window of a rect (setSourceProvider)
+  std::unique_ptr<engine::filmnode::FilmBands> filmBands;       // streaming export: the film in bands (filmStreamBegin)
 
   Impl(const Renderer& rr, const SourceImage& src, const BakedLut* lut, const FastOptions& o)
       : r(rr), source(src), in(src.linear), lutp(lut), exact(lut == nullptr), opt(o) {
@@ -2340,6 +2350,133 @@ bool FrameKernels::runFilm(ImageF& F, const local::AuxTarget* aux) {
       },
       F, &m.opt);
   return m.filmOkV;
+}
+
+// ---- streaming export, film branch (section 42.6) ----------------------------------------------------------------------------------
+void FrameKernels::setSourceProvider(std::function<bool(int, int, int, int)> fn) { impl_->sourceFn = std::move(fn); }
+
+namespace {
+// The film's input of output pixels [x0, x1) of row y (pre-gain source, through the geometry), then stage L of the local adjustments
+// (FrameKernels::runFilm's fetch, without the aux writes). The source window must cover them.
+}  // namespace
+
+bool FrameKernels::filmStreamBegin(std::string* why) {
+  Impl& m = *impl_;
+  m.filmRan = true;
+  if (!m.fr.stock || !m.sourceFn || !engine::filmnode::enabled()) {
+    if (why) *why = "film: no stock / no source provider / film nodes off";
+    return false;
+  }
+  const int w = m.d.w, h = m.d.h;
+  float g[3];
+  if (m.exact) {
+    for (int c = 0; c < 3; ++c) g[c] = m.exactOp->wb[c] * m.exactOp->exposureGain;
+  } else {
+    for (int c = 0; c < 3; ++c) g[c] = m.gain[c];
+  }
+  const SpatialQuality q = m.exact ? (m.opt.spatial == SpatialQuality::Off ? SpatialQuality::Off : SpatialQuality::Full) : m.opt.spatial;
+  const engine::filmnode::FilmFrameArgs a = filmNodeArgs(m.r.p_, m.fr, g, m.in.width, m.in.height, w, h, m.pitch, q, &m.opt);
+  const local::Frame* lf = m.local.get();
+  const float gg[3] = {g[0], g[1], g[2]};
+  auto input = [this, w, lf, gg](int y0, int y1, float* rgb) -> bool {
+    Impl& mm = *impl_;
+    // source windows in column chunks when the geometry slants (straighten): the window of a full-width band would be tall
+    int chunk = w;
+    if (mm.useGeo) {
+      int sx0, sy0, sx1, sy1;
+      sourceRect(0, y0, w, y1, sx0, sy0, sx1, sy1);
+      if (double(sx1 - sx0) * double(sy1 - sy0) > 2.5 * double(w) * double(y1 - y0)) chunk = 512;
+    }
+    if (!rgb) {  // prefetch: the source window of all the rows (the slices that follow fall inside it)
+      if (chunk < w) return true;
+      int sx0, sy0, sx1, sy1;
+      sourceRect(0, y0, w, y1, sx0, sy0, sx1, sy1);
+      return mm.sourceFn(sx0, sy0, sx1, sy1);
+    }
+    for (int cx = 0; cx < w; cx += chunk) {
+      const int cx1 = std::min(w, cx + chunk);
+      int sx0, sy0, sx1, sy1;
+      sourceRect(cx, y0, cx1, y1, sx0, sy0, sx1, sy1);
+      if (!mm.sourceFn(sx0, sy0, sx1, sy1)) return false;
+      parallelFor(
+          y1 - y0,
+          [&](int k) {
+            const int y = y0 + k;
+            float* row = rgb + (std::size_t(k) * w + cx) * 3;
+            if (mm.useGeo) {
+              for (int x = cx; x < cx1; ++x) mm.fetchPixel(x, y, row + 3 * (x - cx));
+            } else {
+              copyRow(row, cx1 - cx, cx, y);
+            }
+            if (!lf) return;
+            for (int x = cx; x < cx1; ++x) {  // stage L on the film's scene input, as runFilm does
+              float* p = row + 3 * (x - cx);
+              const float src[3] = {p[0], p[1], p[2]};
+              float lin[3] = {std::max(0.f, p[0] * gg[0]), std::max(0.f, p[1] * gg[1]), std::max(0.f, p[2] * gg[2])};
+              float u, v;
+              mm.srcUV(x, y, u, v);
+              local::applyLinear(*lf, u, v, src, lin, nullptr);
+              for (int c = 0; c < 3; ++c) p[c] = gg[c] > 0.f ? lin[c] / gg[c] : 0.f;
+            }
+          },
+          4);
+    }
+    return true;
+  };
+  m.filmBands = std::make_unique<engine::filmnode::FilmBands>();
+  if (!m.filmBands->init(a, input, why)) {
+    m.filmBands.reset();
+    return false;
+  }
+  m.filmOkV = true;
+  return true;
+}
+
+bool FrameKernels::filmStreamRows(int y0, int y1, ImageF& out) {
+  Impl& m = *impl_;
+  if (!m.filmBands) return false;
+  const int w = m.d.w;
+  if (out.width != w || out.height != y1 - y0) {
+    out.width = w, out.height = y1 - y0;
+    out.data.resize(std::size_t(w) * std::max(0, y1 - y0) * 3);
+  }
+  return m.filmBands->rows(y0, y1, out.data.data(), std::size_t(w) * 3);
+}
+
+bool FrameKernels::filmStreamAux(int x0, int y0, int x1, int y1, const local::AuxTarget& aux) {
+  Impl& m = *impl_;
+  const local::Frame* lf = m.local.get();
+  if (!lf || !lf->anyWindow || !aux.data) return true;
+  float g[3];
+  if (m.exact) {
+    for (int c = 0; c < 3; ++c) g[c] = m.exactOp->wb[c] * m.exactOp->exposureGain;
+  } else {
+    for (int c = 0; c < 3; ++c) g[c] = m.gain[c];
+  }
+  int sx0, sy0, sx1, sy1;
+  sourceRect(x0, y0, x1, y1, sx0, sy0, sx1, sy1);
+  if (!m.sourceFn || !m.sourceFn(sx0, sy0, sx1, sy1)) return false;
+  parallelFor(
+      y1 - y0,
+      [&](int k) {
+        const int y = y0 + k;
+        float K[kLocalWindowSlots];
+        for (int x = x0; x < x1; ++x) {
+          float p[3];
+          if (m.useGeo) m.fetchPixel(x, y, p);
+          else copyRow(p, 1, x, y);
+          const float src[3] = {p[0], p[1], p[2]};
+          float lin[3] = {std::max(0.f, p[0] * g[0]), std::max(0.f, p[1] * g[1]), std::max(0.f, p[2] * g[2])};
+          float u, v;
+          m.srcUV(x, y, u, v);
+          local::applyLinear(*lf, u, v, src, lin, K);
+          const std::size_t o = std::size_t(y - aux.oy) * aux.w + std::size_t(x - aux.ox);
+          for (int s = 0; s < kLocalWindowSlots; ++s)
+            if (aux.slot[s] >= 0) aux.data[std::size_t(aux.slot[s]) * aux.plane + o] = K[s];
+        }
+      },
+      4);
+  return true;
 }
 
 void FrameKernels::finalizeSpatial() {

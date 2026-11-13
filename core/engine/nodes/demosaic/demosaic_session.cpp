@@ -242,6 +242,20 @@ CacheStats MosaicCache::stats() const {
   return s;
 }
 
+std::size_t MosaicCache::trimExcept(std::uint64_t k0, std::uint64_t k1) {
+  std::lock_guard<std::mutex> lk(mu_);
+  std::size_t freed = 0;
+  for (auto it = lru_.begin(); it != lru_.end();) {
+    if (it->k0 == k0 && it->k1 == k1 && it->kind == 0) {
+      ++it;
+      continue;
+    }
+    freed += it->bytes;
+    bytes_ -= it->bytes;
+    it = lru_.erase(it);
+  }
+  return freed;
+}
 void MosaicCache::clear() {
   std::lock_guard<std::mutex> lk(mu_);
   lru_.clear();

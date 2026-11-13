@@ -41,7 +41,8 @@ struct Label {
 };
 const Label kLabels[] = {{"hair", "头发"},     {"faceskin", "脸部皮肤"}, {"bodyskin", "身体皮肤"}, {"clothes", "衣服"}, {"person", "人物"},
                          {"background", "背景"}, {"depth", "深度"},       {"sky", "天空 (粗略)"},  {"face", "脸"},       {"eyes", "眼睛"},
-                         {"iris", "虹膜"},       {"sclera", "眼白"},      {"lips", "嘴唇"},        {"teeth", "牙齿"},     {"brows", "眉毛"}};
+                         {"iris", "虹膜"},       {"sclera", "眼白"},      {"lips", "嘴唇"},        {"teeth", "牙齿"},     {"brows", "眉毛"},
+                         {"undereye", "眼下"}};
 std::string labelOf(const std::string& key) {
   std::string k = key;
   if (k.size() > 3 && k[0] == 'f' && k[2] == ':') k = k.substr(3);
@@ -301,10 +302,13 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
                 set.entries.push_back({p + "lips", ff.lips});
                 if (ff.open && !ff.teeth.empty()) set.entries.push_back({p + "teeth", ff.teeth});
                 set.entries.push_back({p + "brows", ff.brows});
+                if (!ff.undereye.empty()) set.entries.push_back({p + "undereye", ff.undereye});
               }
-              char b[120];
-              std::snprintf(b, sizeof b, "%s{\"yaw\":%.1f,\"frontal\":%s,\"mouth_open\":%.3f,\"teeth\":%s}", fj.empty() ? "" : ",", ff.yawDeg,
-                            ff.frontal ? "true" : "false", ff.mouthOpen, ff.open && !ff.teeth.empty() ? "true" : "false");
+              char b[200];
+              // iod: inter-ocular distance as a fraction of the photo's long edge = the "face" scale of a retouch adjustment (docs section 43.5)
+              std::snprintf(b, sizeof b, "%s{\"yaw\":%.1f,\"frontal\":%s,\"mouth_open\":%.3f,\"teeth\":%s,\"iod\":%.5f}", fj.empty() ? "" : ",",
+                            ff.yawDeg, ff.frontal ? "true" : "false", ff.mouthOpen, ff.open && !ff.teeth.empty() ? "true" : "false",
+                            ff.iod / float(std::max(1, std::max(rend.w, rend.h))));
               fj += b;
             }
             set.meta = "{\"count\":" + std::to_string(n) + ",\"list\":[" + fj + "]}";

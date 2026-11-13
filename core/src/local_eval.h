@@ -64,11 +64,16 @@ struct Adj {
   float weight = 1.f;            // strength / 100
   int c0 = 0, nc = 0;            // components [c0, c0 + nc)
   float lin[12] = {};            // stage L: exposure EV, contrast, highlights, shadows, whites, blacks (-1..1), temp, tint (-100..100), saturation,
-                                 // vibrance (-1..1), tint amount (0..1), unused
+                                 // vibrance (-1..1), tint amount (0..1), whiten (0..1, portrait retouch)
   float tintRgb[3] = {1.f, 1.f, 1.f};  // luminance-normalised colour of the tint (working space)
-  float win[kLocalWindowSlots] = {};   // stage W: clarity, texture, sharpen (-1..1), noise (0..1), dehaze (-1..1)
+  float wop[kLocalWindowOps] = {};     // stage W by op: clarity, texture, sharpen (-1..1), noise (0..1), dehaze (-1..1), smooth .. facelight (0..1)
+  float win[kLocalWindowSlots] = {};   // the same by amount channel (Frame::chanOp)
   bool hasLinear = false;
   int srcIndex = 0;              // index in EditParams::local
+};
+// A heal spot of the frame (portrait retouch, docs section 43): photo metric (units of the long edge), source offset, opacity 0..1.
+struct SpotM {
+  float x = 0, y = 0, r = 0, ox = 0, oy = 0, alpha = 0;
 };
 struct Frame {
   std::vector<Adj> adj;
@@ -76,7 +81,15 @@ struct Frame {
   float sx = 1.f, sy = 1.f;      // photo metric: x * sx, y * sy are in units of the long edge
   float guideRef = 1.f;          // raster guide: I = sqrt(clamp(v / guideRef, 0, 4))
   bool anyLinear = false, anyWindow = false, anyRaster = false, needGuided = false;
-  bool winUsed[kLocalWindowSlots] = {};
+  bool winUsed[kLocalWindowOps] = {};  // stage-W op k (index from kLocalWindowFirst) is used by some adjustment
+  // Amount channels (aux planes / images): op index of channel c (-1 = none). Without a retouch op the legacy identity (channel c = op c, c < 5);
+  // with one, the used ops packed in op order (at most kLocalWindowSlots; extra ones are dropped with a log line).
+  int chanOp[kLocalWindowSlots] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  bool legacyW = false, retouchW = false;  // some legacy stage-W op / some retouch stage-W op is used
+  // portrait retouch (docs section 43)
+  float iod = 0.f;               // retouch scale of the frame: inter-ocular distance, photo metric (smallest face of the retouch adjustments)
+  float srcLong = 0.f;           // long edge of the source the frame was bound for (pixels per photo metric unit without geometry)
+  std::vector<SpotM> spots;      // heal spots (manual + automatic), in composition order
   std::uint64_t descKey = 0, planesKey = 0;
   int planeFloats = 0;           // size of the GPU plane store
   // GPU descriptor block (vec4 units; layout in local.glsl)
@@ -104,7 +117,7 @@ struct AuxTarget {
   float* data = nullptr;
   int ox = 0, oy = 0, w = 0, h = 0;  // the window in the frame
   std::size_t plane = 0;             // floats per plane
-  int slot[kLocalWindowSlots] = {-1, -1, -1, -1, -1};  // plane index of each stage-W op (-1: no adjustment uses it, not stored)
+  int slot[kLocalWindowSlots] = {-1, -1, -1, -1, -1, -1, -1, -1};  // plane index of each amount channel (-1: not stored)
 };
 // The planes a frame needs (only the stage-W ops some adjustment uses) and their slot map.
 int auxLayout(const Frame& f, AuxTarget& t);
@@ -115,11 +128,25 @@ void linearBlock(const Frame& f, const FrameKernels& fk, float* px, int n, int x
 struct DetailRadii {
   int rt = 1, rs = 1, rg = 2;  // fine box (2 passes), very fine box (1 pass), guided radius on the 1/4 grid
   bool guided = false;
-  int halo = 0;                // pixels, multiple of 4
+  int halo = 0;                // pixels, multiple of 4 (heal + retouch planes + legacy ops: they run in this order)
+  int haloLegacy = 0, haloRetouch = 0, haloHeal = 0;
 };
 DetailRadii detailRadii(const Frame& f, float scale);
-// The LocalDetail window node: `img` is the work window at (ox, oy) of a fw x fh frame, `aux` its amount planes.
-void detailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, int fw, int fh, float scale);
+// The LocalDetail window node: `img` is the work window at (ox, oy) of a fw x fh frame, `aux` its amount planes. `fk` (needed by the portrait
+// retouch: the frame's geometry) may be null when the frame has no retouch op and no heal spot.
+void detailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, int fw, int fh, float scale, const FrameKernels* fk = nullptr);
+// The legacy stage-W ops (clarity .. dehaze) of a window (part of detailWindow).
+void legacyDetailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float scale);
+
+// ---- internal services for the portrait retouch (local_retouch.cpp) ----------------------------------------------------------------------
+// The photo area-averaged to gw x gh, guide-encoded (sqrt(v / ref), 3 channels; cached; the streaming capture is used when installed).
+std::shared_ptr<const Plane> guideGridOf(const SourceImage& src, int gw, int gh, float& ref, std::uint64_t& key);
+// The pixel of guide sample (i, j) of 64 x 64 (guideSamplePos): from the streaming capture when installed, else from the source.
+void guideSample(const SourceImage& src, int i, int j, float px[3]);
+std::shared_ptr<const Plane> planeCacheFind(std::uint64_t key);
+void planeCachePut(std::uint64_t key, std::shared_ptr<const Plane> p);
+// separable box (radius r, replicated edges, divide by 2r + 1) of `ch` interleaved channels: the twin of the GPU sep pass
+void boxRepeat(std::vector<float>& d, int w, int h, int ch, int r);
 
 // One row of the mask of adjustment `index` (0..255) over the output frame of `fk` (UI overlay).
 void maskRow(const Frame& f, const FrameKernels& fk, int index, int y, std::uint8_t* out);
@@ -141,6 +168,8 @@ struct GuideCapture {
 };
 void guideSamplePos(int W, int H, int i, int j, int& x, int& y);
 // Grid sizes the binds of `list` ask for (raster components with refinement whose plane is in the store) on a W x H photo.
+// Long edge cap of the raster refinement grids of an edit (1024 / 768 / 640 by the number of raster components; 512 at the interactive tier).
+int rasterGridCap(const std::vector<LocalAdjustment>& list, bool interactive);
 std::vector<std::pair<int, int>> guideGridSizes(const std::vector<LocalAdjustment>& list, int W, int H, bool interactive);
 // Rows (or columns) [a, b) of cell j of a grid of n cells over N rows (b clamped to N), as guideGrid() averages them.
 void guideCellSpan(int j, int n, int N, int& a, int& b);

@@ -685,6 +685,29 @@ std::vector<Scenario> buildScenarios(const std::string& cubePath, bool haveFilm)
       p.clarity = 10.f;
     }, X);
     add("crop_rotate_detail", [&](EditParams& p) { subject(p, true); p.crop = "4:5"; p.rotate = 90; p.straighten = 3.f; p.flip = true; }, A);
+    // portrait retouch (docs/engine/pipeline-architecture.md section 43): every retouch op on a radial "face", automatic + manual heal spots, whiten
+    auto retouch = [&](EditParams& p) {
+      LocalAdjustment a;
+      a.id = "skin";
+      a.mask.push_back(radial(0.5f, 0.5f, 0.3f, 40.f));
+      a.face = 0.12f;
+      a.ops.v[kLoSmooth] = 60.f, a.ops.v[kLoEven] = 50.f, a.ops.v[kLoRedness] = 50.f, a.ops.v[kLoShine] = 50.f, a.ops.v[kLoHeal] = 100.f;
+      a.ops.v[kLoTexture] = 10.f;
+      p.local.push_back(a);
+      LocalAdjustment u;
+      u.id = "ue";
+      u.mask.push_back(radial(0.4f, 0.4f, 0.06f, 60.f));
+      u.face = 0.12f;
+      u.ops.v[kLoUnderEye] = 70.f, u.ops.v[kLoFaceLight] = 40.f, u.ops.v[kLoWhiten] = 50.f;
+      p.local.push_back(u);
+      LocalAdjustment h;
+      h.id = "spots";
+      h.spots.push_back({0.62f, 0.55f, 0.012f, 0.f, 0.f, false});
+      h.spots.push_back({0.35f, 0.62f, 0.008f, 0.02f, -0.01f, true});
+      p.local.push_back(h);
+    };
+    add("retouch_ops", [&](EditParams& p) { retouch(p); }, I | A);
+    add("retouch_crop_exact", [&](EditParams& p) { retouch(p); p.crop = "4:5"; p.straighten = 2.f; }, X);
     out.push_back(std::move(s));
   }
   return out;

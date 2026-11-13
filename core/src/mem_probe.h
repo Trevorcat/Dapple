@@ -113,6 +113,23 @@ inline std::size_t available() {
 #endif
 }
 
+// Physical memory of the device (bytes, 0 = unknown): the fallback of the export budget when available() cannot be read.
+inline std::size_t physical() {
+#if defined(_WIN32)
+  MEMORYSTATUSEX ms{};
+  ms.dwLength = sizeof ms;
+  if (GlobalMemoryStatusEx(&ms)) return std::size_t(ms.ullTotalPhys);
+  return 0;
+#elif defined(__APPLE__)
+  std::uint64_t mem = 0;
+  std::size_t len = sizeof mem;
+  return sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0 ? std::size_t(mem) : 0;
+#else
+  const long kb = procKb("/proc/meminfo", "MemTotal");
+  return kb > 0 ? std::size_t(kb) * 1024u : 0;
+#endif
+}
+
 // Samples footprint() every millisecond on its own thread while alive. stage() labels what follows; peaks are kept per label (in order of
 // first use). Thread-safe; the sampling loop allocates nothing.
 class Sampler {

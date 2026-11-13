@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "dapple/renderer.h"
+#include "engine/nodes/film/film_nodes.h"
 #include "engine/nodes/demosaic/demosaic_session.h"
 #include "mem_probe.h"
 #include "parallel.h"
@@ -29,10 +30,23 @@ Mode envMode() {
   return Mode::Auto;
 }
 
-std::size_t budgetBytes() {
-  if (const char* e = std::getenv("DAPPLE_EXPORT_BUDGET_MB"); e && e[0]) return std::size_t(std::max(0L, std::atol(e))) << 20;
-  const std::size_t avail = mem::available();
-  if (avail == 0) return std::size_t(384) << 20;  // unknown: assume a phone
+std::size_t budgetBytes(std::string* how) {
+  if (const char* e = std::getenv("DAPPLE_EXPORT_BUDGET_MB"); e && e[0]) {
+    if (how) *how = "DAPPLE_EXPORT_BUDGET_MB";
+    return std::size_t(std::max(0L, std::atol(e))) << 20;
+  }
+  const std::size_t avail = std::getenv("DAPPLE_EXPORT_AVAILABLE_FAILS") ? 0 : mem::available();  // (env: the fallback, tests)
+  if (avail == 0) {
+    // the query failed (some contexts return 0): a quarter of the physical memory minus what the process already holds, at most 1 GB, at
+    // least 256 MB (a 3 GB phone: ~500 MB, enough for any streamed export)
+    const std::size_t phys = mem::physical(), foot = mem::footprint();
+    std::size_t b = phys ? phys / 4 : std::size_t(384) << 20;
+    b = b > foot ? b - std::min(foot, b / 2) : b / 2;
+    b = std::clamp(b, std::size_t(256) << 20, std::size_t(1) << 30);
+    if (how) *how = "available memory unknown: from physical memory";
+    return b;
+  }
+  if (how) *how = "available memory";
 #if defined(__APPLE__)
   // os_proc_available_memory is this process's own headroom before jetsam (iOS); macOS reports half the machine
   const double share = 0.6;
@@ -43,6 +57,14 @@ std::size_t budgetBytes() {
   const std::size_t b = std::size_t(double(avail) * share);
   return b > reserve ? b - reserve : 0;
 }
+
+std::size_t trimForExport(const std::uint64_t keepMosaic[2]) {
+  std::size_t freed = trimMosaicCacheExcept(keepMosaic);  // other photos' mosaics and demosaiced pictures
+  freed += engine::filmnode::releaseFrameWorkspaces();     // frame-sized film planes a previous film render left
+  return freed;
+}
+
+std::size_t predictWholeDecodePeak(int W, int H) { return std::size_t(double(std::max(W, 0)) * double(std::max(H, 0)) * 30.0); }
 
 std::size_t predictWholePeak(int W, int H, bool film) {
   const double px = double(std::max(W, 0)) * double(std::max(H, 0));
@@ -60,8 +82,9 @@ bool openLazy(int W, int H, std::string* why) {
     if (why) *why = "DAPPLE_EXPORT_STREAM=on";
     return true;
   }
-  const std::size_t need = predictWholePeak(W, H, false), budget = budgetBytes();
-  std::snprintf(b, sizeof b, "whole-frame peak %.0f MB vs budget %.0f MB", double(need) / 1048576.0, double(budget) / 1048576.0);
+  std::string how;
+  const std::size_t need = predictWholePeak(W, H, false), budget = budgetBytes(&how);
+  std::snprintf(b, sizeof b, "whole-frame peak %.0f MB vs budget %.0f MB (%s)", double(need) / 1048576.0, double(budget) / 1048576.0, how.c_str());
   if (why) *why = b;
   return need > budget;
 }
@@ -73,9 +96,80 @@ BandSource::BandSource(std::shared_ptr<const MosaicImage> mosaic) : m_(std::move
   gpu_ = demosaic::fullUsesGpu(*m_);
 }
 
+int BandSource::cachedRows() const {
+  int n = 0;
+  for (const Block& b : cache_) n += b.y1 - b.y0;
+  return n;
+}
+void BandSource::dropCache() {
+  std::vector<Block>().swap(cache_);
+  cacheBytes_ = 0;
+}
+void BandSource::keep(const ImageF& win, int y0, int ya, int yb) {
+  if (cacheBudget_ == 0 || win.width != W_ || yb <= ya) return;
+  // only rows not cached yet (the blocks stay disjoint)
+  for (const Block& b : cache_) {
+    if (b.y0 <= ya && ya < b.y1) ya = b.y1;
+    if (b.y0 < yb && yb <= b.y1) yb = b.y0;
+  }
+  if (yb <= ya) return;
+  const std::size_t rowBytes = std::size_t(W_) * 3 * sizeof(float);
+  // room: the lowest blocks give way to rows above them (the render starts at the top)
+  while (cacheBytes_ + std::size_t(yb - ya) * rowBytes > cacheBudget_ && !cache_.empty()) {
+    auto low = std::max_element(cache_.begin(), cache_.end(), [](const Block& a, const Block& b) { return a.y0 < b.y0; });
+    if (low->y0 < ya) break;  // what is cached lies above: keep it, drop the new rows instead
+    cacheBytes_ -= low->px.size() * sizeof(float);
+    cache_.erase(low);
+  }
+  if (cacheBytes_ + std::size_t(yb - ya) * rowBytes > cacheBudget_) return;
+  Block b;
+  b.y0 = ya, b.y1 = yb;
+  b.px.assign(win.row(ya - y0), win.row(ya - y0) + std::size_t(yb - ya) * W_ * 3);
+  cacheBytes_ += b.px.size() * sizeof(float);
+  cache_.push_back(std::move(b));
+}
+void BandSource::applyShadowFloorToCache() {
+  for (Block& b : cache_) {
+    ImageF v;
+    v.width = W_, v.height = b.y1 - b.y0;
+    v.data.swap(b.px);
+    shadowChromaFloor(v);
+    v.data.swap(b.px);
+  }
+}
+bool BandSource::fromCache(int x0, int y0, int x1, int y1) {
+  if (cache_.empty()) return false;
+  std::vector<const Block*> parts;
+  for (int y = y0; y < y1;) {  // every row must be cached
+    const Block* hit = nullptr;
+    for (const Block& b : cache_)
+      if (b.y0 <= y && y < b.y1) hit = &b;
+    if (!hit) return false;
+    parts.push_back(hit);
+    y = hit->y1;
+  }
+  ImageF().data.swap(win_.data);
+  win_ = ImageF(x1 - x0, y1 - y0);
+  parallelFor(y1 - y0, [&](int k) {
+    const int y = y0 + k;
+    for (const Block* b : parts)
+      if (b->y0 <= y && y < b->y1) {
+        std::memcpy(win_.row(k), b->px.data() + (std::size_t(y - b->y0) * W_ + x0) * 3, std::size_t(x1 - x0) * 3 * sizeof(float));
+        break;
+      }
+  });
+  ++cacheHits_;
+  return true;
+}
+
 const ImageF* BandSource::window(int x0, int y0, int x1, int y1) {
   if (!m_ || x0 < 0 || y0 < 0 || x1 > W_ || y1 > H_ || x1 <= x0 || y1 <= y0) return nullptr;
   if (cancelCur_ && cancelCur_->load(std::memory_order_relaxed) != cancelMine_) return nullptr;
+  if (fromCache(x0, y0, x1, y1)) {
+    rowsY0_ = y0;
+    peakBytes_ = std::max(peakBytes_, win_.data.size() * sizeof(float));
+    return &win_;
+  }
   const auto t0 = Clock::now();
   bool fb = false;
   ImageF().data.swap(win_.data);  // the previous window goes before the next one is made (never two bands alive)
@@ -87,6 +181,7 @@ const ImageF* BandSource::window(int x0, int y0, int x1, int y1) {
   fellBack_ |= fb;
   if (win_.width != x1 - x0 || win_.height != y1 - y0) return nullptr;
   if (shadow_) shadowChromaFloor(win_);
+  rowsY0_ = y0;  // rows() reuses a full-width window
   ++windows_;
   ms_ += msSince(t0);
   peakBytes_ = std::max(peakBytes_, win_.data.size() * sizeof(float));
@@ -97,12 +192,25 @@ std::uint64_t BandSourceStore::next() {
   static std::atomic<std::uint64_t> n{1ull << 40};
   return n.fetch_add(1);
 }
-const float* BandSourceStore::window(int x0, int y0, int w, int h, std::size_t& pitchFloats) {
-  const ImageF* im = src_.window(x0, y0, x0 + w, y0 + h);
-  if (!im) return nullptr;
-  pitchFloats = std::size_t(w) * 3;
-  return im->data.data();
+const float* BandSource::rows(int x0, int y0, int x1, int y1, std::size_t& pitchFloats) {
+  // tiles of a row of tiles share their rows: one full-width band serves them all (one demosaic call instead of one per tile). A narrow rect
+  // (a quarter turn: a row of output tiles reads a column of the source) is read as it is.
+  const bool inBand = win_.width == W_ && y0 >= rowsY0_ && y1 <= rowsY0_ + win_.height && !win_.data.empty();
+  if (!inBand && 2 * (x1 - x0) < W_) {
+    if (!window(x0, y0, x1, y1)) return nullptr;
+    pitchFloats = std::size_t(x1 - x0) * 3;
+    return win_.data.data();
+  }
+  if (!inBand) {
+    const int b1 = std::min(H_, std::max(y1, y0 + kBandRows));
+    if (!window(0, y0, W_, b1)) return nullptr;
+  }
+  if (x0 < 0 || x1 > W_) return nullptr;
+  pitchFloats = std::size_t(W_) * 3;
+  return win_.data.data() + std::size_t(y0 - rowsY0_) * pitchFloats + std::size_t(x0) * 3;
 }
+
+const float* BandSourceStore::window(int x0, int y0, int w, int h, std::size_t& pitchFloats) { return src_.rows(x0, y0, x0 + w, y0 + h, pitchFloats); }
 
 SourceImage sizeOnly(const SourceImage& meta, int W, int H) {
   SourceImage s;
@@ -149,23 +257,28 @@ namespace {
 struct RowResizer {
   resize::Geom g;
   ImageF dst;
-  int next = 0;
+  std::vector<char> done;
+  int count = 0;
   int footprint() const { return int(std::ceil(g.sy)) + 2; }
-  // rows [b0, b1) of the picture are in `buf` (row b0 at buf row 0); rows up to `upTo` are final (all rows of the picture below it are in)
+  // rows [b0, b1) of the picture are in `buf` (row b0 at buf row 0): every output row whose footprint lies inside is computed (once), in any
+  // order of the bands
   void feed(const ImageF& buf, int b0, int b1) {
-    int first = next, last = next;
-    while (last < g.dh) {
+    if (done.empty()) done.assign(std::size_t(g.dh), 0);
+    std::vector<int> ys;
+    for (int y = std::max(0, int(b0 / g.sy) - 1); y < g.dh; ++y) {
       int y0, y1;
-      resize::rowSpan(g, last, y0, y1);
-      if (y1 > b1) break;
-      ++last;
+      resize::rowSpan(g, y, y0, y1);
+      if (y0 >= b1) break;
+      if (done[std::size_t(y)] || y0 < b0 || y1 > b1) continue;
+      ys.push_back(y);
     }
-    if (last == first) return;
-    parallelFor(last - first, [&](int k) {
-      const int y = first + k;
+    if (ys.empty()) return;
+    parallelFor(int(ys.size()), [&](int k) {
+      const int y = ys[std::size_t(k)];
       resize::row(g, y, [&](int yy) { return buf.row(yy - b0); }, dst.row(y));
     });
-    next = last;
+    for (int y : ys) done[std::size_t(y)] = 1;
+    count += int(ys.size());
   }
 };
 
@@ -243,18 +356,23 @@ bool analyse(BandSource& src, const SourceImage& meta, const Wants& want, Analys
 
     int K = 2;
     for (const RowResizer& r : rz) K = std::max(K, r.footprint());
-    const int B = std::max(256, K);
-    for (int y0 = 0; y0 < H; y0 += B) {
-      const int y1 = std::min(H, y0 + B), b0 = std::max(0, y0 - K);
-      const ImageF* buf = src.window(0, b0, W, y1);
+    const int B = std::max(512, K);  // one demosaic call per 512 rows (fewer GPU round trips)
+    // bottom to top when the rows may be kept for the render (it starts at the top); the raster guide's area sums need top to bottom
+    const bool up = !gc && pass == 0;
+    const int nb = (H + B - 1) / B;
+    for (int bi = 0; bi < nb; ++bi) {
+      const int y0 = (up ? nb - 1 - bi : bi) * B, y1 = std::min(H, y0 + B);
+      const int b0 = up ? y0 : std::max(0, y0 - K), b1 = up ? std::min(H, y1 + K) : y1;  // the footprint overlap below (up) / above (down)
+      const ImageF* buf = src.window(0, b0, W, b1);
       if (!buf) return fail("cancelled");
+      src.keep(*buf, b0, y0, y1);
       // shadow-floor decision samples: every 4th row / column (before the floor)
       if (decide)
         for (int y = (y0 + 3) / 4 * 4; y < y1; y += 4) {
           const float* p = buf->row(y - b0);
           for (int x = 0; x < W; x += 4) luma.push_back(shadowChromaLuma(p + 3 * x));
         }
-      for (RowResizer& r : rz) r.feed(*buf, b0, y1);
+      for (RowResizer& r : rz) r.feed(*buf, b0, b1);
       for (int j = 0; j < gh; ++j) {
         const int y = gridRowY[std::size_t(j)];
         if (y < y0 || y >= y1) continue;
@@ -289,13 +407,14 @@ bool analyse(BandSource& src, const SourceImage& meta, const Wants& want, Analys
           });
         }
       }
-      if (progress && !progress(float(y1) / float(H) * (pass == 0 ? 1.f : 0.5f))) return fail("cancelled");
+      if (progress && !progress(float(bi + 1) / float(nb) * (pass == 0 ? 1.f : 0.5f))) return fail("cancelled");
     }
     for (const RowResizer& r : rz)
-      if (r.next != r.g.dh) return fail("reduction incomplete");
+      if (r.count != r.g.dh) return fail("reduction incomplete");
     ++out.passes;
     if (decide && shadowChromaWanted(luma)) {  // rare (near-black frames): the reductions must see the floored picture, run again
       src.setShadowFloor(true);
+      src.applyShadowFloorToCache();
       out.shadow = true;
       continue;
     }

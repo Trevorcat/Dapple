@@ -72,6 +72,8 @@ Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, i
 
 // Drops the process-wide mosaic cache (memory pressure, tests).
 void clearMosaicCache();
+// Drops every cached mosaic / demosaiced picture but the mosaic of `key` (MosaicImage::key): the trim before a streaming export. Bytes released.
+std::size_t trimMosaicCacheExcept(const std::uint64_t key[2]);
 // Entries the cache served without decoding / decoded (tests).
 void mosaicCacheCounters(unsigned long long* hits, unsigned long long* misses);
 

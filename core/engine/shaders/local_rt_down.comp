@@ -1,0 +1,47 @@
+#version 450
+// Portrait retouch planes (docs/engine/pipeline-architecture.md section 43): one 4 x 4 cell of the window's 1/4 grid per invocation. Writes
+// (Y, Y^2) of the cell's mean colour (the guided filter of the coarse base L_c) and the skin-weighted sums (w Y, w Cr, w Cb, w) / 16 of the
+// skin reference (normalised convolution; w from the retouch amounts, local::skinWeight). Twin of the grid loop of
+// local::retouchCombineWindow (core/src/local_retouch.cpp).
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+#include "common.glsl"
+
+layout(std140, binding = 0) uniform P {
+  ivec4 dims;  // w, h
+  ivec4 low;   // lw, lh
+  ivec4 ch;    // amount channel of smooth, even, redness, under-eye (-1 = none)
+  ivec4 ch2;   // shine, face light
+} u;
+layout(binding = 1) uniform sampler2D uIn;
+layout(binding = 2) uniform sampler2D uAux0;
+layout(binding = 3) uniform sampler2D uAux1;
+layout(binding = 4, rgba32f) uniform writeonly image2D uYY;
+layout(binding = 5, rgba32f) uniform writeonly image2D uS;
+
+float chan(int c, vec4 a0, vec4 a1) { return c < 0 ? 0.0 : c < 4 ? a0[c] : a1[c - 4]; }
+
+void main() {
+  const ivec2 l = ivec2(gl_GlobalInvocationID.xy);
+  if (l.x >= u.low.x || l.y >= u.low.y) return;
+  const int x0 = l.x * 4, y0 = l.y * 4, x1 = min(u.dims.x, x0 + 4), y1 = min(u.dims.y, y0 + 4);
+  vec3 acc = vec3(0.0);
+  vec4 sk = vec4(0.0);
+  for (int y = y0; y < y1; ++y)
+    for (int x = x0; x < x1; ++x) {
+      const ivec2 q = ivec2(x, y);
+      const vec3 c = texelFetch(uIn, q, 0).rgb;
+      acc += c;
+      const vec4 a0 = texelFetch(uAux0, q, 0), a1 = texelFetch(uAux1, q, 0);
+      const float ks = chan(u.ch.x, a0, a1), ke = chan(u.ch.y, a0, a1), kr = chan(u.ch.z, a0, a1), ku = chan(u.ch.w, a0, a1);
+      const float kh = chan(u.ch2.x, a0, a1);
+      const float s = clamp(ks + ke + kr + kh, 0.0, 1.0), uu = clamp(ku, 0.0, 1.0);
+      const float om = (s + 0.02) * (1.0 - uu);
+      const float Y = lumaOf(c);
+      sk += om * vec4(Y, c.r - Y, c.b - Y, 1.0);
+    }
+  const float inv = 1.0 / float((y1 - y0) * (x1 - x0));
+  const float yv = lumaOf(acc * inv);
+  imageStore(uYY, l, vec4(yv, yv * yv, 0.0, 0.0));
+  imageStore(uS, l, sk * inv);
+}

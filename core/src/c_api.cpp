@@ -122,6 +122,9 @@ struct DappleSession {
   std::atomic<bool> lazyOpen{false};
   std::recursive_mutex lazyMtx;
   std::shared_ptr<dapple::xstream::Analyses> streamA;  // exact reductions of the lazy picture (first streamed render)
+  std::shared_ptr<dapple::xstream::BandSource> bands;  // the band source of the export in flight: its row cache carries the analysis pass's rows to the render
+  bool streamFilm = false;                             // the export in flight is a film edit (its bands need more memory: a smaller row cache)
+  std::filesystem::path fullRawPath;                   // a FULL open of a RAW at natural size (an export may switch it to bands: demoteToStream)
   DappleProgressFn exportProgress = nullptr;           // dapple_session_set_export_progress
   void* exportProgressUser = nullptr;
 };
@@ -616,7 +619,16 @@ std::shared_ptr<const xstream::Analyses> lazyAnalyses(DappleSession* s, xstream:
   }
   want.longEdges.erase(std::remove_if(want.longEdges.begin(), want.longEdges.end(), [&](int le) { return le <= 0 || le >= std::max(s->lazy->width, s->lazy->height); }),
                        want.longEdges.end());
-  xstream::BandSource bs(s->lazy->mosaic);
+  if (!s->bands) s->bands = std::make_shared<xstream::BandSource>(s->lazy->mosaic);
+  xstream::BandSource& bs = *s->bands;
+  {  // the row cache: what the budget leaves after the streaming machinery itself (measured on a phone: ~2700 full-width float rows, ~4100 for a
+     // film: 310 / 470 MB at 61 MP), at most half the budget; DAPPLE_EXPORT_CACHE_MB overrides (0 = off)
+    const std::size_t budget = xstream::budgetBytes();
+    const std::size_t machinery = std::size_t(s->lazy->width) * (s->streamFilm ? 4100u : 2700u) * 12u;
+    std::size_t cb = budget > machinery ? std::min(budget - machinery, budget / 2) : 0;
+    if (const char* e = std::getenv("DAPPLE_EXPORT_CACHE_MB")) cb = std::size_t(std::max(0L, std::atol(e))) << 20;
+    bs.setCacheBudget(cb);
+  }
   bs.setCancel(s->exportEngine.cancelCell(), s->exportEngine.ticket());
   auto a = std::make_shared<xstream::Analyses>();
   std::string err;
@@ -631,8 +643,9 @@ std::shared_ptr<const xstream::Analyses> lazyAnalyses(DappleSession* s, xstream:
     std::lock_guard<std::mutex> ml(s->matchMtx);
     if (!s->keyProxy) s->keyProxy = a->p256;
   }
-  stageLog("export_stream analyses %dx%d: %d pass(es) %.0f ms, shadow floor %d, %d reductions, guide grids %d, %s demosaic", s->lazy->width, s->lazy->height, a->passes,
-           a->ms, a->shadow ? 1 : 0, int(a->reduced.size()), a->guide ? int(a->guide->grids.size()) : 0, bs.gpu() ? "GPU" : "CPU");
+  stageLog("export_stream analyses %dx%d: %d pass(es) %.0f ms, shadow floor %d, %d reductions, guide grids %d, %s demosaic, row cache %.0f MB (%d rows)", s->lazy->width,
+           s->lazy->height, a->passes, a->ms, a->shadow ? 1 : 0, int(a->reduced.size()), a->guide ? int(a->guide->grids.size()) : 0, bs.gpu() ? "GPU" : "CPU",
+           double(bs.cacheBytes()) / 1048576.0, bs.cachedRows());
   return a;
 }
 
@@ -651,8 +664,17 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
   if (dapple::engine::mode() != dapple::engine::Mode::Full) return 0;  // the golden oracle (DAPPLE_ENGINE=off) renders whole pictures only
   const int W = s->lazy->width, H = s->lazy->height, own = std::max(W, H);
   const bool reduced = outLongEdge > 0 && outLongEdge < own;
-  if (paramsIn.outputSpace == 1 && Renderer(paramsIn, *s->camera, nullptr).filmActive()) {
-    // as renderSessionParams: a film is rendered as sRGB, then converted to Display P3 (band by band)
+  s->streamFilm = Renderer(paramsIn, *s->camera, nullptr).filmActive();
+  if (paramsIn.outputSpace == 1 && s->streamFilm) {
+    // as renderSessionParams: a film is rendered as sRGB, then converted to Display P3 (band by band). The film match of the P3 params is
+    // solved first, as renderSessionParams does (the match cache of the session remembers it: the sRGB solve that follows starts from it)
+    xstream::Wants want;
+    want.longEdges = extraLongEdges;
+    if (reduced) want.longEdges.push_back(outLongEdge);
+    want.guideGrids = local::guideGridSizes(paramsIn.local, W, H, false);
+    want.guide = !want.guideGrids.empty();
+    if (!lazyAnalyses(s, want, 0.f, reduced ? 1.f : 0.3f)) return -1;
+    (void)withFilmKey(s, paramsIn, lutPath);
     EditParams q = paramsIn;
     q.outputSpace = 0;
     int ow = 0;
@@ -665,7 +687,8 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
         },
         extraLongEdges);
   }
-  if (Renderer(paramsIn, *s->camera, nullptr).filmActive()) return 0;  // the film branch reads the whole frame: not streamed (section 42.6)
+  // a film stock streams on the CPU in bands (section 42.6): the GPU executor keeps a film frame resident (it would read the whole picture)
+  const bool film = Renderer(paramsIn, *s->camera, nullptr).filmActive();
   xstream::Wants want;
   want.longEdges = extraLongEdges;
   if (reduced) want.longEdges.push_back(outLongEdge);
@@ -684,8 +707,10 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
   renderer.setAnalysisSources(a->p256.get(), a->grid.get(), a->p512.get());
   const xstream::GuideScope guideScope(a->guide.get());
   const SourceImage virt = xstream::sizeOnly(s->lazy->meta, W, H);
-  xstream::BandSource bs(s->lazy->mosaic);
+  if (!s->bands) s->bands = std::make_shared<xstream::BandSource>(s->lazy->mosaic);
+  xstream::BandSource& bs = *s->bands;  // with the rows the analysis pass left in its cache
   bs.setShadowFloor(a->shadow);
+  const std::uint64_t hits0 = bs.cacheHits(), windows0 = bs.windows();
   const float p0 = reduced ? 0.f : 0.3f;
   int bandsDone = 0, outH = 0;
   auto progressSink = [&](int y0, int n, const std::uint8_t* rgb) {
@@ -700,7 +725,7 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
   mem::mark("render");
 #ifdef DAPPLE_HAVE_GPU
   dapple::engine::gpu::installProvider();
-  if (dapple::engine::gpu::runtimeEnabled() && (outLongEdge <= 0 || outLongEdge >= 1500)) {  // as renderSessionParams: the GPU export, its tiles streamed
+  if (!film && dapple::engine::gpu::runtimeEnabled() && (outLongEdge <= 0 || outLongEdge >= 1500)) {  // as renderSessionParams: the GPU export, its tiles streamed
     std::lock_guard<std::mutex> lock(s->exportMtx);
     bs.setCancel(s->exportEngine.cancelCell(), s->exportEngine.ticket());
     xstream::BandSourceStore store(bs);
@@ -761,15 +786,16 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
   }
   std::lock_guard<std::mutex> lock(s->exportMtx);
   bs.setCancel(s->exportEngine.cancelCell(), s->exportEngine.ticket());
-  int tile = 512;  // one JPEG strip per band
+  int tile = film ? 256 : 512;  // one JPEG strip per band (a film band carries its E2 / DIR planes: half the rows)
   if (const char* e = std::getenv("DAPPLE_EXPORT_STREAM_TILE")) tile = std::max(64, std::atoi(e) / 4 * 4);
   std::string err;
   const auto t0 = std::chrono::steady_clock::now();
   int fw = 0, fh = 0;
   const bool ok = xstream::renderBands(s->exportEngine, params, renderer, virt, bs, tile, s->proxy != nullptr, [&](int w, int h) { fw = w, fh = h, sized(w, h); },
                                        progressSink, &err);
-  stageLog("export_stream CPU %dx%d: %s in %.0f ms (%d bands, %llu windows, demosaic %.0f ms %s, largest window %.0f MB)", fw, fh, ok ? "ok" : err.c_str(), msSince(t0),
-           bandsDone, (unsigned long long)bs.windows(), bs.demosaicMs(), bs.gpu() ? "GPU" : "CPU", double(bs.peakWindowBytes()) / 1048576.0);
+  stageLog("export_stream CPU %dx%d: %s in %.0f ms (%d bands, %llu windows demosaiced, %llu from the row cache, demosaic %.0f ms %s, largest window %.0f MB)", fw, fh,
+           ok ? "ok" : err.c_str(), msSince(t0), bandsDone, (unsigned long long)(bs.windows() - windows0), (unsigned long long)(bs.cacheHits() - hits0), bs.demosaicMs(),
+           bs.gpu() ? "GPU" : "CPU", double(bs.peakWindowBytes()) / 1048576.0);
   if (!ok) {
     if (err.rfind("engine: plan not supported", 0) == 0) return 0;
     setError(err);
@@ -1372,7 +1398,7 @@ int32_t dapple_is_supported_file(const char* path) {
 // One-line stage log (field diagnostics): tag dapple_engine on Android, os_log on Apple, stderr elsewhere.
 static void stageLog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void stageLog(const char* fmt, ...) {
-  char buf[256];
+  char buf[640];  // the export lines carry the memory figures at the end: keep them whole
   va_list ap;
   va_start(ap, fmt);
   std::vsnprintf(buf, sizeof buf, fmt, ap);
@@ -1392,13 +1418,22 @@ static double msSince(std::chrono::steady_clock::time_point t0) {
 // Streaming export (section 42): the FULL open of a mosaic RAW whose whole-frame export would not fit the device (xstream::openLazy) keeps the cached
 // mosaic and the metadata only; with long_edge > 0 the reduction is built band by band (bit-identical to resizeToLongEdge of the full decode) and
 // the session is an ordinary one. Null = open it the usual way (the mosaic and the anchor are cached: no second unpack).
-static DappleSession* openLazySession(const fs::path& p, const DecodeOptions& opts, int32_t longEdge) {
+static DappleSession* openLazySession(const fs::path& p, const DecodeOptions& opts, int32_t longEdge, bool* mosaicPath) {
   const auto t0 = std::chrono::steady_clock::now();
   std::string why;
   auto z = openFullLazy(p, opts, &why);
   if (!z) return nullptr;
+  if (mosaicPath) *mosaicPath = true;
+  // the budget is what is available NOW, after dropping what the export can do without (other photos' mosaics, film workspaces, idle AI models)
+  const std::size_t foot0 = mem::footprint();
+  std::size_t trimmed = xstream::trimForExport(z->mosaic->key);
+  dapple_ai_release(0);
+  const std::size_t foot1 = mem::footprint();
   std::string policy;
-  if (!xstream::openLazy(z->width, z->height, &policy)) return nullptr;
+  const bool lazy = xstream::openLazy(z->width, z->height, &policy);
+  stageLog("session_open %s: trim before the export decision released %.0f MB of caches (footprint %.0f -> %.0f MB); %s -> %s", pathToUtf8(p.filename()).c_str(),
+           double(trimmed) / 1048576.0, double(foot0) / 1048576.0, double(foot1) / 1048576.0, policy.c_str(), lazy ? "stream" : "whole frame");
+  if (!lazy) return nullptr;
   auto session = std::make_unique<DappleSession>();
   session->source = z->meta;
   session->cameraOwned = dapple::effectiveCamera(cameras(), session->source.meta);
@@ -1446,8 +1481,26 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
 #endif
         const auto t0 = std::chrono::steady_clock::now();
         // streaming export (section 42): a FULL open of a large mosaic RAW keeps the mosaic, not the float picture
+        bool mosaicPath = false;
         if (opts.quality == DecodeQuality::Full && std::strcmp(decoder->name(), "libraw") == 0 && xstream::envMode() != xstream::Mode::Off)
-          if (DappleSession* lazy = openLazySession(p, opts, long_edge)) return lazy;
+          if (DappleSession* lazy = openLazySession(p, opts, long_edge, &mosaicPath)) return lazy;
+        // a RAW the band path cannot read (linear / JPEG XL DNG, sRAW, an OpcodeList3 warp) decodes whole: refuse cleanly what cannot fit
+        // (the LibRaw decode peaks near 30 B/px: a 48 MP linear DNG ~1.4 GB) instead of being killed by the OS (section 42.7)
+        if (!mosaicPath && opts.quality == DecodeQuality::Full && std::strcmp(decoder->name(), "libraw") == 0 && xstream::envMode() == xstream::Mode::Auto) {
+          if (auto meta = decoder->probe(p); meta && meta->sensorWidth > 0 && meta->sensorHeight > 0) {
+            const std::size_t need = xstream::predictWholeDecodePeak(meta->sensorWidth, meta->sensorHeight);
+            std::string how;
+            const std::size_t budget = xstream::budgetBytes(&how);
+            if (need > budget) {
+              char b[300];
+              std::snprintf(b, sizeof b, "this %dx%d RAW cannot be read in bands and its full decode needs about %.0f MB; the device has about %.0f MB (%s)",
+                            meta->sensorWidth, meta->sensorHeight, double(need) / 1048576.0, double(budget) / 1048576.0, how.c_str());
+              stageLog("session_open %s refused: %s", pathToUtf8(p.filename()).c_str(), b);
+              setError(b);
+              return nullptr;
+            }
+          }
+        }
         auto src = decoder->decode(p, opts);
         if (!src) {
           setError(src.error().message);
@@ -1455,6 +1508,7 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         }
         auto session = std::make_unique<DappleSession>();
         session->source = std::move(*src);
+        if (mosaicPath && long_edge <= 0) session->fullRawPath = p;
         const double decodeMs = msSince(t0);
         if (long_edge > 0) session->source.linear = resizeToLongEdge(session->source.linear, long_edge);
         stageLog("session_open %s quality=%s decoded %dx%d in %.0f ms, long_edge %d total %.0f ms (footprint %.0f MB, available %.0f MB)", pathToUtf8(p.filename()).c_str(),
@@ -2382,6 +2436,7 @@ int streamExportJpeg(DappleSession* s, const EditParams& ep, const char* lutPath
                      const char* exportJson, bool hdr, float headroom, DappleHdrInfo* info);
 // An edit that cannot stream on a lazy session: the whole frame if it fits the device, else a clean error (never a kill by the OS).
 bool wholeFrameFits(DappleSession* s, const EditParams& ep);
+void demoteToStream(DappleSession* s, const EditParams& ep);
 }  // namespace
 
 int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_json, const char* lut_path,
@@ -2413,6 +2468,7 @@ int32_t exportJpegImpl(DappleSession* session, const char* params_json, const ch
           ep.outputSpace = exportSpaceOf(export_json);
           if (session->lazyOpen.load() && !missingRasterIds(ep).empty() && !ensureSource(session)) return DAPPLE_ERROR;  // re-creating a plane needs the picture
           if (!ensureLocalRasters(session, ep)) return DAPPLE_ERROR;  // a plane the edit needs must exist: never export a silently empty mask
+          demoteToStream(session, ep);
           if (session->lazyOpen.load()) {  // streaming export (section 42)
             const int r = streamExportJpeg(session, ep, lut_path, out_long_edge, jpeg_quality, out_path, export_json, false, 0.f, nullptr);
             if (r != 0) return r > 0 ? DAPPLE_OK : DAPPLE_ERROR;
@@ -2539,6 +2595,28 @@ bool writeBytesAtomic(const fs::path& path, const std::vector<std::uint8_t>& byt
   return true;
 }
 // ---- streaming export (section 42): the JPEG / Ultra HDR export of a lazy session -------------------------------------------------------------
+// An edit the open did not foresee (a film stock: ~55 B/px more than a plain export) on a session that holds the whole float picture: when the
+// whole-frame export would not fit, the session gives its picture back and exports in bands from the cached mosaic (same pixels).
+void demoteToStream(DappleSession* s, const EditParams& ep) {
+  if (s->lazyOpen.load() || s->fullRawPath.empty() || xstream::envMode() != xstream::Mode::Auto || dapple::engine::mode() != dapple::engine::Mode::Full) return;
+  const int W = s->source.linear.width, H = s->source.linear.height;
+  const std::size_t held = std::size_t(W) * H * 12;  // the float picture is already there
+  const std::size_t need = xstream::predictWholePeak(W, H, Renderer(ep, *s->camera, nullptr).filmActive());
+  std::string how;
+  const std::size_t budget = xstream::budgetBytes(&how);
+  if (need <= held + budget) return;
+  std::string why;
+  auto z = openFullLazy(s->fullRawPath, DecodeOptions{}, &why);
+  if (!z || z->width != W || z->height != H) return;
+  std::lock_guard<std::recursive_mutex> lk(s->lazyMtx);
+  ImageF().data.swap(s->source.linear.data);
+  s->source.linear = ImageF();
+  s->lazy = std::make_unique<LazyFull>(std::move(*z));
+  s->lazyOpen = true;
+  stageLog("export: whole frame needs %.0f MB more, the device has %.0f MB (%s): the session switches to bands (picture released)", double(need - held) / 1048576.0,
+           double(budget) / 1048576.0, how.c_str());
+}
+
 bool wholeFrameFits(DappleSession* s, const EditParams& ep) {
   if (!s->lazy) return true;
   const std::size_t need = xstream::predictWholePeak(s->lazy->width, s->lazy->height, Renderer(ep, *s->camera, nullptr).filmActive());
@@ -2555,6 +2633,10 @@ bool wholeFrameFits(DappleSession* s, const EditParams& ep) {
 int streamExportJpeg(DappleSession* s, const EditParams& ep, const char* lutPath, int32_t outLongEdge, int32_t quality, const char* outPath,
                      const char* exportJson, bool hdr, float headroom, DappleHdrInfo* info) {
   const auto t0 = std::chrono::steady_clock::now();
+  struct DropBands {  // the band source and its row cache go with the export, whatever its outcome
+    DappleSession* s;
+    ~DropBands() { s->bands.reset(); }
+  } dropBands{s};
   mem::Sampler smp;
   struct Mark {
     explicit Mark(mem::Sampler* m) { mem::current() = m; }
@@ -2646,6 +2728,7 @@ int streamExportJpeg(DappleSession* s, const EditParams& ep, const char* lutPath
       return -1;
     }
   }
+  s->bands.reset();  // the row cache goes with the export
   smp.finish();
   stageLog("export_stream %s %dx%d%s in %.0f ms: peak footprint %.0f MB (+%.0f over the start, available at the start %.0f MB): %s", outPath ? pathToUtf8(toPath(outPath).filename()).c_str() : "",
            dims.width, dims.height, hdr ? (written ? " Ultra HDR" : " (plain)") : "", msSince(t0), double(smp.peak()) / 1048576.0, double(smp.peak() - std::min(smp.peak(), smp.base())) / 1048576.0,
@@ -2732,6 +2815,7 @@ int32_t exportJpegHdrImpl(DappleSession* session, const char* params_json, const
         params.outputSpace = exportSpaceOf(export_json);
         if (session->lazyOpen.load() && !missingRasterIds(params).empty() && !ensureSource(session)) return DAPPLE_ERROR;
         if (!ensureLocalRasters(session, params)) return DAPPLE_ERROR;
+        demoteToStream(session, params);
         if (session->lazyOpen.load()) {  // streaming export (section 42)
           const int r = streamExportJpeg(session, params, lut_path, out_long_edge, jpeg_quality, out_path, export_json, true, headroom_stops, info);
           if (r != 0) return r > 0 ? DAPPLE_OK : DAPPLE_ERROR;

@@ -205,6 +205,48 @@ std::vector<Pt> irisRing(const FaceMesh& m, const int (&idx)[4]) {
 }
 }  // namespace
 
+// Under-eye crescents (docs/engine/pipeline-architecture.md 43.4): below each lower lid, from the outer to the inner corner, starting 3.5 % of the
+// inter-ocular distance below the lid (lashes) and reaching 3.5 + 24 % at its deepest point (t = 0.6 of the lid's arc length, toward the inner
+// corner where dark circles sit), soft edge sigma 3.5 %, minus the lid opening. "Down" = perpendicular to the iris-to-iris line, toward the mouth.
+Plane underEyePlane(const FaceMesh& m, int w, int h, const Plane& eyes) {
+  static const int kLidR[9] = {33, 7, 163, 144, 145, 153, 154, 155, 133};
+  static const int kLidL[9] = {263, 249, 390, 373, 374, 380, 381, 382, 362};
+  const float ex = m.xy[473][0] - m.xy[468][0], ey = m.xy[473][1] - m.xy[468][1];
+  const float iod = std::hypot(ex, ey);
+  if (!(iod > 2.f)) return Plane{};
+  float dx = ey / iod, dy = -ex / iod;
+  const float mx = 0.5f * (m.xy[13][0] + m.xy[14][0]) - 0.5f * (m.xy[468][0] + m.xy[473][0]);
+  const float my = 0.5f * (m.xy[13][1] + m.xy[14][1]) - 0.5f * (m.xy[468][1] + m.xy[473][1]);
+  if (dx * mx + dy * my < 0.f) dx = -dx, dy = -dy;
+  const float peakExp = std::log(0.5f) / std::log(0.6f);
+  std::vector<std::vector<Pt>> rings;
+  for (const int* lid : {kLidR, kLidL}) {
+    float cum[9] = {0};
+    for (int i = 1; i < 9; ++i) cum[i] = cum[i - 1] + std::hypot(m.xy[lid[i]][0] - m.xy[lid[i - 1]][0], m.xy[lid[i]][1] - m.xy[lid[i - 1]][1]);
+    if (!(cum[8] > 0.f)) continue;
+    std::vector<Pt> up, lo;
+    for (int k = 0; k < 24; ++k) {
+      const float t = float(k) / 23.f, at = t * cum[8];
+      int i = 0;
+      while (i < 7 && cum[i + 1] < at) ++i;
+      const float seg = std::max(cum[i + 1] - cum[i], 1e-6f), u = std::clamp((at - cum[i]) / seg, 0.f, 1.f);
+      const float px = m.xy[lid[i]][0] + (m.xy[lid[i + 1]][0] - m.xy[lid[i]][0]) * u;
+      const float py = m.xy[lid[i]][1] + (m.xy[lid[i + 1]][1] - m.xy[lid[i]][1]) * u;
+      const float s = std::pow(std::max(0.f, std::sin(3.14159265f * std::pow(t, peakExp))), 0.7f);
+      const float d0 = 0.035f * iod, d1 = (0.035f + 0.24f * s) * iod;
+      up.push_back({px + dx * d0, py + dy * d0});
+      lo.push_back({px + dx * d1, py + dy * d1});
+    }
+    std::vector<Pt> r = up;
+    for (int k = 23; k >= 0; --k) r.push_back(lo[std::size_t(k)]);
+    rings.push_back(std::move(r));
+  }
+  if (rings.empty()) return Plane{};
+  Plane p = polygonPlane(w, h, rings, std::max(0.6f, 0.035f * iod));
+  if (!eyes.empty() && eyes.w == p.w && eyes.h == p.h) planeSub(p, eyes);
+  return p;
+}
+
 bool faceFeatures(const FaceMesh& m, int w, int h, const std::uint8_t* rgb, int stride, FaceFeatures& out) {
   out = FaceFeatures{};
   if (w < 8 || h < 8) return false;
@@ -220,6 +262,7 @@ bool faceFeatures(const FaceMesh& m, int w, int h, const std::uint8_t* rgb, int 
   const float gap = std::hypot(m.xy[13][0] - m.xy[14][0], m.xy[13][1] - m.xy[14][1]);
   const float width = std::max(1e-3f, std::hypot(m.xy[78][0] - m.xy[308][0], m.xy[78][1] - m.xy[308][1]));
   out.mouthOpen = gap / width;
+  out.iod = std::hypot(m.xy[473][0] - m.xy[468][0], m.xy[473][1] - m.xy[468][1]);
   if (!out.frontal) return true;
   const float sEye = std::max(0.6f, 0.006f * faceW), sMouth = std::max(0.6f, 0.008f * faceW);
   out.eyes = polygonPlane(w, h, {ring(m, kEyeRight), ring(m, kEyeLeft)}, sEye);
@@ -229,6 +272,7 @@ bool faceFeatures(const FaceMesh& m, int w, int h, const std::uint8_t* rgb, int 
   planeSub(out.sclera, iris);
   out.iris = std::move(iris);
   out.lips = polygonPlane(w, h, {ring(m, kLipsOuter), ring(m, kLipsInner)}, sMouth);
+  out.undereye = underEyePlane(m, w, h, out.eyes);
   {  // the mesh brow edges (upper and lower chain) are only a hair apart: grow the band to the width of a brow (2 % of the face width each side)
     const float grow = 0.02f * faceW;
     std::vector<std::vector<Pt>> rings = {browRing(m, kBrowRightUpper, kBrowRightLower), browRing(m, kBrowLeftUpper, kBrowLeftLower)};
@@ -456,7 +500,7 @@ ParsedId parseId(const std::string& id) {
   if (k == "depth") p.group = "depth";
   if (k == "sky") p.group = "sky";
   if (k.size() > 3 && k[0] == 'f' && k[1] >= '1' && k[1] <= '9' && k[2] == ':') {
-    static const char* kFeat[] = {"face", "eyes", "iris", "sclera", "lips", "teeth", "brows"};
+    static const char* kFeat[] = {"face", "eyes", "iris", "sclera", "lips", "teeth", "brows", "undereye"};
     for (const char* n : kFeat)
       if (k.substr(3) == n) p.group = "faces", p.face = k[1] - '0', p.feature = n;
     if (p.face > kMaxFaces) p.group.clear();

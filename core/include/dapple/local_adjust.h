@@ -14,7 +14,7 @@ namespace dapple {
 
 constexpr int kMaxLocalAdjustments = 16;   // extra entries are dropped (one log line)
 constexpr int kMaxMaskComponents = 8;      // per mask
-constexpr int kMaxRasterComponents = 4;    // per edit (extra ones evaluate to 0, one log line)
+constexpr int kMaxRasterComponents = 12;   // distinct raster planes per edit (extra ones evaluate to 0, one log line); grids shrink above 4 (section 40.4)
 constexpr int kMaxBrushComponents = 8;     // per edit
 constexpr int kMaxBrushPoints = 100000;    // per edit (points beyond are dropped)
 
@@ -54,8 +54,9 @@ struct MaskComponent {
   std::string raw;
 };
 
-// The local op registry (one row per op; docs section 40.2). Order is the slot order of LocalOps::v.
-enum class LocalStage : std::uint8_t { Linear, Window };
+// The local op registry (one row per op; docs sections 40.2 and 43). Order is the index order of LocalOps::v.
+// Stage Heal: the op is consumed when the frame is resolved (spot healing: automatic spots detected inside the mask, docs section 43).
+enum class LocalStage : std::uint8_t { Linear, Window, Heal };
 struct LocalOpInfo {
   const char* key;   // JSON key inside "adjust"
   float lo, hi;      // internal range
@@ -65,18 +66,33 @@ struct LocalOpInfo {
 enum LocalOpId : int {
   kLoExposure, kLoContrast, kLoHighlights, kLoShadows, kLoWhites, kLoBlacks, kLoTemp, kLoTint, kLoSaturation, kLoVibrance,
   kLoColorHue, kLoColorSat,                                    // stage L
-  kLoClarity, kLoTexture, kLoSharpen, kLoNoise, kLoDehaze,     // stage W (aux slots 0..4 in this order)
+  kLoClarity, kLoTexture, kLoSharpen, kLoNoise, kLoDehaze,     // stage W (legacy: aux channels 0..4 in this order when no retouch op is used)
+  kLoSmooth, kLoEven, kLoRedness, kLoUnderEye, kLoShine, kLoFaceLight,  // stage W, portrait retouch (docs section 43)
+  kLoWhiten,                                                   // stage L, portrait retouch (teeth / eye whites)
+  kLoHeal,                                                     // stage Heal: automatic spot healing amount
   kLocalOpCount
 };
 const std::array<LocalOpInfo, kLocalOpCount>& localOps();
 constexpr int kLocalWindowFirst = kLoClarity;
-constexpr int kLocalWindowSlots = kLocalOpCount - kLocalWindowFirst;  // 5
+constexpr int kLocalLegacyWindowOps = 5;                       // clarity .. dehaze
+constexpr int kLocalRetouchFirst = kLoSmooth;
+constexpr int kLocalWindowOps = kLoFaceLight + 1 - kLocalWindowFirst;  // 11 stage-W ops (contiguous)
+constexpr int kLocalWindowSlots = 8;                           // per-pixel amount channels a frame can carry (2 x RGBA16F on the GPU)
 
 struct LocalOps {
   std::array<float, kLocalOpCount> v{};  // all zero = no change (colour sat 0 = no tint)
   bool anyLinear() const;
   bool anyWindow() const;
 };
+
+// A manual heal spot (portrait retouch, docs section 43): photo-normalised centre, radius in units of the long edge, optional source offset
+// (units of the long edge; `src` false = the engine picks a nearby clean patch).
+struct HealSpot {
+  float x = 0.5f, y = 0.5f, r = 0.01f;
+  float dx = 0.f, dy = 0.f;
+  bool src = false;
+};
+constexpr int kMaxHealSpots = 64;    // manual spots per adjustment
 
 struct LocalAdjustment {
   std::string id, name;
@@ -85,6 +101,13 @@ struct LocalAdjustment {
   float strength = 100.f;  // 0..100
   std::vector<MaskComponent> mask;
   LocalOps ops;
+  // portrait retouch (docs section 43; JSON object "retouch" of the item, written only when not default)
+  float face = 0.f;          // inter-ocular distance as a fraction of the photo's long edge (from the AI face metadata); 0 = estimate from the mask
+  float healSens = 25.f;     // automatic heal sensitivity 0..100 (25 = conservative: freckles stay)
+  std::vector<HealSpot> spots;  // manual heal spots (healed whatever the mask; the adjustment's strength applies)
+  std::string extraOps;      // "adjust" keys this build does not know, kept verbatim ("k":v,... without braces) and written back
+  std::string extraKeys;     // item keys this build does not know, kept verbatim and written back
+  bool anyRetouch() const;   // a retouch op, or heal spots
 };
 
 // Brings every value into its range, drops entries beyond the caps (one log line each kind of drop).

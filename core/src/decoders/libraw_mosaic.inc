@@ -373,6 +373,8 @@ void logMosaicRefusal(const std::string& reason) {  // once per reason
 }
 }  // namespace
 
+std::size_t trimMosaicCacheExcept(const std::uint64_t key[2]) { return mosaicCache().trimExcept(key[0], key[1]); }
+
 void clearMosaicCache() {
   mosaicCache().clear();
   std::lock_guard<std::mutex> lk(g_anchorMu);

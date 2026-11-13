@@ -153,6 +153,43 @@ bool readItem(const JValue& it, LocalAdjustment& a) {
       float x = 0.f;
       if (const JValue* v = ad->get(ops[std::size_t(k)].key); v && asNumber(*v, x)) a.ops.v[std::size_t(k)] = x / ops[std::size_t(k)].scale;
     }
+    // ops of a newer build: kept verbatim (written back unchanged), not evaluated
+    for (const auto& m : ad->members) {
+      bool known = false;
+      for (int k = 0; k < kLocalOpCount && !known; ++k) known = m.first == ops[std::size_t(k)].key;
+      if (known) continue;
+      logOnce("unknown local op '" + m.first.substr(0, 40) + "' kept, not evaluated");
+      if (!a.extraOps.empty()) a.extraOps += ",";
+      a.extraOps += esc(m.first) + ":";
+      jsonlite::writeValue(m.second, a.extraOps);
+    }
+  }
+  if (const JValue* rt = it.get("retouch"); rt && rt->kind == JValue::Object) {  // portrait retouch (docs section 43)
+    rd(*rt, "face", a.face);
+    rd(*rt, "sens", a.healSens);
+    if (const JValue* sp = rt->get("spots"); sp && sp->kind == JValue::Array) {
+      for (const JValue& e : sp->items) {
+        if (e.kind != JValue::Array || e.items.size() < 3) continue;
+        HealSpot h;
+        float v[5] = {0, 0, 0, 0, 0};
+        bool ok = true;
+        const std::size_t n = std::min<std::size_t>(5, e.items.size());
+        for (std::size_t i = 0; i < n; ++i) ok = ok && asNumber(e.items[i], v[i]);
+        if (!ok) continue;
+        h.x = v[0], h.y = v[1], h.r = v[2];
+        if (n >= 5) h.dx = v[3], h.dy = v[4], h.src = true;
+        a.spots.push_back(h);
+      }
+    }
+  }
+  static const char* kItemKeys[] = {"id", "name", "on", "invert", "strength", "mask", "adjust", "retouch"};
+  for (const auto& m : it.members) {
+    bool known = false;
+    for (const char* k : kItemKeys) known = known || m.first == k;
+    if (known) continue;
+    logOnce("unknown local adjustment key '" + m.first.substr(0, 40) + "' kept");
+    a.extraKeys += "," + esc(m.first) + ":";
+    jsonlite::writeValue(m.second, a.extraKeys);
   }
   return true;
 }
@@ -226,19 +263,34 @@ const std::array<LocalOpInfo, kLocalOpCount>& localOps() {
       {"sharpen", -100.f, 100.f, 1.f, LocalStage::Window},
       {"noise", 0.f, 100.f, 1.f, LocalStage::Window},
       {"dehaze", -100.f, 100.f, 1.f, LocalStage::Window},
+      // portrait retouch (docs section 43)
+      {"smooth", 0.f, 100.f, 1.f, LocalStage::Window},
+      {"even", 0.f, 100.f, 1.f, LocalStage::Window},
+      {"redness", 0.f, 100.f, 1.f, LocalStage::Window},
+      {"undereye", 0.f, 100.f, 1.f, LocalStage::Window},
+      {"shine", 0.f, 100.f, 1.f, LocalStage::Window},
+      {"facelight", 0.f, 100.f, 1.f, LocalStage::Window},
+      {"whiten", 0.f, 100.f, 1.f, LocalStage::Linear},
+      {"heal", 0.f, 100.f, 1.f, LocalStage::Heal},
   }};
   return t;
 }
 
 bool LocalOps::anyLinear() const {
-  for (int k = 0; k < kLocalWindowFirst; ++k)
-    if (k != kLoColorHue && v[std::size_t(k)] != 0.f) return true;
+  const auto& ops = localOps();
+  for (int k = 0; k < kLocalOpCount; ++k)
+    if (ops[std::size_t(k)].stage == LocalStage::Linear && k != kLoColorHue && v[std::size_t(k)] != 0.f) return true;
   return false;
 }
 bool LocalOps::anyWindow() const {
-  for (int k = kLocalWindowFirst; k < kLocalOpCount; ++k)
+  for (int k = kLocalWindowFirst; k < kLocalWindowFirst + kLocalWindowOps; ++k)
     if (v[std::size_t(k)] != 0.f) return true;
   return false;
+}
+bool LocalAdjustment::anyRetouch() const {
+  for (int k = kLocalRetouchFirst; k < kLocalOpCount; ++k)
+    if (ops.v[std::size_t(k)] != 0.f) return true;
+  return !spots.empty();
 }
 
 const char* maskKindName(MaskKind k) {
@@ -267,6 +319,22 @@ void clampLocal(std::vector<LocalAdjustment>& list) {
     for (int k = 0; k < kLocalOpCount; ++k) {
       float& v = a.ops.v[std::size_t(k)];
       v = fixf(v, ops[std::size_t(k)].lo, ops[std::size_t(k)].hi, 0.f);
+    }
+    a.face = fixf(a.face, 0.f, 1.f, 0.f);
+    if (a.face > 0.f && a.face < 0.002f) a.face = 0.002f;
+    a.healSens = fixf(a.healSens, 0.f, 100.f, 25.f);
+    if (int(a.spots.size()) > kMaxHealSpots) {
+      logOnce("more than 64 heal spots in one adjustment: the extra ones are ignored");
+      a.spots.resize(kMaxHealSpots);
+    }
+    for (HealSpot& h : a.spots) {
+      h.x = fixf(h.x, -1.f, 2.f, 0.5f), h.y = fixf(h.y, -1.f, 2.f, 0.5f);
+      h.r = fixf(h.r, 0.0005f, 0.02f, 0.01f);
+      h.dx = fixf(h.dx, -0.08f, 0.08f, 0.f), h.dy = fixf(h.dy, -0.08f, 0.08f, 0.f);
+      const float d = std::hypot(h.dx, h.dy);
+      if (h.src && d > 4.f * h.r) {  // the source stays within 4 radii (bounds the tile halo)
+        h.dx *= 4.f * h.r / d, h.dy *= 4.f * h.r / d;
+      }
     }
     if (int(a.mask.size()) > kMaxMaskComponents) {
       logOnce("more than 8 mask components: the extra ones are ignored");
@@ -312,7 +380,10 @@ void clampLocal(std::vector<LocalAdjustment>& list) {
 std::string localToJson(const std::vector<LocalAdjustment>& list) {
   if (list.empty()) return "";
   const auto& ops = localOps();
-  std::string o = "{\"v\":1,\"items\":[";
+  // version 2 = an item carries portrait retouch ops or a "retouch" object (docs section 43); edits without them stay version 1, byte for byte
+  bool v2 = false;
+  for (const LocalAdjustment& a : list) v2 = v2 || a.anyRetouch() || a.face > 0.f || a.healSens != 25.f;
+  std::string o = v2 ? "{\"v\":2,\"items\":[" : "{\"v\":1,\"items\":[";
   for (std::size_t i = 0; i < list.size(); ++i) {
     const LocalAdjustment& a = list[i];
     if (i) o += ",";
@@ -337,7 +408,30 @@ std::string localToJson(const std::vector<LocalAdjustment>& list) {
       o += ops[std::size_t(k)].key;
       o += "\":" + num(double(v) * ops[std::size_t(k)].scale);
     }
-    o += "}}";
+    if (!a.extraOps.empty()) {
+      if (!first) o += ",";
+      o += a.extraOps;
+    }
+    o += "}";
+    if (a.face > 0.f || a.healSens != 25.f || !a.spots.empty()) {
+      std::string r;
+      if (a.face > 0.f) r += "\"face\":" + num(a.face);
+      if (a.healSens != 25.f) r += std::string(r.empty() ? "" : ",") + "\"sens\":" + num(a.healSens);
+      if (!a.spots.empty()) {
+        r += std::string(r.empty() ? "" : ",") + "\"spots\":[";
+        for (std::size_t i = 0; i < a.spots.size(); ++i) {
+          const HealSpot& h = a.spots[i];
+          if (i) r += ",";
+          r += "[" + num(h.x) + "," + num(h.y) + "," + num(h.r);
+          if (h.src) r += "," + num(h.dx) + "," + num(h.dy);
+          r += "]";
+        }
+        r += "]";
+      }
+      o += ",\"retouch\":{" + r + "}";
+    }
+    o += a.extraKeys;
+    o += "}";
   }
   o += "]}";
   return o;
@@ -351,7 +445,7 @@ bool localFromValue(const jsonlite::JValue& v, std::vector<LocalAdjustment>& out
   } else if (v.kind == JValue::Object) {
     float ver = 1.f;
     rd(v, "v", ver);
-    if (ver > 1.f) logOnce("local adjustments of a newer schema version: reading what this build knows");
+    if (ver > 2.f) logOnce("local adjustments of a newer schema version: reading what this build knows");
     items = v.get("items");
   }
   if (!items || items->kind != JValue::Array) return true;
@@ -390,7 +484,15 @@ std::uint64_t localHash(const std::vector<LocalAdjustment>& list) {
     if (!a.enabled) continue;
     mix(0xA0 | (a.invert ? 1 : 0));
     f(a.strength);
-    for (float v : a.ops.v) f(v);
+    for (int k = 0; k < kLocalRetouchFirst; ++k) f(a.ops.v[std::size_t(k)]);
+    // portrait retouch (docs section 43): mixed only when used, so the hash of older edits is unchanged
+    for (int k = kLocalRetouchFirst; k < kLocalOpCount; ++k)
+      if (a.ops.v[std::size_t(k)] != 0.f) mix(0x7E00 + std::uint64_t(k)), f(a.ops.v[std::size_t(k)]);
+    if (a.anyRetouch() || a.face > 0.f) {
+      mix(0x7E70), f(a.face), f(a.healSens);
+      mix(a.spots.size());
+      for (const HealSpot& hs : a.spots) f(hs.x), f(hs.y), f(hs.r), f(hs.dx), f(hs.dy), mix(hs.src ? 1 : 0);
+    }
     for (const MaskComponent& m : a.mask) {
       mix(std::uint64_t(m.kind) << 8 | std::uint64_t(m.op) << 4 | (m.invert ? 1 : 0));
       switch (m.kind) {

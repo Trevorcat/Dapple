@@ -590,13 +590,37 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   const auto t0 = Clock::now();
   ResultCache local;
   ResultCache& cache = opt.sessionCache ? cache_ : local;
-  const Plan plan = Planner::plan(g, makeRequest(fk, opt.mode, opt.tile, opt.memBudget, 3), &cache);
+  PlanRequest prq = makeRequest(fk, opt.mode, opt.tile, opt.memBudget, 3);
+  // a streamed film frame keeps its tiles: the film plane arrives in bands (section 42.6); env DAPPLE_FILM_TILES=1: the whole-frame film export in
+  // tiles too (comparisons at the same tile size)
+  prq.filmTiles = streaming || (std::getenv("DAPPLE_FILM_TILES") && std::getenv("DAPPLE_FILM_TILES")[0] == '1');
+  Plan plan = Planner::plan(g, prq, &cache);
+  if (streaming && opt.tile > 0 && !std::getenv("DAPPLE_EXPORT_STREAM_TILE")) {  // a wide halo (local clarity / dehaze: ~400 px at 60 MP) costs (T + 2h)^2 / T^2 per tile: wider tiles then
+    int h = 0;
+    for (const Stage& st : plan.stages) h = std::max({h, st.halo.x, st.halo.y});
+    const int want = std::min(1024, (2 * h + 63) / 64 * 64);
+    if (want > opt.tile && plan.grid.nx * plan.grid.ny > 1) {
+      prq.tile = want;
+      plan = Planner::plan(g, prq, &cache);
+    }
+  }
+  if (std::getenv("DAPPLE_PLAN_LOG")) {  // diagnostics: the stages of an exact render
+    std::string l = "plan " + std::to_string(plan.grid.tile) + " tile, " + std::to_string(plan.grid.nx) + "x" + std::to_string(plan.grid.ny) + ":";
+    for (const Stage& st : plan.stages) {
+      l += st.kind == StageKind::TileSweep ? " [sweep" : st.kind == StageKind::GlobalSolve ? " [solve" : st.kind == StageKind::FilmFrame ? " [film" : " [tables";
+      for (const Group& gr : st.groups)
+        for (NodeId id : gr.nodes) l += std::string(" ") + NodeRegistry::name(g.nodes()[id].type);
+      l += "]";
+    }
+    std::fprintf(stderr, "%s\n", l.c_str());
+  }
   stats_.planMs += msSince(t0);
   ++stats_.planned;
   ExecEnv env{fk, g, cache, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, nullptr, 3};
   std::vector<std::uint8_t> band;  // streaming export: the band in flight
   int winX0 = 0, winY0 = 0, winX1 = 0, winY1 = 0;  // source rect of the window the FrameKernels hold
   bool haveWin = false;
+  std::string filmWhy;  // streaming export: why the film could not run in bands
   if (streaming) {
     if (opt.outFloat || plan.unsupported) {
       if (err) *err = "engine: streaming export needs an 8-bit tiled plan";
@@ -609,6 +633,22 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
     out.height = H;
     out.data.clear();
     env.out = band.data();
+    // the source window of a source rect (kept while the next rects fall inside it)
+    auto useWindow = [&](int sx0, int sy0, int sx1, int sy1) {
+      if (haveWin && sx0 >= winX0 && sy0 >= winY0 && sx1 <= winX1 && sy1 <= winY1) return true;
+      fk.setSourceWindow(nullptr, 0, 0);
+      haveWin = false;
+      const ImageF* w = opt.sourceWindow(sx0, sy0, sx1, sy1);
+      if (!w || w->width != sx1 - sx0 || w->height != sy1 - sy0) return false;
+      fk.setSourceWindow(w, sx0, sy0);
+      winX0 = sx0, winY0 = sy0, winX1 = sx1, winY1 = sy1;
+      haveWin = true;
+      return true;
+    };
+    fk.setSourceProvider(useWindow);
+    env.filmBegin = [&] { return fk.filmStreamBegin(&filmWhy); };
+    env.filmRows = [&](int y0, int y1, ImageF& o) { return fk.filmStreamRows(y0, y1, o); };
+    env.filmAux = [&](int x0, int y0, int x1, int y1, const local::AuxTarget& a) { return fk.filmStreamAux(x0, y0, x1, y1, a); };
     env.prepare = [&](int x0, int y0, int x1, int y1) {
       int sx0, sy0, sx1, sy1;
       fk.sourceRect(x0, y0, x1, y1, sx0, sy0, sx1, sy1);
@@ -638,7 +678,10 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   ExecStats es;
   if (opt.beforeExec) opt.beforeExec();
   Status s = plan.unsupported ? Status::Unsupported : CpuExecutor::run(plan, env, &es);
-  if (streaming) fk.setSourceWindow(nullptr, 0, 0);
+  if (streaming) {
+    fk.setSourceWindow(nullptr, 0, 0);
+    fk.setSourceProvider(nullptr);
+  }
   addStats(stats_, es);
   if (statsOut) *statsOut = es;
   if (s == Status::Unsupported) {
@@ -647,7 +690,7 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
     // like any other unsupported plan.
     if (err)
       *err = "engine: plan not supported by the CPU executor" + (std::string(plan.why ? plan.why : "").empty() ? std::string() : " (" + std::string(plan.why) + ")") +
-             (renderer.filmActive() ? " [film: unknown stock / paper or failed table bake]" : "");
+             (renderer.filmActive() ? (filmWhy.empty() ? " [film: unknown stock / paper or failed table bake]" : " [" + filmWhy + "]") : "");
     return false;
   }
   if (s != Status::Ok) {

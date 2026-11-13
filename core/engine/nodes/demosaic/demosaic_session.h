@@ -56,6 +56,9 @@ class MosaicCache {
   std::shared_ptr<const ImageF> full(const std::shared_ptr<const MosaicImage>& m, int threads = 0, bool* hit = nullptr);
   CacheStats stats() const;
   void clear();
+  // Drops every entry but the mosaic of key (k0, k1) (a streaming export frees what other photos left; entries in use stay alive through their
+  // shared_ptr). Returns the bytes the cache no longer holds.
+  std::size_t trimExcept(std::uint64_t k0, std::uint64_t k1);
 
  private:
   struct Entry {

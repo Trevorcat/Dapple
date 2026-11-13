@@ -20,6 +20,7 @@
 // node's output rect grown by its halo (clipped to the frame; reflect boundary against CpuCtx::frame, scipy 'reflect').
 // FilmBlurExposure / FilmDirField are whole-frame nodes (their run() uses the thread pool itself).
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -136,6 +137,32 @@ struct FilmFrameArgs {
   std::uint32_t frameIndex = 0;
 };
 bool filmFrameResolved(const FilmFrameArgs& a, FilmResolved& out);
+
+// ---- the film in row bands (streaming export, docs/engine/pipeline-architecture.md 42.6) ---------------------------------------------
+// runFilmFrame evaluated for ranges of output rows, bit-identical, without any frame-sized plane: the input arrives as rows (InputRows: rows
+// [y0, y1) of the film's input frame, packed RGB, ungained, `a.w` wide), the exposure / halation / DIR mixtures run in bands
+// (fd::MixtureBands: their pyramid levels >= 2 are built by streamed pre-passes and kept, ~1 B/px per mixture), the develop / grain /
+// print / scan tiles are the very tiles of runFilmFrame (grain and glare noise are functions of the absolute pixel and the seed).
+// init() false (why): not streamable (enlarger diffusion filter, highlight boost) or tables / plan failed: render the whole frame.
+// Frees the whole-frame workspaces a previous film render left (frame-sized planes kept for the next frame): the trim before a streaming
+// export. Workspaces in use are skipped. Bytes released.
+std::size_t releaseFrameWorkspaces();
+
+class FilmBands {
+ public:
+  using InputRows = std::function<bool(int y0, int y1, float* rgb)>;  // rgb == null: a prefetch of rows [y0, y1) (sub-ranges follow)
+  FilmBands();
+  ~FilmBands();
+  bool init(const FilmFrameArgs& a, InputRows in, std::string* why = nullptr);
+  // output rows [y0, y1) (display sRGB-encoded, unclamped, packed): row y at out + (y - y0) * outStride. False: input failed / cancelled.
+  bool rows(int y0, int y1, float* out, std::size_t outStride);
+  std::size_t keptBytes() const;  // the pyramid levels kept by the pre-passes
+  int passes() const;             // streamed pre-passes over the input
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> m_;
+};
 bool renderFilmFrame(const FilmFrameArgs& a, const float* in, std::size_t inStrideFloats, float* out, std::size_t outStrideFloats);
 // DAPPLE_FILM_NODES: unset / anything but "0" = on.
 bool enabled();

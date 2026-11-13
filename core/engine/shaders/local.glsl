@@ -5,8 +5,8 @@
 layout(constant_id = 3) const bool LOCALW = false;  // the frame has stage-W ops: write the summed amounts into the aux images
 layout(binding = LB_DESC, std430) readonly buffer LDesc { vec4 ld[]; };     // local::Frame::desc
 layout(binding = LB_PLANES, std430) readonly buffer LPlanes { float lp[]; };  // local::planeStore
-layout(binding = LB_AUX0, rgba16f) uniform writeonly image2D uAux0;      // clarity, texture, sharpen, noise
-layout(binding = LB_AUX1, rgba16f) uniform writeonly image2D uAux1;      // dehaze
+layout(binding = LB_AUX0, rgba16f) uniform writeonly image2D uAux0;      // amount channels 0..3 (legacy: clarity, texture, sharpen, noise)
+layout(binding = LB_AUX1, rgba16f) uniform writeonly image2D uAux1;      // amount channels 4..7 (legacy: dehaze); local::Frame::chanOp
 
 const vec3 kLumaPP = vec3(0.2880402, 0.7118741, 0.0000857);
 float lss(float e0, float e1, float x) {
@@ -62,7 +62,7 @@ float lcomp(int ci, vec2 uv, vec2 xy, vec3 lin, vec3 src, inout bool rangeDone, 
     dh = min(dh, 360.0 - dh);
     return (1.0 - lss(p0.y, p0.y + p0.z, dh)) * lss(0.5 * p0.w, p0.w + 0.005, rng.z);
   }
-  const int off = int(h.w), pw = int(pd.x), ph = int(pd.y), ch = int(pd.z);
+  const int off = int(h.w) * 4096 + int(pd.w), pw = int(pd.x), ph = int(pd.y), ch = int(pd.z);
   if (pw <= 0) return 0.0;  // plane missing (raster not supplied, over the per-edit cap)
   if (kind == 4) return lplane(off, pw, ph, 1, 0, uv);
   if (kind == 5) {
@@ -107,7 +107,7 @@ void localApply(inout vec3 v, vec2 uv, vec3 src, out vec4 K0, out vec4 K1) {
     const int b = 8 + 16 * a;
     const vec4 l0 = ld[b + 1], l1 = ld[b + 2], l2 = ld[b + 3], tc = ld[b + 4], w0 = ld[b + 5], w1 = ld[b + 6];
     K0 += wa * w0;
-    K1.x += wa * w1.x;
+    K1 += wa * w1;
     if (tc.w < 0.5) continue;
     if (l1.z != 0.0 || l1.w != 0.0) {
       vec3 g = vec3(exp2(0.006 * l1.z * wa), exp2(-0.004 * l1.w * wa), exp2(-0.006 * l1.z * wa));
@@ -132,5 +132,16 @@ void localApply(inout vec3 v, vec2 uv, vec3 src, out vec4 K0, out vec4 K1) {
       v = max(vec3(Y) + (v - vec3(Y)) * s, vec3(0.0));
     }
     if (l2.z > 0.0) v *= vec3(1.0) + (tc.xyz - vec3(1.0)) * (l2.z * wa);
+    if (l2.w > 0.0) {  // whiten (portrait retouch, docs section 43): warm chroma out, a capped lift
+      const float t = min(l2.w * wa, 1.0);
+      const float hue = lrange(v).y;
+      const float hw = lss(0.0, 20.0, hue) * (1.0 - lss(115.0, 140.0, hue));
+      const float Y = dot(v, kLumaPP);
+      v = max(vec3(Y) + (v - vec3(Y)) * (1.0 - 0.7 * t * hw), vec3(0.0));
+      if (Y > 1e-9) {
+        const float Y2 = min(Y * exp2(0.5 * t), max(Y, 0.18 * 2.6390158));
+        v *= Y2 / Y;
+      }
+    }
   }
 }

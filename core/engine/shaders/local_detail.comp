@@ -14,7 +14,10 @@ layout(std140, binding = 0) uniform P {
   ivec4 dims;  // w, h, picture origin x, y
   ivec4 low;   // lw, lh
   vec4 grain;  // amp, period
+  ivec4 ch;    // amount channel (0..7, -1 = none) of clarity, texture, sharpen, noise (local::Frame::chanOp)
+  ivec4 ch2;   // dehaze
 } u;
+float chan(int c, vec4 a0, vec4 a1) { return c < 0 ? 0.0 : c < 4 ? a0[c] : a1[c - 4]; }
 layout(binding = 1) uniform sampler2D uIn;
 layout(binding = 2) uniform sampler2D uAux0;
 layout(binding = 3) uniform sampler2D uAux1;
@@ -29,8 +32,9 @@ void main() {
   if (p.x >= u.dims.x || p.y >= u.dims.y) return;
   const ivec2 q = p + u.dims.zw;
   vec3 c = texelFetch(uIn, p, 0).rgb;
-  const vec4 K0 = texelFetch(uAux0, p, 0);
-  const float Kd = texelFetch(uAux1, p, 0).x;
+  const vec4 A0 = texelFetch(uAux0, p, 0), A1 = texelFetch(uAux1, p, 0);
+  const vec4 K0 = vec4(chan(u.ch.x, A0, A1), chan(u.ch.y, A0, A1), chan(u.ch.z, A0, A1), chan(u.ch.w, A0, A1));
+  const float Kd = chan(u.ch2.x, A0, A1);
   const float Y = lumaOf(c);
   float base = Y;
   if (GUIDED) {

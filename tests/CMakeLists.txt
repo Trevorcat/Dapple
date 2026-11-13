@@ -245,6 +245,27 @@ foreach(id ${_local_ids})
   set_tests_properties(engine.local_${id} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
 endforeach()
 
+# Portrait retouch as local operations (docs/engine/pipeline-architecture.md section 43): bands, scale, blobs, heal, whiten, tiles, GPU parity.
+add_executable(dapple_retouch_tests engine/retouch_tests.cpp)
+target_link_libraries(dapple_retouch_tests PRIVATE dapple_core)
+target_include_directories(dapple_retouch_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/cli)
+if(MSVC)
+  target_compile_options(dapple_retouch_tests PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(dapple_retouch_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+set(_retouch_ids json bands scale blobs heal whiten identity tiles interactive undereye rasters)
+if(TARGET dapple_gpu)
+  target_link_libraries(dapple_retouch_tests PRIVATE dapple_gpu)
+  target_include_directories(dapple_retouch_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src)
+  target_compile_definitions(dapple_retouch_tests PRIVATE DAPPLE_RETOUCH_GPU=1)
+  set(_retouch_ids ${_retouch_ids} parity)
+endif()
+foreach(id ${_retouch_ids})
+  add_test(NAME engine.retouch_${id} COMMAND dapple_retouch_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(engine.retouch_${id} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+endforeach()
+
 # Local adjustments through the C API (render / export / UI helpers / video cover path) and the evidence sheets. Compile the C API in, like uhdr_tests.
 set(_local_capi_srcs ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp ${PROJECT_SOURCE_DIR}/core/engine/video/video_c_api.cpp)
 foreach(_t dapple_local_capi_tests dapple_local_sheets)
@@ -292,6 +313,13 @@ add_test(NAME local_sheets.trees COMMAND dapple_local_sheets build/rawsamples/Fu
 add_test(NAME local_sheets.baretree COMMAND dapple_local_sheets build/rawsamples/Pentax/K-1-Mark-II/_K1I9785.PEF build/ai-eval/raw/mobilesam__baretree_t0.png build/masks baretree
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(local_sheets.trees local_sheets.baretree PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+
+# Portrait-retouch evidence sheets (no ctest entry): from the repo root, dapple_retouch_sheets build/retouch [portrait names]
+add_executable(dapple_retouch_sheets engine/retouch_sheets.cpp ${_local_capi_srcs})
+target_link_libraries(dapple_retouch_sheets PRIVATE dapple_core dapple_stb)
+target_include_directories(dapple_retouch_sheets PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/cli)
+target_compile_definitions(dapple_retouch_sheets PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+                           $<$<BOOL:${DAPPLE_FILM_AVX2}>:DAPPLE_FILM_HAVE_AVX2=1>)
 
 # Modern rendering family (filmStock = modern_*): end points, mid-grey, hue, skin window, monotone strength, tiles, GPU parity and cost.
 add_executable(dapple_modern_tests engine/modern_tests.cpp)
@@ -512,7 +540,7 @@ endif()
 if(TARGET dapple_gpu)  # the GPU executor ids need the GPU export path (DAPPLE_HAVE_GPU comes from this link)
   target_link_libraries(dapple_export_stream_tests PRIVATE dapple_gpu)
 endif()
-foreach(id region reductions encoder synthetic peak capi cancel)
+foreach(id region reductions encoder mixbands filmbands synthetic peak capi cancel policy)
   add_test(NAME export_stream.${id} COMMAND dapple_export_stream_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(export_stream.${id} PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77)
 endforeach()

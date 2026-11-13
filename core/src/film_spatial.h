@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <vector>
 
 #include "film_internal.h"
@@ -166,6 +168,7 @@ class Arena {
     cur_ = m.cur;
   }
   std::size_t capacityBytes() const;
+  std::size_t freeAll();  // returns the chunks to the system (memory trim); the arena stays usable
 
  private:
   struct Chunk {
@@ -184,6 +187,35 @@ void applyMixture(const SpatialKernels& K, Arena& arena, const Plane& src, const
 // low-resolution sigma (smooth fields such as the DIR inhibitor).
 bool mixtureFitsHalf(const Mixture& mix);
 void applyMixtureHalf(const SpatialKernels& K, Arena& arena, const Plane& half, const Plane& dst, const Mixture& mix);
+
+// ---- a mixture in row bands (streaming export, docs/engine/pipeline-architecture.md 42.6) ----------------------------------------
+// applyMixture / applyMixtureHalf evaluated for ranges of output rows from ranges of input rows, bit-identical to the whole-plane
+// functions: the pyramid levels >= 2 (a sixteenth of the pixels and less) are built once from one streamed pass over the input (feed,
+// rows in order) and kept (only the level-2 accumulator remains); the full- and half-resolution levels are evaluated per band.
+class MixtureBands {
+ public:
+  MixtureBands();
+  ~MixtureBands();
+  MixtureBands(MixtureBands&&) noexcept;
+  MixtureBands& operator=(MixtureBands&&) noexcept;
+  // W x H = the output (full-resolution) plane; half = the input is the half-resolution plane ((W+1)/2 x (H+1)/2, applyMixtureHalf).
+  void setup(const Mixture& mix, int W, int H, bool half);
+  int inputW() const;
+  int inputH() const;
+  bool needsPrepare() const;  // the pyramid reaches level 2: feed the whole input once before rows()
+  bool prepared() const;
+  // the streamed pass: input rows [y0, y1) in order (y0 = the rows fed so far), rowAt(y) valid for y in [y0, y1) during the call
+  void feed(const SpatialKernels& K, int y0, int y1, const std::function<const float*(int)>& rowAt);
+  // input rows output rows [a, b) read
+  void inputRange(int a, int b, int& ia, int& ib) const;
+  // output rows [a, b): rowAt(y) for the input rows of inputRange, outRow(y) the destination rows
+  void rows(const SpatialKernels& K, int a, int b, const std::function<const float*(int)>& rowAt, const std::function<float*(int)>& outRow) const;
+  std::size_t wholeBytes() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> m_;
+};
 
 // Single separable Gaussian on one plane (tests, small filters). dst may not alias src.
 void gaussianBlurPlane(const SpatialKernels& K, const Plane& src, const Plane& dst, double sigma);

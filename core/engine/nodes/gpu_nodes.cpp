@@ -20,10 +20,12 @@ const char* const kDz[] = {"sep_c2y", "sep_c2y_s", "sep_y", "sep_y_s", "sep_y_v"
 const char* const kDetail[] = {"down", "gf_ab", "sep_c", "sep_c_s", "sep_d2y", "sep_d2y_s", "sep_y", "sep_y_s", "sep_y_v", "bx_d2y", "bx_y", "bx_y_v", "detail"};
 const char* const kResize[] = {"resize", "convert"};
 const char* const kPointLocal[] = {"point_local"};
-const char* const kLocalDetail[] = {"down", "gf_ab", "sep_c", "sep_c_s", "sep_d2y", "sep_d2y_s", "sep_y", "sep_y_s", "sep_y_v", "bx_d2y", "bx_y", "bx_y_v", "local_detail"};
+const char* const kLocalDetail[] = {"down", "gf_ab", "sep_c", "sep_c_s", "sep_d2y", "sep_d2y_s", "sep_y", "sep_y_s", "sep_y_v", "bx_d2y", "bx_y", "bx_y_v", "local_detail",
+                                    "local_heal", "local_rt_down", "local_retouch"};
 const char* const kAll[] = {"point",     "sep_d2y",  "sep_d2y_v", "sep_d2y_s", "sep_c2y", "sep_c2y_v", "sep_c2y_s", "sep_c",  "sep_c_s",
                             "sep_y",     "sep_y_v",  "sep_y_s",   "down",      "nr_luma", "nr_chroma", "dehaze_apply", "reduce", "gf_ab",
-                            "detail",    "resize",   "convert",   "bx_d2y",    "bx_y",    "bx_y_v", "point_local", "local_detail", "local_film_in"};
+                            "detail",    "resize",   "convert",   "bx_d2y",    "bx_y",    "bx_y_v", "point_local", "local_detail", "local_film_in",
+                            "local_heal", "local_rt_down", "local_retouch"};
 
 const GpuImpl kPointImpl = {nullptr, kPoint, recPoint, "point", false};
 const GpuImpl kNrLImpl = {nullptr, kNrL, recNrLuma, nullptr, false};
