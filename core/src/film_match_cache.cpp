@@ -17,6 +17,7 @@
 #include "parallel.h"
 #include "determinism.h"
 #include "dapple/renderer.h"
+#include "film_match_render.h"
 
 namespace dapple {
 
@@ -105,9 +106,7 @@ FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& c
     // the intended key is rendered at exposure 0: an exposure drag keeps it (one develop render of the proxy less per frame)
     const std::string l0Key = toJson(ref0) + "|" + lutId;
     if (cache.keyL0Key != l0Key) {
-      Renderer r0(ref0, camera, lut);
-      r0.setToneProxy(&proxy);
-      cache.keyL0 = medianLightness(r0.renderFloat(proxy, false));
+      cache.keyL0 = medianLightness(renderMatchProxy(ref0, camera, lut, proxy));
       cache.keyL0Key = l0Key;
     }
     float g0[3];
@@ -168,9 +167,7 @@ FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& c
     }
     fp.filmKeyEv = fev;
     fp.filmPrintEv = pev;
-    Renderer r(fp, camera, lut);
-    r.setToneProxy(&proxy);
-    const float L = medianLightness(r.renderFloat(proxy, false));
+    const float L = medianLightness(renderMatchProxy(fp, camera, lut, proxy));
     s.insert(std::lower_bound(s.begin(), s.end(), pev, [](const std::pair<float, float>& a, float v) { return a.first < v; }), {pev, L});
     ++cache.rendered;
     return L;
@@ -197,9 +194,7 @@ FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& c
           EditParams f = fp0;
           f.filmKeyEv = fev;
           f.filmPrintEv = pev0 + d;
-          Renderer r(f, *cam, lo.get());
-          r.setToneProxy(px.get());
-          const float L = medianLightness(r.renderFloat(*px, false));
+          const float L = medianLightness(renderMatchProxy(f, *cam, lo.get(), *px));
           std::lock_guard<std::mutex> lk(seed->m);
           seed->samples.push_back({pev0 + d, L});
         }

@@ -429,6 +429,66 @@ void testFilmTiling(Env& env, int pw = 1500, int ph = 1000, std::vector<int> til
   }
 }
 
+
+// Cost curve of a film frame against its plane size (the allocation-size step, redmi-garnet.md section on the 16 MiB step): the whole frame
+// and the same frame as tiles / bands, hot (minimum of the later rounds). DAPPLE_BAND_SIZES="WxH,WxH,..." overrides the sizes.
+void testBandCurve(Env& env) {
+  std::vector<std::pair<int, int>> sizes = {{900, 600}, {1100, 733}, {1200, 800}, {1250, 833}, {1300, 867}, {1400, 933}, {1600, 1067}, {1800, 1200}, {2200, 1467}};
+  if (const char* e = std::getenv("DAPPLE_BAND_SIZES")) {
+    sizes.clear();
+    for (const char* q = e; *q;) {
+      int w = 0, h = 0, n = 0;
+      if (std::sscanf(q, "%dx%d%n", &w, &h, &n) < 2) break;
+      sizes.push_back({w, h});
+      q += n;
+      if (*q == ',') ++q;
+    }
+  }
+  std::printf("== film frame cost vs plane size (RGBA32F plane MiB = w*h*16/2^20), hot min of 8 ==\n");
+  const CameraProfile& cam = env.cams.resolve("", "");
+  for (const auto& sz : sizes) {
+    const SourceImage src = makeTestImage(sz.first, sz.second);
+    EditParams p = baseParams();
+    p.filmStock = "kodak_portra_400";
+    if (std::getenv("DAPPLE_BAND_GEO")) p.straighten = 3.f, p.rotate = 90;  // a geometry gather (film_src, RGBA32F frame-sized image) in front of the film
+    Renderer r(p, cam, nullptr);
+    FastOptions fo;
+    fo.spatial = SpatialQuality::Interactive;
+    Rig rig(env.be, src, cam);
+    std::string err;
+    std::string topName, passLine;
+    double topMs = 0;
+    double best = 1e30, bestGpu = 1e30, bestWall = 1e30;
+    int w = 0, h = 0;
+    for (int i = 0; i < 12; ++i) {
+      engine::GpuStats st;
+      const auto t0 = std::chrono::steady_clock::now();
+      std::uint8_t* o = rig.render(p, r, src, fo, 33, w, h, &st, err);
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      if (!o) break;
+      std::free(o);
+      if (i >= 3) {
+        best = std::min(best, ms);
+        double sum = 0, top = 0;
+        std::string tn;
+        for (const auto& pt : st.passTimes) {
+          sum += pt.second;
+          if (pt.second > top) top = pt.second, tn = pt.first;
+        }
+        if (sum > 0 && sum < bestGpu) {
+          bestGpu = sum, topMs = top, topName = tn;
+          passLine.clear();
+          for (const auto& pt : st.passTimes) passLine += " " + pt.first + " " + std::to_string(pt.second).substr(0, 5);
+        }
+        bestWall = std::min(bestWall, st.wallMs);
+      }
+    }
+    if (std::getenv("DAPPLE_BAND_PASSES")) std::printf("   passes (ms):%s\n", passLine.c_str());
+    std::printf("  %4dx%-4d plane %5.1f MiB  executor %7.2f ms  gpu passes %6.2f ms (%5.2f ns/px)  biggest %s %.2f ms  frame %7.2f ms\n", sz.first, sz.second,
+                double(sz.first) * sz.second * 16 / 1048576.0, bestWall, bestGpu, bestGpu * 1e6 / (double(sz.first) * sz.second), topName.c_str(), topMs, best);
+  }
+}
+
 // EngineSession::renderExact (the exact variant: ToneColourExact) on the GPU executor against the CPU reference renderer. The device evaluates the
 // exact colour stage through a 65^3 lattice baked with the exact analysis: the budget is the lattice's, not bit identity.
 void testExact(Env& env) {
@@ -964,6 +1024,7 @@ int main(int argc, char** argv) {
   eg::ContextOptions o;
   o.device.allowSoftware = std::getenv("DAPPLE_GPU_SOFTWARE") && std::getenv("DAPPLE_GPU_SOFTWARE")[0] == '1';
   std::string err;
+  if (std::getenv("DAPPLE_GPU_PROFILE")) o.device.profile = true;  // per-pass timestamps (--band-curve)
   o.selfTest = !(std::getenv("DAPPLE_GPU_TEST_NOSELF"));
   env.be = eg::Context::create(o, err);
   if (!env.be) {
@@ -985,6 +1046,10 @@ int main(int argc, char** argv) {
   }
   if (argc > 1 && std::string(argv[1]) == "--film-timing") {
     testFilmTiming(env, argc > 2 && std::string(argv[2]) == "24mp");
+    return g_fail ? 1 : 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--band-curve") {
+    testBandCurve(env);
     return g_fail ? 1 : 0;
   }
   if (argc > 1 && std::string(argv[1]) == "--solve-cache") {

@@ -19,6 +19,7 @@
 #include "dapple/illuminant.h"
 #include "film_internal.h"
 #include "dapple/renderer.h"
+#include "film_match_render.h"
 
 namespace dapple {
 
@@ -900,9 +901,7 @@ FilmPadInfo filmPadFor(const EditParams& p, const CameraProfile& camera, const L
     r.sceneGain(proxy, gain);
     EditParams ref0 = ref;
     ref0.exposure = 0.f;
-    Renderer r0(ref0, camera, lut);
-    r0.setToneProxy(&proxy);
-    keyL0 = medianLightness(r0.renderFloat(proxy, false));
+    keyL0 = medianLightness(renderMatchProxy(ref0, camera, lut, proxy));
   }
   float g0[3];
   for (int c = 0; c < 3; ++c) g0[c] = gain[c] / std::exp2(p.exposure);
@@ -933,9 +932,7 @@ FilmPadInfo filmPadFor(const EditParams& p, const CameraProfile& camera, const L
   in.medianL = [fp, &camera, lut, &proxy](float fev, float pev) {
     fp->filmKeyEv = fev;
     fp->filmPrintEv = pev;
-    Renderer r(*fp, camera, lut);
-    r.setToneProxy(&proxy);
-    return medianLightness(r.renderFloat(proxy, false));
+    return medianLightness(renderMatchProxy(*fp, camera, lut, proxy));
   };
   return filmPadInfo(in);
 } catch (...) {
@@ -959,7 +956,7 @@ FilmExposure matchFilmExposure(const EditParams& p, const CameraProfile& camera,
   {
     Renderer r(ref, camera, lut);
     r.setToneProxy(&proxy);
-    target = medianLightness(r.renderFloat(proxy, false));
+    target = medianLightness(renderMatchProxy(ref, camera, lut, proxy));
     r.sceneGain(proxy, gain);
   }
 
@@ -971,9 +968,7 @@ FilmExposure matchFilmExposure(const EditParams& p, const CameraProfile& camera,
   fp.filmKeyEv = 0.f;
   fp.filmPrintEv = 0.f;
   auto render = [&](const EditParams& e) {
-    Renderer r(e, camera, lut);
-    r.setToneProxy(&proxy);
-    return medianLightness(r.renderFloat(proxy, false));
+    return medianLightness(renderMatchProxy(e, camera, lut, proxy));
   };
 
   FilmMatchInfo local;
@@ -1017,9 +1012,7 @@ FilmExposure matchFilmExposure(const EditParams& p, const CameraProfile& camera,
   ref0.exposure = 0.f;
   float keyL0;
   {
-    Renderer r(ref0, camera, lut);
-    r.setToneProxy(&proxy);
-    keyL0 = medianLightness(r.renderFloat(proxy, false));
+    keyL0 = medianLightness(renderMatchProxy(ref0, camera, lut, proxy));
   }
   float g0[3];
   const float expGain = std::exp2(p.exposure);
