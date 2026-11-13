@@ -688,6 +688,10 @@ class LibRawDecoder final : public ImageDecoder {
   }
 
   Result<SourceImage> decode(const std::filesystem::path& path, const DecodeOptions& options) const override {
+    if (options.quality == DecodeQuality::Preview) {  // the same cached mosaic as the full decode and the regions: one unpack, then block reduction
+      std::string why;
+      if (auto r = decodePreviewFromMosaic(path, options, &why)) return r;
+    }
     if (options.quality == DecodeQuality::Full) {  // the Demosaic node: LibRaw only decompresses (core/src/decoders/libraw_mosaic.inc, docs 32); refusals fall through
       std::string why;
       if (auto r = decodeFullFromMosaic(path, options, &why)) return r;

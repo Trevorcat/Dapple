@@ -54,6 +54,11 @@ inline int haloOf(const Desc& d) { return d.cfa == Cfa::Bayer ? kHaloBayer : (d.
 // Coordinate mapping that keeps the CFA phase: Bayer reflects (i -> -i, 2n - 2 - i), X-Trans repeats with the period.
 int mapCoord(int i, int n, Cfa c);
 
+// A finger is on a control (the app sets this from pointer-down to the end of the drag, dapple_set_interaction): background tile loops (CPU and GPU) wait
+// between tiles, up to 2 s per tile, so a drag never competes with a region / preview decode that is in flight. Cancelled work stops waiting at once.
+void setInteraction(bool on);
+void yieldWhileInteracting(const std::atomic<std::uint64_t>* cancelCur, std::uint64_t cancelMine);
+
 // The scaled value of a raw sample at (x, y) (inside the mosaic): max(raw - black, 0) * wb / span, clipped to 1.
 float scaleSample(const Desc& d, int x, int y);
 

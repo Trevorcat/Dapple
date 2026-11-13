@@ -212,6 +212,7 @@ class DappleBindings {
             ? lib.lookupFunction<_PerfConf, _PerfConfD>('dapple_perf_configure')
             : null,
         touchHint = lib.providesSymbol('dapple_session_touch_hint') ? lib.lookupFunction<_TouchHint, _TouchHintD>('dapple_session_touch_hint') : null,
+        setInteraction = lib.providesSymbol('dapple_set_interaction') ? lib.lookupFunction<_PerfConf1, _PerfConf1D>('dapple_set_interaction') : null,
         threadBackground = lib.providesSymbol('dapple_thread_background')
             ? lib.lookupFunction<_PerfConf1, _PerfConf1D>('dapple_thread_background')
             : null,
@@ -310,6 +311,7 @@ class DappleBindings {
   final _RenderFrameD? sessionRenderFrame;
   final _PerfConfD? perfConfigure;
   final _PerfConf1D? threadBackground;
+  final _PerfConf1D? setInteraction; // dapple_set_interaction: background demosaic tiles wait while a finger is on a control
   final _TouchHintD? touchHint; // dapple_session_touch_hint: keep-warm burst on pointer-down (wave 8)
   final _ThermalFnD? thermalHeadroom;
   final _Info0D? perfInfoJson;

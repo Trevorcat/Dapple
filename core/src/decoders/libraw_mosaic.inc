@@ -325,7 +325,25 @@ void attachMosaicAnchor(ShotMetadata& meta, const MosaicImage& m, const std::fil
   tmp.meta = meta;
   const auto ta0 = std::chrono::steady_clock::now();
   const char* fastEnv = std::getenv("DAPPLE_ANCHOR_FAST");
-  tmp.linear = demosaic::binnedOriented(m, fastEnv && std::strcmp(fastEnv, "off") == 0 || std::max(m.width, m.height) < 4096 ? 1 : 2);  // statistics on a 192 px grid: every 2nd block (an odd step aliased with the CFA period on one sample)
+  const int bstep = fastEnv && std::strcmp(fastEnv, "off") == 0 || std::max(m.width, m.height) < 4096 ? 1 : 2;
+  if (m.opcodeList3.empty()) {
+    tmp.linear = demosaic::binnedOriented(m, bstep);
+  } else {  // the preview the anchor is compared with is geometry-corrected: warp the binned frame like finishMosaicRgb does the full one, then crop and orient
+    ImageF h = demosaic::binnedHalf(m, bstep);
+    try {
+      dng::ApplyReport corr;
+      dng::applyImage(dng::parseOpcodeList(m.opcodeList3.data(), m.opcodeList3.size()), h, corr);
+    } catch (...) {
+    }
+    const int bs = m.cfa == CfaKind::XTrans ? 3 : 2, k = bs * bstep;
+    if (m.hasCrop) {
+      try {
+        h = dng::cropImage(h, m.cropX / k, m.cropY / k, std::max(1, m.cropW / k), std::max(1, m.cropH / k));
+      } catch (...) {
+      }
+    }
+    tmp.linear = (m.flip == 3 || m.flip == 5 || m.flip == 6) ? rotateFlip(h, m.flip) : std::move(h);
+  }  // statistics on a 192 px grid: every 2nd block (an odd step aliased with the CFA period on one sample)
   const auto ta1 = std::chrono::steady_clock::now();
   attachExposureAnchor(tmp, path, options, m.dngBaselineEv, emb);
   {
@@ -390,10 +408,65 @@ Result<SourceImage> decodeFullFromMosaic(const std::filesystem::path& path, cons
   out.meta = m->meta;
   out.sceneReferred = true;
   std::string corr;
+  const auto tf0 = std::chrono::steady_clock::now();
   out.linear = demosaic::demosaicFull(*m, 0, &corr);
+  const auto tf1 = std::chrono::steady_clock::now();
   out.meta.dngCorrections = m->dngCorrections.empty() ? corr : (corr.empty() ? m->dngCorrections : m->dngCorrections + ", " + corr);
   suppressShadowChroma(out.linear);
+  const auto tf2 = std::chrono::steady_clock::now();
   attachMosaicAnchor(out.meta, *m, path, options, &embedded);
+  {  // one-line stage log: the demosaic node (GPU or CPU) with crop / orientation, the shadow-chroma pass, the anchor (cached after the first open)
+    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    char ln[200];
+    std::snprintf(ln, sizeof ln, "full %s: demosaic + crop/orientation %.0f ms, shadow chroma %.0f ms, anchor %.0f ms", pathToUtf8(path.filename()).c_str(), ms(tf0, tf1), ms(tf1, tf2), ms(tf2, std::chrono::steady_clock::now()));
+#if defined(__ANDROID__)
+    __android_log_write(ANDROID_LOG_INFO, "dapple_demosaic", ln);
+#elif defined(__APPLE__)
+    os_log(OS_LOG_DEFAULT, "dapple_demosaic: %{public}s", ln);
+#endif
+  }
+  return out;
+}
+
+Result<SourceImage> decodePreviewFromMosaic(const std::filesystem::path& path, const DecodeOptions& options, std::string* reason) {
+  auto refuse = [&](const std::string& why) {
+    if (reason) *reason = why;
+    return Result<SourceImage>(fail(why));
+  };
+  const char* pe = std::getenv("DAPPLE_PREVIEW_MOSAIC");
+  if (!mosaicPathEnabled() || (pe && std::strcmp(pe, "off") == 0)) return refuse("mosaic preview off");
+  const auto t0 = std::chrono::steady_clock::now();
+  std::future<Result<Image8>> embedded;  // the embedded preview read for the anchor overlaps the unpack, as in the other decodes
+  if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::async, [&path] { return extractEmbeddedPreviewForAnchor(path); });
+  auto mr = mosaicCache().mosaic(path, options);
+  if (!mr) {
+    if (embedded.valid()) embedded.wait();
+    return refuse(mr.error().message);
+  }
+  const std::shared_ptr<const MosaicImage> m = *mr;
+  if (m->cfa == CfaKind::None || !m->opcodeList3.empty()) {
+    if (embedded.valid()) embedded.wait();
+    return refuse(m->cfa == CfaKind::None ? m->reason : std::string("OpcodeList3 (lens warp): the picture needs the whole frame"));
+  }
+  const auto t1 = std::chrono::steady_clock::now();
+  SourceImage out;
+  out.meta = m->meta;
+  out.sceneReferred = true;
+  out.linear = demosaic::binnedOriented(*m);
+  out.meta.dngCorrections = m->dngCorrections;
+  suppressShadowChroma(out.linear);
+  const auto t2 = std::chrono::steady_clock::now();
+  attachMosaicAnchor(out.meta, *m, path, options, embedded.valid() ? &embedded : nullptr);
+  {
+    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    char ln[200];
+    std::snprintf(ln, sizeof ln, "preview %s: mosaic %.0f ms, block reduction %.0f ms, anchor %.0f ms", pathToUtf8(path.filename()).c_str(), ms(t0, t1), ms(t1, t2), ms(t2, std::chrono::steady_clock::now()));
+#if defined(__ANDROID__)
+    __android_log_write(ANDROID_LOG_INFO, "dapple_demosaic", ln);
+#elif defined(__APPLE__)
+    os_log(OS_LOG_DEFAULT, "dapple_demosaic: %{public}s", ln);
+#endif
+  }
   return out;
 }
 

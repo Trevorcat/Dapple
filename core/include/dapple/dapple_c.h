@@ -244,6 +244,8 @@ DAPPLE_API void dapple_perf_configure(int32_t thread_limit, int32_t target_frame
 /* Marks the CALLING thread as background (nice 10, efficiency cores, pool bypassed) until called with 0. Use it
  * around open/preview calls that must not compete with interactive frames (prefetch, thumbnails). */
 DAPPLE_API void dapple_thread_background(int32_t on);
+/* A finger is on a control (1) / lifted (0): background demosaic tile loops (regions, previews) wait between tiles meanwhile. */
+DAPPLE_API void dapple_set_interaction(int32_t active);
 /* AThermal headroom forecast (0 = cool, 1 = throttling threshold), < 0 when unavailable. */
 DAPPLE_API float dapple_thermal_headroom(int32_t forecast_seconds);
 /* {"cpus":N,"perf":N,"efficient":N,"pool":N,"adpf":bool,"thermal_status":N}; free with dapple_free_string. */

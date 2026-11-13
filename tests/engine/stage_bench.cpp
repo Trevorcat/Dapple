@@ -62,6 +62,15 @@ int main(int argc, char** argv) {
     std::printf("%-27s %8.0f ms\n", name, msSince(t0));
     dapple_session_close(r);
   };
+  std::thread finger;
+  if (const char* e = std::getenv("DAPPLE_BENCH_INTERACT_MS")) {  // a finger is down for N ms from the start of the first region: its tile loops must wait
+    const int ms = std::atoi(e);
+    dapple_set_interaction(1);
+    finger = std::thread([ms] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      dapple_set_interaction(0);
+    });
+  }
   const bool warmFirst = std::getenv("DAPPLE_BENCH_ORDER") && std::strcmp(std::getenv("DAPPLE_BENCH_ORDER"), "warmup") == 0;
   if (warmFirst) region("warm-up region 256 x 256", W / 2 - 128, H / 2 - 128, 256, 256);
   if (W >= 3400 && H >= 3400) {
@@ -71,6 +80,7 @@ int main(int argc, char** argv) {
     region("first 1:1 region", W / 4, H / 4, W / 2, H / 2);
   }
 
+  if (finger.joinable()) finger.join();
   t = Clk::now();
   s = dapple_session_open(argv[1], DAPPLE_QUALITY_FULL, 0);
   if (!s) return std::fprintf(stderr, "full: %s\n", dapple_last_error()), 1;

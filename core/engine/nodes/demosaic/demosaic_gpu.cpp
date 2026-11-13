@@ -233,6 +233,7 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
   const bool bay = d.cfa == Cfa::Bayer;
   for (int ty = roi.y0; ty < roi.y1; ty += tile)
     for (int tx = roi.x0; tx < roi.x1; tx += tile) {
+      yieldWhileInteracting(d.cancelCur, d.cancelMine);
       if (d.cancelCur && d.cancelCur->load(std::memory_order_relaxed) != d.cancelMine) return Status::Timeout;  // cancelled
       const Rect t{tx, ty, std::min(tx + tile, roi.x1), std::min(ty + tile, roi.y1)};
       const int rw = t.w(), rh = t.h(), cw = rw + 2 * H, ch = rh + 2 * H;

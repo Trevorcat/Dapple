@@ -22,6 +22,7 @@
 #include "dapple/camera.h"
 #include "dapple/decoder.h"
 #include "dapple/mosaic.h"
+#include "engine/nodes/demosaic/demosaic.h"
 #include "dapple/edit_params.h"
 #include "dapple/encode.h"
 #include "dapple/film.h"
@@ -1200,6 +1201,8 @@ int32_t dapple_session_cancel(DappleSession* session) {
 }
 
 void dapple_thread_background(int32_t on) { sys::setBackground(on != 0); }
+
+void dapple_set_interaction(int32_t active) { dapple::demosaic::setInteraction(active != 0); }
 
 void dapple_perf_configure(int32_t thread_limit, int32_t target_frame_ms) {
   ThreadPool::instance().setLimit(thread_limit);

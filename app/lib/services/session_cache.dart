@@ -170,14 +170,15 @@ class SessionCache {
     return f;
   }
 
-  final Set<String> _primed = {};
+  static bool _primedOnce = false; // the GPU demosaic and its speed verdict are per process, the mosaic and anchor are cached by the preview open itself
 
-  /// Idle warm-up of the true-resolution path, once per photo: opens a 256 x 256 region at the centre, which makes the engine decompress the whole RAW
-  /// into its mosaic cache, bring up the GPU demosaic (and the one-off speed verdict on a new device) and compute the exposure anchor, all of which
-  /// the first pinch-zoom would otherwise wait for (about 8 s on a 2019 phone). Background priority; skipped once a real region was asked for.
+  /// Idle warm-up of the true-resolution path, once per process: a 256 x 256 region at the centre brings up the GPU demosaic and, on a new device, runs its
+  /// one-off speed verdict (about 3 s), so the first pinch-zoom does not. The mosaic and the exposure anchor are already cached by the preview open itself.
+  /// Background priority; skipped once a real region was asked for; the engine's tile loops wait while a finger is on a control (dapple_set_interaction).
   Future<void> primeRegion(Photo ph) async {
     if (!available || ph.demo != null || !ph.isRaw || !DappleSession.hasRegions || _noRegion.contains(ph.id) || _region != null) return;
-    if (!_primed.add(ph.id)) return;
+    if (_primedOnce) return;
+    _primedOnce = true;
     final t = Stopwatch()..start();
     try {
       final fs = await fullSize(ph);
@@ -188,7 +189,7 @@ class SessionCache {
       await s.close();
       debugPrint('dapple region: warm-up done in ${t.elapsedMilliseconds} ms');
     } catch (e) {
-      _primed.remove(ph.id); // cancelled by a real request or failed: nothing to keep
+      _primedOnce = false; // cancelled by a real request or failed: nothing to keep
     }
   }
 

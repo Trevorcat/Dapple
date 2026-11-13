@@ -403,6 +403,56 @@ int testWireRegion() {
   return g_fail ? 1 : 0;
 }
 
+// The half-resolution picture from the cached mosaic (block reduction) against LibRaw's half-size decode, both at 512 px: mean / p99 dE2000 at a viewing
+// exposure that puts the mean luminance at 0.18, over every public sample. Gate: mean <= 1.5 per file.
+int testWirePreview() {
+  const auto files = allSampleFiles();
+  if (files.empty()) return 77;
+  setEnvVar("DAPPLE_ANCHOR", "on");
+  double worstMean = 0;
+  for (const auto& f : files) {
+    DecodeOptions o;
+    o.quality = DecodeQuality::Preview;
+    setEnvVar("DAPPLE_PREVIEW_MOSAIC", "off");
+    auto a = makeLibRawDecoder()->decode(f, o);
+    setEnvVar("DAPPLE_PREVIEW_MOSAIC", "on");
+    clearMosaicCache();
+    std::string why;
+    auto b = decodePreviewFromMosaic(f, o, &why);
+    if (!a || !b) {
+      std::printf("  %s: %s\n", f.filename().string().c_str(), a ? ("not on the mosaic preview (" + why + ")").c_str() : "LibRaw preview failed");
+      continue;
+    }
+    const ImageF ia = resizeToLongEdge(a->linear, 512), ib = resizeToLongEdge(b->linear, 512);
+    if (std::abs(ia.width - ib.width) > 2 || std::abs(ia.height - ib.height) > 2) {
+      std::printf("  %s: size differs %dx%d vs %dx%d\n", f.filename().string().c_str(), ia.width, ia.height, ib.width, ib.height);
+      CHECK(false, "preview sizes differ");
+      continue;
+    }
+    const int W = std::min(ia.width, ib.width), H = std::min(ia.height, ib.height);
+    double sumY = 0;
+    for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) sumY += 0.2880 * ia.row(y)[3 * x] + 0.7119 * ia.row(y)[3 * x + 1];
+    const float g = float(0.18 / std::max(1e-4, sumY / (double(W) * H)));
+    std::vector<float> de;
+    de.reserve(std::size_t(W) * H);
+    double sum = 0;
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x) {
+        const float v = float(demo::dE2000(demo::toLab(ia.row(y) + 3 * x, g), demo::toLab(ib.row(y) + 3 * x, g)));
+        de.push_back(v);
+        sum += v;
+      }
+    std::sort(de.begin(), de.end());
+    const double mean = sum / double(de.size()), p99 = de[std::size_t(0.99 * double(de.size() - 1))];
+    worstMean = std::max(worstMean, mean);
+    std::printf("  %s: mosaic preview %dx%d, LibRaw %dx%d; dE2000 mean %.2f p99 %.2f; anchor %+.3f vs %+.3f EV\n", f.filename().string().c_str(), b->linear.width, b->linear.height, a->linear.width,
+                a->linear.height, mean, p99, b->meta.exposureAnchorEv, a->meta.exposureAnchorEv);
+    CHECK(mean <= 1.5, "preview dE2000 mean %.2f", mean);
+  }
+  std::printf("  worst mean dE2000 %.2f\n", worstMean);
+  return g_fail ? 1 : 0;
+}
+
 // The anchor read from the embedded preview at 1/8 scale (DC coefficients) against the full decode of the preview: within 0.02 EV, same tier, on every sample
 int testWireAnchorFast() {
   std::vector<std::filesystem::path> files;  // every public sample, at the half-size open (the anchor is the same code on every path)
@@ -464,13 +514,18 @@ int testWireAnchor() {
       std::printf("  %s: skipped (%s)\n", f.filename().string().c_str(), m ? "RGB decode failed" : why.c_str());
       continue;
     }
+    auto meanLuma = [](const ImageF& im) {
+      const ImageF t = resizeToLongEdge(im, 128);
+      double sum = 0;
+      for (int y = 0; y < t.height; ++y) for (int x = 0; x < t.width; ++x) sum += 0.2880 * t.row(y)[3 * x] + 0.7119 * t.row(y)[3 * x + 1] + 0.0001 * t.row(y)[3 * x + 2];
+      return sum / (double(t.width) * t.height);
+    };
+    std::printf("  %s: mean luminance mosaic / RGB path %+.3f EV (pictures; the anchor difference below is on top of this)\n", f.filename().string().c_str(), std::log2(meanLuma(m->linear) / std::max(1e-9, meanLuma(r->linear))));
     const double d = std::fabs(double(m->meta.exposureAnchorEv) - double(r->meta.exposureAnchorEv));
     worst = std::max(worst, d);
     std::printf("  %s: anchor mosaic path %+.3f EV (tier %d) RGB path %+.3f EV (tier %d), difference %.4f EV\n", f.filename().string().c_str(), m->meta.exposureAnchorEv, m->meta.exposureAnchorTier, r->meta.exposureAnchorEv, r->meta.exposureAnchorTier, d);
     CHECK(m->meta.exposureAnchorTier == r->meta.exposureAnchorTier, "anchor tier differs");
-    // KNOWN: the iPhone XS DNG anchors 0.41 EV higher on the mosaic path than on the RGB path (found 2026-11, with and without the reduced-size anchor; not yet traced)
-    if (f.filename() == "IMG_1105.dng") std::printf("    known difference, not gated\n");
-    else CHECK(d <= 0.021, "anchor differs by %.4f EV", d);  // 0.02 plus 0.001: one Pixel DNG sat at 0.0192 before the reduced-size preview
+    CHECK(d <= 0.021, "anchor differs by %.4f EV", d);  // 0.02 plus 0.001: one Pixel DNG sat at 0.0192 before the reduced-size preview (the iPhone XS DNG: the anchor frame is warped like the full one, was 0.41 EV)
   }
   std::printf("  worst difference %.4f EV\n", worst);
   return g_fail ? 1 : 0;
@@ -774,7 +829,7 @@ int testGpuReal() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::vector<std::string> all = {"flat", "edges", "zoneplate", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_cache", "wire_cancel", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu"};
+  const std::vector<std::string> all = {"flat", "edges", "zoneplate", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu"};
   std::vector<std::string> ids;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--list") {
@@ -798,6 +853,7 @@ int main(int argc, char** argv) {
     else if (id == "threads") testThreads();
     else if (id == "cache") testCache();
     else if (id == "wire_region") { const int r = testWireRegion(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "wire_preview") { const int r = testWirePreview(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_anchor_fast") { const int r = testWireAnchorFast(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_anchor") { const int r = testWireAnchor(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_cache") { const int r = testWireCache(); if (r == 77 && g_fail == before) return 77; }

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -458,6 +459,17 @@ int mapCoord(int i, int n, Cfa c) {
   return std::min(std::max(i, 0), n - 1);
 }
 
+namespace {
+std::atomic<bool> g_interaction{false};
+}
+void setInteraction(bool on) { g_interaction.store(on, std::memory_order_relaxed); }
+void yieldWhileInteracting(const std::atomic<std::uint64_t>* cancelCur, std::uint64_t cancelMine) {
+  for (int waited = 0; g_interaction.load(std::memory_order_relaxed) && waited < 500; ++waited) {  // 500 x 4 ms
+    if (cancelCur && cancelCur->load(std::memory_order_relaxed) != cancelMine) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+  }
+}
+
 float scaleSample(const Desc& d, int x, int y) {
   const std::size_t i = std::size_t(y) * d.width + x;
   const int ph = (y % d.period) * d.period + (x % d.period);
@@ -543,6 +555,7 @@ void runTiles(const Desc& d, Rect roi, int threads, int tile, F&& tileFn) {
       const std::size_t t = next.fetch_add(1);
       if (t >= tiles.size()) break;
       if (d.cancelCur && d.cancelCur->load(std::memory_order_relaxed) != d.cancelMine) break;
+      yieldWhileInteracting(d.cancelCur, d.cancelMine);
       tileFn(tiles[t], S);
     }
   };
