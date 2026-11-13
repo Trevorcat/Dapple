@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../models.dart';
+import '../../services/detection.dart';
 import '../../services/tool_models.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
@@ -298,8 +299,9 @@ class _EntryCards extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final cards = app.detectedCards;
-    final v = app.latestVideo;
+    // Merge cards need the engine's merge build; the video card needs the platform's video layer (iOS has neither today).
+    final cards = app.engine.available ? app.detectedCards : const <DetectedGroup>[];
+    final v = app.videoLayer ? app.latestVideo : null;
     if (cards.isEmpty && v == null) return const SizedBox.shrink();
     return Column(key: const ValueKey('entry-cards'), children: [
       for (final g in cards)

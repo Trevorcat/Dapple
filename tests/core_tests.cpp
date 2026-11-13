@@ -548,7 +548,7 @@ void testCApi() {
   }
 
   // Real photo, skipped when the sample folder is absent.
-  fs::path root = fs::path(std::u8string(u8"D:/图片"));
+  fs::path root;  // DAPPLE_SAMPLE_DIR only; no private default folder
   if (const char* env = std::getenv("DAPPLE_SAMPLE_DIR")) root = fs::path(std::u8string(env, env + std::strlen(env)));
   fs::path arw;
   if (fs::is_directory(root, ec)) {

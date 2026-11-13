@@ -67,6 +67,11 @@ class FakeEngine implements MergeEngine {
 
 const _t = Duration(milliseconds: 100);
 
+class _NoMergeEngine extends FakeEngine {
+  @override
+  bool get available => false;
+}
+
 Future<(AppState, FakeEngine)> _open(WidgetTester tester) async {
   useWindow(tester, phoneSize);
   final app = AppState.demo();
@@ -367,6 +372,34 @@ void main() {
       expect(o['longEdge'], AppState.panoLongEdge);
       expect(app.photos.first.kind, PhotoKind.pano);
       expect(find.text('全景已加入「今天」'), findsOneWidget);
+    });
+  });
+
+  group('unavailable features are not offered', () {
+    testWidgets('no merge build (iOS today): no merge cards, no 合成 in the selection bar; video card stays', (tester) async {
+      useWindow(tester, phoneSize);
+      final app = AppState.demo();
+      app.engine = _NoMergeEngine();
+      await pumpDapple(tester, app);
+      expect(find.text('HDR · 3 张包围曝光'), findsNothing);
+      expect(find.text('全景 · 4 张连续'), findsNothing);
+      expect(find.text('视频 → 动态照片'), findsOneWidget);
+      final done = app.photos.where((p) => p.status == PhotoStatus.done && p.kind == PhotoKind.photo).take(2).toList();
+      app.enterSelect(done[0].id);
+      app.toggleSelect(done[1].id);
+      await tester.pump(_t);
+      expect(find.byKey(const ValueKey('select-bar')), findsOneWidget);
+      expect(find.byKey(const ValueKey('sel-compose')), findsNothing);
+      expect(find.byKey(const ValueKey('sel-save')), findsOneWidget);
+    });
+
+    testWidgets('no video layer: no 视频 → 动态照片 card, merge cards stay', (tester) async {
+      final (app, _) = await _open(tester);
+      app.videoLayer = false;
+      app.notifyListeners();
+      await tester.pump(_t);
+      expect(find.text('视频 → 动态照片'), findsNothing);
+      expect(find.text('HDR · 3 张包围曝光'), findsOneWidget);
     });
   });
 

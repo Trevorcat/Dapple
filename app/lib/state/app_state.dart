@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../services/live_edit.dart';
+import '../platform/platform_services.dart';
 import '../services/media_permission.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -95,6 +96,9 @@ class AppState extends ChangeNotifier {
 
   /// Engine entry points of the HDR / panorama / Motion Photo tools (tests substitute a fake).
   MergeEngine engine = const NativeMergeEngine();
+
+  /// False where the platform has no video layer (iOS today): the 视频 → 动态照片 entry is not offered. Demo / tests: true.
+  late bool videoLayer = isDemo ? true : PlatformServices.current.video.available;
   FtpBackend ftpBackend = ChannelFtpBackend();
   late final FtpIngestSource ftpSource = FtpIngestSource(ftpBackend);
   StreamSubscription<FtpEvent>? _ftpSub;

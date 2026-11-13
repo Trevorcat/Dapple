@@ -213,9 +213,11 @@ class _SelectBar extends StatelessWidget {
         KeyedSubtree(
             key: const ValueKey('sel-save'),
             child: DIconButton(DI.save, label: '存相册', onPressed: on ? () => _save(context) : null)),
-        KeyedSubtree(
-            key: const ValueKey('sel-compose'),
-            child: DIconButton(DI.merge, label: '合成', onPressed: on ? () => _compose(context) : null)),
+        // HDR / panorama need the engine's merge build (not on iOS yet): no entry rather than a tool that can only fail.
+        if (app.engine.available)
+          KeyedSubtree(
+              key: const ValueKey('sel-compose'),
+              child: DIconButton(DI.merge, label: '合成', onPressed: on ? () => _compose(context) : null)),
         const Spacer(),
         Semantics(
           button: true,

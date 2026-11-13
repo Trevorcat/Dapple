@@ -23,7 +23,9 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -757,6 +759,76 @@ int selfcheckOneShot(bool haveFilm) {
   return bad;
 }
 
+// A merged (HDR / panorama) result leaves the app as a linear DNG and is reopened by the normal session path. The merge itself needs OpenCV
+// (merge_tests covers it); this part does not: write a synthetic linear DNG exactly like dapple_session_save_linear does, reopen it with
+// dapple_session_open, and render it in off and full mode: the two must agree bit for bit, and the pixels must survive the round trip.
+int selfcheckMergedDng() {
+  int bad = 0;
+  const SourceImage src = makeScene(480, 320, 5, true);
+  const std::filesystem::path path = std::filesystem::temp_directory_path() / "dapple_golden_merged.dng";
+  if (auto w = writeLinearDng(src, path); !w) {
+    std::printf("  merged DNG write failed: %s\n", w.error().message.c_str());
+    return 1;
+  }
+  const std::string pj = toJson(base());
+  std::string hashes[2];
+  for (int m = 0; m < 2; ++m) {
+    dapple::engine::setModeOverride(m);
+    DappleSession* s = dapple_session_open(path.string().c_str(), 0, 0);
+    if (!s) {
+      std::printf("  merged DNG reopen failed (mode %d): %s\n", m, dapple_last_error());
+      ++bad;
+      continue;
+    }
+    if (m == 0) {
+      const ImageF& a = s->source.linear;
+      // the DNG stores the pixels divided by a power-of-two headroom (BaselineExposure restores it); compare up to that gain
+      double num = 0, den = 0, err = 0, sum = 0, peak = 0;
+      const bool dims = a.width == src.linear.width && a.height == src.linear.height;
+      if (dims) {
+        const std::size_t n = std::size_t(a.width) * a.height * 3;
+        for (std::size_t i = 0; i < n; ++i) {
+          num += double(src.linear.data[i]) * a.data[i];
+          den += double(a.data[i]) * a.data[i];
+          peak = std::max<double>(peak, src.linear.data[i]);
+        }
+        const double gain = den > 0 ? num / den : 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          const double d = std::fabs(gain * a.data[i] - src.linear.data[i]);
+          err = std::max(err, d);
+          sum += d;
+        }
+        err /= std::max(peak, 1e-6);
+        sum /= std::max(peak, 1e-6) * double(n);
+      }
+      const bool ok = dims && err < 0.03 && sum < 0.005;  // gamut clipping of the saturated patch is the max; the mean is quantisation
+      std::printf("  merged DNG round trip %dx%d max error %.5f mean %.6f (of peak) %s\n", a.width, a.height, err, sum, ok ? "ok" : "BAD");
+      if (!ok) ++bad;
+    }
+    DappleImage im{};
+    const int rc = dapple_session_render_frame(s, pj.c_str(), nullptr, nullptr, &im, nullptr);
+    if (rc != DAPPLE_OK || !im.rgba) {
+      std::printf("  merged DNG render failed (mode %d): %s\n", m, dapple_last_error());
+      ++bad;
+    } else {
+      Fnv h;
+      h.i32(im.width);
+      h.i32(im.height);
+      h.bytes(im.rgba, std::size_t(im.width) * im.height * 4);
+      hashes[m] = hex(h.h);
+      dapple_free_image(&im);
+    }
+    dapple_session_close(s);
+  }
+  dapple::engine::setModeOverride(-1);
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+  const bool same = !hashes[0].empty() && hashes[0] == hashes[1];
+  std::printf("  merged DNG render off %s full %s %s\n", hashes[0].c_str(), hashes[1].c_str(), same ? "identical" : "DIFFERENT");
+  if (!same) ++bad;
+  return bad;
+}
+
 int selfcheck(bool haveFilm) {
   const auto runMode = [&](int m) {
     dapple::engine::setModeOverride(m);
@@ -779,6 +851,9 @@ int selfcheck(bool haveFilm) {
   const int oneshot = selfcheckOneShot(haveFilm);
   std::printf("selfcheck one-shot: %d differences\n", oneshot);
   bad += oneshot;
+  const int merged = selfcheckMergedDng();
+  std::printf("selfcheck merged DNG: %d differences\n", merged);
+  bad += merged;
   std::printf(bad ? "SELFCHECK FAILED (%d)\n" : "SELFCHECK OK (%d)\n", bad);
   return bad ? 1 : 0;
 }

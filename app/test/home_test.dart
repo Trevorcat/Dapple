@@ -1,3 +1,4 @@
+import 'package:dapple/services/merge_engine.dart';
 import 'package:dapple/state/app_state.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -7,9 +8,17 @@ import 'support/harness.dart';
 Future<AppState> _open(WidgetTester tester,
     {DemoScenario sc = DemoScenario.normal, Size size = phoneSize, bool dark = false}) async {
   useWindow(tester, size);
-  final app = AppState.demo(scenario: sc);
+  final app = AppState.demo(scenario: sc)..engine = _MergeBuild();
   await pumpDapple(tester, app, dark: dark);
   return app;
+}
+
+/// The merge entries only show when the engine has the merge build; this stub says it does.
+class _MergeBuild implements MergeEngine {
+  @override
+  bool get available => true;
+  @override
+  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);
 }
 
 const _t = Duration(milliseconds: 100);
