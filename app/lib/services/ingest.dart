@@ -51,6 +51,10 @@ class MediaBridge {
   static Future<String> copyToFile(String uri, String dest) async =>
       (await _media.invokeMethod<String>('copyToFile', {'uri': uri, 'dest': dest}))!;
 
+  /// HEIC / PNG / TIFF / WebP file -> sRGB JPEG at [dest] (ImageIO on iOS, ImageDecoder on Android).
+  static Future<String> toJpeg(String src, String dest) async =>
+      (await _media.invokeMethod<String>('toJpeg', {'src': src, 'dest': dest}))!;
+
   /// Inserts the JPEG into MediaStore Pictures/Dapple. Returns the new URI / path.
   /// [replace] first removes this app's earlier gallery item with the same name (regenerated Motion Photos).
   static Future<String> saveToGallery(String path, String name, {bool replace = false}) async =>

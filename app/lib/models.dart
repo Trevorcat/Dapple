@@ -130,6 +130,19 @@ class Photo {
   }
 
   bool get openable => status != PhotoStatus.arriving && status != PhotoStatus.interrupted && status != PhotoStatus.failed;
+  /// Why a photo could not be developed, in plain words (the raw [error] stays in the log).
+  String get failReason {
+    final e = (error ?? '').toLowerCase();
+    if (e.contains('notfound') || e.contains('找不到') || e.contains('no such file') || e.contains('not found')) return '找不到原图，可能已被删除';
+    if (e.contains('convert') || e.contains('cannot decode') || e.contains('unsupported')) return '这种格式暂时无法处理';
+    if (e.contains('network') || e.contains('icloud') || e.contains('write')) return '读取原图失败，请检查网络后重试';
+    if (e.contains('decode') || e.contains('corrupt') || e.contains('truncated')) return '照片文件已损坏或无法读取';
+    return '处理失败';
+  }
+
+  /// A develop failure (as opposed to a camera transfer that broke).
+  bool get developFailed => status == PhotoStatus.failed && error != null;
+
   bool get processing => status == PhotoStatus.pending || status == PhotoStatus.developing;
 
   /// Chinese display title (file name without extension).

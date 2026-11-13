@@ -17,6 +17,8 @@
 #include <map>
 #if defined(__ANDROID__)
 #include <android/log.h>
+#elif defined(__APPLE__)
+#include <os/log.h>
 #endif
 #include "engine/hal/select.h"
 #include "engine/nodes/demosaic/demosaic_backend.h"
@@ -415,6 +417,8 @@ class DeviceBackend final : public GpuBackend {
   static void logLine(const std::string& l) {
 #if defined(__ANDROID__)
     __android_log_print(ANDROID_LOG_INFO, "dapple_demosaic", "%s", l.c_str());
+#elif defined(__APPLE__)
+    os_log(OS_LOG_DEFAULT, "dapple_demosaic: %{public}s", l.c_str());  // stderr of a release app on a device is not collected
 #endif
     std::fprintf(stderr, "dapple_demosaic: %s\n", l.c_str());
   }

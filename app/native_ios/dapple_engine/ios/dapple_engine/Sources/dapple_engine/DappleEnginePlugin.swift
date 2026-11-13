@@ -30,6 +30,11 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         startGpu()
         FlutterMethodChannel(name: "dapple/media", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handleMedia)
         FlutterMethodChannel(name: "dapple/photos", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handlePhotos)
+        // one-line ingest outcomes from Dart into the unified log (visible in release builds: Console.app / `log stream`, subsystem-free NSLog)
+        FlutterMethodChannel(name: "dapple/log", binaryMessenger: registrar.messenger()).setMethodCallHandler { call, result in
+            if call.method == "line", let l = call.arguments as? String { NSLog("dapple ingest: %@", l) }
+            result(nil)
+        }
         FlutterEventChannel(name: "dapple/media_events", binaryMessenger: registrar.messenger()).setStreamHandler(p)
         registrar.publish(p)
     }
@@ -70,6 +75,13 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
             guard let path = a["path"] as? String else { return result(FlutterError(code: "args", message: "path", details: nil)) }
             let name = (a["name"] as? String) ?? (path as NSString).lastPathComponent
             Self.saveToGallery(path: path, name: name) { r in DispatchQueue.main.async { result(r) } }
+        case "toJpeg":
+            // any ImageIO image (HEIC, PNG, TIFF, wide-gamut JPEG) -> sRGB JPEG; used for files that did not come through Photos (Files app, Documents)
+            guard let src = a["src"] as? String, let dest = a["dest"] as? String else { return result(FlutterError(code: "args", message: "src/dest", details: nil)) }
+            io.async {
+                let ok = Self.convertToJpeg(src: src, dst: dest)
+                DispatchQueue.main.async { result(ok ? dest : FlutterError(code: "convert", message: "cannot convert \((src as NSString).lastPathComponent)", details: nil)) }
+            }
         case "openApp":
             result(false)  // Android package names do not exist here
         default:
@@ -133,24 +145,61 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         let rs = PHAssetResource.assetResources(for: asset)
         guard idx < rs.count else { return done(FlutterError(code: "notfound", message: "resource", details: nil)) }
         let r = rs[idx]
-        let pass = passthrough(r)
         let o = PHAssetResourceRequestOptions()
         o.isNetworkAccessAllowed = true  // iCloud originals
-        let tmp = pass ? dest : NSTemporaryDirectory() + UUID().uuidString + "." + (r.originalFilename as NSString).pathExtension
+        let tmp = NSTemporaryDirectory() + UUID().uuidString + "." + (r.originalFilename as NSString).pathExtension
         try? FileManager.default.removeItem(atPath: tmp)
+        let raw = isRaw(r), jpeg = UTType(r.uniformTypeIdentifier)?.conforms(to: .jpeg) == true
         PHAssetResourceManager.default().writeData(for: r, toFile: URL(fileURLWithPath: tmp), options: o) { err in
             if let err = err { return done(FlutterError(code: "write", message: err.localizedDescription, details: nil)) }
-            if pass { return done(dest) }
-            if convertToJpeg(src: tmp, dst: dest) { try? FileManager.default.removeItem(atPath: tmp); done(dest) }
+            if place(tmp: tmp, dest: dest, raw: raw, jpeg: jpeg) { done(dest) }
             else { done(FlutterError(code: "convert", message: "cannot convert \(r.originalFilename) to JPEG", details: nil)) }
         }
     }
 
+    /// True when the file's pixels can go to the engine as they are: no profile or an sRGB one. The engine reads every JPEG / PNG as sRGB,
+    /// so a Display P3 (or Adobe RGB ...) source has to be converted, not just copied.
+    static func isSRGBLike(_ url: URL) -> Bool {
+        guard let s = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let p = CGImageSourceCopyPropertiesAtIndex(s, 0, nil) as? [CFString: Any] else { return true }
+        if (p[kCGImagePropertyDepth] as? Int ?? 8) > 8 { return false }  // 16-bit sources are reduced to 8 bit by the conversion, not by the engine
+        guard let name = p[kCGImagePropertyProfileName] as? String else { return true }
+        return name.lowercased().contains("srgb")
+    }
+
+    /// HEIC / HEIF / PNG / TIFF / wide-gamut JPEG -> 8-bit sRGB JPEG (quality 0.95) with ImageIO: the decoder honours every profile and
+    /// the HEIC container, the engine needs no HEIF library. Capture date, camera, GPS and the EXIF orientation tag are copied (the
+    /// pixels stay in sensor orientation, the engine applies the tag like for any JPEG). Lost: colours outside sRGB (clipped), bit depth
+    /// beyond 8, HDR gain maps (the SDR base image is used), alpha (flattened).
     static func convertToJpeg(src: String, dst: String) -> Bool {
-        guard let s = CGImageSourceCreateWithURL(URL(fileURLWithPath: src) as CFURL, nil),
+        let url = URL(fileURLWithPath: src)
+        guard let s = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let img = CGImageSourceCreateImageAtIndex(s, 0, [kCGImageSourceShouldCacheImmediately: false] as CFDictionary),
+              let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: img.width, height: img.height, bitsPerComponent: 8, bytesPerRow: 0, space: srgb,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
               let d = CGImageDestinationCreateWithURL(URL(fileURLWithPath: dst) as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else { return false }
-        CGImageDestinationAddImageFromSource(d, s, 0, [kCGImageDestinationLossyCompressionQuality: 0.95] as CFDictionary)  // keeps EXIF and orientation
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: img.width, height: img.height))
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: img.width, height: img.height))
+        guard let out = ctx.makeImage() else { return false }
+        var props = (CGImageSourceCopyPropertiesAtIndex(s, 0, nil) as? [CFString: Any]) ?? [:]
+        for k in [kCGImagePropertyProfileName, kCGImagePropertyPixelWidth, kCGImagePropertyPixelHeight, kCGImagePropertyDepth,
+                  kCGImagePropertyColorModel, kCGImagePropertyHasAlpha, kCGImagePropertyIsFloat, kCGImagePropertyIsIndexed] { props.removeValue(forKey: k) }
+        props[kCGImageDestinationLossyCompressionQuality] = 0.95
+        CGImageDestinationAddImage(d, out, props as CFDictionary)
         return CGImageDestinationFinalize(d)
+    }
+
+    /// Moves a freshly written original to `dest`: RAW and sRGB JPEG unchanged, everything else converted by [convertToJpeg].
+    static func place(tmp: String, dest: String, raw: Bool, jpeg: Bool) -> Bool {
+        try? FileManager.default.removeItem(atPath: dest)
+        if raw || (jpeg && isSRGBLike(URL(fileURLWithPath: tmp))) {
+            do { try FileManager.default.moveItem(atPath: tmp, toPath: dest); return true } catch { return false }
+        }
+        let ok = convertToJpeg(src: tmp, dst: dest)
+        try? FileManager.default.removeItem(atPath: tmp)
+        return ok
     }
 
     private static let albumKey = "dapple.album.id"
@@ -271,10 +320,12 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
                 let ut = UTType(type)
                 let ext = url.pathExtension.isEmpty ? (ut?.preferredFilenameExtension ?? "bin") : url.pathExtension
                 let stem = (p.suggestedName ?? url.deletingPathExtension().lastPathComponent)
-                let keep = ut?.conforms(to: .rawImage) == true || ut?.conforms(to: .jpeg) == true
+                // RAW and sRGB JPEG are copied as they are; HEIC / PNG / TIFF and wide-gamut JPEG are converted (colour managed, see convertToJpeg)
+                let keep = ut?.conforms(to: .rawImage) == true || (ut?.conforms(to: .jpeg) == true && Self.isSRGBLike(url))
                 let finalPath = "\(dest)/\(Int(Date().timeIntervalSince1970 * 1000) + n)_\(stem).\(keep ? ext : "jpg")"
                 if keep { try? FileManager.default.copyItem(at: url, to: URL(fileURLWithPath: finalPath)) }
                 else if !Self.convertToJpeg(src: url.path, dst: finalPath) {
+                    NSLog("dapple pick: %@ convert failed", stem)
                     lock.lock(); out.append(["key": key, "name": stem0, "dup": false, "error": "copy"]); lock.unlock()
                     return
                 }
@@ -283,7 +334,7 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
                     lock.lock(); out.append(["key": key, "name": stem0, "dup": false, "error": "copy"]); lock.unlock()
                     return
                 }
-                lock.lock(); out.append(["key": key, "name": (finalPath as NSString).lastPathComponent, "dup": false, "path": finalPath, "size": size]); lock.unlock()
+                lock.lock(); out.append(["key": key, "name": "\(stem).\(keep ? ext : "jpg")", "dup": false, "path": finalPath, "size": size]); lock.unlock()
             }
         }
         group.notify(queue: .main) { cb?(out) }

@@ -25,6 +25,7 @@ import '../services/capture.dart';
 import '../services/detection.dart';
 import '../services/ftp_ingest.dart';
 import '../services/ingest.dart';
+import '../services/ingest_log.dart';
 import '../services/live_bridge.dart';
 import '../services/merge_engine.dart';
 import '../services/session_cache.dart';
@@ -204,6 +205,9 @@ class AppState extends ChangeNotifier {
     return l;
   }
 
+  /// A camera transfer that broke (a photo that could not be developed has its own wording on its tile and no effect on the camera status).
+  static bool _transferBroken(Photo e) => e.status == PhotoStatus.interrupted || (e.status == PhotoStatus.failed && !e.developFailed);
+
   Photo? photoById(String id) => _photos[id];
   List<Photo> get allPhotos => _photos.values.toList();
   bool get isEmpty => _photos.isEmpty;
@@ -256,7 +260,7 @@ class AppState extends ChangeNotifier {
   ConnState get connState {
     if (linkDown) return ConnState.disconnected;
     if (_photos.isEmpty) return ConnState.idle;
-    if (_photos.values.any((e) => e.status == PhotoStatus.interrupted || e.status == PhotoStatus.failed)) {
+    if (_photos.values.any(_transferBroken)) {
       return ConnState.interrupted;
     }
     if (!cameraSource) return ConnState.idle;
@@ -266,7 +270,7 @@ class AppState extends ChangeNotifier {
   }
 
   int get interruptedCount =>
-      _photos.values.where((e) => e.status == PhotoStatus.interrupted || e.status == PhotoStatus.failed).length;
+      _photos.values.where(_transferBroken).length;
   int get arrivingCount => _photos.values.where((e) => e.status == PhotoStatus.arriving).length;
   int get processedCount => _photos.values.where((e) => e.status == PhotoStatus.done).length;
   int get processingCount => _photos.values.where((e) => e.processing).length;
@@ -361,7 +365,7 @@ class AppState extends ChangeNotifier {
   }
 
   void retryAll() {
-    for (final ph in _photos.values.where((e) => e.status == PhotoStatus.interrupted || e.status == PhotoStatus.failed)) {
+    for (final ph in _photos.values.where(_transferBroken)) {
       retry(ph, quiet: true);
     }
     notifyListeners();
@@ -601,6 +605,7 @@ class AppState extends ChangeNotifier {
     if (!nativeOk) nativeError = '原生库未加载';
     await _loadFilm();
     await _loadLibrary();
+    _repairPaths();
     await _loadDetection();
     ready = true;
     notifyListeners();
@@ -631,6 +636,44 @@ class AppState extends ChangeNotifier {
     } catch (e) {
       debugPrint('load library failed: $e');
     }
+  }
+
+  /// The app container moves when the app is reinstalled (iOS) and the library stores absolute paths: a thumbnail or an imported original
+  /// is looked up again by file name in its folder, and a developed photo whose thumbnail is really gone is developed again.
+  /// Called once after the library is loaded.
+  void _repairPaths() {
+    String? find(String? path, Directory dir) {
+      if (path == null || File(path).existsSync()) return path;
+      final c = p.join(dir.path, p.basename(path));
+      return File(c).existsSync() ? c : path;
+    }
+
+    var n = 0;
+    for (final ph in _photos.values) {
+      final src = find(ph.path, inbox), prev = find(ph.previewPath, previews);
+      if (src != ph.path || prev != ph.previewPath) n++;
+      ph.path = src;
+      ph.previewPath = prev;
+      if (ph.status == PhotoStatus.done && ph.previewPath != null && !File(ph.previewPath!).existsSync()) {
+        ph.previewPath = null;
+        ph.status = PhotoStatus.pending;
+        n++;
+        ingestLog('thumbnail of ${ph.name} is missing, developing again');
+      }
+    }
+    if (n > 0) ingestLog('library repaired: $n photo(s) re-linked or queued');
+  }
+
+  final Set<String> _previewRetried = {};
+
+  /// A tile could not load its thumbnail file although the photo is done: develop it again (once per run).
+  void previewMissing(Photo ph) {
+    if (ph.status != PhotoStatus.done || !_previewRetried.add(ph.id)) return;
+    ingestLog('thumbnail of ${ph.name} cannot be read, developing again');
+    ph.previewPath = null;
+    ph.status = PhotoStatus.pending;
+    changed();
+    if (!isDemo) _enqueue(ph.id);
   }
 
   Timer? _saveTimer;
@@ -724,6 +767,7 @@ class AppState extends ChangeNotifier {
           (DateTime.now().millisecondsSinceEpoch ~/ 1000 - 7 * 24 * 3600); // first run: last 7 days only
       for (var page = 0; page < 200; page++) {
         final files = await mediaSource.scan(limit: pageSize, sinceSec: since);
+        ingestLog('scan: ${files.length} new from ${mediaSource.id}');
         if (files.isEmpty) break;
         _addIncoming(files);
         final maxSec = files.map((f) => f.addedMs ~/ 1000).reduce((a, b) => a > b ? a : b);
@@ -891,6 +935,7 @@ class AppState extends ChangeNotifier {
       var dups = 0, unsupported = 0, failed = 0;
       String? only;
       for (final it in items) {
+        ingestLog('picked ${it.name}: ${it.dup ? 'already in library' : it.error ?? 'copied'}');
         final existing = _existingFor(it.key);
         if (existing != null) {
           dups++;
@@ -925,8 +970,9 @@ class AppState extends ChangeNotifier {
 
   /// Tests: puts a bare photo with [id] into the library.
   @visibleForTesting
-  void simulatePhotoForTest(String id) {
-    _photos[id] = Photo(id: id, name: id, addedMs: 1, status: PhotoStatus.done);
+  void simulatePhotoForTest(Object idOrPhoto) {
+    final ph = idOrPhoto is Photo ? idOrPhoto : Photo(id: idOrPhoto as String, name: idOrPhoto, addedMs: 1, status: PhotoStatus.done);
+    _photos[ph.id] = ph;
   }
 
   void _discard(String? path) {
@@ -957,7 +1003,29 @@ class AppState extends ChangeNotifier {
   // ---------------------------------------------------------------- source path resolution
   /// Returns a readable local path for FFI. Copies content:// into cache when the
   /// MediaStore path cannot be opened directly. [temp] tells the caller to delete it afterwards.
+  /// Types the engine does not read itself (or reads without colour management): converted to an sRGB JPEG by the platform decoder
+  /// (ImageIO on iOS, ImageDecoder on Android; capture date, camera and orientation kept) into the cache, the caller deletes it ([temp]).
+  static const _convertExts = {'.heic', '.heif', '.png', '.tif', '.tiff', '.webp', '.avif'};
+
   Future<({String path, bool temp})> resolveSource(Photo ph) async {
+    final r = await _resolveRaw(ph);
+    final ext = p.extension(r.path).toLowerCase();
+    if (!_convertExts.contains(ext) || !(Platform.isIOS || Platform.isAndroid)) return r;
+    final dest = p.join(_cache.path, 'src', '${DateTime.now().microsecondsSinceEpoch}_${p.basenameWithoutExtension(r.path)}.jpg');
+    try {
+      await Directory(p.dirname(dest)).create(recursive: true);
+      await MediaBridge.toJpeg(r.path, dest);
+    } finally {
+      if (r.temp) {
+        try {
+          await File(r.path).delete();
+        } catch (_) {}
+      }
+    }
+    return (path: dest, temp: true);
+  }
+
+  Future<({String path, bool temp})> _resolveRaw(Photo ph) async {
     final direct = ph.path;
     if (direct != null) {
       try {
@@ -1027,6 +1095,7 @@ class AppState extends ChangeNotifier {
   Future<void> _develop(Photo ph) async {
     ph.status = PhotoStatus.developing;
     changed(save: false);
+    final sw = Stopwatch()..start();
     String? tempPath;
     DappleSession? s;
     try {
@@ -1057,10 +1126,12 @@ class AppState extends ChangeNotifier {
       }
       ph.status = PhotoStatus.done;
       ph.error = null;
+      ingestLog('developed ${ph.name} ${ph.pxW}x${ph.pxH} in ${sw.elapsedMilliseconds} ms');
       if (ph.camera != null && cameraSource) cameraName = ph.camera!;
     } catch (e) {
       ph.status = PhotoStatus.failed;
       ph.error = '$e';
+      ingestLog('FAILED ${ph.name} after ${sw.elapsedMilliseconds} ms: $e');
     } finally {
       await s?.close();
       if (tempPath != null) {

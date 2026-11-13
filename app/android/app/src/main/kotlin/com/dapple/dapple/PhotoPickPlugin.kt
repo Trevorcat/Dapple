@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import io.flutter.plugin.common.BinaryMessenger
@@ -87,12 +88,22 @@ class PhotoPickPlugin(private val activity: Activity, messenger: BinaryMessenger
                     rows.add(mapOf("key" to key, "name" to name, "dup" to false, "error" to "unsupported"))
                     continue
                 }
-                val f = File(out, "${now + n}_$name")
+                val convert = ImageTranscode.needsTranscode(name)
+                val f = File(out, "${now + n}_${if (convert) ImageTranscode.jpegName(name) else name}")
+                val raw = if (convert) File(activity.cacheDir, "pick_${now + n}_$name") else f
                 try {
-                    activity.contentResolver.openInputStream(u)!!.use { i -> f.outputStream().use { o -> i.copyTo(o, 1 shl 20) } }
-                    rows.add(mapOf("key" to key, "name" to name, "dup" to false, "path" to f.absolutePath, "size" to f.length()))
+                    activity.contentResolver.openInputStream(u)!!.use { i -> raw.outputStream().use { o -> i.copyTo(o, 1 shl 20) } }
+                    if (convert) {
+                        val ok = ImageTranscode.toJpeg(raw, f)
+                        raw.delete()
+                        if (!ok) throw IllegalStateException("cannot decode $name")
+                    }
+                    Log.i("DappleIngest", "picked $name: ${f.length()} bytes${if (convert) ", converted to JPEG" else ""}")
+                    rows.add(mapOf("key" to key, "name" to f.name.substringAfter('_'), "dup" to false, "path" to f.absolutePath, "size" to f.length()))
                 } catch (e: Exception) {
                     f.delete()
+                    raw.delete()
+                    Log.w("DappleIngest", "pick of $name failed: ${e.message}")
                     rows.add(mapOf("key" to key, "name" to name, "dup" to false, "error" to "copy"))
                 }
             }
@@ -125,7 +136,7 @@ class PhotoPickPlugin(private val activity: Activity, messenger: BinaryMessenger
 
     companion object {
         const val REQ = 7433
-        private val exts = listOf("arw", "raf", "dng", "jpg", "jpeg")
+        private val exts = listOf("arw", "raf", "dng", "jpg", "jpeg", "heic", "heif", "png", "webp")
 
         fun supported(name: String) = name.substringAfterLast('.', "").lowercase() in exts
 

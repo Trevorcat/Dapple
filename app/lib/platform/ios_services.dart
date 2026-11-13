@@ -32,7 +32,7 @@ class IosPlatformServices implements PlatformServices {
   bool get gpuView => false;
 }
 
-const _photoExt = ['.arw', '.raf', '.dng', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.jpg', '.jpeg', '.heic'];
+const _photoExt = ['.arw', '.raf', '.dng', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.jpg', '.jpeg', '.heic', '.heif', '.png', '.tif', '.tiff'];
 
 /// PhotoKit through DappleEnginePlugin.swift: `dapple/media` lists / copies / saves, `dapple/photos` asks for access and runs the system picker.
 /// Limited access works as full access for the listing (the system only shows the chosen photos); [presentLimitedPicker] widens the selection.

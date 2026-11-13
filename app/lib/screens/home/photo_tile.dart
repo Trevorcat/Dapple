@@ -30,12 +30,14 @@ class PhotoTile extends StatelessWidget {
         b.write('，接收中');
         break;
       case PhotoStatus.pending:
+        b.write('，等待处理');
+        break;
       case PhotoStatus.developing:
-        b.write('，处理中，当前为预览');
+        b.write('，处理中');
         break;
       case PhotoStatus.interrupted:
       case PhotoStatus.failed:
-        b.write('，传输中断');
+        b.write(photo.developFailed ? '，无法处理，${photo.failReason}' : '，传输中断');
         break;
       case PhotoStatus.done:
         break;
@@ -53,7 +55,11 @@ class PhotoTile extends StatelessWidget {
         return;
       case PhotoStatus.interrupted:
       case PhotoStatus.failed:
-        app.showToast('传输中断，点「重试」');
+        if (photo.developFailed) {
+          app.showToast(photo.failReason, actionLabel: '重试', onAction: () => app.retry(photo));
+        } else {
+          app.showToast('传输中断，点「重试」');
+        }
         return;
       default:
         break;
@@ -91,7 +97,7 @@ class PhotoTile extends StatelessWidget {
                   }),
         },
         child: Stack(fit: StackFit.expand, children: [
-          PhotoArt(photo, cacheWidth: 400),
+          PhotoArt(photo, cacheWidth: 400, onMissing: () => app.previewMissing(photo)),
           if (st == PhotoStatus.arriving)
             Center(
               child: Padding(
@@ -114,13 +120,21 @@ class PhotoTile extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(horizontal: 8),
                 alignment: Alignment.center,
                 decoration: BoxDecoration(color: Fx.amber, borderRadius: BorderRadius.circular(8)),
-                child: Text('传输中断', style: T.mini(Fx.onAmber, w: FontWeight.w500)),
+                child: Text(photo.developFailed ? '无法处理' : '传输中断', style: T.mini(Fx.onAmber, w: FontWeight.w500)),
               ),
             ),
+            if (photo.developFailed)
+              Positioned(
+                left: 8,
+                right: 8,
+                bottom: 8,
+                child: Text(photo.failReason,
+                    key: ValueKey('reason-${photo.id}'), maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: T.mini(Colors.black87)),
+              ),
             Center(
               child: Semantics(
                 button: true,
-                label: '${photo.title}，重试传输',
+                label: '${photo.title}，${photo.developFailed ? '重试' : '重试传输'}',
                 excludeSemantics: true,
                 child: GestureDetector(
                   key: ValueKey('retry-${photo.id}'),
@@ -138,6 +152,31 @@ class PhotoTile extends StatelessWidget {
             ),
           ],
           if (sel) const ColoredBox(color: Color(0x38FFFFFF)),
+          // developing: a thin moving bar along the bottom edge, with the word on the tile (queued tiles say so too)
+          if (photo.processing && photo.kind == PhotoKind.photo) ...[
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: LinearProgressIndicator(
+                  key: ValueKey('progress-${photo.id}'),
+                  minHeight: 3,
+                  color: c.accent,
+                  backgroundColor: Colors.black12,
+                  value: st == PhotoStatus.pending ? 0 : null),
+            ),
+            Positioned(
+              left: 6,
+              top: 6,
+              child: Container(
+                height: 20,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(color: Fx.overlay55, borderRadius: BorderRadius.circular(8)),
+                child: Text(st == PhotoStatus.pending ? '等待处理' : '处理中', style: T.mini(Colors.white, w: FontWeight.w500)),
+              ),
+            ),
+          ],
           // bottom-left: state dot or kind badge
           Positioned(left: 6, bottom: 6, child: _bottomLeft(context)),
           // bottom-right: processing spinner

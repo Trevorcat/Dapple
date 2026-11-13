@@ -68,7 +68,7 @@ class DemoEdit {
 /// is drawn by the editor itself; [demoEdit] only drives the approximate demo filter.
 class PhotoArt extends StatelessWidget {
   const PhotoArt(this.photo,
-      {super.key, this.fit = BoxFit.cover, this.cacheWidth, this.demoEdit, this.original = false});
+      {super.key, this.fit = BoxFit.cover, this.cacheWidth, this.demoEdit, this.original = false, this.onMissing});
   final Photo photo;
   final BoxFit fit;
   final int? cacheWidth;
@@ -76,6 +76,9 @@ class PhotoArt extends StatelessWidget {
   /// Demo only: render with this edit state's approximation (editor).
   final DemoEdit? demoEdit;
   final bool original;
+
+  /// Called (once, after the frame) when the preview file cannot be loaded.
+  final VoidCallback? onMissing;
 
   @override
   Widget build(BuildContext context) {
@@ -87,7 +90,10 @@ class PhotoArt extends StatelessWidget {
           fit: fit,
           cacheWidth: cacheWidth,
           gaplessPlayback: true,
-          errorBuilder: (_, _, _) => ColoredBox(color: c.placeholder));
+          errorBuilder: (_, _, _) {
+            if (onMissing != null) WidgetsBinding.instance.addPostFrameCallback((_) => onMissing!());
+            return ColoredBox(color: c.placeholder);
+          });
     }
     final di = photo.demo;
     if (di != null) {

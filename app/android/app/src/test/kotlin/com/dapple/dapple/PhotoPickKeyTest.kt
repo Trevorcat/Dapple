@@ -21,7 +21,20 @@ class PhotoPickKeyTest {
     @Test fun onlyDevelopableTypes() {
         assertTrue(PhotoPickPlugin.supported("A.ARW"))
         assertTrue(PhotoPickPlugin.supported("b.jpeg"))
-        assertFalse(PhotoPickPlugin.supported("c.png"))
+        assertTrue(PhotoPickPlugin.supported("c.PNG"))
+        assertTrue(PhotoPickPlugin.supported("IMG_0001.HEIC"))
+        assertTrue(PhotoPickPlugin.supported("x.heif"))
+        assertFalse(PhotoPickPlugin.supported("clip.mp4"))
         assertFalse(PhotoPickPlugin.supported("noext"))
+    }
+
+    @Test fun heicAndPngAreTranscodedToJpeg() {
+        assertTrue(ImageTranscode.needsTranscode("IMG_0001.HEIC"))
+        assertTrue(ImageTranscode.needsTranscode("a.png"))
+        assertFalse(ImageTranscode.needsTranscode("a.jpg"))
+        assertFalse(ImageTranscode.needsTranscode("a.dng"))
+        assertEquals("IMG_0001.jpg", ImageTranscode.jpegName("IMG_0001.HEIC"))
+        assertEquals("a.b.jpg", ImageTranscode.jpegName("a.b.png"))
+        assertEquals("noext.jpg", ImageTranscode.jpegName("noext"))
     }
 }

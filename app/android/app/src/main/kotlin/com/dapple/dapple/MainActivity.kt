@@ -123,6 +123,15 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
+                "toJpeg" -> {
+                    // HEIC / PNG / WebP file -> sRGB JPEG (ImageTranscode.kt), for files that did not come through the pick channel
+                    val src = File(call.argument<String>("src")!!)
+                    val dest = File(call.argument<String>("dest")!!)
+                    io.execute {
+                        val ok = ImageTranscode.toJpeg(src, dest)
+                        main.post { if (ok) result.success(dest.absolutePath) else result.error("convert", "cannot convert ${src.name}", null) }
+                    }
+                }
                 "openApp" -> {
                     val pkg = call.argument<String>("package")
                     val intent = if (pkg == null) null else packageManager.getLaunchIntentForPackage(pkg)
@@ -140,6 +149,12 @@ class MainActivity : FlutterActivity() {
                 }
                 else -> result.notImplemented()
             }
+        }
+
+        // one-line ingest outcomes from Dart into logcat (tag DappleIngest), also in release builds
+        MethodChannel(messenger, "dapple/log").setMethodCallHandler { call, result ->
+            if (call.method == "line") android.util.Log.i("DappleIngest", call.arguments as? String ?: "")
+            result.success(null)
         }
 
         MethodChannel(messenger, "dapple/live").setMethodCallHandler { call, result ->
