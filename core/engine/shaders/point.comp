@@ -8,6 +8,7 @@
 layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;  // spec constants 16 / 17 = workgroup shape of the device (GLES 3.1 guarantees only 128 invocations)
 #include "common.glsl"
 layout(constant_id = 0) const int GEO = 0;
+layout(constant_id = 4) const bool WARP = false;  // portrait reshaping field (warp.glsl), stored in the Hdr buffer after the HDR grid
 layout(constant_id = 1) const bool HDR = false;  // single-image HDR gain after the white balance gain (core/src/hdr_field.cpp)  // 0 identity (output pixel = source pixel), 1 exact index mapping, 2 Catmull-Rom
 
 layout(std140, binding = 0) uniform P {
@@ -24,6 +25,9 @@ layout(std140, binding = 0) uniform P {
   vec4 h1;      // HDR: clip luminance, grid w, h, bins
   vec4 h2;      // HDR: lmin, lstep, black end EV, top end EV
   vec4 h3;      // HDR: shadow lift peak, highlight pull (EV)
+  ivec4 wI;     // reshaping: grid w, h, offset in hdrg[], 0
+  vec4 wB;      // reshaping: ax, bx, ay, by
+  vec4 wC;      // reshaping: lpx
 } u;
 
 layout(binding = 1) uniform sampler2D uSrc;  // texture path: imageLoad is several times slower on Adreno
@@ -33,6 +37,8 @@ layout(binding = 4) uniform sampler3D uLut2;
 layout(binding = 5, rgba16f) uniform writeonly image2D uD;
 layout(binding = 6, rgba8) uniform writeonly image2D uOut8;
 layout(binding = 7, std430) readonly buffer Hdr { float hdrg[]; };
+#define WARP_AT(i) hdrg[i]
+#include "warp.glsl"
 
 #ifdef LOCAL
 // local adjustments, stage L (docs/engine/pipeline-architecture.md section 40)
@@ -115,6 +121,7 @@ void cubicW(float t, out float w[4]) {
   w[2] = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
   w[3] = 0.5 * t3 - 0.5 * t2;
 }
+#include "warp_lanczos.glsl"
 vec3 sampleCubic(float x, float y) {
   x -= 0.5;
   y -= 0.5;
@@ -184,8 +191,11 @@ void main() {
     else if (u.c.x == 1) { sx = fy; sy = sH - fx; }
     else if (u.c.x == 2) { sx = sW - fx; sy = sH - fy; }
     else { sx = sW - fy; sy = fx; }
+    bool moved = false;
+    if (WARP) moved = warpDisplace(sx, sy);
     hdrUV = vec2(sx, sy) / vec2(u.a.xy);
-    if (GEO == 1) v = srcAt(int(floor(sx)), int(floor(sy)));
+    if (GEO == 1 && !moved) v = srcAt(int(floor(sx)), int(floor(sy)));
+    else if (moved) v = sampleLanczos3(sx, sy);
     else v = sampleCubic(sx, sy);
   }
 #ifdef LOCAL

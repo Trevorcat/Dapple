@@ -287,7 +287,7 @@ enum {
   DAPPLE_FRAME_INTERACTIVE = 1, /* drag quality: no grain; noise reduction only when its sliders moved */
   DAPPLE_FRAME_ANALYSIS = 2,    /* also return the tonal analysis JSON (same schema as analyze_json) */
   DAPPLE_FRAME_EXACT = 4,       /* reference pipeline (no lattice), for tests and export parity */
-  DAPPLE_FRAME_BACKGROUND = 8,  /* low priority: calling thread on efficiency cores, nice 10, never uses the pool */
+  DAPPLE_FRAME_BACKGROUND = 8,  /* low priority: never the shared pool (the background pool while no finger is down); calling thread on efficiency cores, nice 10, when a finger is down (dapple_set_interaction) at the frame's start */
 };
 
 /* Zero-readback display (docs/engine/present.md): an image on the GPU device the engine renders with (see the view API), into which

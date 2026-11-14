@@ -13,6 +13,7 @@ struct PointU {
   std::int32_t c[4], d[4];
   float e[4];
   float h0[4], h1[4], h2[4], h3[4];
+  WarpU w;
 };
 }  // namespace
 
@@ -20,10 +21,11 @@ bool recordPoint(GpuRecorder& r, const PointNode& n, H D) {
   const FramePlan& P = *n.plan;
   const int geo = !P.useGeo ? 0 : (P.exact ? 1 : 2);
   const bool hdrOn = P.hdr.active() && n.lut.hdr >= 0;
+  const bool warpOn = P.warp.active() && n.src.warp >= 0;
   const bool localOn = P.local && n.ldesc >= 0 && n.lplanes >= 0;
   const bool localW = localOn && n.aux0 >= 0 && n.aux1 >= 0;
-  const hal::PipelineH p = localOn ? r.pl("point_local", {{0, geo}, {1, hdrOn ? 1 : 0}, {3, localW ? 1 : 0}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}})
-                                   : r.pl("point", {{0, geo}, {1, hdrOn ? 1 : 0}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}});
+  const hal::PipelineH p = localOn ? r.pl("point_local", {{0, geo}, {1, hdrOn ? 1 : 0}, {3, localW ? 1 : 0}, {4, warpOn ? 1 : 0}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}})
+                                   : r.pl("point", {{0, geo}, {1, hdrOn ? 1 : 0}, {4, warpOn ? 1 : 0}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}});
   if (!p) return false;
   PointU u{};
   for (int k = 0; k < 3; ++k) u.gain[k] = P.gain[k];
@@ -64,10 +66,13 @@ bool recordPoint(GpuRecorder& r, const PointNode& n, H D) {
     u.h2[0] = h.field->lmin, u.h2[1] = h.field->lstep, u.h2[2] = h.lo, u.h2[3] = h.hi;
     u.h3[0] = h.ls, u.h3[1] = h.hp;
   }
+  if (warpOn) warpUniform(P, n.src, u.w);
+  // binding 7: the HDR buffer, which also carries the reshaping field after the HDR grid
+  const H hb = warpOn ? n.src.warp : (hdrOn ? n.lut.hdr : n.lut.tone);
   if (localOn) {
     r.g.dispatch("point_local", p,
                  {GpuGraph::R(n.src.img), GpuGraph::R(n.lut.tone), GpuGraph::R(n.lut.lat), GpuGraph::R(n.lut.lat2), GpuGraph::W(D),
-                  n.ep.last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8)), GpuGraph::R(hdrOn ? n.lut.hdr : n.lut.tone),
+                  n.ep.last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8)), GpuGraph::R(hb),
                   GpuGraph::R(n.ldesc), GpuGraph::R(n.lplanes), localW ? GpuGraph::W(n.aux0) : GpuGraph::R(r.dummy(kF16)),
                   localW ? GpuGraph::W(n.aux1) : GpuGraph::R(r.dummy(kF16))},
                  r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
@@ -75,7 +80,7 @@ bool recordPoint(GpuRecorder& r, const PointNode& n, H D) {
   }
   r.g.dispatch("point", p,
                {GpuGraph::R(n.src.img), GpuGraph::R(n.lut.tone), GpuGraph::R(n.lut.lat), GpuGraph::R(n.lut.lat2), GpuGraph::W(D),
-                n.ep.last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8)), GpuGraph::R(hdrOn ? n.lut.hdr : n.lut.tone)},
+                n.ep.last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8)), GpuGraph::R(hb)},
                r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
   return true;
 }

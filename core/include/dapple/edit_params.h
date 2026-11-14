@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "dapple/local_adjust.h"
+#include "dapple/reshape.h"
 #include "dapple/modern.h"
 #include "dapple/result.h"
 
@@ -156,6 +157,10 @@ struct EditParams {
   // Local adjustments through masks (dapple/local_adjust.h, docs/engine/pipeline-architecture.md section 40): JSON key "local".
   // Ignored by the old Renderer (DAPPLE_ENGINE=off).
   std::vector<LocalAdjustment> local;
+
+  // Portrait reshaping (dapple/reshape.h, docs/engine/pipeline-architecture.md section 45): JSON key "reshape". A geometric warp folded
+  // into the geometry fetch. Ignored by the old Renderer (DAPPLE_ENGINE=off).
+  ReshapeParams reshape;
 
   // Brings every value into its legal range (NaN -> default, unknown crop -> "orig", rotate to a
   // multiple of 90, unknown look -> "std"). toJson/fromJson and the renderer call it.

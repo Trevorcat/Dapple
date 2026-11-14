@@ -24,6 +24,7 @@
 #include "engine/nodes/film/film_nodes.h"
 #include "frame_kernels.h"
 #include "local_eval.h"
+#include "warp_field.h"
 #include "spatial.h"
 
 namespace dapple {
@@ -413,6 +414,41 @@ void sampleCubicWin(const ImageF& win, int ox, int oy, int W, int H, float x, fl
     float acc[3] = {0.f, 0.f, 0.f};
     for (int i = 0; i < 4; ++i) {
       const float* px = row + 3 * (std::clamp(ix - 1 + i, 0, W - 1) - ox);
+      acc[0] += wx[i] * px[0];
+      acc[1] += wx[i] * px[1];
+      acc[2] += wx[i] * px[2];
+    }
+    for (int c = 0; c < 3; ++c) out[c] += wy[j] * acc[c];
+  }
+  for (int c = 0; c < 3; ++c) out[c] = std::max(0.f, out[c]);
+}
+
+// Lanczos-3 sample (6 x 6 taps, normalised weights, clamped to the picture's edges, >= 0) of a window of a W x H picture (window pixel (0, 0) =
+// picture pixel (ox, oy); the whole picture: ox = oy = 0). The reads of the portrait reshaping field (section 45). Twin: warp_lanczos.glsl.
+inline float lanczos3w(float d) {
+  if (std::fabs(d) < 1e-6f) return 1.f;
+  if (std::fabs(d) >= 3.f) return 0.f;
+  const float a = 3.14159265f * d;
+  return 3.f * std::sin(a) * std::sin(a * (1.f / 3.f)) / (a * a);
+}
+void sampleLanczos3(const ImageF& img, int ox, int oy, int W, int H, float x, float y, float out[3]) {
+  x -= 0.5f;
+  y -= 0.5f;
+  const float fxl = std::floor(x), fyl = std::floor(y);
+  const int ix = int(fxl), iy = int(fyl);
+  const float tx = x - fxl, ty = y - fyl;
+  float wx[6], wy[6], sx = 0.f, sy = 0.f;
+  for (int k = 0; k < 6; ++k) {
+    wx[k] = lanczos3w(float(k - 2) - tx), wy[k] = lanczos3w(float(k - 2) - ty);
+    sx += wx[k], sy += wy[k];
+  }
+  for (int k = 0; k < 6; ++k) wx[k] /= sx, wy[k] /= sy;
+  out[0] = out[1] = out[2] = 0.f;
+  for (int j = 0; j < 6; ++j) {
+    const float* row = img.row(std::clamp(iy - 2 + j, 0, H - 1) - oy);
+    float acc[3] = {0.f, 0.f, 0.f};
+    for (int i = 0; i < 6; ++i) {
+      const float* px = row + 3 * (std::clamp(ix - 2 + i, 0, W - 1) - ox);
       acc[0] += wx[i] * px[0];
       acc[1] += wx[i] * px[1];
       acc[2] += wx[i] * px[2];
@@ -2008,6 +2044,9 @@ struct FrameKernels::Impl {
   int winX = 0, winY = 0;
   std::function<bool(int, int, int, int)> sourceFn;              // streaming export: asks for the source window of a rect (setSourceProvider)
   std::unique_ptr<engine::filmnode::FilmBands> filmBands;       // streaming export: the film in bands (filmStreamBegin)
+  std::shared_ptr<const warp::Field> wf;  // portrait reshaping (section 45): the backward field, null = none
+  warp::Map wm;
+  int wpad = 0;                           // source pixels the field can move a read
 
   Impl(const Renderer& rr, const SourceImage& src, const BakedLut* lut, const FastOptions& o)
       : r(rr), source(src), in(src.linear), lutp(lut), exact(lut == nullptr), opt(o) {
@@ -2044,7 +2083,17 @@ struct FrameKernels::Impl {
       sp.scale = (sp.scale > 0.f ? sp.scale : float(std::max(d.w, d.h)) / 2048.f) * k;
     }
     vig = r.p_.vignette / 100.f;
-    useGeo = geo.active || region;
+    if (r.p_.reshape.active()) {
+      // the field lives in the photo's normalised space: a region window samples it in its parent's coordinates (docs section 44)
+      const bool par = source.parent && source.parent->fullW > 0 && source.parent->fullH > 0;
+      const int PW = par ? source.parent->fullW : in.width, PH = par ? source.parent->fullH : in.height;
+      wf = warp::bind(r.p_.reshape, PW, PH, !exact && opt.spatial == SpatialQuality::Interactive);
+      if (wf) {
+        wm = warp::makeMap(*wf, in.width, in.height, PW, PH, par ? source.parent->x0 : 0, par ? source.parent->y0 : 0);
+        wpad = int(std::ceil(wf->maxDisp * wm.lpx)) + 1;
+      }
+    }
+    useGeo = geo.active || region || wf != nullptr;
     exactMap = geo.exact && !region;
     if (effectiveHdr(r.p_) > 0.f) {
       std::vector<float> exactTone;
@@ -2069,6 +2118,7 @@ struct FrameKernels::Impl {
     const float fx = d.ox0 + (float(x) + 0.5f) * d.stepX, fy = d.oy0 + (float(y) + 0.5f) * d.stepY;
     float sx, sy;
     geo.mapF(fx, fy, sx, sy);
+    if (wf) warp::displace(*wf, wm, sx, sy);
     u = sx / float(in.width);
     v = sy / float(in.height);
   }
@@ -2082,10 +2132,15 @@ struct FrameKernels::Impl {
     const float fx = d.ox0 + (float(x) + 0.5f) * d.stepX, fy = d.oy0 + (float(y) + 0.5f) * d.stepY;
     float sx, sy;
     geo.mapF(fx, fy, sx, sy);
-    if (exactMap) {
+    const bool moved = wf && warp::displace(*wf, wm, sx, sy);  // reshaping: resampled where the field moves the read, exact elsewhere
+    if (exactMap && !moved) {
       const int iy = std::clamp(int(std::floor(sy)), 0, in.height - 1), ix = std::clamp(int(std::floor(sx)), 0, in.width - 1);
       const float* px = win ? win->row(iy - winY) + 3 * (ix - winX) : in.row(iy) + 3 * ix;
       v[0] = px[0], v[1] = px[1], v[2] = px[2];
+    } else if (moved) {
+      // a read moved by the reshaping field: Lanczos-3 (sharper than the geometry's Catmull-Rom, which softens a sub-pixel shift; section 45)
+      if (win) sampleLanczos3(*win, winX, winY, in.width, in.height, sx, sy, v);
+      else sampleLanczos3(in, 0, 0, in.width, in.height, sx, sy, v);
     } else if (win) {
       sampleCubicWin(*win, winX, winY, in.width, in.height, sx, sy, v);
     } else {
@@ -2149,6 +2204,11 @@ FramePlan FrameKernels::framePlan() const {
   fp.spatialScale = spatialScale();
   fp.local = m.local;
   fp.localDetail = m.local && m.local->anyWindow;
+  if (m.wf) {
+    fp.warp.field = m.wf;
+    fp.warp.ax = m.wm.ax, fp.warp.bx = m.wm.bx, fp.warp.ay = m.wm.ay, fp.warp.by = m.wm.by, fp.warp.lpx = m.wm.lpx;
+    fp.warp.pad = m.wpad;
+  }
   return fp;
 }
 
@@ -2195,7 +2255,8 @@ void FrameKernels::sourceRect(int x0, int y0, int x1, int y1, int& sx0, int& sy0
       m.geo.mapF(fx, fy, sx, sy);
       lx = std::min(lx, sx), hx = std::max(hx, sx), ly = std::min(ly, sy), hy = std::max(hy, sy);
     }
-  const int g = m.exactMap ? 2 : 4;  // the nearest pixel / the 4 x 4 Catmull-Rom taps, and a pixel of float slack
+  // the nearest pixel / the 4 x 4 Catmull-Rom taps, and a pixel of float slack; a reshaping field moves reads by up to wpad pixels
+  const int g = m.wf ? 6 + m.wpad : (m.exactMap ? 2 : 4);  // Lanczos-3 reads 3 px either side
   sx0 = std::clamp(int(std::floor(lx)) - g, 0, W), sx1 = std::clamp(int(std::ceil(hx)) + g, 0, W);
   sy0 = std::clamp(int(std::floor(ly)) - g, 0, H), sy1 = std::clamp(int(std::ceil(hy)) + g, 0, H);
 }
@@ -2338,7 +2399,7 @@ bool FrameKernels::streamFilm(std::uint8_t* rgba) {
     for (int x = 0; x < w; ++x) m.fetchPixel(x, y, row + 3 * x);
   };
   auto fetchTramp = [](void* u, int y, float* row) { (*static_cast<decltype(fetchRowFn)*>(u))(y, row); };
-  const bool resampled = m.geo.active || m.region;
+  const bool resampled = m.useGeo;  // geometry, region or a reshaping field
   return lease->renderRows(m.in, w, h, gainEv, resampled ? fetchTramp : nullptr, &fetchRowFn, tramp, &sink);
 }
 

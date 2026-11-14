@@ -153,19 +153,28 @@ inline bool setAffinity(const std::vector<int>& cpus) {
 inline thread_local int g_class = 0;  // 0 normal, 1 interactive, 2 background
 inline bool inBackground() { return g_class == 2; }
 
-inline void setBackground(bool on) {
+inline thread_local bool g_bgPinned = false;  // the background class of this thread lowered its priority / cores (setBackground with pin = true)
+
+// pin = false: the work is background work for the pools (ThreadPool::run sends it to the background pool, whose workers stop taking chunks while a finger
+// is down) but the calling thread keeps its priority and every core: for a frame the user is waiting for while no finger is on a control (the zoomed detail
+// after a finger-up: on the Note10+ a 1971 x 2464 detail frame took 325 ms on the efficiency cores at nice 10 against 117 ms unpinned, GPU executor).
+inline void setBackground(bool on, bool pin = true) {
   const int was = g_class;
+  const bool wasPinned = g_bgPinned;
   (void)was;
+  (void)wasPinned;
   g_class = on ? 2 : 0;
+  if (on && was == 2) return;  // already background: keep the current pinning
+  g_bgPinned = on && pin;
 #if defined(__APPLE__)
-  ::pthread_set_qos_class_self_np(on ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED, 0);
+  if (on ? pin : wasPinned) ::pthread_set_qos_class_self_np(on ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED, 0);
 #endif
 #ifdef DAPPLE_SYSPERF_LINUX
   const Topology& t = topology();
-  if (on && was != 2) {
+  if (on && pin) {
     ::setpriority(PRIO_PROCESS, gettid_() , 10);
     if (t.hetero()) setAffinity(t.efficient);
-  } else if (!on && was == 2) {
+  } else if (!on && was == 2 && wasPinned) {
     ::setpriority(PRIO_PROCESS, gettid_(), 0);  // may be refused (RLIMIT_NICE); the thread then stays nice
     std::vector<int> all;
     for (int i = 0; i < t.total; ++i) all.push_back(i);

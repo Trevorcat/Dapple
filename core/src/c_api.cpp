@@ -44,6 +44,7 @@
 #include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
 #include "frame_kernels.h"
 #include "local_eval.h"
+#include "warp_field.h"
 #include "ai_masks.h"
 #include "engine/nodes/film/film_async.h"
 #include "engine/nodes/film/frame_trace.h"
@@ -1138,12 +1139,30 @@ int32_t dapple_session_map_point(DappleSession* s, const char* params_json, int3
         EditParams params;
         if (!parseParams(params_json, params)) return DAPPLE_ERROR;
         params.local.clear();
+        // portrait reshaping (section 45): the geometry part is affine; the field is applied on the photo side of it
+        const ReshapeParams reshape = params.reshape;
+        params.reshape = ReshapeParams{};
         std::lock_guard<std::mutex> lk(s->mtx);
         MaskView mv;
         if (!maskView(s, params, long_edge, mv)) {
           setError("map point: no source");
           return DAPPLE_ERROR;
         }
+        std::shared_ptr<const warp::Field> wf;
+        if (reshape.active()) {
+          const bool par = mv.src->parent && mv.src->parent->fullW > 0 && mv.src->parent->fullH > 0;
+          wf = warp::bind(reshape, par ? mv.src->parent->fullW : mv.src->linear.width, par ? mv.src->parent->fullH : mv.src->linear.height, false);
+        }
+        // a region window's (u, v) are fractions of the window; the field is in the parent's
+        const bool par = wf && mv.src->parent && mv.src->parent->fullW > 0;
+        const double rkx = par ? double(mv.src->linear.width) / mv.src->parent->fullW : 1.0, rbx = par ? double(mv.src->parent->x0) / mv.src->parent->fullW : 0.0;
+        const double rky = par ? double(mv.src->linear.height) / mv.src->parent->fullH : 1.0, rby = par ? double(mv.src->parent->y0) / mv.src->parent->fullH : 0.0;
+        auto fieldMap = [&](bool fwd, double iu, double iv, double& ou, double& ov) {
+          double pu = iu * rkx + rbx, pv = iv * rky + rby;
+          if (fwd) warp::forwardUV(*wf, pu, pv, pu, pv);
+          else warp::backwardUV(*wf, pu, pv, pu, pv);
+          ou = (pu - rbx) / rkx, ov = (pv - rby) / rky;
+        };
         // the frame -> photo mapping is affine (rotate 90, straighten, flip, crop): from three probes of srcUV at pixel centres
         float u0, v0, ux, vx, uy, vy;
         mv.fk->srcUV(0, 0, u0, v0);
@@ -1151,15 +1170,19 @@ int32_t dapple_session_map_point(DappleSession* s, const char* params_json, int3
         mv.fk->srcUV(0, 1, uy, vy);
         const double a = ux - u0, b = uy - u0, c = vx - v0, d = vy - v0;  // (u, v) = (u0, v0) + [a b; c d] (px - 0.5, py - 0.5)
         if (direction == 0) {
-          *u = float(u0 + a * (x - 0.5) + b * (y - 0.5));
-          *v = float(v0 + c * (x - 0.5) + d * (y - 0.5));
+          double pu = u0 + a * (x - 0.5) + b * (y - 0.5), pv = v0 + c * (x - 0.5) + d * (y - 0.5);
+          if (wf) fieldMap(false, pu, pv, pu, pv);  // the content shown there comes from here
+          *u = float(pu);
+          *v = float(pv);
         } else {
           const double det = a * d - b * c;
           if (std::fabs(det) < 1e-20) {
             setError("map point: degenerate geometry");
             return DAPPLE_ERROR;
           }
-          const double du = x - u0, dv = y - v0;
+          double px = x, py = y;
+          if (wf) fieldMap(true, x, y, px, py);  // where the photo point is shown after the reshaping
+          const double du = px - u0, dv = py - v0;
           *u = float((d * du - b * dv) / det + 0.5);
           *v = float((-c * du + a * dv) / det + 0.5);
         }
@@ -1234,6 +1257,8 @@ std::vector<std::string> localRasterIds(const EditParams& p) {
     for (const MaskComponent& m : a.mask)
       if (m.kind == MaskKind::Raster && !m.ref.empty() && std::find(ids.begin(), ids.end(), m.ref) == ids.end()) ids.push_back(m.ref);
   }
+  // the person plane of the reshaping's background protection (section 45) obeys the same rule
+  if (p.reshape.active() && !p.reshape.matte.empty() && std::find(ids.begin(), ids.end(), p.reshape.matte) == ids.end()) ids.push_back(p.reshape.matte);
   return ids;
 }
 std::vector<std::string> missingRasterIds(const EditParams& p) {
@@ -2112,8 +2137,10 @@ int32_t dapple_session_render_frame(DappleSession* session, const char* params_j
         }
         bool ok = false;
         if (rq.flags & DAPPLE_FRAME_BACKGROUND) {
-          // low priority work (detail session...): this thread, efficiency cores, never the shared pool
-          sys::setBackground(true);
+          // low priority work (detail session...): this thread, never the shared pool (the background pool while no finger is down). Efficiency cores and
+          // nice 10 only while a finger is on a control: with no finger down the frame is the sharp picture the user is waiting for (the zoomed detail after
+          // a finger-up), 3x slower on the efficiency cores of a Note10+ (sysperf.h setBackground).
+          sys::setBackground(true, sys::interacting());
           try {
             ok = renderFrame(session, params_json, lut_path, rq, out, analysis_json);
           } catch (...) {

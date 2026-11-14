@@ -8,6 +8,7 @@
 #include <numeric>
 
 #include "ai_masks.h"
+#include "dapple/reshape.h"
 
 namespace dapple::aimask {
 
@@ -259,6 +260,7 @@ bool faceFeatures(const FaceMesh& m, int w, int h, const std::uint8_t* rgb, int 
   out.yawDeg = std::asin(std::clamp(dz / std::max(dist3, 1e-6f), -1.f, 1.f)) * 57.29578f;
   out.frontal = std::fabs(out.yawDeg) < kFrontalYawDeg;
   out.face = polygonPlane(w, h, {ring(m, kFaceOval)}, std::max(0.8f, 0.012f * faceW));
+  for (int k = 0; k < kReshapeFacePts; ++k) out.shape[k][0] = m.xy[kReshapeFaceMesh[k]][0], out.shape[k][1] = m.xy[kReshapeFaceMesh[k]][1];
   const float gap = std::hypot(m.xy[13][0] - m.xy[14][0], m.xy[13][1] - m.xy[14][1]);
   const float width = std::max(1e-3f, std::hypot(m.xy[78][0] - m.xy[308][0], m.xy[78][1] - m.xy[308][1]));
   out.mouthOpen = gap / width;
@@ -369,6 +371,12 @@ std::string facesMetaJson(const std::vector<FaceFeatures>& faces, int w, int h) 
     j += b;
     const std::vector<std::string> keys = faceFeatureKeys(f);
     for (std::size_t k = 0; k < keys.size(); ++k) j += (k ? ",\"" : "\"") + keys[k] + "\"";
+    j += "],\"shape\":[";  // the reshaping anchors (section 45), photo normalised
+    for (int k = 0; k < kReshapeFacePts; ++k) {
+      char s[48];
+      std::snprintf(s, sizeof s, k ? ",%.5f,%.5f" : "%.5f,%.5f", f.shape[k][0] / W, f.shape[k][1] / H);
+      j += s;
+    }
     j += "]}";
   }
   return j + "]}";

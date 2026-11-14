@@ -68,7 +68,8 @@ struct SpotPx {
   int ox = 0, oy = 0, stride = 1;
 };
 // The spots whose disc touches the window (wx, wy, ww, wh) of the frame, in window coordinates, in composition order.
-void spotsForWindow(const Frame& f, const Affine& A, int wx, int wy, int ww, int wh, std::vector<SpotPx>& out);
+// `warp` (portrait reshaping, section 45): the spots follow the reshaped picture (centre and source forward-mapped through the field).
+void spotsForWindow(const Frame& f, const Affine& A, int wx, int wy, int ww, int wh, std::vector<SpotPx>& out, const warp::Field* warp = nullptr);
 // Heal pass: every spot fills its disc with the source patch plus a smooth correction fitted on a ring (reads the input only).
 void healWindow(const std::vector<SpotPx>& spots, ImageF& img);
 // The shared retouch planes of a window: L_f (full resolution), the guided coefficients of L_c and the skin reference S (1/4 grid).

@@ -15,6 +15,7 @@
 
 #include "engine/exec/cpu_executor.h"
 #include "local_eval.h"
+#include "warp_field.h"
 #include "engine/plan/plan.h"
 
 namespace dapple::engine::filmnode {
@@ -192,6 +193,23 @@ void localRequest(PlanRequest& rq, const local::Frame* lf) {
 void bindLocal(FramePlan& fp, const Renderer& r, const SourceImage& src, bool interactive) {
   if (src.parent && src.parent->fullW > 0 && src.parent->fullH > 0 && fp.srcW > 0 && fp.srcH > 0)  // a region source (docs section 44): radii are fractions of the parent picture
     fp.spatialScale *= float(std::max(src.parent->fullW, src.parent->fullH)) / float(std::max(fp.srcW, fp.srcH));
+  if (r.params().reshape.active() && fp.srcW > 0 && fp.srcH > 0 && !src.linear.empty()) {
+    // portrait reshaping (section 45): the field of the photo, mapped to the plan's source pixels (the store may be a resized copy of `src`)
+    const bool par = src.parent && src.parent->fullW > 0 && src.parent->fullH > 0;
+    const int PW = par ? src.parent->fullW : src.linear.width, PH = par ? src.parent->fullH : src.linear.height;
+    fp.warp.field = warp::bind(r.params().reshape, PW, PH, interactive);
+    if (fp.warp.field) {
+      const warp::Field& f = *fp.warp.field;
+      const float kx = float(src.linear.width) / float(fp.srcW), ky = float(src.linear.height) / float(fp.srcH);  // source px of `src` per plan px
+      fp.warp.ax = float(f.gw - 1) / float(PW) * kx;
+      fp.warp.bx = float(par ? src.parent->x0 : 0) * float(f.gw - 1) / float(PW);
+      fp.warp.ay = float(f.gh - 1) / float(PH) * ky;
+      fp.warp.by = float(par ? src.parent->y0 : 0) * float(f.gh - 1) / float(PH);
+      fp.warp.lpx = float(std::max(PW, PH)) / kx;
+      fp.warp.pad = int(std::ceil(f.maxDisp * fp.warp.lpx)) + 1;
+      fp.useGeo = true;
+    }
+  }
   if (r.params().local.empty()) return;
   fp.local = local::bind(r.params().local, src, interactive);
   fp.localDetail = fp.local && fp.local->anyWindow;

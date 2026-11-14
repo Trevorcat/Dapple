@@ -217,3 +217,13 @@ SpatialRadii spatialRadii(const FramePlan& P, float resizeSharpen) {
 }
 
 }  // namespace dapple::engine::gpu
+
+#include "warp_field.h"
+namespace dapple::engine::gpu {
+void warpUniform(const FramePlan& P, const SourceBind& s, WarpU& u) {
+  const warp::Field& f = *P.warp.field;
+  u.wI[0] = f.gw, u.wI[1] = f.gh, u.wI[2] = s.warpOff, u.wI[3] = 0;
+  u.wB[0] = P.warp.ax, u.wB[1] = P.warp.bx, u.wB[2] = P.warp.ay, u.wB[3] = P.warp.by;
+  u.wC[0] = P.warp.lpx, u.wC[1] = u.wC[2] = u.wC[3] = 0.f;
+}
+}  // namespace dapple::engine::gpu

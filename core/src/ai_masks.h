@@ -67,6 +67,7 @@ struct FaceFeatures {
   float cx = 0, cy = 0;   // midpoint of the iris centres, pixels
   Plane undereye;         // frontal faces only: the crescent below each eye (portrait retouch, docs/engine/pipeline-architecture.md 43.4)
   float iod = 0;          // inter-ocular distance (iris centres 468 / 473), pixels of the input image
+  float shape[54][2] = {};  // portrait reshaping anchors (dapple/reshape.h kReshapeFaceMesh order), pixels of the input image (section 45)
 };
 // The under-eye crescents of a face (docs section 43.4), eyes = the lid-opening plane it is clipped by (may be empty).
 Plane underEyePlane(const FaceMesh& m, int w, int h, const Plane& eyes);
@@ -127,7 +128,7 @@ ParsedId parseId(const std::string& id);
 std::string makeId(const std::string& photo, const std::string& key);
 
 // ---- cache files ----------------------------------------------------------------------------------------------------------------------
-constexpr int kEpoch = 6;  // algorithm version: bump when a builder changes (old cache files are then misses)
+constexpr int kEpoch = 7;  // algorithm version: bump when a builder changes (old cache files are then misses)
 struct SetEntry {
   std::string key;  // "hair", "f1:lips" ...
   Plane plane;

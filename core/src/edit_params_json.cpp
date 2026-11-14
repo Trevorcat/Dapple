@@ -11,6 +11,7 @@
 #include "edit_params_fields.h"
 #include "json_value.h"
 #include "local_eval.h"
+#include "warp_field.h"
 
 namespace dapple {
 
@@ -128,6 +129,7 @@ Result<EditParams> fromJson(const std::string& json) {
   readCurveJson(root, "toneCurveGreen", p.toneCurveGreen);
   readCurveJson(root, "toneCurveBlue", p.toneCurveBlue);
   if (const JValue* lv = root.get("local")) localFromValue(*lv, p.local);
+  if (const JValue* rv = root.get("reshape")) reshapeFromValue(*rv, p.reshape);
   p.clamp();
   return p;
 }

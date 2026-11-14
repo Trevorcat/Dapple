@@ -38,7 +38,7 @@ Everything in this table is purely classical given a good skin mask. The only ne
 - InsightFace: code MIT, but the pretrained models and their training data are "non-commercial research purposes only", and downloading via the Python library follows the same policy; commercial licences are by contact (updated 2025-11-24) [V: https://github.com/deepinsight/insightface]. Reject.
 - dlib: code Boost licence [U]; the stock 68-point shape predictor was trained on iBUG 300-W data whose terms are non-commercial [U]. Reject.
 - Eye / teeth whitening, eye enhancement: whitening = reduce chroma and yellow (b) in the sclera or teeth mask, raise L a little, clamp so the result never goes paper-white; iris clarity = modest local contrast and exposure in the iris mask; leave catchlights alone (protect pixels brighter than a threshold). Lip colour = a/b shift or hue-preserving saturation in the lip mask. Brow = density/contrast in the brow polygon. All classical.
-- Liquify-style reshaping (slim face, big eyes): optional, NOT requested by the owner, and mostly a beauty-app feature. If ever added, make it manual only (user brush or per-slider), never automatic, default zero. Landmarks make it technically easy (mesh warp), so the risk is UX, not engineering.
+- Liquify-style reshaping (slim face, big eyes): requested later (2026-11-14), see `portrait-reshape.md` and engine section 45 (manual, default zero, as recommended here). Original note: optional, NOT requested by the owner, and mostly a beauty-app feature. If ever added, make it manual only (user brush or per-slider), never automatic, default zero. Landmarks make it technically easy (mesh warp), so the risk is UX, not engineering.
 
 ### 1c. Relighting and background
 

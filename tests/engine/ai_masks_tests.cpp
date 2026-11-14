@@ -408,7 +408,7 @@ static void testMouth() {
   CHECK(faceFeatures(syntheticMesh(14.f, 200.f), W, H, nullptr, 0, fd) && fd.mouth.empty());  // turned head: no mouth plane
   const ParsedId pid = parseId(makeId("00000000000000a1", "f2:mouth"));
   CHECK(pid.ok && pid.group == "faces" && pid.face == 2 && pid.feature == "mouth");
-  CHECK(kEpoch == 6);
+  CHECK(kEpoch == 7);  // 7: the faces meta carries the reshaping anchors (section 45)
 }
 
 // a mesh whose unused points sit at the face centre and with iris centres (468 / 473), as a real mesh has

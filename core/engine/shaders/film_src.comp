@@ -4,6 +4,7 @@
 #extension GL_GOOGLE_include_directive : enable
 layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
 layout(constant_id = 0) const int GEO = 2;  // 1 exact index mapping, 2 Catmull-Rom
+layout(constant_id = 4) const bool WARP = false;  // portrait reshaping field (warp.glsl, binding 3)
 
 layout(std140, binding = 0) uniform P {
   ivec4 a;      // srcW, srcH (full source space), dW, dH
@@ -12,10 +13,16 @@ layout(std140, binding = 0) uniform P {
   vec4 geoB;    // ox0, oy0, stepX, stepY
   vec4 geoC;    // fullW, fullH, 0, 0
   ivec4 c;      // rot, flip, 0, 0
+  ivec4 wI;
+  vec4 wB;
+  vec4 wC;
 } u;
 
 layout(binding = 1) uniform sampler2D uSrc;
 layout(binding = 2, rgba32f) uniform writeonly image2D uOut;
+layout(binding = 3, std430) readonly buffer Warp { float wg[]; };
+#define WARP_AT(i) wg[i]
+#include "warp.glsl"
 
 vec3 srcAt(int x, int y) {
   return texelFetch(uSrc, ivec2(clamp(x, 0, u.a.x - 1), clamp(y, 0, u.a.y - 1)) - u.b.xy, 0).rgb;
@@ -27,6 +34,7 @@ void cubicW(float t, out float w[4]) {
   w[2] = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
   w[3] = 0.5 * t3 - 0.5 * t2;
 }
+#include "warp_lanczos.glsl"
 vec3 sampleCubic(float x, float y) {
   x -= 0.5;
   y -= 0.5;
@@ -62,7 +70,10 @@ void main() {
   else if (u.c.x == 2) { sx = sW - fx; sy = sH - fy; }
   else { sx = sW - fy; sy = fx; }
   vec3 v;
-  if (GEO == 1) v = srcAt(int(floor(sx)), int(floor(sy)));
+  bool moved = false;
+  if (WARP) moved = warpDisplace(sx, sy);
+  if (GEO == 1 && !moved) v = srcAt(int(floor(sx)), int(floor(sy)));
+  else if (moved) v = sampleLanczos3(sx, sy);
   else v = sampleCubic(sx, sy);
   imageStore(uOut, p, vec4(v, 1.0));
 }

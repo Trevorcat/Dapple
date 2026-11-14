@@ -389,6 +389,7 @@ static void syntheticImpl(int W, int H, int tile, bool xtrans, int flip, const c
                      {"geo", R"({"crop":"4:3","rot":90,"straighten":7.5})"},
                      {"vignette", R"({"vignette":-60})"},
                      {"local", kLocal},
+                     {"reshape", R"({"crop":"4:3","straighten":3,"reshape":{"push":[{"r":0.08,"pts":[0.4,0.5,0.46,0.53]},{"r":0.05,"pts":[0.6,0.3,0.6,0.36]}]}})"},
                      {"p3", R"({"saturation":40,"outputSpace":1})"}};
   for (const C& c : cases) {
     if (only && !std::strstr(only, c.id)) continue;  // a comma list of the cases to run (default: all)
@@ -426,7 +427,7 @@ static void testSynthetic() { syntheticImpl(6000, 4000, 512, false, 0); }
 // The long edge stays above 512: below it the streamed analysis has no 512 px copy and the HDR / modern stage dereferences the empty virtual source (a
 // defect found by this twin, see the report). Two ids so that the two layouts run side by side.
 static void testSyntheticSmall() {
-  syntheticImpl(520, 192, 48, false, 0, "std,modern,hdr,detail,geo,local,p3");
+  syntheticImpl(520, 192, 48, false, 0, "std,modern,hdr,detail,geo,local,reshape,p3");
   syntheticImpl(192, 520, 48, false, 6, "std,geo");
 }
 static void testSyntheticXtSmall() {

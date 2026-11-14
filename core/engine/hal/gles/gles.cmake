@@ -107,7 +107,7 @@ foreach(_entry ${DAPPLE_GPU_SHADERS})
     # ES rule lint: the generated ESSL must be accepted by glslang as #version 310 es
     COMMAND "${DAPPLE_GLSLC}" -std=310es --target-env=opengl -fshader-stage=compute -c "${_gen}/${_name}.essl" -o "${_gen}/${_name}.lint.spv"
     COMMAND ${CMAKE_COMMAND} -E touch "${_stamp}"
-    DEPENDS "${DAPPLE_SHADER_DIR}/${_src}" "${DAPPLE_SHADER_DIR}/common.glsl" "${DAPPLE_SHADER_DIR}/local.glsl" ${_shaderc_dep} "${_shaderc}"
+    DEPENDS "${DAPPLE_SHADER_DIR}/${_src}" "${DAPPLE_SHADER_DIR}/common.glsl" "${DAPPLE_SHADER_DIR}/local.glsl" "${DAPPLE_SHADER_DIR}/warp.glsl" "${DAPPLE_SHADER_DIR}/warp_lanczos.glsl" ${_shaderc_dep} "${_shaderc}"
     COMMENT "ESSL ${_name} (${_src})" VERBATIM)
   list(APPEND _stamps "${_stamp}")
   string(APPEND _incs "#include \"${_name}_gles.h\"\n")

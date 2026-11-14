@@ -51,7 +51,16 @@ void grainArgs(const FramePlan& P, float& amp, float& period);
 struct SourceBind {
   H img = -1;
   int ox = 0, oy = 0;
+  // portrait reshaping (section 45): the buffer that holds the field (the HDR buffer: field after the HDR grid) and its float offset
+  H warp = -1;
+  int warpOff = 0;
 };
+// Uniform block tail of the shaders that include warp.glsl
+struct WarpU {
+  std::int32_t wI[4];
+  float wB[4], wC[4];
+};
+void warpUniform(const FramePlan& P, const SourceBind& s, WarpU& u);
 struct LutBind {
   H tone = -1, lat = -1, lat2 = -1;
   H hdr = -1;  // single-image HDR field (SSBO), -1 = none

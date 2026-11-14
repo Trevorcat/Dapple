@@ -7,6 +7,8 @@ add_library(dapple_core STATIC
   src/local_adjust.cpp
   src/local_eval.cpp
   src/local_retouch.cpp
+  src/reshape.cpp
+  src/warp_field.cpp
   src/ai_masks.cpp
   src/ai_masks_build.cpp
   src/ai_masks_sky.cpp

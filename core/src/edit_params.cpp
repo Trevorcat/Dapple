@@ -146,6 +146,7 @@ void EditParams::clamp() {
   rotate = ((rotate % 360) + 360) % 360;
   rotate = (rotate + 45) / 90 * 90 % 360;
   clampLocal(local);
+  clampReshape(reshape);
 }
 
 EditParams& EditParams::operator+=(const EditParams& d) {
@@ -183,6 +184,7 @@ EditParams& EditParams::operator+=(const EditParams& d) {
     local.insert(local.end(), d.local.begin(), d.local.end());
     clampLocal(local);
   }
+  if (!d.reshape.empty()) reshape = d.reshape;  // a reshaping is per photo: the delta's wins
   return *this;
 }
 
@@ -234,6 +236,10 @@ std::string writeJson(const EditParams& p, bool diffOnly) {
   if (!p.local.empty()) {
     o << ((first && cs.empty()) ? "\n  " : ",\n  ");
     o << "\"local\": " << localToJson(p.local);
+  }
+  if (!p.reshape.empty()) {
+    o << ((first && cs.empty() && p.local.empty()) ? "\n  " : ",\n  ");
+    o << "\"reshape\": " << reshapeToJson(p.reshape);
   }
   o << "\n}\n";
   return o.str();

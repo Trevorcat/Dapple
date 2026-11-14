@@ -526,7 +526,11 @@ class _IconPainter extends CustomPainter {
         canvas.drawPath(poly([22.5, 14, 20, 15.5, 22.5, 17]), line);
         break;
       case DI.smallFace:
-        canvas.drawOval(Rect.fromCenter(center: const Offset(12, 12), width: 18, height: 21), soft..color = color.withValues(alpha: 0.25));
+        // the face before (thin) and after (smaller, full line)
+        canvas.drawOval(Rect.fromCenter(center: const Offset(12, 12), width: 18, height: 21), Paint()
+          ..color = color.withValues(alpha: 0.45)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = stroke * 0.6);
         canvas.drawOval(Rect.fromCenter(center: const Offset(12, 12.5), width: 11, height: 13.5), line);
         break;
       case DI.chin:

@@ -99,7 +99,7 @@ foreach(_entry ${DAPPLE_GPU_SHADERS})
             "${_SH}/${_src}" -o "${_spv}"
     COMMAND ${CMAKE_COMMAND} -DSPV=${_spv} -DOUT=${_h} -DNAME=g_${_name}_spv
             -P "${_SH}/cmake/embed_spv.cmake"
-    DEPENDS "${_SH}/${_src}" "${_SH}/common.glsl" "${_SH}/local.glsl"
+    DEPENDS "${_SH}/${_src}" "${_SH}/common.glsl" "${_SH}/local.glsl" "${_SH}/warp.glsl" "${_SH}/warp_lanczos.glsl"
             "${_SH}/cmake/embed_spv.cmake"
     COMMENT "glslc ${_name} (${_src})")
   list(APPEND _spv_headers "${_h}")

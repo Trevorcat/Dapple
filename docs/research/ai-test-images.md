@@ -66,3 +66,16 @@ Retrieval: Commons API (`prop=imageinfo&iiprop=extmetadata`), search `incategory
 - Author (Commons field): Andrew Scheer
 - Licence line: CC0 (Creative Commons Zero, Public Domain Dedication) http://creativecommons.org/publicdomain/zero/1.0/deed.en
 - Original size: 1823x1215; credit field: https://www.flickr.com/photos/andrewscheer/44167590694/
+
+## Full-body photos for the portrait reshaping (2026-11-14, `build/ai-eval/body/`, 2048 px long edge, Commons API thumbnails)
+
+Licence lines as Wikimedia Commons reports them on 2026-11-14 (`LicenseShortName` / `UsageTerms`), chosen for straight lines behind the person. Used only as local test input (`scripts/reshape/landmarks.py`, `dapple_reshape_sheets`); not redistributed. b1 and b2 were uploaded to Commons from Pexels at a time the Pexels licence was CC0; Commons states CC0.
+
+| file | content | page | author (Commons field) | licence |
+|---|---|---|---|---|
+| b1_seated_beach | seated on a beach chair, arm raised away from the body | https://commons.wikimedia.org/wiki/File:Woman_Sitting_on_Sun_Chair_Beside_Seashore.jpg | Andrea Piacquadio | CC0 (Creative Commons Zero, Public Domain Dedication) |
+| b2_standing_parliament | standing, three-quarter body, gothic facade (many vertical lines) | https://commons.wikimedia.org/wiki/File:A.M._in_front_of_the_Hungarian_Parliament.jpg | A. M | CC0 |
+| b3_standing_hands_pockets | standing, arms against the body (hands in pockets), parking lines | https://commons.wikimedia.org/wiki/File:Ahmad_Adam.jpg | Alikamzat | CC0 |
+| b4_cadet_leaning_wall | full length, leaning, arms against the body, brick wall (black and white) | https://commons.wikimedia.org/wiki/File:Cadet_Mac_S.jpg | GP377 | CC0 |
+| b5_couple_wall | two adults holding children, full length, corrugated wall (black and white, historic) | https://commons.wikimedia.org/wiki/File:Man_and_woman_standing_in_front_of_a_building_-_both_the_man_and_woman_are_holding_a_young_child(GN04384).jpg | State Government Photographer (History Trust of South Australia) | CC0 |
+| b6_three_women_street | three women standing full length, brick facade and windows | https://commons.wikimedia.org/wiki/File:Street_photography_of_talking_and_laughing_women_in_the_street,_on_the_side_of_the_Hermitage_museum_building_in_Amsterdam;_free_photo_by_Fons_Heijnsbroek,_2007.tif | Fons Heijnsbroek | CC0 |

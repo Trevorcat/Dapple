@@ -266,6 +266,22 @@ foreach(id ${_retouch_ids})
   set_tests_properties(engine.retouch_${id} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
 endforeach()
 
+# Portrait reshaping: the warp stage and its operators (docs/engine/pipeline-architecture.md section 45).
+add_executable(dapple_reshape_tests engine/reshape_tests.cpp)
+target_link_libraries(dapple_reshape_tests PRIVATE dapple_core)
+target_include_directories(dapple_reshape_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/cli)
+set(_reshape_ids json identity bounded protect push tiles region interactive mappoint sharpness)
+if(TARGET dapple_gpu)
+  target_link_libraries(dapple_reshape_tests PRIVATE dapple_gpu)
+  target_include_directories(dapple_reshape_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src)
+  target_compile_definitions(dapple_reshape_tests PRIVATE DAPPLE_RESHAPE_GPU=1)
+  set(_reshape_ids ${_reshape_ids} parity)
+endif()
+foreach(id ${_reshape_ids})
+  add_test(NAME engine.reshape_${id} COMMAND dapple_reshape_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(engine.reshape_${id} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+endforeach()
+
 # Local adjustments through the C API (render / export / UI helpers / video cover path) and the evidence sheets. Compile the C API in, like uhdr_tests.
 set(_local_capi_srcs ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp ${PROJECT_SOURCE_DIR}/core/engine/video/video_c_api.cpp)
 foreach(_t dapple_local_capi_tests dapple_local_sheets)
@@ -317,9 +333,18 @@ set_tests_properties(local_sheets.trees local_sheets.baretree PROPERTIES TIMEOUT
 # Portrait-retouch evidence sheets (no ctest entry): from the repo root, dapple_retouch_sheets build/retouch [portrait names]
 add_executable(dapple_retouch_sheets engine/retouch_sheets.cpp ${_local_capi_srcs})
 target_link_libraries(dapple_retouch_sheets PRIVATE dapple_core dapple_stb)
+if(TARGET dapple_gpu)  # --settle runs its frames on the GPU executor with DAPPLE_GPU=1 (as the app does)
+  target_link_libraries(dapple_retouch_sheets PRIVATE dapple_gpu)
+  target_compile_definitions(dapple_retouch_sheets PRIVATE DAPPLE_RETOUCH_GPU=1)
+endif()
 target_include_directories(dapple_retouch_sheets PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/cli)
 target_compile_definitions(dapple_retouch_sheets PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
                            $<$<BOOL:${DAPPLE_FILM_AVX2}>:DAPPLE_FILM_HAVE_AVX2=1>)
+# Portrait-reshaping evidence sheets (no ctest entry): from the repo root, dapple_reshape_sheets build/reshape [names]
+add_executable(dapple_reshape_sheets engine/reshape_sheets.cpp ${_local_capi_srcs})
+target_link_libraries(dapple_reshape_sheets PRIVATE dapple_core dapple_stb)
+target_include_directories(dapple_reshape_sheets PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/cli)
+target_compile_definitions(dapple_reshape_sheets PRIVATE $<$<BOOL:${DAPPLE_FILM_AVX2}>:DAPPLE_FILM_HAVE_AVX2=1>)
 
 # Modern rendering family (filmStock = modern_*): end points, mid-grey, hue, skin window, monotone strength, tiles, GPU parity and cost.
 add_executable(dapple_modern_tests engine/modern_tests.cpp)

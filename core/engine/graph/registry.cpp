@@ -27,7 +27,7 @@ NodeRegistry::NodeRegistry() {
 
   // ---- groups of keys ------------------------------------------------------------------------------------------------
   const ParamMask FRAME = [&] {
-    ParamMask m = P.mask({"crop", "straighten", "rotate", "flip", "ctx.region", "ctx.srcSize", "ctx.outLongEdge"});
+    ParamMask m = P.mask({"crop", "straighten", "rotate", "flip", "ctx.region", "ctx.srcSize", "ctx.outLongEdge", "reshape"});
     return m;
   }();
   const ParamMask TONE = P.mask({"contrast", "highlights", "shadows", "whites", "blacks"});

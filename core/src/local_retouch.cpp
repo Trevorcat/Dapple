@@ -18,6 +18,7 @@
 #include <string>
 
 #include "parallel.h"
+#include "warp_field.h"
 
 namespace dapple::local {
 
@@ -499,13 +500,21 @@ int healHalo(const Frame& f, float ppu) {
   return f.spots.empty() ? 0 : int(std::ceil(h)) + 2;
 }
 
-void spotsForWindow(const Frame& f, const Affine& A, int wx, int wy, int ww, int wh, std::vector<SpotPx>& out) {
+void spotsForWindow(const Frame& f, const Affine& A, int wx, int wy, int ww, int wh, std::vector<SpotPx>& out, const warp::Field* warp) {
   out.clear();
   const double det = A.m[0] * A.m[4] - A.m[1] * A.m[3];
   if (std::fabs(det) < 1e-30) return;
   const double i00 = A.m[4] / det, i01 = -A.m[1] / det, i10 = -A.m[3] / det, i11 = A.m[0] / det;
   const double ppu = affinePpu(A);
-  for (const SpotM& s : f.spots) {
+  for (const SpotM& s0 : f.spots) {
+    SpotM s = s0;
+    if (warp) {  // photo metric (units of the long edge) -> photo-normalised -> forward through the field -> back
+      const double Lw = double(std::max(warp->photoW, warp->photoH)), kx = Lw / warp->photoW, ky = Lw / warp->photoH;
+      double u, v, us, vs;
+      warp::forwardUV(*warp, s0.x * kx, s0.y * ky, u, v);
+      warp::forwardUV(*warp, (s0.x + s0.ox) * kx, (s0.y + s0.oy) * ky, us, vs);
+      s.x = float(u / kx), s.y = float(v / ky), s.ox = float(us / kx - u / kx), s.oy = float(vs / ky - v / ky);
+    }
     const double X = double(s.x) - A.m[2], Y = double(s.y) - A.m[5];
     const double cx = i00 * X + i01 * Y, cy = i10 * X + i11 * Y;
     const float R = float(double(s.r) * ppu);
@@ -785,7 +794,7 @@ void retouchDetailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, floa
   const Affine A = frameAffine(P);
   if (!f.spots.empty()) {
     std::vector<SpotPx> sp;
-    spotsForWindow(f, A, aux.ox, aux.oy, img.width, img.height, sp);
+    spotsForWindow(f, A, aux.ox, aux.oy, img.width, img.height, sp, P.warp.field.get());
     healWindow(sp, img);
   }
   if (f.retouchW) {

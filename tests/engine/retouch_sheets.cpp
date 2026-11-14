@@ -785,8 +785,117 @@ int runBench(const fs::path& outDir, const std::string& name, int reps, int zfla
   return 0;
 }
 
+#ifdef DAPPLE_RETOUCH_GPU
+#include "engine/exec/gpu_runtime.h"
+#endif
+// --settle mode: the frame that follows the finger-up after a 局部 pad drag (owner report: ~1.5 s to the sharp picture on a foldable).
+//   dapple_retouch_sheets --settle <outdir> [name] [reps]
+// Per case (person area + colour pad, gradient + light pad, brush + light pad, person + colour pad on top of the portrait recipe) and per step of a drag:
+// one drag frame (interactive, 480 px, the 120 Hz rung) then the settled frame at the screen sizes the app asks for (1080: a phone, 2048: a foldable's
+// inner screen at fit), and the zoomed detail render (session 4096, a 2x view of a 2000 x 2200 window: region 0.62 of the picture, 2464 px long edge)
+// in the background class the app uses and in the foreground class. All after a first round (planes and caches warm), medians of [reps].
+int runSettle(const fs::path& outDir, const std::string& name, int reps) {
+#ifdef DAPPLE_RETOUCH_GPU
+  dapple::engine::gpu::installProvider();  // DAPPLE_GPU=1: frames on the GPU executor like the app's
+#endif
+  const fs::path src = fs::path("build/ai-eval/portraits") / (name + ".jpg"), md = fs::path("build/retouch/masks") / name;
+  if (!fs::exists(src)) return std::printf("%s: source missing\n", name.c_str()), 1;
+  std::vector<std::string> have;
+  for (const char* k : {"person", "faceskin", "f1_skin", "f1_undereye", "f1_teeth", "f1_sclera", "f1_iris", "f1_lips", "f1_mouth", "f1_eyes", "f1_brows"}) {
+    const Mask m = loadMask(md / (std::string(k) + ".png"));
+    if (!m.ok()) continue;
+    const std::string id = "rt_" + name + "_" + k;
+    if (dapple_mask_raster_set(id.c_str(), m.w, m.h, m.d.data(), m.w) == DAPPLE_OK) have.push_back(k);
+  }
+  auto has = [&](const char* k) { return std::find(have.begin(), have.end(), k) != have.end(); };
+  if (!has("person")) return std::printf("%s: person mask missing (build/retouch/masks)\n", name.c_str()), 1;
+  std::string recipe;  // the portrait recipe's items (without the outer braces), for the last case
+  {
+    std::ifstream mf(md / "meta.json");
+    std::stringstream ss;
+    ss << mf.rdbuf();
+    const std::string meta = ss.str();
+    const auto iodv = numsAfter(meta, "iod", 1, meta.find("\"faces\""));
+    if (!iodv.empty()) {
+      const std::string r = paramsR2(name, iodv[0], recipeR2(true, has("f1_mouth"), has("f1_teeth")));
+      const std::size_t a = r.find('['), b = r.rfind(']');
+      if (a != std::string::npos && b != std::string::npos && b > a + 1) recipe = r.substr(a + 1, b - a - 1);
+    }
+  }
+  const std::string person = "{\"kind\":\"raster\",\"op\":\"add\",\"ref\":\"rt_" + name + "_person\",\"refine\":50}";
+  const std::string gradient = R"({"kind":"linear","op":"add","x0":0.5,"y0":0,"x1":0.5,"y1":0.55})";
+  std::string pts;
+  for (int i = 0; i <= 40; ++i) pts += std::string(i ? "," : "") + num(0.3 + 0.01 * i) + "," + num(0.55 + 0.1 * std::sin(i * 0.3));
+  const std::string brush = "{\"kind\":\"brush\",\"op\":\"add\",\"strokes\":[{\"size\":0.05,\"hardness\":50,\"flow\":100,\"erase\":false,\"pts\":[" + pts + "]}]}";
+  struct Case {
+    const char* name;
+    std::string mask;
+    bool colour;  // colour pad (temp, saturation, vibrance) or light pad (exposure, contrast, whites, blacks)
+    bool withRecipe;
+  };
+  const std::vector<Case> cases = {{"person+colour", person, true, false}, {"gradient+light", gradient, false, false}, {"brush+light", brush, false, false},
+                                   {"person+colour+portrait", person, true, true}};
+  auto params = [&](const Case& c, double x, double y) {
+    const std::string adj = c.colour ? "\"temp\":" + num(40 * x) + ",\"saturation\":" + num(30 * y) + ",\"vibrance\":" + num(15 * y)
+                                     : "\"exposure\":" + num(30 * x) + ",\"contrast\":" + num(40 * y) + ",\"whites\":" + num(10 * y) + ",\"blacks\":" + num(-10 * y);
+    std::string o = "{\"local\":{\"v\":2,\"items\":[";
+    if (c.withRecipe && !recipe.empty()) o += recipe + ",";
+    return o + "{\"id\":\"pad\",\"strength\":100,\"mask\":[" + c.mask + "],\"adjust\":{" + adj + "}}]}}";
+  };
+  auto frame = [&](DappleSession* s, const std::string& pj, int longEdge, const float* region, int regionLong, int flags, int* wOut = nullptr, int* hOut = nullptr) {
+    DappleFrameRequest rq{};
+    rq.size = sizeof rq, rq.long_edge = longEdge, rq.flags = flags;
+    if (region) {
+      for (int i = 0; i < 4; ++i) rq.region[i] = region[i];
+      rq.region_long_edge = regionLong;
+    }
+    DappleImage im{};
+    const double t0 = nowMs();
+    const int rc = dapple_session_render_frame(s, pj.c_str(), "", &rq, &im, nullptr);
+    const double ms = nowMs() - t0;
+    if (rc != DAPPLE_OK) std::printf("  frame failed: %s\n", dapple_last_error());
+    if (wOut) *wOut = im.width;
+    if (hOut) *hOut = im.height;
+    dapple_free_image(&im);
+    return ms;
+  };
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.empty() ? 0.0 : v[v.size() / 2];
+  };
+  DappleSession* sp = dapple_session_open(src.string().c_str(), DAPPLE_QUALITY_PREVIEW, 2048);
+  DappleSession* sz = dapple_session_open(src.string().c_str(), DAPPLE_QUALITY_PREVIEW, 4096);
+  if (!sp || !sz) return std::printf("open failed: %s\n", dapple_last_error()), 1;
+  const float rg[4] = {0.19f, 0.12f, 0.81f, 0.74f};
+  (void)outDir;
+  for (const Case& c : cases) {
+    std::vector<double> drag, s1080, s2048, zBg, zFg;
+    int w1 = 0, h1 = 0, w2 = 0, h2 = 0, wz = 0, hz = 0;
+    for (int r = 0; r <= reps; ++r) {
+      const double x = -0.5 + 0.1 * (r % 5), y = 0.3 - 0.07 * (r % 4);
+      const std::string pj = params(c, x, y);
+      const double a = frame(sp, pj, 480, nullptr, 0, DAPPLE_FRAME_INTERACTIVE);
+      const double b = frame(sp, pj, 1080, nullptr, 0, 0, &w1, &h1);
+      const double d = frame(sp, pj, 2048, nullptr, 0, 0, &w2, &h2);
+      const double e = frame(sz, pj, 0, rg, 2464, DAPPLE_FRAME_BACKGROUND, &wz, &hz);
+      const double f = frame(sz, params(c, x + 0.01, y), 0, rg, 2464, 0);
+      if (r) drag.push_back(a), s1080.push_back(b), s2048.push_back(d), zBg.push_back(e), zFg.push_back(f);
+    }
+    std::printf("SETTLE %s %s: drag(480) %.1f | settled %dx%d %.1f, %dx%d %.1f | zoom detail %dx%d background %.1f foreground %.1f ms (medians of %d)\n",
+                name.c_str(), c.name, median(drag), w1, h1, median(s1080), w2, h2, median(s2048), wz, hz, median(zBg), median(zFg), reps);
+  }
+  dapple_session_close(sp);
+  dapple_session_close(sz);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc >= 3 && !std::strcmp(argv[1], "--settle")) {
+    const fs::path out = argv[2];
+    fs::create_directories(out);
+    return runSettle(out, argc >= 4 ? argv[3] : "p1_glasses_flag", argc >= 5 ? std::atoi(argv[4]) : 5);
+  }
   if (argc >= 3 && !std::strcmp(argv[1], "--bench")) {
     const fs::path out = argv[2];
     fs::create_directories(out);

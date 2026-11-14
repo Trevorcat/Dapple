@@ -271,6 +271,15 @@ ParamRegistry::ParamRegistry() {
         in.edit.local.assign(1, a);
         return true;
       });
+  // portrait reshaping (section 45): a geometric warp of the source fetch, so a frame key (everything downstream of the Geometry node)
+  add("reshape", G, [](const ParamInputs& in, Hasher& h) { h.u64(reshapeHash(in.edit.reshape)); },
+      [](ParamInputs& in, int v) {
+        ReshapePush s;
+        s.r = 0.1f;
+        s.pts = {0.4f, 0.5f, v ? 0.45f : 0.43f, 0.5f};
+        in.edit.reshape.push.assign(1, s);
+        return true;
+      });
   if (keys_.size() > kMaxKeys) throw std::logic_error("too many ParamKeys");
 }
 

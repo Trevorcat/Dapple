@@ -6,6 +6,7 @@
 #include "engine/exec/gpu_executor.h"
 #include "hdr_field.h"
 #include "local_eval.h"
+#include "warp_field.h"
 #include "determinism.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -197,7 +198,7 @@ WRect footprint(const FramePlan& P, const WRect& work) {
       y0 = std::min(y0, sy);
       y1 = std::max(y1, sy);
     }
-  const int m = P.exact ? 2 : 4;
+  const int m = P.warp.active() ? 6 + P.warp.pad : (P.exact ? 2 : 4);  // a reshaping field moves reads by up to `pad` pixels
   WRect r;
   r.x0 = std::max(0, int(std::floor(x0)) - m);
   r.y0 = std::max(0, int(std::floor(y0)) - m);
@@ -437,6 +438,9 @@ class Executor final : public IGpuExecutor {
   hal::ImageH* resizedSource(int w, int h);
   std::shared_ptr<DeviceTables> ensureTables(const GpuRun& in);
   std::shared_ptr<DeviceHdr> ensureHdr(const GpuRun& in);
+  // The HDR buffer of the point pass with the reshaping field appended (section 45): HDR grid (when active) then the field; `warpOff` =
+  // the field's float offset. Without a field this is ensureHdr.
+  std::shared_ptr<DeviceHdr> ensureGeoAux(const GpuRun& in, int& warpOff);
   // A read-only SSBO with `bytes` of `data`, kept in tables_ under (slot, key) (local adjustments: descriptors, plane store)
   std::shared_ptr<DeviceHdr> ensureBuffer(NodeType slot, std::uint64_t key, const void* data, std::size_t bytes);
   // Local adjustments of the frame: descriptor + plane store SSBOs (both null when the frame has none; false on a device error)
@@ -661,6 +665,21 @@ std::shared_ptr<DeviceHdr> Executor::ensureHdr(const GpuRun& in) {
   e.bytes = bytes;
   tables_.put(NodeType::Hdr, std::move(e));
   return t;
+}
+
+std::shared_ptr<DeviceHdr> Executor::ensureGeoAux(const GpuRun& in, int& warpOff) {
+  warpOff = 0;
+  const FramePlan& P = in.frame;
+  if (!P.warp.active()) return ensureHdr(in);
+  std::vector<float> data;
+  std::uint64_t key = P.warp.field->id * 0x9E3779B97F4A7C15ull + 0x5245534841504555ull;  // "RESHAPE"
+  if (P.hdr.active()) {
+    data = P.hdr.field->g;
+    key ^= P.hdr.field->id * 1099511628211ull;
+  }
+  warpOff = int(data.size());
+  data.insert(data.end(), P.warp.field->d.begin(), P.warp.field->d.end());
+  return ensureBuffer(NodeType::Hdr, key, data.data(), data.size() * sizeof(float));
 }
 
 std::shared_ptr<DeviceHdr> Executor::ensureBuffer(NodeType slot, std::uint64_t key64, const void* data, std::size_t bytes) {
@@ -1045,6 +1064,7 @@ struct Executor::Walk {
         std::int32_t a[4], b[4];
         float geoA[4], geoB[4], geoC[4];
         std::int32_t c[4];
+        WarpU w;
       } u{};
       u.a[0] = P.srcW;
       u.a[1] = P.srcH;
@@ -1062,10 +1082,13 @@ struct Executor::Walk {
       u.geoC[1] = P.fullH;
       u.c[0] = P.rot;
       u.c[1] = P.flip ? 1 : 0;
-      const hal::PipelineH p = r.pl("film_src", {{0, P.exact ? 1 : 2}});
+      const bool warpOn = P.warp.active() && src.warp >= 0;
+      if (warpOn) warpUniform(P, src, u.w);
+      const hal::PipelineH p = r.pl("film_src", {{0, P.exact ? 1 : 2}, {4, warpOn ? 1 : 0}});
       if (!p) return -1;
       const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.outW), std::uint32_t(P.outH));
-      r.g.dispatch("film_src", p, {GpuGraph::R(src.img), GpuGraph::W(g)}, r.gx(P.outW), r.gy(P.outH), &u, sizeof u);
+      r.g.dispatch("film_src", p, {GpuGraph::R(src.img), GpuGraph::W(g), GpuGraph::R(warpOn ? src.warp : r.g.externalBuf(r.gBuf))}, r.gx(P.outW),
+                   r.gy(P.outH), &u, sizeof u);
       in = g;
     }
     return in;
@@ -1352,8 +1375,9 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
     if (!L) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
   }
   std::shared_ptr<DeviceHdr> HD;
-  if (in.frame.hdr.active()) {
-    HD = ensureHdr(in);
+  int warpOff = 0;
+  if (in.frame.hdr.active() || in.frame.warp.active()) {
+    HD = ensureGeoAux(in, warpOff);
     if (!HD) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
   }
   std::shared_ptr<DeviceHdr> LDsc, LPl;
@@ -1384,7 +1408,8 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   w.interior = w.work = WRect{0, 0, fw, fh};
   w.src.img = g.external(*S);
   if (L) w.lut = lutBind(g, *L);
-  if (HD) w.lut.hdr = g.externalBuf(HD->buf);
+  if (HD && P.hdr.active()) w.lut.hdr = g.externalBuf(HD->buf);
+  if (HD && P.warp.active()) w.src.warp = g.externalBuf(HD->buf), w.src.warpOff = warpOff;
   if (LDsc && LPl) {
     w.ldesc = g.externalBuf(LDsc->buf);
     w.lplanes = g.externalBuf(LPl->buf);
@@ -1538,8 +1563,9 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     if (!L) return bad(Status::Internal);
   }
   std::shared_ptr<DeviceHdr> HD;
-  if (in.frame.hdr.active()) {
-    HD = ensureHdr(in);
+  int warpOff = 0;
+  if (in.frame.hdr.active() || in.frame.warp.active()) {
+    HD = ensureGeoAux(in, warpOff);
     if (!HD) return bad(Status::Internal);
   }
   std::shared_ptr<DeviceHdr> LDsc, LPl;
@@ -1617,6 +1643,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     Walk wp(rec, in, rsharp, true);
     wp.interior = wp.work = WRect{0, 0, P.outW, P.outH};
     wp.src.img = g.external(*S);
+    if (HD && P.warp.active()) wp.src.warp = g.externalBuf(HD->buf), wp.src.warpOff = warpOff;
     wp.fres = &fres;
     wp.ftab = &DF->gt;
     wp.fplan = &DF->pr;
@@ -1732,7 +1759,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     w.interior = interior;
     w.work = work;
     if (L) w.lut = lutBind(g, *L);
-    if (HD) w.lut.hdr = g.externalBuf(HD->buf);
+    if (HD && P.hdr.active()) w.lut.hdr = g.externalBuf(HD->buf);
+    if (HD && P.warp.active()) w.src.warp = g.externalBuf(HD->buf), w.src.warpOff = warpOff;
     if (LDsc && LPl) {
       w.ldesc = g.externalBuf(LDsc->buf);
       w.lplanes = g.externalBuf(LPl->buf);

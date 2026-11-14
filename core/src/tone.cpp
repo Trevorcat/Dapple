@@ -22,6 +22,7 @@ ImageF renderProxy(const EditParams& pIn, const CameraProfile& camera, const Sou
   EditParams p = pIn;
   p.hdr = 0.f;  // the tonal analysis is taken without the single-image HDR (EditParams::hdr): it would otherwise enter every table key
   p.local.clear();  // ... and without the local adjustments (docs/engine/pipeline-architecture.md section 40): a local drag must not rebuild the tables
+  p.reshape = ReshapeParams{};  // ... and without the reshaping (section 45): a push drag must not rebuild the tables
   if (engine::mode() == engine::Mode::Off) return Renderer(p, camera, nullptr).renderFloat(proxy, false);
   ImageF f;
   std::string err;

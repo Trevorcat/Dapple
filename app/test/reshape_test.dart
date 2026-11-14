@@ -5,7 +5,7 @@ import 'package:dapple/editor/fold_layout.dart' show debugFoldLayouts;
 import 'package:dapple/model/params.dart';
 import 'package:dapple/model/reshape.dart';
 import 'package:dapple/native/ai_bindings.dart' show AiFace, AiJobResult;
-import 'package:flutter/material.dart';
+import 'package:dapple/screens/editor/local_controller.dart' show ReshapeItems;
 import 'package:flutter_test/flutter_test.dart';
 
 import 'editor_v2_test.dart' show Finger, settle;
@@ -172,6 +172,25 @@ void main() {
       r.lc.setComparing(true);
       expect(r.lc.ctl.engine.hideLocal, isTrue);
       r.lc.setComparing(false);
+    });
+
+    testWidgets('分项: the group operators on one radar; 下巴 goes both ways', (t) async {
+      final fake = FakeLocalAi();
+      final r = await openPortrait(t, fake, withFaces(portraitResult(), 1));
+      await tapKey(t, 'shape-chin');
+      await tapKey(t, 'items-button');
+      expect(key('shape-radar-chin'), findsOneWidget);
+      final items = r.lc.reshapeTool.items();
+      expect([for (final i in items) i.id], ['slim', 'small', 'chin', 'eyes', 'nose']);
+      final chin = items.firstWhere((i) => i.id == 'chin');
+      expect(chin.min, -100);
+      final src = r.lc.reshapeTool.itemSource;
+      src.begin(chin);
+      src.set(chin, -40);
+      src.end();
+      await settle(t, 3);
+      expect(shapeOf(r).value(ReshapeOp.chin), -40);
+      expect(shapeOf(r).facesOf(ReshapeOp.chin), {1});
     });
 
     testWidgets('an analysis without anchors (older engine / cache): no 形体 tiles', (t) async {

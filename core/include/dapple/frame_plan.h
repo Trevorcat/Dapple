@@ -12,6 +12,7 @@ namespace dapple {
 class Lut3D;
 struct HdrField;  // core/src/hdr_field.h
 namespace local { struct Frame; }  // core/src/local_eval.h
+namespace warp { struct Field; }   // core/src/warp_field.h
 
 struct FramePlan {
   bool supported = true;      // false: the CPU path must render this frame (reason in `why`)
@@ -79,6 +80,16 @@ struct FramePlan {
   // masks and the scene-linear ops after `gain` / HDR; `localDetail` = the frame has the window ops (LocalDetail node).
   std::shared_ptr<const local::Frame> local;
   bool localDetail = false;
+  // Portrait reshaping (docs/engine/pipeline-architecture.md section 45): the backward displacement field, applied to the source position after
+  // the geometry mapping (s -> s + B(s); grid coordinate = s * a + b, displacement in source pixels = d * lpx). `useGeo` is on whenever it
+  // is set (an identity geometry then takes the exact index mapping where the field is zero). `pad` = source pixels the field can move a
+  // read (tile / band source windows grow by it).
+  struct Warp {
+    std::shared_ptr<const warp::Field> field;
+    float ax = 1.f, bx = 0.f, ay = 1.f, by = 0.f, lpx = 1.f;
+    int pad = 0;
+    bool active() const { return field != nullptr; }
+  } warp;
 
   bool anySpatial() const {
     return nrLuma > 0 || nrColor > 0 || dehaze != 0 || clarity != 0 || texture != 0 || sharpen > 0 || grain > 0;

@@ -159,6 +159,53 @@ class ReshapeTool {
   void cancel() => up();
 }
 
+/// 分项 of a 形体 tile: the operators of its group, on the faces it works on (or the body); 下巴 both ways.
+extension ReshapeItems on ReshapeTool {
+  List<PadItem> items() {
+    final op = sel;
+    if (op == null) return const [];
+    final body = reshapeSpecOf(op).body;
+    return [
+      for (final o in body ? bodyOps : faceOps)
+        PadItem(reshapeSpecOf(o).key, reshapeSpecOf(o).label, reshapeSpecOf(o).min, 100, 0, (v) => fmtValue(reshapeSpecOf(o).min < 0 ? Fmt.signed : Fmt.plain, v)),
+    ];
+  }
+
+  ItemSource get itemSource => ReshapeItemSource(this);
+}
+
+class ReshapeItemSource extends ItemSource {
+  ReshapeItemSource(this.t);
+  final ReshapeTool t;
+  ReshapeOp _op(PadItem it) => reshapeSpecs.firstWhere((s) => s.key == it.id).op;
+
+  @override
+  Listenable get changes => Listenable.merge([t.lc.ctl.app.editTick, t.lc]);
+  @override
+  double actual(PadItem it) => t.value.value(_op(it));
+  @override
+  double implied(PadItem it) => 0;
+  @override
+  void begin(PadItem it) => t.lc.ctl.gestureBegin('reshape-item-${it.id}', param: null);
+  @override
+  void set(PadItem it, double v) {
+    final op = _op(it);
+    // the faces the selected tile works on (the main face when it has none yet)
+    var sel = t.sel == null ? <int>{} : t.value.facesOf(t.sel!);
+    if (sel.isEmpty && t.faces.isNotEmpty) sel = {t.faces.first.index};
+    t._write(t._anchored().withValue(op, v.clamp(it.min, it.max).toDouble(), sel: sel), step: false);
+  }
+
+  @override
+  void end() => t.lc.ctl.gestureEnd();
+  @override
+  void reset(PadItem it) {
+    begin(it);
+    set(it, 0);
+    end();
+  }
+}
+
 /// The strip of the selected 形体 tile: 0 at the bottom, the recommended amount in the middle, the believable maximum at the top.
 class ReshapeStripSource extends PadSource {
   ReshapeStripSource(this.t);

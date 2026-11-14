@@ -98,6 +98,8 @@ class LocalHeader extends StatelessWidget {
     final readout = HeaderReadout(
       listenable: Listenable.merge([ctl.app.editTick, lc]),
       text: () {
+        final op = lc.reshapeTool.sel;
+        if (op != null) return '形体 · ${reshapeSpecOf(op).label} ${lc.reshapeTool.value.value(op).round()}';
         final s = lc.sel;
         if (s == null) return '';
         final r = localReadout(localUiOf(s), area: s, pad: lc.padCat);
@@ -138,8 +140,11 @@ class LocalHeader extends StatelessWidget {
       sub = readout;
       if (a != null) buttons.add(reset);
     } else {
-      sub = portraitPanel && a == null ? subText('美颜') : readout;
-      if (a != null) {
+      final shaping = lc.reshapeTool.sel != null && lc.body == LocalBody.portrait;
+      sub = portraitPanel && a == null && !shaping ? subText('美颜') : readout;
+      if (shaping) {
+        buttons.add(HeaderButton(key: const ValueKey('items-button'), label: '分项', onTap: () => ctl.setItemised(true)));
+      } else if (a != null) {
         buttons
           ..add(reset)
           ..add(HeaderButton(key: const ValueKey('items-button'), label: '分项', onTap: () => ctl.setItemised(true)));
@@ -467,6 +472,7 @@ class LocalBodyView extends StatelessWidget {
     // the empty state IS the first step: the shape card
     if (lc.body == LocalBody.aiParts) return AiPartsCard(lc: lc);
     if (lc.body == LocalBody.portrait && !ctl.itemised) return PortraitPanel(ctl: ctl);
+    if (lc.body == LocalBody.portrait && ctl.itemised && lc.reshapeTool.sel != null) return LocalItemised(ctl: ctl);
     if (lc.list.isEmpty || lc.body == LocalBody.addArea) return ShapeCard(lc: lc, mode: LocalBody.addArea);
     switch (lc.body) {
       case LocalBody.addPart:
@@ -781,6 +787,21 @@ class LocalItemised extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final lc = ctl.local;
+    final rt = lc.reshapeTool;
+    if (rt.sel != null) {
+      // a 形体 tile: the operators of its group for the faces it works on (下巴 both ways), one radar
+      final items = rt.items();
+      final sel = ctl.selItem.clamp(0, items.length - 1);
+      return Column(
+        children: [
+          Expanded(
+            child: RadarView(key: ValueKey('shape-radar-${rt.sel!.name}'), ctl: ctl, cat: PadCat.light, items: items, selected: sel, onSelect: ctl.selectItem, source: rt.itemSource),
+          ),
+          const SizedBox(height: Sp.s),
+          ItemRuler(ctl: ctl, cat: PadCat.light, item: items[sel], source: rt.itemSource),
+        ],
+      );
+    }
     if (lc.selIsPortrait) {
       // a portrait chip: its own few parameters, one radar (no groups)
       final items = lc.portraitItems();

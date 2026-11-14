@@ -105,8 +105,9 @@ double _pow(double a, double e) => a <= 0 ? 1 : math.pow(a, e).toDouble();
 ///    wired for [DSlider] through [EditInteraction], or inferred from a burst of [edited] calls) frames are
 ///    rendered at [interactiveLongEdge] (<= 1080 px) with the cheaper neighbourhood pipeline, with no
 ///    debounce;
-///  * final: [idleDelay] (150 ms) after the last edit / when the drag ends, one frame at
-///    [finalLongEdge] (default 1600 px) with everything on.
+///  * final: at the finger-up of an explicit drag (same call, no timer: [endInteraction]), or [idleDelay] (150 ms) after the last
+///    edit of a drag inferred from a burst, one frame at [finalLongEdge] (default 1600 px) with everything on. Zoomed in, the zoom
+///    detail of the same edit starts at the finger-up too, beside that frame.
 ///
 /// Zoom detail: see [setViewport].
 class EditorEngine extends ChangeNotifier {
@@ -125,7 +126,8 @@ class EditorEngine extends ChangeNotifier {
   /// High-resolution render of the visible region while zoomed in; null when not available. The UI
   /// draws it over [image], stretched to [detailRect], and falls back to [image] where it is null.
   /// Contract: it is only set when the zoom is above [detailMinZoom] and the view has been still for
-  /// [detailDelay]; it is cleared (null) on every edit, when the photo changes and when zooming out.
+  /// [detailDelay] (counted from the last view change, so after an edit on a still view it starts at once); it is cleared (null) on
+  /// every edit, when the photo changes and when zooming out.
   /// While panning/pinching the previous detail stays (it is positioned by [detailRect], not by the
   /// viewport) until a fresh one replaces it.
   ui.Image? detail;

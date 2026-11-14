@@ -58,7 +58,7 @@ H recordRetouch(GpuRecorder& r, const LocalDetailNode& n, H D, bool last) {
   const local::Affine A = local::frameAffine(P);
   if (!f.spots.empty()) {
     std::vector<local::SpotPx> sp;
-    local::spotsForWindow(f, A, n.ox, n.oy, n.W, n.Hh, sp);
+    local::spotsForWindow(f, A, n.ox, n.oy, n.W, n.Hh, sp, P.warp.field.get());
     const bool lastHere = last && !f.retouchW;
     if (!sp.empty() || lastHere) {
       HealU u{};
@@ -226,6 +226,7 @@ struct FiU {
   std::int32_t a[4], b[4];
   float geoA[4], geoB[4], geoC[4];
   std::int32_t c[4];
+  WarpU w;
 };
 }  // namespace
 
@@ -233,7 +234,8 @@ bool recordLocalFilmIn(GpuRecorder& r, const LocalFilmInNode& n, H out) {
   const FramePlan& P = *n.plan;
   const int geo = !P.useGeo ? 0 : (P.exact ? 1 : 2);
   const bool w = n.aux0 >= 0 && n.aux1 >= 0;
-  const hal::PipelineH p = r.pl("local_film_in", {{0, geo}, {3, w ? 1 : 0}});
+  const bool warpOn = P.warp.active() && n.src.warp >= 0;
+  const hal::PipelineH p = r.pl("local_film_in", {{0, geo}, {3, w ? 1 : 0}, {4, warpOn ? 1 : 0}});
   if (!p) return false;
   FiU u{};
   for (int k = 0; k < 3; ++k) u.gain[k] = P.gain[k];
@@ -243,9 +245,10 @@ bool recordLocalFilmIn(GpuRecorder& r, const LocalFilmInNode& n, H out) {
   u.geoB[0] = P.ox0, u.geoB[1] = P.oy0, u.geoB[2] = P.stepX, u.geoB[3] = P.stepY;
   u.geoC[0] = P.fullW, u.geoC[1] = P.fullH;
   u.c[0] = P.rot, u.c[1] = P.flip ? 1 : 0;
+  if (warpOn) warpUniform(P, n.src, u.w);
   r.g.dispatch("local_film_in", p,
                {GpuGraph::R(n.src.img), GpuGraph::W(out), GpuGraph::R(n.ldesc), GpuGraph::R(n.lplanes), w ? GpuGraph::W(n.aux0) : GpuGraph::R(r.dummy(kF16)),
-                w ? GpuGraph::W(n.aux1) : GpuGraph::R(r.dummy(kF16))},
+                w ? GpuGraph::W(n.aux1) : GpuGraph::R(r.dummy(kF16)), GpuGraph::R(warpOn ? n.src.warp : n.lplanes)},
                r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
   return true;
 }
