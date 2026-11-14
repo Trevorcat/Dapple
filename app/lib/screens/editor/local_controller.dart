@@ -716,6 +716,23 @@ class LocalController extends ChangeNotifier {
 
   String? _planeId(String key) => aiPlanes[key]?.id;
 
+  /// An off chip whose areas would not fit the edit's 12 raster planes (a group photo: 眼睛 is two planes per face). The default set
+  /// leaves such a chip off by design (priority order, [kPortraitPriority]); the chip says why (`块数已满`) and a tap shows the toast.
+  bool chipBlocked(PortraitChip c) {
+    if (chipOn(c)) return false;
+    final fs = portraitFaces;
+    final all = {for (final f in fs) f.n};
+    var u = list;
+    var any = false;
+    for (final ar in specOf(c).areas) {
+      final mask = portraitMask(ar, fs, all, _planeId);
+      if (mask.isEmpty || u.indexOf(ar.id) >= 0) continue;
+      any = true;
+      u = u.add(LocalAdjustment(id: ar.id, mask: mask));
+    }
+    return any && (u.rasterPlanes > kMaxRasterComponents || u.length > kMaxLocalAdjustments);
+  }
+
   /// Creates (or re-links, same ids: never duplicates) the areas of [chips] for [faces] (null = every face). One undo step.
   ///
   /// [fill]: the default set; chips are added in [kPortraitPriority] order while the edit's 12 planes last (a group photo gets skin,
@@ -1811,6 +1828,9 @@ class LocalController extends ChangeNotifier {
     if (active) unawaited(checkMissing());
     _onEdit();
   }
+
+  /// A card (or the heal mode) is open in the panel: one back closes it.
+  bool get hasCard => healMode || (active && body != LocalBody.pads);
 
   /// Back key: a card in the panel closes first.
   bool handleBack() {

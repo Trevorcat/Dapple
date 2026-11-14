@@ -573,7 +573,7 @@ void main() {
       expect(app.editOf(id).filmPaper, 'none');
     });
 
-    testWidgets('back: extra editor, itemised view, fold, close, in that order', (t) async {
+    testWidgets('back: extra editor, itemised view, close the tool, in that order (a fold is not a layer)', (t) async {
       final (app, id) = await openFilm(t);
       await tapDock(t, EGroup.color);
       await t.tap(find.byKey(const ValueKey('items-button')));
@@ -589,9 +589,6 @@ void main() {
       expect(find.byKey(const ValueKey('radar')), findsOneWidget);
       await back();
       expect(find.byKey(const ValueKey('pad-color')), findsOneWidget);
-      await back();
-      expect(find.byKey(const ValueKey('docked-panel')), findsOneWidget);
-      expect(find.byKey(const ValueKey('pad-color')), findsNothing, reason: 'folded to handle and header');
       await back();
       expect(find.byKey(const ValueKey('docked-panel')), findsNothing);
       expect(app.editOf(id), isNotNull);

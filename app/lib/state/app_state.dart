@@ -1238,7 +1238,9 @@ class AppState extends ChangeNotifier {
       final an = await s.analyze();
       if (an != null) ph.nearest = an['nearest'] as String?;
       final out = previewPathFor(ph);
-      await s.exportJpeg(wireParams(ph), longEdge: 2048, quality: 88, outPath: out);
+      final wp = wireParams(ph);
+      await s.exportJpeg(wp, longEdge: 2048, quality: 88, outPath: out);
+      _previewSig[ph.id] = jsonEncode(wp);
       ph.previewPath = out;
       _dropImageCache();
       if ((ph.kind == PhotoKind.hdr || ph.kind == PhotoKind.pano) && await isBlankImageFile(out)) {
@@ -1290,12 +1292,20 @@ class AppState extends ChangeNotifier {
 
   /// Re-writes the grid thumbnail (2048 px JPEG) after the editor closes.
   Future<void> commitEdit(Photo ph) {
+    commitCount++;
     final f = _commitEdit(ph);
     _commitsInFlight.add(f);
     return f.whenComplete(() => _commitsInFlight.remove(f));
   }
 
   final Set<Future<void>> _commitsInFlight = {};
+
+  /// Thumbnail commits requested so far (tests: one per editor close, none per back press).
+  @visibleForTesting
+  int commitCount = 0;
+
+  /// Edit signature of each photo's current preview file (this session): an unchanged edit is not re-rendered on leaving the editor.
+  final Map<String, String> _previewSig = {};
 
   /// Memory (pipeline-architecture.md 42.9): the release after the editor closed waits for its thumbnail commits.
   Future<void> whenCommitsDone() => Future.wait(_commitsInFlight.toList());
@@ -1305,9 +1315,14 @@ class AppState extends ChangeNotifier {
     changed();
     if (isDemo || !nativeOk || ph.previewPath == null) return;
     try {
+      // the thumbnail is re-rendered only when the edit differs from what the file on disk already shows
+      final wp = wireParams(ph);
+      final sig = jsonEncode(wp);
+      if (_previewSig[ph.id] == sig && File(previewPathFor(ph)).existsSync()) return;
       final s = await sessions.get(ph);
       if (s == null) return;
-      await s.exportJpeg(wireParams(ph), longEdge: 2048, quality: 88, outPath: previewPathFor(ph));
+      await s.exportJpeg(wp, longEdge: 2048, quality: 88, outPath: previewPathFor(ph));
+      _previewSig[ph.id] = sig;
       _dropImageCache();
       notifyListeners();
     } catch (e) {

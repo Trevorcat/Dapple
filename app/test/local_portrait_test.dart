@@ -507,6 +507,22 @@ void main() {
       expect(t.takeException(), isNull);
     });
 
+    testWidgets('眼睛 default, one face: on, and no "full" note', (t) async {
+      final single = await openPortrait(t, FakeLocalAi(), portraitResult(), faces: 1);
+      expect(single.lc.chipOn(PortraitChip.eyes), isTrue);
+      expect(single.lc.chipBlocked(PortraitChip.eyes), isFalse);
+      expect(find.text('块数已满'), findsNothing);
+    });
+
+    testWidgets('眼睛 default, a group: off by design (12-plane budget) and the chip says why', (t) async {
+      final group = await openPortrait(t, FakeLocalAi(), portraitResult(faces: 3), faces: 3);
+      expect(group.lc.chipOn(PortraitChip.eyes), isFalse, reason: 'two planes per face do not fit the 12 planes next to the skin');
+      expect(group.lc.chipBlocked(PortraitChip.eyes), isTrue);
+      await t.pump(const Duration(milliseconds: 300));
+      expect(find.descendant(of: find.byKey(const ValueKey('chip-eyes')), matching: find.text('块数已满')), findsOneWidget);
+      expect(find.descendant(of: find.byKey(const ValueKey('chip-skin')), matching: find.text('块数已满')), findsNothing);
+    });
+
     testWidgets('three faces: at least the skin is made (a group photo is the common case)', (t) async {
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult(faces: 3), faces: 3);

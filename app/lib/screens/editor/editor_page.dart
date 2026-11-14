@@ -496,15 +496,15 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
       backgroundColor: c.stage,
       resizeToAvoidBottomInset: false,
       body: ListenableBuilder(
-        listenable: Listenable.merge([wm, zoom, ctl.immersive, ctl.editingRow]),
+        listenable: Listenable.merge([wm, zoom, ctl.immersive, ctl.editingRow, ctl.edits, ctl.local]),
         builder: (context, child) => PopScope(
           canPop: !menuOpen && ctl.canPop,
           onPopInvokedWithResult: (didPop, _) {
             if (didPop) return;
             if (menuOpen) {
               setState(() => menuOpen = false);
-            } else {
-              ctl.handleBack();
+            } else if (!ctl.handleBack()) {
+              Navigator.of(context).pop(); // canPop was stale: nothing transient is open, so back leaves
             }
           },
           child: child!,

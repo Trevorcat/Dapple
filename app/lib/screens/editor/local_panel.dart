@@ -1490,15 +1490,17 @@ class PortraitPanel extends StatelessWidget {
     Widget chip(PortraitChip pc, double w, double h) {
       final on = lc.chipOn(pc), selected = on && selChip == pc;
       final spec = specOf(pc);
+      final blocked = lc.chipBlocked(pc);
       return DTile(
         key: ValueKey('chip-${pc.name}'),
         label: spec.label,
         icon: iconOf(pc),
+        note: blocked ? '块数已满' : null,
         width: w,
         height: h,
         state: selected ? TileState.selected : (on ? TileState.on : TileState.normal),
         cue: selected,
-        semantics: '${spec.label}${on ? '，已开' : ''}',
+        semantics: '${spec.label}${on ? '，已开' : ''}${blocked ? '，块数已满，人物、天空、点选最多 $kMaxRasterComponents 块' : ''}',
         onTap: () => lc.tapChip(pc),
       );
     }

@@ -104,9 +104,45 @@ PlaneCache& cache() {
 struct RasterStore {
   std::mutex m;
   std::unordered_map<std::string, std::shared_ptr<const Raster>> map;
-  std::list<std::string> order;  // oldest first (cap 64 planes / 96 MB)
+  std::unordered_map<std::string, std::uint64_t> tick;  // last use (set or get) of each plane
+  std::uint64_t clock = 0;
   std::size_t bytes = 0;
 };
+// The photo a plane belongs to: "ai:<photo>:<key>" -> "<photo>"; any other id is its own group.
+std::string rasterGroup(const std::string& id) {
+  if (id.compare(0, 3, "ai:") != 0) return id;
+  const std::size_t c = id.find(':', 3);
+  return c == std::string::npos ? id : id.substr(3, c - 3);
+}
+// Caps: 64 planes / 96 MB. The planes that go first are those of photos other than the one used last (least recently used photo first,
+// then least recently used plane); only when nothing else is left does a plane of the photo in use go (its least recently used one:
+// the planes the open edit references are read at every render, so they are the freshest).
+void rasterEvict(RasterStore& s) {
+  while (s.map.size() > 1 && (s.map.size() > 64 || s.bytes > (96u << 20))) {
+    std::string cur;
+    std::uint64_t best = 0;
+    for (const auto& [id, t] : s.tick)
+      if (t >= best) best = t, cur = rasterGroup(id);
+    std::unordered_map<std::string, std::uint64_t> groupTick;
+    for (const auto& [id, t] : s.tick) {
+      std::uint64_t& g = groupTick[rasterGroup(id)];
+      g = std::max(g, t);
+    }
+    const std::string* victim = nullptr;
+    std::uint64_t vg = ~0ull, vt = ~0ull;
+    for (const auto& [id, t] : s.tick) {
+      const std::string g = rasterGroup(id);
+      const std::uint64_t gt = g == cur ? ~0ull - 1 : groupTick[g];  // the photo in use goes last
+      if (gt < vg || (gt == vg && t < vt)) victim = &id, vg = gt, vt = t;
+    }
+    if (!victim) return;
+    const std::string id = *victim;
+    logLine("local adjustments: raster store full (64 planes / 96 MB), dropped '" + id.substr(0, 40) + "'" + (rasterGroup(id) == cur ? " (photo in use)" : ""));
+    s.bytes -= s.map[id]->px.size();
+    s.map.erase(id);
+    s.tick.erase(id);
+  }
+}
 RasterStore& rasters() {
   static RasterStore s;
   return s;
@@ -918,19 +954,11 @@ bool rasterSet(const std::string& id, int w, int h, const std::uint8_t* bytes, i
   r->hash = hsh | 1;
   RasterStore& s = rasters();
   std::lock_guard<std::mutex> lk(s.m);
-  if (auto old = s.map.find(id); old != s.map.end()) {
-    s.bytes -= old->second->px.size();
-  } else {
-    s.order.push_back(id);
-  }
+  if (auto old = s.map.find(id); old != s.map.end()) s.bytes -= old->second->px.size();
   s.bytes += r->px.size();
   s.map[id] = std::move(r);
-  while (s.order.size() > 1 && (s.map.size() > 64 || s.bytes > (96u << 20))) {
-    logLine("local adjustments: raster store full (64 planes / 96 MB), dropped '" + s.order.front().substr(0, 40) + "'");
-    s.bytes -= s.map[s.order.front()]->px.size();
-    s.map.erase(s.order.front());
-    s.order.pop_front();
-  }
+  s.tick[id] = ++s.clock;
+  rasterEvict(s);
   return true;
 }
 bool rasterRemove(const std::string& id) {
@@ -939,16 +967,22 @@ bool rasterRemove(const std::string& id) {
   auto it = s.map.find(id);
   if (it == s.map.end()) return false;
   s.bytes -= it->second->px.size();
-  s.order.remove(id);
+  s.tick.erase(id);
   s.map.erase(it);
   return true;
 }
-bool rasterHas(const std::string& id) { return rasterGet(id) != nullptr; }
+bool rasterHas(const std::string& id) {  // a probe: does not count as a use
+  RasterStore& s = rasters();
+  std::lock_guard<std::mutex> lk(s.m);
+  return s.map.find(id) != s.map.end();
+}
 std::shared_ptr<const Raster> rasterGet(const std::string& id) {
   RasterStore& s = rasters();
   std::lock_guard<std::mutex> lk(s.m);
   auto it = s.map.find(id);
-  return it == s.map.end() ? nullptr : it->second;
+  if (it == s.map.end()) return nullptr;
+  s.tick[id] = ++s.clock;
+  return it->second;
 }
 std::uint64_t rasterContentHash(const std::string& id) {
   auto r = rasterGet(id);

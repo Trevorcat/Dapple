@@ -1254,6 +1254,18 @@ bool ensureLocalRasters(DappleSession* s, const EditParams& p) {
   setError("export: local mask plane '" + still[0] + "' is missing and could not be re-created (" + why + "); nothing was written");
   return false;
 }
+// A foreground exact frame never shows a silently empty AI mask: a plane of this photo that the edit references and the store no longer holds
+// (evicted by the raster store's caps) is re-created first (disk cache, else recomputation). Failures are not errors of the frame: the mask
+// stays empty (logged once) and the app's missing-plane check offers 重新分析.
+void recreateLocalRastersSoft(DappleSession* s, const EditParams& p) {
+  const std::vector<std::string> missing = missingRasterIds(p);
+  if (missing.empty()) return;
+  aimask::Control ctl;
+  ctl.yield = false;
+  std::string why;
+  const std::vector<std::string> still = aimask::ensure(aiSource(s), missing, ctl, &why);
+  if (!still.empty()) local::logLine("local adjustments: plane '" + still[0].substr(0, 40) + "' could not be re-created (" + why + ")");
+}
 std::string jsonEsc(const std::string& in) {
   std::string o;
   for (char c : in) {
@@ -1774,6 +1786,10 @@ static thread_local double tlSwatchMatchMs = 0;  // film match time of the swatc
 static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lutPath, const DappleFrameRequest& rq,
                  DappleImage* out, char** analysisOut, const EditParams* paramsIn = nullptr) {
   if (!ensureSource(s)) return false;
+  if (!paramsIn && paramsJson && !(rq.flags & DAPPLE_FRAME_INTERACTIVE) && !tlHintFrame) {  // before the session lock: re-creating a plane renders the session
+    EditParams pe;
+    if (parseParams(paramsJson, pe)) recreateLocalRastersSoft(s, pe);
+  }
   std::lock_guard<std::mutex> lock(s->mtx);
   EditParams params;
   if (paramsIn)

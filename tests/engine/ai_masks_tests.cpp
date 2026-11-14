@@ -639,6 +639,101 @@ static void testExport() {
   dapple_session_close(s);
 }
 
+// ---- raster store eviction and on-demand re-creation ---------------------------------------------------------------------------------------------
+// Planes of photos that are no longer open go first (least recently used photo first); the photo in use loses planes only when nothing else is left,
+// and then the ones its edit does not read.
+static void testStore() {
+  const std::vector<std::uint8_t> px(16 * 8, 100);
+  auto pid = [](char ph, int k) { return std::string("ai:") + std::string(16, ph) + ":k" + std::to_string(k); };
+  auto put = [&](const std::string& id) { CHECK(local::rasterSet(id, 16, 8, px.data(), 16)); };
+  for (char c : {'a', 'b', 'c', 'd'})
+    for (int k = 0; k < 70; ++k) local::rasterRemove(pid(c, k));
+  for (int k = 0; k < 30; ++k) put(pid('a', k));
+  for (int k = 0; k < 30; ++k) put(pid('b', k));
+  CHECK(local::rasterGet(pid('a', 5)) != nullptr);  // a is now more recent than b
+  for (int k = 0; k < 5; ++k) put(pid('c', k));       // 65 planes: one goes, from the least recently used photo (b), its oldest plane
+  CHECK(!local::rasterHas(pid('b', 0)));
+  int na = 0, nb = 0, nc = 0;
+  for (int k = 0; k < 30; ++k) na += local::rasterHas(pid('a', k)), nb += local::rasterHas(pid('b', k));
+  for (int k = 0; k < 5; ++k) nc += local::rasterHas(pid('c', k));
+  CHECK(na == 30 && nb == 29 && nc == 5);
+  // analysing one more photo pushes out b entirely before a loses anything
+  for (int k = 0; k < 30; ++k) put(pid('d', k));
+  nb = 0, na = 0;
+  for (int k = 0; k < 30; ++k) nb += local::rasterHas(pid('b', k)), na += local::rasterHas(pid('a', k));
+  int nd = 0;
+  for (int k = 0; k < 30; ++k) nd += local::rasterHas(pid('d', k));
+  std::printf("  after d: a %d b %d d %d\n", na, nb, nd);
+  CHECK(nd == 30 && nb == 0 && na == 29 && !local::rasterHas(pid('a', 0)));  // b went entirely, then a's oldest plane; c (newer than a) is whole
+  nc = 0;
+  for (int k = 0; k < 5; ++k) nc += local::rasterHas(pid('c', k));
+  CHECK(nc == 5);
+  // the open photo alone over the cap: the planes the edit reads (touched at every render) survive, the unread ones go
+  for (char c : {'a', 'b', 'c', 'd'})
+    for (int k = 0; k < 70; ++k) local::rasterRemove(pid(c, k));
+  put(pid('a', 0));
+  for (int k = 1; k < 64; ++k) put(pid('a', k));
+  for (int k = 64; k < 70; ++k) {
+    CHECK(local::rasterGet(pid('a', 0)) != nullptr);  // the edit reads plane 0 at every render
+    put(pid('a', k));
+  }
+  CHECK(local::rasterHas(pid('a', 0)));
+  CHECK(local::rasterHas(pid('a', 69)));
+  int count = 0;
+  local::rasterStoreBytes(&count);
+  CHECK(count <= 64);
+  for (int k = 0; k < 70; ++k) local::rasterRemove(pid('a', k));
+}
+
+// A foreground exact frame re-creates a plane the edit references and the store lost (disk cache), so the mask is not silently empty.
+static void testRecreate() {
+  const fs::path root = tmpRoot() / "recreate";
+  fs::remove_all(root);
+  fs::create_directories(root);
+  const int W = 320, H = 200;
+  std::vector<std::uint8_t> px(std::size_t(W) * H * 3);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      std::uint8_t* p = &px[(std::size_t(y) * W + x) * 3];
+      p[0] = std::uint8_t(60 + x * 120 / W), p[1] = std::uint8_t(70 + y * 100 / H), p[2] = std::uint8_t(90 + (x + y) * 50 / (W + H));
+    }
+  const std::string jpg = (root / "src.jpg").string();
+  CHECK(stbi_write_jpg(jpg.c_str(), W, H, 3, px.data(), 95) != 0);
+  configure("", (root / "cache").string());
+  DappleSession* s = dapple_session_open(jpg.c_str(), DAPPLE_QUALITY_PREVIEW, 0);
+  CHECK(s != nullptr);
+  if (!s) return;
+  char* pid = dapple_session_ai_photo_id(s);
+  const std::string ph = pid ? pid : "";
+  dapple_free_string(pid);
+  const std::string id = makeId(ph, "person");
+  PlaneSet set;
+  set.entries = {{"person", rect(64, 40, 0, 0, 32, 40)}};
+  set.meta = "{\"found\":true}";
+  CHECK(storeGroup(ph, "person", set));
+  const std::string withMask = std::string("{\"local\":{\"v\":1,\"items\":[{\"id\":\"p\",\"strength\":100,\"mask\":[{\"kind\":\"raster\",\"op\":\"add\",\"ref\":\"") + id +
+                               "\",\"refine\":0}],\"adjust\":{\"exposure\":40}}]}}";
+  CHECK(local::rasterSet(id, 64, 40, set.entries[0].plane.px.data(), 64));
+  DappleFrameRequest rq{};
+  rq.size = int32_t(sizeof rq);
+  rq.flags = DAPPLE_FRAME_EXACT;
+  DappleImage ref{}, again{}, none{};
+  CHECK(dapple_session_render_frame(s, withMask.c_str(), nullptr, &rq, &ref, nullptr) == DAPPLE_OK);
+  // evicted: the next exact frame brings it back from the disk cache and renders the same picture
+  local::rasterRemove(id);
+  CHECK(dapple_mask_raster_has(id.c_str()) == 0);
+  CHECK(dapple_session_render_frame(s, withMask.c_str(), nullptr, &rq, &again, nullptr) == DAPPLE_OK);
+  CHECK(dapple_mask_raster_has(id.c_str()) == 1);
+  CHECK_NEAR(meanLuma(again, true), meanLuma(ref, true), 0.01);
+  // an interactive frame does not stop to re-create (the exact frame that follows does)
+  local::rasterRemove(id);
+  rq.flags = DAPPLE_FRAME_INTERACTIVE;
+  CHECK(dapple_session_render_frame(s, withMask.c_str(), nullptr, &rq, &none, nullptr) == DAPPLE_OK);
+  CHECK(dapple_mask_raster_has(id.c_str()) == 0);
+  dapple_free_image(&ref), dapple_free_image(&again), dapple_free_image(&none);
+  dapple_session_close(s);
+}
+
 // ---- sky -----------------------------------------------------------------------------------------------------------------------------------------
 static void testSky() {
   const int W = 320, H = 240;
@@ -697,7 +792,7 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"polygon", testPolygon}, {"faces", testFaces}, {"parts", testParts}, {"taps", testTaps}, {"depth", testDepth},
                      {"cache", testCache},     {"ensure", testEnsure}, {"export", testExport}, {"sky", testSky}, {"status", testStatus},
-                     {"mouth", testMouth}, {"facesjson", testFacesJson}, {"facescache", testFacesCache}};
+                     {"mouth", testMouth}, {"facesjson", testFacesJson}, {"facescache", testFacesCache}, {"store", testStore}, {"recreate", testRecreate}};
   if (argc < 2) {
     for (const T& t : tests) std::printf("%s\n", t.id);
     return 0;

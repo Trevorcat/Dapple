@@ -824,8 +824,9 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   // ------------------------------------------------------------ back
 
-  /// System back: typed value, then the layers (extra editor, itemised view, film map), then fold, then close, then zoom.
-  /// Returns true when something was dismissed.
+  /// System back (guidelines 5.x "返回"): closes at most ONE transient layer per press, innermost first: typed value, local card / heal
+  /// mode, extra editor, itemised view / film map, the open tool, immersive. Zoom and panel fold are not layers: back never only resets
+  /// them. With nothing open it returns false and the page leaves the editor. Returns true when something was dismissed.
   bool handleBack() {
     if (editingRow.value != null) {
       cancelNumeric();
@@ -842,20 +843,9 @@ class EditorController extends ChangeNotifier implements GestureSink {
       _bump();
       return true;
     }
-    if (docked) {
-      final w = wm.focused;
-      if (w != null && !w.collapsed) {
-        wm.setCollapsed(w.group, true);
-        return true;
-      }
-    }
     if (wm.closeLatest()) {
       _resetLayers();
       _bump();
-      return true;
-    }
-    if (zoom.zoomed) {
-      zoom.reset(animate: true);
       return true;
     }
     if (immersive.value) {
@@ -865,7 +855,11 @@ class EditorController extends ChangeNotifier implements GestureSink {
     return false;
   }
 
-  bool get canPop => editingRow.value == null && !wm.adjustMode && !zoom.zoomed && !immersive.value;
+  /// Something transient is open that one back would close (the route must not pop then).
+  bool get hasTransient =>
+      editingRow.value != null || local.hasCard || extra != null || itemised || filmMapOpen || wm.adjustMode || immersive.value;
+
+  bool get canPop => !hasTransient;
 
   @override
   void dispose() {
