@@ -3,7 +3,7 @@
 Run: F:/projects/sony-render/tools/py-ai/Scripts/python.exe -I F:/projects/sony-render/scripts/reshape/landmarks.py [name ...]
 Inputs: build/ai-eval/portraits/<p*>.jpg (CC0, docs/research/ai-test-images.md) and build/ai-eval/body/<b*>.jpg.
 Writes build/reshape/in/<name>/ (photo.png <= 2048, person.png at 1024, meta.json) and build/reshape/in/<name>_pts.jpg (points drawn).
-Pose model: MediaPipe Pose Landmarker full (Apache-2.0, model card "BlazePose GHUM 3D"), tools/_dl/ai-models/mp_pose/x_full/."""
+Pose model: MediaPipe Pose Landmarker full (Apache-2.0, model card "BlazePose GHUM 3D"), tools/_dl/ai-models/mp_pose/x_full/; the app ships the lite one (x_lite, DAPPLE_POSE=x_lite)."""
 import sys, os, math, json
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'ai-eval'))
@@ -18,8 +18,8 @@ ANCHOR_MESH = [10, 109, 67, 103, 54, 21, 162, 127, 234, 93, 132, 58, 172, 136, 1
                323, 454, 356, 389, 251, 284, 332, 297, 338, 468, 473, 33, 133, 362, 263, 159, 145, 386, 374, 64, 294, 1, 168, 61, 291, 13, 14]
 PORT = os.path.join(ROOT, 'build', 'ai-eval', 'portraits')
 BODY = os.path.join(ROOT, 'build', 'ai-eval', 'body')
-OUT = os.path.join(ROOT, 'build', 'reshape', 'in')
-POSE = os.path.join(ROOT, 'tools', '_dl', 'ai-models', 'mp_pose', 'x_full')
+OUT = os.environ.get('DAPPLE_RESHAPE_IN') or os.path.join(ROOT, 'build', 'reshape', 'in')  # DAPPLE_RESHAPE_IN: another input folder (the sheets tool reads the same variable)
+POSE = os.path.join(ROOT, 'tools', '_dl', 'ai-models', 'mp_pose', os.environ.get('DAPPLE_POSE', 'x_full'))  # DAPPLE_POSE=x_lite: the model the app ships
 NAMES = ['p1_glasses_flag', 'p2_dark_skin_dreads', 'p3_curly_glasses_outdoor', 'p5_headscarf', 'p6_asian_woman_grey', 'p9_three_people_frontal',
          'b1_seated_beach', 'b2_standing_parliament', 'b3_standing_hands_pockets', 'b4_cadet_leaning_wall', 'b5_couple_wall', 'b6_three_women_street']
 

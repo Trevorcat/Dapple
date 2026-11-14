@@ -4,8 +4,8 @@
 //   1. every active operator adds a smooth FORWARD displacement (where content goes) into a grid F: compactly supported kernels
 //      K(s) = (1 - s^2)^3 around landmarks / pose segments, so everything far from the person is exactly zero;
 //   2. background protection: the person / face operators are multiplied by w = 1 inside the person matte and a smooth decay over a
-//      band delta outside it (distance on the grid); the long-legs band stretch is not (it is a function of the height only, so straight
-//      horizontal and vertical lines stay straight);
+//      band delta outside it (distance on the grid); the long-legs stretch is not (it is a function of the height inside a horizontal window around
+//      the main person's legs, smooth to 0 at the sides: no seam, horizontal lines stay horizontal inside the window);
 //   3. fold-free: the spectral norm of grad F is limited to 0.75 (scaled down with one log line), so p -> p + F(p) is invertible;
 //   4. inversion into the BACKWARD field B (p + B(p) = q with q + F(q) = p) by fixed-point iteration q <- p - F(q);
 //   5. the manual push strokes are composed after the operators, dab by dab, in backward form: B'(p) = Bd(p) + B(p + Bd(p)); a restore
@@ -232,8 +232,10 @@ double halfWidth(const Matte* M, V c, V n, double est) {
   const double a = M->edge(c, n, 2.5 * est), b = M->edge(c, n * -1.0, 2.5 * est);
   return std::clamp(0.5 * (a + b), 0.6 * est, 1.6 * est);
 }
-// compress a capsule a -> b toward its axis: content at the edge (half width hw) moves in by amt * hw
-void limb(Grid& F, V a, V b, double hw, double amt) {
+// compress a capsule a -> b toward its axis: content at the edge (half width hw) moves in by amt * hw. `side`: 0 = both edges, +1 / -1 = only the
+// edge on the + / - side of the axis (n = perp(unit(b - a))), moved in by `boost` times as much: a limb pressed against the torso or the other
+// leg keeps its inner edge (the neighbour is not pulled along), the outer edge does the thinning.
+void limb(Grid& F, V a, V b, double hw, double amt, int side = 0, double boost = 1.0) {
   const double L = len(b - a);
   if (L < 1e-5 || hw < 1e-5) return;
   const V u = unit(b - a), n = perp(u);
@@ -241,10 +243,11 @@ void limb(Grid& F, V a, V b, double hw, double amt) {
   F.splat(std::min(a.x, b.x) - R - 0.3 * L, std::min(a.y, b.y) - R - 0.3 * L, std::max(a.x, b.x) + R + 0.3 * L, std::max(a.y, b.y) + R + 0.3 * L,
           [&](V p) {
             const double t = dot(p - a, u) / L, q = dot(p - a, n);
+            if (side * q < 0) return V{};
             const double G = t < 0.15 ? K((0.15 - t) / 0.3) : (t > 0.85 ? K((t - 0.85) / 0.3) : 1.0);
             if (G <= 0) return V{};
             const double H = plateau(std::fabs(q) / hw, 1.0, 1.0);
-            return H > 0 ? n * (-amt * q * H * G) : V{};
+            return H > 0 ? n * (-amt * (side ? boost : 1.0) * q * H * G) : V{};
           });
 }
 
@@ -266,33 +269,63 @@ void opWaist(Grid& F, const BodyGeo& g, const Matte* M, double s) {
   });
 }
 
+// An arm hangs against the torso when its midpoint lies beside the torso (within its half width of the torso's edge): then only the outer edge moves.
 void opArms(Grid& F, const BodyGeo& g, const Matte* M, double s) {
   const int seg[4][2] = {{11, 13}, {13, 15}, {12, 14}, {14, 16}};
+  const bool torso = g.ok(11) && g.ok(12) && g.ok(23) && g.ok(24);
+  const V S = (g.P[11] + g.P[12]) * 0.5, Hm = (g.P[23] + g.P[24]) * 0.5;
+  const double Lt = torso ? len(Hm - S) : 0;
   for (int k = 0; k < 4; ++k) {
     const int a = seg[k][0], b = seg[k][1];
     if (!(g.ok(a) && g.ok(b))) continue;
     const V u = unit(g.P[b] - g.P[a]), n = perp(u);
     const double est = (k % 2 == 0 ? 0.14 : 0.11) * g.sh;
-    const double hw = halfWidth(M, (g.P[a] + g.P[b]) * 0.5, n, est);
-    limb(F, g.P[a], g.P[b], hw, s * 0.12);
+    const V mid = (g.P[a] + g.P[b]) * 0.5;
+    const double hw = halfWidth(M, mid, n, est);
+    int side = 0;
+    if (torso && Lt > 1e-4) {
+      const V t = unit(Hm - S);
+      const double along = dot(mid - S, t) / Lt, lat = dot(mid - S, perp(t));
+      const double tw = 0.5 * std::max(g.sh, g.hipd);  // the torso's half width
+      if (along > -0.05 && along < 1.1 && std::fabs(lat) < tw + 1.2 * hw) {
+        // the side of the axis that faces the torso axis gets no field
+        const V toTorso = unit(S + t * dot(mid - S, t) - mid);
+        side = dot(toTorso, n) > 0 ? -1 : 1;
+      }
+    }
+    limb(F, g.P[a], g.P[b], hw, s * 0.12, side, 1.6);
   }
 }
 
+// Legs pressed together (the two midpoints closer than their widths): each leg keeps the edge that faces the other.
 void opLegs(Grid& F, const BodyGeo& g, const Matte* M, double s) {
   const int seg[4][2] = {{23, 25}, {25, 27}, {24, 26}, {26, 28}};
   const double base = std::max(g.hipd, 0.5 * g.sh);
+  double hwv[4] = {};
+  V mid[4];
+  bool ok[4];
   for (int k = 0; k < 4; ++k) {
     const int a = seg[k][0], b = seg[k][1];
-    if (!(g.ok(a) && g.ok(b))) continue;
+    ok[k] = g.ok(a) && g.ok(b);
+    if (!ok[k]) continue;
     const V u = unit(g.P[b] - g.P[a]), n = perp(u);
-    const double est = (k % 2 == 0 ? 0.40 : 0.27) * base;
-    const double hw = halfWidth(M, (g.P[a] + g.P[b]) * 0.5, n, est);
-    limb(F, g.P[a], g.P[b], hw, s * 0.10);
+    mid[k] = (g.P[a] + g.P[b]) * 0.5;
+    hwv[k] = halfWidth(M, mid[k], n, (k % 2 == 0 ? 0.40 : 0.27) * base);
+  }
+  for (int k = 0; k < 4; ++k) {
+    if (!ok[k]) continue;
+    const int a = seg[k][0], b = seg[k][1];
+    const V n = perp(unit(g.P[b] - g.P[a]));
+    int side = 0;
+    const int o = k < 2 ? k + 2 : k - 2;  // the same segment of the other leg
+    if (ok[o] && len(mid[k] - mid[o]) < 1.4 * (hwv[k] + hwv[o])) side = dot(mid[o] - mid[k], n) > 0 ? -1 : 1;
+    limb(F, g.P[a], g.P[b], hwv[k], s * 0.10, side, 1.6);
   }
 }
 
+// Needs the shoulders and the hips: on a head-and-shoulders crop the head is most of the picture and the shrink would be far past believable.
 void opHead(Grid& F, const BodyGeo& g, double s) {
-  if (!(g.ok(7) && g.ok(8))) return;
+  if (!(g.ok(7) && g.ok(8) && g.ok(11) && g.ok(12) && g.ok(23) && g.ok(24))) return;
   const V hc = (g.P[7] + g.P[8]) * 0.5;
   const double Rh = 0.8 * len(g.P[7] - g.P[8]);
   if (Rh < 1e-4) return;
@@ -306,9 +339,15 @@ void opHead(Grid& F, const BodyGeo& g, double s) {
   });
 }
 
-// 长腿: a band stretch in the height only (full width): legs from the hips to the feet longer by up to 12 %, the ground below the
-// feet compressed back so the frame keeps its content; nothing above the hips moves. Only for an upright body.
-void opLongLegs(Grid& F, const BodyGeo& g, double s) {
+// 长腿 (main person only): a stretch in the height, applied inside a horizontal WINDOW around this person's legs: legs from the hips to the
+// feet longer by up to 12 %, the ground below the feet compressed back so the frame keeps its content (exactly zero at the bottom row); nothing
+// above the hips moves. Field = fy(y) * W(x): W is 1 over the legs (hips to feet, widened by the person plane where it is there) and falls to 0 over
+// `fall` on both sides (smoothstep, no seam). The falloff is wide on purpose: a background line that crosses it is lifted by up to fy
+// in the window and by 0 outside, so its slope is at most 1.5 * peak / fall; fall = 8 * peak (at least half the window, at most 0.30 of the long
+// edge) keeps that slope at 0.19 (about 11 degrees) or less, 0.27 at the cap. Vertical lines bend by the same amount; horizontal lines stay
+// horizontal inside the window. Fold-free: grad F = [[0, 0], [fy W', fy' W]] with fy' <= 0.12 and fy W' <= 0.27.
+// Only for an upright body whose feet are in the picture with room below them (>= 1 % of the height below the shoes).
+void opLongLegs(Grid& F, const BodyGeo& g, const Matte* M, double s) {
   if (!(g.ok(23) && g.ok(24))) return;
   if (g.ok(11) && g.ok(12)) {
     const V t = unit((g.P[23] + g.P[24]) * 0.5 - (g.P[11] + g.P[12]) * 0.5);
@@ -316,15 +355,18 @@ void opLongLegs(Grid& F, const BodyGeo& g, double s) {
   }
   const double hipY = 0.5 * (g.P[23].y + g.P[24].y);
   double footY = -1;
-  for (int k = 25; k <= 32; ++k)
-    if (k >= 27 && g.ok(k)) footY = std::max(footY, g.P[k].y);
+  for (int k = 27; k <= 32; ++k)
+    if (g.ok(k)) footY = std::max(footY, g.P[k].y);
   const double B = F.AY;
   if (footY < 0) return;  // feet not visible: not a full-length picture, nothing to lengthen plausibly
-  footY = std::min(footY, B);
+  // the shoes reach below the foot landmarks (heel / toe points): the legs end 3 % of the height lower; a picture with no room below them (feet at the
+  // edge) has nowhere to put longer legs and is left alone
+  footY = std::min(footY + 0.03 * B, B);
+  if (B - footY < 0.01 * B) return;
   if (footY - hipY < 0.05 * B) return;
   double k = s * 0.12;
   const double m = 0.06 * (footY - hipY);
-  const bool ground = B - footY > 0.02 * B;
+  const bool ground = true;
   double c = 0;
   if (ground) {
     c = k * (footY - hipY) / (B - footY);
@@ -348,11 +390,37 @@ void opLongLegs(Grid& F, const BodyGeo& g, double s) {
     P[j] = P[j - 1] + sp * F.hY / 8, N[j] = N[j - 1] + sn * F.hY / 8;
   }
   const double scale = ground && N[n - 1] < 0 ? -P[n - 1] / N[n - 1] : 0.0;
+  std::vector<double> fy(n, 0.0);
+  double peak = 0;
   for (int j = 0; j < n; ++j) {
-    double fy = P[j] + scale * N[j];
-    if (j == n - 1 && ground) fy = 0;
-    if (std::fabs(fy) < 1e-12) continue;
-    for (int i = 0; i < F.gw; ++i) F.f[2 * (std::size_t(j) * F.gw + i) + 1] += fy;
+    double v = P[j] + scale * N[j];
+    if (j == n - 1 && ground) v = 0;
+    fy[j] = v;
+    peak = std::max(peak, std::fabs(v));
+  }
+  if (peak < 1e-9) return;
+  // the window: the leg landmarks (hips to feet) plus what a skirt or coat adds (the person plane's edge on a few rows, at most one body width)
+  double xl = 1e9, xr = -1e9;
+  for (int q = 23; q <= 32; ++q)
+    if (g.ok(q)) xl = std::min(xl, g.P[q].x), xr = std::max(xr, g.P[q].x);
+  const double base = std::max(g.hipd, 0.5 * g.sh);
+  double pl = 0.45 * base, pr = 0.45 * base;
+  if (M && M->r) {
+    for (int r = 1; r <= 5; ++r) {
+      const double y = hipY + (footY - hipY) * (0.15 + 0.17 * r);
+      if (M->at(V{xl, y}) >= 0.5) pl = std::max(pl, std::min(M->edge(V{xl, y}, V{-1, 0}, 1.0 * base), 1.0 * base));
+      if (M->at(V{xr, y}) >= 0.5) pr = std::max(pr, std::min(M->edge(V{xr, y}, V{1, 0}, 1.0 * base), 1.0 * base));
+    }
+  }
+  xl -= pl, xr += pr;
+  const double fall = std::clamp(std::max(8.0 * peak, 0.5 * (xr - xl)), 0.03, 0.30);
+  for (int j = 0; j < n; ++j) {
+    if (std::fabs(fy[j]) < 1e-12) continue;
+    for (int i = 0; i < F.gw; ++i) {
+      const double x = F.X(i);
+      const double w = x < xl ? sstep(xl - fall, xl, x) : (x > xr ? 1.0 - sstep(xr, xr + fall, x) : 1.0);
+      if (w > 0) F.f[2 * (std::size_t(j) * F.gw + i) + 1] += fy[j] * w;
+    }
   }
 }
 
@@ -559,6 +627,7 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
   // 1. forward field of the protected operators
   // the matte must cover the people it protects: every active face centre and the visible torso points of every active body. A segmenter
   // that missed the person (black-and-white photo, unusual pose) would otherwise cancel the operators: then no protection, logged.
+  std::vector<char> bodySkip(r.bodies.size(), 0);
   if (Mp) {
     int checked = 0, inside = 0;
     for (const ReshapeFace& f : r.faces)
@@ -566,14 +635,22 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
         const FaceGeo g = faceGeo(f, G.AX, G.AY);
         ++checked, inside += M.at(g.c) >= 0.5;
       }
-    for (const ReshapeBody& b : r.bodies)
+    // a body the person plane does not cover (a segmenter that missed it: black-and-white photos, odd poses) is not warped: its operators would
+    // bend the background behind it with nothing to confine them
+    for (std::size_t bi = 0; bi < r.bodies.size(); ++bi) {
+      const ReshapeBody& b = r.bodies[bi];
       if (b.active() && (b.waist || b.arms || b.legs || b.head)) {
         const BodyGeo g = bodyGeo(b, G.AX, G.AY);
         int n = 0, in = 0;
         for (int k : {0, 11, 12, 23, 24})
           if (g.ok(k)) ++n, in += M.at(g.P[k]) >= 0.5;
-        ++checked, inside += n == 0 || 2 * in >= n;
+        if (n > 0 && 2 * in < n) {
+          bodySkip[bi] = 1;
+          out->matteMissing = true;
+          local::logLine("reshape: the person plane does not cover the posed body: its operators are off");
+        }
       }
+    }
     if (inside < checked) {
       out->matteMissing = true;
       Mp = nullptr;
@@ -595,14 +672,17 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
     scale = std::max(scale, 0.15 * g.fw);
   }
   bool band = false;
-  for (const ReshapeBody& b : r.bodies) {
+  for (std::size_t bi = 0; bi < r.bodies.size(); ++bi) {
+    const ReshapeBody& b = r.bodies[bi];
     if (!b.active()) continue;
     const BodyGeo g = bodyGeo(b, G.AX, G.AY);
-    if (b.waist) opWaist(F, g, Mp, b.waist / 100.0);
-    if (b.arms) opArms(F, g, Mp, b.arms / 100.0);
-    if (b.legs) opLegs(F, g, Mp, b.legs / 100.0);
-    if (b.head) opHead(F, g, b.head / 100.0);
-    if (b.waist || b.arms || b.legs || b.head) scale = std::max(scale, 0.25 * g.sh);
+    if (!bodySkip[bi]) {
+      if (b.waist) opWaist(F, g, Mp, b.waist / 100.0);
+      if (b.arms) opArms(F, g, Mp, b.arms / 100.0);
+      if (b.legs) opLegs(F, g, Mp, b.legs / 100.0);
+      if (b.head) opHead(F, g, b.head / 100.0);
+      if (b.waist || b.arms || b.legs || b.head) scale = std::max(scale, 0.25 * g.sh);
+    }
     band = band || b.longLegs != 0;
   }
   // 2. background protection
@@ -615,7 +695,7 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
   }
   if (band)
     for (const ReshapeBody& b : r.bodies)
-      if (b.active() && b.longLegs) opLongLegs(F, bodyGeo(b, G.AX, G.AY), b.longLegs / 100.0);
+      if (b.active() && b.longLegs) opLongLegs(F, bodyGeo(b, G.AX, G.AY), M.r ? &M : nullptr, b.longLegs / 100.0);
   // 3. fold-free
   double gmax = maxGradient(F);
   if (gmax > 0.75) {

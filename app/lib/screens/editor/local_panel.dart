@@ -1630,17 +1630,22 @@ class PortraitPanel extends StatelessWidget {
     Widget shapeTile(ReshapeOp op, double w, double h) {
       final on = rt.on(op), selected = on && selShape == op;
       final spec = reshapeSpecOf(op);
-      return DTile(
+      // a body operator with nothing to work on (landmarks missing or doubtful): greyed (opacity 0.4, guidelines) with the reason under the word;
+      // a tap says it in full (the same pattern as the room note of the portrait chips)
+      final block = spec.body && !on ? rt.blockOf(op) : null;
+      final tile = DTile(
         key: ValueKey('shape-${op.name}'),
         label: spec.label,
         icon: reshapeIcon(op),
+        note: block?.note,
         width: w,
         height: h,
         state: selected ? TileState.selected : (on ? TileState.on : TileState.normal),
         cue: selected,
-        semantics: '${spec.label}${on ? '，已开' : ''}',
+        semantics: '${spec.label}${on ? '，已开' : ''}${block == null ? '' : '，不可用，${block.message}'}',
         onTap: () => rt.tap(op),
       );
+      return block == null ? tile : Opacity(key: ValueKey('shape-grey-${op.name}'), opacity: 0.4, child: tile);
     }
 
     final rGroups = reshapeGroups(rt);

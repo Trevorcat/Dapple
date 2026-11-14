@@ -23,6 +23,7 @@ Avail availability(const std::string&) {
 static Res off() { return {false, false, "AI masks are not part of this build"}; }
 Res person(const Img&, PersonOut&, const std::atomic<bool>*) { return off(); }
 Res faces(const Img&, const Plane*, int, std::vector<FaceMesh>&, const std::atomic<bool>*) { return off(); }
+Res poses(const Img&, int, std::vector<PoseOut>&, const std::atomic<bool>*) { return off(); }
 Res depth(const Img&, DepthOut&, const std::atomic<bool>*) { return off(); }
 Res prepareTap(const Img&, const std::string&, std::unique_ptr<TapHandle>&, const std::atomic<bool>*) { return off(); }
 void configure(const std::string&, int) {}
@@ -117,6 +118,7 @@ Avail availability(const std::string& dir) {
     a.reason = "tap models missing";
   }
   if (a.person && a.faces && a.depth && a.tap) a.reason.clear();
+  a.pose = modelExists(dir, "pose_detector") && modelExists(dir, "pose_landmarks");  // optional: never the reason of the others
   return a;
 }
 
@@ -140,6 +142,20 @@ Res faces(const Img& im, const Plane* personMask, int maxFaces, std::vector<Face
     FaceMesh m;
     for (int i = 0; i < 478; ++i) m.xy[i][0] = ff.lm.xy[i][0], m.xy[i][1] = ff.lm.xy[i][1], m.z[i] = ff.lm.z[i];
     out.push_back(m);
+  }
+  return {true, false, ""};
+}
+
+Res poses(const Img& im, int maxPoses, std::vector<PoseOut>& out, const std::atomic<bool>* cancel) {
+  out.clear();
+  std::vector<ai::Pose> p;
+  const ai::Status st = ai::findPoses(toImage(im), p, maxPoses, opts(cancel));
+  if (!st.ok()) return fromStatus(st);
+  for (const ai::Pose& q : p) {
+    PoseOut o;
+    for (int i = 0; i < 33; ++i) o.xy[i][0] = q.xy[i][0], o.xy[i][1] = q.xy[i][1], o.vis[i] = q.vis[i];
+    o.score = q.score;
+    out.push_back(o);
   }
   return {true, false, ""};
 }

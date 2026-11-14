@@ -224,8 +224,14 @@ bool loadInput(const fs::path& dir, Input& in) {
   return true;
 }
 
+// the input folder: build/reshape/in, or DAPPLE_RESHAPE_IN (scripts/reshape/landmarks.py writes the same variable's folder)
+std::string inRoot() {
+  const char* e = std::getenv("DAPPLE_RESHAPE_IN");
+  return e && *e ? e : "build/reshape/in";
+}
+
 int run(const fs::path& out, const std::string& name, std::ofstream& lines) {
-  const fs::path dir = fs::path("build/reshape/in") / name;
+  const fs::path dir = fs::path(inRoot()) / name;
   Input in;
   in.name = name;
   if (!loadInput(dir, in)) {
@@ -384,7 +390,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> names;
   for (int i = 2; i < argc; ++i) names.push_back(argv[i]);
   if (names.empty())
-    for (const auto& e : fs::directory_iterator("build/reshape/in"))
+    for (const auto& e : fs::directory_iterator(inRoot()))
       if (e.is_directory()) names.push_back(e.path().filename().string());
   std::sort(names.begin(), names.end());
   std::ofstream lines(out / "lines.txt");

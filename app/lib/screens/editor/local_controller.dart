@@ -490,6 +490,8 @@ class LocalController extends ChangeNotifier {
     personFound = skyFound = false;
     faces = 0;
     faceList = const [];
+    poseList = const [];
+    _bodyCovered = null;
     _tapSessionRef = '';
     missingRefs.clear();
   }
@@ -529,6 +531,9 @@ class LocalController extends ChangeNotifier {
       debugPrint('local ai: tasks $tasks -> ${r?.state} ${r?.totalMs.round()} ms, ${r?.planes.length} planes, person ${r?.personFound}, faces ${r?.faces}, sky ${r?.skyFound}, '
           'groups ${r?.groups.map((g) => '${g.group}:${g.state}:${g.ms.round()}').join(' ')}');
     }
+    if (kDebugMode && r != null && r.poseList.isNotEmpty) {
+      debugPrint('local ai: poses ${r.poseList.length} main ${r.poseList.first.pts.map((v) => v.toStringAsFixed(4)).join(',')}');
+    }
     if (r != null && r.state != 'cancelled' && r.state != 'error') {
       aiDone |= tasks;
       for (final pl in r.planes) {
@@ -538,6 +543,10 @@ class LocalController extends ChangeNotifier {
       if ((tasks & AiBits.faces) != 0) {
         faces = r.faces;
         if (r.faceList.isNotEmpty) faceList = r.faceList;
+      }
+      if ((tasks & AiBits.pose) != 0) {
+        poseList = r.poseList;
+        _bodyCovered = null;
       }
       if ((tasks & AiBits.sky) != 0) skyFound = r.skyFound;
     } else if (r != null && r.state == 'error') {
@@ -555,7 +564,7 @@ class LocalController extends ChangeNotifier {
       aiPending = null;
     }
     if (r != null && (tasks & (AiBits.person | AiBits.faces)) != 0) _portraitFacesDirty = true;
-    if (portraitWaiting && (aiDone & (AiBits.person | AiBits.faces)) == (AiBits.person | AiBits.faces)) {
+    if (portraitWaiting && portraitAnalysed) {
       portraitWaiting = false;
       _portraitReady();
     }
@@ -649,6 +658,31 @@ class LocalController extends ChangeNotifier {
   /// 对比 is held: the photo without any local area.
   bool comparing = false;
 
+  /// The people of the pose analysis, main person first (empty: not run on this device, or nobody found).
+  List<AiPose> poseList = const [];
+
+  /// Whether the person plane covers the main person's posed body (null: not computed yet for this analysis).
+  bool? _bodyCovered;
+
+  /// The engine's rule for the protected body operators: at least half of the visible nose, shoulder and hip points lie inside the person plane
+  /// (a segmenter that missed the person leaves them without protection and the engine skips them). No plane to ask = covered.
+  bool get bodyCovered {
+    final c = _bodyCovered;
+    if (c != null) return c;
+    final pose = poseList.isEmpty ? null : poseList.first.pts;
+    final pl = aiPlanes['person'];
+    final pv = pl == null ? null : ai.preview(pl.id, longEdge: 256);
+    if (pose == null || pose.length != 99 || pv == null || pv.width < 2) return _bodyCovered = true;
+    var n = 0, inside = 0;
+    for (final k in const [0, 11, 12, 23, 24]) {
+      if (pose[3 * k + 2] < 0.5) continue;
+      n++;
+      final x = (pose[3 * k] * pv.width).floor().clamp(0, pv.width - 1), y = (pose[3 * k + 1] * pv.height).floor().clamp(0, pv.height - 1);
+      if (pv.rgba[4 * (y * pv.width + x)] >= 128) inside++;
+    }
+    return _bodyCovered = n == 0 || 2 * inside >= n;
+  }
+
   /// The engine's face list of the last analysis (`face_list`: iod, mouth, teeth per face); empty with an older engine or cache.
   List<AiFace> faceList = const [];
 
@@ -688,7 +722,10 @@ class LocalController extends ChangeNotifier {
 
   List<PortraitChip> get portraitChips => availableChips(aiPlanes.keys.toSet(), portraitFaces);
 
-  bool get portraitAnalysed => (aiDone & (AiBits.person | AiBits.faces)) == (AiBits.person | AiBits.faces);
+  /// The analysis the 人像 panel needs: the people and faces, and the body pose where the device has the pose model.
+  int get portraitTasks => AiBits.person | AiBits.faces | (deviceTasks & AiBits.pose);
+
+  bool get portraitAnalysed => (aiDone & portraitTasks) == portraitTasks;
 
   /// The chip of the selected area (null: not a portrait area).
   PortraitChip? get selChip {
@@ -707,7 +744,7 @@ class LocalController extends ChangeNotifier {
       _portraitReady();
     } else {
       portraitWaiting = true;
-      startAnalysis(AiBits.person | AiBits.faces);
+      startAnalysis(portraitTasks);
     }
     _changed();
   }
@@ -1257,6 +1294,8 @@ class LocalController extends ChangeNotifier {
 
   /// Zoom factor of the photo (handles keep their screen size).
   double zoomScale = 1;
+
+  double get photoAspect => _photoAspect;
 
   double get _photoAspect {
     final p = ctl.app.photoById(ctl.id);

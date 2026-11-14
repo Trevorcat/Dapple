@@ -697,3 +697,23 @@ std::string photoIdOf(const float* lin, int w, int h) {
 }
 
 }  // namespace dapple::aimask
+
+namespace dapple::aimask {
+std::string posesMetaJson(const std::vector<PoseMeta>& poses, int w, int h) {
+  const float W = float(std::max(1, w)), H = float(std::max(1, h));
+  std::string j = "{\"count\":" + std::to_string(poses.size()) + ",\"list\":[";
+  for (std::size_t i = 0; i < poses.size(); ++i) {
+    char b[64];
+    std::snprintf(b, sizeof b, "%s{\"index\":%zu,\"score\":%.3f,\"pts\":[", i ? "," : "", i + 1, double(poses[i].score));
+    j += b;
+    for (int k = 0; k < 33; ++k) {
+      char s[64];
+      std::snprintf(s, sizeof s, k ? ",%.5f,%.5f,%.3f" : "%.5f,%.5f,%.3f", double(std::clamp(poses[i].xy[k][0] / W, -0.5f, 1.5f)),
+                    double(std::clamp(poses[i].xy[k][1] / H, -0.5f, 1.5f)), double(std::clamp(poses[i].vis[k], 0.f, 1.f)));
+      j += s;
+    }
+    j += "]}";
+  }
+  return j + "]}";
+}
+}  // namespace dapple::aimask

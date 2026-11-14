@@ -22,11 +22,17 @@ class ReshapeTool {
   /// The faces the analysis gave anchors for (an engine / cache without `shape` gives none: the face tiles stay away).
   List<AiFace> get faces => [for (final f in lc.faceList) if (f.shape.length == 108) f];
 
-  /// The pose of the main person: not produced by this build's analysis (the body tiles appear when it is).
-  List<double>? get pose => null;
+  /// The pose of the main person (the first of the analysis' people: largest, then most central); null = none found.
+  List<double>? get pose => lc.poseList.isEmpty || lc.poseList.first.pts.length != 99 ? null : lc.poseList.first.pts;
+
+  /// The device has the pose model: the 身体 group is shown (greyed where an operator has nothing to work on).
+  bool get bodyAvailable => (lc.deviceTasks & AiBits.pose) != 0 || value.body != null;
+
+  /// Why [op] cannot work on this photo (null = it can): missing or doubtful landmarks, or no person plane under the body.
+  BodyBlock? blockOf(ReshapeOp op) => bodyBlockFor(op, pose, covered: lc.bodyCovered, aspect: lc.photoAspect);
 
   List<ReshapeOp> get faceOps => faces.isEmpty ? const [] : faceOpsFor(anyFrontal: faces.any((f) => f.frontal));
-  List<ReshapeOp> get bodyOps => pose == null ? const [] : const [ReshapeOp.waist, ReshapeOp.arms, ReshapeOp.legs, ReshapeOp.longLegs, ReshapeOp.head];
+  List<ReshapeOp> get bodyOps => bodyAvailable ? const [ReshapeOp.waist, ReshapeOp.arms, ReshapeOp.legs, ReshapeOp.longLegs, ReshapeOp.head] : const [];
 
   /// Push works on any photo (no analysis needed).
   bool get available => true;
@@ -51,6 +57,16 @@ class ReshapeTool {
   /// A tile (U3): off -> on at the recommended amount for the main person (the largest face) and selected; on, not selected -> selected;
   /// selected -> its action card (关掉).
   void tap(ReshapeOp op) {
+    if (reshapeSpecOf(op).body) {
+      final b = blockOf(op);
+      if (b != null) {
+        // greyed: say why instead of doing nothing (an operator that was on keeps its tile on so 关掉 still works)
+        if (!on(op)) {
+          lc._toast(b.message);
+          return;
+        }
+      }
+    }
     if (!on(op)) {
       final main = faces.isEmpty ? <int>{} : {faces.first.index};
       _write(_anchored().withValue(op, kReshapeDefault, sel: main));
@@ -166,7 +182,7 @@ extension ReshapeItems on ReshapeTool {
     if (op == null) return const [];
     final body = reshapeSpecOf(op).body;
     return [
-      for (final o in body ? bodyOps : faceOps)
+      for (final o in body ? [for (final b in bodyOps) if (blockOf(b) == null || on(b)) b] : faceOps)
         PadItem(reshapeSpecOf(o).key, reshapeSpecOf(o).label, reshapeSpecOf(o).min, 100, 0, (v) => fmtValue(reshapeSpecOf(o).min < 0 ? Fmt.signed : Fmt.plain, v)),
     ];
   }

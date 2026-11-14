@@ -43,6 +43,7 @@ class AiTask {
   static const depth = 4;
   static const sky = 8; // classical prior, "天空 (粗略)"
   static const tapPrepare = 16; // run the tap encoder now
+  static const pose = 32; // body landmarks of up to 4 people, main person first (job result `pose_list`)
   static const all = person | faces | depth | sky;
 }
 
@@ -107,6 +108,7 @@ class AiAvailability {
     this.depth = false,
     this.tap = false,
     this.sky = false,
+    this.pose = false,
     this.tapEngine = '',
     this.backends = '',
     this.reason = '',
@@ -114,12 +116,12 @@ class AiAvailability {
   });
   static const none = AiAvailability(reason: 'native library without AI masks');
 
-  final bool compiled, available, person, faces, depth, tap, sky;
+  final bool compiled, available, person, faces, depth, tap, sky, pose;
   final String tapEngine, backends, reason;
   final int residentBytes;
 
   /// Bit mask of the AiTask values that can run.
-  int get tasks => (person ? AiTask.person : 0) | (faces ? AiTask.faces : 0) | (depth ? AiTask.depth : 0) | (sky ? AiTask.sky : 0) | (tap ? AiTask.tapPrepare : 0);
+  int get tasks => (person ? AiTask.person : 0) | (faces ? AiTask.faces : 0) | (depth ? AiTask.depth : 0) | (sky ? AiTask.sky : 0) | (tap ? AiTask.tapPrepare : 0) | (pose ? AiTask.pose : 0);
 
   factory AiAvailability.fromJson(Map<String, Object?> j) {
     final t = j['tasks'] is Map ? Map<String, Object?>.from(j['tasks']! as Map) : const <String, Object?>{};
@@ -132,6 +134,7 @@ class AiAvailability {
       depth: b(t['depth']),
       tap: b(t['tap']),
       sky: b(t['sky']),
+      pose: b(t['pose']),
       tapEngine: '${j['tap_engine'] ?? ''}',
       backends: '${j['backends'] ?? ''}',
       reason: '${j['reason'] ?? ''}',
@@ -196,8 +199,26 @@ class AiFace {
       );
 }
 
+/// One person of a job's `pose_list`: 1-based index (main person first), the detector's score and the 33 BlazePose landmarks as photo-normalised
+/// (x, y, visibility) triples (99 numbers; the layout of `ReshapeBody.pts`).
+class AiPose {
+  const AiPose({required this.index, this.score = 0, this.pts = const []});
+  final int index;
+  final double score;
+  final List<double> pts;
+
+  factory AiPose.fromJson(Map<String, Object?> j) => AiPose(
+        index: (j['index'] as num?)?.toInt() ?? 0,
+        score: (j['score'] as num?)?.toDouble() ?? 0,
+        pts: AiFace._nums(j['pts']),
+      );
+}
+
 class AiJobResult {
-  const AiJobResult({required this.state, required this.message, required this.planes, required this.groups, required this.personFound, required this.faces, required this.skyFound, required this.totalMs, this.faceList = const []});
+  const AiJobResult({required this.state, required this.message, required this.planes, required this.groups, required this.personFound, required this.faces, required this.skyFound, required this.totalMs, this.faceList = const [], this.poseList = const []});
+
+  /// The people of the pose analysis (`pose_list`), main person first; empty when it did not run or found nobody.
+  final List<AiPose> poseList;
 
   /// The faces of the analysis (`face_list`); empty from an engine / cache that does not write it (the app then estimates the scale).
   final List<AiFace> faceList;
@@ -235,6 +256,7 @@ class AiJobResult {
       skyFound: j['sky_found'] == true,
       totalMs: (j['total_ms'] as num?)?.toDouble() ?? 0,
       faceList: [for (final f in (j['face_list'] as List? ?? const [])) if (f is Map) AiFace.fromJson(Map<String, Object?>.from(f))],
+      poseList: [for (final f in (j['pose_list'] as List? ?? const [])) if (f is Map) AiPose.fromJson(Map<String, Object?>.from(f))],
     );
   }
 }

@@ -270,7 +270,7 @@ endforeach()
 add_executable(dapple_reshape_tests engine/reshape_tests.cpp)
 target_link_libraries(dapple_reshape_tests PRIVATE dapple_core)
 target_include_directories(dapple_reshape_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/cli)
-set(_reshape_ids json identity bounded protect push tiles region interactive mappoint sharpness)
+set(_reshape_ids json identity bounded protect push tiles region interactive mappoint sharpness body)
 if(TARGET dapple_gpu)
   target_link_libraries(dapple_reshape_tests PRIVATE dapple_gpu)
   target_include_directories(dapple_reshape_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src)
@@ -650,9 +650,9 @@ foreach(_t ${_dapple_heavy})
   endif()
 endforeach()
 
-# Timing-sensitive (present.loop_view measures a frame loop) or not yet safe next to other test processes (film.c_api crashes only when run in parallel:
+# Timing-sensitive (present.loop_view measures a frame loop, demosaic.wire_cancel a cancel latency) or not yet safe next to other test processes (film.c_api crashes only when run in parallel:
 # shared state still to be found): run them alone so the default run does not report load as failures.
-foreach(_t present.loop_view film.c_api)
+foreach(_t present.loop_view film.c_api demosaic.wire_cancel)
   if(TEST ${_t})
     set_tests_properties(${_t} PROPERTIES RUN_SERIAL TRUE)
   endif()

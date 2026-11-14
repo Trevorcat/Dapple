@@ -45,7 +45,7 @@ enum LocalGlyph { linear, radial, brush, luminance, color, subject, sky, person,
 
 /// AiTask bits (app/lib/native/ai_bindings.dart), repeated here so the model needs no native import.
 abstract final class AiBits {
-  static const person = 1, faces = 2, depth = 4, sky = 8, tapPrepare = 16;
+  static const person = 1, faces = 2, depth = 4, sky = 8, tapPrepare = 16, pose = 32;
 }
 
 class LocalKind {

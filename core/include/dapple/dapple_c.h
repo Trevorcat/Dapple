@@ -204,7 +204,8 @@ enum {
   DAPPLE_AI_FACES = 2,        /* face features of up to max_faces faces (frontal faces get eyes / lips / teeth / brows) */
   DAPPLE_AI_DEPTH = 4,
   DAPPLE_AI_SKY = 8,          /* classical prior (+ depth far part when the depth model is present) */
-  DAPPLE_AI_TAP_PREPARE = 16  /* run the tap encoder now (about 0.7 s on a phone) so the first tap is fast */
+  DAPPLE_AI_TAP_PREPARE = 16, /* run the tap encoder now (about 0.7 s on a phone) so the first tap is fast */
+  DAPPLE_AI_POSE = 32         /* body landmarks of up to 4 people, main person first (job result "pose_list"; portrait reshaping body operators) */
 };
 /* model_dir: the files <id>.tflite|.ort|.onnx (person_parts, face_detector, face_landmarks, depth, tap_encoder, tap_decoder, sam_encoder,
  * sam_decoder); cache_dir: the app cache directory (the same as dapple_gpu_configure's; may be NULL = no disk cache). */

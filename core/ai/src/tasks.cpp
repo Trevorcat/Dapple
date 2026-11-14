@@ -293,6 +293,131 @@ Status faceLandmarks(const Image& im, const Face& face, Landmarks& out, const Ta
   return {};
 }
 
+// ---- poses ----------------------------------------------------------------------------------------------------------------------------
+namespace {
+// SSD anchors of the BlazePose detector (224 input): strides 8, 16, 32 x3 -> 28x28x2, 14x14x2, 7x7x6 = 2254, centres (x + .5) / fm
+struct PoseAnchors {
+  std::vector<float> x, y;
+  PoseAnchors() {
+    for (auto [fm, k] : {std::pair<int, int>{28, 2}, std::pair<int, int>{14, 2}, std::pair<int, int>{7, 6}})
+      for (int yy = 0; yy < fm; ++yy)
+        for (int xx = 0; xx < fm; ++xx)
+          for (int i = 0; i < k; ++i) {
+            x.push_back((xx + 0.5f) / fm);
+            y.push_back((yy + 0.5f) / fm);
+          }
+  }
+};
+struct PoseCand {
+  float score, box[4], kp[2][2];  // box cx cy w h; kp0 = mid hip, kp1 = the point on the full-body circle
+};
+}  // namespace
+
+Status findPoses(const Image& im, std::vector<Pose>& out, int maxPoses, const TaskOptions& o) {
+  out.clear();
+  if (auto s = checkImage(im); !s) return s;
+  static const PoseAnchors an;
+  int ox = 0, oy = 0;
+  const img::Rgb sq = img::letterboxSquare(im, ox, oy);
+  const int s = sq.w;
+  const img::Rgb small = img::resizeBilinear(sq.px.data(), s, s, s * 3, 224, 224);
+  std::vector<float> in = toNhwc(small, 1.0f, 127.5f, 127.5f, true);
+  std::vector<Tensor> res;
+  if (auto st = run(modelFor("pose_detector"), {view(DType::F32, {1, 224, 224, 3}, in.data())}, res, ro(o)); !st) return st;
+  if (res.size() < 2) return {Code::RunFailed, "pose_detector: unexpected outputs"};
+  const Tensor* raw = &res[0];
+  const Tensor* sc = &res[1];
+  if (raw->count() != 2254 * 12) std::swap(raw, sc);
+  if (raw->count() != 2254 * 12 || sc->count() != 2254) return {Code::RunFailed, "pose_detector: unexpected output shapes"};
+  std::vector<PoseCand> cand;
+  for (int i = 0; i < 2254; ++i) {
+    const float p = sigmoidf(std::min(100.0f, std::max(-100.0f, sc->f32()[i])));
+    if (p < 0.5f) continue;
+    const float* r = raw->f32() + size_t(i) * 12;
+    PoseCand c;
+    c.score = p;
+    c.box[0] = (r[0] / 224 + an.x[size_t(i)]) * float(s) - float(ox);
+    c.box[1] = (r[1] / 224 + an.y[size_t(i)]) * float(s) - float(oy);
+    c.box[2] = r[2] / 224 * float(s);
+    c.box[3] = r[3] / 224 * float(s);
+    for (int k = 0; k < 2; ++k) {
+      c.kp[k][0] = (r[4 + 2 * k] / 224 + an.x[size_t(i)]) * float(s) - float(ox);
+      c.kp[k][1] = (r[5 + 2 * k] / 224 + an.y[size_t(i)]) * float(s) - float(oy);
+    }
+    cand.push_back(c);
+  }
+  // weighted NMS (IoU 0.3)
+  std::stable_sort(cand.begin(), cand.end(), [](const PoseCand& a, const PoseCand& b) { return a.score > b.score; });
+  std::vector<PoseCand> dets;
+  while (!cand.empty() && int(dets.size()) < 2 * std::max(1, maxPoses)) {
+    const PoseCand best = cand[0];
+    std::vector<PoseCand> grp, rest;
+    for (const PoseCand& c : cand) (iouBox(best.box, c.box) > 0.3 ? grp : rest).push_back(c);
+    double wsum = 0, kp[2][2] = {};
+    for (auto& c : grp) wsum += c.score;
+    for (auto& c : grp)
+      for (int k = 0; k < 2; ++k) for (int j = 0; j < 2; ++j) kp[k][j] += double(c.kp[k][j]) * c.score;
+    PoseCand m = best;
+    for (int k = 0; k < 2; ++k) for (int j = 0; j < 2; ++j) m.kp[k][j] = float(kp[k][j] / wsum);
+    dets.push_back(m);
+    cand = std::move(rest);
+  }
+  const float cxImg = 0.5f * float(im.w), cyImg = 0.5f * float(im.h);
+  struct Ranked {
+    Pose p;
+    float rank;
+  };
+  std::vector<Ranked> ranked;
+  for (const PoseCand& d : dets) {
+    if (o.cancel && o.cancel->load()) return {Code::Cancelled, "cancelled"};
+    const double x0 = d.kp[0][0], y0 = d.kp[0][1], dx = double(d.kp[1][0]) - x0, dy = double(d.kp[1][1]) - y0;
+    const double L = std::sqrt(dx * dx + dy * dy);
+    if (L < 8) continue;  // a detection too small to crop usefully
+    const double ux = dx / L, uy = dy / L, size = 2 * L * 1.25, th = std::atan2(ux, -uy);
+    const double c = std::cos(th), sn = std::sin(th), k = size / 256;
+    const double a[6] = {c * k, -sn * k, x0 - 128 * k * c + 128 * k * sn, sn * k, c * k, y0 - 128 * k * sn - 128 * k * c};
+    const img::Rgb crop = img::affineBilinear(im, a, 256, 256);
+    std::vector<float> cin = toNhwc(crop, 255.0f, 0, 1, false);
+    std::vector<Tensor> lr;
+    if (auto st = run(modelFor("pose_landmarks"), {view(DType::F32, {1, 256, 256, 3}, cin.data())}, lr, ro(o)); !st) return st;
+    const Tensor* lm = nullptr;
+    const Tensor* fl = nullptr;
+    for (const Tensor& t : lr) {
+      if (t.count() == 195 && !lm) lm = &t;
+      else if (t.count() == 1 && !fl) fl = &t;
+    }
+    if (!lm || !fl) return {Code::RunFailed, "pose_landmarks: unexpected outputs"};
+    Pose p;
+    p.score = d.score;
+    p.flag = fl->f32()[0];
+    if (!(p.flag > 0.5f)) continue;
+    float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f;
+    for (int i = 0; i < 33; ++i) {
+      const double u = lm->f32()[i * 5], v = lm->f32()[i * 5 + 1];
+      p.xy[i][0] = float(a[0] * u + a[1] * v + a[2]);
+      p.xy[i][1] = float(a[3] * u + a[4] * v + a[5]);
+      p.vis[i] = sigmoidf(std::min(100.0f, std::max(-100.0f, lm->f32()[i * 5 + 3]))) * sigmoidf(std::min(100.0f, std::max(-100.0f, lm->f32()[i * 5 + 4])));
+      if (p.vis[i] >= 0.5f) {
+        bx0 = std::min(bx0, p.xy[i][0]), bx1 = std::max(bx1, p.xy[i][0]);
+        by0 = std::min(by0, p.xy[i][1]), by1 = std::max(by1, p.xy[i][1]);
+      }
+    }
+    if (bx1 < bx0) continue;  // nothing visible
+    p.box[0] = bx0, p.box[1] = by0, p.box[2] = bx1, p.box[3] = by1;
+    // main person: the largest extent, discounted by how far its centre is from the picture's centre (0 at the centre .. -50 % at a corner)
+    const float area = (bx1 - bx0) * (by1 - by0);
+    const float dxc = (0.5f * (bx0 + bx1) - cxImg) / float(im.w), dyc = (0.5f * (by0 + by1) - cyImg) / float(im.h);
+    const float offc = std::min(1.0f, std::sqrt(dxc * dxc + dyc * dyc) / 0.7071f);
+    ranked.push_back({p, area * (1.0f - 0.5f * offc)});
+  }
+  std::stable_sort(ranked.begin(), ranked.end(), [](const Ranked& a, const Ranked& b) { return a.rank > b.rank; });
+  for (const Ranked& r : ranked) {
+    if (int(out.size()) >= maxPoses) break;
+    out.push_back(r.p);
+  }
+  return {};
+}
+
 // ---- person parts --------------------------------------------------------------------------------------------------------------------
 namespace {
 struct GateFeatures {

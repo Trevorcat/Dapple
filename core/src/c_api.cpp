@@ -1324,7 +1324,7 @@ int32_t dapple_session_ai_start(DappleSession* s, int32_t tasks, int32_t flags, 
           setError("AI masks unavailable: " + a.reason);
           return -1;
         }
-        return aimask::startJob(aiSource(s), tasks & 31, max_faces > 0 ? max_faces : aimask::kMaxFaces, (flags & 1) != 0);
+        return aimask::startJob(aiSource(s), tasks & 63, max_faces > 0 ? max_faces : aimask::kMaxFaces, (flags & 1) != 0);
       },
       -1);
 }

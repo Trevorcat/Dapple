@@ -398,6 +398,123 @@ void testProtect() {
   CHECK(f && f->matteMissing && !f->matteUsed);
 }
 
+// ---- body operators: long legs for the main person only, gating, limbs pressed together ---------------------------------------------------------
+// A landscape photo with two figures 0.5 long edges apart; only the first has long legs (the app gives the engine the main person only).
+ReshapeBody figure(int W, int H, double xL, double sc) {
+  ReshapeBody b = synthBody(W, H);
+  const double L = std::max(W, H), cxL = 0.5 * W / L;
+  for (int k = 0; k < kReshapeBodyPts; ++k) {
+    b.pts[3 * k] = float(((b.pts[3 * k] * W / L - cxL) * sc + xL) * L / W);
+    b.pts[3 * k + 1] = float(b.pts[3 * k + 1] * H / L * sc * L / H);
+  }
+  return b;
+}
+void testBody() {
+  const int W = 1800, H = 1000;
+  const double L = 1800, B = double(H) / L;
+  ReshapeBody a = figure(W, H, 0.30, 0.55);
+  a.longLegs = 100;
+  ReshapeParams r;
+  r.bodies = {a};
+  auto f = warp::bind(r, W, H, false);
+  CHECK(f != nullptr);
+  if (!f) return;
+  double legsMax = 0, farMax = 0, bottom = 0, jump = 0, slope = 0;
+  const double footRow = 0.55 * 0.91;
+  for (int j = 0; j < 500; ++j) {
+    const double v = (j + 0.5) / 500;
+    double prev = 0;
+    for (int i = 0; i < 1800; i += 2) {
+      const double u = (i + 0.5) / 1800;
+      double dx, dy;
+      warp::sampleUV(*f, u, v, dx, dy);
+      const double x = u;  // isotropic: AX = 1
+      if (std::fabs(x - 0.30) < 0.04 && std::fabs(v * B - footRow) < 0.03) legsMax = std::max(legsMax, std::fabs(dy));
+      if (x > 0.70) farMax = std::max(farMax, std::hypot(dx, dy));
+      if (j == 499) {
+        double bx, by;
+        warp::sampleUV(*f, u, 1.0, bx, by);
+        bottom = std::max(bottom, std::fabs(by));
+      }
+      if (i) jump = std::max(jump, std::fabs(dy - prev)), slope = std::max(slope, std::fabs(dy - prev) / (2.0 / 1800));
+      prev = dy;
+    }
+  }
+  std::printf("  long legs, main person only: |dy| at the legs %.2f px, beyond the window 0 (%.2e px), bottom row %.2e px, max step between samples %.3f px, max slope along a row %.3f\n",
+              legsMax * L, farMax * L, bottom * L, jump * L, slope);
+  CHECK(legsMax * L > 8);
+  CHECK(farMax == 0.0);  // the second figure (x = 0.8) and everything right of the falloff: exactly untouched
+  CHECK(bottom * L < 0.01);
+  CHECK(jump * L < 1.5);  // smooth over 2 px steps: no seam
+  CHECK(slope < 0.30);
+  CHECK(f->maxGrad < 0.75f && !f->gradLimited);
+
+  // gating: a body without what the operator needs moves nothing
+  auto vis = [&](ReshapeBody b, std::initializer_list<int> ks, float v) {
+    for (int k : ks) b.pts[3 * k + 2] = v;
+    return b;
+  };
+  auto moves = [&](const ReshapeBody& b) {
+    ReshapeParams p;
+    p.bodies = {b};
+    auto g = warp::bind(p, W, H, false);
+    return g && g->maxDisp > 0;
+  };
+  ReshapeBody full = figure(W, H, 0.30, 0.55);
+  ReshapeBody t = full;
+  t.longLegs = 100;
+  CHECK(moves(t));
+  CHECK(!moves(vis(t, {27, 28, 29, 30, 31, 32}, 0.1f)));  // no feet
+  t = full, t.head = 100;
+  CHECK(moves(t));
+  CHECK(!moves(vis(t, {23, 24}, 0.1f)));                  // head and shoulders only
+  t = full, t.legs = 100;
+  CHECK(moves(t));
+  CHECK(!moves(vis(t, {25, 26, 27, 28}, 0.1f)));          // no legs
+  t = full, t.waist = 100;
+  CHECK(!moves(vis(t, {23, 24}, 0.1f)));                  // no hips
+  t = full, t.arms = 100;
+  CHECK(!moves(vis(t, {13, 14, 15, 16}, 0.1f)));          // no arms
+
+  // a person plane that does not cover the posed body (the segmenter missed it): the protected operators are off
+  {
+    std::vector<std::uint8_t> zero(64 * 64, 0);
+    local::rasterSet("rs_empty", 64, 64, zero.data(), 64);
+    ReshapeParams p;
+    t = full, t.waist = 100, t.arms = 100;
+    p.bodies = {t};
+    p.matte = "rs_empty";
+    auto g = warp::bind(p, W, H, false);
+    CHECK(g == nullptr || g->maxDisp == 0);
+  }
+
+  // legs pressed together and an arm against the torso: the inner edge stays (the neighbour is not pulled), the outer edge moves in
+  {
+    const int W2 = 900, H2 = 1200;
+    ReshapeBody b = synthBody(W2, H2);
+    b.legs = 100;
+    ReshapeParams p;
+    p.bodies = {b};
+    auto g = warp::bind(p, W2, H2, false);
+    CHECK(g != nullptr);
+    if (g) {
+      const double L2 = 1200, cx = 0.5, y = 0.70 * L2 / H2;  // mid thigh
+      double inner = 0, outer = 0, dx, dy;
+      for (double d = 0.0; d <= 0.02; d += 0.002) {  // the gap between the legs (edges at +-0.01 L around the centre)
+        warp::sampleUV(*g, cx + d * L2 / W2, y, dx, dy);
+        inner = std::max(inner, std::fabs(dx) * L2);
+      }
+      for (double d = 0.07; d <= 0.085; d += 0.002) {  // the outer edge of the right leg (x = 0.045 + 0.035 = 0.08 L)
+        warp::sampleUV(*g, cx + d * L2 / W2, y, dx, dy);
+        outer = std::max(outer, std::fabs(dx) * L2);
+      }
+      std::printf("  legs together at 100: |B| in the gap %.2f px, at the outer edge %.2f px\n", inner, outer);
+      CHECK(outer > 1.0);
+      CHECK(inner < 0.2 * outer);
+    }
+  }
+}
+
 // ---- push / restore ----------------------------------------------------------------------------------------------------------------------------
 void testPush() {
   const int W = 800, H = 800;
@@ -846,7 +963,7 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"json", testJson},       {"identity", testIdentity}, {"bounded", testBounded},         {"protect", testProtect},
                      {"push", testPush},       {"tiles", testTiles},       {"region", testRegion},           {"interactive", testInteractive},
-                     {"mappoint", testMapPoint}, {"sharpness", testSharpness},
+                     {"mappoint", testMapPoint}, {"sharpness", testSharpness}, {"body", testBody},
 #ifdef DAPPLE_RESHAPE_GPU
                      {"parity", testParity},
 #endif

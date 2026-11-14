@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -163,7 +164,7 @@ std::string availabilityJson() {
   const bool any = a.person || a.faces || a.depth || a.tap || (kShipSky && rt::compiled());
   std::string j = std::string("{\"compiled\":") + (rt::compiled() ? "true" : "false") + ",\"available\":" + (any ? "true" : "false") +
                   ",\"backends\":\"" + esc(a.backends) + "\",\"tasks\":{\"person\":" + (a.person ? "true" : "false") +
-                  ",\"faces\":" + (a.faces ? "true" : "false") + ",\"depth\":" + (a.depth ? "true" : "false") +
+                  ",\"faces\":" + (a.faces ? "true" : "false") + ",\"depth\":" + (a.depth ? "true" : "false") + ",\"pose\":" + (a.pose ? "true" : "false") +
                   ",\"tap\":" + (a.tap ? "true" : "false") + ",\"sky\":" + (kShipSky && rt::compiled() ? "true" : "false") + "},\"tap_engine\":\"" + a.tapEngine +
                   "\",\"reason\":\"" + esc(a.reason) + "\",\"resident_bytes\":" + std::to_string(rt::resident()) + "}";
   return j;
@@ -175,6 +176,7 @@ std::string Result::json() const {
   std::snprintf(b, sizeof b, ",\"faces\":%d,\"sky_found\":%s,\"render_ms\":%.1f,\"total_ms\":%.1f", faceCount, skyFound ? "true" : "false", renderMs, totalMs);
   j += b;
   j += ",\"face_list\":" + (facesList.empty() ? std::string("[]") : facesList);
+  if (!poseList.empty()) j += ",\"pose_list\":" + poseList;
   j += ",\"groups\":[";
   for (std::size_t i = 0; i < groups.size(); ++i) {
     std::snprintf(b, sizeof b, ",\"ms\":%.1f}", groups[i].ms);
@@ -238,7 +240,7 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
     const char* name;
     float w0, w1;
   };
-  const G groups[] = {{kTaskPerson, "person", 0.10f, 0.40f}, {kTaskFaces, "faces", 0.40f, 0.55f}, {kTaskDepth, "depth", 0.55f, 0.90f}, {kTaskSky, "sky", 0.90f, 1.0f}};
+  const G groups[] = {{kTaskPerson, "person", 0.10f, 0.40f}, {kTaskFaces, "faces", 0.40f, 0.50f}, {kTaskPose, "pose", 0.50f, 0.55f}, {kTaskDepth, "depth", 0.55f, 0.90f}, {kTaskSky, "sky", 0.90f, 1.0f}};
   for (const G& g : groups) {
     if (!(tasks & g.bit)) continue;
     if (cancelled()) {
@@ -265,6 +267,8 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
         unavailable(av.reason.empty() ? "person model unavailable" : av.reason);
       } else if (g.bit == kTaskFaces && !av.faces) {
         unavailable(av.reason.empty() ? "face models unavailable" : av.reason);
+      } else if (g.bit == kTaskPose && !av.pose) {
+        unavailable("pose models unavailable");
       } else if (g.bit == kTaskDepth && !av.depth) {
         unavailable(av.reason.empty() ? "depth model unavailable" : av.reason);
       } else if (!needRender()) {
@@ -304,6 +308,18 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
             }
             // iod: inter-ocular distance as a fraction of the photo's long edge = the "face" scale of a retouch adjustment (docs section 43.5)
             set.meta = facesMetaJson(fl, rend.w, rend.h);
+          }
+        } else if (g.bit == kTaskPose) {
+          std::vector<rt::PoseOut> ps;
+          res = rt::poses(im, 4, ps, ctl.cancel);
+          if (res.ok) {
+            std::vector<PoseMeta> pm;
+            for (const rt::PoseOut& q : ps) {
+              PoseMeta m;
+              std::memcpy(m.xy, q.xy, sizeof m.xy), std::memcpy(m.vis, q.vis, sizeof m.vis), m.score = q.score;
+              pm.push_back(m);
+            }
+            set.meta = posesMetaJson(pm, rend.w, rend.h);
           }
         } else if (g.bit == kTaskDepth) {
           rt::DepthOut d;
@@ -346,7 +362,7 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
     }
     if (have) {
       publish(ph, g.name, set, cachedHit, r);
-      gs.state = set.entries.empty() ? "none" : cachedHit ? "cached" : "ok";
+      gs.state = set.entries.empty() && !(g.bit == kTaskPose && set.meta.find("\"count\":0") == std::string::npos) ? "none" : cachedHit ? "cached" : "ok";
       if (g.bit == kTaskPerson) {
         r.personFound = metaFlag(set.meta, "found");
         if (!r.personFound) gs.message = "no person found";
@@ -357,6 +373,7 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
         r.facesList = facesListOfMeta(set.meta);
         if (!r.faceCount) gs.message = "no face mesh found";
       }
+      if (g.bit == kTaskPose) r.poseList = facesListOfMeta(set.meta);
       if (sky) {
         r.skyFound = !set.entries.empty();
         if (!r.skyFound) gs.message = "no sky-like region";

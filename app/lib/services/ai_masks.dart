@@ -22,7 +22,7 @@ import '../native/ai_bindings.dart';
 import '../native/dapple_session.dart';
 
 export '../native/ai_bindings.dart'
-    show AiTask, AiAvailability, AiPlane, AiGroup, AiFace, AiJobResult, AiProgress, AiTapResult, AiMissing, AiPlanePreview;
+    show AiTask, AiAvailability, AiPlane, AiGroup, AiFace, AiPose, AiJobResult, AiProgress, AiTapResult, AiMissing, AiPlanePreview;
 
 class AiMasks {
   AiMasks._();

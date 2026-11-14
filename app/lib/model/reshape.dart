@@ -243,3 +243,55 @@ double pushRadius(int i, {double iod = 0}) {
   final r = kPushRadius[i.clamp(0, kPushRadius.length - 1)];
   return iod > 0 ? math.max(0.008, math.min(0.25, r * (iod / 0.06).clamp(0.5, 2.5))) : r;
 }
+
+/// Why a body operator cannot work on this photo: the short word under the greyed tile and the sentence of the toast a tap on it shows.
+class BodyBlock {
+  const BodyBlock(this.note, this.message);
+  final String note, message;
+}
+
+/// What each body operator needs, from the pose of the main person (33 x (x, y, visibility), null = no pose found). The same rules as the engine's
+/// operators (core/src/warp_field.cpp: a point counts at visibility >= 0.5): an operator whose landmarks are missing or doubtful is greyed here
+/// instead of warping on guesses. [covered] = the person plane covers the posed body (a segmenter that missed the person, e.g. on a
+/// black-and-white photo, leaves the protected operators without anything to confine them: the engine skips them, so they are greyed).
+/// Null = available.
+BodyBlock? bodyBlockFor(ReshapeOp op, List<double>? pose, {bool covered = true, double aspect = 1}) {
+  const none = BodyBlock('没找到', '没找到身体，试试拍到半身或全身的照片');
+  if (pose == null || pose.length != 99) return none;
+  bool ok(int k) => pose[3 * k + 2] >= 0.5;
+  bool all(List<int> ks) => ks.every(ok);
+  bool anyPair(List<(int, int)> ps) => ps.any((p) => ok(p.$1) && ok(p.$2));
+  const protectedOps = {ReshapeOp.waist, ReshapeOp.arms, ReshapeOp.legs, ReshapeOp.head};
+  if (protectedOps.contains(op) && !covered) {
+    return const BodyBlock('轮廓不清', '看不清人的轮廓，改动会带着背景一起变形，所以先关着');
+  }
+  switch (op) {
+    case ReshapeOp.waist:
+      if (!all([11, 12, 23, 24])) return const BodyBlock('没拍到腰', '要拍到肩和腰才能瘦腰');
+    case ReshapeOp.arms:
+      if (!anyPair([(11, 13), (13, 15), (12, 14), (14, 16)])) return const BodyBlock('没拍到手臂', '没看清手臂，不能瘦手臂');
+    case ReshapeOp.legs:
+      if (!anyPair([(23, 25), (25, 27), (24, 26), (26, 28)])) return const BodyBlock('没拍到腿', '没看清腿，不能瘦腿');
+    case ReshapeOp.longLegs:
+      if (!all([23, 24])) return const BodyBlock('没拍到腿', '要拍到腰和腿才能拉长腿');
+      var foot = -1.0;
+      for (var k = 27; k <= 32; k++) {
+        if (ok(k)) foot = math.max(foot, pose[3 * k + 1]);
+      }
+      if (foot < 0) return const BodyBlock('没拍到脚', '要拍到脚才能拉长腿');
+      final hipY = (pose[3 * 23 + 1] + pose[3 * 24 + 1]) / 2;
+      if (all([11, 12])) {
+        final dx = ((pose[3 * 23] + pose[3 * 24]) / 2 - (pose[3 * 11] + pose[3 * 12]) / 2) * aspect;  // aspect = width / height: the engine measures in isotropic units
+        final dy = hipY - (pose[3 * 11 + 1] + pose[3 * 12 + 1]) / 2;
+        final l = math.sqrt(dx * dx + dy * dy);
+        if (l > 0 && dy / l < math.cos(30 * math.pi / 180)) return const BodyBlock('要站直', '人要站直才能拉长腿');
+      }
+      if (foot + 0.03 > 0.99) return const BodyBlock('脚在边上', '脚太靠近照片边缘，没有地方拉长');
+      if (math.min(foot + 0.03, 1.0) - hipY < 0.05) return const BodyBlock('腿太短', '腿在画面里太小，不能拉长腿');
+    case ReshapeOp.head:
+      if (!all([7, 8, 11, 12, 23, 24])) return const BodyBlock('没拍到腰', '要拍到头、肩和腰才能小头');
+    default:
+      break;
+  }
+  return null;
+}

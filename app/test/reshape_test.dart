@@ -4,7 +4,7 @@
 import 'package:dapple/editor/fold_layout.dart' show debugFoldLayouts;
 import 'package:dapple/model/params.dart';
 import 'package:dapple/model/reshape.dart';
-import 'package:dapple/native/ai_bindings.dart' show AiFace, AiJobResult;
+import 'package:dapple/native/ai_bindings.dart' show AiAvailability, AiFace, AiJobResult, AiPose;
 import 'package:dapple/screens/editor/local_controller.dart' show ReshapeItems;
 import 'package:flutter_test/flutter_test.dart';
 
@@ -26,6 +26,52 @@ AiJobResult withFaces(AiJobResult r, int n) => AiJobResult(
       totalMs: r.totalMs,
       faceList: [for (var i = 1; i <= n; i++) AiFace(index: i, iod: 0.1 / i, frontal: true, shape: shapeAt(i / (n + 1)))],
     );
+
+/// A standing figure: 33 landmarks (x, y, visibility), everything visible except the indices in [hidden].
+List<double> poseOf({Set<int> hidden = const {}, double cx = 0.5}) {
+  final p = List<double>.filled(99, 0);
+  void put(int k, double dx, double y) {
+    p[3 * k] = cx + dx;
+    p[3 * k + 1] = y;
+    p[3 * k + 2] = hidden.contains(k) ? 0.1 : 0.95;
+  }
+  put(0, 0, 0.12);
+  put(7, -0.03, 0.11);
+  put(8, 0.03, 0.11);
+  put(11, -0.09, 0.22);
+  put(12, 0.09, 0.22);
+  put(13, -0.10, 0.34);
+  put(14, 0.10, 0.34);
+  put(15, -0.10, 0.45);
+  put(16, 0.10, 0.45);
+  put(23, -0.05, 0.48);
+  put(24, 0.05, 0.48);
+  put(25, -0.05, 0.68);
+  put(26, 0.05, 0.68);
+  put(27, -0.05, 0.88);
+  put(28, 0.05, 0.88);
+  for (final k in [29, 30, 31, 32]) {
+    put(k, k.isEven ? 0.05 : -0.05, 0.92);
+  }
+  return p;
+}
+
+/// [r] with a pose list (the main person first) and the face anchors of [n] faces.
+AiJobResult withPoses(AiJobResult r, int n, List<List<double>> poses) {
+  final f = withFaces(r, n);
+  return AiJobResult(
+    state: f.state,
+    message: f.message,
+    planes: f.planes,
+    groups: f.groups,
+    personFound: f.personFound,
+    faces: f.faces,
+    skyFound: f.skyFound,
+    totalMs: f.totalMs,
+    faceList: f.faceList,
+    poseList: [for (var i = 0; i < poses.length; i++) AiPose(index: i + 1, score: 0.9, pts: poses[i])],
+  );
+}
 
 Reshape shapeOf(Rig r) => r.app.editOf(r.id).reshape;
 
@@ -198,6 +244,96 @@ void main() {
       await openPortrait(t, fake, portraitResult());
       expect(key('shape-group-脸型'), findsNothing);
       expect(key('shape-slim'), findsNothing);
+    });
+  });
+
+  group('身体', () {
+    setUp(() => debugFoldLayouts = false);
+    tearDown(() => debugFoldLayouts = true);
+
+    const withPose = AiAvailability(compiled: true, available: true, person: true, faces: true, depth: true, tap: true, sky: true, pose: true);
+
+    test('what each operator needs: the engine rules on the landmarks', () {
+      final full = poseOf();
+      for (final op in [ReshapeOp.waist, ReshapeOp.arms, ReshapeOp.legs, ReshapeOp.longLegs, ReshapeOp.head]) {
+        expect(bodyBlockFor(op, full), isNull, reason: '$op');
+        expect(bodyBlockFor(op, null)?.note, '没找到');
+      }
+      // no legs in the picture (a half-body shot): 瘦腿 and 长腿 are off, 瘦腰 / 瘦手臂 / 小头 stay
+      final half = poseOf(hidden: {25, 26, 27, 28, 29, 30, 31, 32});
+      expect(bodyBlockFor(ReshapeOp.legs, half)?.note, '没拍到腿');
+      expect(bodyBlockFor(ReshapeOp.longLegs, half)?.note, '没拍到脚');
+      expect(bodyBlockFor(ReshapeOp.waist, half), isNull);
+      expect(bodyBlockFor(ReshapeOp.head, half), isNull);
+      // a head-and-shoulders shot: no hips, so no 小头 (it would be the whole picture) and no 瘦腰
+      final bust = poseOf(hidden: {23, 24, 25, 26, 27, 28, 29, 30, 31, 32});
+      expect(bodyBlockFor(ReshapeOp.head, bust)?.note, '没拍到腰');
+      expect(bodyBlockFor(ReshapeOp.waist, bust)?.note, '没拍到腰');
+      expect(bodyBlockFor(ReshapeOp.arms, bust), isNull);
+      // ankles doubtful but the feet are not: 长腿 still has a foot
+      expect(bodyBlockFor(ReshapeOp.longLegs, poseOf(hidden: {27, 28})), isNull);
+      // lying down: not upright
+      final lying = poseOf();
+      for (var k = 0; k < 33; k++) {
+        final x = lying[3 * k], y = lying[3 * k + 1];
+        lying[3 * k] = y;
+        lying[3 * k + 1] = x;
+      }
+      expect(bodyBlockFor(ReshapeOp.longLegs, lying)?.note, '要站直');
+      // the person plane misses the body: the protected operators are off, 长腿 is not (no protection to lose)
+      expect(bodyBlockFor(ReshapeOp.waist, full, covered: false)?.note, '轮廓不清');
+      expect(bodyBlockFor(ReshapeOp.longLegs, full, covered: false), isNull);
+    });
+
+    testWidgets('身体: five tiles after 脸型; a first tap = on at 50 for the main person; 长腿 and 瘦腿 greyed with a hint on a half-body shot', (t) async {
+      final fake = FakeLocalAi()..avail = withPose;
+      final r = await openPortrait(t, fake, withPoses(portraitResult(), 1, [poseOf(hidden: {25, 26, 27, 28, 29, 30, 31, 32}), poseOf(cx: 0.2)]));
+      expect(fake.runs.first & 32, 32, reason: 'the portrait analysis asks for the pose');
+      expect(key('shape-group-身体'), findsOneWidget);
+      for (final op in [ReshapeOp.waist, ReshapeOp.arms, ReshapeOp.legs, ReshapeOp.longLegs, ReshapeOp.head]) {
+        expect(key('shape-${op.name}'), findsOneWidget);
+      }
+      expect(key('shape-grey-legs'), findsOneWidget);
+      expect(key('shape-grey-longLegs'), findsOneWidget);
+      expect(key('shape-grey-waist'), findsNothing);
+      expect(find.text('没拍到腿'), findsOneWidget);
+      expect(t.getSize(key('shape-waist')).height, greaterThanOrEqualTo(48));
+      // a tap on a greyed tile: the reason, nothing turns on
+      await t.ensureVisible(key('shape-longLegs'));
+      await tapKey(t, 'shape-longLegs');
+      expect(find.text('要拍到脚才能拉长腿'), findsOneWidget);
+      expect(shapeOf(r).on(ReshapeOp.longLegs), isFalse);
+      // 瘦腰: on at 50 for the main person (the first pose), the 33 points travel with the edit
+      await t.ensureVisible(key('shape-waist'));
+      await tapKey(t, 'shape-waist');
+      final s = shapeOf(r);
+      expect(s.value(ReshapeOp.waist), kReshapeDefault);
+      expect(s.body!.pts.length, 99);
+      expect(s.body!.pts[3 * 25 + 2], closeTo(0.1, 1e-9), reason: 'the main person (half-body) is the one that is reshaped');
+      expect(s.matte, isNotNull);
+      final j = s.toEngineJson()!;
+      expect((j['bodies'] as List).single['waist'], 50);
+      // 分项: only the operators that can work here
+      await tapKey(t, 'items-button');
+      expect([for (final i in r.lc.reshapeTool.items()) i.id], ['waist', 'arms', 'head']);
+    });
+
+    testWidgets('no pose found: the 身体 tiles are greyed with 没找到; without the pose model the group is not there', (t) async {
+      final fake = FakeLocalAi()..avail = withPose;
+      final r = await openPortrait(t, fake, withPoses(portraitResult(), 1, const []));
+      expect(key('shape-group-身体'), findsOneWidget);
+      expect(find.text('没找到'), findsNWidgets(5));
+      await t.ensureVisible(key('shape-head'));
+      await tapKey(t, 'shape-head');
+      expect(shapeOf(r).body, isNull);
+      expect(find.text('没找到身体，试试拍到半身或全身的照片'), findsOneWidget);
+    });
+
+    testWidgets('a device without the pose model: no 身体 group (and the portrait analysis does not wait for it)', (t) async {
+      final fake = FakeLocalAi();
+      await openPortrait(t, fake, withFaces(portraitResult(), 1));
+      expect(fake.runs.first & 32, 0);
+      expect(key('shape-group-身体'), findsNothing);
     });
   });
 }

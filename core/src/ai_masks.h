@@ -83,6 +83,14 @@ std::vector<std::string> faceFeatureKeys(const FaceFeatures& f);
 std::string facesMetaJson(const std::vector<FaceFeatures>& faces, int w, int h);
 // The "list":[...] array text of a faces meta ("[]" when absent).
 std::string facesListOfMeta(const std::string& meta);
+// Group meta of the pose group: {"count":n,"list":[{"index":1,"score":..,"pts":[x0,y0,v0, ... 33 landmarks]}]} (photo normalised, main person first; pts is the
+// `ReshapeBody::pts` layout). Poses come from the rt layer; `list` is read back with facesListOfMeta.
+struct PoseMeta {
+  float xy[33][2] = {};
+  float vis[33] = {};
+  float score = 0;
+};
+std::string posesMetaJson(const std::vector<PoseMeta>& poses, int w, int h);
 
 struct PartPlanes {
   Plane hair, faceSkin, bodySkin, clothes, person, background;
@@ -150,7 +158,7 @@ struct Img {
 namespace rt {
 bool compiled();  // DAPPLE_AI
 struct Avail {
-  bool person = false, faces = false, depth = false, tap = false;
+  bool person = false, faces = false, depth = false, tap = false, pose = false;
   std::string tapEngine;  // "magictouch" | "mobilesam" | ""
   std::string backends;   // "litert+ort" ...
   std::string reason;     // why something is missing (first line)
@@ -169,6 +177,13 @@ struct PersonOut {
 Res person(const Img&, PersonOut&, const std::atomic<bool>* cancel);
 // `personMask` (optional, 0..255 plane of the person group): person regions without a validated face get extra detector windows (small and several faces)
 Res faces(const Img&, const Plane* personMask, int maxFaces, std::vector<FaceMesh>&, const std::atomic<bool>* cancel);
+struct PoseOut {  // one person: 33 landmarks in pixels of the input image + visibility, main person first
+  float xy[33][2] = {};
+  float vis[33] = {};
+  float score = 0;
+};
+// At most `maxPoses` people (portrait reshaping body operators, section 47); empty when none is found.
+Res poses(const Img&, int maxPoses, std::vector<PoseOut>&, const std::atomic<bool>* cancel);
 struct DepthOut {
   int w = 0, h = 0;
   std::vector<float> d;
@@ -191,7 +206,7 @@ std::size_t resident();
 }  // namespace rt
 
 // ---- service ----------------------------------------------------------------------------------------------------------------------------
-enum Task : int { kTaskPerson = 1, kTaskFaces = 2, kTaskDepth = 4, kTaskSky = 8, kTaskTapPrepare = 16 };
+enum Task : int { kTaskPerson = 1, kTaskFaces = 2, kTaskDepth = 4, kTaskSky = 8, kTaskTapPrepare = 16, kTaskPose = 32 };
 constexpr int kMaxFaces = 4;
 constexpr int kPlaneLongEdge = 1024;
 
@@ -226,6 +241,7 @@ struct Result {
   bool personFound = false;
   int faceCount = 0;
   std::string facesList;  // JSON array of the faces (facesMetaJson "list"), "face_list" of the job JSON
+  std::string poseList;   // JSON array of the poses (posesMetaJson "list"), "pose_list" of the job JSON; empty when the pose group did not run
   bool skyFound = false;
   double renderMs = 0, totalMs = 0;
   std::string json() const;

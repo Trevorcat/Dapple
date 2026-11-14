@@ -56,6 +56,19 @@ struct FaceFindStats {
 };
 Status findFaces(const Image& im, const uint8_t* personMask, int mw, int mh, std::vector<FoundFace>& out, const TaskOptions& o = {}, FaceFindStats* stats = nullptr);
 
+// ---- poses (MediaPipe Pose Landmarker lite: BlazePose detector + BlazePose GHUM landmarks, two stages) ------------------------------
+struct Pose {
+  float score = 0;         // detector score after sigmoid
+  float flag = 0;          // landmark model's person-present logit (> 0.5 = valid, as the desktop reference)
+  float xy[33][2] = {};    // image pixels
+  float vis[33] = {};      // visibility * presence, 0..1
+  float box[4] = {};       // x0 y0 x1 y1 of the landmarks with vis >= 0.5 (0 when none)
+};
+// Detector (224, letterboxed, weighted NMS IoU 0.3, score >= 0.5), then per person a rotated crop (side 2.5 x the hip-to-circle radius, up along
+// the detector's axis) and the 33 landmarks. At most `maxPoses` valid poses, MAIN PERSON FIRST: the largest landmark extent, discounted by the
+// distance of its centre from the picture's centre. Persons the landmark model rejects are dropped.
+Status findPoses(const Image& im, std::vector<Pose>& out, int maxPoses = 4, const TaskOptions& o = {});
+
 // ---- person parts -----------------------------------------------------------------------------------------------------------
 enum PersonClass : uint8_t { kBackground = 0, kHair = 1, kBodySkin = 2, kFaceSkin = 3, kClothes = 4, kOthers = 5 };
 struct PersonParts {

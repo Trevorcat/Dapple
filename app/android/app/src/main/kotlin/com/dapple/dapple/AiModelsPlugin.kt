@@ -11,7 +11,7 @@ import java.util.concurrent.Executors
 
 /**
  * dapple/ai (MethodChannel): `prepare` -> absolute path of the directory that holds the AI model files (person_parts.tflite, face_detector.tflite,
- * face_landmarks.tflite, tap_encoder.tflite, tap_decoder.tflite, depth.ort), or null when the APK carries none (built with -Pdapple.ai=false).
+ * face_landmarks.tflite, pose_detector.tflite, pose_landmarks.tflite, tap_encoder.tflite, tap_decoder.tflite, depth.ort), or null when the APK carries none (built with -Pdapple.ai=false).
  *
  * The models are bundled as assets under ai-models/ (no server, no Play services: docs/legal/ai-models.md). The engine reads them with ordinary file
  * I/O, so they are copied once to filesDir/ai-models; a file is copied again only when its size differs from the asset (an app update with a new
