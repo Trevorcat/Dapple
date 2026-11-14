@@ -141,7 +141,7 @@ class _StylesPageState extends State<StylesPage> {
         under,
         AnimatedOpacity(
           opacity: img == null ? 0 : 1,
-          duration: const Duration(milliseconds: 200),
+          duration: Mo.medium,
           child: img == null
               ? const SizedBox.shrink()
               : RawImage(key: const ValueKey('default-image'), image: img, fit: BoxFit.cover, filterQuality: FilterQuality.medium),
@@ -172,15 +172,35 @@ class _StylesPageState extends State<StylesPage> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(key: const ValueKey('default-preview'), height: height ?? 190, width: double.infinity, child: _picture()),
+          SizedBox(
+            key: const ValueKey('default-preview'),
+            height: height ?? 190,
+            width: double.infinity,
+            child: Stack(fit: StackFit.expand, children: [
+              _picture(),
+              // no developed photo yet: the picture is a sample, said by a small label on it (not a sentence, audit F38)
+              if (_photo == null)
+                Positioned(
+                  left: Sp.s,
+                  top: Sp.s,
+                  child: Container(
+                    key: const ValueKey('sample-pill'),
+                    height: 20,
+                    padding: const EdgeInsets.symmetric(horizontal: Sp.s),
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(color: Fx.overlay55, borderRadius: BorderRadius.circular(Rd.thumb)),
+                    child: Text('示例', style: T.mini(Fx.onPhoto, w: FontWeight.w500)),
+                  ),
+                ),
+            ]),
+          ),
           Padding(
             padding: const EdgeInsets.all(Sp.l),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(_photo == null ? '新照片默认使用（预览为示例画面）' : '新照片默认使用', style: T.small(c.text2)),
-                const SizedBox(height: 4),
-                const SizedBox(height: 4),
+                Text('新照片默认使用', style: T.small(c.text2)),
+                const SizedBox(height: Sp.s),
                 Row(
                   children: [
                     BaseIcon(key: const ValueKey('default-icon'), data: _iconOf(def), size: 48),
@@ -283,29 +303,6 @@ class _StylesPageState extends State<StylesPage> {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: sections);
   }
 
-  Widget _imports() {
-    final c = context.c;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const SectionTitle('导入'),
-        // TODO(look import): .xmp via dapple_xmp_to_json (lists unsupported items), .cube LUT, Fujifilm recipes.
-        for (final r in const [('Lightroom 预设（.xmp）', 'xmp'), ('LUT 滤镜（.cube）', 'cube'), ('相机胶片配方', 'fuji')])
-          InkWell(
-            key: ValueKey('import-${r.$2}'),
-            onTap: () => app.showToast('待实现'),
-            child: Container(
-              constraints: const BoxConstraints(minHeight: 56),
-              padding: const EdgeInsets.symmetric(horizontal: Sp.l),
-              child: Row(
-                children: [Expanded(child: Text(r.$1, style: T.body17(c.text)))],
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-
   Widget _phoneBody(BuildContext context) {
     return ListView(
       padding: const EdgeInsets.only(bottom: 120),
@@ -315,7 +312,6 @@ class _StylesPageState extends State<StylesPage> {
           child: _card(),
         ),
         Semantics(container: true, label: '默认成像', child: _grid(MediaQuery.sizeOf(context).width)),
-        _imports(),
       ],
     );
   }
@@ -333,8 +329,7 @@ class _StylesPageState extends State<StylesPage> {
             padding: const EdgeInsets.only(bottom: 120),
             children: [
               Semantics(container: true, label: '默认成像', child: _grid(0)),
-              _imports(),
-            ],
+                  ],
           ),
         ),
       ],

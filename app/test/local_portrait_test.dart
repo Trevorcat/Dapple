@@ -272,7 +272,7 @@ void main() {
   });
 
   group('分项', () {
-    testWidgets('one radar with the recipe ops of 肤质 and 祛斑灵敏度; sens is written to retouch.sens', (t) async {
+    testWidgets('one radar with the recipe ops of 肤质 and 祛斑范围; sens is written to retouch.sens', (t) async {
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult());
       await toPads(t, r);
@@ -280,10 +280,10 @@ void main() {
       expect(key('local-radar-pt-skin'), findsOneWidget);
       expect(key('local-group-detail'), findsNothing, reason: 'no groups for a portrait area');
       final items = r.lc.portraitItems();
-      expect([for (final i in items) i.label], ['磨皮', '匀肤', '去红', '祛斑', '纹理', '祛斑灵敏度']);
+      expect([for (final i in items) i.label], ['磨皮', '匀肤', '去红', '祛斑', '纹理', '祛斑范围']);
       expect([for (final i in items) i.max], [100, 60, 70, 100, 20, 100]);
       expect(items.firstWhere((i) => i.id == 'texture').min, -20);
-      for (final w in ['磨皮', '匀肤', '去红', '祛斑', '纹理', '祛斑灵敏度']) {
+      for (final w in ['磨皮', '匀肤', '去红', '祛斑', '纹理', '祛斑范围']) {
         expect(find.text(w), findsWidgets, reason: w);
       }
       expect(byId(r, 'pt-skin').sens, 25);

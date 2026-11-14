@@ -19,6 +19,8 @@ import '../../model/bases.dart';
 import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../theme/tokens.dart';
+import '../../widgets/controls.dart' show HitBox, kHit;
+import '../../widgets/icons.dart';
 import 'editor_controller.dart';
 import 'editor_widgets.dart' show CurvePainter, curveY;
 import 'film_map_view.dart';
@@ -32,7 +34,8 @@ import 'tone_editor.dart';
 // ------------------------------------------------------------------ metrics
 
 const double kPanelHandleH = 18;
-const double kHeaderH = 40;
+/// One header line: a 48 dp touch row (the buttons are 32 dp pills with a 48 x 48 target, guidelines 6).
+const double kHeaderH = 48;
 
 /// Fixed part of the panel's height: handle, header, the gaps (the rest is the content).
 const double kPanelTopGap = 4, kPanelBottomPad = 12;
@@ -54,7 +57,12 @@ const double kPanelMaxW = 600;
 /// The header of the side pane has a second line for the readout.
 const double kSideHeaderH = kHeaderH + 22;
 
-double headerH(double textScale, {bool side = false}) => (side ? kSideHeaderH : kHeaderH) + math.max(0.0, textScale - 1) * 24;
+/// From this text scale on, the header puts its buttons on a line of their own instead of shrinking their words (guidelines 12.6).
+const double kHeaderWrapScale = 1.3;
+bool headerWraps(double textScale) => textScale >= kHeaderWrapScale;
+
+double headerH(double textScale, {bool side = false}) =>
+    (side ? kSideHeaderH : kHeaderH) + (headerWraps(textScale) ? kHeaderH : 0) + math.max(0.0, textScale - 1) * 24;
 
 /// Panel height when folded to the handle and the header.
 double panelCollapsedH(double textScale, {bool side = false}) => kPanelHandleH + headerH(textScale, side: side) + 6;
@@ -65,7 +73,7 @@ double panelCollapsedH(double textScale, {bool side = false}) => kPanelHandleH +
 ///
 /// [region]: height between the top bar and the dock; [photoW]: width the photo may use; [aspect]: width / height of the photo.
 double bottomPanelHeight({required double region, required double photoW, required double aspect, required double screenH, double textScale = 1, bool itemised = false}) {
-  final extra = math.max(0.0, textScale - 1) * 24;
+  final extra = math.max(0.0, textScale - 1) * 24 + (headerWraps(textScale) ? kHeaderH : 0); // large text: the header's button line
   final hRef = math.min(photoW / aspect, region);
   final allowed = region - 8 - 0.9 * hRef; // the photo keeps 90 % of its height
   final lo = kPanelFixedH + kPadMinH + extra, comfy = kPanelFixedH + kPadComfortH + extra;
@@ -101,17 +109,21 @@ PanelNeeds panelNeeds({
   double textScale = 1,
   bool collapsed = false,
   bool itemised = false,
+  double sideHeaderExtra = 0,
 }) {
-  final extra = math.max(0.0, textScale - 1) * 24;
+  // [sideHeaderExtra]: a side-pane header taller than the title + readout lines (局部: the chips are a 48 dp line of their own)
+  final extra = math.max(0.0, textScale - 1) * 24 + (headerWraps(textScale) ? kHeaderH : 0); // large text: the header's button line
   if (collapsed) {
     return PanelNeeds(bottom: panelCollapsedH(textScale), side: panelCollapsedH(textScale, side: true), sideMin: panelCollapsedH(textScale, side: true), growBottom: 0, growSide: 0, growMin: 0, pad: false);
   }
-  final sideFixed = kPanelHandleH + kSideHeaderH + kPanelTopGap + kPanelBottomPad + extra;
+  final sideFixed = kPanelHandleH + kSideHeaderH + kPanelTopGap + kPanelBottomPad + extra + sideHeaderExtra;
   final side = sideFixed + (itemised ? kRadarContentH : 176);
   return PanelNeeds(
     bottom: bottomPanelHeight(region: region, photoW: photoW, aspect: aspect, screenH: screenH, textScale: textScale, itemised: itemised),
     side: side,
-    sideMin: side - 20,
+    // 分项 in a short side pane (landscape phone): the radar shrinks rather than the pane giving way to a bottom panel that leaves a
+    // stamp-sized photo (guidelines 15.8, editor-panel 8: the side radar is small)
+    sideMin: itemised ? sideFixed + 180 : side - 20 - sideHeaderExtra,
     growBottom: 0,
     growSide: itemised ? 0 : 220,
     growMin: 0,
@@ -164,9 +176,9 @@ class _DockedPanelHostState extends State<DockedPanelHost> {
               key: const ValueKey('docked-panel'),
               decoration: BoxDecoration(
                 color: c.surface,
-                borderRadius: BorderRadius.circular(22),
+                borderRadius: BorderRadius.circular(Rd.panel),
                 border: Border.all(color: c.sep),
-                boxShadow: const [BoxShadow(color: Color(0x1F000000), blurRadius: 16, offset: Offset(0, 4))],
+                boxShadow: Fx.shadowPanel,
               ),
               clipBehavior: Clip.antiAlias,
               child: OverflowBox(
@@ -233,13 +245,13 @@ class _DockedPanelState extends State<DockedPanel> {
       child: Column(key: ValueKey('panel-${g.name}'), children: [
         _Handle(ctl: ctl, group: g, collapsed: widget.collapsed),
         if (local)
-          LocalHeader(ctl: ctl, side: widget.side, textScale: ts)
+          LocalHeader(ctl: ctl, side: widget.side, textScale: ts, collapsed: widget.collapsed)
         else
           _Header(ctl: ctl, group: g, cat: cat, side: widget.side, textScale: ts),
         if (!widget.collapsed)
           Expanded(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, kPanelTopGap, 12, kPanelBottomPad),
+              padding: const EdgeInsets.fromLTRB(Sp.m, kPanelTopGap, Sp.m, kPanelBottomPad),
               child: local ? LocalBodyView(ctl: ctl, side: widget.side) : (cat == null ? CropBody(ctl: ctl) : _body(cat)),
             ),
           ),
@@ -294,7 +306,8 @@ class _Handle extends StatelessWidget {
 
 // ------------------------------------------------------------------ header
 
-/// A pill button of the header (32 dp tall, 44 dp touch target through its padding).
+/// A pill button of the header: a 32 dp pill inside a 48 x 48 touch target. [pressed] = a layer that is open (分项, the film map):
+/// `accentBtn` with `onAccent`, which reads in both themes.
 class HeaderButton extends StatelessWidget {
   const HeaderButton({super.key, required this.label, required this.onTap, this.pressed = false, this.icon, this.semantics, this.chevron = false, this.trailingChevron = false});
   final String label;
@@ -306,12 +319,18 @@ class HeaderButton extends StatelessWidget {
   final bool trailingChevron;
   final VoidCallback onTap;
   final bool pressed;
-  final IconData? icon;
+
+  /// An icon of the app's line set instead of the word (the word stays the semantics label).
+  final DI? icon;
   final String? semantics;
 
   @override
   Widget build(BuildContext context) {
     final c = context.c;
+    final fg = pressed ? c.onAccent : c.text;
+    final fg2 = pressed ? c.onAccent : c.text2;
+    // icons grow with the text (guidelines 12.6)
+    final ts = MediaQuery.textScalerOf(context).scale(16) / 16;
     return Semantics(
       button: true,
       toggled: pressed,
@@ -321,20 +340,18 @@ class HeaderButton extends StatelessWidget {
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
+        child: HitBox(
           child: Container(
-            height: 32,
-            constraints: const BoxConstraints(minWidth: 32),
-            padding: const EdgeInsets.symmetric(horizontal: 11),
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            padding: const EdgeInsets.symmetric(horizontal: Sp.m),
             alignment: Alignment.center,
-            decoration: BoxDecoration(color: pressed ? c.accent : c.bg, borderRadius: BorderRadius.circular(16)),
+            decoration: BoxDecoration(color: pressed ? c.accentBtn : c.bg, borderRadius: BorderRadius.circular(Rd.cardLg)),
             child: icon != null
-                ? Icon(icon, size: 17, color: pressed ? Colors.white : c.text)
+                ? DIcon(icon!, size: 18 * ts, color: fg)
                 : Row(mainAxisSize: MainAxisSize.min, children: [
-                    Text(label, maxLines: 1, style: T.cap(pressed ? Colors.white : c.text, w: FontWeight.w500)),
-                    if (chevron && !trailingChevron) Icon(Icons.keyboard_arrow_down, size: 16, color: pressed ? Colors.white : c.text2),
-                    if (trailingChevron) Icon(Icons.chevron_right, size: 16, color: pressed ? Colors.white : c.text2),
+                    Text(label, maxLines: 1, style: T.cap(fg, w: FontWeight.w500)),
+                    if (chevron && !trailingChevron) DIcon(DI.down, size: 14 * ts, color: fg2),
+                    if (trailingChevron) DIcon(DI.forward, size: 14 * ts, color: fg2),
                   ]),
           ),
         ),
@@ -381,22 +398,32 @@ class _Header extends StatelessWidget {
     final extraRow = Row(mainAxisSize: MainAxisSize.min, children: [
       for (final x in extras) ...[
         HeaderButton(key: ValueKey('extra-${x.$1}'), label: x.$1, chevron: true, trailingChevron: true, onTap: () => ctl.openExtra(x.$2)),
-        const SizedBox(width: 6),
+        const SizedBox(width: Sp.xs),
       ],
     ]);
     final buttons = <Widget>[
+      // 无 clears what is chosen, so it is there only when something is (audit F44); with nothing chosen the one button says what it does
       if (cat == PadCat.film && !inExtra && !inItems)
         ListenableBuilder(
           listenable: ctl.app.editTick,
-          builder: (context, _) => HeaderButton(key: const ValueKey('film-none'), label: '无', pressed: ctl.edit.film == null, semantics: '不使用胶片或现代成像', onTap: ctl.stockNone),
+          builder: (context, _) => ctl.edit.film == null
+              ? const SizedBox.shrink()
+              : HeaderButton(key: const ValueKey('film-none'), label: '无', semantics: '不使用胶片或现代成像', onTap: ctl.stockNone),
         ),
       if (cat == PadCat.film && !inExtra && !inItems)
         ListenableBuilder(
           listenable: ctl.app.editTick,
           builder: (context, _) {
-            final name = ctl.edit.film == null ? '无' : baseNameOf(ctl.app.film, ctl.edit.film);
+            final none = ctl.edit.film == null;
+            final name = none ? '选胶片' : baseNameOf(ctl.app.film, ctl.edit.film);
             final modern = isModernId(ctl.edit.film);
-            return HeaderButton(key: const ValueKey('stock-button'), label: name, chevron: true, pressed: ctl.filmMapOpen, semantics: '选择${modern ? '成像' : '胶片'}，当前$name', onTap: () => ctl.setFilmMap(!ctl.filmMapOpen));
+            return HeaderButton(
+                key: const ValueKey('stock-button'),
+                label: name,
+                chevron: true,
+                pressed: ctl.filmMapOpen,
+                semantics: none ? '选胶片' : '选择${modern ? '成像' : '胶片'}，当前$name',
+                onTap: () => ctl.setFilmMap(!ctl.filmMapOpen));
           },
         ),
       ListenableBuilder(
@@ -408,7 +435,7 @@ class _Header extends StatelessWidget {
             maintainSize: true,
             maintainAnimation: true,
             maintainState: true,
-            child: HeaderButton(key: ValueKey('reset-${group.name}'), label: '复位', icon: Icons.refresh, semantics: '复位$name', onTap: () => cat == null ? ctl.resetCrop() : ctl.resetPad(cat)),
+            child: HeaderButton(key: ValueKey('reset-${group.name}'), label: '复位', icon: DI.reset, semantics: '复位$name', onTap: () => cat == null ? ctl.resetCrop() : ctl.resetPad(cat)),
           );
         },
       ),
@@ -426,21 +453,38 @@ class _Header extends StatelessWidget {
           },
         ),
     ];
-    final h = headerH(textScale, side: side);
+    // the side pane's second line is a readout (22 dp); in 分项 it holds the editor entries, which are 48 dp targets: the body gives
+    // up the difference (it was an 18 dp overflow, audit F46)
+    final h = headerH(textScale, side: side) + (side && inItems && extras.isNotEmpty ? kHeaderH - (kSideHeaderH - kHeaderH) : 0);
     final titleStyle = T.body(c.text, w: FontWeight.w600);
     final titleW = (TextPainter(text: TextSpan(text: title, style: titleStyle), textDirection: TextDirection.ltr, textScaler: MediaQuery.textScalerOf(context))..layout()).width;
+    // 裁切 has one button (复位): it stays beside the title even with large text
+    final wrap = headerWraps(textScale) && cat != null;
+    Widget buttonRow() => Row(mainAxisSize: MainAxisSize.min, children: [for (final b in buttons) ...[const SizedBox(width: Sp.xs), b]]);
     return SizedBox(
       height: h,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14),
+        padding: const EdgeInsets.symmetric(horizontal: Sp.l),
         child: LayoutBuilder(builder: (context, cons) {
-          // the buttons shrink to what is left beside the title (large text), they never overflow
-          final room = cons.maxWidth - titleW - (side ? 8 : 10 + 70);
-          Widget group() => ConstrainedBox(
-                constraints: BoxConstraints(maxWidth: math.max(40.0, room)),
-                child: FittedBox(fit: BoxFit.scaleDown, alignment: Alignment.centerRight, child: Row(mainAxisSize: MainAxisSize.min, children: [for (final b in buttons) ...[const SizedBox(width: 6), b]])),
-              );
           final sub = inItems ? SizedBox(width: double.infinity, child: FittedBox(fit: BoxFit.scaleDown, alignment: Alignment.centerLeft, child: extraRow)) : readout;
+          if (wrap) {
+            // large text: the title (and readout) on one line, the buttons at full size on a line of their own (guidelines 12.6)
+            return Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Text(title, key: const ValueKey('header-title'), style: titleStyle),
+                const SizedBox(width: Sp.m),
+                Expanded(child: side ? const SizedBox.shrink() : sub),
+              ]),
+              if (side) sub,
+              Align(alignment: Alignment.centerRight, child: SingleChildScrollView(scrollDirection: Axis.horizontal, reverse: true, child: buttonRow())),
+            ]);
+          }
+          // the buttons keep their size and target; the readout / the editor entries beside them give way
+          final room = cons.maxWidth - titleW - (side ? 8 : 12 + 70);
+          Widget group() => ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: math.max(kHit, room)),
+                child: FittedBox(fit: BoxFit.scaleDown, alignment: Alignment.centerRight, child: buttonRow()),
+              );
           return side
               ? Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Row(children: [Text(title, key: const ValueKey('header-title'), style: titleStyle), const Spacer(), group()]),
@@ -448,7 +492,7 @@ class _Header extends StatelessWidget {
                 ])
               : Row(children: [
                   Text(title, key: const ValueKey('header-title'), style: titleStyle),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: Sp.m),
                   Expanded(child: inItems ? FittedBox(fit: BoxFit.scaleDown, alignment: Alignment.centerLeft, child: extraRow) : readout),
                   group(),
                 ]);
@@ -470,7 +514,7 @@ class PadRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       StrengthStrip(ctl: ctl, cat: cat),
-      const SizedBox(width: 10),
+      const SizedBox(width: Sp.m),
       Expanded(child: PadFace(ctl: ctl, cat: cat, presets: cat == PadCat.color)),
     ]);
   }
@@ -497,18 +541,28 @@ class PanelChip extends StatelessWidget {
       label: label,
       excludeSemantics: true,
       onTap: onTap,
+      // a 36 dp chip in a 48 dp touch row (guidelines 6, 10.2)
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: onTap,
-        child: Container(
-          height: 36,
-          padding: EdgeInsets.symmetric(horizontal: compact ? 4 : 12),
-          alignment: Alignment.center,
-          decoration: BoxDecoration(color: selected ? c.accentSoft : c.chip, borderRadius: BorderRadius.circular(18), border: selected ? Border.all(color: c.accent, width: 1.5) : null),
-          child: Row(mainAxisSize: MainAxisSize.min, children: [
-            if (dot != null) ...[Container(width: 10, height: 10, decoration: BoxDecoration(color: dot, shape: BoxShape.circle)), const SizedBox(width: 6)],
-            Flexible(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: T.cap(selected ? c.accent : c.text, w: selected ? FontWeight.w600 : FontWeight.w400))),
-          ]),
+        child: Padding(
+          // the opaque detector takes the padding too: 6 + 36 + 6 = 48
+          padding: const EdgeInsets.symmetric(vertical: (kHit - 36) / 2),
+          child: Center(
+            heightFactor: 1,
+            widthFactor: compact ? null : 1,
+            child: Container(
+              height: 36,
+              constraints: const BoxConstraints(minWidth: kHit),
+              padding: EdgeInsets.symmetric(horizontal: compact ? Sp.xs : Sp.m),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(color: selected ? c.accentSoft : c.chip, borderRadius: BorderRadius.circular(Rd.chip), border: selected ? Border.all(color: c.accent, width: 1.5) : null),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                if (dot != null) ...[Container(width: 10, height: 10, decoration: BoxDecoration(color: dot, shape: BoxShape.circle)), const SizedBox(width: Sp.s)],
+                Flexible(child: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: T.cap(selected ? c.accent : c.text, w: selected ? FontWeight.w600 : FontWeight.w400))),
+              ]),
+            ),
+          ),
         ),
       ),
     );
@@ -555,22 +609,32 @@ class CropBody extends StatelessWidget {
       listenable: Listenable.merge([ctl.app.editTick, ctl.edits]),
       builder: (context, _) {
         final e = ctl.edit;
-        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            for (var i = 0; i < cropRatios.length; i++) ...[
-              if (i > 0) const SizedBox(width: 6),
-              Expanded(child: PanelChip(key: ValueKey('crop-${cropRatios[i]}'), label: cropRatioNames[i], selected: e.crop == cropRatios[i], compact: true, onTap: () => ctl.setCropRatio(cropRatios[i]))),
-            ],
-          ]),
-          const SizedBox(height: 8),
-          Row(children: [
-            Expanded(child: PanelChip(key: const ValueKey('crop-rotate'), label: '旋转 90°', selected: false, compact: true, onTap: ctl.rotate90)),
-            const SizedBox(width: 6),
-            Expanded(child: PanelChip(key: const ValueKey('crop-flip'), label: '水平翻转', selected: e.flip, compact: true, onTap: ctl.toggleFlip)),
-          ]),
-          const Spacer(),
-          SpecRuler(ctl: ctl, valueKey: 'straighten', label: '拉直'),
-        ]);
+        Widget ratio(int i) => Expanded(
+            child: PanelChip(key: ValueKey('crop-${cropRatios[i]}'), label: cropRatioNames[i], selected: e.crop == cropRatios[i], compact: true, onTap: () => ctl.setCropRatio(cropRatios[i])));
+        return LayoutBuilder(builder: (context, cons) {
+          // a narrow pane puts the six ratios on two rows of three instead of clipping the words (audit F46)
+          final perRow = (cons.maxWidth - Sp.s * 5) / 6 < 56 * MediaQuery.textScalerOf(context).scale(13) / 13 ? 3 : 6;
+          final rows = [
+            for (var r = 0; r < cropRatios.length; r += perRow)
+              Row(children: [
+                for (var i = r; i < r + perRow; i++) ...[if (i > r) const SizedBox(width: Sp.s), ratio(i)],
+              ]),
+          ];
+          final top = Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            ...rows,
+            Row(children: [
+              Expanded(child: PanelChip(key: const ValueKey('crop-rotate'), label: '旋转 90°', selected: false, compact: true, onTap: ctl.rotate90)),
+              const SizedBox(width: Sp.s),
+              Expanded(child: PanelChip(key: const ValueKey('crop-flip'), label: '水平翻转', selected: e.flip, compact: true, onTap: ctl.toggleFlip)),
+            ]),
+          ]);
+          return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            // the chips give way (scroll) before the ruler does when the pane is short
+            Flexible(child: SingleChildScrollView(child: top)),
+            const SizedBox(height: Sp.s),
+            SpecRuler(ctl: ctl, valueKey: 'straighten', label: '拉直'),
+          ]);
+        });
       },
     );
   }
@@ -689,7 +753,7 @@ class _CurveEditorState extends State<CurveEditor> {
       const SizedBox(height: 8),
       Expanded(
         child: ClipRRect(
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(Rd.block),
           child: ColoredBox(
             color: c.bg,
             child: LayoutBuilder(builder: (context, cons) {

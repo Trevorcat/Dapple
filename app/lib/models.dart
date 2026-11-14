@@ -18,6 +18,11 @@ enum PhotoStatus {
 }
 
 /// Composite kinds of the "昨天" group (requirements 4.2.4).
+/// Why developing failed, by what the user can do about it.
+enum FailKind { gone, unsupported, unreadable, corrupt, other }
+
+enum FailAction { retry, remove, none }
+
 enum PhotoKind { photo, hdr, pano, live, video, bracket, frame }
 
 /// A photo known to the app (MediaStore, system picker, a future FTP source, or the demo set).
@@ -130,16 +135,33 @@ class Photo {
   }
 
   bool get openable => status != PhotoStatus.arriving && status != PhotoStatus.interrupted && status != PhotoStatus.failed;
-  /// Why a photo could not be developed, in plain words (the raw [error] stays in the log).
-  String get failReason {
+  /// Why a photo could not be developed, in plain words: what happened, no guessed cause (guidelines 13.1). The raw [error] stays in
+  /// the log.
+  String get failReason => switch (failKind) {
+        FailKind.gone => '原图不在了',
+        FailKind.unsupported => '还不支持这种格式',
+        FailKind.unreadable => '读不到原图',
+        FailKind.corrupt => '文件已损坏',
+        FailKind.other => '没处理成功',
+      };
+
+  FailKind get failKind {
     final e = (error ?? '').toLowerCase();
-    if (e.contains('notfound') || e.contains('找不到') || e.contains('no such file') || e.contains('not found')) return '找不到原图，可能已被删除';
-    if (e.contains('convert') || e.contains('cannot decode') || e.contains('unsupported')) return '这种格式暂时无法处理';
-    if (e.contains('cannot write')) return '处理失败'; // the engine could not write the preview: local, not the network
-    if (e.contains('network') || e.contains('icloud') || e.contains('write')) return '读取原图失败，请检查网络后重试';
-    if (e.contains('decode') || e.contains('corrupt') || e.contains('truncated')) return '照片文件已损坏或无法读取';
-    return '处理失败';
+    if (e.contains('notfound') || e.contains('找不到') || e.contains('no such file') || e.contains('not found')) return FailKind.gone;
+    if (e.contains('convert') || e.contains('cannot decode') || e.contains('unsupported')) return FailKind.unsupported;
+    if (e.contains('cannot write')) return FailKind.other; // the engine could not write the preview: local, not the network
+    if (e.contains('network') || e.contains('icloud') || e.contains('write')) return FailKind.unreadable;
+    if (e.contains('decode') || e.contains('corrupt') || e.contains('truncated')) return FailKind.corrupt;
+    return FailKind.other;
   }
+
+  /// The one next step that can help (audit F06): reading again can work; a missing or broken original can only be removed; a format
+  /// the engine does not read has no step (the tile says so).
+  FailAction get failAction => switch (failKind) {
+        FailKind.unreadable || FailKind.other => FailAction.retry,
+        FailKind.gone || FailKind.corrupt => FailAction.remove,
+        FailKind.unsupported => FailAction.none,
+      };
 
   /// A develop failure (as opposed to a camera transfer that broke).
   bool get developFailed => status == PhotoStatus.failed && error != null;

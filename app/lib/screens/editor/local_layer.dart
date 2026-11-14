@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 
 import '../../editor/mask_geometry.dart';
 import '../../model/local_adjust.dart';
+import '../../theme/tokens.dart';
 import 'local_controller.dart';
 import 'zoom_view.dart';
 
@@ -77,15 +78,18 @@ class _LocalPhotoLayerState extends State<LocalPhotoLayer> {
         child: Stack(fit: StackFit.expand, clipBehavior: Clip.none, children: [
           IgnorePointer(
             child: ListenableBuilder(
-              listenable: Listenable.merge([lc.overlayOn, lc.overlayStale, lc.overlayFollow]),
+              // never while an export / share is being prepared: the tint is an editing aid only (exports are engine renders and never
+              // contain it)
+              listenable: Listenable.merge([lc.overlayOn, lc.overlayStale, lc.overlayFollow, lc.ctl.app]),
               builder: (context, _) => AnimatedOpacity(
-                opacity: lc.overlayOn.value && (!lc.overlayStale.value || lc.overlayFollow.value) ? 1 : 0,
-                duration: const Duration(milliseconds: 150),
+                opacity: lc.overlayOn.value && !lc.ctl.app.exportInProgress && (!lc.overlayStale.value || lc.overlayFollow.value) ? 1 : 0,
+                duration: Mo.small,
                 child: ValueListenableBuilder<ui.Image?>(
                   valueListenable: lc.overlay,
                   builder: (context, img, _) => img == null
                       ? const SizedBox.shrink()
-                      : RawImage(key: const ValueKey('local-overlay'), image: img, fit: BoxFit.fill, filterQuality: FilterQuality.medium),
+                      // scaled with a smooth filter: the UI adds no blockiness of its own
+                      : RawImage(key: const ValueKey('local-overlay'), image: img, fit: BoxFit.fill, filterQuality: FilterQuality.medium, isAntiAlias: true),
                 ),
               ),
             ),

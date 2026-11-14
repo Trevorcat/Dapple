@@ -42,6 +42,25 @@ enum DI {
   close,
   plus,
   warn,
+  // added for 局部 / 人像 and the import sheet (audit 2026-11 F10, F24)
+  minus,
+  folder,
+  addPart,
+  subPart,
+  invert,
+  duplicate,
+  trash,
+  removePart,
+  strokeAdd,
+  strokeErase,
+  eraser,
+  skin,
+  underEye,
+  eyes,
+  shine,
+  teeth,
+  lips,
+  faceLight,
 }
 
 class DIcon extends StatelessWidget {
@@ -316,6 +335,165 @@ class _IconPainter extends CustomPainter {
       case DI.plus:
         canvas.drawLine(const Offset(12, 5), const Offset(12, 19), line);
         canvas.drawLine(const Offset(5, 12), const Offset(19, 12), line);
+        break;
+      case DI.minus:
+        canvas.drawLine(const Offset(5, 12), const Offset(19, 12), line);
+        break;
+      case DI.folder:
+        canvas.drawPath(
+            Path()
+              ..moveTo(3.5, 7)
+              ..arcToPoint(const Offset(5.5, 5), radius: const Radius.circular(2))
+              ..lineTo(9.5, 5)
+              ..lineTo(11.5, 7.5)
+              ..lineTo(18.5, 7.5)
+              ..arcToPoint(const Offset(20.5, 9.5), radius: const Radius.circular(2))
+              ..lineTo(20.5, 17)
+              ..arcToPoint(const Offset(18.5, 19), radius: const Radius.circular(2))
+              ..lineTo(5.5, 19)
+              ..arcToPoint(const Offset(3.5, 17), radius: const Radius.circular(2))
+              ..close(),
+            line);
+        break;
+      case DI.addPart:
+      case DI.subPart:
+        canvas.drawCircle(const Offset(12, 12), 8.5, line);
+        canvas.drawLine(const Offset(8, 12), const Offset(16, 12), line);
+        if (icon == DI.addPart) canvas.drawLine(const Offset(12, 8), const Offset(12, 16), line);
+        break;
+      case DI.invert:
+        final box = RRect.fromRectAndRadius(const Rect.fromLTWH(4, 4, 16, 16), const Radius.circular(3));
+        canvas.save();
+        canvas.clipRRect(box);
+        canvas.drawRect(const Rect.fromLTWH(12, 4, 8, 16), fill);
+        canvas.restore();
+        canvas.drawRRect(box, line);
+        break;
+      case DI.duplicate:
+        rr(8.5, 8.5, 12, 12, 2.5);
+        canvas.drawPath(
+            Path()
+              ..moveTo(15.5, 8.5)
+              ..lineTo(15.5, 5.5)
+              ..arcToPoint(const Offset(13.5, 3.5), radius: const Radius.circular(2), clockwise: false)
+              ..lineTo(5.5, 3.5)
+              ..arcToPoint(const Offset(3.5, 5.5), radius: const Radius.circular(2), clockwise: false)
+              ..lineTo(3.5, 13.5)
+              ..arcToPoint(const Offset(5.5, 15.5), radius: const Radius.circular(2), clockwise: false)
+              ..lineTo(8.5, 15.5),
+            line);
+        break;
+      case DI.trash:
+        canvas.drawLine(const Offset(4, 6.5), const Offset(20, 6.5), line);
+        canvas.drawPath(poly([9, 6.5, 9.5, 3.5, 14.5, 3.5, 15, 6.5]), line);
+        canvas.drawPath(poly([6, 6.5, 7, 20, 17, 20, 18, 6.5]), line);
+        canvas.drawLine(const Offset(10, 10.5), const Offset(10, 16), line);
+        canvas.drawLine(const Offset(14, 10.5), const Offset(14, 16), line);
+        break;
+      case DI.removePart:
+        rr(3.5, 7.5, 12, 12, 3);
+        canvas.drawLine(const Offset(16, 3.5), const Offset(20.5, 8), line);
+        canvas.drawLine(const Offset(20.5, 3.5), const Offset(16, 8), line);
+        break;
+      case DI.strokeAdd:
+      case DI.strokeErase:
+        canvas.drawPath(
+            Path()
+              ..moveTo(3.5, 18)
+              ..cubicTo(6, 11, 8.5, 21, 11.5, 15)
+              ..cubicTo(13, 12, 14.5, 14, 15.5, 16),
+            line);
+        canvas.drawLine(const Offset(14.5, 7), const Offset(20.5, 7), line);
+        if (icon == DI.strokeAdd) canvas.drawLine(const Offset(17.5, 4), const Offset(17.5, 10), line);
+        break;
+      case DI.eraser:
+        canvas.save();
+        canvas.translate(12, 12);
+        canvas.rotate(-math.pi / 4);
+        final r = RRect.fromRectAndRadius(Rect.fromCenter(center: Offset.zero, width: 18, height: 9), const Radius.circular(2.5));
+        canvas.save();
+        canvas.clipRRect(r);
+        canvas.drawRect(const Rect.fromLTWH(-9, -4.5, 7, 9), fill);
+        canvas.restore();
+        canvas.drawRRect(r, line);
+        canvas.restore();
+        break;
+      case DI.skin:
+        // a face with a small four-point sparkle: smooth skin
+        canvas.drawOval(Rect.fromCenter(center: const Offset(10, 13.5), width: 12, height: 15), line);
+        canvas.drawPath(
+            Path()
+              ..moveTo(18.5, 2)
+              ..quadraticBezierTo(18.5, 5.5, 22, 5.5)
+              ..quadraticBezierTo(18.5, 5.5, 18.5, 9)
+              ..quadraticBezierTo(18.5, 5.5, 15, 5.5)
+              ..quadraticBezierTo(18.5, 5.5, 18.5, 2)
+              ..close(),
+            fill);
+        break;
+      case DI.underEye:
+        canvas.drawPath(
+            Path()
+              ..moveTo(3, 10)
+              ..cubicTo(7, 4.5, 17, 4.5, 21, 10)
+              ..cubicTo(17, 15.5, 7, 15.5, 3, 10),
+            line);
+        canvas.drawCircle(const Offset(12, 10), 2.4, fill);
+        canvas.drawPath(
+            Path()
+              ..moveTo(6, 18.5)
+              ..quadraticBezierTo(12, 21.5, 18, 18.5),
+            line);
+        break;
+      case DI.eyes:
+        canvas.drawPath(
+            Path()
+              ..moveTo(2.5, 12)
+              ..cubicTo(6, 5.5, 18, 5.5, 21.5, 12)
+              ..cubicTo(18, 18.5, 6, 18.5, 2.5, 12),
+            line);
+        canvas.drawCircle(const Offset(12, 12), 3.6, line);
+        canvas.drawCircle(const Offset(13.4, 10.6), 1.4, fill);
+        break;
+      case DI.shine:
+        canvas.drawCircle(const Offset(12, 12), 8.5, line);
+        canvas.drawArc(Rect.fromCircle(center: const Offset(12, 12), radius: 5), math.pi * 1.08, math.pi * 0.42, false, line);
+        canvas.drawCircle(const Offset(15.5, 15.5), 1.2, fill);
+        break;
+      case DI.teeth:
+        canvas.drawPath(
+            Path()
+              ..moveTo(4, 9)
+              ..lineTo(20, 9)
+              ..cubicTo(20, 15.5, 16.5, 19, 12, 19)
+              ..cubicTo(7.5, 19, 4, 15.5, 4, 9)
+              ..close(),
+            line);
+        canvas.drawLine(const Offset(4.6, 12.5), const Offset(19.4, 12.5), line);
+        canvas.drawLine(const Offset(9.5, 9), const Offset(9.5, 12.5), line);
+        canvas.drawLine(const Offset(14.5, 9), const Offset(14.5, 12.5), line);
+        break;
+      case DI.lips:
+        canvas.drawPath(
+            Path()
+              ..moveTo(3, 12)
+              ..cubicTo(5.5, 8, 8.5, 6.5, 10.5, 8)
+              ..quadraticBezierTo(12, 9, 13.5, 8)
+              ..cubicTo(15.5, 6.5, 18.5, 8, 21, 12)
+              ..cubicTo(17.5, 17.5, 6.5, 17.5, 3, 12)
+              ..close(),
+            line);
+        canvas.drawPath(
+            Path()
+              ..moveTo(3, 12)
+              ..quadraticBezierTo(12, 13.8, 21, 12),
+            line);
+        break;
+      case DI.faceLight:
+        canvas.drawOval(Rect.fromCenter(center: const Offset(9, 13), width: 11, height: 14), line);
+        canvas.drawLine(const Offset(16.5, 7.5), const Offset(20, 5.5), line);
+        canvas.drawLine(const Offset(17.5, 12.5), const Offset(21.5, 12.5), line);
+        canvas.drawLine(const Offset(16.5, 17.5), const Offset(20, 19.5), line);
         break;
       case DI.warn:
         canvas.drawCircle(const Offset(12, 12), 9.5, line);

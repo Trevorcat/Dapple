@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../theme/tokens.dart';
+import '../../widgets/controls.dart' show kHit;
 import '../../widgets/icons.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart' show GlassCapsule;
@@ -22,7 +23,7 @@ const List<EGroup> padDockOrder = [EGroup.light, EGroup.color, EGroup.style, EGr
 String dockLabel(EGroup g) => g == EGroup.crop ? '裁切' : (g == EGroup.local ? '局部' : PadCatX.ofGroup(g)!.label);
 
 /// Hold time before the popup appears (a drag beyond [kHoldSlop] starts it at once).
-const Duration kHoldDelay = Duration(milliseconds: 260);
+const Duration kHoldDelay = Mo.hold;
 const double kHoldSlop = 8;
 
 class PadDock extends StatelessWidget {
@@ -35,17 +36,19 @@ class PadDock extends StatelessWidget {
       listenable: Listenable.merge([ctl.wm, ctl.app.editTick, ctl.hold, ctl.local]),
       builder: (context, _) => LayoutBuilder(builder: (context, cons) {
         final n = padDockOrder.length;
-        final iw = (cons.maxWidth / n).clamp(46.0, 76.0).toDouble(); // six items: the side-pane dock on a landscape phone is ~300 dp
+        // six items of at least 48 dp (the touch target, guidelines 6): the side-pane dock on a landscape phone is ~288 dp; a still
+        // narrower window scrolls the dock (guidelines 15.2.2) rather than shrinking the items
+        final iw = (cons.maxWidth / n).clamp(kHit, 76.0).toDouble();
+        final row = SizedBox(
+          width: iw * n,
+          height: 56,
+          child: Row(children: [
+            for (final g in padDockOrder) SizedBox(width: iw, height: 56, child: DockItem(key: ValueKey('dock-$g'), ctl: ctl, group: g)),
+          ]),
+        );
         return GlassCapsule(
           radius: 28,
-          child: SizedBox(
-            width: iw * n,
-            height: 56,
-            child: Row(children: [
-              for (final g in padDockOrder)
-                SizedBox(width: iw, height: 56, child: DockItem(key: ValueKey('dock-$g'), ctl: ctl, group: g)),
-            ]),
-          ),
+          child: iw * n <= cons.maxWidth + 0.5 ? row : SizedBox(width: cons.maxWidth, child: SingleChildScrollView(scrollDirection: Axis.horizontal, child: row)),
         );
       }),
     );
@@ -144,7 +147,8 @@ class _DockItemState extends State<DockItem> {
                 height: 26,
                 child: CustomPaint(
                     key: const ValueKey('glyph-local'),
-                    painter: LocalDockGlyphPainter(la == null || la.mask.isEmpty ? LocalGlyph.radial : kindOfComponent(la.mask.first).glyph, areas.length, fg))))
+                    painter: LocalDockGlyphPainter(la == null || la.mask.isEmpty ? LocalGlyph.radial : kindOfComponent(la.mask.first).glyph, areas.length, fg,
+                        ink: c.surface, textScale: MediaQuery.textScalerOf(context).scale(11) / 11, base: DefaultTextStyle.of(context).style))))
         : pc == null
         ? DIcon(DI.crop, size: 24, color: fg, stroke: 1.9)
         : Opacity(opacity: dim ? 0.38 : 1, child: SizedBox(width: 34, height: 26, child: CustomPaint(key: ValueKey('glyph-${pc.name}'), painter: GlyphPainter(s.x, s.y, s.a, pc == PadCat.film, fg))));
@@ -233,9 +237,9 @@ class HoldPopupLayer extends StatelessWidget {
           child: IgnorePointer(
             child: Container(
               key: const ValueKey('hold-popup'),
-              padding: const EdgeInsets.all(6),
-              decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(26), boxShadow: const [BoxShadow(color: Color(0x52000000), blurRadius: 28, offset: Offset(0, 8))]),
-              child: PadFace(ctl: ctl, cat: h.cat, interactive: false, presets: h.cat == PadCat.color, radius: 21),
+              padding: const EdgeInsets.all(Sp.s),
+              decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(Rd.panel), boxShadow: Fx.shadowFloat),
+              child: PadFace(ctl: ctl, cat: h.cat, interactive: false, presets: h.cat == PadCat.color, radius: Rd.cardLg),
             ),
           ),
         );

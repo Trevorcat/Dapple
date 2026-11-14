@@ -122,7 +122,7 @@ void main() {
       expect(viewOf(app, id, PadCat.light).x, closeTo(-0.8, 0.02));
       expect(viewOf(app, id, PadCat.light).y, closeTo(0.9, 0.02));
       // the field fills the whole pad: the pad starts at the strip's right edge plus the gap, no inner padding
-      expect(r.left - stripRect(t, PadCat.light).right, 10);
+      expect(r.left - stripRect(t, PadCat.light).right, 12);
       // the recipe wrote the parameters
       expect(app.editOf(id).value('exposure'), closeTo(-0.8 * 16, 0.6));
       // the edges clamp
@@ -396,7 +396,9 @@ void main() {
       await settle(t, 3);
       expect(app.editOf(id).film, isNull);
       expect(app.editOf(id).values.containsKey('film_grain'), isFalse);
-      expect(find.descendant(of: find.byKey(const ValueKey('stock-button')), matching: find.text('无')), findsOneWidget);
+      // nothing chosen: one button that says what it does, and no 无 (audit F44)
+      expect(find.descendant(of: find.byKey(const ValueKey('stock-button')), matching: find.text('选胶片')), findsOneWidget);
+      expect(find.byKey(const ValueKey('film-none')), findsNothing);
     });
 
     test('pickDot: the finger stands for a point 2.4x closer to the press point', () {

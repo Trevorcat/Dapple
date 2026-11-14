@@ -94,17 +94,17 @@ void main() {
     expect(find.byType(CodecDiagnosticsPage), findsOneWidget);
   });
 
-  testWidgets('settings has a visible diagnostics entry (phone)', (t) async {
+  testWidgets('settings: the diagnostics open from a long press on the version (phone; no visible row, audit F39)', (t) async {
     t.view.physicalSize = const Size(1080, 2400);
     t.view.devicePixelRatio = 3;
     addTearDown(t.view.reset);
     final app = AppState.demo();
     await t.pumpWidget(MaterialApp(theme: buildTheme(Brightness.light), home: Scaffold(body: SettingsPage(app: app, wide: false))));
     await t.pump(const Duration(milliseconds: 300));
-    await t.scrollUntilVisible(find.byKey(const ValueKey('codec-diagnostics')), 300, scrollable: find.byType(Scrollable).first);
-    await t.ensureVisible(find.byKey(const ValueKey('codec-diagnostics')));
+    await t.scrollUntilVisible(find.byKey(const ValueKey('about-version')), 300, scrollable: find.byType(Scrollable).first);
+    await t.ensureVisible(find.byKey(const ValueKey('about-version')));
     await t.pump();
-    await t.tap(find.byKey(const ValueKey('codec-diagnostics')));
+    await t.longPress(find.byKey(const ValueKey('about-version')));
     await t.pump();
     await t.pump(const Duration(milliseconds: 600));
     expect(find.byType(CodecDiagnosticsPage), findsOneWidget);
@@ -121,10 +121,10 @@ void main() {
     await t.scrollUntilVisible(find.byKey(const ValueKey('cat-5')), 100, scrollable: find.descendant(of: find.byKey(const ValueKey('cat-list')), matching: find.byType(Scrollable)));
     await t.tap(find.byKey(const ValueKey('cat-5')));
     await t.pump(const Duration(milliseconds: 300));
-    expect(find.byKey(const ValueKey('codec-diagnostics')), findsOneWidget);
-    await t.ensureVisible(find.byKey(const ValueKey('codec-diagnostics')));
+    expect(find.byKey(const ValueKey('about-version')), findsOneWidget);
+    await t.ensureVisible(find.byKey(const ValueKey('about-version')));
     await t.pump();
-    await t.tap(find.byKey(const ValueKey('codec-diagnostics')));
+    await t.longPress(find.byKey(const ValueKey('about-version')));
     await t.pump();
     await t.pump(const Duration(milliseconds: 600));
     expect(find.byType(CodecDiagnosticsPage), findsOneWidget);

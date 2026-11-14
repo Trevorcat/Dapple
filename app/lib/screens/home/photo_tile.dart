@@ -37,7 +37,7 @@ class PhotoTile extends StatelessWidget {
         break;
       case PhotoStatus.interrupted:
       case PhotoStatus.failed:
-        b.write(photo.developFailed ? '，无法处理，${photo.failReason}' : '，传输中断');
+        b.write(photo.developFailed ? '，${photo.failReason}' : '，传输中断');
         break;
       case PhotoStatus.done:
         break;
@@ -56,9 +56,10 @@ class PhotoTile extends StatelessWidget {
       case PhotoStatus.interrupted:
       case PhotoStatus.failed:
         if (photo.developFailed) {
-          app.showToast(photo.failReason, actionLabel: '重试', onAction: () => app.retry(photo));
+          final act = _failAct();
+          app.showToast(photo.failReason, actionLabel: act?.$1, onAction: act?.$2);
         } else {
-          app.showToast('传输中断，点「重试」');
+          app.showToast('传输中断', actionLabel: '重试', onAction: () => app.retry(photo));
         }
         return;
       default:
@@ -69,6 +70,17 @@ class PhotoTile extends StatelessWidget {
     } else {
       openEditor(context, app, photo.id);
     }
+  }
+
+  /// The step that can help, by what happened (audit F06): 重试 when reading again can work, 移除 when the original is gone or broken,
+  /// nothing when the format is not supported (the tile says so).
+  (String, VoidCallback)? _failAct() {
+    if (!photo.developFailed) return ('重试', () => app.retry(photo));
+    return switch (photo.failAction) {
+      FailAction.retry => ('重试', () => app.retry(photo)),
+      FailAction.remove => ('移除', () => app.removeFromLibrary(photo)),
+      FailAction.none => null,
+    };
   }
 
   @override
@@ -98,7 +110,7 @@ class PhotoTile extends StatelessWidget {
           TapGestureRecognizer: GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
               TapGestureRecognizer.new, (r) => r.onTap = () => _tap(context)),
           LongPressGestureRecognizer: GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
-              () => LongPressGestureRecognizer(duration: const Duration(milliseconds: 450)),
+              () => LongPressGestureRecognizer(duration: Mo.multiSelect),
               (r) => r.onLongPress = () {
                     if (selectable) app.enterSelect(photo.id);
                   }),
@@ -117,77 +129,53 @@ class PhotoTile extends StatelessWidget {
               ),
             ),
           if (broken) ...[
-            const ColoredBox(color: Color(0x2EF0A020)),
+            ColoredBox(color: Fx.amber.withValues(alpha: 0.18)),
             Positioned.fill(child: DecoratedBox(decoration: BoxDecoration(border: Border.all(color: Fx.amber, width: 3)))),
+            // what happened, on the amber pill's own solid ground (audit F18): never bare text on the photo
             Positioned(
               left: 6,
               top: 6,
-              child: Container(
-                height: 20,
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                alignment: Alignment.center,
-                decoration: BoxDecoration(color: Fx.amber, borderRadius: BorderRadius.circular(8)),
-                child: Text(photo.developFailed ? '无法处理' : '传输中断', style: T.mini(Fx.onAmber, w: FontWeight.w500)),
-              ),
-            ),
-            if (photo.developFailed)
-              Positioned(
-                left: 8,
-                right: 8,
-                bottom: 8,
-                child: Text(photo.failReason,
-                    key: ValueKey('reason-${photo.id}'), maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: T.mini(Colors.black87)),
-              ),
-            Center(
-              child: Semantics(
-                button: true,
-                label: '${photo.title}，${photo.developFailed ? '重试' : '重试传输'}',
-                excludeSemantics: true,
-                child: GestureDetector(
-                  key: ValueKey('retry-${photo.id}'),
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () => app.retry(photo),
-                  child: Container(
-                    width: 64,
-                    height: 48,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(color: Fx.amber, borderRadius: BorderRadius.circular(8)),
-                    child: Text('重试', style: T.body(Fx.onAmber, w: FontWeight.w500)),
-                  ),
+              right: 6,
+              child: Align(
+                alignment: Alignment.topLeft,
+                child: Container(
+                  key: photo.developFailed ? ValueKey('reason-${photo.id}') : null,
+                  constraints: const BoxConstraints(minHeight: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: Sp.s, vertical: 2),
+                  decoration: BoxDecoration(color: Fx.amber, borderRadius: BorderRadius.circular(Rd.thumb)),
+                  child: Text(photo.developFailed ? photo.failReason : '传输中断',
+                      maxLines: 2, overflow: TextOverflow.ellipsis, style: T.mini(Fx.onAmber, w: FontWeight.w500)),
                 ),
               ),
             ),
-          ],
-          if (sel) const ColoredBox(color: Color(0x38FFFFFF)),
-          // developing: a thin moving bar along the bottom edge, with the word on the tile (queued tiles say so too)
-          if (photo.processing && photo.kind == PhotoKind.photo) ...[
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: LinearProgressIndicator(
-                  key: ValueKey('progress-${photo.id}'),
-                  minHeight: 3,
-                  color: c.accent,
-                  backgroundColor: Colors.black12,
-                  value: st == PhotoStatus.pending ? 0 : null),
-            ),
-            Positioned(
-              left: 6,
-              top: 6,
-              child: Container(
-                height: 20,
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                alignment: Alignment.center,
-                decoration: BoxDecoration(color: Fx.overlay55, borderRadius: BorderRadius.circular(8)),
-                child: Text(st == PhotoStatus.pending ? '等待处理' : '处理中', style: T.mini(Colors.white, w: FontWeight.w500)),
+            if (_failAct() case final act?)
+              Center(
+                child: Semantics(
+                  button: true,
+                  label: '${photo.title}，${photo.developFailed ? act.$1 : '重试传输'}',
+                  excludeSemantics: true,
+                  child: GestureDetector(
+                    key: ValueKey('${act.$1 == '移除' ? 'remove' : 'retry'}-${photo.id}'),
+                    behavior: HitTestBehavior.opaque,
+                    onTap: act.$2,
+                    child: Container(
+                      width: 64,
+                      height: 48,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(color: Fx.amber, borderRadius: BorderRadius.circular(Rd.thumb)),
+                      child: Text(act.$1, style: T.body(Fx.onAmber, w: FontWeight.w500)),
+                    ),
+                  ),
+                ),
               ),
-            ),
           ],
+          if (sel) ColoredBox(color: Fx.onPhoto.withValues(alpha: 0.22)),
+          // waiting / developing (guidelines 10.12, audit F17): the hollow dot bottom-left says "not final yet"; the spinner bottom-right
+          // says it is being worked on now. No word pill, no edge bar.
           // bottom-left: state dot or kind badge
           Positioned(left: 6, bottom: 6, child: _bottomLeft(context)),
           // bottom-right: processing spinner
-          if (photo.processing)
+          if (st == PhotoStatus.developing)
             Positioned(
               right: 6,
               bottom: 6,
@@ -212,8 +200,8 @@ class PhotoTile extends StatelessWidget {
           height: 20,
           padding: const EdgeInsets.symmetric(horizontal: 8),
           alignment: Alignment.center,
-          decoration: BoxDecoration(color: accent ? c.accentBtn : Fx.overlay55, borderRadius: BorderRadius.circular(8)),
-          child: Text(t, style: T.mini(Colors.white, w: FontWeight.w500)),
+          decoration: BoxDecoration(color: accent ? c.accentBtn : Fx.overlay55, borderRadius: BorderRadius.circular(Rd.thumb)),
+          child: Text(t, style: T.mini(Fx.onPhoto, w: FontWeight.w500)),
         );
     switch (photo.kind) {
       case PhotoKind.bracket:
@@ -225,7 +213,7 @@ class PhotoTile extends StatelessWidget {
               width: 36,
               height: 36,
               decoration: const BoxDecoration(color: Fx.overlay55, shape: BoxShape.circle),
-              child: const Center(child: DIcon(DI.play, size: 18, color: Colors.white))),
+              child: const Center(child: DIcon(DI.play, size: 18, color: Fx.onPhoto))),
           const SizedBox(width: 6),
           pill(photo.badge ?? ''),
         ]);
@@ -236,7 +224,7 @@ class PhotoTile extends StatelessWidget {
       case PhotoKind.photo:
         break;
     }
-    if (photo.processing) return const Dot(Colors.white, size: 10, hollow: true);
+    if (photo.processing) return const Dot(Fx.onPhoto, size: 10, hollow: true);
     if (photo.flag) return const Dot(Fx.amber, size: 10, ring: true);
     if (photo.edit.isAdjusted) return const Dot(Fx.adjusted, size: 10, ring: true);
     return const SizedBox.shrink();

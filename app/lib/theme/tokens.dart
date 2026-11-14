@@ -20,6 +20,7 @@ class DC extends ThemeExtension<DC> {
     required this.accent,
     required this.accentBtn,
     required this.accentSoft,
+    this.onAccent = const Color(0xFFFFFFFF),
     required this.track,
     required this.glass,
     required this.chip,
@@ -51,6 +52,9 @@ class DC extends ThemeExtension<DC> {
   });
 
   final Color bg, surface, surfaceHi, text, text2, sep, accent, accentBtn, accentSoft, track, glass, chip;
+
+  /// Text and icons on an `accentBtn` fill (guidelines 2.1: white on the primary button; 2.4: 5.81 / 4.96).
+  final Color onAccent;
   final Color stage, focusStage, placeholder, warn, warnBg, okBg, okIcon, danger, scrim, navAnd;
   final Color primaryContainer, onPrimaryContainer, secContainer, onSecContainer, outline;
   final Color histFill, zoneA, snackBg, snackText, snackAct, tick;
@@ -166,6 +170,24 @@ class Fx {
   static const chG = Color(0xFF30A46C);
   static const chB = Color(0xFF0091FF);
   static const tempTrack = [Color(0xFF3B82F6), Color(0xFFE5E7EB), Color(0xFFF59E0B)];
+  /// Tone band of the 局部 tool strip: dark -> light.
+  static const toneTrack = [Color(0xFF0B0B0C), Color(0xFFF7F7F5)];
+
+  /// Distance band (远近): near (warm, strong) -> far (hazy blue), an air-perspective hint.
+  static const depthTrack = [Color(0xFF6B4A33), Color(0xFFB9A58F), Color(0xFFCFDCE8)];
+
+  /// A name label on a pad (the colour-style dots): the pad is a light gradient in both themes (guidelines 2.2).
+  static const padLabel = Color(0xE6FFFFFF);
+  static const onPadLabel = Color(0xFF15171A);
+
+  /// A white handle / outline drawn on the photo or a pad, and its thin dark rim.
+  static const handle = Color(0xFFFFFFFF);
+  static const handleRim = Color(0x59000000);
+
+  /// Shadows (guidelines 10.8 / 15.2.3): a docked panel, and a surface that floats over the photo (tool strip, popup).
+  static const shadowPanel = [BoxShadow(color: Color(0x1F000000), blurRadius: 16, offset: Offset(0, 4))];
+  static const shadowFloat = [BoxShadow(color: Color(0x38000000), blurRadius: 24, offset: Offset(0, 6))];
+
   static const tintTrack = [Color(0xFF22C55E), Color(0xFFE5E7EB), Color(0xFFD946EF)];
   static const hueTrack = [
     Color(0xFFFF3B30),
@@ -183,9 +205,24 @@ class Sp {
   static const double grid = 2, xs = 4, s = 8, m = 12, l = 16, xl = 24;
 }
 
-/// Radii (guidelines 5), Android column.
+/// Radii (guidelines 5), Android column, plus the steps of the scale the editor uses: 14 (menu, inner panel blocks), 18 (a 36-tall
+/// capsule: chip, pill button), 20 (floating strip, alert), 24 (floating panel, popup). Nothing outside the scale.
 class Rd {
-  static const double thumb = 8, tile = 12, card = 12, cardLg = 16, ctaMd = 24, cta = 26, sheet = 28, dialog = 28;
+  static const double thumb = 8, tile = 12, card = 12, block = 14, cardLg = 16, chip = 18, float = 20, ctaMd = 24, panel = 24, cta = 26, sheet = 28, dialog = 28;
+}
+
+/// Motion (guidelines 9 / 15.3): the three spring tiers as durations, and the fixed hold times.
+class Mo {
+  static const small = Duration(milliseconds: 150), medium = Duration(milliseconds: 200), large = Duration(milliseconds: 350);
+
+  /// Press-and-hold on a dock item before the pad pops up (editor-panel 3) and the film map's magnification (editor-panel 4).
+  static const hold = Duration(milliseconds: 260);
+
+  /// A semantic tap on a press-and-hold control shows its held state this long.
+  static const peek = Duration(milliseconds: 900);
+
+  /// Long press on a photo tile enters multi-select (guidelines 9).
+  static const multiSelect = Duration(milliseconds: 450);
 }
 
 /// Type scale (guidelines 3.1). Android weights 400 / 500 (nav selected 700).

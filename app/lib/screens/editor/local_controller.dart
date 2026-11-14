@@ -439,7 +439,17 @@ class LocalController extends ChangeNotifier {
       if ((tasks & AiBits.faces) != 0) faces = r.faces;
       if ((tasks & AiBits.sky) != 0) skyFound = r.skyFound;
     } else if (r != null && r.state == 'error') {
-      _toast('没能分析这张照片');
+      // what happened plus the step that can help (audit F21 / U9): the same analysis once more
+      final again = aiPending, mode = _pendingMode, portrait = portraitWaiting;
+      ctl.app.showToast('没能分析这张照片', actionLabel: '重试', onAction: () {
+        if (again != null) {
+          chooseKind(again, mode);
+        } else if (portrait) {
+          openPortrait();
+        } else {
+          startAnalysis(tasks);
+        }
+      });
       aiPending = null;
     }
     if (r != null && (tasks & (AiBits.person | AiBits.faces)) != 0) _portraitFacesDirty = true;
@@ -1464,8 +1474,12 @@ class LocalController extends ChangeNotifier {
   Timer? _reqTimer;
   String _overlayFor = '';
 
-  /// Device pixels of the frame's long edge (the overlay's resolution).
+  /// Device pixels of the frame's long edge at fit zoom.
   double frameDevicePx = 1024;
+
+  /// The overlay's long edge: the photo as it is on screen now, in device pixels (fit size x device pixel ratio x zoom), bounded
+  /// to 256..2048. It was the fit size capped at 1024, which a 1440p phone (or any zoom) upscaled into visible blocks.
+  int get overlayPx => (frameDevicePx * math.max(1.0, zoomScale)).clamp(256.0, 2048.0).round();
 
   int get _now => DateTime.now().millisecondsSinceEpoch;
 
@@ -1494,7 +1508,8 @@ class LocalController extends ChangeNotifier {
   String _sigNow() {
     final a = sel;
     if (a == null) return '';
-    return '${ctl.id}|$selIndex|${identityHashCode(a.mask)}|${a.invert}|${_geoSig()}';
+    // the resolution step is part of the signature: zooming in past a step asks for a sharper overlay
+    return '${ctl.id}|$selIndex|${identityHashCode(a.mask)}|${a.invert}|${_geoSig()}|${overlayPx ~/ 256}';
   }
 
   void _wantOverlay() {
@@ -1538,7 +1553,7 @@ class LocalController extends ChangeNotifier {
       final s = await ctl.app.sessions.get(p);
       if (s == null) return;
       final pj = jsonEncode(ctl.app.wireParams(p));
-      final px = await LocalNative.overlay(s.address, pj, idx, frameDevicePx.clamp(256, 1024).round());
+      final px = await LocalNative.overlay(s.address, pj, idx, overlayPx);
       if (px == null) return;
       final c = Completer<ui.Image>();
       ui.decodeImageFromPixels(px.rgba, px.width, px.height, ui.PixelFormat.rgba8888, c.complete);
@@ -1649,18 +1664,18 @@ class LocalController extends ChangeNotifier {
           'redness' => '去红',
           'heal' => '祛斑',
           'texture' => '纹理',
-          'undereye' => '去黑眼圈',
+          'undereye' => '眼下提亮',
           'shine' => '去油光',
           'whiten' => pt.$2.id == 'pt-teeth' ? '牙齿美白' : '眼白提亮',
           'clarity' => '眼神',
-          'saturation' => pt.$2.id == 'pt-lips' ? '唇色' : '虹膜饱和度',
-          'facelight' => '面部补光',
+          'saturation' => pt.$2.id == 'pt-lips' ? '唇色' : '瞳色',
+          'facelight' => '补光',
           _ => localOpByKey[k]?.label ?? k,
         };
     return [
       for (final o in pt.$2.ops)
         PadItem(o.key, label(o.key), o.key == 'texture' ? -o.max : 0, o.max, o.def, (v) => o.key == 'texture' ? fmtValue(Fmt.signed, v) : fmtValue(Fmt.plain, v)),
-      if (pt.$2.id == 'pt-skin') PadItem('sens', '祛斑灵敏度', 0, 100, 25, (v) => fmtValue(Fmt.plain, v)),
+      if (pt.$2.id == 'pt-skin') PadItem('sens', '祛斑范围', 0, 100, 25, (v) => fmtValue(Fmt.plain, v)),
     ];
   }
 

@@ -323,7 +323,7 @@ class AppState extends ChangeNotifier {
 
   String get connTitle {
     if (usbCardActive) return usb.cardTitle;
-    if (needsMediaPermission) return '还不能读取手机里的照片';
+    if (needsMediaPermission) return '还不能读取照片';
     switch (connState) {
       case ConnState.disconnected:
         return '${cameraName.isEmpty ? '手机相册' : cameraName} · 已断开';
@@ -337,12 +337,14 @@ class AppState extends ChangeNotifier {
 
   String get connLine {
     if (usbCardActive) return usb.cardLine;
-    if (needsMediaPermission) return mediaBlocked ? '在系统设置里允许 Dapple 访问照片' : '允许后，手机相册里的照片会出现在这里';
+    // the action says what to do (允许访问 / 打开设置): the line only states what happened, or nothing (audit C)
+    if (needsMediaPermission) return mediaBlocked ? '已被系统拒绝' : '';
     switch (connState) {
       case ConnState.disconnected:
         return '最后收到第 ${_photos.length} 张';
       case ConnState.idle:
-        if (!isDemo && ftpRunning) return ftpAddressText ?? '未连接 Wi-Fi 或热点';
+        // the address is a settings detail (audit F22); the card only says where to find it
+        if (!isDemo && ftpRunning) return ftpAddressText == null ? '未连接 Wi-Fi 或热点' : '设置里看地址';
         return cameraSource || _photos.isEmpty ? '没有新照片' : '照片来自手机相册 · ${_photos.length} 张';
       case ConnState.interrupted:
         return '$interruptedCount 张传输中断';
@@ -399,7 +401,7 @@ class AppState extends ChangeNotifier {
             await requestPermission();
             if (!mediaPermitted && !mediaBlocked) showToast('需要允许访问照片');
           } else {
-            showToast('正在等待相机：请在相机上开启 FTP 传输并选择这台手机');
+            showToast('等待相机');
           }
         }
         break;
@@ -977,6 +979,17 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// A photo whose original is gone or broken (audit F06): it leaves the list (the app's own preview goes with it; the phone's files are
+  /// not touched). 撤销 puts it back.
+  void removeFromLibrary(Photo ph) {
+    if (_photos.remove(ph.id) == null) return;
+    changed();
+    showToast('已移除「${ph.title}」', actionLabel: '撤销', onAction: () {
+      _photos[ph.id] = ph;
+      changed();
+    });
+  }
+
   /// Debug builds only (DebugOpen `{"purgeCaptures":true}`): removes every in-app capture (`cap:` ids) and its private files from the library.
   /// The library has no delete action; this is how test shots are cleaned up on a device.
   int purgeCaptures() {
@@ -1054,14 +1067,17 @@ class AppState extends ChangeNotifier {
       _addIncoming(fresh);
       if (fresh.isNotEmpty && frozen) releaseNew(); // a pick is the user's own action: show it now
       final notes = <String>[
-        if (unsupported > 0) '$unsupported 个文件不是支持的照片格式，已跳过',
-        if (failed > 0) '$failed 张没能读取，请再试一次',
+        if (unsupported > 0) '$unsupported 个文件格式不支持，已跳过',
+        if (failed > 0) '$failed 张没读出来',
         if (dups > 0 && fresh.isEmpty) (dups == 1 ? '这张已经在照片里' : '所选照片已经都在照片里'),
       ];
-      if (notes.isNotEmpty) showToast(notes.join('；'));
+      // reading again can help with the files that were not read; skipped formats and duplicates need nothing
+      if (notes.isNotEmpty) {
+        showToast(notes.join('；'), actionLabel: failed > 0 ? '重试' : null, onAction: failed > 0 ? () => importFromPicker(source: source) : null);
+      }
       return items.length == 1 ? only : null;
     } catch (e) {
-      showToast('导入失败，请再试一次');
+      showToast('没导入成功', actionLabel: '重试', onAction: () => importFromPicker(source: source));
       return null;
     } finally {
       importing = false;
@@ -1159,7 +1175,7 @@ class AppState extends ChangeNotifier {
     if (ph.id.startsWith('ftp:arr:') || ph.id.startsWith('usb:arr:')) {
       // An interrupted camera upload can only be resent by the camera.
       _photos.remove(ph.id);
-      if (!quiet) showToast('请在相机上重新发送');
+      if (!quiet) showToast('已移除 · 从相机重新发送这张');
       changed();
       return;
     }
@@ -1251,7 +1267,7 @@ class AppState extends ChangeNotifier {
     _photos.remove(ph.id);
     _tryDelete(ph.path);
     _tryDelete(ph.previewPath);
-    showToast('已移除一张空白的合成结果，请重新合成');
+    showToast('已移除一张空白的合成结果');
     changed();
   }
 
@@ -1488,6 +1504,23 @@ class AppState extends ChangeNotifier {
 
   /// True while [saveOneToAlbum] is exporting [id].
   bool isSaving(String id) => _saving.contains(id);
+
+  /// Open publish / export sheets (the publish page counts itself in and out).
+  int _exportSheets = 0;
+  // called from a page's initState / dispose: listeners hear it after the frame, never during a build
+  void exportSheetOpened() {
+    _exportSheets++;
+    Future.microtask(notifyListeners);
+  }
+
+  void exportSheetClosed() {
+    if (_exportSheets > 0) _exportSheets--;
+    Future.microtask(notifyListeners);
+  }
+
+  /// An export or share is being prepared: the editor hides its working overlays (the 局部 red tint), which belong to editing only.
+  /// Exports are rendered by the engine from the edit parameters and never contain those overlays.
+  bool get exportInProgress => _exportSheets > 0 || _saving.isNotEmpty;
 
   /// One-tap "save to album" at the user's save size (original by default): toast while working, toast
   /// when done, and the photo's `exported` flag drives the check mark.

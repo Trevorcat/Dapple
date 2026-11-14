@@ -38,6 +38,9 @@ class GlassCapsule extends StatelessWidget {
 
 // ===================================================================================== top bar
 
+/// Width of the top bar standing as a rail beside the photo (one 48 dp button).
+const double kTopRailW = 48;
+
 class EditorTopBar extends StatelessWidget {
   const EditorTopBar({
     super.key,
@@ -45,7 +48,12 @@ class EditorTopBar extends StatelessWidget {
     required this.photoId,
     required this.onBack,
     required this.onMore,
+    this.vertical = false,
   });
+
+  /// Beside the side pane (landscape, the unfolded inner screen): a rail on the photo column's outer edge, back on top, so the photo
+  /// can take the full height (audit F25).
+  final bool vertical;
   final AppState app;
   final String Function() photoId;
   final VoidCallback onBack;
@@ -61,7 +69,9 @@ class EditorTopBar extends StatelessWidget {
         PerfProbe.count('topbar');
         final saving = app.isSaving(id);
         final done = app.photoById(id)?.exported ?? false;
-        return Row(
+        return Flex(
+          direction: vertical ? Axis.vertical : Axis.horizontal,
+          mainAxisSize: vertical ? MainAxisSize.min : MainAxisSize.max,
           children: [
             GlassCapsule(
               radius: 24,
@@ -72,10 +82,11 @@ class EditorTopBar extends StatelessWidget {
                 onPressed: onBack,
               ),
             ),
-            const Spacer(),
+            if (vertical) const SizedBox(height: 8) else const Spacer(),
             GlassCapsule(
               radius: 24,
-              child: Row(
+              child: Flex(
+                direction: vertical ? Axis.vertical : Axis.horizontal,
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   DIconButton(

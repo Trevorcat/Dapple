@@ -64,7 +64,7 @@ void main() {
       await app.refreshPermission();
       expect(app.mediaBlocked, isTrue);
       expect(app.connAction, '打开设置');
-      expect(app.connLine, '在系统设置里允许 Dapple 访问照片');
+      expect(app.connLine, '已被系统拒绝');
       await app.connectAction();
       expect(opened, 1);
       expect(app.mediaPermitted, isFalse);
@@ -95,7 +95,7 @@ void main() {
       ..scanDone = true;
     await pumpDapple(tester, app);
     expect(find.text('最近 7 天没有新照片'), findsOneWidget);
-    expect(find.text('更早的照片可以从相册选择'), findsOneWidget);
+    expect(find.text('更早的照片可以从相册选择'), findsNothing, reason: 'the button is the next step; no explanation line');
     expect(find.byKey(const ValueKey('empty-import')), findsOneWidget);
     await shot(tester, 'home_empty_7days');
   });
@@ -107,7 +107,8 @@ void main() {
       ..tab = 1;
     await pumpDapple(tester, app);
     await tester.pump(_t);
-    expect(find.textContaining('预览为示例画面'), findsOneWidget);
+    expect(find.text('新照片默认使用'), findsOneWidget);
+    expect(find.byKey(const ValueKey('sample-pill')), findsOneWidget, reason: 'the sample picture is labelled on the picture, not by a sentence');
     expect(find.byKey(const ValueKey('base-modern_clean')), findsOneWidget);
     expect(find.byType(Image), findsWidgets); // the bundled sample scene, not a flat placeholder
     await shot(tester, 'styles_no_photo');

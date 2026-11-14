@@ -13,6 +13,21 @@ import 'icons.dart';
 /// Minimum touch target on Android.
 const double kHit = 48;
 
+/// The touch target of a control whose picture is smaller than [kHit] (guidelines 6, audit U10): the visual keeps its size and
+/// sits centred in a box of at least 48 x 48. Put it inside the GestureDetector (opaque), so the whole box takes the tap. Rows
+/// of such controls wrap when they do not fit; they never shrink the box.
+class HitBox extends StatelessWidget {
+  const HitBox({super.key, required this.child, this.minWidth = kHit, this.minHeight = kHit});
+  final Widget child;
+  final double minWidth, minHeight;
+
+  @override
+  Widget build(BuildContext context) => ConstrainedBox(
+        constraints: BoxConstraints(minWidth: minWidth, minHeight: minHeight),
+        child: Align(widthFactor: 1, heightFactor: 1, child: child),
+      );
+}
+
 // ---------------------------------------------------------------- buttons
 
 class PrimaryButton extends StatelessWidget {

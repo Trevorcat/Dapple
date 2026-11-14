@@ -13,21 +13,42 @@ import '../../model/pad_model.dart';
 import '../../model/portrait.dart';
 import '../../services/local_ai.dart' show AiPlane;
 import '../../theme/tokens.dart';
+import '../../widgets/controls.dart' show HitBox, kHit;
+import '../../widgets/icons.dart';
 import 'editor_controller.dart';
 import 'itemised_view.dart';
 import 'local_controller.dart';
 import 'local_glyphs.dart';
 import 'pad_gestures.dart';
-import 'pad_panel.dart' show HeaderButton, PanelChip, headerH;
+import 'pad_panel.dart' show HeaderButton, PanelChip, headerWraps, kHeaderH;
 import 'pad_widgets.dart';
 
 // ------------------------------------------------------------------ header
 
+/// Area chips: a 40 dp tile in a 48 dp touch box, laid side by side without gaps (the boxes touch, the tiles keep 8 dp apart).
+const double kAreaChip = 40;
+
 class LocalHeader extends StatelessWidget {
-  const LocalHeader({super.key, required this.ctl, required this.side, required this.textScale});
+  const LocalHeader({super.key, required this.ctl, required this.side, required this.textScale, this.collapsed = false});
   final EditorController ctl;
   final bool side;
   final double textScale;
+
+  /// Folded to the handle and the header: only the first line shows.
+  final bool collapsed;
+
+  /// Number of chips (the [+] and one per shown area).
+  static int chipCount(LocalController lc) {
+    var n = 1, portrait = false;
+    for (final a in lc.list.items) {
+      if (portraitOf(a) != null) {
+        if (portrait) continue;
+        portrait = true;
+      }
+      n++;
+    }
+    return n;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -56,7 +77,7 @@ class LocalHeader extends StatelessWidget {
       if (parts)
         Opacity(
           opacity: lc.partPick.isEmpty ? 0.38 : 1,
-          child: HeaderButton(key: const ValueKey('parts-add'), label: lc.partMode == LocalBody.subPart ? '减去' : '添加', pressed: lc.partPick.isNotEmpty, onTap: lc.addPickedParts),
+          child: HeaderButton(key: const ValueKey('parts-add'), label: lc.partMode == LocalBody.subPart ? '减去' : '加上', pressed: lc.partPick.isNotEmpty, onTap: lc.addPickedParts),
         )
       else if (!inCard && a != null) ...[
         ListenableBuilder(
@@ -68,7 +89,7 @@ class LocalHeader extends StatelessWidget {
               maintainSize: true,
               maintainAnimation: true,
               maintainState: true,
-              child: HeaderButton(key: const ValueKey('reset-local'), label: '复位', icon: Icons.refresh, semantics: '复位这个区域的调整', onTap: lc.resetOps),
+              child: HeaderButton(key: const ValueKey('reset-local'), label: '复位', icon: DI.reset, semantics: '复位这个区域的调整', onTap: lc.resetOps),
             );
           },
         ),
@@ -77,48 +98,57 @@ class LocalHeader extends StatelessWidget {
         HeaderButton(key: const ValueKey('items-button'), label: '分项', pressed: ctl.itemised, onTap: () => ctl.setItemised(!ctl.itemised)),
       ],
     ];
-    // the side pane's second line holds the chips (26 dp): 4 dp more than the readout line of the other categories; the body gives them up
-    final h = headerH(textScale, side: side) + (side ? 4 : 0);
     final titleStyle = T.body(c.text, w: FontWeight.w600);
-    final chips = LocalChips(lc: lc, compact: side);
-    return SizedBox(
-      height: h,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14),
-        child: side
-            ? Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Text(title, key: const ValueKey('header-title'), style: titleStyle),
-                      const Spacer(),
-                      for (final b in buttons) ...[const SizedBox(width: 6), b],
-                    ],
-                  ),
-                  SizedBox(height: 26, child: chips),
-                ],
-              )
-            : Row(
-                children: [
-                  Text(title, key: const ValueKey('header-title'), style: titleStyle),
-                  const SizedBox(width: 10),
-                  Expanded(child: chips),
-                  for (final b in buttons) ...[const SizedBox(width: 6), b],
-                ],
-              ),
-      ),
-    );
+    final scaler = MediaQuery.textScalerOf(context);
+    final line = kHeaderH + math.max(0.0, textScale - 1) * 24;
+    return LayoutBuilder(builder: (context, cons) {
+      final w = cons.maxWidth - 2 * Sp.l;
+      double textW(String s, TextStyle st) => (TextPainter(text: TextSpan(text: s, style: st), textDirection: TextDirection.ltr, textScaler: scaler)..layout()).width;
+      // what the first line needs besides the chips: the title and the buttons at their own size (a pill is its word + 24, at least 48)
+      final labels = [
+        if (inCard) '返回',
+        if (parts) lc.partMode == LocalBody.subPart ? '减去' : '加上',
+        if (!parts && !inCard && a != null) ...['', '对比', '分项'],
+      ];
+      final buttonsW = labels.fold<double>(0, (s, l) => s + Sp.xs + math.max(kHit, textW(l, T.cap(c.text, w: FontWeight.w500)) + 2 * Sp.m));
+      final n = chipCount(lc);
+      final inline = !side && !headerWraps(textScale) && textW(title, titleStyle) + Sp.m + n * kHit + buttonsW <= w;
+      final perLine = math.max(1, (w / kHit).floor());
+      // crowded chips wrap onto more lines (they never shrink below their touch size); folded, only the first line shows
+      final chipLines = inline || collapsed ? 0 : (n / perLine).ceil();
+      final buttonRow = Row(mainAxisSize: MainAxisSize.min, children: [for (final b in buttons) ...[const SizedBox(width: Sp.xs), b]]);
+      final first = Row(
+        children: [
+          Text(title, key: const ValueKey('header-title'), style: titleStyle),
+          const SizedBox(width: Sp.m),
+          Expanded(child: inline ? LocalChips(lc: lc) : const SizedBox.shrink()),
+          // large text: the buttons keep their words at full size; on a narrow pane they scroll rather than shrink
+          Flexible(flex: 0, child: SingleChildScrollView(scrollDirection: Axis.horizontal, reverse: true, child: buttonRow)),
+        ],
+      );
+      return SizedBox(
+        height: line + chipLines * kHit,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: Sp.l),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(height: line, child: first),
+              if (chipLines > 0) SizedBox(height: chipLines * kHit, child: LocalChips(lc: lc)),
+            ],
+          ),
+        ),
+      );
+    });
   }
 }
 
 /// [+] and one chip per area: the kind's glyph, a small "+" when the area has several parts, a half-filled corner when it is
 /// inverted. Tap selects; a second tap on the selected chip shows its actions; holding a chip shows its mask.
 class LocalChips extends StatelessWidget {
-  const LocalChips({super.key, required this.lc, this.compact = false});
+  const LocalChips({super.key, required this.lc});
   final LocalController lc;
-  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -133,26 +163,15 @@ class LocalChips extends StatelessWidget {
       }
       shown.add(i);
     }
-    return LayoutBuilder(
-      builder: (context, cons) {
-        final n = shown.length + 1;
-        final full = compact ? 26.0 : 32.0;
-        // shrink to fit (tighter gaps first), never below 26; beyond that (16 areas on a narrow screen) the row scrolls
-        final gap = full * n + 6.0 * (n - 1) <= cons.maxWidth ? 6.0 : 4.0;
-        final side = ((cons.maxWidth - gap * (n - 1)) / n).clamp(compact ? 24.0 : 26.0, full).toDouble();
-        final row = Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _AddChip(lc: lc, size: side),
-            for (final i in shown) ...[SizedBox(width: gap), _AreaChip(lc: lc, index: i, size: side)],
-          ],
-        );
-        final fits = side * n + gap * (n - 1) <= cons.maxWidth + 0.5;
-        return Align(
-          alignment: Alignment.centerLeft,
-          child: fits ? row : SingleChildScrollView(scrollDirection: Axis.horizontal, child: row),
-        );
-      },
+    // every chip keeps its 48 dp target; a line that is full wraps (the header made room for the lines)
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Wrap(
+        children: [
+          _AddChip(lc: lc, size: kAreaChip),
+          for (final i in shown) _AreaChip(lc: lc, index: i, size: kAreaChip),
+        ],
+      ),
     );
   }
 }
@@ -177,24 +196,27 @@ class _AddChip extends StatelessWidget {
 
     return Semantics(
       button: true,
-      label: '新区域',
+      label: '新区域…',
       excludeSemantics: true,
       onTap: tap,
       child: GestureDetector(
         key: const ValueKey('local-add'),
         behavior: HitTestBehavior.opaque,
         onTap: tap,
-        child: Opacity(
-          opacity: full ? 0.38 : 1,
-          child: Container(
-            width: size,
-            height: size,
-            decoration: BoxDecoration(
-              color: open ? c.accentSoft : c.chip,
-              borderRadius: BorderRadius.circular(size * 0.3),
-              border: open ? Border.all(color: c.accent, width: 1.5) : null,
+        child: HitBox(
+          child: Opacity(
+            opacity: full ? 0.38 : 1,
+            child: Container(
+              width: size,
+              height: size,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: open ? c.accentSoft : c.chip,
+                borderRadius: BorderRadius.circular(Rd.tile),
+                border: open ? Border.all(color: c.accent, width: 1.5) : null,
+              ),
+              child: DIcon(DI.plus, size: size * 0.55, color: open ? c.accent : c.text),
             ),
-            child: Icon(Icons.add, size: size * 0.6, color: open ? c.accent : c.text),
           ),
         ),
       ),
@@ -216,7 +238,13 @@ class _AreaChip extends StatelessWidget {
     final selected = a.id == lc.selId || (portrait && lc.selIsPortrait);
     final glyph = portraitOf(a) != null ? LocalGlyph.portrait : (a.mask.isEmpty ? LocalGlyph.raster : kindOfComponent(a.mask.first).glyph);
     final fg = selected ? c.accent : c.text;
-    final label = '区域 ${index + 1}，${a.mask.isEmpty ? '' : kindOfComponent(a.mask.first).label}${a.mask.length > 1 ? '，${a.mask.length} 块' : ''}${a.invert ? '，反选' : ''}';
+    final label = [
+      portrait ? '人像' : '区域 ${index + 1}',
+      if (!portrait && a.mask.isNotEmpty) kindOfComponent(a.mask.first).label,
+      if (!portrait && a.mask.length > 1) '${a.mask.length} 块',
+      if (a.invert) '反选',
+      if (!a.on) '已关闭',
+    ].join('，');
     return Semantics(
       button: true,
       selected: selected,
@@ -234,14 +262,15 @@ class _AreaChip extends StatelessWidget {
         },
         onLongPressEnd: (_) => lc.setPeek(false),
         onLongPressCancel: () => lc.setPeek(false),
-        child: Opacity(
+        child: HitBox(
+          child: Opacity(
           opacity: a.on ? 1 : 0.4,
           child: Container(
             width: size,
             height: size,
             decoration: BoxDecoration(
               color: selected ? c.accentSoft : c.chip,
-              borderRadius: BorderRadius.circular(size * 0.3),
+              borderRadius: BorderRadius.circular(Rd.tile),
               border: selected ? Border.all(color: c.accent, width: 1.5) : null,
             ),
             child: Stack(
@@ -268,13 +297,14 @@ class _AreaChip extends StatelessWidget {
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
                         border: Border.all(color: fg, width: 1),
-                        gradient: LinearGradient(colors: [fg, fg, Colors.transparent, Colors.transparent], stops: const [0, 0.5, 0.5, 1]),
+                        gradient: LinearGradient(colors: [fg, fg, fg.withValues(alpha: 0), fg.withValues(alpha: 0)], stops: const [0, 0.5, 0.5, 1]),
                       ),
                     ),
                   ),
               ],
             ),
           ),
+        ),
         ),
       ),
     );
@@ -310,14 +340,14 @@ class LocalBodyView extends StatelessWidget {
     }
     if (ctl.itemised) return LocalItemised(ctl: ctl);
     if (lc.selIsPortrait) return PortraitPanel(ctl: ctl);
-    final strip = StrengthStrip(ctl: ctl, cat: PadCat.light, source: lc.lightPad, label: '区域强度');
+    final strip = StrengthStrip(ctl: ctl, cat: PadCat.light, source: lc.lightPad, label: '强度');
     final light = PadFace(key: const ValueKey('local-pad-light'), ctl: ctl, cat: PadCat.light, source: lc.lightPad);
     final color = PadFace(key: const ValueKey('local-pad-color'), ctl: ctl, cat: PadCat.color, source: lc.colorPad);
     return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         strip,
-        const SizedBox(width: 10),
+        const SizedBox(width: Sp.m),
         // the two pads side by side or stacked, whichever keeps them closer to square (a squat pad crowds its edge icons)
         Expanded(
           child: LayoutBuilder(
@@ -376,6 +406,9 @@ class ShapeCard extends StatelessWidget {
         final perRow = rows.fold<int>(1, (n, r) => math.max(n, r.length));
         final tileW = math.min(84.0, (cons.maxWidth - 8 * (perRow - 1)) / perRow);
         final tileH = math.max(56.0, math.min(84.0, (cons.maxHeight - 8 * (rows.length - 1)) / rows.length));
+        // a short pane (landscape phone): a smaller glyph rather than clipped words (the words stay at their size)
+        final ts = MediaQuery.textScalerOf(context).scale(12) / 12;
+        final compact = tileH < (32 + 4 + 16 * ts + (kinds.any((k) => k.note != null) ? 14 * ts : 0));
         Widget tile(LocalKind k) {
           final running = lc.runningFor(k);
           return Semantics(
@@ -389,19 +422,19 @@ class ShapeCard extends StatelessWidget {
               child: Container(
                 width: tileW,
                 height: tileH,
-                decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(16)),
+                decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(Rd.cardLg)),
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     SizedBox(
                       width: 36,
-                      height: 32,
+                      height: compact ? 24 : 32,
                       child: Stack(
                         alignment: Alignment.center,
                         children: [
                           Opacity(
                             opacity: running ? 0.35 : 1,
-                            child: LocalGlyphIcon(k.glyph, size: 28, color: c.text),
+                            child: LocalGlyphIcon(k.glyph, size: compact ? 22 : 28, color: c.text),
                           ),
                           if (running)
                             SizedBox(
@@ -413,7 +446,7 @@ class ShapeCard extends StatelessWidget {
                         ],
                       ),
                     ),
-                    const SizedBox(height: 4),
+                    SizedBox(height: compact ? 2 : Sp.xs),
                     Text(k.label, maxLines: 1, style: T.cap(c.text2)),
                     if (k.note != null) Text(k.note!, maxLines: 1, style: T.mini(c.text2.withValues(alpha: 0.7))),
                   ],
@@ -464,9 +497,9 @@ class AiPartsCard extends StatelessWidget {
               height: 28,
               child: CircularProgressIndicator(value: lc.aiProgress <= 0 ? null : lc.aiProgress, strokeWidth: 3, color: c.accent, backgroundColor: c.track),
             ),
-            const SizedBox(width: 12),
+            const SizedBox(width: Sp.m),
             Text('正在找人', style: T.body(c.text2)),
-            const SizedBox(width: 16),
+            const SizedBox(width: Sp.s),
             HeaderButton(
               key: const ValueKey('parts-cancel'),
               label: '取消',
@@ -501,21 +534,19 @@ class AiPartsCard extends StatelessWidget {
       );
     }
 
+    // the chips are 36 dp in 48 dp touch rows: the rows touch, the chips keep 12 dp apart
     final rows = <Widget>[
-      Wrap(spacing: 6, runSpacing: 6, children: [for (final p in people) chip(p)]),
+      Wrap(spacing: Sp.s, children: [for (final p in people) chip(p)]),
       for (final e in byFace.entries)
-        Padding(
-          padding: const EdgeInsets.only(top: 8),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.only(top: 9, right: 6),
-                child: Text(byFace.length > 1 ? '脸 ${e.key}' : '脸', style: T.cap(c.text2)),
-              ),
-              Expanded(child: Wrap(spacing: 6, runSpacing: 6, children: [for (final p in e.value) chip(p)])),
-            ],
-          ),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: Sp.l, right: Sp.s),
+              child: Text(byFace.length > 1 ? '脸 ${e.key}' : '脸', style: T.cap(c.text2)),
+            ),
+            Expanded(child: Wrap(spacing: Sp.s, children: [for (final p in e.value) chip(p)])),
+          ],
         ),
     ];
     return SingleChildScrollView(
@@ -534,20 +565,26 @@ class AreaActions extends StatelessWidget {
     final c = context.c;
     final a = lc.sel;
     final full = a != null && a.mask.length >= kMaxMaskComponents;
-    final acts = <(String, IconData, VoidCallback, bool)>[
-      if (lc.selIsAi) ...[('涂抹补充', Icons.brush_outlined, () => lc.brushFix(add: true), false), ('涂抹擦除', Icons.auto_fix_off_outlined, () => lc.brushFix(add: false), false)],
-      ('加一块', Icons.add_circle_outline, () => full ? lc.ctl.app.showToast('每个区域最多 $kMaxMaskComponents 块') : lc.showBody(LocalBody.addPart), false),
-      ('减一块', Icons.remove_circle_outline, () => full ? lc.ctl.app.showToast('每个区域最多 $kMaxMaskComponents 块') : lc.showBody(LocalBody.subPart), false),
-      ('反选', Icons.flip_outlined, lc.invertArea, false),
-      ('复制', Icons.content_copy_outlined, lc.duplicateArea, false),
+    // labels that open the shape card end with "…" (guidelines 13.2)
+    final acts = <(String, DI, VoidCallback, bool)>[
+      if (lc.selIsAi) ...[('涂抹补充', DI.strokeAdd, () => lc.brushFix(add: true), false), ('涂抹擦除', DI.strokeErase, () => lc.brushFix(add: false), false)],
+      ('加一块…', DI.addPart, () => full ? lc.ctl.app.showToast('每个区域最多 $kMaxMaskComponents 块') : lc.showBody(LocalBody.addPart), false),
+      ('减一块…', DI.subPart, () => full ? lc.ctl.app.showToast('每个区域最多 $kMaxMaskComponents 块') : lc.showBody(LocalBody.subPart), false),
+      ('反选', DI.invert, lc.invertArea, false),
+      ('复制', DI.duplicate, lc.duplicateArea, false),
       // the selected part (chosen on the tool strip) goes; the area stays
-      if (a != null && a.mask.length > 1) ('去掉这块', Icons.layers_clear_outlined, () => lc.removePart(lc.selComp), false),
-      ('删除', Icons.delete_outline, lc.deleteArea, true),
+      if (a != null && a.mask.length > 1) ('去掉这块', DI.removePart, () => lc.removePart(lc.selComp), false),
+      ('删除', DI.trash, lc.deleteArea, true),
     ];
     return LayoutBuilder(
       builder: (context, cons) {
-        final perRow = acts.length > 5 ? (acts.length / 2).ceil() : acts.length;
-        final w = math.min(84.0, (cons.maxWidth - 8 * (perRow - 1)) / perRow);
+        // as many to a row as fit with their word on one line (a narrow side pane takes two or three rows), at most 84 dp wide
+        final scaler = MediaQuery.textScalerOf(context);
+        final need = acts.fold<double>(kHit, (m, x) => math.max(m, (TextPainter(text: TextSpan(text: x.$1, style: T.cap(c.text2)), textDirection: TextDirection.ltr, textScaler: scaler)..layout()).width + Sp.l));
+        final fit = math.max(1, ((cons.maxWidth + Sp.s) / (need + Sp.s)).floor());
+        final rows = (acts.length / math.min(fit, acts.length > 5 ? (acts.length / 2).ceil() : acts.length)).ceil();
+        final perRow = (acts.length / rows).ceil();
+        final w = math.min(84.0, (cons.maxWidth - Sp.s * (perRow - 1)) / perRow);
         return Center(
           child: Wrap(
             spacing: 8,
@@ -560,19 +597,19 @@ class AreaActions extends StatelessWidget {
                   label: x.$1,
                   excludeSemantics: true,
                   child: GestureDetector(
-                    key: ValueKey('act-${x.$1}'),
+                    key: ValueKey('act-${x.$1.replaceAll('…', '')}'),
                     behavior: HitTestBehavior.opaque,
                     onTap: x.$3,
                     child: Container(
                       width: w,
                       height: 72 + math.max(0.0, MediaQuery.textScalerOf(context).scale(12) / 12 - 1) * 26,
-                      decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(16)),
+                      decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(Rd.cardLg)),
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          Icon(x.$2, size: 24, color: x.$4 ? c.danger : c.text),
-                          const SizedBox(height: 6),
-                          Text(x.$1, style: T.cap(x.$4 ? c.danger : c.text2)),
+                          DIcon(x.$2, size: 24 * MediaQuery.textScalerOf(context).scale(12) / 12, color: x.$4 ? c.danger : c.text),
+                          const SizedBox(height: Sp.xs),
+                          Text(x.$1, maxLines: 1, softWrap: false, style: T.cap(x.$4 ? c.danger : c.text2)),
                         ],
                       ),
                     ),
@@ -603,7 +640,7 @@ class LocalItemised extends StatelessWidget {
           Expanded(
             child: RadarView(key: ValueKey('local-radar-${lc.selId}'), ctl: ctl, cat: PadCat.light, items: items, selected: sel, onSelect: ctl.selectItem, source: lc.items),
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: Sp.s),
           ItemRuler(ctl: ctl, cat: PadCat.light, item: items[sel], source: lc.items),
         ],
       );
@@ -616,7 +653,7 @@ class LocalItemised extends StatelessWidget {
         Row(
           children: [
             for (var i = 0; i < groups.length; i++) ...[
-              if (i > 0) const SizedBox(width: 6),
+              if (i > 0) const SizedBox(width: Sp.s),
               Expanded(
                 child: PanelChip(key: ValueKey('local-group-${groups[i].$1}'), label: groups[i].$2, selected: lc.itemGroup == groups[i].$1, compact: true, onTap: () => lc.setItemGroup(groups[i].$1)),
               ),
@@ -627,7 +664,7 @@ class LocalItemised extends StatelessWidget {
         Expanded(
           child: RadarView(key: ValueKey('local-radar-${lc.itemGroup}'), ctl: ctl, cat: PadCat.light, items: items, selected: sel, onSelect: ctl.selectItem, source: lc.items),
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: Sp.s),
         ItemRuler(ctl: ctl, cat: PadCat.light, item: items[sel], source: lc.items),
       ],
     );
@@ -636,12 +673,17 @@ class LocalItemised extends StatelessWidget {
 
 // ------------------------------------------------------------------ the dock glyph
 
-/// The dock's 局部 glyph: the selected (or last) area's kind, a count dot when there are several.
+/// The dock's 局部 glyph: the selected (or last) area's kind, a count badge when there are several (a 16 dp disc in the glyph's
+/// colour with the number in 11 px [ink], the same badge as the photo grid's counts; never smaller than the type scale's 11).
 class LocalDockGlyphPainter extends CustomPainter {
-  const LocalDockGlyphPainter(this.glyph, this.count, this.color);
+  const LocalDockGlyphPainter(this.glyph, this.count, this.color, {this.ink = const Color(0xFFFFFFFF), this.textScale = 1, this.base}); // token-exempt: default, callers pass a token
   final LocalGlyph glyph;
   final int count;
-  final Color color;
+  final Color color, ink;
+  final double textScale;
+
+  /// The ambient text style (font family): a bare TextPainter would not inherit it.
+  final TextStyle? base;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -650,18 +692,19 @@ class LocalDockGlyphPainter extends CustomPainter {
     paintLocalGlyph(canvas, box, glyph, color, stroke: 1.5);
     if (count > 1) {
       final tp = TextPainter(
-        text: TextSpan(
-          text: '$count',
-          style: TextStyle(fontSize: 9, height: 1, fontWeight: FontWeight.w700, color: color),
-        ),
+        text: TextSpan(text: '$count', style: (base ?? const TextStyle()).merge(T.mini(ink, w: FontWeight.w600)).copyWith(height: 1, fontFeatures: const [FontFeature.tabularFigures()])),
         textDirection: TextDirection.ltr,
+        textScaler: TextScaler.linear(textScale),
       )..layout();
-      tp.paint(canvas, Offset(box.right + 2, box.top - 1));
+      final d = math.max(16.0 * textScale, tp.width + 6);
+      final centre = Offset(box.right + 1, box.top + 3);
+      canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromCenter(center: centre, width: d, height: 16 * textScale), Radius.circular(8 * textScale)), Paint()..color = color);
+      tp.paint(canvas, centre - Offset(tp.width / 2, tp.height / 2));
     }
   }
 
   @override
-  bool shouldRepaint(LocalDockGlyphPainter o) => o.glyph != glyph || o.count != count || o.color != color;
+  bool shouldRepaint(LocalDockGlyphPainter o) => o.glyph != glyph || o.count != count || o.color != color || o.ink != ink || o.textScale != textScale;
 }
 
 // ------------------------------------------------------------------ tool strip (on the photo)
@@ -689,7 +732,6 @@ class LocalToolStrip extends StatelessWidget {
         if (parts) {
           for (var i = 0; i < a.mask.length; i++) {
             children.add(_PartChip(lc: lc, index: i));
-            children.add(const SizedBox(width: 4));
           }
         }
         Widget? tool;
@@ -730,23 +772,22 @@ class LocalToolStrip extends StatelessWidget {
         }
         if (tool == null && !parts) return const SizedBox.shrink();
         if (tool != null) {
-          if (parts) children.add(Container(width: 1, height: 24, color: c.sep, margin: const EdgeInsets.symmetric(horizontal: 6)));
+          if (parts) children.add(Container(width: 1, height: 24, color: c.sep, margin: const EdgeInsets.symmetric(horizontal: Sp.s, vertical: Sp.m)));
           children.add(tool);
         }
-        return Center(
+        // every item is a 48 dp target: when the parts and the tool do not fit the photo's width the strip wraps onto a second line
+        // (above the first, the strip stays on the photo's bottom edge); it never scales its targets down
+        return Align(
+          alignment: Alignment.bottomCenter,
           child: Container(
             key: const ValueKey('local-tools'),
-            height: 48,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            decoration: BoxDecoration(
-              color: c.surface,
-              borderRadius: BorderRadius.circular(24),
-              boxShadow: const [BoxShadow(color: Color(0x33000000), blurRadius: 12, offset: Offset(0, 3))],
-            ),
-            // several parts plus the brush tools can exceed a narrow photo: the strip scales down rather than overflow
-            child: FittedBox(
-              fit: BoxFit.scaleDown,
-              child: Row(mainAxisSize: MainAxisSize.min, children: children),
+            padding: const EdgeInsets.symmetric(horizontal: Sp.s),
+            decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(Rd.float), boxShadow: Fx.shadowFloat),
+            child: Wrap(
+              alignment: WrapAlignment.center,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              verticalDirection: VerticalDirection.up,
+              children: children,
             ),
           ),
         );
@@ -775,38 +816,32 @@ class _PartChip extends StatelessWidget {
       label: '${index == 0 ? '' : (m.op == MaskOp.subtract ? '减去 ' : (m.op == MaskOp.intersect ? '限定 ' : '加上 '))}${k.label}',
       excludeSemantics: true,
       onTap: () => lc.selectPart(index),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          GestureDetector(
-            key: ValueKey('local-part-$index'),
-            behavior: HitTestBehavior.opaque,
-            onTap: () => lc.selectPart(index),
-            child: Container(
-              width: 36,
-              height: 36,
-              decoration: BoxDecoration(
-                color: selected ? c.accentSoft : c.chip,
-                shape: BoxShape.circle,
-                border: selected ? Border.all(color: c.accent, width: 1.5) : null,
-              ),
-              child: Stack(
-                children: [
-                  Center(child: LocalGlyphIcon(k.glyph, size: 20, color: fg)),
-                  if (sign.isNotEmpty)
-                    Positioned(
-                      left: 4,
-                      top: 2,
-                      child: Text(
-                        sign,
-                        style: TextStyle(fontSize: 11, height: 1, fontWeight: FontWeight.w700, color: fg),
-                      ),
-                    ),
-                ],
-              ),
+      child: GestureDetector(
+        key: ValueKey('local-part-$index'),
+        behavior: HitTestBehavior.opaque,
+        onTap: () => lc.selectPart(index),
+        child: HitBox(
+          child: Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              color: selected ? c.accentSoft : c.chip,
+              shape: BoxShape.circle,
+              border: selected ? Border.all(color: c.accent, width: 1.5) : null,
+            ),
+            child: Stack(
+              children: [
+                Center(child: LocalGlyphIcon(k.glyph, size: 20, color: fg)),
+                if (sign.isNotEmpty)
+                  Positioned(
+                    left: Sp.xs,
+                    top: 2,
+                    child: Text(sign, style: T.mini(fg, w: FontWeight.w700).copyWith(height: 1)),
+                  ),
+              ],
             ),
           ),
-        ],
+        ),
       ),
     );
   }
@@ -826,15 +861,15 @@ class _BrushTools extends StatelessWidget {
           Semantics(
             button: true,
             selected: lc.brushSize == i,
-            label: const ['细', '中', '粗', '很粗'][i],
+            label: kSizeNames[i],
             excludeSemantics: true,
             child: GestureDetector(
               key: ValueKey('brush-size-$i'),
               behavior: HitTestBehavior.opaque,
               onTap: () => lc.setBrushSize(i),
               child: SizedBox(
-                width: 40,
-                height: 44,
+                width: kHit,
+                height: kHit,
                 child: Center(
                   child: Container(
                     width: 6.0 + i * 5,
@@ -845,7 +880,7 @@ class _BrushTools extends StatelessWidget {
               ),
             ),
           ),
-        Container(width: 1, height: 24, color: c.sep, margin: const EdgeInsets.symmetric(horizontal: 4)),
+        Container(width: 1, height: 24, color: c.sep, margin: const EdgeInsets.symmetric(horizontal: Sp.xs)),
         Semantics(
           button: true,
           toggled: lc.erase,
@@ -855,12 +890,14 @@ class _BrushTools extends StatelessWidget {
             key: const ValueKey('brush-erase'),
             behavior: HitTestBehavior.opaque,
             onTap: () => lc.setErase(!lc.erase),
-            child: Container(
-              width: 40,
-              height: 32,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(color: lc.erase ? c.accent : null, borderRadius: BorderRadius.circular(16)),
-              child: CustomPaint(size: const Size(20, 20), painter: _EraserPainter(lc.erase ? Colors.white : c.text)),
+            child: HitBox(
+              child: Container(
+                width: 40,
+                height: 32,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(color: lc.erase ? c.accentBtn : null, borderRadius: BorderRadius.circular(Rd.cardLg)),
+                child: DIcon(DI.eraser, size: 20, color: lc.erase ? c.onAccent : c.text),
+              ),
             ),
           ),
         ),
@@ -869,30 +906,8 @@ class _BrushTools extends StatelessWidget {
   }
 }
 
-class _EraserPainter extends CustomPainter {
-  const _EraserPainter(this.color);
-  final Color color;
-  @override
-  void paint(Canvas canvas, Size s) {
-    canvas.save();
-    canvas.translate(s.width / 2, s.height / 2);
-    canvas.rotate(-math.pi / 4);
-    final r = Rect.fromCenter(center: Offset.zero, width: s.width * 0.9, height: s.height * 0.45);
-    final rr = RRect.fromRectAndRadius(r, const Radius.circular(3));
-    canvas.drawRRect(
-      rr,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.5
-        ..color = color,
-    );
-    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTRB(r.left, r.top, r.left + r.width * 0.4, r.bottom), const Radius.circular(3)), Paint()..color = color);
-    canvas.restore();
-  }
-
-  @override
-  bool shouldRepaint(_EraserPainter o) => o.color != color;
-}
+/// The four sizes of the brush and of the heal spots: one set of words for both (audit C).
+const kSizeNames = ['小', '中', '大', '特大'];
 
 /// A tone (dark -> light) or hue band with the selected range raised; drag an end to resize it, the middle to move it.
 class _RangeBar extends StatefulWidget {
@@ -974,7 +989,7 @@ class _RangeBarState extends State<_RangeBar> {
       value: widget.hue ? '${m.hue.round()}° ± ${m.range.round()}°' : '${m.lo.round()} – ${m.hi.round()}',
       child: SizedBox(
         width: w,
-        height: 44,
+        height: kHit,
         child: ClaimSurface(
           onDown: _down,
           onMove: _move,
@@ -1007,7 +1022,7 @@ class _RangePainter extends CustomPainter {
       canvas.drawRect(bar, Paint()..shader = LinearGradient(colors: colors).createShader(bar));
     } else {
       // tones: dark -> light; distance: near (warm, strong) -> far (hazy blue), as an air-perspective hint
-      final cols = depth ? const [Color(0xFF6B4A33), Color(0xFFB9A58F), Color(0xFFCFDCE8)] : const [Color(0xFF0B0B0C), Color(0xFFF7F7F5)];
+      final cols = depth ? Fx.depthTrack : Fx.toneTrack;
       canvas.drawRect(bar, Paint()..shader = LinearGradient(colors: cols).createShader(bar));
     }
     // dim what is not selected (the soft edge drawn as a fade)
@@ -1029,13 +1044,13 @@ class _RangePainter extends CustomPainter {
             fadeL,
             Paint()
               ..blendMode = BlendMode.dstOut
-              ..shader = const LinearGradient(colors: [Color(0x00000000), Color(0xFF000000)]).createShader(fadeL),
+              ..shader = const LinearGradient(colors: [Color(0x00000000), Color(0xFF000000)]).createShader(fadeL), // token-exempt: an alpha mask, not a colour
           );
           canvas.drawRect(
             fadeR,
             Paint()
               ..blendMode = BlendMode.dstOut
-              ..shader = const LinearGradient(colors: [Color(0xFF000000), Color(0x00000000)]).createShader(fadeR),
+              ..shader = const LinearGradient(colors: [Color(0xFF000000), Color(0x00000000)]).createShader(fadeR), // token-exempt: an alpha mask, not a colour
           );
         }
       }
@@ -1059,15 +1074,15 @@ class _RangePainter extends CustomPainter {
       Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1
-        ..color = const Color(0x33000000),
+        ..color = Fx.handleRim.withValues(alpha: 0.2),
     );
     // the two end handles
     for (final t in [a, b]) {
       var x = (t % 1 + 1) % 1 * w;
       if (!hue) x = t.clamp(0.0, 1.0) * w;
       final r = Rect.fromCenter(center: Offset(x, size.height / 2), width: 6, height: h + 8);
-      canvas.drawRRect(RRect.fromRectAndRadius(r.inflate(1), const Radius.circular(4)), Paint()..color = const Color(0x59000000));
-      canvas.drawRRect(RRect.fromRectAndRadius(r, const Radius.circular(3)), Paint()..color = Colors.white);
+      canvas.drawRRect(RRect.fromRectAndRadius(r.inflate(1), const Radius.circular(4)), Paint()..color = Fx.handleRim);
+      canvas.drawRRect(RRect.fromRectAndRadius(r, const Radius.circular(3)), Paint()..color = Fx.handle);
     }
   }
 
@@ -1104,23 +1119,26 @@ class _TapTools extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.c;
+    // two 48 dp halves on one 36 dp track (the track is drawn behind, the targets are the full halves)
     Widget seg(bool add) {
       final on = lc.tapAdd == add;
       return Semantics(
         button: true,
         selected: on,
-        label: add ? '点一下加上' : '点一下去掉',
+        label: add ? '加上' : '去掉',
         excludeSemantics: true,
         child: GestureDetector(
           key: ValueKey(add ? 'tap-add' : 'tap-sub'),
           behavior: HitTestBehavior.opaque,
           onTap: () => lc.setTapAdd(add),
-          child: Container(
-            width: 44,
-            height: 32,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(color: on ? c.accent : null, borderRadius: BorderRadius.circular(16)),
-            child: Icon(add ? Icons.add : Icons.remove, size: 20, color: on ? Colors.white : c.text),
+          child: HitBox(
+            child: Container(
+              width: 44,
+              height: 32,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(color: on ? c.accentBtn : null, borderRadius: BorderRadius.circular(Rd.cardLg)),
+              child: DIcon(add ? DI.plus : DI.minus, size: 20, color: on ? c.onAccent : c.text),
+            ),
           ),
         ),
       );
@@ -1130,12 +1148,13 @@ class _TapTools extends StatelessWidget {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Container(
-          padding: const EdgeInsets.all(2),
-          decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(18)),
-          child: Row(mainAxisSize: MainAxisSize.min, children: [seg(true), seg(false)]),
+        Stack(
+          alignment: Alignment.center,
+          children: [
+            Container(width: 2 * 44 + 4, height: 36, decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(Rd.chip))),
+            Row(mainAxisSize: MainAxisSize.min, children: [seg(true), seg(false)]),
+          ],
         ),
-        const SizedBox(width: 8),
         Semantics(
           button: true,
           enabled: hasTaps,
@@ -1145,7 +1164,7 @@ class _TapTools extends StatelessWidget {
             key: const ValueKey('tap-undo'),
             behavior: HitTestBehavior.opaque,
             onTap: hasTaps ? lc.undoTap : null,
-            child: SizedBox(width: 40, height: 44, child: Icon(Icons.undo, size: 20, color: hasTaps ? c.text : c.text2.withValues(alpha: 0.4))),
+            child: SizedBox(width: kHit, height: kHit, child: Center(child: DIcon(DI.undo, size: 20, color: hasTaps ? c.text : c.text2.withValues(alpha: 0.4)))),
           ),
         ),
         SizedBox(
@@ -1179,7 +1198,7 @@ class _Reanalyse extends StatelessWidget {
           SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2.5, color: c.accent)),
           const SizedBox(width: 8),
           Text('正在重新分析', style: T.cap(c.text2)),
-          const SizedBox(width: 6),
+          const SizedBox(width: Sp.s),
         ],
       );
     }
@@ -1204,7 +1223,7 @@ class CompareButton extends StatelessWidget {
       excludeSemantics: true,
       onTap: () {
         lc.setComparing(true);
-        Future<void>.delayed(const Duration(milliseconds: 900), () => lc.setComparing(false));
+        Future<void>.delayed(Mo.peek, () => lc.setComparing(false));
       },
       child: Listener(
         key: const ValueKey('local-compare'),
@@ -1212,14 +1231,13 @@ class CompareButton extends StatelessWidget {
         onPointerDown: (_) => lc.setComparing(true),
         onPointerUp: (_) => lc.setComparing(false),
         onPointerCancel: (_) => lc.setComparing(false),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
+        child: HitBox(
           child: Container(
             height: 32,
-            padding: const EdgeInsets.symmetric(horizontal: 11),
+            padding: const EdgeInsets.symmetric(horizontal: Sp.m),
             alignment: Alignment.center,
-            decoration: BoxDecoration(color: lc.comparing ? c.accent : c.bg, borderRadius: BorderRadius.circular(16)),
-            child: Text('对比', maxLines: 1, style: T.cap(lc.comparing ? Colors.white : c.text, w: FontWeight.w500)),
+            decoration: BoxDecoration(color: lc.comparing ? c.accentBtn : c.bg, borderRadius: BorderRadius.circular(Rd.cardLg)),
+            child: Text('对比', maxLines: 1, style: T.cap(lc.comparing ? c.onAccent : c.text, w: FontWeight.w500)),
           ),
         ),
       ),
@@ -1233,14 +1251,15 @@ class PortraitPanel extends StatelessWidget {
   const PortraitPanel({super.key, required this.ctl});
   final EditorController ctl;
 
-  static IconData iconOf(PortraitChip c) => switch (c) {
-    PortraitChip.skin => Icons.face_retouching_natural,
-    PortraitChip.undereye => Icons.visibility_outlined,
-    PortraitChip.shine => Icons.flare,
-    PortraitChip.teeth => Icons.sentiment_very_satisfied_outlined,
-    PortraitChip.eyes => Icons.remove_red_eye_outlined,
-    PortraitChip.lips => Icons.favorite_border,
-    PortraitChip.light => Icons.wb_sunny_outlined,
+  /// The app's own line icons (guidelines 8): 眼下 = an eye with an arc under it, 眼睛 = an eye with a catch light.
+  static DI iconOf(PortraitChip c) => switch (c) {
+    PortraitChip.skin => DI.skin,
+    PortraitChip.undereye => DI.underEye,
+    PortraitChip.shine => DI.shine,
+    PortraitChip.teeth => DI.teeth,
+    PortraitChip.eyes => DI.eyes,
+    PortraitChip.lips => DI.lips,
+    PortraitChip.light => DI.faceLight,
   };
 
   @override
@@ -1259,9 +1278,9 @@ class PortraitPanel extends StatelessWidget {
               height: 28,
               child: CircularProgressIndicator(value: lc.aiProgress <= 0 ? null : lc.aiProgress, strokeWidth: 3, color: c.accent, backgroundColor: c.track),
             ),
-            const SizedBox(width: 12),
+            const SizedBox(width: Sp.m),
             Text('正在找人', style: T.body(c.text2)),
-            const SizedBox(width: 16),
+            const SizedBox(width: Sp.s),
             HeaderButton(
               key: const ValueKey('portrait-cancel'),
               label: '取消',
@@ -1281,6 +1300,7 @@ class PortraitPanel extends StatelessWidget {
     final chips = lc.portraitChips;
     final selChip = lc.selChip;
     final faces = lc.frontalFaces;
+    final ts = MediaQuery.textScalerOf(context).scale(12) / 12;
     Widget chip(PortraitChip pc, double w, double h) {
       final on = lc.chipOn(pc), selected = on && selChip == pc;
       final spec = specOf(pc);
@@ -1300,15 +1320,16 @@ class PortraitPanel extends StatelessWidget {
             height: h,
             decoration: BoxDecoration(
               color: on ? c.accentSoft : c.bg,
-              borderRadius: BorderRadius.circular(14),
+              borderRadius: BorderRadius.circular(Rd.block),
               border: selected ? Border.all(color: c.accent, width: 1.5) : null,
             ),
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Icon(iconOf(pc), size: 22, color: on ? c.accent : c.text2),
-                const SizedBox(height: 3),
-                Text(spec.label, style: T.cap(on ? c.accent : c.text2, w: on ? FontWeight.w600 : FontWeight.w400)),
+                // a short tile (large text, landscape) keeps the word at its size and gives up icon size
+                DIcon(iconOf(pc), size: (h - 8 - 16 * ts).clamp(12.0, 22 * ts).toDouble(), color: on ? c.accent : c.text2),
+                const SizedBox(height: 2),
+                Text(spec.label, maxLines: 1, style: T.cap(on ? c.accent : c.text2, w: on ? FontWeight.w600 : FontWeight.w400)),
               ],
             ),
           ),
@@ -1320,27 +1341,29 @@ class PortraitPanel extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         StrengthStrip(key: ValueKey('portrait-strip-${lc.selId}'), ctl: ctl, cat: PadCat.light, source: lc.lightPad, label: selChip == null ? '强度' : '${specOf(selChip).label}强度'),
-        const SizedBox(width: 10),
+        const SizedBox(width: Sp.m),
         Expanded(
           child: LayoutBuilder(
             builder: (context, cons) {
-              // every chip in view: four to a row (seven chips = two rows), the tiles shrink with the panel, never scroll away
-              const gap = 6.0;
-              final cols = math.min(4, math.max(1, chips.length));
+              // every chip in view: four to a row (seven chips = two rows); the tiles shrink with the panel down to their 48 dp target,
+              // never below it (a narrower panel takes fewer columns instead)
+              const gap = Sp.s;
+              final fit = ((cons.maxWidth + gap) / (kHit + gap)).floor();
+              final cols = math.min(math.min(4, fit), math.max(1, chips.length));
               final rows = (chips.length / cols).ceil();
-              final faceRow = faces.length > 1 && selChip != null ? 50.0 : 0.0;
-              final w = ((cons.maxWidth - gap * (cols - 1)) / cols).clamp(40.0, 80.0).toDouble();
-              final h = ((cons.maxHeight - faceRow - gap * (rows - 1)) / rows).clamp(40.0, 60.0).toDouble();
+              final faceRow = faces.length > 1 && selChip != null ? kHit + Sp.s : 0.0;
+              final w = ((cons.maxWidth - gap * (cols - 1)) / cols).clamp(kHit, 80.0).toDouble();
+              final h = ((cons.maxHeight - faceRow - gap * (rows - 1)) / rows).clamp(kHit, 60.0 * ts).toDouble();
               return SingleChildScrollView(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Wrap(spacing: gap, runSpacing: gap, children: [for (final pc in chips) chip(pc, w, h)]),
                     if (faces.length > 1 && selChip != null) ...[
-                      const SizedBox(height: 10),
+                      const SizedBox(height: Sp.s),
                       Row(
                         children: [
-                          for (final f in faces) ...[_FaceThumb(lc: lc, face: f, on: lc.selFaces.contains(f.n)), const SizedBox(width: 8)],
+                          for (final f in faces) ...[_FaceThumb(lc: lc, face: f, on: lc.selFaces.contains(f.n)), const SizedBox(width: Sp.xs)],
                         ],
                       ),
                     ],
@@ -1374,18 +1397,21 @@ class _FaceThumb extends StatelessWidget {
       excludeSemantics: true,
       child: GestureDetector(
         key: ValueKey('face-${face.n}'),
+        behavior: HitTestBehavior.opaque,
         onTap: () => lc.toggleFace(face.n),
-        child: Container(
-          width: 40,
-          height: 40,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            border: Border.all(color: on ? c.accent : c.sep, width: on ? 2.5 : 1),
-          ),
-          child: ClipOval(
-            child: Opacity(
-              opacity: on ? 1 : 0.45,
-              child: img == null || box == null ? Center(child: Text('${face.n}', style: T.cap(c.text2))) : CustomPaint(painter: _CropPainter(img, box)),
+        child: HitBox(
+          child: Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(color: on ? c.accent : c.sep, width: on ? 2.5 : 1),
+            ),
+            child: ClipOval(
+              child: Opacity(
+                opacity: on ? 1 : 0.45,
+                child: img == null || box == null ? Center(child: Text('${face.n}', style: T.cap(c.text2))) : CustomPaint(painter: _CropPainter(img, box)),
+              ),
             ),
           ),
         ),
@@ -1429,30 +1455,31 @@ class _HealTools extends StatelessWidget {
             key: const ValueKey('heal-mode'),
             behavior: HitTestBehavior.opaque,
             onTap: () => lc.setHealMode(!lc.healMode),
-            child: Container(
-              height: 32,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              alignment: Alignment.center,
-              decoration: BoxDecoration(color: lc.healMode ? c.accent : c.bg, borderRadius: BorderRadius.circular(16)),
-              child: Text('点一下祛斑', style: T.cap(lc.healMode ? Colors.white : c.text, w: FontWeight.w500)),
+            child: HitBox(
+              child: Container(
+                height: 32,
+                padding: const EdgeInsets.symmetric(horizontal: Sp.m),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(color: lc.healMode ? c.accentBtn : c.bg, borderRadius: BorderRadius.circular(Rd.cardLg)),
+                child: Text('点一下祛斑', style: T.cap(lc.healMode ? c.onAccent : c.text, w: FontWeight.w500)),
+              ),
             ),
           ),
         ),
         if (lc.healMode) ...[
-          const SizedBox(width: 4),
           for (var i = 0; i < 4; i++)
             Semantics(
               button: true,
               selected: lc.healSize == i,
-              label: const ['小', '中', '大', '很大'][i],
+              label: kSizeNames[i],
               excludeSemantics: true,
               child: GestureDetector(
                 key: ValueKey('heal-size-$i'),
                 behavior: HitTestBehavior.opaque,
                 onTap: () => lc.setHealSize(i),
                 child: SizedBox(
-                  width: 34,
-                  height: 44,
+                  width: kHit,
+                  height: kHit,
                   child: Center(
                     child: Container(
                       width: 6.0 + i * 4,

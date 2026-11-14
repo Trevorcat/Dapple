@@ -164,7 +164,7 @@ class _TopBar extends StatelessWidget {
           ),
         KeyedSubtree(
           key: const ValueKey('import-button'),
-          child: DIconButton(DI.plus, label: '从相册选择', onPressed: () => importMenu(context, app)),
+          child: DIconButton(DI.plus, label: '导入照片…', onPressed: () => importMenu(context, app)),
         ),
         if (!app.isEmpty)
           KeyedSubtree(
@@ -198,9 +198,9 @@ class _NewPill extends StatelessWidget {
           decoration: BoxDecoration(
             color: c.accentBtn,
             borderRadius: BorderRadius.circular(22),
-            boxShadow: const [BoxShadow(color: Color(0x40000000), blurRadius: 8, offset: Offset(0, 3))],
+            boxShadow: Fx.shadowFloat,
           ),
-          child: Text('新到 $count 张', style: T.body(Colors.white, w: FontWeight.w500, tabular: true)),
+          child: Text('新到 $count 张', style: T.body(context.c.onAccent, w: FontWeight.w500, tabular: true)),
         ),
       ),
     );
@@ -275,7 +275,7 @@ class _ImportBar extends StatelessWidget {
     return Semantics(
       liveRegion: true,
       container: true,
-      label: '正在导入所选照片',
+      label: '正在导入',
       child: Container(
         key: const ValueKey('import-bar'),
         constraints: const BoxConstraints(minHeight: 44),
@@ -285,7 +285,7 @@ class _ImportBar extends StatelessWidget {
         child: Row(children: [
           Spinner(size: 18, color: c.onSecContainer),
           const SizedBox(width: Sp.m),
-          Expanded(child: Text('正在导入所选照片…', style: T.body(c.onSecContainer, w: FontWeight.w500))),
+          Expanded(child: Text('正在导入', style: T.body(c.onSecContainer, w: FontWeight.w500))),
         ]),
       ),
     );
@@ -400,14 +400,12 @@ class _Empty extends StatelessWidget {
         DIcon(DI.camera, size: 48, color: c.text2, stroke: 1.6),
         const SizedBox(height: Sp.m),
         Text(recent ? '最近 7 天没有新照片' : '还没有照片', style: T.body17(c.text, w: FontWeight.w500)),
-        const SizedBox(height: Sp.xs),
-        Text(recent ? '更早的照片可以从相册选择' : '从相册选几张，或用相机传输', style: T.small(c.text2)),
         const SizedBox(height: Sp.l),
         SizedBox(
           width: 200,
           child: KeyedSubtree(
               key: const ValueKey('empty-import'),
-              child: PrimaryButton('从相册选择', height: 48, onPressed: () => importAndEdit(context, app))),
+              child: PrimaryButton('从相册选…', height: 48, onPressed: () => importAndEdit(context, app))),
         ),
         const SizedBox(height: Sp.s),
         SizedBox(
@@ -419,11 +417,11 @@ class _Empty extends StatelessWidget {
         if (app.mediaLimited)
           KeyedSubtree(
               key: const ValueKey('empty-more'),
-              child: TextAction('选择更多照片', onPressed: () => app.chooseMorePhotos())),
+              child: TextAction('选择更多照片…', onPressed: () => app.chooseMorePhotos())),
         if (canPickFiles)
           KeyedSubtree(
               key: const ValueKey('empty-import-files'),
-              child: TextAction('从文件选择', onPressed: () => importAndEdit(context, app, source: 'files'))),
+              child: TextAction('从文件选…', onPressed: () => importAndEdit(context, app, source: 'files'))),
         const SizedBox(height: 96),
       ]),
     );

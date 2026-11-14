@@ -66,7 +66,14 @@ class _PublishPageState extends State<PublishPage> {
   @override
   void initState() {
     super.initState();
+    app.exportSheetOpened();
     _probeHdr();
+  }
+
+  @override
+  void dispose() {
+    app.exportSheetClosed();
+    super.dispose();
   }
 
   void _probeHdrSoon() => Future.microtask(_probeHdr);
@@ -187,7 +194,8 @@ class _PublishPageState extends State<PublishPage> {
       paths = await _export(photos, fallback, progress, () => cancelled);
     } catch (_) {
       paths = null;
-      if (mounted) app.showToast('导出失败');
+      // what happened plus the step that can help (audit F20)
+      if (mounted) app.showToast('没导出成功', actionLabel: '重试', onAction: () => _run(fallback));
     }
     if (!mounted) return;
     Navigator.of(context).pop(); // dialog
@@ -254,62 +262,86 @@ class _PublishPageState extends State<PublishPage> {
     return w;
   }
 
+  /// Height of the thumbnail strip: 104, or 72 on a short window (landscape phone) so the presets and the options stay in view.
+  double _stripH = 104;
+
   @override
   Widget build(BuildContext context) {
     final c = context.c;
     final mq = MediaQuery.of(context);
-    final wide = mq.size.width >= 600;
+    final size = mq.size;
+    final wide = size.width >= 600;
+    // landscape phone / unfolded inner screen: two columns (photos and presets | options and the button), audit F45
+    final twoCol = size.width >= 720 && size.width >= size.height;
+    _stripH = size.height < 480 ? 72 : 104;
     final footer = math.max(mq.padding.bottom, 16.0);
     final top = wide ? 48.0 : mq.padding.top;
+    final header = Column(mainAxisSize: MainAxisSize.min, children: [
+      // Material sheet header: drag handle, close icon, left-aligned title.
+      Padding(
+        padding: const EdgeInsets.only(top: 8),
+        child: Center(child: Container(width: 32, height: 4, decoration: BoxDecoration(color: c.track, borderRadius: BorderRadius.circular(2)))),
+      ),
+      SizedBox(
+        height: 56,
+        child: Row(children: [
+          const SizedBox(width: 4),
+          DIconButton(DI.close, key: const ValueKey('publish-close'), label: '关闭', onPressed: () => Navigator.of(context).pop(false)),
+          const SizedBox(width: 4),
+          Expanded(child: Text(_title, key: const ValueKey('publish-title'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.body17(c.text, w: FontWeight.w500))),
+          const SizedBox(width: 16),
+        ]),
+      ),
+    ]);
+    final where = <Widget>[
+      _strip_(),
+      const SizedBox(height: Sp.xl),
+      Text('发到哪里', style: T.small(c.accent, w: FontWeight.w500)),
+      const SizedBox(height: 8),
+      _presetGrid(),
+    ];
+    final how = <Widget>[
+      _infoCard(),
+      for (final w in _warnings()) ...[const SizedBox(height: 12), _WarnCard(w)],
+    ];
+    Widget button({bool line = true}) => Container(
+          decoration: BoxDecoration(border: line ? Border(top: BorderSide(color: c.sep)) : null),
+          padding: EdgeInsets.fromLTRB(16, 8, 16, twoCol ? 16 : footer),
+          child: PrimaryButton('分享…', onPressed: _overLimit ? null : _chooseHandoff, key: const ValueKey('publish-share')),
+        );
+    final Widget body;
+    if (twoCol) {
+      body = Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(16, 4, 8, 16), children: where)),
+        Expanded(
+          child: Column(children: [
+            Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(8, 4, 16, 8), children: how)),
+            button(line: false),
+          ]),
+        ),
+      ]);
+    } else {
+      body = Column(children: [
+        Expanded(child: ListView(padding: const EdgeInsets.fromLTRB(16, 4, 16, 16), children: [...where, const SizedBox(height: 16), ...how])),
+        button(),
+      ]);
+    }
     Widget sheet = Material(
       color: c.bg,
       borderRadius: BorderRadius.vertical(top: const Radius.circular(Rd.sheet), bottom: Radius.circular(wide ? Rd.sheet : 0)),
       clipBehavior: Clip.antiAlias,
       child: Stack(children: [
-        Column(children: [
-          // Material sheet header: drag handle, close icon, left-aligned title.
-          Padding(
-            padding: const EdgeInsets.only(top: 8),
-            child: Center(child: Container(width: 32, height: 4, decoration: BoxDecoration(color: c.track, borderRadius: BorderRadius.circular(2)))),
-          ),
-          SizedBox(
-            height: 56,
-            child: Row(children: [
-              const SizedBox(width: 4),
-              DIconButton(DI.close,
-                  key: const ValueKey('publish-close'), label: '关闭', onPressed: () => Navigator.of(context).pop(false)),
-              const SizedBox(width: 4),
-              Expanded(
-                  child: Text(_title,
-                      key: const ValueKey('publish-title'),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: T.body17(c.text, w: FontWeight.w500))),
-              const SizedBox(width: 16),
-            ]),
-          ),
-          Expanded(
-            child: ListView(padding: const EdgeInsets.fromLTRB(16, 4, 16, 16), children: [
-              _strip_(),
-              const SizedBox(height: 24),
-              Text('发到哪里', style: T.small(c.accent, w: FontWeight.w500)),
-              const SizedBox(height: 8),
-              _presetGrid(),
-              const SizedBox(height: 16),
-              _infoCard(),
-              for (final w in _warnings()) ...[const SizedBox(height: 12), _WarnCard(w)],
-            ]),
-          ),
-          Container(
-            decoration: BoxDecoration(border: Border(top: BorderSide(color: c.sep))),
-            padding: EdgeInsets.fromLTRB(16, 8, 16, footer),
-            child: PrimaryButton('分享…', onPressed: _overLimit ? null : _chooseHandoff, key: const ValueKey('publish-share')),
-          ),
-        ]),
+        Column(children: [header, Expanded(child: body)]),
         ToastLayer(app: app, bottom: 8 + 52 + footer + 12),
       ]),
     );
-    if (wide) {
+    if (twoCol) {
+      final pad = mq.padding;
+      sheet = Padding(
+        padding: EdgeInsets.fromLTRB(math.max(pad.left, 16), math.max(pad.top, 8), math.max(pad.right, 16), math.max(pad.bottom, 8)),
+        child: Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 880), child: sheet)),
+      );
+    } else if (wide) {
       sheet = Center(child: ConstrainedBox(constraints: BoxConstraints(maxWidth: 440, maxHeight: mq.size.height - 96), child: sheet));
     } else {
       sheet = Padding(padding: EdgeInsets.only(top: top), child: sheet);
@@ -320,19 +352,19 @@ class _PublishPageState extends State<PublishPage> {
   Widget _strip_() {
     final ps = _photos;
     return SizedBox(
-      height: 104,
+      height: _stripH,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
         itemCount: ps.length,
         separatorBuilder: (_, _) => const SizedBox(width: 12),
         itemBuilder: (_, i) {
           final ph = ps[i];
-          final w = 104 * _ratioOf(_ratio, ph);
+          final w = _stripH * _ratioOf(_ratio, ph);
           return SizedBox(
             width: w,
-            height: 104,
+            height: _stripH,
             child: Stack(children: [
-              Positioned.fill(child: ClipRRect(borderRadius: BorderRadius.circular(8), child: PhotoArt(ph, cacheWidth: 400))),
+              Positioned.fill(child: ClipRRect(borderRadius: BorderRadius.circular(Rd.thumb), child: PhotoArt(ph, cacheWidth: 400))),
               Positioned(
                   left: 6,
                   top: 6,
@@ -341,7 +373,7 @@ class _PublishPageState extends State<PublishPage> {
                       height: 22,
                       alignment: Alignment.center,
                       decoration: const BoxDecoration(color: Fx.overlay55, shape: BoxShape.circle),
-                      child: Text('${i + 1}', style: T.cap(Colors.white, w: FontWeight.w500)))),
+                      child: Text('${i + 1}', style: T.cap(Fx.onPhoto, w: FontWeight.w500)))),
               Positioned(
                   right: -4,
                   top: -4,
@@ -456,18 +488,17 @@ class _PublishPageState extends State<PublishPage> {
             behavior: HitTestBehavior.opaque,
             onTap: () => setState(() => _p3 = !_p3),
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              constraints: const BoxConstraints(minHeight: 56),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: Sp.s),
               decoration: BoxDecoration(border: Border(top: BorderSide(color: c.sep))),
               child: Row(children: [
                 Expanded(
                     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('色彩空间', style: T.body17(c.text)),
-                  const SizedBox(height: 2),
-                  Text('广色域能留住更鲜艳的颜色；有些应用和较旧的屏幕不识别色彩配置，会把它显示得偏灰或偏色。',
-                      key: const ValueKey('row-cs-sub'), style: T.small(c.text2)),
+                  // plain words for the colour space (audit C): 更鲜艳 = wide gamut (P3), 标准 = sRGB; no explanation sentence (R17)
+                  Text('颜色', style: T.body17(c.text)),
                 ])),
                 const SizedBox(width: 12),
-                Text(_p3 ? '广色域 P3' : 'sRGB', key: const ValueKey('row-cs-value'), style: T.body17(c.text2, w: FontWeight.w400)),
+                Text(_p3 ? '更鲜艳' : '标准', key: const ValueKey('row-cs-value'), style: T.body17(c.text2, w: FontWeight.w400)),
                 const SizedBox(width: 4),
                 DIcon(DI.forward, size: 18, color: c.text2),
               ]),
@@ -476,18 +507,17 @@ class _PublishPageState extends State<PublishPage> {
         if (_hdrAvailable)
           Container(
             key: const ValueKey('row-hdr'),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            constraints: const BoxConstraints(minHeight: 56),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: Sp.s),
             decoration: BoxDecoration(border: Border(top: BorderSide(color: c.sep))),
             child: Row(children: [
               Expanded(
                   child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('HDR 照片', style: T.body17(c.text)),
-                const SizedBox(height: 2),
-                Text('在支持 HDR 的屏幕上，高光会比白色更亮，其他屏幕照常显示；部分平台上传后会丢掉 HDR。',
-                    key: const ValueKey('row-hdr-sub'), style: T.small(c.text2)),
+                // HDR in plain words (audit C): on a screen that can, the highlights are brighter than white
+                Text('高光更亮', style: T.body17(c.text)),
               ])),
               const SizedBox(width: 12),
-              DSwitch(key: const ValueKey('switch-hdr'), value: _hdr, label: 'HDR 照片', onChanged: (v) => setState(() => _hdr = v)),
+              DSwitch(key: const ValueKey('switch-hdr'), value: _hdr, label: '高光更亮', onChanged: (v) => setState(() => _hdr = v)),
             ]),
           ),
       ]),
@@ -555,7 +585,7 @@ class _MiniBtn extends StatelessWidget {
               height: 26,
               decoration: const BoxDecoration(color: Fx.overlay55, shape: BoxShape.circle),
               alignment: Alignment.center,
-              child: DIcon(icon, size: 14, color: Colors.white, stroke: 2.4),
+              child: DIcon(icon, size: 14, color: Fx.onPhoto, stroke: 2.4),
             ),
           ),
         ),

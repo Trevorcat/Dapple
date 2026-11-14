@@ -115,7 +115,7 @@ class _LicensesPageState extends State<LicensesPage> {
             block('licence-libjxl-link', '许可证', 'BSD 3-Clause  ${LicensesPage.libjxlLicenseUrl}'),
             block('licence-libomp', 'LLVM OpenMP 运行库', LicensesPage.libompNotice),
             block('licence-libomp-link', '许可证', 'Apache-2.0 with LLVM Exceptions  ${LicensesPage.libompLicenseUrl}'),
-            const SectionTitle('AI 蒙版'),
+            const SectionTitle('人物与天空识别'),
             block('licence-ai', 'AI 模型与推理库（LiteRT、ONNX Runtime）', LicensesPage.aiNotice),
             if (_apache != null) block('licence-ai-apache', 'Apache License 2.0 全文（MediaPipe 模型、LiteRT、Depth Anything V2 Small）', _apache!),
             if (_ortMit != null) block('licence-ai-ort-mit', 'ONNX Runtime: MIT License', _ortMit!),

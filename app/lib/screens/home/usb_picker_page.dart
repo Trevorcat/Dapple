@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart' show Uint8List;
 
 import '../../platform/usb_camera.dart';
 import '../../services/usb_ingest.dart';
@@ -96,13 +96,7 @@ class _UsbPickerPageState extends State<UsbPickerPage> {
     final chosen = [for (final id in _picked) ?_byGid[id]];
     final n = usb.importGroups(chosen);
     Navigator.of(context).maybePop();
-    if (n == 0) app.showToast('已在照片里');
-  }
-
-  Future<void> _copyDiagnostics() async {
-    final text = await usb.diagnostics();
-    await Clipboard.setData(ClipboardData(text: text));
-    app.showToast('已复制诊断信息');
+    if (n == 0) app.showToast('已导入');
   }
 
   @override
@@ -116,9 +110,8 @@ class _UsbPickerPageState extends State<UsbPickerPage> {
         builder: (context, _) {
           final gone = usb.phase != UsbPhase.ready;
           return Column(children: [
-            PageBar('卡里的照片',
-                leading: DIconButton(DI.back, label: '返回', onPressed: () => Navigator.of(context).maybePop()),
-                trailing: TextAction('复制诊断信息', size: 15, onPressed: _copyDiagnostics)),
+            // the cable diagnostics are a support tool, not part of picking photos: they live behind 设置 › 版本 (audit F23)
+            PageBar('卡里的照片', leading: DIconButton(DI.back, label: '返回', onPressed: () => Navigator.of(context).maybePop())),
             if (gone)
               Padding(
                 padding: const EdgeInsets.fromLTRB(Sp.l, 0, Sp.l, Sp.s),
@@ -134,8 +127,16 @@ class _UsbPickerPageState extends State<UsbPickerPage> {
 
   Widget _grid(BuildContext context, DC c) {
     if (_groups.isEmpty) {
+      // reading: a spinner and no word (guidelines 10.13); failed: what happened and the one step that helps (audit F04)
+      if (_loading) return const Center(child: Spinner(key: ValueKey('usb-loading')));
       return Center(
-        child: Text(_loading ? '读取中' : (_failed ? '读取失败' : '卡里没有照片'), style: T.body(c.text2)),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text(_failed ? '读不到卡里的照片' : '卡里没有照片', style: T.body(c.text2)),
+          if (_failed) ...[
+            const SizedBox(height: Sp.s),
+            SizedBox(width: 200, child: KeyedSubtree(key: const ValueKey('usb-retry'), child: SecondaryButton('重试', height: kHit, onPressed: _loadMore))),
+          ],
+        ]),
       );
     }
     return CustomScrollView(controller: _scroll, slivers: [
@@ -164,7 +165,7 @@ class _UsbPickerPageState extends State<UsbPickerPage> {
           padding: const EdgeInsets.all(Sp.l),
           child: Column(children: [
             if (_loading) const Spinner(),
-            if (_failed) TextAction('重试', onPressed: _loadMore),
+            if (_failed) ...[Text('读不到更多照片', style: T.small(c.text2)), TextAction('重试', onPressed: _loadMore)],
             if (_skippedVideos > 0) Text('视频暂不导入', style: T.small(c.text2)),
           ]),
         ),
@@ -176,8 +177,9 @@ class _UsbPickerPageState extends State<UsbPickerPage> {
     final pad = MediaQuery.paddingOf(context).bottom;
     return Padding(
       padding: EdgeInsets.fromLTRB(Sp.l, Sp.s, Sp.l, Sp.l + pad),
+      // nothing picked: the button names its action and waits (not a hint in place of a button, audit F23)
       child: PrimaryButton(
-        _picked.isEmpty ? '选择照片' : '导入 ${_picked.length} 张',
+        _picked.isEmpty ? '导入' : '导入 ${_picked.length} 张',
         key: const ValueKey('usb-import'),
         onPressed: _picked.isEmpty || gone ? null : _import,
       ),
@@ -216,7 +218,7 @@ class _TileState extends State<_Tile> {
     return Semantics(
       button: true,
       selected: widget.number > 0,
-      label: '${g.label}${g.hasRaw ? '，原片' : ''}${widget.known ? '，已在照片里' : ''}',
+      label: '${g.label}${g.hasRaw ? '，原片' : ''}${widget.known ? '，已导入' : ''}',
       excludeSemantics: true,
       child: GestureDetector(
         onTap: widget.onTap,
@@ -227,11 +229,19 @@ class _TileState extends State<_Tile> {
             if (_thumb != null) Image.memory(_thumb!, fit: BoxFit.cover, gaplessPlayback: true, errorBuilder: (_, _, _) => const SizedBox()),
             if (_thumb == null) Center(child: Text(g.label, style: T.small(c.text2), textAlign: TextAlign.center)),
             if (widget.known) ColoredBox(color: c.bg.withValues(alpha: 0.6)),
-            Positioned(
-              left: 6,
-              bottom: 6,
-              child: Text(widget.known ? '已导入' : (g.hasRaw ? 'RAW' : ''), style: T.small(widget.known ? c.text2 : (_thumb == null ? c.text2 : Colors.white), w: FontWeight.w500)),
-            ),
+            // only the exception is marked (guidelines 13.4): 已导入 on its own solid pill; originals carry no label
+            if (widget.known)
+              Positioned(
+                left: 6,
+                bottom: 6,
+                child: Container(
+                  height: 20,
+                  padding: const EdgeInsets.symmetric(horizontal: Sp.s),
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(color: Fx.overlay55, borderRadius: BorderRadius.circular(Rd.thumb)),
+                  child: Text('已导入', style: T.mini(Fx.onPhoto, w: FontWeight.w500)),
+                ),
+              ),
             if (!widget.known) Positioned(right: 6, top: 6, child: SelectDot(number: widget.number, size: 24)),
           ]),
         ),

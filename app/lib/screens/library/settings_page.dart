@@ -51,7 +51,7 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   void _openCodecDiagnostics() {
-    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const CodecDiagnosticsPage()));
+    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => CodecDiagnosticsPage(cableDiagnostics: app.isDemo ? null : app.usb.diagnostics)));
   }
 
   Widget _phone(BuildContext context) => ListView(padding: const EdgeInsets.only(bottom: 120), children: [
@@ -227,7 +227,6 @@ class _SettingsPageState extends State<SettingsPage> {
               sub: line,
               leading: Dot(dot),
               trailing: act == null ? null : ActionChip32(act, onPressed: () => app.connectAction())),
-          _row(context, '添加相机…', key: 'add-camera', onTap: () => app.showToast('待实现')),
         ];
             case 1:
         return _ftpSection(context);
@@ -263,8 +262,6 @@ class _SettingsPageState extends State<SettingsPage> {
             padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text('惯用手', style: T.body17(c.text)),
-              const SizedBox(height: 2),
-              Text('横屏、展开的折叠屏和平板上，控制面板默认停靠在惯用手一侧；自动会根据你的拇指习惯判断', style: T.small(c.text2)),
               const SizedBox(height: Sp.s),
               DSegmented(
                 key: const ValueKey('seg-handedness'),
@@ -276,7 +273,6 @@ class _SettingsPageState extends State<SettingsPage> {
             ]),
           ),
           _row(context, '触感反馈',
-              sub: '仅在自动位、范围端点和档位处轻震；关闭后仍保留视觉提示',
               onTap: () => app.updateSettings((x) => x.haptics = !x.haptics),
               trailing: DSwitch(
                   key: const ValueKey('sw-haptics'),
@@ -300,12 +296,7 @@ class _SettingsPageState extends State<SettingsPage> {
               key: 'licenses',
               onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => LicensesPage(app: app))),
               trailing: DIcon(DI.forward, size: 16, color: c.text2)),
-          _row(context, '编解码器诊断',
-              key: 'codec-diagnostics',
-              sub: '本机视频编解码器与自检结果',
-              onTap: _openCodecDiagnostics,
-              trailing: DIcon(DI.forward, size: 16, color: c.text2)),
-          // the long-press on the version is kept as a shortcut
+          // the diagnostics (codecs, the camera cable) are a support tool: only the long-press on the version opens them (audit F39)
           _row(context, '版本',
               key: 'about-version',
               onLongPress: _openCodecDiagnostics,

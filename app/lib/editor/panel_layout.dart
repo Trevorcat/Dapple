@@ -85,7 +85,11 @@ PanelLayout solvePanelLayout({
   bool trailing = true,
   double photoInsetH = 0,
   double margin = 12,
+  double? sideTop,
+  double sideLead = 0,
 }) {
+  // [sideTop] / [sideLead]: beside the pane the photo column may start higher than [regionTop] when the top bar stands as a
+  // vertical rail on the column's outer edge, [sideLead] wide (the photo stays maximal: audit F25)
   final w = size.width, h = size.height;
   final dockTop = h - dockBottom - dockH;
   final regionBottom = dockTop - 8;
@@ -95,8 +99,9 @@ PanelLayout solvePanelLayout({
   final refBottom = _fit(w - 2 * photoInsetH, a, aspect);
   final sw = sidePaneWidth(w);
   final sideOk = sidePaneFits(w);
-  final sideRegionH = h - regionTop - margin;
-  final refSideFull = sideOk ? _fit(w - 16, sideRegionH, aspect) : Size.zero;
+  final sTop = sideTop ?? regionTop;
+  final sideRegionH = h - sTop - margin;
+  final refSideFull = sideOk ? _fit(w - 16 - sideLead, sideRegionH, aspect) : Size.zero;
   final ref = math.max(refBottom.width * refBottom.height, math.max(refSideFull.width * refSideFull.height, 0.0));
 
   // bottom
@@ -117,7 +122,7 @@ PanelLayout solvePanelLayout({
   PanelLayout? sidePl;
   if (sideOk) {
     final paneX = trailing ? w - sw : 0.0;
-    final regS = Rect.fromLTWH(trailing ? 0 : sw, regionTop, w - sw, sideRegionH);
+    final regS = Rect.fromLTWH(trailing ? sideLead : sw, sTop, w - sw - sideLead, sideRegionH);
     final ps = _fit(regS.width - 16, regS.height, aspect);
     final col = regionBottom - (paneTop ?? regionTop); // the pane column above the dock
     final spareS = math.max(0.0, col - needSide);

@@ -14,7 +14,9 @@ class ConnCard extends StatelessWidget {
 
   /// A camera on the cable: the ready card opens the list of the card's photos; the other wired states ask again.
   void _act(BuildContext context) {
-    if (app.usbCardActive && app.usb.phase == UsbPhase.ready) {
+    if (app.usbCardActive && app.usb.phase == UsbPhase.ready && app.usb.importing) {
+      app.usb.cancelImport();
+    } else if (app.usbCardActive && app.usb.phase == UsbPhase.ready) {
       openUsbPicker(context, app);
     } else {
       app.connectAction();
@@ -36,7 +38,7 @@ class ConnCard extends StatelessWidget {
     final action = app.connAction;
     return Semantics(
       container: true,
-      label: '${app.connTitle}，${app.connLine}',
+      label: [app.connTitle, if (app.connLine.isNotEmpty) app.connLine].join('，'),
       child: Container(
         key: const ValueKey('conn-card'),
         margin: const EdgeInsets.symmetric(horizontal: Sp.l),
@@ -47,7 +49,8 @@ class ConnCard extends StatelessWidget {
           color: Colors.transparent,
           child: InkWell(
             key: const ValueKey('conn-card-tap'),
-            onTap: action == null ? null : () => _act(context),
+            // stopping a transfer is the chip's alone: a tap anywhere on the card must not end it by accident
+            onTap: action == null || (wired && app.usb.importing) ? null : () => _act(context),
             child: Container(
               constraints: const BoxConstraints(minHeight: 64),
               padding: const EdgeInsets.fromLTRB(Sp.l, Sp.m, Sp.s, Sp.m),
@@ -56,8 +59,10 @@ class ConnCard extends StatelessWidget {
                 Expanded(
                   child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
                     Text(app.connTitle, style: T.body17(c.text)),
-                    const SizedBox(height: 2),
-                    Text(app.connLine, style: T.body(st == ConnState.interrupted ? c.warn : c.text2, tabular: true)),
+                    if (app.connLine.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(app.connLine, style: T.body(st == ConnState.interrupted ? c.warn : c.text2, tabular: true)),
+                    ],
                     if (prog != null) ...[const SizedBox(height: 8), Padding(padding: const EdgeInsets.only(right: Sp.s), child: DProgress(prog))],
                   ]),
                 ),

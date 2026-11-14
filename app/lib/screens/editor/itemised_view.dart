@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import '../../editor/haptics.dart';
 import '../../model/pad_model.dart';
 import '../../theme/tokens.dart';
+import '../../widgets/icons.dart';
 import 'editor_controller.dart';
 import 'pad_gestures.dart';
 import 'panel_widgets.dart' show NumberEntry;
@@ -451,11 +452,18 @@ class _TapeRulerState extends State<TapeRuler> {
             Positioned(
               right: 0,
               top: 0,
-              child: GestureDetector(
-                key: const ValueKey('ruler-reset'),
-                behavior: HitTestBehavior.opaque,
+              child: Semantics(
+                button: true,
+                label: '${widget.label}复位',
+                excludeSemantics: true,
                 onTap: widget.onReset,
-                child: SizedBox(width: 48, height: 34, child: Icon(Icons.refresh, size: 18, color: c.text2)),
+                child: GestureDetector(
+                  key: const ValueKey('ruler-reset'),
+                  behavior: HitTestBehavior.opaque,
+                  onTap: widget.onReset,
+                  // the app's anticlockwise reset (guidelines 8), a 48 dp target (guidelines 6)
+                  child: SizedBox(width: 48, height: 48, child: Center(child: DIcon(DI.reset, size: 18, color: c.text2))),
+                ),
               ),
             ),
         ]),

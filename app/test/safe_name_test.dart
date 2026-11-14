@@ -45,6 +45,6 @@ void main() {
   });
   test('engine write failure reads as plain failure', () {
     final ph = Photo(id: 'x', name: 'a', addedMs: 1)..error = 'DappleException: Cannot write 001_0.jpg';
-    expect(ph.failReason, '处理失败');
+    expect(ph.failReason, '没处理成功');
   });
 }

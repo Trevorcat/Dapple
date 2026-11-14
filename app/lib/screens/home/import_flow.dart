@@ -9,7 +9,7 @@ import '../editor/editor_page.dart';
 
 bool _busy = false;
 
-/// "从相册选择" / "从文件选择": system picker -> originals copied in -> developing in the list; exactly one pick opens the editor on it.
+/// "从相册选…" / "从文件选…": system picker -> originals copied in -> developing in the list; exactly one pick opens the editor on it.
 Future<void> importAndEdit(BuildContext context, AppState app, {String source = 'photos'}) async {
   if (_busy) return;
   _busy = true;
@@ -34,28 +34,24 @@ Future<void> importMenu(BuildContext context, AppState app) async {
     shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(Rd.sheet))),
     builder: (ctx) {
       final c = ctx.c;
-      Widget row(String key, DI icon, String title, String sub, String v) => InkWell(
+      // one line per source, no explanation (audit F24): the system picker opens next, hence the "…"
+      Widget row(String key, DI icon, String title, String v) => InkWell(
             key: ValueKey(key),
             onTap: () => Navigator.of(ctx).pop(v),
             child: Container(
-              constraints: const BoxConstraints(minHeight: 64),
+              constraints: const BoxConstraints(minHeight: 56),
               padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
               child: Row(children: [
                 DIcon(icon, size: 24, color: c.text2),
                 const SizedBox(width: Sp.l),
-                Expanded(
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-                    Text(title, style: T.body17(c.text)),
-                    Text(sub, style: T.small(c.text2)),
-                  ]),
-                ),
+                Expanded(child: Text(title, style: T.body17(c.text))),
               ]),
             ),
           );
       return SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          row('import-photos', DI.photos, '从相册选择', '可一次选多张', 'photos'),
-          row('import-files', DI.plus, '从文件选择', '相册里看不到的 RAW（DNG、ARW、RAF）', 'files'),
+          row('import-photos', DI.photos, '从相册选…', 'photos'),
+          row('import-files', DI.folder, '从文件选…', 'files'),
           const SizedBox(height: Sp.s),
         ]),
       );

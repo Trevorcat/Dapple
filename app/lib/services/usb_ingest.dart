@@ -298,9 +298,9 @@ class UsbIngest extends ChangeNotifier {
       case UsbPhase.ready:
         if (notice == 'space') return '手机空间不足 · 已停止';
         if (importing) return '正在接收第 ${(_donePhotos + 1).clamp(1, _queuedPhotos)} 张 · 共 $_queuedPhotos 张';
-        if (failed > 0) return '$failed 个文件没收到 · 共收到 $received 张';
+        if (failed > 0) return '$failed 张没收到 · 共收到 $received 张';
         if (lastName != null) return '收到 ${_stem(lastName!)} · 共 $received 张';
-        return cardTotal > 0 ? '约 $cardTotal 个文件 · 自动接收' : '自动接收新照片';
+        return cardTotal > 0 ? '卡里约 $cardTotal 张 · 自动接收' : '自动接收新照片';
       case UsbPhase.unplugged:
         return received > 0 ? '共收到 $received 张' : '没有新照片';
       case UsbPhase.error:
@@ -321,7 +321,8 @@ class UsbIngest extends ChangeNotifier {
       case UsbPhase.permission:
         return '允许';
       case UsbPhase.ready:
-        return '导入照片…';
+        // a transfer that takes more than a moment can be stopped (audit U9 / F22)
+        return importing ? '停止' : '导入照片…';
       case UsbPhase.error:
         return reason == 'permission_denied' ? '允许' : '重试';
       default:

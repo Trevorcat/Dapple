@@ -99,7 +99,7 @@ class FilmMapView extends StatefulWidget {
 }
 
 class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStateMixin {
-  late final AnimationController _zoom = AnimationController(vsync: this, duration: const Duration(milliseconds: 260));
+  late final AnimationController _zoom = AnimationController(vsync: this, duration: Mo.hold);
   late final Animation<double> _t = CurvedAnimation(parent: _zoom, curve: Curves.easeOutCubic, reverseCurve: Curves.easeInCubic);
   List<FilmDot> _dots = const [];
   Size _size = Size.zero;
@@ -176,7 +176,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   Widget build(BuildContext context) {
     final c = context.c;
     return ClipRRect(
-      borderRadius: BorderRadius.circular(18),
+      borderRadius: BorderRadius.circular(Rd.chip),
       child: ColoredBox(
         color: c.bg,
         child: LayoutBuilder(builder: (context, cons) {
@@ -241,17 +241,17 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
       children.add(Positioned(
         key: const ValueKey('modern-plate'),
         left: l - pad,
-        top: tp - pad - 9,
+        top: tp - pad - 12,
         width: r - l + 2 * pad,
-        height: bt - tp + 2 * pad + 9,
+        height: bt - tp + 2 * pad + 12,
         child: IgnorePointer(
           child: DecoratedBox(
-            decoration: BoxDecoration(color: c.text.withValues(alpha: 0.05), borderRadius: BorderRadius.circular(14), border: Border.all(color: c.text.withValues(alpha: 0.12), width: 0.5)),
+            decoration: BoxDecoration(color: c.text.withValues(alpha: 0.05), borderRadius: BorderRadius.circular(Rd.block), border: Border.all(color: c.text.withValues(alpha: 0.12), width: 0.5)),
             child: Align(
               alignment: Alignment.topLeft,
               child: Padding(
                 padding: const EdgeInsets.only(left: 8, top: 3),
-                child: Transform.scale(alignment: Alignment.topLeft, scale: 1 / z, child: Text('现代', style: TextStyle(fontSize: 9, height: 1, color: c.text2))),
+                child: Transform.scale(alignment: Alignment.topLeft, scale: 1 / z, child: Text('现代', style: T.mini(c.text2).copyWith(height: 1))),
               ),
             ),
           ),
@@ -281,7 +281,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
                     right: -40,
                     child: Opacity(
                       opacity: on ? 1 : ((t - 0.35) / 0.4).clamp(0.0, 1.0),
-                      child: Center(child: Text(d.name, softWrap: false, style: TextStyle(fontSize: 10.5, height: 1.1, fontWeight: on ? FontWeight.w600 : FontWeight.w400, color: c.text))),
+                      child: Center(child: Text(d.name, softWrap: false, style: T.mini(c.text, w: on ? FontWeight.w600 : FontWeight.w400).copyWith(height: 1.1))),
                     ),
                   ),
               ]),

@@ -240,16 +240,16 @@ void main() {
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-hdr')), findsNothing);
-    expect(find.text('HDR 照片'), findsNothing);
+    expect(find.text('高光更亮'), findsNothing);
   });
 
-  testWidgets('HDR 照片 option: off by default, explains itself, switch toggles', (tester) async {
+  testWidgets('HDR (高光更亮) option: off by default, plain words without an explanation, switch toggles', (tester) async {
     final app = _HdrApp(1.5);
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-hdr')), findsOneWidget);
-    expect(find.text('HDR 照片'), findsOneWidget);
-    expect((tester.widget(find.byKey(const ValueKey('row-hdr-sub'))) as Text).data, contains('部分平台上传后会丢掉 HDR'));
+    expect(find.text('高光更亮'), findsOneWidget);
+    expect(find.byKey(const ValueKey('row-hdr-sub')), findsNothing);
     expect((tester.widget(find.byKey(const ValueKey('switch-hdr'))) as DSwitch).value, isFalse);
     await tester.tap(find.byKey(const ValueKey('switch-hdr')));
     await tester.pump();
@@ -262,20 +262,20 @@ void main() {
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-cs')), findsNothing);
-    expect(find.text('色彩空间'), findsNothing);
+    expect(find.text('颜色'), findsNothing);
   });
 
-  testWidgets('色彩空间 option: sRGB by default, one plain warning, tap switches to 广色域 P3 and reaches the export', (tester) async {
+  testWidgets('colour space option (颜色): 标准 (sRGB) by default, no explanation, tap switches to 更鲜艳 (P3) and reaches the export', (tester) async {
     final app = _WideApp(0.2);
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-cs')), findsOneWidget);
-    expect((tester.widget(find.byKey(const ValueKey('row-cs-value'))) as Text).data, 'sRGB');
-    expect((tester.widget(find.byKey(const ValueKey('row-cs-sub'))) as Text).data, contains('不识别色彩配置'));
+    expect((tester.widget(find.byKey(const ValueKey('row-cs-value'))) as Text).data, '标准');
+    expect(find.byKey(const ValueKey('row-cs-sub')), findsNothing);
     await shot(tester, 'publish_phone_p3');
     await tester.tap(find.byKey(const ValueKey('row-cs')));
     await tester.pump();
-    expect((tester.widget(find.byKey(const ValueKey('row-cs-value'))) as Text).data, '广色域 P3');
+    expect((tester.widget(find.byKey(const ValueKey('row-cs-value'))) as Text).data, '更鲜艳');
     await tester.tap(find.byKey(const ValueKey('publish-share')));
     await step(tester);
     await tester.tap(find.byKey(const ValueKey('handoff-system')));

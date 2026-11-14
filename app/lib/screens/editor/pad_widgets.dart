@@ -361,8 +361,8 @@ class _PadFaceState extends State<PadFace> {
               height: 18,
               padding: const EdgeInsets.symmetric(horizontal: 6),
               alignment: Alignment.center,
-              decoration: BoxDecoration(color: const Color(0xE6FFFFFF), borderRadius: BorderRadius.circular(9), boxShadow: const [BoxShadow(color: Color(0x26000000), blurRadius: 3)]),
-              child: Text(p.name, style: T.mini(const Color(0xFF15171A), w: FontWeight.w600)),
+              decoration: BoxDecoration(color: Fx.padLabel, borderRadius: BorderRadius.circular(Rd.thumb), boxShadow: const [BoxShadow(color: Color(0x26000000), blurRadius: 3)]),
+              child: Text(p.name, style: T.mini(Fx.onPadLabel, w: FontWeight.w600)),
             ),
           ),
         ));
@@ -448,7 +448,7 @@ class _StrengthStripState extends State<StrengthStrip> {
             child: Opacity(
               opacity: src.enabled ? 1 : 0.38,
               child: DecoratedBox(
-                decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(18)),
+                decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(Rd.chip)),
                 child: RepaintBoundary(
                   child: ListenableBuilder(
                     listenable: src.changes,

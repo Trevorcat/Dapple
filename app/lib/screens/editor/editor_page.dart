@@ -289,13 +289,16 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
           photoInsetH: e.photoPad.horizontal / 2,
           margin: e.marginL,
           force: force,
+          // beside the pane the top bar is a vertical rail on the photo column's outer edge: the photo takes the full height
+          sideTop: e.pad.top + 8,
+          sideLead: (trailing ? e.marginL : e.marginR) + kTopRailW + 8,
         );
     // The panel is as tall as its category needs and never changes height within it; the placement (bottom / side) is
     // decided per category, screen, photo and hand side, never during a drag.
     final region = dockTop - 8 - regionTop;
     PanelNeeds needsFor({required bool collapsed, required bool itemised}) => panelNeeds(
         screenW: size.width, paneW: sw - e.marginL, screenH: e.size.height, region: region, photoW: size.width - e.photoPad.horizontal, aspect: aspect,
-        textScale: e.textScale, collapsed: collapsed, itemised: itemised);
+        textScale: e.textScale, collapsed: collapsed, itemised: itemised, sideHeaderExtra: w.group == EGroup.local ? 2 * kHeaderH - kSideHeaderH : 0);
     PanelNeeds needs() => needsFor(collapsed: w.collapsed, itemised: ctl.itemised && (PadCatX.ofGroup(w.group) != null || w.group == EGroup.local));
     final key = '${w.group.name}|${size.width.round()}x${size.height.round()}|${aspect.toStringAsFixed(3)}|$trailing|$id';
     if (key != _placeKey && !ctl.dragging.value) {
@@ -529,7 +532,11 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
         animation: _t,
         builder: (context, _) {
           final r = _geoNow().region;
-          return Positioned(left: r.left + 8, width: math.max(0.0, r.width - 16), top: r.bottom - 60, height: 52, child: LocalToolStrip(ctl: ctl));
+          // room for two lines of 48 dp targets; the strip sits 8 dp above the photo's bottom edge (on the photo, local-adjustments 5;
+          // the region can reach below the photo when system insets pad it) and grows upward
+          final ph = _photoRect();
+          final bottom = ph.isEmpty ? r.bottom : math.min(r.bottom, ph.bottom);
+          return Positioned(left: r.left + 8, width: math.max(0.0, r.width - 16), top: bottom - 8 - 2 * 48, height: 2 * 48, child: LocalToolStrip(ctl: ctl));
         },
       ),
       // browse-mode filmstrip on wide screens
@@ -598,14 +605,13 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
                 builder: (context, _) {
                   final to = _to!;
                   final sideOpen = to.open && to.place == PanelPlace.side;
-                  final paneW = sideOpen ? (size.width - to.region.width).clamp(0.0, size.width * 0.6) : 0.0;
-                  final trailing = to.region.left == 0;
-                  return Positioned(
-                    top: topBarTop,
-                    left: marginL + (sideOpen && !trailing ? paneW : 0),
-                    right: marginR + (sideOpen && trailing ? paneW : 0),
-                    child: EditorTopBar(app: app, photoId: () => id, onBack: () => Navigator.of(context).maybePop(), onMore: _toggleMenu),
-                  );
+                  final bar = EditorTopBar(app: app, photoId: () => id, onBack: () => Navigator.of(context).maybePop(), onMore: _toggleMenu, vertical: sideOpen);
+                  if (sideOpen) {
+                    // a rail on the photo column's outer edge (the pane is on the other side): the photo keeps the full height
+                    final paneLeading = to.panel.center.dx < size.width / 2;
+                    return Positioned(top: topBarTop, left: paneLeading ? null : marginL, right: paneLeading ? marginR : null, child: bar);
+                  }
+                  return Positioned(top: topBarTop, left: marginL, right: marginR, child: bar);
                 },
               ),
               AnimatedBuilder(

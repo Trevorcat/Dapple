@@ -14,7 +14,10 @@ import 'page_bar.dart';
 /// Hidden diagnostics (long-press the version on 关于): what the device's codecs declare, the ladders that follow from it and
 /// the one-time self-test results. Nothing here can be switched; the codec choice is automatic.
 class CodecDiagnosticsPage extends StatefulWidget {
-  const CodecDiagnosticsPage({super.key, this.loader, this.gpuLoader});
+  const CodecDiagnosticsPage({super.key, this.loader, this.gpuLoader, this.cableDiagnostics});
+
+  /// The camera-cable diagnostics (moved here from the card's photo list, audit F23): copied to the clipboard on request.
+  final Future<String> Function()? cableDiagnostics;
 
   /// Test hook: returns the report JSON (`run` = run missing self-tests, `force` = repeat all).
   final Future<String> Function({bool run, bool force})? loader;
@@ -184,6 +187,11 @@ class _CodecDiagnosticsPageState extends State<CodecDiagnosticsPage> {
               const SizedBox(width: Sp.l),
               TextAction('全部重测', size: 17, onPressed: _busy ? null : () => _refresh(force: true)),
             ]),
+            if (widget.cableDiagnostics != null)
+              TextAction('复制相机连接诊断', key: const ValueKey('copy-cable-diagnostics'), size: 17, onPressed: () async {
+                final text = await widget.cableDiagnostics!();
+                await Clipboard.setData(ClipboardData(text: text));
+              }),
             const SizedBox(height: Sp.m),
             SelectableText(
               _text(),

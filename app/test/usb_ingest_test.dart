@@ -41,7 +41,7 @@ void main() {
     expect(usb.cardTitle, '相机 · 正在连接');
     cam.ready();
     expect(usb.cardTitle, 'Sony ILCE-7RM5 · 已连接');
-    expect(usb.cardLine, '约 1234 个文件 · 自动接收');
+    expect(usb.cardLine, '卡里约 1234 张 · 自动接收');
     expect(usb.cardAction, '导入照片…');
     final all = '${usb.cardTitle}${usb.cardLine}${usb.cardAction}';
     expect(all, isNot(contains('MTP')));
@@ -150,7 +150,7 @@ void main() {
     cam.emit({'type': 'importFailed', 'key': 'usb:dsc00001.jpg|100|1700000000', 'name': 'DSC00001.JPG', 'reason': 'failed'});
     expect(usb.failed, 1);
     cam.emit({'type': 'importQueueDone', 'imported': 0, 'failed': 1});
-    expect(usb.cardLine, '1 个文件没收到 · 共收到 0 张');
+    expect(usb.cardLine, '1 张没收到 · 共收到 0 张');
     expect(usb.importGroups([g]), 1);
   });
 
@@ -177,7 +177,7 @@ void main() {
     expect(usb.phase, UsbPhase.none);
     cam.ready(total: 99);
     expect(usb.received, 0);
-    expect(usb.cardLine, '约 99 个文件 · 自动接收');
+    expect(usb.cardLine, '卡里约 99 张 · 自动接收');
     // the same file is offered again after re-plugging and is queued again
     expect(usb.importGroups([UsbGroup.fromMap(camGroup('DSC00001', [camFile(1, 'DSC00001.ARW')]))]), 1);
   });

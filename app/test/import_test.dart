@@ -31,13 +31,13 @@ void main() {
     for (final size in [phoneSize, foldSize]) {
       await _open(tester, (_) => [], sc: DemoScenario.empty, size: size);
       expect(find.byKey(const ValueKey('empty-import')), findsOneWidget);
-      expect(find.text('从相册选择'), findsWidgets);
+      expect(find.text('从相册选…'), findsWidgets);
       expect(find.byKey(const ValueKey('empty-connect')), findsOneWidget);
       expect(find.byKey(const ValueKey('import-button')), findsOneWidget);
       await _open(tester, (_) => [], size: size);
       expect(find.byKey(const ValueKey('empty-import')), findsNothing);
       expect(find.byKey(const ValueKey('import-button')), findsOneWidget);
-      expect(find.bySemanticsLabel('从相册选择'), findsOneWidget);
+      expect(find.bySemanticsLabel('导入照片…'), findsOneWidget);
     }
   });
 
@@ -81,6 +81,6 @@ void main() {
           PickedItem(key: 'imp:y', name: 'y.dng', error: 'copy'),
         ];
     expect(await app.importFromPicker(), isNull);
-    expect(app.toast?.message, '1 个文件不是支持的照片格式，已跳过；1 张没能读取，请再试一次');
+    expect(app.toast?.message, '1 个文件格式不支持，已跳过；1 张没读出来');
   });
 }

@@ -31,17 +31,36 @@ void main() {
       _ph('f', PhotoStatus.failed, error: 'PlatformException(convert, cannot convert IMG_1.HEIC to JPEG)'),
     ]);
     await tester.pump(const Duration(milliseconds: 200));
-    expect(find.byKey(const ValueKey('progress-q')), findsOneWidget);
-    expect(find.byKey(const ValueKey('progress-d')), findsOneWidget);
-    expect(find.text('等待处理'), findsOneWidget);
-    expect(find.text('处理中'), findsWidgets);
-    expect(find.text('无法处理'), findsOneWidget);
+    // guidelines 10.12 / audit F17: waiting = the hollow dot only, developing = the dot and the corner spinner; no word pill, no edge bar
+    expect(find.text('等待处理'), findsNothing);
+    expect(find.byKey(const ValueKey('progress-q')), findsNothing);
+    expect(find.bySemanticsLabel(RegExp(r'^q，.*等待处理')), findsOneWidget);
+    expect(find.bySemanticsLabel(RegExp(r'^d，.*处理中')), findsOneWidget);
+    // a format the engine does not read: what happened on the amber pill, and no button (retrying cannot help, audit F06)
     expect(find.byKey(const ValueKey('reason-f')), findsOneWidget);
-    expect(find.text('这种格式暂时无法处理'), findsOneWidget);
-    // retry: the failure is cleared (the demo build finishes it at once, a real one queues it)
-    await tester.tap(find.byKey(const ValueKey('retry-f')));
+    expect(find.text('还不支持这种格式'), findsOneWidget);
+    expect(find.byKey(const ValueKey('retry-f')), findsNothing);
+    expect(find.byKey(const ValueKey('remove-f')), findsNothing);
+    expect(app.photoById('f')!.failAction, FailAction.none);
+  });
+
+  testWidgets('a failure retrying can fix offers 重试; a gone original offers 移除 with 撤销', (tester) async {
+    final app = await _open(tester, [
+      _ph('n', PhotoStatus.failed, error: 'network: icloud download failed'),
+      _ph('g', PhotoStatus.failed, error: 'asset not found: ph://x'),
+    ]);
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.text('读不到原图'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('retry-n')));
     await tester.pump(const Duration(milliseconds: 100));
-    expect(app.photoById('f')!.status, isNot(PhotoStatus.failed));
+    expect(app.photoById('n')!.status, isNot(PhotoStatus.failed));
+    expect(find.text('原图不在了'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('remove-g')));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(app.photoById('g'), isNull);
+    expect(app.toast?.actionLabel, '撤销');
+    app.toast!.onAction!();
+    expect(app.photoById('g'), isNotNull);
   });
 
   testWidgets('a failed develop is not reported as a broken camera transfer', (tester) async {
@@ -61,10 +80,15 @@ void main() {
   });
 
   test('plain failure reasons', () {
-    expect(_ph('a', PhotoStatus.failed, error: 'asset not found: ph://x').failReason, '找不到原图，可能已被删除');
-    expect(_ph('a', PhotoStatus.failed, error: '找不到原始文件').failReason, '找不到原图，可能已被删除');
-    expect(_ph('a', PhotoStatus.failed, error: 'JPEG decode failed: bad').failReason, '照片文件已损坏或无法读取');
-    expect(_ph('a', PhotoStatus.failed, error: 'weird').failReason, '处理失败');
+    // what happened, no guessed cause, no 请 (guidelines 13.1, audit C)
+    expect(_ph('a', PhotoStatus.failed, error: 'asset not found: ph://x').failReason, '原图不在了');
+    expect(_ph('a', PhotoStatus.failed, error: '找不到原始文件').failReason, '原图不在了');
+    expect(_ph('a', PhotoStatus.failed, error: 'JPEG decode failed: bad').failReason, '文件已损坏');
+    expect(_ph('a', PhotoStatus.failed, error: 'network timeout').failReason, '读不到原图');
+    expect(_ph('a', PhotoStatus.failed, error: 'weird').failReason, '没处理成功');
+    expect(_ph('a', PhotoStatus.failed, error: 'asset not found').failAction, FailAction.remove);
+    expect(_ph('a', PhotoStatus.failed, error: 'network timeout').failAction, FailAction.retry);
+    expect(_ph('a', PhotoStatus.failed, error: 'unsupported').failAction, FailAction.none);
   });
 
   test('log lines carry file names, never paths', () {

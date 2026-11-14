@@ -80,14 +80,14 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('usb-tile-100msdcf/dsc00001'))); // known: not selectable
     await tester.pump();
-    expect(find.text('选择照片'), findsOneWidget);
+    expect(find.text('导入'), findsOneWidget, reason: 'nothing picked: the button names its action and waits');
     await tester.tap(find.byKey(const ValueKey('usb-tile-100msdcf/dsc00003')));
     await tester.pump();
     expect(find.text('导入 1 张'), findsOneWidget);
 
-    await tester.tap(find.text('复制诊断信息'));
-    await tester.pump();
-    expect(copied, 'DIAG TEXT');
+    // the cable diagnostics moved to 设置 › 版本 (long press): not part of picking photos (audit F23)
+    expect(find.text('复制诊断信息'), findsNothing);
+    expect(copied, isNull);
 
     await tester.tap(find.byKey(const ValueKey('usb-import')));
     await tester.pump();
