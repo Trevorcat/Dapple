@@ -155,13 +155,13 @@ struct Counters {
   bool cUsed = false;       // false: the build did not use mode C (no slimming operator)
 };
 // Reshape modes of the slimming operators (瘦腰 瘦手臂 瘦腿 小头), internal switch (not in the UI):
-//   Smooth    (S) one smooth field, protected by a decay band around the person plane (the background near the person is dragged)
-//   Layered   (L) person warped, background frozen, the uncovered strip filled from just outside it (section 48; default)
+//   Smooth    (S) one smooth field, protected by a decay band around the person plane (the background near the person is dragged; default)
+//   Layered   (L) person warped, background frozen, the uncovered strip filled from just outside it (section 48)
 //   Structure (C) one continuous field, the minimiser of a quadratic energy that keeps straight photo structures straight (section 49)
 enum class Mode { Smooth = 0, Layered = 1, Structure = 2 };
 void setMode(Mode m);
 Mode mode();
-// Test / evidence hook: false = the earlier single smooth field (background dragged by the band), for before / after sheets. Default true.
+// Test / evidence hook: false = the earlier single smooth field (background dragged by the band), for before / after sheets.
 void setLayered(bool on);  // true = Layered, false = Smooth
 // Internal 长腿 switch (not in the UI): 0 = W windowed stretch with the ground compressed (earlier), 1 = windowed stretch on the person layer, feet anchored
 // (layered; default), 2 = A whole-frame stretch along the leg axis, 3 = B whole-frame vertical stretch.

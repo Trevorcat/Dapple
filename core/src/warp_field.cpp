@@ -884,7 +884,7 @@ void nearestOutside(const Grid& G, const std::vector<char>& in, std::vector<floa
   }
 }
 
-Mode g_mode = Mode::Layered;
+Mode g_mode = Mode::Smooth;  // default: one smooth field (owner decision 2026-11-15); Layered and Structure stay as internal modes
 int g_leg = 3;  // 长腿 variant: 0 = W windowed + compressed ground (earlier), 1 = windowed on the person layer (layered), 2 = A stretch along the leg axis, 3 = B vertical stretch (default)
 double g_band = 0;  // evidence hook: protection band override (long-edge units), 0 = the default
 
