@@ -2988,3 +2988,30 @@ New: `core/include/dapple/reshape.h`, `core/src/reshape.cpp`, `core/src/warp_fie
 * The app's handle map (radial / gradient handles, brush strokes, taps of local areas) is geometry-only: on a reshaped region they are placed in the reshaped picture's coordinates, off by the local displacement (up to ~20 px on a head-shot at 瘦脸 100). `dapple_session_map_point` is warp-aware; the app's `FrameMap` would need a point-wise call there.
 * Region windows: reads moved outside the window are clamped (the app inflates the region by 12 %, larger than the displacements measured).
 * One pose per photo (the main person), 长腿 only for upright bodies; shoulders / neck / hips / chest left out on purpose (research 1).
+
+## 46. The sharp frame after a 局部 drag: settle latency (engine, 2026-11-14)
+
+Owner report (book-style foldable, large inner screen): after a 局部 pad drag on a person area the picture stays soft for about 1.5 s after the finger stopped. Budget measured from the injected finger-up (logcat `InputDispatcher` time) to the sharp picture on screen, Note10+ (`RFCMA05Q5ZX`, debug APK with `--dart-define=DAPPLE_PERF=true`, CC0 portrait `p1_glasses_flag`, person area + colour pad, gradient + light pad, brush + light pad, fit and zoomed; scripts and logs `build/settle/`, `table.py` makes the rows below). The perf probe logs `release`, `final_req`, `detail_start`, `detail_done` and the settled frame's `rel2final` (`editor_engine.dart`, `DPERF` lines).
+
+Causes, all on the path from the finger-up to the zoomed detail (at fit the settled frame was already 100 - 200 ms on this phone):
+
+1. **Timers.** Finger-up -> `releaseDelay` 50 ms -> settled frame; settled frame shown -> `detailDelay` 200 ms (the viewport's idle time, counted again after every edit although the view had not moved) -> detail render.
+2. **The detail ran on the efficiency cores.** `DAPPLE_FRAME_BACKGROUND` pinned the calling thread to the efficiency cores at nice 10 even with no finger down. Bench (`dapple_retouch_sheets --settle`, GPU executor, Note10+): a 1971 x 2464 detail 315 - 325 ms pinned against 105 - 117 ms unpinned; with the portrait recipe 634 against 439 ms. In the app the 1339 x 1611 detail took 199 - 317 ms; it also started 200 ms after the last frame, when the GPU clocks had fallen.
+3. **Zoom threshold against the wrong frame.** `setViewport`'s zoom is relative to `image`, the first (readback) frame of the photo (1280 px on this phone), not to the settled zero-copy frames (864 px): a 2x zoom read 1.3 and never got a detail render (stayed soft for good).
+
+Changes: `EditorEngine.endInteraction` requests the settled frame in the same call (`_settleNow`, no timer; `idleDelay` stays for drags inferred from edit bursts) and, zoomed in, starts the detail render beside it (the detail no longer waits for a settled frame in flight, only for drag frames); `_scheduleDetail` waits only for the rest of `detailDelay` since the last view change; the detail threshold uses the newest settled frame's width (`_detailZoom`); background frames pin to the efficiency cores only when a finger is down at the frame's start (`sys::setBackground(on, pin)`, `c_api.cpp`; they still use the background pool, whose workers stop taking chunks when a finger goes down). Pixels are unchanged (scheduling and thread class only; settled sizes unchanged).
+
+| Note10+, ms after finger-up (two drags each) | before: settled shown | before: detail shown (render) | after: settled shown | after: detail shown (render) |
+|---|---|---|---|---|
+| person + colour, fit | 154, 99 | - | 75, 19 | - |
+| person + colour, zoom 2.8 | 208, 149 | 761 (317), 577 (213) | 140, 80 | 293 (135), 142 (62) |
+| gradient + light, fit | 129, 105 | - | 113, 29 | - |
+| gradient + light, zoom | 153, 102 | 624 (246), 512 (199) | 97, 46 | 197 (90), 107 (60) |
+| brush + light, fit | 204, 144 | - | 143, 98 | - |
+| brush + light, zoom | 167, 128 | 722 (315), 568 (204) | 101, 68 | 235 (122), 127 (58) |
+
+Finger-up to `endInteraction` is 2 - 45 ms of it (debug build, gesture arena). Drag frames (native ms, median per drag) are unchanged: before 3 - 45, after 3 - 45 for the same scenarios; a re-grab right after the finger-up: first frames of the second drag 53 / 11 ms before, 17 / 13 ms after.
+
+**Foldable estimate (by size, Note10+ bench, GPU executor):** at fit on a ~2000 x 2200 window the settled frame is 1638 x 2048 (`finalLongEdge` = the picture's on-screen long edge, capped at the 2048 source; screen-exact, no larger): 40 - 60 ms, 246 ms with the portrait recipe; zoomed 2x the detail is about 1971 x 2464: 72 - 94 ms now against 315 - 325 ms before (375 against 634 with the portrait recipe). Before, a zoomed 局部 drag on the foldable paid 50 + settled 2048 frame + 200 + a pinned 2464 detail, i.e. roughly 0.7 - 1.1 s on a Note10+ class SoC plus the first decode of the detail session; now about 0.15 - 0.2 s (0.45 s with the portrait recipe) on the Note10+, less on a current flagship.
+
+Left: the first detail of a photo opens the 4096 px detail session (a decode, 2.1 s measured once on the Note10+); the portrait recipe makes every settled / detail frame 3 - 5x dearer (LocalDetail / retouch combine); some zoomed pad drags spend 25 - 50 ms per frame in `tables` (`cpu_ms` split; the same before and after, cause not examined); after the detail the native loop renders the settled frame once more (`e2p -1`, a repaint, not shown to be needed).
