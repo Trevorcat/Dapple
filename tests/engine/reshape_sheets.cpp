@@ -6,6 +6,7 @@
 //   <name>_push.jpg   a push stroke and a restore over half of it: original | push | push + restore
 //   dapple_reshape_sheets <outdir> --bg [names...]   (section 48) per body operator at 100: the earlier single field next to the layered one; bg.txt has the share of
 //                     changed background pixels and the shift of the drawn lines; names with 'shadow' also get the detected shadow variants
+//   dapple_reshape_sheets <outdir> --c [names...]    (section 49) the three modes of the slimming operators side by side (S | L | C) at 100, numbers in c.txt
 //   lines.txt         background bending per photo and operator: max |B| on background pixels (person plane < 0.5) within the protection band,
 //                     beyond it, and the share of background pixels that move more than 0.5 px (at the 2048 px render)
 #include <stb_image.h>
@@ -751,6 +752,248 @@ int runBg(const fs::path& out, const std::string& name, std::ofstream& txt, bool
   return 0;
 }
 
+// ---- --c: the three modes of the slimming operators side by side (section 49) --------------------------------------------------------------------
+struct EdgePx {
+  int x, y;
+  float nx, ny;
+};
+struct EdgeMap {
+  std::vector<EdgePx> e;
+  std::vector<int> id;  // per pixel, -1 = none
+  int w = 0, h = 0;
+};
+// strong 1 px edges (non-maximum suppressed Sobel) of the render outside the person (>= 12 px from it)
+EdgeMap findEdges(const Pic& o, const std::vector<float>& dist) {
+  EdgeMap m;
+  m.w = o.w, m.h = o.h;
+  m.id.assign(std::size_t(o.w) * o.h, -1);
+  std::vector<float> gx(m.id.size(), 0.f), gy(m.id.size(), 0.f), mag(m.id.size(), 0.f);
+  auto L = [&](int x, int y) { return float(lumaAt(o, std::clamp(x, 0, o.w - 1), std::clamp(y, 0, o.h - 1))); };
+  for (int y = 0; y < o.h; ++y)
+    for (int x = 0; x < o.w; ++x) {
+      const std::size_t i = std::size_t(y) * o.w + x;
+      gx[i] = (L(x + 1, y - 1) + 2 * L(x + 1, y) + L(x + 1, y + 1) - L(x - 1, y - 1) - 2 * L(x - 1, y) - L(x - 1, y + 1)) / 8.f;
+      gy[i] = (L(x - 1, y + 1) + 2 * L(x, y + 1) + L(x + 1, y + 1) - L(x - 1, y - 1) - 2 * L(x, y - 1) - L(x + 1, y - 1)) / 8.f;
+      mag[i] = std::hypot(gx[i], gy[i]);
+    }
+  for (int y = 2; y < o.h - 2; ++y)
+    for (int x = 2; x < o.w - 2; ++x) {
+      const std::size_t i = std::size_t(y) * o.w + x;
+      if (mag[i] < 14.f || dist[i] < 12.f) continue;
+      const float nx = gx[i] / mag[i], ny = gy[i] / mag[i];
+      const int ax = int(std::lround(nx)), ay = int(std::lround(ny));
+      if (mag[i] < mag[std::size_t(y + ay) * o.w + x + ax] || mag[i] <= mag[std::size_t(y - ay) * o.w + x - ax]) continue;
+      m.id[i] = int(m.e.size());
+      m.e.push_back({x, y, nx, ny});
+    }
+  return m;
+}
+const EdgePx* edgeNear(const EdgeMap& m, double x, double y, float nx, float ny) {
+  const int cx = int(std::lround(x)), cy = int(std::lround(y));
+  const EdgePx* best = nullptr;
+  double bd = 1e9;
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+      const int px = cx + dx, py = cy + dy;
+      if (px < 0 || py < 0 || px >= m.w || py >= m.h) continue;
+      const int id = m.id[std::size_t(py) * m.w + px];
+      if (id < 0) continue;
+      const EdgePx& q = m.e[std::size_t(id)];
+      if (std::fabs(q.nx * nx + q.ny * ny) < 0.95f) continue;
+      const double d = std::hypot(px - x, py - y);
+      if (d < bd) bd = d, best = &q;
+    }
+  return bd <= 1.3 ? best : nullptr;
+}
+struct Straight {
+  double sag32 = 0, sag96 = 0, sag96p99 = 0;  // sagitta of the carried straight edges at chords 64 / 192 px (max; 99th percentile of the 96 one), px at 2048
+  double shift = 0, moved = 0;                // max across-edge shift, share of qualifying edge pixels shifted > 1 px (%)
+  int nQual = 0, nEdges = 0;
+  int px = 0, py = 0;                         // where the 32 px sagitta peaks
+};
+// carry every edge pixel through the field (forward map); s = the shift across the edge. A straight edge stays straight iff s is constant along it, so
+// the second difference of s over +-k px along the edge is the sagitta of the carried edge.
+Straight straightness(const EdgeMap& m, const dapple::warp::Field& f) {
+  Straight r;
+  r.nEdges = int(m.e.size());
+  std::vector<double> s(m.e.size());
+  for (std::size_t i = 0; i < m.e.size(); ++i) {
+    const EdgePx& e = m.e[i];
+    double uo, vo;
+    dapple::warp::forwardUV(f, (e.x + 0.5) / m.w, (e.y + 0.5) / m.h, uo, vo);
+    s[i] = e.nx * (uo * m.w - 0.5 - e.x) + e.ny * (vo * m.h - 0.5 - e.y);
+  }
+  std::vector<double> sg96;
+  std::size_t moved = 0;
+  for (std::size_t i = 0; i < m.e.size(); ++i) {
+    const EdgePx& e = m.e[i];
+    const float tx = -e.ny, ty = e.nx;
+    double sg[2] = {-1, -1};
+    int q = 0;
+    for (int k : {32, 96}) {
+      const EdgePx *a = edgeNear(m, e.x + k * tx, e.y + k * ty, e.nx, e.ny), *b = edgeNear(m, e.x - k * tx, e.y - k * ty, e.nx, e.ny);
+      if (a && b) sg[q] = std::fabs(s[std::size_t(m.id[std::size_t(a->y) * m.w + a->x])] + s[std::size_t(m.id[std::size_t(b->y) * m.w + b->x])] - 2 * s[i]) * 0.5;
+      ++q;
+    }
+    if (sg[0] >= 0) {
+      ++r.nQual;
+      r.shift = std::max(r.shift, std::fabs(s[i]));
+      moved += std::fabs(s[i]) > 1.0;
+      if (sg[0] > r.sag32) r.sag32 = sg[0], r.px = e.x, r.py = e.y;
+    }
+    if (sg[1] >= 0) r.sag96 = std::max(r.sag96, sg[1]), sg96.push_back(sg[1]);
+  }
+  if (!sg96.empty()) {
+    std::sort(sg96.begin(), sg96.end());
+    r.sag96p99 = sg96[std::size_t(0.99 * double(sg96.size() - 1))];
+  }
+  r.moved = r.nQual ? 100.0 * double(moved) / double(r.nQual) : 0.0;
+  return r;
+}
+// how much of the shadow follows the person: for shadow pixels (stride), the displacement of the content projected on the displacement of the nearest
+// silhouette point, clamped to 0..1 (1 = moves with the person, 0 = frozen); only where the silhouette moves >= 1.5 px
+double shadowFollow(const std::vector<char>& mask, const std::vector<std::pair<int, int>>& boundary, const dapple::warp::Field& f, int w, int h) {
+  double acc = 0;
+  int n = 0;
+  auto fwd = [&](int x, int y, double& dx, double& dy) {
+    double uo, vo;
+    dapple::warp::forwardUV(f, (x + 0.5) / w, (y + 0.5) / h, uo, vo);
+    dx = uo * w - 0.5 - x, dy = vo * h - 0.5 - y;
+  };
+  std::vector<std::pair<double, double>> bv(boundary.size());
+  for (std::size_t i = 0; i < boundary.size(); ++i) fwd(boundary[i].first, boundary[i].second, bv[i].first, bv[i].second);
+  for (int y = 0; y < h; y += 5)
+    for (int x = 0; x < w; x += 5) {
+      if (!mask[std::size_t(y) * w + x]) continue;
+      std::size_t bi = 0;
+      double bd = 1e18;
+      for (std::size_t i = 0; i < boundary.size(); ++i) {
+        const double d = double(boundary[i].first - x) * (boundary[i].first - x) + double(boundary[i].second - y) * (boundary[i].second - y);
+        if (d < bd) bd = d, bi = i;
+      }
+      const double vl = std::hypot(bv[bi].first, bv[bi].second);
+      if (vl < 1.5) continue;
+      double ux, uy;
+      fwd(x, y, ux, uy);
+      acc += std::clamp((ux * bv[bi].first + uy * bv[bi].second) / (vl * vl), 0.0, 1.0), ++n;
+    }
+  return n ? 100.0 * acc / n : -1.0;
+}
+
+int runC(const fs::path& out, const std::string& name, std::ofstream& txt) {
+  using dapple::warp::Mode;
+  const fs::path dir = fs::path(inRoot()) / name;
+  Input in;
+  in.name = name;
+  if (!loadInput(dir, in)) return 1;
+  const Plane person = loadPlane(dir / "person.png");
+  const std::string matteId = "rs:" + name + ":person", lumaId = "rs:" + name + ":luma";
+  if (person.w) dapple_mask_raster_set(matteId.c_str(), person.w, person.h, person.d.data(), person.w);
+  DappleSession* s = dapple_session_open((dir / "photo.png").string().c_str(), DAPPLE_QUALITY_FULL, 0);
+  if (!s) return 1;
+  const int LE = 2048;
+  const Pic orig = render(s, "{}", LE);
+  if (!orig.ok() || in.pose.size() != 99) return 1;
+  {  // the luminance plane the structure analysis reads: the photo at a 512 px long edge
+    const Pic sm = resizeW(orig, orig.w >= orig.h ? 512 : std::max(1, int(std::lround(512.0 * orig.w / orig.h))));
+    std::vector<std::uint8_t> l(std::size_t(sm.w) * sm.h);
+    for (int y = 0; y < sm.h; ++y)
+      for (int x = 0; x < sm.w; ++x) l[std::size_t(y) * sm.w + x] = std::uint8_t(std::clamp(lumaAt(sm, x, y) + 0.5, 0.0, 255.0));
+    dapple_mask_raster_set(lumaId.c_str(), sm.w, sm.h, l.data(), sm.w);
+  }
+  const bool shadowCase = name.find("shadow") != std::string::npos;
+  std::vector<char> nearM, farM;
+  if (shadowCase) detectShadow(orig, person, nearM, farM);
+  std::vector<char> inO(std::size_t(orig.w) * orig.h), outO(inO.size());
+  for (int y = 0; y < orig.h; ++y)
+    for (int x = 0; x < orig.w; ++x) inO[std::size_t(y) * orig.w + x] = planeAt(person, orig.w, orig.h, x, y) >= 128, outO[std::size_t(y) * orig.w + x] = !inO[std::size_t(y) * orig.w + x];
+  const std::vector<float> dIn = distFrom(outO, orig.w, orig.h), dOut = distFrom(inO, orig.w, orig.h);
+  const EdgeMap edges = findEdges(orig, dOut);
+  std::vector<std::pair<int, int>> boundary;
+  for (int y = 1; y < orig.h - 1; y += 2)
+    for (int x = 1; x < orig.w - 1; x += 2)
+      if (inO[std::size_t(y) * orig.w + x] && dIn[std::size_t(y) * orig.w + x] <= 2.f) boundary.emplace_back(x, y);
+  std::printf("%s: %dx%d, %zu strong edge px outside the person, %zu boundary px\n", name.c_str(), orig.w, orig.h, edges.e.size(), boundary.size());
+  const struct {
+    Mode m;
+    const char* label;
+  } modes[] = {{Mode::Smooth, "S"}, {Mode::Layered, "L"}, {Mode::Structure, "C"}};
+  struct OpSet {
+    const char* label;
+    const char* ops;
+  };
+  const OpSet sets[] = {{"all", "\"waist\":100,\"arms\":100,\"legs\":100,\"head\":100"}, {"waist", "\"waist\":100"}, {"arms", "\"arms\":100"}, {"legs", "\"legs\":100"}, {"head", "\"head\":100"}};
+  const int panel = shadowCase ? 300 : 400;
+  std::vector<Pic> sheetAll, sheetOps;
+  for (const OpSet& os : sets) {
+    const std::string js = std::string("{\"reshape\":{\"v\":2,\"matte\":\"") + matteId + "\",\"luma\":\"" + lumaId + "\",\"bodies\":[{" + os.ops + ",\"pts\":" + arr(in.pose) + "}]}}";
+    std::vector<Pic> rs;
+    std::vector<Straight> st;
+    for (const auto& md : modes) {
+      dapple::warp::setMode(md.m);
+      dapple::warp::resetCache();
+      const Pic r = render(s, js, LE);
+      auto pp = dapple::fromJson(js);
+      std::shared_ptr<const dapple::warp::Field> fld;
+      if (pp) fld = dapple::warp::bind(pp->reshape, orig.w, orig.h, false);
+      const auto cn = dapple::warp::counters();
+      dapple::warp::setMode(Mode::Layered);
+      if (!r.ok() || !fld) return 1;
+      const BgMetrics m = measure(orig, r, person, {}, shadowCase ? &nearM : nullptr, shadowCase ? &farM : nullptr, fld.get());
+      const Straight sr = straightness(edges, *fld);
+      char b[900];
+      std::snprintf(b, sizeof b, "%-22s %-6s %s  bg changed %6.2f %% (beyond 8 px %6.2f %%), frame %5.1f %% | edges: %d qualifying of %d, sagitta 64 px chord max %5.2f px, 192 px chord max %5.2f px (p99 %5.2f), max across-shift %5.1f px, %5.1f %% shifted > 1 px",
+                    name.c_str(), os.label, md.label, m.bgChanged, m.bgChangedFar, m.frameChanged, sr.nQual, sr.nEdges, sr.sag32, sr.sag96, sr.sag96p99, sr.shift, sr.moved);
+      std::string line = b;
+      if (shadowCase) {
+        const double fn = shadowFollow(nearM, boundary, *fld, orig.w, orig.h), ff = shadowFollow(farM, boundary, *fld, orig.w, orig.h);
+        std::snprintf(b, sizeof b, " | shadow: near follows %5.1f %%, far follows %5.1f %%, near changed %5.1f %%, far %5.1f %%", fn, ff, m.nearShadow, m.farShadow);
+        line += b;
+      }
+      std::snprintf(b, sizeof b, " | raw grad %.3f max|B| %.1f px", fld->rawGrad, fld->maxMove * LE);
+      line += b;
+      if (md.m == Mode::Structure) {
+        std::snprintf(b, sizeof b, " | C: analysis %.1f ms, solve %.1f ms (%d it, rel %.1e), fold blend %.2f %% of moving nodes, %d passes", cn.cAnalysisMs, cn.cSolveMs, cn.cIters, cn.cResidual, 100.0 * cn.cFoldFrac, cn.cFoldPasses);
+        line += b;
+      }
+      txt << line << "\n";
+      std::printf("%s\n", line.c_str());
+      rs.push_back(r);
+      st.push_back(sr);
+    }
+    // crops: at the silhouette strip (centroid of the pixels L changed within 14 px of the silhouette; else the frame centre) and at the carried straight edge that bends most
+    int ccx = orig.w / 2, ccy = orig.h / 2;
+    {
+      double sx = 0, sy = 0, n = 0;
+      for (int y = 0; y < orig.h; ++y)
+        for (int x = 0; x < orig.w; ++x) {
+          const std::size_t i = std::size_t(y) * orig.w + x;
+          const std::uint8_t *a0 = &orig.d[i * 3], *c = &rs[1].d[i * 3];
+          if (std::abs(int(a0[0]) - c[0]) + std::abs(int(a0[1]) - c[1]) + std::abs(int(a0[2]) - c[2]) <= 40) continue;
+          if ((inO[i] && dIn[i] <= 14) || (!inO[i] && dOut[i] <= 14)) sx += x, sy += y, ++n;
+        }
+      if (n > 20) ccx = int(sx / n), ccy = int(sy / n);
+    }
+    std::vector<Pic> row0{resizeW(orig, panel)}, row1{zoom2(orig, ccx, ccy, 100)};
+    for (const Pic& r : rs) row0.push_back(resizeW(r, panel)), row1.push_back(zoom2(r, ccx, ccy, 100));
+    if (std::strcmp(os.label, "all") == 0) {
+      int lx = ccx, ly = ccy;
+      double best = -1;
+      for (const Straight& q : st)
+        if (q.sag32 > best && q.sag32 > 0.3) best = q.sag32, lx = q.px, ly = q.py;
+      std::vector<Pic> row2{zoom2(orig, lx, ly, 100)};
+      for (const Pic& r : rs) row2.push_back(zoom2(r, lx, ly, 100));
+      sheetAll = {hcat(row0), hcat(row1), hcat(row2)};
+    } else {
+      sheetOps.push_back(hcat(row0)), sheetOps.push_back(hcat(row1));
+    }
+  }
+  save(vcat(sheetAll), out / (name + "_c.jpg"));
+  save(vcat(sheetOps), out / (name + "_c_ops.jpg"));
+  dapple_session_close(s);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -762,11 +1005,12 @@ int main(int argc, char** argv) {
   const fs::path out = argv[1];
   fs::create_directories(out);
   std::vector<std::string> names;
-  bool bgMode = false, gradMode = false, legsOnly = false;
+  bool bgMode = false, gradMode = false, legsOnly = false, cMode = false;
   for (int i = 2; i < argc; ++i) {
     if (std::strcmp(argv[i], "--bg") == 0) bgMode = true;
     else if (std::strcmp(argv[i], "--legs") == 0) bgMode = true, legsOnly = true;
     else if (std::strcmp(argv[i], "--grad") == 0) gradMode = true;
+    else if (std::strcmp(argv[i], "--c") == 0) cMode = true;
     else names.push_back(argv[i]);
   }
   if (names.empty())
@@ -776,6 +1020,12 @@ int main(int argc, char** argv) {
   if (gradMode) {
     for (const auto& n : names) runGrad(n);
     return 0;
+  }
+  if (cMode) {
+    std::ofstream txt(out / "c.txt");
+    int rc2 = 0;
+    for (const auto& n : names) rc2 |= runC(out, n, txt);
+    return rc2;
   }
   if (bgMode) {
     std::ofstream txt(out / (legsOnly ? "legs.txt" : "bg.txt"));

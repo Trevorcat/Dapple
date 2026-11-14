@@ -1259,6 +1259,7 @@ std::vector<std::string> localRasterIds(const EditParams& p) {
   }
   // the person plane of the reshaping's background protection (section 45) obeys the same rule
   if (p.reshape.active() && !p.reshape.matte.empty() && std::find(ids.begin(), ids.end(), p.reshape.matte) == ids.end()) ids.push_back(p.reshape.matte);
+  if (p.reshape.active() && !p.reshape.luma.empty() && std::find(ids.begin(), ids.end(), p.reshape.luma) == ids.end()) ids.push_back(p.reshape.luma);
   return ids;
 }
 std::vector<std::string> missingRasterIds(const EditParams& p) {

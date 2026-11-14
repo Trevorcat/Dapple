@@ -270,7 +270,7 @@ endforeach()
 add_executable(dapple_reshape_tests engine/reshape_tests.cpp)
 target_link_libraries(dapple_reshape_tests PRIVATE dapple_core)
 target_include_directories(dapple_reshape_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/cli)
-set(_reshape_ids json identity bounded protect push tiles region interactive mappoint sharpness body layered legs)
+set(_reshape_ids json identity bounded protect push tiles region interactive mappoint sharpness body layered legs structure structure_tiles)
 if(TARGET dapple_gpu)
   target_link_libraries(dapple_reshape_tests PRIVATE dapple_gpu)
   target_include_directories(dapple_reshape_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src)
@@ -616,6 +616,7 @@ set(_dapple_heavy
   engine.overhead
   engine.retouch_parity
   engine.retouch_tiles
+  engine.reshape_structure
   engine.reuse
   engine.selfcheck
   export_stream.cancel

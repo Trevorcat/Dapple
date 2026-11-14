@@ -79,6 +79,7 @@ void clampReshape(ReshapeParams& r) {
   if (int(r.bodies.size()) > kReshapeMaxBodies) r.bodies.resize(kReshapeMaxBodies), local::logLine("reshape: more than 4 bodies, extra dropped");
   if (int(r.push.size()) > kReshapeMaxStrokes) r.push.resize(kReshapeMaxStrokes), local::logLine("reshape: more than 64 strokes, extra dropped");
   if (r.matte.size() > 128) r.matte.clear();
+  if (r.luma.size() > 128) r.luma.clear();
   for (auto& f : r.faces) {
     f.index = std::clamp(f.index, 0, 64);
     if (f.pts.size() != 2u * kReshapeFacePts) f.pts.clear();
@@ -111,6 +112,10 @@ std::string reshapeToJson(const ReshapeParams& r) {
   if (!r.matte.empty()) {
     o += ",\"matte\":";
     str(o, r.matte);
+  }
+  if (!r.luma.empty()) {
+    o += ",\"luma\":";
+    str(o, r.luma);
   }
   if (!r.faces.empty()) {
     o += ",\"faces\":[";
@@ -183,6 +188,8 @@ bool reshapeFromValue(const jsonlite::JValue& v, ReshapeParams& r) {
     }
     if (k == "matte") {
       if (x.kind == jsonlite::JValue::String) r.matte = x.str;
+    } else if (k == "luma") {
+      if (x.kind == jsonlite::JValue::String) r.luma = x.str;
     } else if (k == "faces" && x.kind == jsonlite::JValue::Array) {
       for (const auto& it : x.items) {
         if (it.kind != jsonlite::JValue::Object) continue;
@@ -236,6 +243,7 @@ std::uint64_t reshapeHash(const ReshapeParams& r) {
   std::uint64_t h = 1469598103934665603ull;
   for (unsigned char c : s) h = (h ^ c) * 1099511628211ull;
   if (!r.matte.empty()) h = (h ^ local::rasterContentHash(r.matte)) * 1099511628211ull;
+  if (!r.luma.empty()) h = (h ^ local::rasterContentHash(r.luma)) * 1099511628211ull;
   return h ? h : 1;
 }
 

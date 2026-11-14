@@ -41,6 +41,8 @@ struct Field {
   bool gradLimited = false;    // the operators asked for more and were scaled down
   float delta = 0;             // background protection band (long-edge units), 0 = no matte
   bool matteUsed = false;
+  bool structure = false;      // mode C was used (one continuous field, d)
+  float cFoldFrac = 0;         // mode C: share of nodes blended toward the smooth field to stay fold-free
   bool matteMissing = false;   // a matte id was given but the plane is not in the raster store
   std::uint64_t id = 0;        // content key (params hash, grid)
   std::size_t bytes() const { return (d.size() + dp.size() + bg.size() + bs.size()) * sizeof(float) + mp.size(); }
@@ -142,9 +144,25 @@ void backwardUV(const Field& f, double u, double v, double& uo, double& vo);
 struct Counters {
   std::uint64_t builds = 0, hits = 0;
   double lastBuildMs = 0;
+  // structure-aware mode (section 49), of the last field built in that mode
+  double cAnalysisMs = 0;   // structure tensor of the photo (0 when it came from the cache)
+  double cSolveMs = 0;      // the sparse solve on the coarse grid
+  int cIters = 0;           // conjugate-gradient iterations used
+  double cResidual = 0;     // final residual relative to the start
+  double cFoldFrac = 0;     // share of nodes that violated the fold limit and were blended toward the smooth field
+  int cRounds = 0;          // reweighted re-solves it took to keep the solution fold-free
+  int cFoldPasses = 0;      // blend passes it took (0 = the solved field was fold-free as it was)
+  bool cUsed = false;       // false: the build did not use mode C (no slimming operator)
 };
+// Reshape modes of the slimming operators (瘦腰 瘦手臂 瘦腿 小头), internal switch (not in the UI):
+//   Smooth    (S) one smooth field, protected by a decay band around the person plane (the background near the person is dragged)
+//   Layered   (L) person warped, background frozen, the uncovered strip filled from just outside it (section 48; default)
+//   Structure (C) one continuous field, the minimiser of a quadratic energy that keeps straight photo structures straight (section 49)
+enum class Mode { Smooth = 0, Layered = 1, Structure = 2 };
+void setMode(Mode m);
+Mode mode();
 // Test / evidence hook: false = the earlier single smooth field (background dragged by the band), for before / after sheets. Default true.
-void setLayered(bool on);
+void setLayered(bool on);  // true = Layered, false = Smooth
 // Internal 长腿 switch (not in the UI): 0 = W windowed stretch with the ground compressed (earlier), 1 = windowed stretch on the person layer, feet anchored
 // (layered; default), 2 = A whole-frame stretch along the leg axis, 3 = B whole-frame vertical stretch.
 void setLegMode(int mode);

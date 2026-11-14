@@ -18,6 +18,7 @@
 #include <mutex>
 
 #include "local_eval.h"
+#include "warp_structure.h"
 
 namespace dapple::warp {
 
@@ -598,6 +599,182 @@ double maxGradient(const Grid& G) {
   return m;
 }
 
+// spectral norm of grad F at every node
+std::vector<double> nodeGradient(const Grid& G) {
+  std::vector<double> out(std::size_t(G.gw) * G.gh, 0.0);
+  for (int j = 0; j < G.gh; ++j)
+    for (int i = 0; i < G.gw; ++i) {
+      const int i0 = std::max(0, i - 1), i1 = std::min(G.gw - 1, i + 1), j0 = std::max(0, j - 1), j1 = std::min(G.gh - 1, j + 1);
+      const double* a = &G.f[2 * (std::size_t(j) * G.gw + i0)];
+      const double* b = &G.f[2 * (std::size_t(j) * G.gw + i1)];
+      const double* c = &G.f[2 * (std::size_t(j0) * G.gw + i)];
+      const double* d = &G.f[2 * (std::size_t(j1) * G.gw + i)];
+      const double ex = (i1 - i0) * G.hX, ey = (j1 - j0) * G.hY;
+      const double J00 = (b[0] - a[0]) / ex, J10 = (b[1] - a[1]) / ex, J01 = (d[0] - c[0]) / ey, J11 = (d[1] - c[1]) / ey;
+      const double p = J00 * J00 + J10 * J10, q = J01 * J01 + J11 * J11, r = J00 * J01 + J10 * J11;
+      out[std::size_t(j) * G.gw + i] = std::sqrt(0.5 * (p + q) + std::sqrt(0.25 * (p - q) * (p - q) + r * r));
+    }
+  return out;
+}
+
+// ---- mode C: the structure-aware continuous field (section 49) -------------------------------------------------------------------------
+constexpr int kSolveCellsExact = 160, kSolveCellsInteractive = 96;  // long edge of the solve grid in cells (the solution is upsampled bilinearly to the field's grid)
+constexpr double kWdPerson = 60.0, kWdZero = 1000.0;
+struct CInfo {
+  double analysisMs = 0, solveMs = 0, rel = 0;
+  int iters = 0, rounds = 0;
+  bool structure = false;  // the photo analysis was available
+};
+// Fb: the operators' intended forward displacement (unprotected), Fwarm: the smooth field (warm start). Fc <- the minimiser on the fine grid G.
+void structureField(const Grid& G, const Grid& Fb, const Grid& Fwarm, const Matte* Mp, const ReshapeParams& r, double bodyScale, bool interactive, Grid& Fc, CInfo& info) {
+  const int cells = interactive ? kSolveCellsInteractive : kSolveCellsExact;
+  const int sw = std::max(4, int(std::lround(cells * G.AX)) + 1), sh = std::max(4, int(std::lround(cells * G.AY)) + 1);
+  const double hx = G.AX / (sw - 1), hy = G.AY / (sh - 1);
+  const std::size_t N = std::size_t(sw) * sh;
+  std::vector<double> T(2 * N), x(2 * N), m(N, -1.0), me(N, -1.0), wp(N, 0.0), wd(N), Te(2 * N);
+  double tmax = 0;
+  for (int j = 0; j < sh; ++j)
+    for (int i = 0; i < sw; ++i) {
+      const std::size_t k = std::size_t(j) * sw + i;
+      const V p{i * hx, j * hy};
+      const V t = Fb.at(p.x, p.y), w = Fwarm.at(p.x, p.y);
+      T[2 * k] = t.x, T[2 * k + 1] = t.y, x[2 * k] = w.x, x[2 * k + 1] = w.y;
+      tmax = std::max(tmax, len(t));
+      if (Mp) m[k] = Mp->at(p);
+    }
+  std::vector<char> marked(N, 0);
+  for (int j = 0; j < sh; ++j)
+    for (int i = 0; i < sw; ++i) {
+      const std::size_t k = std::size_t(j) * sw + i;
+      if (Mp) {  // eroded by one node
+        double v = 1.0;
+        for (int dj = -1; dj <= 1; ++dj)
+          for (int di = -1; di <= 1; ++di) v = std::min(v, m[std::size_t(std::clamp(j + dj, 0, sh - 1)) * sw + std::clamp(i + di, 0, sw - 1)]);
+        me[k] = v;
+        wp[k] = kWdPerson * sstep(0.35, 0.9, v);
+        marked[k] = v >= 0.5;
+      } else {  // no reliable plane: the operators' own influence
+        const double a = tmax > 0 ? len(V{T[2 * k], T[2 * k + 1]}) / tmax : 0.0;
+        wp[k] = kWdPerson * sstep(0.03, 0.15, a);
+        marked[k] = wp[k] >= 0.5 * kWdPerson;
+      }
+    }
+  std::shared_ptr<const StructureGrid> S;
+  if (!r.luma.empty()) {
+    if (auto L = local::rasterGet(r.luma)) {
+      bool hit = false;
+      S = structureAnalyse(L->px.data(), L->w, L->h, L->hash, sw, sh, &hit);
+      info.analysisMs = hit ? 0.0 : S->ms;  // 0 when the photo's analysis came from the cache
+      info.structure = true;
+    } else {
+      local::logLine("reshape: luma plane '" + r.luma.substr(0, 48) + "' is missing: no structure term");
+    }
+  } else {
+    local::logLine("reshape: no luma plane: structure-aware mode without the structure term");
+  }
+  const std::vector<double> dist = structureDistance(marked, sw, sh, hx, hy);
+  const double Dext = std::clamp(std::max(1.2 * bodyScale, 4.0 * tmax), 0.03, 0.16);  // the field must be able to die out at a gradient well below 1
+  for (int j = 0; j < sh; ++j)
+    for (int i = 0; i < sw; ++i) {
+      const std::size_t k = std::size_t(j) * sw + i;
+      double wz = kWdZero * sstep(0.6 * Dext, Dext, dist[k]);
+      if (i == 0 || j == 0 || i == sw - 1 || j == sh - 1) wz = std::max(wz, kWdZero * (1.0 - sstep(0.3, 0.9, std::max(me[k], 0.0))));  // zero at the frame border
+      wd[k] = wp[k] + wz;
+      Te[2 * k] = wd[k] > 0 ? wp[k] * T[2 * k] / wd[k] : 0.0, Te[2 * k + 1] = wd[k] > 0 ? wp[k] * T[2 * k + 1] / wd[k] : 0.0;
+    }
+  StructureSolveIn in;
+  in.w = sw, in.h = sh, in.hx = hx, in.hy = hy, in.S = S.get(), in.wd = &wd, in.T = &Te, in.dist = &dist, in.decay = Dext;
+  // The solved field must stay fold-free: where the gradient of the solution exceeds 0.6 the smoothness weight is raised around the node (the field then
+  // spreads over a wider band there instead of dropping steeply) and the system is solved again from the previous solution, up to 4 times.
+  std::vector<double> stiff(N, 1.0);
+  in.stiff = &stiff;
+  in.maxIter = 60;
+  StructureSolveOut so = structureSolve(in, x);
+  info.solveMs = so.ms, info.iters = so.iters, info.rel = so.rel;
+  for (int round = 0; round < 4; ++round) {
+    std::vector<double> g(N, 0.0);
+    bool any = false;
+    for (int j = 1; j + 1 < sh; ++j)
+      for (int i = 1; i + 1 < sw; ++i) {
+        const std::size_t k = std::size_t(j) * sw + i;
+        const double *a = &x[2 * (k - 1)], *b = &x[2 * (k + 1)], *c = &x[2 * (k - sw)], *d = &x[2 * (k + sw)];
+        const double J00 = (b[0] - a[0]) / (2 * hx), J10 = (b[1] - a[1]) / (2 * hx), J01 = (d[0] - c[0]) / (2 * hy), J11 = (d[1] - c[1]) / (2 * hy);
+        const double p = J00 * J00 + J10 * J10, q = J01 * J01 + J11 * J11, r2 = J00 * J01 + J10 * J11;
+        g[k] = std::sqrt(0.5 * (p + q) + std::sqrt(0.25 * (p - q) * (p - q) + r2 * r2));
+        any = any || g[k] > 0.6;
+      }
+    if (!any) break;
+    std::vector<double> add(N, 1.0);
+    for (std::size_t k = 0; k < N; ++k)
+      if (g[k] > 0.6) add[k] = 1.0 + 6.0 * (g[k] / 0.6 - 1.0);
+    for (int sp = 0; sp < 2; ++sp) {  // spread to the neighbours (x0.7 per step)
+      std::vector<double> nx2 = add;
+      for (int j = 1; j + 1 < sh; ++j)
+        for (int i = 1; i + 1 < sw; ++i) {
+          const std::size_t k = std::size_t(j) * sw + i;
+          double m = add[k];
+          for (int dj = -1; dj <= 1; ++dj)
+            for (int di = -1; di <= 1; ++di) m = std::max(m, 1.0 + 0.7 * (add[k + std::size_t(dj * sw + di)] - 1.0));
+          nx2[k] = m;
+        }
+      add = nx2;
+    }
+    for (std::size_t k = 0; k < N; ++k) stiff[k] *= add[k];
+    in.maxIter = 30;
+    const StructureSolveOut s2 = structureSolve(in, x);
+    info.solveMs += s2.ms, info.iters += s2.iters, info.rel = s2.rel, ++info.rounds;
+  }
+  Fc = G;
+  Fc.zero();
+  for (int j = 0; j < G.gh; ++j)
+    for (int i = 0; i < G.gw; ++i) {
+      const double gx = std::clamp(G.X(i) / hx, 0.0, double(sw - 1)), gy = std::clamp(G.Y(j) / hy, 0.0, double(sh - 1));
+      const int a = std::min(int(gx), sw - 2), b = std::min(int(gy), sh - 2);
+      const double fx = gx - a, fy = gy - b;
+      const double* p = &x[2 * (std::size_t(b) * sw + a)];
+      const double* q = p + 2 * std::size_t(sw);
+      double* o = &Fc.f[2 * (std::size_t(j) * G.gw + i)];
+      for (int c = 0; c < 2; ++c) o[c] = (p[c] * (1 - fx) + p[c + 2] * fx) * (1 - fy) + (q[c] * (1 - fx) + q[c + 2] * fx) * fy;
+    }
+}
+
+// Fold-free check of the field on the fine grid: where a node still has a gradient above `lim` after the reweighting of the solve (it is rare: the
+// upsampling and the person-plane edges can add a little), the field is diffused (3 x 3 mean) around it, with a weight growing around the node, until none
+// is left. Blending that neighbourhood toward the smooth field was tried first and made the gradient worse (the two fields differ strongly there; the
+// blend weight's own gradient multiplies the difference: 1.3 -> 3.7). Returns the share of the moving nodes that violated at first; passes = how many it took.
+double foldFreeDiffuse(Grid& F, double lim, int& passes) {
+  const int w = F.gw, h = F.gh;
+  double frac = 0;
+  passes = 0;
+  for (int pass = 0; pass < 24; ++pass) {
+    const std::vector<double> g = nodeGradient(F);
+    std::vector<char> bad(g.size(), 0);
+    std::size_t nb = 0, nm = 0;
+    for (std::size_t k = 0; k < g.size(); ++k) {
+      if (F.f[2 * k] != 0 || F.f[2 * k + 1] != 0) ++nm;
+      if (g[k] > lim) bad[k] = 1, ++nb;
+    }
+    if (pass == 0) frac = nm ? double(nb) / double(nm) : 0.0;
+    if (!nb) break;
+    ++passes;
+    const std::vector<double> d = structureDistance(bad, w, h, 1.0, 1.0);
+    const Grid src = F;
+    for (int j = 1; j + 1 < h; ++j)
+      for (int i = 1; i + 1 < w; ++i) {
+        const std::size_t k = std::size_t(j) * w + i;
+        const double lam = 1.0 - sstep(0.0, 6.0, d[k]);
+        if (lam <= 0) continue;
+        for (int c = 0; c < 2; ++c) {
+          double acc = 0;
+          for (int dj = -1; dj <= 1; ++dj)
+            for (int di = -1; di <= 1; ++di) acc += src.f[2 * (k + std::size_t(dj * w + di)) + c];
+          F.f[2 * k + c] = src.f[2 * k + c] + lam * (acc / 9.0 - src.f[2 * k + c]);
+        }
+      }
+  }
+  return frac;
+}
+
 // ---- push strokes, composed in backward form ---------------------------------------------------------------------------------------
 void composePush(Grid& B, const std::vector<ReshapePush>& strokes) {
   std::vector<double> patch;
@@ -707,7 +884,7 @@ void nearestOutside(const Grid& G, const std::vector<char>& in, std::vector<floa
   }
 }
 
-bool g_layered = true;
+Mode g_mode = Mode::Layered;
 int g_leg = 3;  // 长腿 variant: 0 = W windowed + compressed ground (earlier), 1 = windowed on the person layer (layered), 2 = A stretch along the leg axis, 3 = B vertical stretch (default)
 double g_band = 0;  // evidence hook: protection band override (long-edge units), 0 = the default
 
@@ -743,7 +920,15 @@ void setLegMode(int m) {
 }
 void setLayered(bool on) {
   std::lock_guard<std::mutex> lk(g_mu);
-  g_layered = on;
+  g_mode = on ? Mode::Layered : Mode::Smooth;
+}
+void setMode(Mode m) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_mode = m;
+}
+Mode mode() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_mode;
 }
 void resetCache() {
   std::lock_guard<std::mutex> lk(g_mu);
@@ -762,7 +947,7 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
   std::uint64_t key = reshapeHash(r);
   key = (key ^ std::uint64_t(G.gw) * 0x9E3779B97F4A7C15ull) * 1099511628211ull;
   key = (key ^ std::uint64_t(G.gh) * 0xC2B2AE3D27D4EB4Full) * 1099511628211ull;
-  key = (key ^ std::uint64_t(g_layered ? 0x51ull : 0x17ull)) * 1099511628211ull;
+  key = (key ^ std::uint64_t(g_mode == Mode::Layered ? 0x51ull : g_mode == Mode::Smooth ? 0x17ull : 0x93ull)) * 1099511628211ull;
   key = (key ^ std::uint64_t(g_band * 1e6)) * 1099511628211ull;
   key = (key ^ std::uint64_t(g_leg + 7)) * 1099511628211ull;
   {
@@ -825,7 +1010,7 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
     }
   }
   // Layered mode (section 48): needs the person plane to cover every body that is lengthened as well (its legs); otherwise the earlier single field.
-  bool layered = Mp && g_layered;
+  bool layered = Mp && g_mode == Mode::Layered;
   bool anyLong = false;
   for (const ReshapeBody& b : r.bodies) anyLong = anyLong || (b.active() && b.longLegs != 0);
   if (anyLong && g_leg == 0) layered = false;  // W: the earlier single field with the compressed ground (A, B: a separate whole-frame stretch, composed below)
@@ -865,25 +1050,42 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
     scale = std::max(scale, 0.15 * g.fw);
   }
   bool band = false;
+  // Mode C (section 49): the slimming operators go into their own grid Fb (the data of the structure-aware solve); everything else keeps the protection band
+  const bool modeC = g_mode == Mode::Structure;
+  Grid Fb = G;
+  Fb.zero();
+  Grid& Fbody = modeC ? Fb : F;
+  double bodyScale = 0;
+  bool slimming = false;
   for (std::size_t bi = 0; bi < r.bodies.size(); ++bi) {
     const ReshapeBody& b = r.bodies[bi];
     if (!b.active()) continue;
     const BodyGeo g = bodyGeo(b, G.AX, G.AY);
     if (!bodySkip[bi]) {
-      if (b.waist) opWaist(F, g, Mp, b.waist / 100.0);
-      if (b.arms) opArms(F, g, Mp, b.arms / 100.0);
-      if (b.legs) opLegs(F, g, Mp, b.legs / 100.0);
-      if (b.head) opHead(F, g, b.head / 100.0);
-      if (b.waist || b.arms || b.legs || b.head) scale = std::max(scale, 0.25 * g.sh);
+      if (b.waist) opWaist(Fbody, g, Mp, b.waist / 100.0);
+      if (b.arms) opArms(Fbody, g, Mp, b.arms / 100.0);
+      if (b.legs) opLegs(Fbody, g, Mp, b.legs / 100.0);
+      if (b.head) opHead(Fbody, g, b.head / 100.0);
+      if (b.waist || b.arms || b.legs || b.head) scale = std::max(scale, 0.25 * g.sh), bodyScale = std::max(bodyScale, 0.25 * g.sh), slimming = true;
     }
     band = band || b.longLegs != 0;
   }
+  const bool useC = modeC && slimming;
+  Grid Ff;  // useC: the face part of the field (protected below), F = Ff + Fb until the solve replaces Fb
+  if (useC) {
+    Ff = F;
+    for (std::size_t k = 0; k < F.f.size(); ++k) F.f[k] += Fb.f[k];
+  }
   // 2. background protection
   if (layered) out->matteUsed = true;  // layered: the background is frozen by construction, the person field needs no decay band around the matte
+  std::vector<double> wprot;
   if (Mp && scale > 0 && !layered) {
     const double delta = g_band > 0 ? g_band : std::clamp(scale, 0.006, 0.05);
     const std::vector<double> w = protection(G, M, delta);
+    if (useC) wprot = w;
     for (std::size_t k = 0; k < w.size(); ++k) F.f[2 * k] *= w[k], F.f[2 * k + 1] *= w[k];
+    if (useC)
+      for (std::size_t k = 0; k < w.size(); ++k) Ff.f[2 * k] *= w[k], Ff.f[2 * k + 1] *= w[k];
     out->delta = float(delta);
     out->matteUsed = true;
   }
@@ -899,9 +1101,21 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
         }
       }
   // 3. fold-free
-  double gmax = maxGradient(F);
-  out->rawGrad = float(gmax);
-  if (gmax > 0.75) {
+  double gmax = useC ? 0.0 : maxGradient(F);
+  if (useC) {  // C: the face part and the slimming part are limited on their own (the slimming field is not multiplied by the decay band)
+    const double gf = maxGradient(Ff), gb = maxGradient(Fb);
+    gmax = std::max(gf, gb);
+    out->rawGrad = float(gmax);
+    if (gf > 0.75)
+      for (double& v : Ff.f) v *= 0.75 / gf;
+    if (gb > 0.75)
+      for (double& v : Fb.f) v *= 0.75 / gb;
+    if (gmax > 0.75) out->gradLimited = true, local::logLine("reshape: operators limited to stay fold-free (gradient " + std::to_string(gmax) + ")");
+    gmax = std::min(gmax, 0.75);
+  } else {
+    out->rawGrad = float(gmax);
+  }
+  if (!useC && gmax > 0.75) {
     const double k = 0.75 / gmax;
     for (double& v : F.f) v *= k;
     out->gradLimited = true;
@@ -909,6 +1123,28 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
     gmax = 0.75;
   }
   out->maxGrad = float(gmax);
+  // 3b. mode C: F <- Ff + the structure-aware solution for the slimming operators (already limited above), fold-free
+  if (useC) {
+    Grid Fwarm = Fb;  // the smooth field of the slimming operators (protected by the decay band when there is a plane)
+    if (!wprot.empty())
+      for (std::size_t k = 0; k < wprot.size(); ++k) Fwarm.f[2 * k] *= wprot[k], Fwarm.f[2 * k + 1] *= wprot[k];
+    CInfo ci;
+    Grid Fc;
+    structureField(G, Fb, Fwarm, Mp, r, bodyScale, interactive, Fc, ci);
+    for (std::size_t k = 0; k < F.f.size(); ++k) F.f[k] = Ff.f[k] + Fc.f[k];
+    int passes = 0;
+    const double frac = foldFreeDiffuse(F, 0.75, passes);
+    out->structure = true;
+    out->cFoldFrac = float(frac);
+    out->maxGrad = float(maxGradient(F));
+    out->matteUsed = out->matteUsed || Mp;
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_counters.cAnalysisMs = ci.analysisMs, g_counters.cSolveMs = ci.solveMs, g_counters.cIters = ci.iters, g_counters.cResidual = ci.rel;
+    g_counters.cFoldFrac = frac, g_counters.cFoldPasses = passes, g_counters.cRounds = ci.rounds, g_counters.cUsed = true;
+  } else if (modeC) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_counters.cUsed = false;
+  }
   // 4. inversion
   Grid B = G;
   B.zero();

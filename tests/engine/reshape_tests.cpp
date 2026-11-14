@@ -1199,6 +1199,151 @@ void testLegs() {
   warp::setLegMode(3);
 }
 
+// ---- structure-aware continuous field (mode C, section 49) --------------------------------------------------------------------------------------------
+// A scene of its own: a flat wall with one straight diagonal line that runs behind the figure of the synthetic scene. The luma plane (512 px long edge) is
+// analytic, the person plane is putMatte's.
+bool inFigure(double X, double Y, double cx) {
+  const bool head = std::hypot((X - cx) / 0.075, (Y - 0.22) / 0.1) < 1.0;
+  const bool torso = std::fabs(X - cx) < 0.11 && Y > 0.31 && Y < 0.62;
+  const bool legs = (std::fabs(X - cx - 0.045) < 0.035 || std::fabs(X - cx + 0.045) < 0.035) && Y >= 0.62 && Y < 0.93;
+  return head || torso || legs;
+}
+// distance from (X, Y) to the line through (0.02, 0.30) and (0.73, 0.52)
+double lineDist(double X, double Y) {
+  const double dx = 0.71, dy = 0.22, n = std::hypot(dx, dy);
+  return std::fabs((X - 0.02) * dy - (Y - 0.30) * dx) / n;
+}
+void putLuma(const char* id, int W, int H) {
+  const int L = 512, w = W >= H ? L : int(std::lround(L * double(W) / H)), h = H >= W ? L : int(std::lround(L * double(H) / W));
+  std::vector<std::uint8_t> px(std::size_t(w) * h);
+  const double Lp = std::max(W, H), cx = 0.5 * W / Lp;
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const double X = (x + 0.5) / w * W / Lp, Y = (y + 0.5) / h * H / Lp;
+      px[std::size_t(y) * w + x] = inFigure(X, Y, cx) ? 90 : (lineDist(X, Y) < 0.003 ? 20 : 170);
+    }
+  local::rasterSet(id, w, h, px.data(), w);
+}
+EditParams structureEdit(int W, int H, bool luma) {
+  EditParams p;
+  ReshapeBody b = synthBody(W, H);
+  b.waist = b.arms = b.legs = b.head = 100;
+  p.reshape.bodies = {b};
+  p.reshape.matte = "rs_matte";
+  if (luma) p.reshape.luma = "rs_luma";
+  return p;
+}
+// sagitta (max deviation from the best straight line, long-edge units x 2048) of the diagonal line carried through the field, left and right of the figure
+double carriedLineDeviation(const warp::Field& f, int W, int H) {
+  const double Lp = std::max(W, H), cx = 0.5 * W / Lp;
+  double worst = 0;
+  for (int side = 0; side < 2; ++side) {
+    std::vector<std::pair<double, double>> q;
+    for (int i = 0; i <= 400; ++i) {
+      const double X = 0.02 + 0.71 * i / 400.0, Y = 0.30 + 0.22 * i / 400.0;
+      bool far = true;  // 0.03 from the silhouette
+      for (int a = -3; a <= 3 && far; ++a)
+        for (int b = -3; b <= 3 && far; ++b) far = !inFigure(X + 0.01 * a, Y + 0.01 * b, cx);
+      if (!far || (side == 0) != (X < cx)) continue;
+      double uo, vo;
+      warp::forwardUV(f, X * Lp / W, Y * Lp / H, uo, vo);
+      q.emplace_back(uo * W / Lp, vo * H / Lp);
+    }
+    if (q.size() < 20) continue;
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (const auto& t : q) sx += t.first, sy += t.second, sxx += t.first * t.first, sxy += t.first * t.second;
+    const double n = double(q.size()), sl = (n * sxy - sx * sy) / (n * sxx - sx * sx), ic = (sy - sl * sx) / n;
+    for (const auto& t : q) worst = std::max(worst, std::fabs(t.second - (sl * t.first + ic)) * std::cos(std::atan(sl)) * 2048.0);
+  }
+  return worst;
+}
+void structureCacheWarm() {
+  // the photo analysis is per photo (cached): build it once before timing the field itself
+  EditParams q = structureEdit(600, 800, true);
+  warp::setMode(warp::Mode::Structure);
+  warp::bind(q.reshape, 6000, 4000, false);
+  warp::bind(q.reshape, 6000, 4000, true);
+  warp::resetCache();
+}
+void testStructure() {
+  const int W = 600, H = 800;
+  putMatte("rs_matte", W, H);
+  putLuma("rs_luma", W, H);
+  const EditParams p = structureEdit(W, H, true);
+  warp::setMode(warp::Mode::Smooth);
+  warp::resetCache();
+  auto fs = warp::bind(p.reshape, W, H, false);
+  warp::setMode(warp::Mode::Structure);
+  warp::resetCache();
+  auto fc = warp::bind(p.reshape, W, H, false);
+  const auto cn = warp::counters();
+  warp::setMode(warp::Mode::Layered);
+  CHECK(fs && fc && fc->structure && !fc->layered);
+  if (!fs || !fc) return;
+  const double dS = carriedLineDeviation(*fs, W, H), dC = carriedLineDeviation(*fc, W, H);
+  std::printf("  diagonal line behind the figure, body ops at 100: deviation from straight (px at 2048) S %.2f, C %.2f; C: analysis %.1f ms, solve %.1f ms (%d it), fold blend %.2f %% (%d passes), max grad %.3f\n", dS,
+              dC, cn.cAnalysisMs, cn.cSolveMs, cn.cIters, 100.0 * cn.cFoldFrac, cn.cFoldPasses, fc->maxGrad);
+  CHECK(dS > 1.0);
+  CHECK(dC <= 0.5);
+  // fold-free at 100: the forward map is invertible, (u, v) -> backward -> forward round trip closes on a grid of points
+  CHECK(fc->maxGrad < 0.8f);
+  double worst = 0;
+  for (int j = 1; j < 40; ++j)
+    for (int i = 1; i < 30; ++i) {
+      const double u = i / 30.0, v = j / 40.0, L = 800.0;
+      double bu, bv, fu, fv;
+      warp::backwardUV(*fc, u, v, bu, bv);
+      warp::forwardUV(*fc, bu, bv, fu, fv);
+      worst = std::max(worst, std::hypot((fu - u) * W, (fv - v) * H) * 2048.0 / L);
+    }
+  std::printf("  C fold-free at 100: max grad %.3f, forward(backward(p)) - p max %.3f px at 2048\n", fc->maxGrad, worst);
+  CHECK(worst < 0.5);
+  // strength changes only the data: half strength moves the person about half as far
+  EditParams ph = p;
+  ph.reshape.bodies[0].waist = ph.reshape.bodies[0].arms = ph.reshape.bodies[0].legs = ph.reshape.bodies[0].head = 50;
+  warp::setMode(warp::Mode::Structure);
+  auto fh = warp::bind(ph.reshape, W, H, false);
+  warp::setMode(warp::Mode::Layered);
+  CHECK(fh && fh->maxDisp > 0.4f * fc->maxDisp && fh->maxDisp < 0.6f * fc->maxDisp);
+  // cost of building the field for a 24 MP photo (the grid does not depend on the photo size) and for the interactive tier, per mode
+  for (int tier = 0; tier < 2; ++tier)
+    for (warp::Mode m : {warp::Mode::Smooth, warp::Mode::Structure}) {
+      warp::setMode(m);
+      warp::resetCache();
+      structureCacheWarm();
+      const auto t0 = std::chrono::steady_clock::now();
+      auto f = warp::bind(p.reshape, 6000, 4000, tier == 1);
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      const auto c2 = warp::counters();
+      std::printf("  field build 6000 x 4000, %s, mode %s: %.1f ms%s\n", tier ? "interactive" : "exact", m == warp::Mode::Smooth ? "S" : m == warp::Mode::Layered ? "L" : "C", ms,
+                  m == warp::Mode::Structure ? (" (solve " + std::to_string(c2.cSolveMs) + " ms, " + std::to_string(c2.cIters) + " it, analysis cached)").c_str() : "");
+      CHECK(bool(f));
+    }
+  warp::setMode(warp::Mode::Layered);
+}
+void testStructureTiles() {
+  const int W = 600, H = 800;
+  const SourceImage src = makeScene(W, H);
+  putMatte("rs_matte", W, H);
+  putLuma("rs_luma", W, H);
+  const EditParams p = structureEdit(W, H, true);
+  warp::setMode(warp::Mode::Structure);
+  EngineSession es;
+  Image8 whole, base;
+  CHECK(exactRender(es, EditParams{}, src, ExecMode::Whole, 0, base));
+  CHECK(exactRender(es, p, src, ExecMode::Whole, 0, whole));
+  CHECK(maxDiff(whole, base, nullptr) > 20);  // it does something
+  for (int tile : {96, 200}) {
+    Image8 t;
+    std::size_t d = 0;
+    CHECK(exactRender(es, p, src, ExecMode::TiledExport, tile, t));
+    const double m = maxDiff(whole, t, &d);
+    std::printf("  mode C, tile %3d: max code %.0f, differing bytes %zu\n", tile, m, d);
+    CHECK(m <= 1);
+  }
+  warp::setMode(warp::Mode::Layered);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1209,7 +1354,7 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"json", testJson},       {"identity", testIdentity}, {"bounded", testBounded},         {"protect", testProtect},
                      {"push", testPush},       {"tiles", testTiles},       {"region", testRegion},           {"interactive", testInteractive},
-                     {"mappoint", testMapPoint}, {"sharpness", testSharpness}, {"body", testBody}, {"layered", testLayered}, {"legs", testLegs},
+                     {"mappoint", testMapPoint}, {"sharpness", testSharpness}, {"body", testBody}, {"layered", testLayered}, {"legs", testLegs}, {"structure", testStructure}, {"structure_tiles", testStructureTiles},
 #ifdef DAPPLE_RESHAPE_GPU
                      {"parity", testParity},
 #endif

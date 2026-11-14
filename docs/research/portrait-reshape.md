@@ -89,3 +89,18 @@ What the search found about **how leg lengthening is done by the mainstream apps
 ### 4.3 Clean-room statement
 
 Only ideas were taken (layering, mask-driven fill, 1-D stretch with eased ends, slope-keeping as an objective). No code was read or ported; the fill (nearest-outside vectors by two-pass propagation, a mirror read) and the stretch are our own. Licences of the opened sources: all are articles, papers or a patent; none gives code.
+
+### 4.4 Main-session reading (2026-11-15)
+
+What the main session read itself, with the level of verification (nothing here was run; these are reading notes):
+
+| Source | Claim | Verification |
+|---|---|---|
+| Zhou, Fu, Liu, Cohen-Or, Han, "Parametric Reshaping of Human Bodies in Images" (SIGGRAPH 2010) | One continuous mesh warp of the whole image, solved as a sparse linear system. Energy = body terms + E_reg (adjacent triangles deform alike) + E_dis = sum u_i \|A_i - I\|^2 with u_i the content saliency; borders fixed. They explicitly prefer this to "first segmenting the human region, then reshaping the segmented subject, and finally pasting ... by completing in-between holes", and state the remaining weakness: background artefacts "especially noticeable at regions with structural features (e.g. ground and wall)", to be alleviated through the saliency weights. | full text read |
+| Kuaishou Y-Tech write-up (besthub.dev, "how Kuaishou's Y-Tech fixes background distortion in portrait beautification") | A background triangle mesh (about 150 points) is re-optimised after the beauty warp so that detected straight lines keep their slope, plus a triangle-shape term where no lines exist; nonlinear least squares; shipped on phones. No layers, no inpainting. Leg lengthening: the region below the hip line is stretched toward the feet with a smooth gradient. | page extract |
+| Ren et al., "Structure-Aware Flow Generation for Human Body Reshaping" (CVPR 2022) | The flow warps the whole image; limitation section: the flow "will also affect the overlapped areas in the background", causing "twisted lines or deformed objects"; matting + inpainting is only suggested as a possible fix. | ar5iv text extract |
+| Meitu 增高 (since 2014) | Full-width stretch of a band chosen by two lines. Confirms the 长腿 default (whole-frame vertical stretch, section 48). | main-session reading, secondary source |
+
+### 4.5 Mode C: structure-aware continuous field (2026-11-15, section 49 of the pipeline notes)
+
+Third mode for the slimming operators, built from the reading above: Zhou's single continuous field with the saliency idea inverted for the background, and the Kuaishou "straight lines keep their slope" objective expressed through a structure tensor instead of a line detector (so no line detector, no model). Results and the default recommendation are in section 49 of `docs/engine/pipeline-architecture.md`.

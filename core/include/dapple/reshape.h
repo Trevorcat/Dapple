@@ -50,12 +50,13 @@ struct ReshapePush {
 
 struct ReshapeParams {
   std::string matte;        // raster id of the person plane (background protection); empty = no protection
+  std::string luma;         // raster id of the photo's luminance plane (structure analysis of the structure-aware mode, section 49); empty = none
   std::vector<ReshapeFace> faces;
   std::vector<ReshapeBody> bodies;
   std::vector<ReshapePush> push;
   std::vector<std::pair<std::string, std::string>> extra;  // unknown keys, kept verbatim (raw JSON) and written back
 
-  bool empty() const { return faces.empty() && bodies.empty() && push.empty() && extra.empty() && matte.empty(); }
+  bool empty() const { return faces.empty() && bodies.empty() && push.empty() && extra.empty() && matte.empty() && luma.empty(); }
   bool active() const;      // anything that moves a pixel
 };
 
