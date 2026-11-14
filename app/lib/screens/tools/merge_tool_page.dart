@@ -135,6 +135,17 @@ class _MergeToolPageState extends State<MergeToolPage> {
   Future<void> _start() async {
     _debounce?.cancel();
     _handle?.requestCancel();
+    // frames that are not a bracket / not overlapping merge into a ghosted or broken picture: say so before the work starts
+    final verdict = await app.checkMergeDraft(d);
+    if (!mounted) return;
+    if (!verdict.isOk) {
+      final goOn = await showMergeDoubt(context, message: verdict.message!, goOnLabel: isHdr ? '仍然合成' : '仍然拼接');
+      if (!mounted) return;
+      if (!goOn) {
+        await _pick();
+        return;
+      }
+    }
     final job = await app.startMerge(d);
     if (!mounted) return;
     final r = await showToolProgress(context, app, job);

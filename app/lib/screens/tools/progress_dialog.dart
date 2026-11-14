@@ -19,6 +19,34 @@ Future<ToolDialogResult> showToolProgress(BuildContext context, AppState app, To
   return r ?? ToolDialogResult.cancelled;
 }
 
+/// The frames do not look like what the tool needs (services/merge_check.dart): what is wrong in plain words, 重选 as the one primary
+/// action, and the way on for someone who knows better. Returns true for "go on anyway".
+Future<bool> showMergeDoubt(BuildContext context, {required String message, required String goOnLabel}) async {
+  final r = await showDialog<bool>(
+    context: context,
+    builder: (ctx) {
+      final c = ctx.c;
+      return Dialog(
+        key: const ValueKey('merge-doubt'),
+        backgroundColor: c.surfaceHi,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 40),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(Rd.dialog)),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Text(message, key: const ValueKey('merge-doubt-text'), style: T.h2(c.text)),
+            const SizedBox(height: Sp.l),
+            KeyedSubtree(key: const ValueKey('merge-doubt-reselect'), child: PrimaryButton('重选', height: 48, onPressed: () => Navigator.of(ctx).pop(false))),
+            const SizedBox(height: Sp.s),
+            Center(child: KeyedSubtree(key: const ValueKey('merge-doubt-go'), child: TextAction(goOnLabel, size: 17, onPressed: () => Navigator.of(ctx).pop(true)))),
+          ]),
+        ),
+      );
+    },
+  );
+  return r ?? false;
+}
+
 class _ToolProgressDialog extends StatefulWidget {
   const _ToolProgressDialog({required this.app, required this.job});
   final AppState app;

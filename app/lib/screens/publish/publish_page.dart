@@ -118,7 +118,11 @@ class _PublishPageState extends State<PublishPage> {
   @visibleForTesting
   void debugSetPresetForTest(Preset p) => _pick(p);
 
+  /// The user tapped a preset (the default one is not a choice of a platform).
+  bool _presetChosen = false;
+
   void _pick(Preset p) => setState(() {
+        _presetChosen = true;
         _preset = p;
         _ratio = p.defRatio;
         _size = p.longEdge ?? app.settings.exportLongEdge;
@@ -221,6 +225,12 @@ class _PublishPageState extends State<PublishPage> {
     var handed = true;
     if (!fallback) handed = await ShareService.instance.shareFiles(paths);
     if (!mounted || !handed) return;
+    // one photo and no platform picked: nothing to walk through, back to where the user came from with the short toast
+    if (photos.length == 1 && !_presetChosen && !_split) {
+      app.showToast(fallback ? '已存入相册「Dapple」' : '已交给系统分享');
+      Navigator.of(context).pop(true);
+      return;
+    }
     final hasNext = _split && _batch + 1 < _batches;
     final r = await Navigator.of(context).push<DoneResult>(MaterialPageRoute(
       builder: (_) => PublishDonePage(

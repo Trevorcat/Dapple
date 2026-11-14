@@ -212,6 +212,31 @@ void main() {
     expect(result.value, isTrue);
   });
 
+  testWidgets('one photo, no platform picked: no done page, back with the short toast', (tester) async {
+    final app = AppState.demo();
+    final result = await open(tester, app, idsOf(app, 1));
+    await tester.tap(find.byKey(const ValueKey('publish-share')));
+    await step(tester);
+    await tester.tap(find.byKey(const ValueKey('handoff-system')));
+    await step(tester);
+    expect(find.byKey(const ValueKey('done-finish')), findsNothing);
+    expect(find.byKey(const ValueKey('publish-share')), findsNothing, reason: 'the publish sheet is closed too');
+    expect(app.toast?.message, '已交给系统分享');
+    expect(result.value, isTrue);
+  });
+
+  testWidgets('one photo with a platform preset keeps the done page', (tester) async {
+    final app = AppState.demo();
+    await open(tester, app, idsOf(app, 1));
+    await tester.tap(find.byKey(const ValueKey('preset-xhs')));
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('publish-share')));
+    await step(tester);
+    await tester.tap(find.byKey(const ValueKey('handoff-system')));
+    await step(tester);
+    expect(find.byKey(const ValueKey('done-finish')), findsOneWidget);
+  });
+
   testWidgets('gallery fallback: open app then 已打开', (tester) async {
     final app = AppState.demo();
     await open(tester, app, idsOf(app, 2));

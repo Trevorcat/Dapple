@@ -547,7 +547,7 @@ std::shared_ptr<engine::gpu::Context> gpuContext() {
   return ctx;
 }
 
-void testParity() {
+void parityImpl(const std::vector<std::pair<int, int>>& sizes) {
   auto ctx = gpuContext();
   struct Case {
     const char* name;
@@ -561,7 +561,7 @@ void testParity() {
       {"hdr 80 + clarity, sharpen, NR", [](EditParams& p) { p.hdr = 80.f; p.clarity = 30.f; p.sharpen = 50.f; p.nrLuma = 30.f; }, false},
       {"hdr 100 interactive", [](EditParams& p) { p.hdr = 100.f; }, true},
   };
-  for (const std::pair<int, int>& sz : {std::pair<int, int>{640, 448}, std::pair<int, int>{1536, 1024}}) {
+  for (const std::pair<int, int>& sz : sizes) {
     const SourceImage src = makeScene(sz.first, sz.second);
     dapple::gpu::Rig rig(ctx, src, cam());
     EngineSession cpuEs;
@@ -606,6 +606,10 @@ void testParity() {
     }
   }
 }
+
+void testParity() { parityImpl({{640, 448}, {1536, 1024}}); }
+// GPU against CPU for the single-image HDR (with crop, vignette, detail stages, interactive) on one small frame: in the default run
+void testParitySmall() { parityImpl({{320, 224}}); }
 
 double medianGpuMs(dapple::gpu::Rig& rig, const EditParams& p, const SourceImage& src, const FastOptions& fo, int srcLong, int& w, int& h) {
   std::vector<double> v;
@@ -700,7 +704,7 @@ int main(int argc, char** argv) {
   const T tests[] = {{"identity", testIdentity}, {"lowrange", testLowRange}, {"anchors", testAnchors}, {"midband", testMidband}, {"tiles", testTiles}, {"monotonic", testMonotonic}, {"halo", testHalo}, {"noise", testNoise},
                      {"cpubench", testCpuBench},
 #ifdef DAPPLE_HDR_GPU
-                     {"parity", testParity}, {"bench", testBench},
+                     {"parity", testParity}, {"parity_small", testParitySmall}, {"bench", testBench},
 #endif
   };
   bool ran = false;

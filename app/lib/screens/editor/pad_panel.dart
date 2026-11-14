@@ -263,19 +263,19 @@ class _DockedPanelState extends State<DockedPanel> {
   }
 }
 
-/// The header of the open category: title, readout, 复位 and 分项 (局部: its own, with the area chips). [filmHome]: the film map is
-/// the category's home layer (the fold layouts keep it open), so it has no ‹ and keeps 分项 beside 无.
+/// The header of the open category: title, readout, 复位 and 分项 (局部: its own, with the area chips). The same one in the phone panel,
+/// the workbench and the column.
 class PanelHeaderOf extends StatelessWidget {
-  const PanelHeaderOf({super.key, required this.ctl, required this.group, required this.side, required this.textScale, this.collapsed = false, this.filmHome = false});
+  const PanelHeaderOf({super.key, required this.ctl, required this.group, required this.side, required this.textScale, this.collapsed = false});
   final EditorController ctl;
   final EGroup group;
-  final bool side, collapsed, filmHome;
+  final bool side, collapsed;
   final double textScale;
 
   @override
   Widget build(BuildContext context) => group == EGroup.local
       ? LocalHeader(ctl: ctl, side: side, textScale: textScale, collapsed: collapsed)
-      : _Header(ctl: ctl, group: group, cat: PadCatX.ofGroup(group), side: side, textScale: textScale, filmHome: filmHome);
+      : _Header(ctl: ctl, group: group, cat: PadCatX.ofGroup(group), side: side, textScale: textScale);
 }
 
 /// The body of the open category (the pad row, the film map, 分项, a complex editor, 裁切's chips and ruler, 局部's cards and pad). A window too
@@ -292,7 +292,7 @@ class PanelBodyOf extends StatelessWidget {
     final extra = ctl.extra;
     if (extra != null) return ExtraEditor(ctl: ctl, cat: cat, extra: extra);
     if (ctl.itemised) return ItemisedView(ctl: ctl, cat: cat);
-    if (cat == PadCat.film && ctl.filmMapOpen) return FilmMapView(key: const ValueKey('film-map'), ctl: ctl, persistent: ctl.controlsHome);
+    if (cat == PadCat.film && ctl.filmMapOpen) return FilmMapView(key: const ValueKey('film-map'), ctl: ctl);
     return PadRow(ctl: ctl, cat: cat);
   }
 
@@ -520,11 +520,11 @@ class HeaderReadout extends StatelessWidget {
 }
 
 class _Header extends StatelessWidget {
-  const _Header({required this.ctl, required this.group, required this.cat, required this.side, required this.textScale, this.filmHome = false});
+  const _Header({required this.ctl, required this.group, required this.cat, required this.side, required this.textScale});
   final EditorController ctl;
   final EGroup group;
   final PadCat? cat;
-  final bool side, filmHome;
+  final bool side;
   final double textScale;
 
   @override
@@ -562,11 +562,10 @@ class _Header extends StatelessWidget {
             title: name,
             side: side,
             textScale: textScale,
-            onBack: filmHome ? null : () => ctl.setFilmMap(false),
+            onBack: () => ctl.setFilmMap(false),
             sub: Text(none ? '选成像' : baseNameOf(ctl.app.film, ctl.edit.film), key: const ValueKey('header-sub'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.cap(c.text2)),
             buttons: [
               if (!none) HeaderButton(key: const ValueKey('film-none'), label: '无', semantics: '不用成像', onTap: ctl.stockNone),
-              if (filmHome) HeaderButton(key: const ValueKey('items-button'), label: '分项', onTap: () => ctl.setItemised(true)),
             ],
           );
         },

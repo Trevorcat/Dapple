@@ -989,9 +989,9 @@ void testIdentity() {
 }
 
 // ---- tiles ------------------------------------------------------------------------------------------------------------------------------
-void testTiles() {
-  const SourceImage src = makePortrait(800, 1000);
-  putRasters(800, 1000);
+void tilesImpl(int W, int H, std::vector<int> tileSizes) {
+  const SourceImage src = makePortrait(W, H);
+  putRasters(W, H);
   struct Case {
     const char* name;
     std::function<void(EditParams&)> set;
@@ -1009,7 +1009,7 @@ void testTiles() {
     EngineSession es;
     Image8 whole;
     CHECK(exactRender(es, p, src, ExecMode::Whole, 0, whole));
-    for (int tile : {96, 256}) {
+    for (int tile : tileSizes) {
       Image8 t;
       std::size_t d = 0;
       CHECK(exactRender(es, p, src, ExecMode::TiledExport, tile, t));
@@ -1019,6 +1019,9 @@ void testTiles() {
     }
   }
 }
+void testTiles() { tilesImpl(800, 1000, {96, 256}); }
+// the same property on a small portrait (several tiles per side, the crop / flip and the local clarity halo): in the default run
+void testTilesSmall() { tilesImpl(240, 300, {64, 96}); }
 
 
 // ---- region (section 44) ----------------------------------------------------------------------------------------------------------
@@ -1230,7 +1233,7 @@ std::shared_ptr<engine::gpu::Context> gpuContext() {
   return ctx;
 }
 
-void testParity() {
+void parityImpl(const std::vector<std::pair<int, int>>& sizes, int exportTile) {
   auto ctx = gpuContext();
   struct Case {
     const char* name;
@@ -1260,7 +1263,7 @@ void testParity() {
       {"12 raster masks", [](EditParams& p) { p.local = twelveRasters(1200, 1500); }, false},
       {"12 raster masks interactive", [](EditParams& p) { p.local = twelveRasters(1200, 1500); }, true},
   };
-  for (const std::pair<int, int>& sz : {std::pair<int, int>{640, 800}, std::pair<int, int>{1200, 1500}}) {
+  for (const std::pair<int, int>& sz : sizes) {
     const SourceImage src = makePortrait(sz.first, sz.second);
     putRasters(sz.first, sz.second);
     dapple::gpu::Rig rig(ctx, src, cam());
@@ -1300,7 +1303,7 @@ void testParity() {
       std::string err;
       engine::GpuStats st;
       const bool ok = rig.exportTiled(
-          p, r, src, 0, 65, pass ? 192 : 4096, false, 0.f, [&](int w, int h) { ew = w, eh = h, dst.assign(std::size_t(w) * h * 4, 0); },
+          p, r, src, 0, 65, pass ? exportTile : 4096, false, 0.f, [&](int w, int h) { ew = w, eh = h, dst.assign(std::size_t(w) * h * 4, 0); },
           [&](int x0, int y0, int tw, int th, const std::uint8_t* px, std::size_t stride) {
             for (int j = 0; j < th; ++j) std::memcpy(&dst[(std::size_t(y0 + j) * ew + x0) * 4], px + std::size_t(j) * stride, std::size_t(tw) * 4);
             return true;
@@ -1315,20 +1318,21 @@ void testParity() {
       const int d = std::abs(int(a[i]) - int(b[i]));
       diff += d != 0, mx = std::max(mx, d);
     }
-    std::printf("  GPU tiled export (192 px tiles) vs one tile %dx%d: max code %d, differing bytes %zu\n", ew, eh, mx, diff);
+    std::printf("  GPU tiled export (%d px tiles) vs one tile %dx%d: max code %d, differing bytes %zu\n", exportTile, ew, eh, mx, diff);
     CHECK(mx <= 1);
   }
 }
+void testParity() { parityImpl({{640, 800}, {1200, 1500}}, 192); }
+// all the retouch operations, interactive and full, crop / flip, 12 raster masks, tiled export: GPU against CPU on one small portrait (default run)
+void testParitySmall() { parityImpl({{240, 300}}, 96); }
 #endif
 
 #ifdef DAPPLE_RETOUCH_GPU
 // GPU: the portrait retouch of a region source against the same pixels of the whole frame (both on the GPU executor)
-void testRegionGpu() {
+void regionGpuImpl(int W, int H, int x0, int y0, int x1, int y1, int margin) {
   auto ctx = gpuContext();
-  const int W = 800, H = 1000;
   const SourceImage src = makePortrait(W, H, true);
   putRasters(W, H);
-  const int x0 = 100, y0 = 200, x1 = 700, y1 = 900;
   SourceImage ws;
   ws.meta = src.meta, ws.sceneReferred = true;
   ws.linear = ImageF(x1 - x0, y1 - y0);
@@ -1355,18 +1359,20 @@ void testRegionGpu() {
   } else {
     int mx = 0;
     std::size_t over1 = 0, n = 0;
-    for (int y = 128; y < rh - 128; ++y)
-      for (int x = 128; x < rw - 128; ++x)
+    for (int y = margin; y < rh - margin; ++y)
+      for (int x = margin; x < rw - margin; ++x)
         for (int c = 0; c < 3; ++c) {
           const int e = std::abs(int(a[(std::size_t(y + y0) * gw + x + x0) * 4 + c]) - int(b[(std::size_t(y) * rw + x) * 4 + c]));
           mx = std::max(mx, e), over1 += e > 1, ++n;
         }
-    std::printf("  GPU retouch, window (%d,%d) %dx%d vs the whole frame, 128 px in: max code %d, over 1: %zu of %zu\n", x0, y0, rw, rh, mx, over1, n);
+    std::printf("  GPU retouch, window (%d,%d) %dx%d vs the whole frame, %d px in: max code %d, over 1: %zu of %zu\n", x0, y0, rw, rh, margin, mx, over1, n);
     CHECK(mx <= 2 && double(over1) <= 0.001 * double(n));
   }
   std::free(a);
   std::free(b);
 }
+void testRegionGpu() { regionGpuImpl(800, 1000, 100, 200, 700, 900, 128); }
+void testRegionGpuSmall() { regionGpuImpl(300, 380, 40, 70, 260, 330, 64); }
 #endif
 
 // ---- bench (not in ctest) ----------------------------------------------------------------------------------------------------------------
@@ -1462,10 +1468,10 @@ int main(int argc, char** argv) {
     void (*fn)();
   };
   const T tests[] = {{"json", testJson},   {"bands", testBands},       {"scale", testScale},       {"blobs", testBlobs},
-                     {"heal", testHeal},   {"whiten", testWhiten},     {"identity", testIdentity}, {"tiles", testTiles},
+                     {"heal", testHeal},   {"whiten", testWhiten},     {"identity", testIdentity}, {"tiles", testTiles}, {"tiles_small", testTilesSmall},
                      {"interactive", testInteractive}, {"undereye", testUnderEye}, {"rasters", testRasters}, {"complexion", testComplexion}, {"twoscales", testTwoScales}, {"rangesmooth", testRangeSmooth}, {"region", testRegion},
 #ifdef DAPPLE_RETOUCH_GPU
-                     {"parity", testParity}, {"regiongpu", testRegionGpu},
+                     {"parity", testParity}, {"regiongpu", testRegionGpu}, {"parity_small", testParitySmall}, {"regiongpu_small", testRegionGpuSmall},
 #endif
   };
   const std::string id = argc > 1 ? argv[1] : "";

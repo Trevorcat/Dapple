@@ -73,10 +73,10 @@
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Dapple reads the photos you choose to edit.</string>
+	<string>Dapple reads the photos you choose to edit, and the photos of a camera connected by cable.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Dapple saves your edited photos to the Photos library.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Dapple can take a RAW photo with the phone camera for testing.</string>
+	<string>Dapple takes RAW photos with the phone camera and reads photos from a camera connected by cable.</string>
 </dict>
 </plist>

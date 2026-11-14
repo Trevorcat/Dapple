@@ -369,8 +369,15 @@ std::vector<std::filesystem::path> allSampleFiles() {
   return v;
 }
 
-int testWireRegion() {
-  const auto files = sampleFiles();
+// The two smallest public files with a mosaic of each colour filter layout (a Bayer CR2 and an X-Trans RAF): the twins of the wire tests run on these alone
+std::vector<std::filesystem::path> smallSampleFiles() {
+  std::vector<std::filesystem::path> v;
+  for (const char* f : {"build/rawsamples/Canon/EOS-5D-Mark-IV/B13A0732.CR2", "build/rawsamples/Fujifilm/X-S10/Fujifilm-X-S10-compressed.RAF"})
+    if (std::filesystem::exists(f)) v.push_back(f);
+  return v;
+}
+
+int wireRegionImpl(const std::vector<std::filesystem::path>& files, int nRegions) {
   if (files.empty()) return 77;
   setEnvVar("DAPPLE_ANCHOR", "off");
   for (const auto& f : files) {
@@ -388,7 +395,7 @@ int testWireRegion() {
     long bad = 0, px = 0;
     unsigned seed = 11;
     auto rnd = [&](int n) { seed = seed * 1664525u + 1013904223u; return int((seed >> 8) % unsigned(std::max(1, n))); };
-    for (int k = 0; k < 6; ++k) {
+    for (int k = 0; k < nRegions; ++k) {
       const int w = 16 + rnd(900), h = 16 + rnd(700), x0 = k == 0 ? 0 : rnd(im.width - w), y0 = k == 1 ? im.height - h : rnd(im.height - h);
       auto reg = decodeRawRegion(f, x0, y0, x0 + w, y0 + h, {}, &why);
       CHECK(bool(reg), "region open failed: %s", why.c_str());
@@ -398,16 +405,18 @@ int testWireRegion() {
         for (int x = 0; x < w; ++x)
           for (int c = 0; c < 3; ++c) bad += reg->linear.row(y)[3 * x + c] != im.row(y0 + y)[3 * (x0 + x) + c], ++px;
     }
-    std::printf("  %s: 6 regions against the full open, %ld values, %ld differing\n", f.filename().string().c_str(), px, bad);
+    std::printf("  %s: %d regions against the full open, %ld values, %ld differing\n", f.filename().string().c_str(), nRegions, px, bad);
     CHECK(bad == 0, "a region differs from the same rectangle of the full open (%ld values)", bad);
   }
   return g_fail ? 1 : 0;
 }
+int testWireRegion() { return wireRegionImpl(sampleFiles(), 6); }
+// region opens against the full open on a Bayer and an X-Trans sample, first, last and random rectangles: in the default run
+int testWireRegionSmall() { return wireRegionImpl(smallSampleFiles(), 4); }
 
 // The half-resolution picture from the cached mosaic (block reduction) against LibRaw's half-size decode, both at 512 px: mean / p99 dE2000 at a viewing
 // exposure that puts the mean luminance at 0.18, over every public sample. Gate: mean <= 1.5 per file.
-int testWirePreview() {
-  const auto files = allSampleFiles();
+int wirePreviewImpl(const std::vector<std::filesystem::path>& files) {
   if (files.empty()) return 77;
   setEnvVar("DAPPLE_ANCHOR", "on");
   double worstMean = 0;
@@ -466,12 +475,13 @@ int testWirePreview() {
   std::printf("  worst mean dE2000 %.2f\n", worstMean);
   return g_fail ? 1 : 0;
 }
+int testWirePreview() { return wirePreviewImpl(allSampleFiles()); }
+int testWirePreviewSmall() { return wirePreviewImpl(smallSampleFiles()); }
 
 
 // The half-resolution X-Trans picture served for the 2x-view request against LibRaw's half-size decode, on every public X-Trans sample: gradient-energy sharpness
 // of the 3 x 3-blurred luminance >= 0.97 (X-T50) / 0.88 (X-S10 chart) and the low-frequency colour (4 x 4 block means, dE2000 at a viewing exposure) <= 2.0; exit 77 without sample files.
-int testHalfReal() {
-  const auto files = allSampleFiles();
+int halfRealImpl(const std::vector<std::filesystem::path>& files) {
   int ran = 0;
   setEnvVar("DAPPLE_ANCHOR", "off");
   for (const auto& f : files) {
@@ -527,13 +537,12 @@ int testHalfReal() {
   }
   return ran ? (g_fail ? 1 : 0) : 77;
 }
+int testHalfReal() { return halfRealImpl(allSampleFiles()); }
+// the half-resolution X-Trans picture against LibRaw's half-size decode on the one small X-Trans sample: in the default run
+int testHalfRealSmall() { return halfRealImpl(smallSampleFiles()); }
 
 // The anchor read from the embedded preview at 1/8 scale (DC coefficients) against the full decode of the preview: within 0.02 EV, same tier, on every sample
-int testWireAnchorFast() {
-  std::vector<std::filesystem::path> files;  // every public sample, at the half-size open (the anchor is the same code on every path)
-  if (std::filesystem::exists("build/rawsamples"))
-    for (const auto& e : std::filesystem::recursive_directory_iterator("build/rawsamples")) if (e.is_regular_file()) files.push_back(e.path());
-  std::sort(files.begin(), files.end());
+int wireAnchorFastImpl(std::vector<std::filesystem::path> files) {  // every public sample, at the half-size open (the anchor is the same code on every path)
   if (files.empty()) return 77;
   setEnvVar("DAPPLE_ANCHOR", "on");
   setEnvVar("DAPPLE_DEMOSAIC", "on");
@@ -569,9 +578,9 @@ int testWireAnchorFast() {
   std::printf("  worst difference %.4f EV\n", worst);
   return g_fail ? 1 : 0;
 }
+int testWireAnchorFast() { return wireAnchorFastImpl(allSampleFiles()); }
 
-int testWireAnchor() {
-  const auto files = allSampleFiles();
+int wireAnchorImpl(const std::vector<std::filesystem::path>& files) {
   if (files.empty()) return 77;
   setEnvVar("DAPPLE_ANCHOR", "on");
   double worst = 0;
@@ -605,6 +614,9 @@ int testWireAnchor() {
   std::printf("  worst difference %.4f EV\n", worst);
   return g_fail ? 1 : 0;
 }
+int testWireAnchor() { return wireAnchorImpl(allSampleFiles()); }
+// the anchor of the mosaic path against the RGB path on a small Bayer sample (the X-Trans RGB decode of LibRaw takes seconds: that stays in the heavy test): in the default run
+int testWireAnchorSmall() { const auto f = smallSampleFiles(); return wireAnchorImpl(std::vector<std::filesystem::path>(f.begin(), f.begin() + std::min<std::size_t>(1, f.size()))); }
 
 int testWireCache() {
   const auto files = sampleFiles();
@@ -652,9 +664,17 @@ int testWireCancel() {
   for (int attempt = 0; attempt < 3 && !(cancelledOnce && bestLatency < 800.0); ++attempt) {
     gen.store(1);
     std::atomic<std::int64_t> cancelAtNs{0};
+    unsigned long long hits0 = 0, miss0 = 0;
+    mosaicCacheCounters(&hits0, &miss0);
     const auto t0 = std::chrono::steady_clock::now();
     std::thread th([&] {
-      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      // wait for the open to have started (it looks the cached mosaic up first: the hit counter moves), not for a fixed time; give up after 2 s
+      for (const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(2); std::chrono::steady_clock::now() < dl;) {
+        unsigned long long h = 0, m = 0;
+        mosaicCacheCounters(&h, &m);
+        if (h > hits0) break;
+        std::this_thread::yield();
+      }
       cancelAtNs.store(std::chrono::steady_clock::now().time_since_epoch().count());
       gen.store(2);
     });
@@ -1163,6 +1183,10 @@ int main(int argc, char** argv) {
     else if (id == "half_flatclip") testHalfFlatClip();
     else if (id == "threads") testThreads();
     else if (id == "cache") testCache();
+    else if (id == "wire_region_small") { const int r = testWireRegionSmall(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "wire_preview_small") { const int r = testWirePreviewSmall(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "wire_anchor_small") { const int r = testWireAnchorSmall(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "half_real_small") { const int r = testHalfRealSmall(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_region") { const int r = testWireRegion(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_preview") { const int r = testWirePreview(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_anchor_fast") { const int r = testWireAnchorFast(); if (r == 77 && g_fail == before) return 77; }

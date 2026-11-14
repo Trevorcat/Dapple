@@ -240,7 +240,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
   // ------------------------------------------------------------ panel layers
 
   /// The controls are a permanent part of the layout (the fold layouts: workbench, column, below the fold): an open category is
-  /// the home, not a transient layer, so back never closes it, the film map is the home layer of 成像 and a tap on the photo does not
+  /// the home, not a transient layer, so back never closes it, a tap on the photo does not
   /// fold anything.
   bool controlsHome = false;
 
@@ -849,7 +849,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
     }
     if (itemised || _mapIsLayer) {
       itemised = false;
-      if (!controlsHome) filmMapOpen = false;
+      filmMapOpen = false;
       _bump();
       return true;
     }
@@ -869,8 +869,8 @@ class EditorController extends ChangeNotifier implements GestureSink {
   bool get hasTransient =>
       editingRow.value != null || local.hasCard || extra != null || itemised || _mapIsLayer || (wm.adjustMode && !controlsHome) || immersive.value;
 
-  /// The film map is a layer (back closes it) unless it is 成像's home layer.
-  bool get _mapIsLayer => filmMapOpen && !(controlsHome && openCat == PadCat.film);
+  /// The film map is a layer of 成像 in every layout (back closes it, choosing a stock returns to the pad).
+  bool get _mapIsLayer => filmMapOpen;
 
   bool get canPop => !hasTransient;
 

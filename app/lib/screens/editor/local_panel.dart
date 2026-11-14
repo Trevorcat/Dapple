@@ -1590,20 +1590,21 @@ class PortraitPanel extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // a group photo: the faces come first, so what the toast points at is in view on the shortest panel (the chips scroll)
+                    if (faces.length > 1 && selChip != null) ...[
+                      Row(
+                        children: [
+                          for (final f in faces) ...[_FaceThumb(lc: lc, face: f, on: lc.selFaces.contains(f.n)), const SizedBox(width: Sp.xs)],
+                        ],
+                      ),
+                      const SizedBox(height: Sp.s),
+                    ],
                     for (final g in kPortraitGroups)
                       if (g.$2.any(chips.contains)) ...[
                         if (g.$1 != kPortraitGroups.first.$1) const SizedBox(height: gap),
                         SizedBox(height: kGroupTitleH, child: Text(g.$1, key: ValueKey('portrait-group-${g.$1}'), style: T.cap(c.text2, w: FontWeight.w500))),
                         Wrap(spacing: gap, runSpacing: gap, children: [for (final pc in g.$2) if (chips.contains(pc)) chip(pc, w, h)]),
                       ],
-                    if (faces.length > 1 && selChip != null) ...[
-                      const SizedBox(height: Sp.s),
-                      Row(
-                        children: [
-                          for (final f in faces) ...[_FaceThumb(lc: lc, face: f, on: lc.selFaces.contains(f.n)), const SizedBox(width: Sp.xs)],
-                        ],
-                      ),
-                    ],
                   ],
                 ),
               );

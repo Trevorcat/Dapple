@@ -46,6 +46,9 @@ extension PadCatX on PadCat {
       };
 }
 
+/// One character for an edge word, shown beside the edge icon (暗 / 亮, 冷 / 暖, 淡 / 浓, 柔 / 锐, 低 / 高 for contrast, 净 / 粒).
+String edgeChar(String word) => const {'反差低': '低', '反差高': '高', '干净': '净', '颗粒': '粒', '通透': '透'}[word] ?? word.substring(0, 1);
+
 /// The line icons of the pad edges (one vocabulary everywhere; drawn by pad_icons.dart).
 enum PadIconKind { moon, sun, contrastLow, contrastHigh, cold, warm, pale, rich, soft, sharp, clean, grain, hazy, clear }
 

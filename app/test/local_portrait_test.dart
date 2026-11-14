@@ -2,6 +2,8 @@
 // the default set in one undo step, the chips (add, select, remove), the strip, 分项, 点一下祛斑, 对比, several faces, re-analysis and the
 // layout across window shapes. The AI service is the fully controllable [FakeLocalAi] of local_ai_test.dart.
 import 'dart:convert';
+import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:dapple/editor/fold_layout.dart' show debugFoldLayouts;
 import 'package:dapple/model/local_adjust.dart';
@@ -11,6 +13,7 @@ import 'package:dapple/screens/editor/local_controller.dart' show LocalBody;
 import 'package:dapple/screens/editor/local_panel.dart' show LocalToolStrip;
 import 'package:dapple/services/local_ai.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'editor_v2_test.dart' show Finger, n5Dpr, n5Phys, phoneDpr, phonePhys, settle;
@@ -68,6 +71,7 @@ List<String> ids(Rig r) => [for (final a in r.local.items) a.id];
 LocalAdjustment byId(Rig r, String id) => r.local.byId(id)!;
 
 void main() {
+  groupAffordanceTests();
   // these tests are about the ordinary panel placement (side pane on a wide window); the fold layouts have their own tests (fold_layout_test.dart)
   setUp(() => debugFoldLayouts = false);
   tearDown(() => debugFoldLayouts = true);
@@ -488,7 +492,7 @@ void main() {
     testWidgets('two faces with open mouths: everything fits, so every chip is on for both faces and there is no narrowing toast', (t) async {
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult(faces: 2), faces: 2);
-      expect(r.app.toast?.message, isNot(kGroupMainOnly));
+      expect(r.app.toast?.message, isNot(contains('点面板里的脸')));
       for (final c in [PortraitChip.skin, PortraitChip.undereye, PortraitChip.shine, PortraitChip.teeth, PortraitChip.eyes, PortraitChip.lips]) {
         expect(r.lc.chipOn(c), isTrue, reason: '$c');
       }
@@ -508,7 +512,7 @@ void main() {
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult(faces: 3), faces: 3);
       expect(r.local.rasterPlanes, lessThanOrEqualTo(kMaxRasterComponents));
-      expect(r.app.toast?.message, kGroupMainOnly);
+      expect(r.app.toast?.message, groupToast(r.lc.selFaces.length));
       expect(r.app.toast?.message, isNot(contains('12')));
       for (final c in [PortraitChip.skin, PortraitChip.undereye, PortraitChip.shine, PortraitChip.teeth, PortraitChip.eyes, PortraitChip.lips]) {
         expect(r.lc.chipOn(c), isTrue, reason: '$c');
@@ -701,4 +705,28 @@ void main() {
       expect(t.takeException(), isNull);
     });
   });
+}
+
+// 6: the group toast points at "the faces below": they must be on screen when the toast shows.
+void groupAffordanceTests() {
+  for (final (name, w, h) in [('375x667', 375.0, 667.0), ('414x896', 414.0, 896.0)]) {
+    testWidgets('$name three faces: the toast says what happened and the face row it points to is on screen', (t) async {
+      const dpr = 3.0;
+      final fake = FakeLocalAi();
+      final r = await openPortrait(t, fake, portraitResult(faces: 3), phys: Size(w * dpr, h * dpr), dpr: dpr, faces: 3);
+      expect(r.app.toast?.message, groupToast(r.lc.selFaces.length));
+      await t.runAsync(() async {
+        final b = t.renderObject<RenderRepaintBoundary>(find.byType(RepaintBoundary).first);
+        final img = await b.toImage(pixelRatio: 1.5);
+        final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
+        File('build/local-fit/group-$name.png')..parent.createSync(recursive: true)..writeAsBytesSync(bytes!.buffer.asUint8List());
+      });
+      for (final n in [1, 2, 3]) {
+        final f = find.byKey(ValueKey('face-$n'));
+        expect(f, findsOneWidget, reason: 'face $n');
+        expect(f.hitTestable(), findsOneWidget, reason: 'face $n is reachable');
+        expect(t.getRect(f).bottom, lessThanOrEqualTo(h));
+      }
+    });
+  }
 }

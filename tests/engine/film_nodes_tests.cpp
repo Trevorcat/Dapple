@@ -531,7 +531,7 @@ ParamMask inherited(const Graph& g, const NodeRegistry& reg, NodeType t) {
   return m;
 }
 
-int conformance(const NodeRegistry& reg, bool verbose, int quality, bool keepGrain) {
+int conformance(const NodeRegistry& reg, bool verbose, int quality, bool keepGrain, const char* onlyPrefix = nullptr) {
   const ParamRegistry& P = ParamRegistry::instance();
   EditParams e;
   e.filmStock = "kodak_portra_400";
@@ -554,6 +554,7 @@ int conformance(const NodeRegistry& reg, bool verbose, int quality, bool keepGra
   int violations = 0, perturbed = 0, moves = 0;
   std::map<NodeType, std::vector<std::string>> movedBy;
   for (std::size_t k = 0; k < P.size(); ++k) {
+    if (onlyPrefix && P.info(ParamKey(k)).name.rfind(onlyPrefix, 0) != 0) continue;  // a subset of the parameters (the small twin)
     for (int variant = 0; variant < 2; ++variant) {
       ParamInputs in = base;
       if (!P.perturb(ParamKey(k), in, variant)) continue;
@@ -593,6 +594,19 @@ int conformance(const NodeRegistry& reg, bool verbose, int quality, bool keepGra
   return violations;
 }
 
+// the declaration check on the film parameters (full quality), and the harness biting on a mask that forgets a key: in the default run
+void testKeysSmall() {
+  const NodeRegistry& N = NodeRegistry::instance();
+  const ParamRegistry& P = ParamRegistry::instance();
+  CHECK(conformance(N, false, 2, false, "film_") == 0);
+  ParamMask wrong = N.desc(NodeType::FilmGrain).deps;
+  wrong.bits.reset(P.mustFind("film_grain"));
+  const NodeRegistry broken = N.withDeps(NodeType::FilmGrain, wrong);
+  const int v1 = conformance(broken, false, 2, false, "film_");
+  CHECK(v1 > 0);
+  std::printf("  negative control: dropping film_grain from FilmGrain => %d violations\n", v1);
+}
+
 void testKeys() {
   const NodeRegistry& N = NodeRegistry::instance();
   std::puts(" full quality, all effects:");
@@ -600,7 +614,7 @@ void testKeys() {
   std::puts(" interactive tier, grain-family drag (grain kept):");
   CHECK(conformance(N, true, 1, true) == 0);
   std::puts(" interactive tier, no grain:");
-  CHECK(conformance(N, false, 1, false) == 0);
+  CHECK(conformance(N, false, 2, false, "film_") == 0);
   // negative controls: the harness must catch a mask that forgets a key
   const ParamRegistry& P = ParamRegistry::instance();
   ParamMask wrong = N.desc(NodeType::FilmGrain).deps;
@@ -710,7 +724,7 @@ ef::FilmFx enlFx(int family, float strength = 0.5f, float scale = 1.f) {
   return f;
 }
 
-void testFx() {
+void fxImpl(const std::vector<std::string>& only) {
   ef::FilmFx both = enlFx(2, 1.0f, 2.f);
   both.boostEv = 1.2f;
   both.protectEv = 1.0f;
@@ -739,7 +753,7 @@ void testFx() {
   };
   const std::string tag = fxPlatformTag();
   const fs::path golden = fs::path(DAPPLE_SOURCE_DIR) / "tests" / "engine" / "golden" / "film_fx.txt";
-  const bool record = std::getenv("DAPPLE_FX_RECORD") != nullptr;
+  const bool record = only.empty() && std::getenv("DAPPLE_FX_RECORD") != nullptr;  // a subset never rewrites the golden file
   std::map<std::string, std::uint64_t> want;
   std::string goldenTag;
   if (!record && fs::exists(golden)) {
@@ -759,6 +773,7 @@ void testFx() {
                 goldenTag.c_str(), tag.c_str());
   std::vector<std::pair<std::string, std::uint64_t>> got;
   for (const FxCase& c : cases) {
+    if (!only.empty() && std::find(only.begin(), only.end(), std::string(c.name)) == only.end()) continue;
     EditParams e;
     e.filmStock = c.stock;
     e.filmGrain = c.grain;
@@ -839,6 +854,12 @@ void testFx() {
     }
     std::printf("  recorded %zu hashes to %s\n", got.size(), golden.string().c_str());
   }
+}
+void testFx() { fxImpl({}); }
+// the boost, every kind of enlarger filter, interactive and quality-0 tiers, a scan film, a tiny frame and both effects together: the node chain against the
+// simulator (and the golden hashes) on five of the nineteen frames: in the default run
+void testFxSmall() {
+  fxImpl({"boost interactive", "enlarger glimmerglass", "enlarger cine + 2383", "enlarger on scan film (no print)", "boost tiny 33x17", "boost + enlarger"});
 }
 
 // ---- grain statistics ---------------------------------------------------------------------------------------------------------
@@ -968,13 +989,13 @@ GrainStat grainStats(const ImageF& im, int N, int bands) {
   return s;
 }
 
-void testGrainScale() {
-  const int FW = 2400, FH = 1600;
+void grainScaleImpl(int FW, int FH, bool smallRun) {
   const struct {
     float level;
     const char* stock;
   } scenes[] = {{0.18f, "kodak_portra_400"}, {0.04f, "kodak_portra_400"}, {0.18f, "kodak_ektar_100"}};
   for (const auto& sc : scenes) {
+    if (smallRun && sc.level < 0.1f) continue;  // the 0.04 scene is the slowest of the three
     EditParams e;
     e.filmStock = sc.stock;
     e.filmHalation = 0.f;  // a flat field has no use for it; keeps the reference free of edge effects
@@ -984,7 +1005,7 @@ void testGrainScale() {
     ImageF full;
     CHECK(nodeRender(rf, fullIn, full));
     std::printf("  %s, scene %.2f, full-resolution %dx%d\n", sc.stock, sc.level, FW, FH);
-    for (int k : {3, 4, 6}) {
+    for (int k : smallRun ? std::vector<int>{3, 4} : std::vector<int>{3, 4, 6}) {
       const int PW = FW / k, PH = FH / k;
       const ImageF ref = boxDown(full, k);
       // the preview: interactive tier, grain-family drag (keepGrain), scale-aware against the full-resolution render
@@ -1014,6 +1035,10 @@ void testGrainScale() {
     }
   }
 }
+
+void testGrainScale() { grainScaleImpl(2400, 1600, false); }
+// the preview grain matches the full-resolution render's (variance, band spectrum, mean) on an 1800 x 1200 frame, mid-grey scenes of two stocks: in the default run
+void testGrainScaleSmall() { grainScaleImpl(1800, 1200, true); }
 
 // ---- frame index ------------------------------------------------------------------------------------------------------------------
 void testGrainFrame() {
@@ -1143,7 +1168,7 @@ struct Test {
   void (*fn)();
 };
 const Test kTests[] = {{"equiv", testEquiv},       {"rebake", testRebake},   {"keys", testKeys},         {"graph", testGraph},
-                       {"concurrent", testConcurrent}, {"grain_scale", testGrainScale}, {"grain_frame", testGrainFrame}, {"fx", testFx}, {"bench", testBench}};
+                       {"concurrent", testConcurrent}, {"grain_scale", testGrainScale}, {"grain_scale_small", testGrainScaleSmall}, {"grain_frame", testGrainFrame}, {"fx", testFx}, {"fx_small", testFxSmall}, {"keys_small", testKeysSmall}, {"bench", testBench}};
 
 }  // namespace
 

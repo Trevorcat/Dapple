@@ -253,6 +253,7 @@ class EditorEngine extends ChangeNotifier {
       }
       _releaseMs = _clock.elapsedMilliseconds;
       PerfProbe.dragging = false;
+      PerfProbe.log('release', {'zoom': _zoom, 'final': finalLongEdge, 'needFinal': _needFinal});
       if (quality.endDrag()) PerfProbe.log('rung', {'to': quality.rung.toString(), 'ema': quality.emaMs, 'at': 'drag end'});
       DappleBindings.instanceOrNull?.setInteraction?.call(0);
       _scheduleFinal(delay: releaseDelay);
@@ -286,6 +287,7 @@ class EditorEngine extends ChangeNotifier {
       if (_drag > 0 || !live) return;
       _needFinal = false;
       _dirty = true;
+      PerfProbe.log('final_req', {'sinceRelease': _releaseMs >= 0 ? _clock.elapsedMilliseconds - _releaseMs : -1, 'busy': _busy, 'gpuInFlight': _gpuInFlight});
       _kick();
     });
   }
@@ -723,8 +725,11 @@ class EditorEngine extends ChangeNotifier {
             'present': e.presentMs,
             'lat': e.latencyMs,
             'w': e.width,
+            'h': e.height,
             'first': firstLive,
+            if (!interactive && _releaseMs >= 0) 'rel2final': _clock.elapsedMilliseconds - _releaseMs,
           });
+          if (!interactive) _releaseMs = -1;
         }
         if (an != null || firstLive || !interactive) notifyListeners();
         if (!interactive && !_gpuInFlight && !_dirty) _gpuIdleTail();
@@ -866,8 +871,12 @@ class EditorEngine extends ChangeNotifier {
   Future<void> _renderDetail() async {
     final ph = photo;
     final img = image;
-    if (ph == null || img == null || !live || _zoom <= detailMinZoom || _fullWidthPx <= 0) return;
+    if (ph == null || img == null || !live || _zoom <= detailMinZoom || _fullWidthPx <= 0) {
+      PerfProbe.log('detail_skip', {'img': img != null, 'zoom': _zoom, 'fw': _fullWidthPx});
+      return;
+    }
     if (_busy || _dirty || _interactiveNow || _gpuInFlight) {
+      PerfProbe.log('detail_wait', {'busy': _busy, 'dirty': _dirty, 'inter': _interactiveNow, 'gpu': _gpuInFlight});
       _scheduleDetail(); // edits in flight: try again once the view is still
       return;
     }
@@ -893,6 +902,8 @@ class EditorEngine extends ChangeNotifier {
     final out = math.min(math.max(wPx, hPx), math.min(2800.0, srcCap)).round().clamp(256, 2800);
     final gen = ++_detailGen, myGen = _gen, version = _viewVersion;
     _detailBusy = true;
+    final dt0 = _clock.elapsedMilliseconds;
+    PerfProbe.log('detail_start', {'zoom': _zoom, 'out': out, 'region': [region.left, region.top, region.right, region.bottom]});
     try {
       // True resolution first (RAW files): the visible rectangle at the picture's native pixels, one region at a time. Only for edits that act on pixels
       // alone: crop / rotate / flip / straighten / vignette refer to the whole picture, so they keep the half-resolution detail session below.
@@ -916,6 +927,7 @@ class EditorEngine extends ChangeNotifier {
             im.dispose();
             return;
           }
+          PerfProbe.log('detail_done', {'kind': 'region', 'ms': _clock.elapsedMilliseconds - dt0, 'w': im.width, 'h': im.height});
           debugPrint('dapple detail: 1:1 region ${r.width.toStringAsFixed(3)} x ${r.height.toStringAsFixed(3)} of the picture, zoom ${_zoom.toStringAsFixed(1)}');
           detail?.dispose();
           detail = im;
@@ -938,6 +950,7 @@ class EditorEngine extends ChangeNotifier {
         im.dispose();
         return;
       }
+      PerfProbe.log('detail_done', {'kind': 'half', 'ms': _clock.elapsedMilliseconds - dt0, 'w': im.width, 'h': im.height});
       detail?.dispose();
       detail = im;
       detailRect = region;

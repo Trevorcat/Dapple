@@ -203,13 +203,13 @@ void testWhole() {
 }
 
 // ---- tiles: tile invariance + halo conformance -----------------------------------------------------------------------------
-void testTiles() {
-  const SourceImage small = makeScene(701, 523);  // sizes that are not multiples of the tile or of 4
+void tilesImpl(bool smallRun) {
+  const SourceImage small = smallRun ? makeScene(211, 157) : makeScene(701, 523);  // sizes that are not multiples of the tile or of 4
   EngineSession es;
   for (const Case& c : cases()) {
     Image8 whole;
     CHECK(exactRender(es, c.p, small, ExecMode::Whole, 0, whole));
-    for (int tile : {64, 128, 192}) {
+    for (int tile : smallRun ? std::vector<int>{48, 80} : std::vector<int>{64, 128, 192}) {
       Image8 t;
       ExecStats st;
       EngineSession esT;  // fresh cache: the frame-global solves are accumulated tile by tile (a shared cache would hold the Whole run's)
@@ -229,8 +229,8 @@ void testTiles() {
       CHECK(m.maxCode <= 1);
     }
   }
-  // a larger radii scale (a 3.4 MP frame: scale 1.1 -> halos of tens of pixels), all stages together
-  const SourceImage big = makeScene(2301, 1499, true, 9);
+  // a larger radii scale (a 3.4 MP frame: scale 1.1 -> halos of tens of pixels), all stages together; the small run uses a 0.9 MP frame
+  const SourceImage big = smallRun ? makeScene(1101, 799, true, 9) : makeScene(2301, 1499, true, 9);
   EditParams p = cases().back().p;
   p.rotate = 0;
   Image8 whole, t;
@@ -250,6 +250,9 @@ void testTiles() {
   CHECK(exactRender(es, q, big, ExecMode::TiledExport, 256, t2));
   CHECK(w2.data == t2.data);
 }
+void testTiles() { tilesImpl(false); }
+// tile invariance and halo conformance of every stage on a small frame (several tiles each side, sizes off the tile grid): in the default run
+void testTilesSmall() { tilesImpl(true); }
 
 // ---- plan ----------------------------------------------------------------------------------------------------------------------
 Graph graphFor(const EditParams& p, const SourceImage& src, bool exact, FrameKernels** fkOut, std::unique_ptr<FrameKernels>& hold,
@@ -516,7 +519,7 @@ int main(int argc, char** argv) {
     const char* id;
     void (*fn)();
   };
-  const T tests[] = {{"whole", testWhole}, {"tiles", testTiles}, {"plan", testPlan}, {"cancel", testCancel}, {"analysis", testAnalysis}, {"bench", testBench}, {"export60", testExport60}};
+  const T tests[] = {{"whole", testWhole}, {"tiles", testTiles}, {"tiles_small", testTilesSmall}, {"plan", testPlan}, {"cancel", testCancel}, {"analysis", testAnalysis}, {"bench", testBench}, {"export60", testExport60}};
   if (argc >= 2 && std::string(argv[1]) == "--list") {
     for (const T& t : tests) std::printf("%s\n", t.id);
     return 0;

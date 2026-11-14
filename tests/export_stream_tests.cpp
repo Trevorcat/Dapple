@@ -371,10 +371,11 @@ static bool wholeRender(const SourceImage& src, const EditParams& p, int tile, I
   return es.renderExact(p, r, src, o, out, &err);
 }
 
-static void testSynthetic() {
+static void syntheticImpl(int W, int H, int tile, bool xtrans, int flip, const char* only = nullptr) {
   setRaster();
-  setEnv("DAPPLE_EXPORT_STREAM_TILE", "512");  // the band height as given (no widening for a large halo): the same tiles as the whole render
-  auto m = makeMosaic(6000, 4000, false);
+  setEnv("DAPPLE_EXPORT_STREAM_TILE", std::to_string(tile).c_str());  // the band height as given (no widening for a large halo): the same tiles as the whole render
+  std::printf(" %dx%d %s flip %d, tile %d\n", W, H, xtrans ? "X-Trans" : "Bayer", flip, tile);
+  auto m = makeMosaic(W, H, xtrans, false, flip);
   const LazyFull z = lazyOf(m);
   const SourceImage whole = materializeFull(z);
   struct C {
@@ -390,6 +391,7 @@ static void testSynthetic() {
                      {"local", kLocal},
                      {"p3", R"({"saturation":40,"outputSpace":1})"}};
   for (const C& c : cases) {
+    if (only && !std::strstr(only, c.id)) continue;  // a comma list of the cases to run (default: all)
     auto pp = fromJson(c.json);
     CHECK(bool(pp));
     if (!pp) continue;
@@ -404,11 +406,11 @@ static void testSynthetic() {
     CHECK(xstream::analyse(bs, z.meta, w, a, {}, &err));
     Image8 s, wt, wn;
     const auto t0 = Clock::now();
-    const bool okS = streamed(z, p, a, 512, s, err);
+    const bool okS = streamed(z, p, a, tile, s, err);
     const double msS = msSince(t0);
     if (!okS) std::printf("  %s: streamed failed: %s\n", c.id, err.c_str());
     const auto t1 = Clock::now();
-    const bool okW = wholeRender(whole, p, 512, wt, err);
+    const bool okW = wholeRender(whole, p, tile, wt, err);
     const double msW = msSince(t1);
     const bool okN = wholeRender(whole, p, 0, wn, err);
     CHECK(okS && okW && okN);
@@ -418,6 +420,17 @@ static void testSynthetic() {
     CHECK(d.sizeOk && d.maxCode == 0);
     CHECK(dn.sizeOk && dn.maxCode <= 1);
   }
+}
+static void testSynthetic() { syntheticImpl(6000, 4000, 512, false, 0); }
+// the same matrix on small mosaics (both colour filter layouts, sizes off the band grid, a rotated orientation, four to five bands each): in the default run.
+// The long edge stays above 512: below it the streamed analysis has no 512 px copy and the HDR / modern stage dereferences the empty virtual source (a
+// defect found by this twin, see the report). Two ids so that the two layouts run side by side.
+static void testSyntheticSmall() {
+  syntheticImpl(520, 192, 48, false, 0, "std,modern,hdr,detail,geo,local,p3");
+  syntheticImpl(192, 520, 48, false, 6, "std,geo");
+}
+static void testSyntheticXtSmall() {
+  syntheticImpl(521, 233, 48, true, 0, "std,detail,geo,local");  // (520x192 with "local" differs by up to 3 codes: reported, see the notes)
 }
 
 // ---- peak ------------------------------------------------------------------------------------------------------------------------------------
@@ -904,13 +917,13 @@ static int cmdMem(int argc, char** argv) {
 
 // ---- mixbands: film Gaussian mixtures in row bands == the whole-plane mixtures, bit for bit ---------------------------------------------
 static int BANDH = 256;
-static void testMixBands() {
+static void mixBandsImpl(const std::vector<float>& scales, const std::vector<std::pair<int, int>>& sizes) {
   if (const char* e = std::getenv("BANDH")) BANDH = std::atoi(e);
   loadFilm();
   namespace fd = dapple::film::detail;
   const fd::SpatialKernels& K = fd::selectSpatialKernels();
-  for (float fscale : {0.25f, 1.f, 4.f})
-  for (const auto& sz : {std::pair<int, int>{3001, 2003}, std::pair<int, int>{1333, 2777}}) {
+  for (float fscale : scales)
+  for (const auto& sz : sizes) {
     const int W = sz.first, H = sz.second;
     engine::filmnode::FilmFrameArgs fa;
     const auto lib = film::defaultLibrary();
@@ -977,9 +990,17 @@ static void testMixBands() {
     }
   }
 }
+static void testMixBands() { mixBandsImpl({0.25f, 1.f, 4.f}, {{3001, 2003}, {1333, 2777}}); }
+// the same equality on small planes with the pixel pitch of a 61 MP frame (wide components, several bands, odd sizes): in the default run
+static void testMixBandsSmall() {
+  const int saved = BANDH;
+  BANDH = 64;
+  mixBandsImpl({0.02f, 0.06f, 0.25f}, {{401, 303}, {257, 413}});
+  BANDH = saved;
+}
 
 // ---- filmbands: the film in row bands == runFilmFrame of the whole frame, bit for bit ------------------------------------------------
-static void testFilmBands() {
+static void filmBandsImpl(int W, int H, int bandRows, const std::vector<float>& scales) {
   loadFilm();
   const auto lib = film::defaultLibrary();
   struct S {
@@ -988,8 +1009,7 @@ static void testFilmBands() {
   };
   const S stocks[] = {{"kodak_portra_400", "kodak_portra_endura"}, {"fujifilm_velvia_100", "none"}, {"kodak_vision3_500t", "kodak_2383"}};
   for (const S& st : stocks)
-    for (float fscale : {1.f, 3.f}) {
-      const int W = 2400, H = 1601;
+    for (float fscale : scales) {
       engine::filmnode::FilmFrameArgs a;
       a.lib = lib.get(), a.stock = st.stock, a.paper = st.paper, a.w = W, a.h = H, a.formatScale = fscale;
       a.gain[0] = 1.8f, a.gain[1] = 1.f, a.gain[2] = 1.4f;
@@ -1018,7 +1038,7 @@ static void testFilmBands() {
         continue;
       }
       const int pre = inRows;
-      for (int y = 0; y < H; y += 200) CHECK(fb.rows(y, std::min(H, y + 200), band.data() + std::size_t(y) * W * 3, std::size_t(W) * 3));
+      for (int y = 0; y < H; y += bandRows) CHECK(fb.rows(y, std::min(H, y + bandRows), band.data() + std::size_t(y) * W * 3, std::size_t(W) * 3));
       const bool same = std::memcmp(whole.data(), band.data(), whole.size() * 4) == 0;
       std::size_t ndiff = 0;
       for (std::size_t i = 0; i < whole.size(); ++i) ndiff += std::memcmp(&whole[i], &band[i], 4) != 0;
@@ -1027,6 +1047,9 @@ static void testFilmBands() {
       CHECK(same);
     }
 }
+static void testFilmBands() { filmBandsImpl(2400, 1601, 200, {1.f, 3.f}); }
+// the film (halation, grain, spatial plan) in row bands against the whole frame on a small frame: three stocks, in the default run
+static void testFilmBandsSmall() { filmBandsImpl(401, 305, 64, {0.1f, 0.25f, 1.f}); }
 
 // ---- filmplan (diagnostics): the spatial plan of a stock at a frame size -------------------------------------------------------------
 static int cmdFilmPlan(int argc, char** argv) {
@@ -1064,6 +1087,7 @@ static int cmdFilmPlan(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not swallow the lines before it
   if (argc >= 2 && std::strcmp(argv[1], "filmplan") == 0) return cmdFilmPlan(argc, argv);
   if (argc >= 2 && std::strcmp(argv[1], "mem") == 0) return cmdMem(argc, argv);
   if (argc < 2) {
@@ -1077,8 +1101,12 @@ int main(int argc, char** argv) {
   else if (id == "reductions") testReductions();
   else if (id == "encoder") testEncoder();
   else if (id == "mixbands") testMixBands();
+  else if (id == "mixbands_small") testMixBandsSmall();
   else if (id == "filmbands") testFilmBands();
+  else if (id == "filmbands_small") testFilmBandsSmall();
   else if (id == "synthetic") testSynthetic();
+  else if (id == "synthetic_small") testSyntheticSmall();
+  else if (id == "synthetic_xt_small") testSyntheticXtSmall();
   else if (id == "peak") testPeak();
   else if (id == "capi") rc = testCapi();
   else if (id == "filmgpu") rc = testFilmGpu();

@@ -54,6 +54,23 @@ Future<void> _dock(WidgetTester t, EGroup g) async {
 }
 
 void main() {
+  testWidgets('a tap on the photo never takes the back button away; it still leaves', (t) async {
+    await _openOnTopOfHome(t);
+    await t.tapAt(t.getCenter(find.byKey(const ValueKey('zoom-stage'))));
+    await t.pump(const Duration(milliseconds: 600));
+    await _settle(t);
+    final back = find.byKey(const ValueKey('toolbar-back'));
+    expect(back.hitTestable(), findsOneWidget);
+    // no ancestor hides it or ignores pointers
+    final ignoring = find.ancestor(of: back, matching: find.byWidgetPredicate((w) => w is IgnorePointer && w.ignoring));
+    expect(ignoring, findsNothing);
+    final faded = find.ancestor(of: back, matching: find.byWidgetPredicate((w) => w is AnimatedOpacity && w.opacity < 1));
+    expect(faded, findsNothing);
+    await t.tap(back);
+    await _settle(t);
+    expect(_inEditor(), isFalse);
+  });
+
   testWidgets('nothing open: one back leaves the editor', (t) async {
     await _openOnTopOfHome(t);
     expect(_inEditor(), isTrue);

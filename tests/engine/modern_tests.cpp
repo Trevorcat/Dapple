@@ -665,7 +665,7 @@ std::shared_ptr<engine::gpu::Context> gpuContext() {
   return ctx;
 }
 
-void testParity() {
+void parityImpl(const std::vector<std::pair<int, int>>& sizes) {
   auto ctx = gpuContext();
   struct Case {
     const char* name;
@@ -680,7 +680,7 @@ void testParity() {
       {"clean + crop, vignette, NR, sharpen", [](EditParams& p) { p.filmStock = "modern_clean"; p.crop = "4:5"; p.vignette = -20.f; p.nrLuma = 20.f; p.sharpen = 50.f; }, false},
       {"vivid interactive", [](EditParams& p) { p.filmStock = "modern_vivid"; }, true},
   };
-  for (const std::pair<int, int>& sz : {std::pair<int, int>{640, 448}, std::pair<int, int>{1536, 1024}}) {
+  for (const std::pair<int, int>& sz : sizes) {
     const SourceImage src = makeScene(sz.first, sz.second);
     dapple::gpu::Rig rig(ctx, src, cam());
     EngineSession cpuEs;
@@ -715,6 +715,10 @@ void testParity() {
     }
   }
 }
+
+void testParity() { parityImpl({{640, 448}, {1536, 1024}}); }
+// the three modern looks, strength, look, geometry and detail stages, interactive: GPU against CPU on one small frame (default run)
+void testParitySmall() { parityImpl({{320, 224}}); }
 
 double medianGpuMs(dapple::gpu::Rig& rig, const EditParams& p, const SourceImage& src, const FastOptions& fo, int& w, int& h) {
   std::vector<double> v;
@@ -810,7 +814,7 @@ int main(int argc, char** argv) {
                      {"highkey", testHighKey}, {"lowkey", testLowKey}, {"gap", testGap}, {"midgrey", testMidGrey},   {"hue", testHue},         {"skin", testSkin},   {"monotonic", testMonotonic}, {"tiles", testTiles},
                      {"cpubench", testCpuBench},
 #ifdef DAPPLE_MODERN_GPU
-                     {"parity", testParity},     {"bench", testBench},
+                     {"parity", testParity}, {"parity_small", testParitySmall},     {"bench", testBench},
 #endif
   };
   bool ran = false;

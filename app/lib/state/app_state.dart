@@ -31,6 +31,7 @@ import '../services/usb_ingest.dart';
 import '../services/ingest.dart';
 import '../services/ingest_log.dart';
 import '../services/live_bridge.dart';
+import '../services/merge_check.dart';
 import '../services/merge_engine.dart';
 import '../services/session_cache.dart';
 import '../services/memory_policy.dart';
@@ -87,6 +88,17 @@ class AppState extends ChangeNotifier {
   late final Directory merged;
   late final Directory liveDir;
   late final SharedPreferences _prefs;
+
+  /// The first-use hint on the pads (one line, "can be dragged") has been touched away once on this install. The demo has none.
+  late bool padHintSeen = isDemo;
+  void markPadHintSeen() {
+    padHintSeen = true;
+    if (isDemo) return;
+    try {
+      unawaited(_prefs.setBool('padHintSeen', true));
+    } catch (_) {}
+  }
+
 
   final Map<String, Photo> _photos = {};
   AppSettings settings = AppSettings();
@@ -194,6 +206,8 @@ class AppState extends ChangeNotifier {
   MediaAccess mediaAccess = MediaAccess.full;
   bool get mediaLimited => mediaPermitted && mediaAccess == MediaAccess.limited;
   bool get mediaBlocked => !mediaPermitted && mediaAccess == MediaAccess.blocked;
+  /// iOS "仅添加": saving works, reading does not. Not a refusal: the way forward is the system Settings, the line says what is allowed.
+  bool get mediaAddOnly => !mediaPermitted && mediaAccess == MediaAccess.addOnly;
 
   /// True once a library scan has finished since the app started (the empty state must not claim "no new photos" before that).
   bool scanDone = false;
@@ -339,7 +353,7 @@ class AppState extends ChangeNotifier {
   String get connLine {
     if (usbCardActive) return usb.cardLine;
     // the action says what to do (允许访问 / 打开设置): the line only states what happened, or nothing (audit C)
-    if (needsMediaPermission) return mediaBlocked ? '已被系统拒绝' : '';
+    if (needsMediaPermission) return mediaBlocked ? '已被系统拒绝' : (mediaAddOnly ? '只能存入照片，读不到相册' : '');
     switch (connState) {
       case ConnState.disconnected:
         return '最后收到第 ${_photos.length} 张';
@@ -365,7 +379,7 @@ class AppState extends ChangeNotifier {
   /// Label of the card's action button or null.
   String? get connAction {
     if (usbCardActive) return usb.cardAction;
-    if (needsMediaPermission) return mediaBlocked ? '打开设置' : '允许访问';
+    if (needsMediaPermission) return mediaBlocked || mediaAddOnly ? '打开设置' : '允许访问';
     switch (connState) {
       case ConnState.interrupted:
         return '重试';
@@ -400,7 +414,7 @@ class AppState extends ChangeNotifier {
           // Wireless transfer works (camera FTP ingest, see the settings section): only the gallery permission can be (re)granted here.
           if (!mediaPermitted) {
             await requestPermission();
-            if (!mediaPermitted && !mediaBlocked) showToast('需要允许访问照片');
+            if (!mediaPermitted && !mediaBlocked && !mediaAddOnly) showToast('需要允许访问照片');
           } else {
             showToast('等待相机');
           }
@@ -652,6 +666,7 @@ class AppState extends ChangeNotifier {
     }
     pickerSource = PickerIngestSource(inbox);
     _prefs = await SharedPreferences.getInstance();
+    padHintSeen = _prefs.getBool('padHintSeen') ?? false;
     settings = AppSettings(
       defaultLookId: _prefs.getString('defaultLook2') ?? 'std',
       defaultBaseId: _prefs.getString('defaultBase'),
@@ -817,7 +832,7 @@ class AppState extends ChangeNotifier {
   /// The card's / settings row's action: the system prompt while it can be shown, the app's Settings page once the user has refused.
   Future<void> requestPermission() async {
     if (!permissionPlatform || isDemo) return;
-    if (mediaBlocked) {
+    if (mediaBlocked || mediaAddOnly) {
       await mediaPerm.openSettings(); // the state is re-read when the app resumes
       return;
     }
@@ -1762,6 +1777,36 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     unawaited(_runMerge(j));
     return j;
+  }
+
+  /// Tests: replaces the plausibility check of [checkMergeDraft].
+  @visibleForTesting
+  Future<MergeVerdict> Function(MergeDraft d)? mergeCheckOverride;
+
+  /// EV of a frame from its group badge ("+1 EV", "−2 EV"); null when it has none.
+  static double? evOfBadge(String? badge) {
+    final m = RegExp(r'^([+−-]?)(\d+(?:\.\d+)?) EV$').firstMatch(badge ?? '');
+    if (m == null) return null;
+    final v = double.parse(m.group(2)!);
+    return m.group(1) == '+' || m.group(1) == '' ? v : -v;
+  }
+
+  /// Before a merge: do the checked frames look like a bracket (HDR) or an overlapping sequence (panorama)? Small previews only; a frame
+  /// without a preview, the demo and a failing probe all count as "fine" (the check can only warn, never block).
+  Future<MergeVerdict> checkMergeDraft(MergeDraft d) async {
+    if (mergeCheckOverride != null) return mergeCheckOverride!(d);
+    if (isDemo) return MergeVerdict.ok;
+    try {
+      final probes = <FrameProbe?>[];
+      for (final s in d.checked) {
+        final ph = _photos[s.photoId];
+        final path = ph?.previewPath;
+        probes.add(path == null ? null : await loadProbe(path, ev: ph!.kind == PhotoKind.bracket ? evOfBadge(ph.badge) : null));
+      }
+      return checkFrames(d.kind.engineKind, probes);
+    } catch (_) {
+      return MergeVerdict.ok;
+    }
   }
 
   void cancelJob(ToolJob j) {

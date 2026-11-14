@@ -12,21 +12,19 @@ import '../../model/params.dart';
 import '../../theme/tokens.dart';
 import 'editor_controller.dart';
 import 'local_panel.dart' show LocalHeader;
-import 'pad_dock.dart' show dockLabel, padDockOrder;
+import 'pad_dock.dart' show DockItem, padDockH, padDockOrder;
 import 'pad_panel.dart';
 
 /// Selects the category [g] in a fold layout: the controls are always open there, so a second tap on the selected one changes nothing.
-/// 成像 shows its map as the home layer.
+/// 成像 opens on its pad like on the phone; the film map is a layer the stock chip opens.
 void foldSelect(EditorController ctl, EGroup g) {
   if (ctl.wm.focused?.group != g) ctl.showCategory(g);
   foldSync(ctl);
 }
 
-/// A fold layout always has a category open (the first one when nothing is), and 成像 shows its map unless 分项 or an editor is open.
+/// A fold layout always has a category open (the first one when nothing is).
 void foldSync(EditorController ctl) {
   if (ctl.wm.focused == null) ctl.showCategory(EGroup.light);
-  final film = ctl.wm.focused?.group == EGroup.style;
-  if (film && !ctl.itemised && ctl.extra == null && !ctl.filmMapOpen) ctl.setFilmMap(true);
 }
 
 /// Lines 局部's header holds under the title row at [width] (the area chips, the 光线 / 颜色 / 质地 switch): the info card has to make room.
@@ -64,6 +62,15 @@ class HistogramCard extends StatelessWidget {
   }
 }
 
+/// The height the histogram is scaled to: the tallest bin that is not an end bin, so a pile-up at the black or white end (clipping) does not
+/// flatten the rest into a line. The end bins that exceed it are drawn cut off at the top. All mass at the ends: the tallest bin.
+double histogramCeiling(List<double> h) {
+  if (h.length < 3) return h.fold<double>(0, math.max);
+  final inner = h.sublist(1, h.length - 1).fold<double>(0, math.max);
+  final all = h.fold<double>(0, math.max);
+  return inner > all * 0.02 ? inner : all;
+}
+
 class _HistPainter extends CustomPainter {
   const _HistPainter(this.hist, this.fill, this.grid);
   final List<double> hist;
@@ -75,11 +82,11 @@ class _HistPainter extends CustomPainter {
     for (var i = 1; i < 4; i++) {
       canvas.drawLine(Offset(size.width * i / 4, 0), Offset(size.width * i / 4, size.height), g);
     }
-    final mx = hist.fold<double>(0, math.max);
+    final mx = histogramCeiling(hist);
     if (mx <= 0 || hist.length < 2) return;
     final area = Path()..moveTo(0, size.height);
     for (var i = 0; i < hist.length; i++) {
-      area.lineTo(i / (hist.length - 1) * size.width, size.height - hist[i] / mx * size.height * 0.92);
+      area.lineTo(i / (hist.length - 1) * size.width, size.height - math.min(1.0, hist[i] / mx) * size.height * 0.92);
     }
     area
       ..lineTo(size.width, size.height)
@@ -91,7 +98,9 @@ class _HistPainter extends CustomPainter {
   bool shouldRepaint(_HistPainter o) => o.hist != hist || o.fill != fill || o.grid != grid;
 }
 
-/// The six categories as chips in a grid of [perRow] (the column), the same chips as the rail's.
+/// The six categories as the dock's own items (glyph over word, [DockItem]) in a grid of [perRow], for the column. The dock's items, so
+/// the glyphs show the state of each category and a tap behaves as on the phone; only the press-and-hold popup is left out (it has no
+/// place to rise from here: the pad is on the card).
 class FoldCatGrid extends StatelessWidget {
   const FoldCatGrid({super.key, required this.ctl, this.perRow = 3});
   final EditorController ctl;
@@ -99,18 +108,19 @@ class FoldCatGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final dh = padDockH(MediaQuery.textScalerOf(context).scale(15) / 15);
     return ListenableBuilder(
-      listenable: Listenable.merge([ctl.wm, ctl.edits]),
+      listenable: Listenable.merge([ctl.wm, ctl.app.editTick, ctl.local]),
       builder: (context, _) {
-        final cur = ctl.wm.focused?.group;
         final rows = <Widget>[];
         for (var r = 0; r < padDockOrder.length; r += perRow) {
-          rows.add(Row(children: [
-            for (var i = r; i < math.min(r + perRow, padDockOrder.length); i++) ...[
-              if (i > r) const SizedBox(width: Sp.s),
-              Expanded(child: PanelChip(key: ValueKey('fold-cat-${padDockOrder[i].name}'), label: dockLabel(padDockOrder[i]), selected: cur == padDockOrder[i], compact: true, onTap: () => foldSelect(ctl, padDockOrder[i]))),
-            ],
-          ]));
+          rows.add(SizedBox(
+            height: dh,
+            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              for (var i = r; i < math.min(r + perRow, padDockOrder.length); i++)
+                Expanded(child: KeyedSubtree(key: ValueKey('fold-cat-${padDockOrder[i].name}'), child: DockItem(ctl: ctl, group: padDockOrder[i], holdToAdjust: false))),
+            ]),
+          ));
         }
         return Column(mainAxisSize: MainAxisSize.min, children: rows);
       },
@@ -121,12 +131,15 @@ class FoldCatGrid extends StatelessWidget {
 /// Histogram card above the open category's header: the left half of the workbench and the top of the column. With little height the
 /// histogram gives way and the header (which never shrinks) stays.
 class FoldInfo extends StatelessWidget {
-  const FoldInfo({super.key, required this.ctl, required this.textScale, this.linesWidth});
+  const FoldInfo({super.key, required this.ctl, required this.textScale, this.linesWidth, this.headerOnly = false});
   final EditorController ctl;
   final double textScale;
 
   /// The width 局部's header lines are laid out for (null: the card's own).
   final double? linesWidth;
+
+  /// Only the title row and what hangs under it, no histogram (the column, when 局部's lines leave no room for one).
+  final bool headerOnly;
 
   @override
   Widget build(BuildContext context) {
@@ -135,14 +148,15 @@ class FoldInfo extends StatelessWidget {
       builder: (context, _) {
         final g = ctl.wm.focused?.group ?? EGroup.light;
         if (linesWidth != null) ctl.local.headerInnerW = linesWidth;
-        final header = PanelHeaderOf(ctl: ctl, group: g, side: true, textScale: textScale, filmHome: true);
+        final header = PanelHeaderOf(ctl: ctl, group: g, side: true, textScale: textScale);
         return LayoutBuilder(builder: (context, cons) {
           final lines = g == EGroup.local ? LocalHeader.belowLinesFor(ctl.local, ctl.local.headerInnerW ?? cons.maxWidth - 2 * Sp.l, textScale) : 0;
           final headerH = PanelHeader.heightOf(textScale: textScale, side: true, subTappable: true, lines: lines);
           final room = cons.maxHeight - headerH - Sp.s;
-          if (room - Sp.s < 56) return SingleChildScrollView(physics: const ClampingScrollPhysics(), child: header);
+          if (headerOnly) return Padding(padding: const EdgeInsets.only(top: Sp.s), child: header);
+          if (room - Sp.s < 56) return SingleChildScrollView(physics: const ClampingScrollPhysics(), child: Padding(padding: const EdgeInsets.only(top: Sp.s), child: header));
           return Column(children: [
-            Expanded(child: Padding(padding: const EdgeInsets.fromLTRB(Sp.m, Sp.m, Sp.m, 0), child: HistogramCard(ctl: ctl))),
+            Expanded(child: Padding(padding: const EdgeInsets.fromLTRB(Sp.l, Sp.m, Sp.l, 0), child: HistogramCard(ctl: ctl))),
             const SizedBox(height: Sp.xs),
             header,
             const SizedBox(height: Sp.s),
@@ -185,12 +199,8 @@ class FoldBench extends StatelessWidget {
     return ListenableBuilder(
       listenable: ctl.wm,
       builder: (context, _) {
-        // 裁切 has nothing for a histogram to show: its half shrinks to the title row and the space is left to the photo's ground
-        var info = plan.info;
-        if (ctl.wm.focused?.group == EGroup.crop) {
-          final hh = math.max(56.0, 0.0) * math.max(1.0, textScale);
-          info = Rect.fromLTWH(info.left, info.top, info.width, math.min(info.height, hh));
-        }
+        // both cards keep the full height of the bench in every category (a card shrunk to its title row would leave a blank strip under it)
+        final info = plan.info;
         return Stack(children: [
           card(const ValueKey('fold-info'), info, FoldInfo(ctl: ctl, textScale: textScale, linesWidth: plan.info.width - 2 * Sp.l)),
           card(const ValueKey('fold-work'), plan.work, FoldWork(ctl: ctl)),
@@ -245,9 +255,36 @@ class FoldColumn extends StatelessWidget {
       ]);
     }
 
-    final cats = Padding(padding: const EdgeInsets.fromLTRB(Sp.m, 0, Sp.m, Sp.xs), child: FoldCatGrid(ctl: ctl));
-    final info = FoldInfo(ctl: ctl, textScale: textScale, linesWidth: r.width - 2 * Sp.l);
-    final work = Expanded(flex: 5, child: FoldWork(ctl: ctl));
+    final cats = Padding(padding: const EdgeInsets.fromLTRB(Sp.l - 2, 0, Sp.l - 2, Sp.xs), child: FoldCatGrid(ctl: ctl));
+    final catsH = 2 * padDockH(textScale) + Sp.xs;
+    // the handle (drag to the other side) has its own band above the histogram
+    final histogram = Padding(padding: const EdgeInsets.fromLTRB(Sp.l, 16, Sp.l, Sp.xs), child: HistogramCard(ctl: ctl));
+    // The hierarchy reads top to bottom: the histogram, the six categories (level 1), then the open category's own header (title, readout,
+    // 复位, 分项, and 局部's area chips with the 光线 / 颜色 / 质地 switch, or 成像's stock chip), then the strength strip and the pad (or what
+    // swaps with it). The header has its natural height: the readout keeps its own line.
+    Widget header({bool hist = false}) => ListenableBuilder(
+          listenable: Listenable.merge([ctl.wm, ctl.edits, ctl.editingRow, ctl.local]),
+          builder: (context, _) {
+            final g = ctl.wm.focused?.group ?? EGroup.light;
+            ctl.local.headerInnerW = r.width - 2 * Sp.l;
+            return Padding(padding: const EdgeInsets.only(top: Sp.xs), child: PanelHeaderOf(ctl: ctl, group: g, side: true, textScale: textScale));
+          },
+        );
+    // the histogram gives way when the rest leaves it too little (its height is a share of what the fixed rows leave)
+    Widget upperRows(double height, {required bool withHeader}) => ListenableBuilder(
+          listenable: Listenable.merge([ctl.wm, ctl.edits, ctl.editingRow, ctl.local]),
+          builder: (context, _) {
+            final lines = foldHeaderLines(ctl, r.width - 2 * Sp.l, textScale);
+            final headerMax = PanelHeader.heightOf(textScale: textScale, side: true, subTappable: true, lines: lines) + Sp.xs;
+            final room = height - catsH - (withHeader ? headerMax : 0) - (withHeader ? 220 : 0);
+            return Column(children: [
+              if (room >= 56) Expanded(flex: 2, child: histogram) else const SizedBox(height: 16),
+              cats,
+              if (withHeader) header(),
+              if (withHeader) Expanded(flex: room >= 56 ? 5 : 1, child: FoldWork(ctl: ctl)),
+            ]);
+          },
+        );
     final split = plan.split;
     if (split == null) {
       return Positioned.fromRect(
@@ -256,20 +293,20 @@ class FoldColumn extends StatelessWidget {
           key: const ValueKey('fold-column'),
           decoration: foldCard(c),
           clipBehavior: Clip.antiAlias,
-          child: withHandle(Column(children: [Expanded(flex: 2, child: info), cats, work])),
+          child: withHandle(upperRows(r.height, withHeader: true)),
         ),
       );
     }
     final topH = (split.$1 - r.top).clamp(0.0, r.height).toDouble();
     final lowTop = split.$2;
     return Stack(children: [
-      Positioned(left: r.left, top: r.top, width: r.width, height: topH, child: Container(key: const ValueKey('fold-column'), decoration: foldCard(c), clipBehavior: Clip.antiAlias, child: withHandle(info))),
+      Positioned(left: r.left, top: r.top, width: r.width, height: topH, child: Container(key: const ValueKey('fold-column'), decoration: foldCard(c), clipBehavior: Clip.antiAlias, child: withHandle(upperRows(topH, withHeader: false)))),
       Positioned(
         left: r.left,
         top: lowTop,
         width: r.width,
         height: math.max(0.0, r.bottom - lowTop),
-        child: Container(key: const ValueKey('fold-column-low'), decoration: foldCard(c), clipBehavior: Clip.antiAlias, child: Column(children: [const SizedBox(height: Sp.s), cats, work])),
+        child: Container(key: const ValueKey('fold-column-low'), decoration: foldCard(c), clipBehavior: Clip.antiAlias, child: Column(children: [header(), Expanded(child: FoldWork(ctl: ctl))])),
       ),
     ]);
   }

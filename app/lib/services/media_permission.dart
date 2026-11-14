@@ -15,8 +15,9 @@ bool mediaStatusGrants(PermissionStatus st) => st.isGranted || st.isLimited;
 
 /// What the app can do about the photo library right now.
 ///  [full]/[limited] list photos (limited = the user picked some: iOS "选择照片", Android 14 "选择照片和视频");
+///  [addOnly] iOS "仅添加": saving to the album works, listing does not; it is a choice the user can widen in Settings, not a refusal;
 ///  [askable] the system prompt can still be shown; [blocked] the user refused (or a policy forbids it): only the system Settings can change it.
-enum MediaAccess { full, limited, askable, blocked }
+enum MediaAccess { full, limited, addOnly, askable, blocked }
 
 extension MediaAccessX on MediaAccess {
   bool get listing => this == MediaAccess.full || this == MediaAccess.limited;
@@ -62,6 +63,7 @@ class MediaPermission {
   static MediaAccess accessOfIos(String? s) => switch (s) {
         'authorized' => MediaAccess.full,
         'limited' => MediaAccess.limited,
+        'addOnly' => MediaAccess.addOnly,
         'denied' || 'restricted' => MediaAccess.blocked,
         _ => MediaAccess.askable,
       };

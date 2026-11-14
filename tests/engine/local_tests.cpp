@@ -627,9 +627,9 @@ void testCache() {
 
 // ---- coords -------------------------------------------------------------------------------------------------------------------------
 // A hard disc at a photo point stays at that photo point and stays a disc under every geometry (crop / rotate / flip / straighten).
-void testCoords() {
-  const SourceImage src = makeScene(1200, 900);
-  const float W = 1200.f, H = 900.f, longE = 1200.f;
+void coordsImpl(int iw, int ih) {
+  const SourceImage src = makeScene(iw, ih);
+  const float W = float(iw), H = float(ih), longE = float(iw);
   const float pu = 0.3f, pv = 0.4f, rad = 0.08f;
   struct G {
     const char* crop;
@@ -703,6 +703,9 @@ void testCoords() {
   std::printf("  %d geometries checked, %d skipped (disc leaves the frame)\n", checked, clipped);
   CHECK(checked >= 12);
 }
+void testCoords() { coordsImpl(1200, 900); }
+// the same geometry matrix on a small frame (the disc is 24 px): in the default run
+void testCoordsSmall() { coordsImpl(300, 225); }
 
 // ---- interactive ----------------------------------------------------------------------------------------------------------------------
 // The hand-over from the interactive tier (coarse planes) to the exact frame changes masks by plane resolution only.
@@ -861,7 +864,7 @@ std::shared_ptr<engine::gpu::Context> gpuContext() {
   return ctx;
 }
 
-void testParity() {
+void parityImpl(const std::vector<std::pair<int, int>>& sizes, int exportTile) {
   auto ctx = gpuContext();
   filmLibrary();
   putEdgeRaster("t_edge", 200, 140, 0.55f, 2.f);
@@ -879,7 +882,7 @@ void testParity() {
       {"film portra + all kinds", [](EditParams& p) { p.local = richEdit(); p.filmStock = "kodak_portra_400"; }, false},
       {"film portra 50 + all kinds, crop", [](EditParams& p) { p.local = richEdit(); p.filmStock = "kodak_portra_400"; p.filmStrength = 50.f; p.crop = "4:5"; }, false},
   };
-  for (const std::pair<int, int>& sz : {std::pair<int, int>{640, 448}, std::pair<int, int>{1536, 1024}}) {
+  for (const std::pair<int, int>& sz : sizes) {
     const SourceImage src = makeScene(sz.first, sz.second);
     dapple::gpu::Rig rig(ctx, src, cam());
     EngineSession cpuEs;
@@ -919,7 +922,7 @@ void testParity() {
       std::string err;
       engine::GpuStats st;
       const bool ok = rig.exportTiled(
-          p, r, src, 0, 65, pass ? 192 : 4096, false, 0.f, [&](int w, int h) { ew = w, eh = h, dst.assign(std::size_t(w) * h * 4, 0); },
+          p, r, src, 0, 65, pass ? exportTile : 4096, false, 0.f, [&](int w, int h) { ew = w, eh = h, dst.assign(std::size_t(w) * h * 4, 0); },
           [&](int x0, int y0, int tw, int th, const std::uint8_t* px, std::size_t stride) {
             for (int j = 0; j < th; ++j) std::memcpy(&dst[(std::size_t(y0 + j) * ew + x0) * 4], px + std::size_t(j) * stride, std::size_t(tw) * 4);
             return true;
@@ -934,10 +937,13 @@ void testParity() {
       const int d = std::abs(int(a[i]) - int(b[i]));
       diff += d != 0, mx = std::max(mx, d);
     }
-    std::printf("  GPU tiled export (192 px tiles) vs one tile %dx%d: max code %d, differing bytes %zu\n", ew, eh, mx, diff);
+    std::printf("  GPU tiled export (%d px tiles) vs one tile %dx%d: max code %d, differing bytes %zu\n", exportTile, ew, eh, mx, diff);
     CHECK(mx <= 1);
   }
 }
+void testParity() { parityImpl({{640, 448}, {1536, 1024}}, 192); }
+// every mask kind and op, geometry, hdr, film, interactive and a tiled export, GPU against CPU on one small frame: in the default run
+void testParitySmall() { parityImpl({{320, 224}}, 96); }
 #endif
 
 
@@ -1103,13 +1109,12 @@ void testRegion() {
 
 #ifdef DAPPLE_LOCAL_GPU
 // GPU: the region source's frame against the same pixels of the whole source's frame (both on the GPU executor), and against the CPU region frame
-void testRegionGpu() {
+void regionGpuImpl(int W, int H, int wx0, int wy0, int wx1, int wy1, int margin) {
   auto ctx = gpuContext();
   filmLibrary();
-  const int W = 960, H = 640;
   const SourceImage src = makeScene(W, H);
   putEdgeRaster("t_edge", 200, 140, 0.55f, 2.f);
-  const SourceImage ws = windowOf(src, 240, 160, 720, 480);
+  const SourceImage ws = windowOf(src, wx0, wy0, wx1, wy1);
   dapple::gpu::Rig whole(ctx, src, cam()), win(ctx, ws, cam());
   EngineSession cpuEs;
   std::vector<RegionCase> gcases = regionCases();
@@ -1129,11 +1134,11 @@ void testRegionGpu() {
     std::uint8_t* b = win.render(p, r2, ws, fo, 33, rw, rh, nullptr, err2);
     FrameResult res;
     const bool okCpu = cpuFrame(cpuEs, p, ws, false, res);
-    if (!a || !b || !okCpu || rw != 480 || rh != 320 || res.w != rw || res.h != rh) {
+    if (!a || !b || !okCpu || rw != wx1 - wx0 || rh != wy1 - wy0 || res.w != rw || res.h != rh) {
       std::printf("  %-30s render failed (%s %s %s)\n", c.name, err1.c_str(), err2.c_str(), res.error.c_str());
       ++g_failures;
     } else {
-      const CropDiff d = cropDiff(a, gw, b, rw, rh, 240, 160, 64, 4);
+      const CropDiff d = cropDiff(a, gw, b, rw, rh, wx0, wy0, margin, 4);
       const dapple::gpu::DeStats cd = dapple::gpu::compareRgba8(b, res.rgba, std::size_t(rw) * rh);
       std::printf("  %-30s GPU window vs GPU whole crop: max code %d, over 1: %zu of %zu;  GPU window vs CPU window: mean %.4f p99 %.3f\n", c.name, d.maxCode, d.over1, d.n, cd.mean, cd.p99);
       CHECK(d.maxCode <= 2 && double(d.over1) <= 0.001 * double(d.n));
@@ -1144,6 +1149,8 @@ void testRegionGpu() {
     std::free(res.rgba);
   }
 }
+void testRegionGpu() { regionGpuImpl(960, 640, 240, 160, 720, 480, 64); }
+void testRegionGpuSmall() { regionGpuImpl(384, 256, 96, 64, 288, 192, 24); }
 #endif
 
 
@@ -1340,9 +1347,9 @@ int main(int argc, char** argv) {
     void (*fn)();
   };
   const T tests[] = {{"json", testJson}, {"components", testComponents}, {"identity", testIdentity}, {"raster", testRaster}, {"tiles", testTiles},
-                     {"cache", testCache}, {"coords", testCoords}, {"interactive", testInteractive}, {"film", testFilm}, {"region", testRegion}, {"regionfilm", testRegionFilm},
+                     {"cache", testCache}, {"coords", testCoords}, {"coords_small", testCoordsSmall}, {"interactive", testInteractive}, {"film", testFilm}, {"region", testRegion}, {"regionfilm", testRegionFilm},
 #ifdef DAPPLE_LOCAL_GPU
-                     {"parity", testParity}, {"regiongpu", testRegionGpu},
+                     {"parity", testParity}, {"regiongpu", testRegionGpu}, {"parity_small", testParitySmall}, {"regiongpu_small", testRegionGpuSmall},
 #endif
   };
   const std::string id = argc > 1 ? argv[1] : "";

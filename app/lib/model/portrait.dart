@@ -82,8 +82,10 @@ const List<PortraitChip> kPortraitPriority = [
   PortraitChip.light,
 ];
 
-/// The toast when a group photo's default set works on the main (largest) face only; the face strip adds the others.
-const String kGroupMainOnly = '合影只修了最大的人脸，其他人在下方加';
+/// The toast when a group photo's default set does not cover every face (guidelines 13.1: the result, then the action; no sentence):
+/// what was done, and where the others are added (the face row at the top of the 人像 panel).
+String groupToast(int done) => '${done <= 1 ? '已修最大的脸' : '已修 $done 张脸'} · 点面板里的脸加其他人';
+const String kGroupMainOnly = '已修最大的脸 · 点面板里的脸加其他人';
 
 /// The area name that marks a portrait area: `portrait:` + the area id.
 String portraitName(String areaId) => 'portrait:$areaId';

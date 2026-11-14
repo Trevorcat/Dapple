@@ -1,8 +1,7 @@
 // A camera on the phone's USB cable: the platform seam of the wired import (docs/research/usb-tethering.md step 1).
 //
 // Android: Kotlin UsbCameraPlugin (android.mtp.MtpDevice) behind dapple/usbcam + dapple/usbcam_events.
-// iOS (not built yet) must provide the same behaviour behind this interface, see [UsbCameraBackend] and
-// docs/research/usb-tethering-test-plan.md "iOS later". Host / tests / platforms without it: [NoUsbCamera].
+// iOS: Swift DappleUsbCamPlugin (ImageCaptureCore, untested with a real camera) behind the same two channels. Host / tests / platforms without it: [NoUsbCamera].
 import 'dart:async';
 import 'dart:io';
 
@@ -99,7 +98,7 @@ abstract class UsbCameraBackend {
   /// The text to copy and send after trying a camera.
   Future<String> diagnostics();
 
-  static UsbCameraBackend forPlatform() => Platform.isAndroid ? ChannelUsbCamera() : const NoUsbCamera();
+  static UsbCameraBackend forPlatform() => (Platform.isAndroid || Platform.isIOS) ? ChannelUsbCamera() : const NoUsbCamera();
 }
 
 class ChannelUsbCamera implements UsbCameraBackend {
@@ -151,7 +150,7 @@ class ChannelUsbCamera implements UsbCameraBackend {
   Future<String> diagnostics() async => await _ch.invokeMethod<String>('diagnostics') ?? '';
 }
 
-/// iOS today, desktop, tests that need no camera: no camera, no events, never throws.
+/// Desktop, tests that need no camera: no camera, no events, never throws.
 class NoUsbCamera implements UsbCameraBackend {
   const NoUsbCamera();
   @override

@@ -34,4 +34,15 @@ void main() {
       expect(asked, [want, want]);
     });
   }
+
+  test('iOS status names map to access; add-only is not a refusal', () {
+    expect(MediaPermission.accessOfIos('authorized'), MediaAccess.full);
+    expect(MediaPermission.accessOfIos('limited'), MediaAccess.limited);
+    expect(MediaPermission.accessOfIos('addOnly'), MediaAccess.addOnly);
+    expect(MediaPermission.accessOfIos('denied'), MediaAccess.blocked);
+    expect(MediaPermission.accessOfIos('restricted'), MediaAccess.blocked);
+    expect(MediaPermission.accessOfIos('notDetermined'), MediaAccess.askable);
+    expect(MediaAccess.addOnly.listing, isFalse);
+    expect(MediaAccess.addOnly, isNot(MediaAccess.blocked));
+  });
 }

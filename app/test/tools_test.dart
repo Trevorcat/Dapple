@@ -3,10 +3,12 @@ import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:dapple/models.dart';
+import 'package:dapple/platform/platform_services.dart';
 import 'package:dapple/services/detection.dart';
 import 'package:dapple/services/ftp_ingest.dart';
 import 'package:dapple/services/ingest.dart';
 import 'package:dapple/services/live_bridge.dart';
+import 'package:dapple/services/merge_check.dart';
 import 'package:dapple/services/merge_engine.dart';
 import 'package:dapple/services/tool_models.dart';
 import 'package:dapple/screens/tools/live_tool_page.dart';
@@ -379,6 +381,36 @@ void main() {
       expect(app.job, isNull);
     });
 
+    testWidgets('frames that do not look like a bracket: say so; 重选 starts nothing, 仍然合成 merges', (tester) async {
+      final (app, eng) = await _open(tester);
+      app.mergeCheckOverride = (d) async => const MergeVerdict(MergeProblem.notSameScene, '这几张不像同一个场景');
+      await tester.tap(find.byKey(const ValueKey('entry-bracket-y0')));
+      await _settle(tester);
+      await tester.tap(find.byKey(const ValueKey('tool-main')));
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('merge-doubt')), findsOneWidget);
+      expect(find.text('这几张不像同一个场景'), findsOneWidget);
+      expect(find.text('重选'), findsOneWidget);
+      expect(find.text('仍然合成'), findsOneWidget);
+      expect(eng.merges, isEmpty, reason: 'nothing runs while the question is open');
+      await shot(tester, 'merge_doubt');
+      // 重选 closes the question and offers the picker; nothing was merged
+      await tester.tap(find.byKey(const ValueKey('merge-doubt-reselect')));
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('merge-doubt')), findsNothing);
+      expect(eng.merges, isEmpty);
+      // the picker is open: 完成 keeps the selection, then 仍然合成
+      expect(find.byKey(const ValueKey('pick-done')), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('pick-done')));
+      await _settle(tester);
+      await tester.tap(find.byKey(const ValueKey('tool-main')));
+      await _settle(tester);
+      await tester.tap(find.byKey(const ValueKey('merge-doubt-go')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(eng.merges.length, 1);
+    });
+
     testWidgets('success: back home, result is a normal photo, toast', (tester) async {
       final (app, eng) = await _open(tester);
       await tester.tap(find.byKey(const ValueKey('entry-bracket-y0')));
@@ -714,6 +746,41 @@ void main() {
       expect(calls.where((c) => c.method == 'saveToGallery'), isEmpty);
     });
 
+    testWidgets('a video file from the document picker is the second source: a row in the list, its pick sets the window', (tester) async {
+      final saved = PlatformServices.current;
+      addTearDown(() => PlatformServices.current = saved);
+      var asked = 0;
+      PlatformServices.current = _FileVideoServices(() async {
+        asked++;
+        return VideoItem(id: 'doc_1', uri: 'content://docs/v.mp4', name: 'v.mp4', durationMs: 9000, size: 1000, addedMs: 0);
+      });
+      final (app, _) = await _open(tester);
+      app.videos = [];
+      app.navigatorKey.currentState!.push(MaterialPageRoute<void>(builder: (_) => LiveToolPage(app: app)));
+      await _settle(tester);
+      await tester.tap(find.byKey(const ValueKey('tool-main')));
+      await _settle(tester);
+      expect(find.text('相册里没有视频'), findsWidgets, reason: 'the library list can be empty, the file route is still offered');
+      expect(find.byKey(const ValueKey('video-from-file')), findsOneWidget);
+      expect(find.text('从文件选…'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('video-from-file')));
+      await _settle(tester);
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(asked, 1);
+      expect(find.text('3 秒片段 · 视频 0:09'), findsOneWidget);
+    });
+
+    testWidgets('no document picker on the platform: no 从文件选 row', (tester) async {
+      final (app, _) = await _open(tester);
+      app.videos = [_video(14)];
+      app.navigatorKey.currentState!.push(MaterialPageRoute<void>(builder: (_) => LiveToolPage(app: app)));
+      await _settle(tester);
+      await tester.tap(find.byKey(const ValueKey('tool-main')));
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('video-list')), findsOneWidget);
+      expect(find.byKey(const ValueKey('video-from-file')), findsNothing);
+    });
+
     testWidgets('no video preselected: the tool lists the MediaStore videos and a pick sets the window', (tester) async {
       final (app, _) = await _open(tester);
       app.videos = [_video(14)];
@@ -778,3 +845,21 @@ void main() {
 
 VideoItem _video(int seconds) =>
     VideoItem(id: 'v', uri: 'content://v', name: 'C0021.MP4', durationMs: seconds * 1000, size: 1000, addedMs: 0);
+
+class _FileVideo extends NullVideoPlatform {
+  _FileVideo(this._pick);
+  final Future<VideoItem?> Function() _pick;
+  @override
+  bool get canPickVideoFile => true;
+  @override
+  Future<VideoItem?> pickVideoFile() => _pick();
+}
+
+class _FileVideoServices extends NullServices {
+  _FileVideoServices(Future<VideoItem?> Function() pick)
+      : _video = _FileVideo(pick),
+        super('host');
+  final VideoPlatform _video;
+  @override
+  VideoPlatform get video => _video;
+}

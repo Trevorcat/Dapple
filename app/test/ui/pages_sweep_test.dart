@@ -764,7 +764,12 @@ void main() {
       await step(t, z, '成像', () async {
         await dock(t, EGroup.style);
         await settle(t, 8);
-        await snap(t, z, 'bench_film', '工作台 成像: the film map', suffix: sfx);
+        await snap(t, z, 'bench_film', '工作台 成像: the default layer, the stock chip, strength and the film pad', suffix: sfx);
+        await t.tap(key('stock-button'));
+        await settle(t, 8);
+        await snap(t, z, 'bench_film_map', '工作台 成像: the chip opened the film map in place of the pad', suffix: sfx);
+        await t.tap(key('header-back'));
+        await settle(t, 8);
       });
       await step(t, z, '质地', () async {
         await dock(t, EGroup.effects);
@@ -802,7 +807,12 @@ void main() {
       await step(t, z, '成像', () async {
         await dock(t, EGroup.style);
         await settle(t, 8);
-        await snap(t, z, 'column_film', '竖构图 成像: the film map', suffix: sfx);
+        await snap(t, z, 'column_film', '竖构图 成像: the default layer, the stock chip, strength and the film pad', suffix: sfx);
+        await t.tap(key('stock-button'));
+        await settle(t, 8);
+        await snap(t, z, 'column_film_map', '竖构图 成像: the chip opened the film map in place of the pad', suffix: sfx);
+        await t.tap(key('header-back'));
+        await settle(t, 8);
       });
       await step(t, z, '裁切', () async {
         await dock(t, EGroup.crop);
@@ -819,6 +829,47 @@ void main() {
         await settle(t, 8);
         await snap(t, z, 'column_swapped', '竖构图: the column moved to the other side', suffix: sfx);
       });
+      await drain(t);
+    });
+  }
+
+  // a book-style device standing half open (wide window, horizontal fold): the photo above, the workbench under the fold
+  testWidgets('fold half-opened book standing', (t) async {
+    const z = Sz('book-standing-904x832', 904, 832, fold: Fold.horizontal);
+    win(t, z, posture: ui.DisplayFeatureState.postureHalfOpened, marker: true);
+    const sfx = '-fold';
+    await step(t, z, 'standing', () async {
+      await openEd(t, z, group: EGroup.light, before: filmSetup);
+      await snap(t, z, 'half_bench_light', '半开 光线: the photo above the fold, the workbench halves below it', suffix: sfx);
+      await dock(t, EGroup.crop);
+      await snap(t, z, 'half_bench_crop', '半开 裁切', suffix: sfx);
+      await dock(t, EGroup.style);
+      await settle(t, 8);
+      await snap(t, z, 'half_bench_film', '半开 成像', suffix: sfx);
+    });
+    await drain(t);
+  });
+
+  testWidgets('fold dark bench and column', (t) async {
+    const z = Sz('book-inner-904x832', 904, 832, fold: Fold.vertical);
+    win(t, z);
+    const sfx = '-fold';
+    await openEd(t, z, group: EGroup.light, dark: true, before: filmSetup);
+    await snap(t, z, 'bench_light_dark', '工作台 光线, dark theme', suffix: sfx);
+    await dock(t, EGroup.crop);
+    await snap(t, z, 'bench_crop_dark', '工作台 裁切, dark theme: the cluster keeps off the photo corners', suffix: sfx);
+    await openEd(t, z, group: EGroup.light, dark: true, before: filmSetup, title: '街角咖啡');
+    await snap(t, z, 'column_light_dark', '竖构图 光线, dark theme', suffix: sfx);
+    await drain(t);
+  });
+
+  // cover-size windows: the photo to look at, previous / next, 发布; the editor says to open the device
+  for (final zd in ['flip-cover-360x380', 'wide-fold-cover-400x400']) {
+    testWidgets('cover viewer $zd', (t) async {
+      final z = sizes.firstWhere((s) => s.dir == zd);
+      win(t, z);
+      await openEd(t, z, group: EGroup.light, before: filmSetup);
+      await snap(t, z, 'cover_viewer', '封面窗口: the photo, previous / next, 发布 and the one line', suffix: '-cover');
       await drain(t);
     });
   }

@@ -49,7 +49,11 @@ class EditorTopBar extends StatelessWidget {
     required this.onBack,
     required this.onMore,
     this.vertical = false,
+    this.immersive = false,
   });
+
+  /// Immersive view: the action group fades out, the back button stays and works.
+  final bool immersive;
 
   /// Beside the side pane (landscape, the unfolded inner screen): a rail on the photo column's outer edge, back on top, so the photo
   /// can take the full height (audit F25).
@@ -83,7 +87,12 @@ class EditorTopBar extends StatelessWidget {
               ),
             ),
             if (vertical) const SizedBox(height: 8) else const Spacer(),
-            GlassCapsule(
+            IgnorePointer(
+              ignoring: immersive,
+              child: AnimatedOpacity(
+              opacity: immersive ? 0 : 1,
+              duration: const Duration(milliseconds: 150),
+              child: GlassCapsule(
               radius: 24,
               child: Flex(
                 direction: vertical ? Axis.vertical : Axis.horizontal,
@@ -140,6 +149,8 @@ class EditorTopBar extends StatelessWidget {
                   ),
                 ],
               ),
+            ),
+            ),
             ),
           ],
         );

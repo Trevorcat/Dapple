@@ -174,6 +174,14 @@ class LiveBridge {
     return [for (final r in rows ?? const <Map>[]) VideoItem.fromMap(r)];
   }
 
+  /// Second video source: one video file from the system document picker (Android: Storage Access Framework, `VideoPickPlugin.kt`;
+  /// iOS: UIDocumentPicker, see docs/ios/README.md "pending native calls"). A row shaped like a [listVideos] row (the uri is the
+  /// document's URI / a file URL the other calls accept); null when the picker was cancelled or the file is not a playable video.
+  static Future<VideoItem?> pickVideoFile() async {
+    final row = await _live.invokeMapMethod<String, dynamic>('pickVideoFile');
+    return row == null ? null : VideoItem.fromMap(row);
+  }
+
   static Future<Map<String, dynamic>> info(String uri) async =>
       ((await _live.invokeMapMethod<String, dynamic>('info', {'uri': uri})) ?? {}).cast<String, dynamic>();
 

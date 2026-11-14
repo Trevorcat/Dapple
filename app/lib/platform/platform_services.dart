@@ -43,6 +43,12 @@ abstract class VideoPlatform {
   bool get available;
   Future<List<VideoItem>> listVideos({int limit = 50});
 
+  /// Whether a video can also come from a file chosen in the system document picker (not only from the system library).
+  bool get canPickVideoFile;
+
+  /// The document picker for one video file: a row like [listVideos]'s, null when cancelled or not a playable video.
+  Future<VideoItem?> pickVideoFile();
+
   /// `{decodable: bool, ...}`; an empty map when unsupported.
   Future<Map<String, dynamic>> probe(String uri);
 
@@ -116,6 +122,10 @@ class _AndroidVideo implements VideoPlatform {
   bool get available => true;
   @override
   Future<List<VideoItem>> listVideos({int limit = 50}) => LiveBridge.listVideos(limit: limit);
+  @override
+  bool get canPickVideoFile => true;
+  @override
+  Future<VideoItem?> pickVideoFile() => LiveBridge.pickVideoFile();
   @override
   Future<Map<String, dynamic>> probe(String uri) => LiveBridge.probe(uri);
   @override
@@ -201,6 +211,10 @@ class NullVideoPlatform implements VideoPlatform {
   bool get available => false;
   @override
   Future<List<VideoItem>> listVideos({int limit = 50}) async => const [];
+  @override
+  bool get canPickVideoFile => false;
+  @override
+  Future<VideoItem?> pickVideoFile() async => null;
   @override
   Future<Map<String, dynamic>> probe(String uri) async => const {};
   @override

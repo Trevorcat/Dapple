@@ -321,8 +321,7 @@ void runCase(GpuCtx& G, const hal::ImageH& src, const ImageF& in, const CaseSpec
   ef::releaseGpuPlan(*G.core, pr);
 }
 
-void testCases(GpuCtx& G, bool grainOnly) {
-  const int w = 960, h = 640;
+void testCases(GpuCtx& G, bool grainOnly, int w = 960, int h = 640, const std::vector<std::string>& only = {}) {
   const ImageF in = scene(w, h);
   hal::ImageH src;
   std::string err;
@@ -343,7 +342,7 @@ void testCases(GpuCtx& G, bool grainOnly) {
       // the same grain compared pixel by pixel (the hash is identical, so no downscale is needed to agree)
       {"final tier with grain, per pixel", "kodak_portra_400", w, h, 2, 100.f, 100.f, 0.1, 1.0, false},
       // grain-family drag at the interactive tier: grain kept, scale-aware against a 3x larger full-resolution render
-      {"interactive grain drag, scale-aware", "kodak_portra_400", w, h, 1, 100.f, 100.f, 0.1, 1.0, false, true, 2880},
+      {"interactive grain drag, scale-aware", "kodak_portra_400", w, h, 1, 100.f, 100.f, 0.1, 1.0, false, true, 3 * w},
       // highlight boost (film_boost.comp): the maximum of the frame, the constants and the curve on the device
       {"boost 1.5 EV (portra, final, no grain)", "kodak_portra_400", w, h, 2, 0.f, 100.f, 0.15, 1.5, false, false, 0, boostFx(1.5f)},
       {"boost 2 EV range .2 (ektar, interactive)", "kodak_ektar_100", w, h, 1, 0.f, 100.f, 0.15, 1.5, false, false, 0, boostFx(2.0f, 0.2f)},
@@ -371,6 +370,7 @@ void testCases(GpuCtx& G, bool grainOnly) {
   };
   for (const CaseSpec& c : cases) {
     if (grainOnly && c.grain == 0.f) continue;
+    if (!only.empty() && std::find(only.begin(), only.end(), std::string(c.name)) == only.end()) continue;
     runCase(G, src, in, c);
   }
   G.dev().destroy(src);
@@ -796,6 +796,12 @@ int main(int argc, char** argv) {
   else if (id == "bench") testBench(G);
   else if (id == "merge") testMerge(G);
   else if (id.empty() || id == "all") testCases(G, false);
+  // one frame of every kind (point chain, scan, interactive halation, final tier, grain, grain drag, boost, enlarger filter, dye-cloud blur) at 320 x 224
+  else if (id == "small")
+    testCases(G, false, 320, 224,
+              {"point chain portra400", "point chain velvia (scan)", "halation + glare (portra, interactive)", "final tier, grain off (DIR, unsharp)", "final tier with grain",
+               "interactive grain drag, scale-aware", "boost 1.5 EV (portra, final, no grain)", "enlarger black_pro_mist (portra, final)",
+               "enlarger on a slide (no print: unchanged)", "boost + enlarger", "dye-cloud blur (portra, 24 MP pitch), per pixel"});
   else if (id == "grain") testCases(G, true);
   std::printf(g_failures ? "FAILED: %d check(s)\n" : "ok\n", g_failures);
   return g_failures ? 1 : 0;

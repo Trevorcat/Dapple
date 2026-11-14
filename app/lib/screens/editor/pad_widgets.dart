@@ -282,6 +282,18 @@ class _PadFaceState extends State<PadFace> {
     _begun = false;
   }
 
+  /// One character beside each edge icon (left, right, bottom, top), low emphasis: the pad says which way is which without a legend.
+  List<Widget> _edgeLabels(List<String> words) {
+    const m = 36.0; // the icon sits 20 from its edge and is 20 wide: the character starts after it
+    Widget t(String w) => ExcludeSemantics(child: Text(edgeChar(w), key: ValueKey('pad-edge-$w'), style: kPadEdgeStyle));
+    return [
+      Positioned(left: m, top: 0, bottom: 0, child: Center(child: t(words[0]))),
+      Positioned(right: m, top: 0, bottom: 0, child: Center(child: t(words[1]))),
+      Positioned(bottom: 20 - 8, left: 0, right: 0, child: Center(child: Padding(padding: const EdgeInsets.only(left: 44), child: t(words[2])))),
+      Positioned(top: 20 - 8, left: 0, right: 0, child: Center(child: Padding(padding: const EdgeInsets.only(left: 44), child: t(words[3])))),
+    ];
+  }
+
   @override
   Widget build(BuildContext context) {
     final cat = widget.cat;
@@ -296,6 +308,7 @@ class _PadFaceState extends State<PadFace> {
         DecoratedBox(decoration: padFieldDecoration(cat, dark, radius: r)),
         ?overlay,
         RepaintBoundary(child: CustomPaint(painter: _FieldPainter(cat, r, widget.edgeIcons))),
+        if (widget.interactive) ..._edgeLabels(words),
         RepaintBoundary(
           child: ListenableBuilder(
             listenable: src.changes,
@@ -528,6 +541,31 @@ class LookDot extends StatelessWidget {
           ),
         ]),
       ),
+    );
+  }
+}
+
+/// The edge characters of a pad: 12 px, weight 500, white at 80 % with a soft shadow like the icons.
+const TextStyle kPadEdgeStyle = TextStyle(
+  fontSize: 12,
+  height: 1,
+  fontWeight: FontWeight.w500,
+  color: Color(0xF2FFFFFF),
+  // readable on the light end of a pad too: a tight dark edge plus a soft halo
+  shadows: [Shadow(color: Color(0xE6000000), blurRadius: 1.5), Shadow(color: Color(0x99000000), blurRadius: 4), Shadow(color: Color(0x66000000), blurRadius: 8)],
+);
+
+/// First-use hint near the pad: one short line, shown until the first touch, once per install.
+class PadHintPill extends StatelessWidget {
+  const PadHintPill({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
+      decoration: BoxDecoration(color: c.surfaceHi, borderRadius: BorderRadius.circular(20), border: Border.all(color: c.sep)),
+      child: Text('在盘面上拖动圆点来调整', style: T.cap(c.text, w: FontWeight.w500)),
     );
   }
 }

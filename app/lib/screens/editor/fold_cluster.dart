@@ -6,6 +6,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 
 import '../../editor/fold_layout.dart';
@@ -34,7 +35,7 @@ const Duration kBallCompareHold = Duration(milliseconds: 420);
 const Duration kClusterIdle = Duration(milliseconds: 3500);
 
 class FoldCluster extends StatefulWidget {
-  const FoldCluster({super.key, required this.ctl, required this.geo, required this.onSlide, required this.onDrop});
+  const FoldCluster({super.key, required this.ctl, required this.geo, required this.onSlide, required this.onDrop, this.hidden});
   final EditorController ctl;
   final BallGeo geo;
 
@@ -43,6 +44,9 @@ class FoldCluster extends StatefulWidget {
 
   /// The grip was let go at this global x: past the middle of the photo the cluster changes sides.
   final ValueChanged<double> onDrop;
+
+  /// True while a crop handle is being dragged: the cluster fades out (and takes no touch) so it never covers the handles.
+  final ValueListenable<bool>? hidden;
 
   @override
   State<FoldCluster> createState() => _FoldClusterState();
@@ -215,7 +219,8 @@ class _FoldClusterState extends State<FoldCluster> {
       _mode = _Drag.item;
       return;
     }
-    if (cat == PadCat.film) {
+    if (cat == PadCat.film && ctl.filmMapOpen) {
+      // with the map open the ball steps through the stocks; otherwise it drags the film pad like any other category
       _dots = layoutFilmMap(ctl.app.film, FilmMapStore.positions ?? const {});
       if (_dots.isEmpty) return;
       final cur = ctl.edit.film;
@@ -314,8 +319,9 @@ class _FoldClusterState extends State<FoldCluster> {
     final c = context.c;
     final g = widget.geo;
     return ListenableBuilder(
-      listenable: Listenable.merge([ctl.wm, ctl.edits, ctl.local]),
+      listenable: Listenable.merge([ctl.wm, ctl.edits, ctl.local, ?widget.hidden]),
       builder: (context, _) {
+        final gone = widget.hidden?.value ?? false;
         final grp = _group;
         final crop = grp == EGroup.local ? false : PadCatX.ofGroup(grp) == null;
         final remoteOk = grp == EGroup.local && ctl.local.canMoveRemote;
@@ -333,10 +339,12 @@ class _FoldClusterState extends State<FoldCluster> {
                 ctl.setItemised(!ctl.itemised);
                 foldSync(ctl);
               });
-        return AnimatedOpacity(
+        return IgnorePointer(
+          ignoring: gone,
+          child: AnimatedOpacity(
           key: const ValueKey('fold-cluster'),
-          opacity: _awake || _active > 0 ? 1 : 0.45,
-          duration: const Duration(milliseconds: 300),
+          opacity: gone ? 0 : (_awake || _active > 0 ? 1 : 0.45),
+          duration: const Duration(milliseconds: 200),
           child: Transform.translate(
             offset: Offset(_gdx, 0),
             child: Stack(clipBehavior: Clip.none, children: [
@@ -399,6 +407,7 @@ class _FoldClusterState extends State<FoldCluster> {
               ),
             ]),
           ),
+        ),
         );
       },
     );

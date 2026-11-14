@@ -5,11 +5,13 @@ import 'package:flutter/gestures.dart' show DragStartBehavior;
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
+import '../../platform/platform_services.dart';
 import '../../services/live_bridge.dart';
 import '../../services/tool_models.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
+import '../../widgets/icons.dart';
 import 'progress_dialog.dart';
 import 'tool_common.dart';
 
@@ -431,6 +433,24 @@ class _VideoList extends StatelessWidget {
             Expanded(child: Text('选择视频', textAlign: TextAlign.center, style: T.body17(c.text, w: FontWeight.w600))),
             const SizedBox(width: 84),
           ])),
+      // the second source: a video file from the system document picker (not only the library's videos)
+      if (PlatformServices.current.video.canPickVideoFile)
+        InkWell(
+          key: const ValueKey('video-from-file'),
+          onTap: () async {
+            final v = await PlatformServices.current.video.pickVideoFile();
+            if (v != null && context.mounted) Navigator.of(context).pop(v);
+          },
+          child: Container(
+            constraints: const BoxConstraints(minHeight: 56),
+            padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
+            child: Row(children: [
+              DIcon(DI.folder, size: 24, color: c.text2),
+              const SizedBox(width: Sp.l),
+              Expanded(child: Text('从文件选…', style: T.body17(c.text))),
+            ]),
+          ),
+        ),
       Expanded(
         child: list.isEmpty
             ? Center(child: Text('相册里没有视频', style: T.body17(c.text2)))

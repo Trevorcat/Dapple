@@ -5,17 +5,18 @@ import 'package:dapple/screens/editor/pad_panel.dart' show kMinPhotoH;
 import 'package:dapple/screens/editor/pad_dock.dart' show padDockOrder;
 import 'package:dapple/screens/publish/publish_done_page.dart';
 import 'package:dapple/model/catalog.dart';
+import 'package:dapple/model/params.dart' show EGroup;
 import 'package:dapple/screens/library/styles_page.dart';
 import 'package:dapple/state/app_state.dart';
 import 'package:dapple/theme/tokens.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'editor_v2_test.dart' show open, settle;
+import 'editor_v2_test.dart' show open, settle, setView;
 import 'support/harness.dart';
 
 void main() {
-  for (final (name, w, h) in [('flip cover 360x380', 360.0, 380.0), ('wide-fold cover 400x400', 400.0, 400.0), ('phone landscape 915x412', 915.0, 412.0)]) {
+  for (final (name, w, h) in [('phone landscape 915x412', 915.0, 412.0)]) {
     testWidgets('$name: the editor panel never covers the photo or the top bar', (t) async {
       await open(t, phys: Size(w * 3, h * 3), dpr: 3);
       for (final k in padDockOrder) {
@@ -30,6 +31,31 @@ void main() {
           expect(panel.top - topBar.bottom, greaterThanOrEqualTo(kMinPhotoH), reason: '$k: the photo keeps a minimum height');
         }
       }
+    });
+  }
+
+  for (final (name, w, h) in [('flip cover 360x380', 360.0, 380.0), ('wide-fold cover 400x400', 400.0, 400.0)]) {
+    testWidgets('$name: a cover window looks, picks and shares; the editor says to open the device, the edit goes on when it is large', (t) async {
+      await open(t, phys: Size(w * 3, h * 3), dpr: 3);
+      expect(find.byKey(const ValueKey('docked-panel')), findsNothing);
+      expect(find.byKey(ValueKey('dock-${EGroup.light}')), findsNothing);
+      expect(find.byKey(const ValueKey('cover-line')), findsOneWidget);
+      for (final k in ['cover-prev', 'cover-next', 'cover-publish', 'toolbar-back']) {
+        final r = t.getRect(find.byKey(ValueKey(k)));
+        expect(r.width, greaterThanOrEqualTo(48), reason: k);
+        expect(r.height, greaterThanOrEqualTo(48), reason: k);
+        expect(r.left >= 0 && r.right <= w && r.bottom <= h, isTrue, reason: '$k inside the window');
+      }
+      final before = find.byKey(const ValueKey('zoom-stage'));
+      expect(before, findsOneWidget);
+      await t.tap(find.byKey(const ValueKey('cover-next')));
+      await settle(t, 6);
+      expect(t.takeException(), isNull);
+      // the window becomes large: the editor with its dock, same photo
+      setView(t, const Size(412 * 3, 915 * 3), 3);
+      await settle(t, 10);
+      expect(find.byKey(const ValueKey('cover-line')), findsNothing);
+      expect(find.byKey(ValueKey('dock-${EGroup.light}')), findsOneWidget);
     });
   }
 

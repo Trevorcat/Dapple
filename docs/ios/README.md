@@ -40,12 +40,32 @@ Bundle ids `com.lumi.dapple.00008020` (XR) and `com.lumi.dapple.26d2a524` (X); f
 
 ## Stubbed / missing
 
-Wireless camera transfer, codec layer (VideoToolbox), Live Photo tools: designs with the API mapping in `swift-designs.md`. The Dart stubs (`app/lib/platform/ios_services.dart`) fail gracefully. Haptics go through Flutter.
+Wireless camera transfer (the wired one is done, see "Camera on the cable"), codec layer (VideoToolbox), Live Photo tools: designs with the API mapping in `swift-designs.md`. The Dart stubs (`app/lib/platform/ios_services.dart`) fail gracefully. Haptics go through Flutter.
 
 ## Camera capture (done 2026-11-13)
 
 `DappleCapturePlugin.swift` (channel `dapple/capture`, result maps like Android: `capture` -> `{jpg?, dng?, thumb?, source:"avfoundation"}`; extra calls `available`, `permission`, `openSettings`, `capabilities`, `autoShutter` for test runs) + `app/lib/platform/ios_capture.dart` (`IosCaptureBackend`, wired by `IosPlatformServices` and by `AppState.captureBackend = PlatformServices.current.capture`). The capture screen is a native full-screen view controller (AVCaptureVideoPreviewLayer, portrait), `capture_flow.dart` / `ingestCapture` are shared with Android. Ladder RAW+JPEG -> RAW -> JPEG per lens, remembered per lens id + OS build (`UserDefaults`), ProRAW preferred over Bayer when the output supports it, flash off, orientation from the device, tap to focus / expose, vertical drag = exposure compensation, GPS only from an already granted location permission, settle = exposure / focus / white balance stop adjusting (min 0.7 s after start, 2.5 s timeout), interruptions and runtime errors handled; camera denied / restricted -> toast with Settings. The simulator reports `available=false` (no button). Capabilities per phone: `build/ios/capture/*_capture_caps.json`.
 Test drive: build with `DAPPLE_IOS_AUTOTEST=true`, push `Documents/DAPPLE_OPEN` = `{"capture":true,"documents":false,"noopen":true,"autoMs":6000,"save":false,"mode":"raw"}` (mode optional, one capture per app launch, `save:false` keeps the shot out of Photos); the shot log is `Documents/capture_log.txt`, capabilities `Documents/capture_caps.json`. Real shots through the button save the DNG + JPEG into the Photos album "Dapple" (Android parity); `queryNew` now skips that album so the shots are not ingested twice.
+
+## Camera on the cable (written 2026-11-14, NOT tested with a real camera)
+
+`DappleUsbCamPlugin.swift` (ImageCaptureCore: `ICDeviceBrowser` for cameras on the cable, `ICCameraDevice` session, `ICCameraFile` listing / thumbnails / downloads) behind the same two channels and the same event maps as the Android `UsbCameraPlugin`
+(`dapple/usbcam`: start, stop, status, requestPermission, list, thumbnail, import, cancelImport, diagnostics; `dapple/usbcam_events`: state, newShots, importQueue, importStart, importProgress, importDone, importFailed, importQueueDone). The Dart side is unchanged
+(`UsbCameraBackend`, `UsbIngest`, the picker page, the home connection card); the capability flag is `UsbCameraBackend.forPlatform()` (`app/lib/platform/usb_camera.dart`), now true on iOS, so the home card offers the wired import.
+How it behaves: the first `start` asks for contents authorization (system prompt, the app's `NSPhotoLibraryUsageDescription` and `NSCameraUsageDescription` strings now mention the camera on the cable; state `permission`, then `error: permission_denied` when refused, and
+`requestPermission` opens Settings); a camera is opened as soon as it appears (`opening`, then `ready` when the content catalogue is complete); only shots added after that are imported by themselves, older ones through the picker (`list` pages, newest first, RAW + JPEG with the same
+name in the same folder = one exposure, JPEG first); thumbnails come from `requestThumbnailData` (256 px); `import` downloads one file after another into the inbox as `name.part`, renamed when whole (a partial file is never visible; an existing file of the same size is not copied
+again; a different file of the same name gets `-<capture second>`), progress is the `NSProgress` polled every 200 ms, two failures in a row or no space (free space < file + 200 MB) abort the queue, `cancelImport` stops after the file in flight; unplug (`didRemoveDevice`, session closed by the camera)
+sweeps the `.part` files, reports `unplugged` and looks for another camera; the screen lock is held off while a queue runs. Videos are skipped (counted in `skippedVideos`), HEIF is imported as it is (ImageIO reads it).
+**Not verified (no camera and no cable in reach; the code compiles for the device and the engine of the macOS tests is untouched):** whether a camera lists RAW files in `mediaFiles` (the paired RAW of a JPEG is added when only the pair is listed), the capture dates the camera reports, the
+real download speed and progress granularity, a mid-transfer unplug, the system prompt text and whether `contentsAuthorizationStatus` alone is enough (control authorization is never requested), cameras that need "PC connect" mode, the suspend / resume of the browser in the background
+(`deviceBrowserWillSuspendOperations` is logged and the session is looked up again on resume). `diagnostics` returns the log to copy after a try.
+
+## Pending native calls
+
+* `pickVideoFile` (channel `dapple/photos`, `DappleVideoPicker.swift`; written because the Live Photo tool's Dart API was not defined yet when this was made; point the Dart caller at this name or change the Swift to the name it uses): shows the system document picker
+  (`UIDocumentPickerViewController`, movie / video types, one file, `asCopy: true`), copies the chosen file to `<app tmp>/dapple-video-pick/<name>` and returns that path as a string; `null` when the user cancels; errors `busy`, `nopicker`, `copy`. The folder is emptied on the next pick.
+  Compiles for the device; not driven on a phone (no phone work in that task).
 
 ## Driving the UI from the PC (WebDriverAgent)
 
@@ -90,3 +110,14 @@ Checklist: (1) `dm_scale`, `dm_bg`, `dm_bo16`, `dm_x0 ... dm_x4_16` compile and 
 * **Video -> Live Photo**: `DappleLivePlugin.swift` (channel `dapple/live`, same method names and maps as the Kotlin LiveBridge): PhotoKit video list, `info` / `probe`, frames and thumbnails (AVAssetImageGenerator), `trim` (AVAssetExportSession, H.264, frame exact), `findVideo`. `LivePhoto.swift`: `MediaBridge.saveToGallery` of a `*_MP.jpg` (the engine's Motion Photo: JPEG + MP4, XMP `MicroVideoOffset`) splits it, writes the Apple maker-note content identifier into the still (ImageIO, key 17), copies the MP4 samples into a MOV with `com.apple.quicktime.content.identifier` and the `still-image-time` timed-metadata track (AVAssetWriter, no re-encode), and saves both through one `PHAssetCreationRequest` (`.photo` + `.pairedVideo`). The Dart API is unchanged; `IosPlatformServices.video` is now available, so the video card on the home page and the "动态照片" entry appear.
 * **Checked on the Mac (simulator process, no Photos)**: the still carries `MakerApple 17 = <id>`, the MOV has the identifier item, a video and a `mebx` metadata track (`/tmp` harness, `xcrun simctl spawn`). **Not checked**: `PHAssetCreationRequest` accepting the pair and Photos showing the LIVE badge (needs a phone with Photos access); the tool UI on a phone.
 * **Differences to Android** (reported, not hidden): the clip is not rendered through the still's edit (`trim` ignores `edit`: an edited still gets the clip as recorded); the cover is always an SDR frame (`coverHdr` copies the SDR still); no S-Log3 / HLG interpretation; no Ultra HDR.
+
+## Pending native calls
+
+Dart side is done and waits for these; each entry says the exact call, the result and what flips on when it exists.
+
+* **`dapple/live` `pickVideoFile`** (second source of the 视频 → 实况照片 tool: a video file chosen in the system document picker, for videos that are not in Photos). Dart: `LiveBridge.pickVideoFile()` (`app/lib/services/live_bridge.dart`), `VideoPlatform.pickVideoFile()` / `canPickVideoFile` (`app/lib/platform/platform_services.dart`), the "从文件选…" row on top of the video list (`app/lib/screens/tools/live_tool_page.dart`). Android twin: `VideoPickPlugin.kt` (`ACTION_OPEN_DOCUMENT`, `video/*`).
+  * Method: `pickVideoFile`, no arguments, in `DappleLivePlugin.swift` (channel `dapple/live`).
+  * Presents `UIDocumentPickerViewController(forOpeningContentTypes: [.movie], asCopy: false)` (single selection) from the top view controller; the call stays open until the sheet is dismissed.
+  * Result: `nil` when cancelled or when the file is not a playable video (`AVURLAsset(url:)` with a zero or unreadable duration). Otherwise one map shaped exactly like a `listVideos` row: `{id: String ("doc_" + a stable hash of the URL), uri: String, name: String (lastPathComponent), durationMs: Int, size: Int (bytes, 0 if unknown), addedMs: Int (now), width: Int, height: Int}` where width / height are the displayed size (apply `preferredTransform`).
+  * `uri` must be accepted by every other `dapple/live` call that takes a `uri` (`info`, `probe`, `thumbs`, `frame`, `trim`, `coverHdr`) and by `dapple/media copyToFile`: use the file URL string (`url.absoluteString`). Call `url.startAccessingSecurityScopedResource()` before reading and keep it open for the session (or copy the file into the app's inbox and return that file URL, which also keeps "rebuild later" working after a relaunch; delete it with the Live Photo's source cleanup).
+  * Then flip `_IosVideo.canPickVideoFile` to `true` in `app/lib/platform/ios_services.dart`; the row appears by itself. Nothing else on the Dart side changes.

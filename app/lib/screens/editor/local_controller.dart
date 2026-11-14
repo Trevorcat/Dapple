@@ -712,7 +712,7 @@ class LocalController extends ChangeNotifier {
       final sel = _defaultFaces(chips);
       final all = portraitFaces.length;
       _setChips(chips, faces: sel, fill: true);
-      if (sel.length < all) _toast(kGroupMainOnly);
+      if (sel.length < all) _toast(groupToast(sel.length));
     }
     _aiNotify();
   }

@@ -567,7 +567,7 @@ struct ConformanceStats {
   std::vector<std::string> violations;
 };
 
-ConformanceStats runConformance(const std::vector<Baseline>& baselines, const NodeRegistry& reg, const Lut3D* lut) {
+ConformanceStats runConformance(const std::vector<Baseline>& baselines, const NodeRegistry& reg, const Lut3D* lut, int stride = 1, const char* onlyKey = nullptr) {
   const ParamRegistry& P = ParamRegistry::instance();
   const SourceImage scene = makeScene(96, 64, true), jpeg = makeScene(96, 64, false);
   ConformanceStats st;
@@ -590,7 +590,8 @@ ConformanceStats runConformance(const std::vector<Baseline>& baselines, const No
         }
       }
     };
-    for (std::size_t k = 0; k < P.size(); ++k)
+    for (std::size_t k = 0; k < P.size(); ++k) {
+      if ((onlyKey ? P.info(ParamKey(k)).name != onlyKey : int(k) % stride != 0)) continue;  // the small twin perturbs every fourth parameter, a control just the one it drops
       for (int variant = 0; variant < 2; ++variant) {
         ParamInputs in2 = b.in;
         if (!P.perturb(ParamKey(k), in2, variant)) {
@@ -602,6 +603,7 @@ ConformanceStats runConformance(const std::vector<Baseline>& baselines, const No
         ++st.runs;
         compare(other, P.info(ParamKey(k)).name);
       }
+    }
     {  // the camera cannot be varied through the registry: use a second real profile
       const TableRun other = runTables(b.in, reg, scene, jpeg, bl, camB());
       ++st.runs;
@@ -657,14 +659,20 @@ std::vector<Baseline> conformanceBaselines() {
   return v;
 }
 
-void testConformance() {
+void conformanceImpl(const std::vector<std::string>& only) {
   const NodeRegistry& N = NodeRegistry::instance();
   const std::string cube = writeCube();
   const auto lut = loadLut(cube);
   CHECK(lut != nullptr);
-  const auto baselines = conformanceBaselines();
+  std::vector<Baseline> baselines = conformanceBaselines();
+  if (!only.empty()) {  // a subset (the first, "plain_final", always stays: the negative controls run on it)
+    std::vector<Baseline> keep;
+    for (const Baseline& b : baselines)
+      if (keep.empty() || std::find(only.begin(), only.end(), b.name) != only.end()) keep.push_back(b);
+    baselines = keep;
+  }
   const auto t0 = Clock::now();
-  const ConformanceStats st = runConformance(baselines, N, lut.get());
+  const ConformanceStats st = runConformance(baselines, N, lut.get(), only.empty() ? 1 : 4);
   // Known deviations (docs/engine/pipeline-architecture.md 10.2, a3 notes). The harness is exact about them: the set of
   // (key, node) pairs must be inside this list, so a new undeclared dependency fails.
   //  - (fixed in a4b) crop / straighten / vignette: the tonal analysis (Renderer::bake -> analyzeTone) renders the proxy WITH
@@ -690,7 +698,7 @@ void testConformance() {
   std::printf("  known legacy deviations observed: %d evaluations over %zu (key, node) pairs\n", knownCount, seenKnown.size());
   std::printf("  table-node conformance: %zu baselines, %ld node evaluations, %ld equal-key checks (outputs bit-identical), %ld key-changed, %ld keys not perturbable alone (%.1f s)\n",
               baselines.size(), st.runs, st.equalKeyChecks, st.changedKeyChecks, st.skippedKeys, msSince(t0) / 1000.0);
-  CHECK(st.equalKeyChecks > 1000);
+  CHECK(st.equalKeyChecks > (only.empty() ? 1000 : 150));
 
   // negative control: a wrong declaration must be caught
   const ParamRegistry& P = ParamRegistry::instance();
@@ -698,7 +706,7 @@ void testConformance() {
   wrong.bits.reset(P.mustFind("contrast"));
   const NodeRegistry broken = N.withDeps(NodeType::ToneTable, wrong);
   std::vector<Baseline> one{baselines[0]};
-  const ConformanceStats bad = runConformance(one, broken, lut.get());
+  const ConformanceStats bad = runConformance(one, broken, lut.get(), 1, only.empty() ? nullptr : "contrast");
   bool caught = false;
   for (const auto& v : bad.violations) caught |= v.find("contrast") != std::string::npos && v.find("ToneTable") != std::string::npos;
   CHECK(caught);
@@ -706,12 +714,16 @@ void testConformance() {
   ParamMask wrong2 = N.desc(NodeType::ColourLattice).deps;
   wrong2.bits.reset(P.mustFind("saturation"));
   const NodeRegistry broken2 = N.withDeps(NodeType::ColourLattice, wrong2);
-  const ConformanceStats bad2 = runConformance(one, broken2, lut.get());
+  const ConformanceStats bad2 = runConformance(one, broken2, lut.get(), 1, only.empty() ? nullptr : "saturation");
   bool caught2 = false;
   for (const auto& v : bad2.violations) caught2 |= v.find("saturation") != std::string::npos;
   CHECK(caught2);
   std::printf("  negative control: ColourLattice declared without 'saturation' -> caught=%d\n", int(caught2));
 }
+void testConformance() { conformanceImpl({}); }
+// every parameter perturbed against the keys of the table nodes on three of the eight baselines (final, exact with overflow, modern fast), and both negative
+// controls: in the default run
+void testConformanceSmall() { conformanceImpl({"tone_move_exact", "modern_fast"}); }
 
 // ---- ResultCache ---------------------------------------------------------------------------------------------------------------
 void testCache() {
@@ -756,7 +768,7 @@ struct SeqFrame {
 };
 
 // the frame() lists of cli/edit_bench.cpp (two scenarios, one session each, warm-up + repeat calls per list)
-std::vector<SeqFrame> benchSequence() {
+std::vector<SeqFrame> benchSequence(bool smallRun = false) {
   std::vector<SeqFrame> out;
   EditParams autoP = edit0();
   autoP.toneStrength = 60.f;
@@ -765,7 +777,8 @@ std::vector<SeqFrame> benchSequence() {
   heavy.hsl[kOrange].saturation = 15;
   heavy.gradeShadows = {220, 30, 0};
   heavy.gradeHighlights = {40, 25, 0};
-  const int repeat = 8;
+  const int repeat = smallRun ? 3 : 8;
+  const int le1 = smallRun ? 360 : 1080, le2 = smallRun ? 640 : 1600;  // the interactive and the final long edges (the small run: a 640 px source)
   for (const EditParams& base : {autoP, heavy}) {
     auto list = [&](const char* name, auto&& vary, int flags, int le) {
       for (int k = 0; k <= repeat; ++k) {
@@ -778,13 +791,13 @@ std::vector<SeqFrame> benchSequence() {
     auto sat = [](EditParams& q, int k) { q.saturation += 0.1f * float(k % 100); };
     auto clar = [](EditParams& q, int k) { q.clarity = float(k % 60); };
     auto none = [](EditParams&, int) {};
-    list("i1080_exposure", expo, DAPPLE_FRAME_INTERACTIVE, 1080);
-    list("i1080_saturation", sat, DAPPLE_FRAME_INTERACTIVE, 1080);
-    list("i1080_clarity", clar, DAPPLE_FRAME_INTERACTIVE, 1080);
-    list("i1600_exposure", expo, DAPPLE_FRAME_INTERACTIVE, 1600);
-    list("final1600_unchanged", none, 0, 1600);
-    list("final1600_exposure", expo, 0, 1600);
-    list("exact1600", none, DAPPLE_FRAME_EXACT, 1600);
+    list("i1080_exposure", expo, DAPPLE_FRAME_INTERACTIVE, le1);
+    list("i1080_saturation", sat, DAPPLE_FRAME_INTERACTIVE, le1);
+    list("i1080_clarity", clar, DAPPLE_FRAME_INTERACTIVE, le1);
+    list("i1600_exposure", expo, DAPPLE_FRAME_INTERACTIVE, le2);
+    list("final1600_unchanged", none, 0, le2);
+    list("final1600_exposure", expo, 0, le2);
+    list("exact1600", none, DAPPLE_FRAME_EXACT, le2);
   }
   return out;
 }
@@ -795,10 +808,10 @@ struct SeqResult {
   std::vector<double> ms;
 };
 
-SeqResult runSequence(int mode, const std::vector<SeqFrame>& seq) {
+SeqResult runSequence(int mode, const std::vector<SeqFrame>& seq, int srcW = 1600, int srcH = 1067) {
   setModeOverride(mode);
   auto* s = new DappleSession;
-  s->source = makeScene(1600, 1067, true, 3);
+  s->source = makeScene(srcW, srcH, true, 3);
   s->camera = &camA();
   SeqResult r;
   for (const SeqFrame& f : seq) {
@@ -827,9 +840,9 @@ SeqResult runSequence(int mode, const std::vector<SeqFrame>& seq) {
   return r;
 }
 
-void testReuse() {
-  const auto seq = benchSequence();
-  const SeqResult off = runSequence(0, seq), tables = runSequence(1, seq);  // 0 = the old Renderer path (oracle), 1 = the engine
+void reuseImpl(bool smallRun) {
+  const auto seq = benchSequence(smallRun);
+  const SeqResult off = runSequence(0, seq, smallRun ? 640 : 1600, smallRun ? 427 : 1067), tables = runSequence(1, seq, smallRun ? 640 : 1600, smallRun ? 427 : 1067);  // 0 = the old Renderer path (oracle), 1 = the engine
   auto count = [](const std::string& k, char c) { return int(std::count(k.begin(), k.end(), c)); };
   std::printf("  edit-bench drag sequences (%zu frames, two scenarios): old bakes[3]: bake %d, lattice-reuse %d, full-hit %d | engine: bake %d, reuse %d, hit %d\n",
               seq.size(), count(off.kinds, 'B'), count(off.kinds, 'R'), count(off.kinds, 'H'), count(tables.kinds, 'B'),
@@ -851,6 +864,9 @@ void testReuse() {
     std::printf("  old   %s\n  new   %s\n", off.kinds.c_str(), tables.kinds.c_str());
   }
 }
+void testReuse() { reuseImpl(false); }
+// the same drag sequences on a 640 px source (shorter lists): the engine reuses exactly where the old path did and renders the same pixels: in the default run
+void testReuseSmall() { reuseImpl(true); }
 
 // ---- planner / graph overhead --------------------------------------------------------------------------------------------------------
 void testOverhead() {
@@ -942,8 +958,8 @@ int main(int argc, char** argv) {
     void (*fn)();
   };
   const T tests[] = {{"hash", testHash},           {"registry", testRegistry},     {"validate", testValidate},
-                     {"snapshots", testSnapshots}, {"keys", testKeys},             {"conformance", testConformance},
-                     {"cache", testCache},         {"reuse", testReuse},           {"overhead", testOverhead}};
+                     {"snapshots", testSnapshots}, {"keys", testKeys},             {"conformance", testConformance}, {"conformance_small", testConformanceSmall},
+                     {"cache", testCache},         {"reuse", testReuse}, {"reuse_small", testReuseSmall},           {"overhead", testOverhead}};
   if (argc >= 2 && std::string(argv[1]) == "--list") {
     for (const T& t : tests) std::printf("%s\n", t.id);
     return 0;

@@ -32,6 +32,7 @@ class MainActivity : FlutterActivity() {
     private var viewPlugin: DappleViewPlugin? = null
     private var capturePlugin: CapturePlugin? = null
     private var pickPlugin: PhotoPickPlugin? = null
+    private var videoPick: VideoPickPlugin? = null
     private var usbPlugin: UsbCameraPlugin? = null
     private var memoryPlugin: MemoryPlugin? = null
 
@@ -44,6 +45,7 @@ class MainActivity : FlutterActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (capturePlugin?.onActivityResult(requestCode, resultCode, data) == true) return
         if (pickPlugin?.onActivityResult(requestCode, resultCode, data) == true) return
+        if (videoPick?.onActivityResult(requestCode, resultCode, data) == true) return
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
     }
@@ -69,6 +71,8 @@ class MainActivity : FlutterActivity() {
 
         // "从相册选择" / "从文件选择": system photo picker and document picker (PhotoPickPlugin.kt), same channel and result rows as iOS
         pickPlugin = PhotoPickPlugin(this, messenger)
+        // a video file from the document picker, second source of the Motion Photo tool (VideoPickPlugin.kt, call dapple/live pickVideoFile)
+        videoPick = VideoPickPlugin(this)
 
         // Camera on the USB-C cable: android.mtp.MtpDevice (UsbCameraPlugin.kt), channels dapple/usbcam + dapple/usbcam_events
         usbPlugin = UsbCameraPlugin(this, messenger)
@@ -185,6 +189,7 @@ class MainActivity : FlutterActivity() {
                 }
             }
             when (call.method) {
+                "pickVideoFile" -> videoPick!!.pick(result)
                 "listVideos" -> { val n = call.argument<Int>("limit") ?: 50; run { live.listVideos(n) } }
                 "info" -> { val u = call.argument<String>("uri")!!; run { live.info(u) } }
                 "probe" -> { val u = call.argument<String>("uri")!!; run { live.probe(u) } }

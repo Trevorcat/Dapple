@@ -226,7 +226,7 @@ class _SettingsPageState extends State<SettingsPage> {
           return [
             _row(context, '手机相册',
                 key: 'photo-access',
-                sub: app.mediaLimited ? '只能读取你选的照片' : (app.mediaPermitted ? '当前照片来源' : '未允许访问照片'),
+                sub: app.mediaLimited ? '只能读取你选的照片' : (app.mediaPermitted ? '当前照片来源' : (app.mediaAddOnly ? '只能存入照片，读不到相册' : '未允许访问照片')),
                 leading: Dot(app.mediaPermitted ? c.okIcon : c.track),
                 trailing: app.mediaLimited
                     ? ActionChip32('选择更多', onPressed: () => app.chooseMorePhotos())

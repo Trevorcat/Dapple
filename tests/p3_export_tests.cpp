@@ -118,19 +118,23 @@ static void oklch(const float s[3], float& L, float& C, float& hDeg) {
 static constexpr int kW = 1800, kH = 1200, kPatch = 24;
 // Flat 24 px patches, compared on their 12 px interiors: the exported JPEG (4:2:0 chroma) is faithful there, so the numbers below measure the colour
 // pipeline, not the codec.
+static int g_colStep = 1;  // the small twins keep every third hue column of the chart (one patch in three, the same colours): a third of the pixels
 static bool interior(std::size_t i) {
-  const int x = int(i % kW) % kPatch, y = int(i / kW) % kPatch;
+  const int cw = kW / g_colStep;
+  const int x = int(i % std::size_t(cw)) % kPatch, y = int(i / std::size_t(cw)) % kPatch;
   return x >= 6 && x < 18 && y >= 6 && y < 18;
 }
 static Image8 makeChart(float maxChroma) {
   Image8 im;
-  im.width = kW;
+  const int cw = kW / g_colStep;
+  im.width = cw;
   im.height = kH;
-  im.data.assign(std::size_t(kW) * kH * 3, 0);
+  im.data.assign(std::size_t(cw) * kH * 3, 0);
   const int bandH = 360, rampY = 3 * bandH;
   const float Ls[3] = {0.35f, 0.55f, 0.75f};
   for (int y = 0; y < kH; ++y)
-    for (int x = 0; x < kW; ++x) {
+    for (int xc = 0; xc < cw; ++xc) {
+      const int x = (xc / kPatch) * kPatch * g_colStep + xc % kPatch;  // the column of the full chart this one stands for
       float p[3];
       if (y < rampY) {
         const int b = y / bandH;
@@ -144,7 +148,7 @@ static Image8 makeChart(float maxChroma) {
         const float g = srgbDecode(float(x / kPatch * kPatch + kPatch / 2) / (kW - 1));
         p[0] = p[1] = p[2] = g;
       }
-      for (int c = 0; c < 3; ++c) im.data[(std::size_t(y) * kW + x) * 3 + c] = std::uint8_t(srgbEncode(std::clamp(p[c], 0.f, 1.f)) * 255.f + 0.5f);
+      for (int c = 0; c < 3; ++c) im.data[(std::size_t(y) * cw + xc) * 3 + c] = std::uint8_t(srgbEncode(std::clamp(p[c], 0.f, 1.f)) * 255.f + 0.5f);
     }
   return im;
 }
@@ -388,7 +392,8 @@ struct Direct {
   float maxShare = 0.f;                 // > 0: only colours whose boundary share (P3 result) is below it (the modern chroma compression)
   const char* maskParams = nullptr;     // the pixels to leave out are those of this edit's P3 render (the vignette darkens a colour into sRGB afterwards)
 };
-static void testInsideDirect() {
+static bool wanted(const std::vector<std::string>& only, const char* name) { return only.empty() || std::find(only.begin(), only.end(), std::string(name)) != only.end(); }
+static void insideDirectImpl(const std::vector<std::string>& only) {
   const Direct cases[] = {
       {"standard", "{}", 0.40f, 0.05},
       {"contrast+sat+vib+highlights", "{\"contrast\":40,\"saturation\":25,\"vibrance\":30,\"highlights\":-30}", 0.40f, 0.05},
@@ -413,6 +418,7 @@ static void testInsideDirect() {
       {"modern_soft", "{\"film\":\"modern_soft\"}", 0.40f, 1.0, 0.85f},
   };
   for (const Direct& c : cases) {
+    if (!wanted(only, c.name)) continue;
     const SourceImage src = chartSource(c.maxChroma);
     const ImageF sr = renderDirect(src, c.params, 0), p3 = renderDirect(src, c.params, 1);
     const ImageF p3m = c.maskParams ? renderDirect(src, c.maskParams, 1) : ImageF();
@@ -437,6 +443,13 @@ static void testInsideDirect() {
     CHECK(st.max <= c.maxBound);
   }
 }
+static void testInsideDirect() { insideDirectImpl({}); }
+// one edit of each kind (tone and colour, HSL, grade, a vignette that darkens into sRGB, a look, a modern chroma compression): P3 against sRGB in the float pipeline
+static void testInsideDirectSmall() {
+  g_colStep = 3;
+  insideDirectImpl({"standard", "hsl + temp + tint", "vignette", "look cool", "modern_vivid"});
+  g_colStep = 1;
+}
 
 struct Case {
   const char* name;
@@ -444,7 +457,7 @@ struct Case {
   float maxChroma;
   double maxBound, meanBound;
 };
-static void testInside() {
+static void insideImpl(const std::vector<std::string>& only) {
   // Film stocks (and their blend with the normal render) go through the C API: they are rendered as sRGB and converted (see c_api.cpp), measured on
   // the exported JPEGs (flat patches; the 8-bit grids of both files are allowed for, see quantAllow).
   if (!dapple_film_list_json) return;
@@ -455,12 +468,14 @@ static void testInside() {
       {"film portra with grain", "{\"film\":\"kodak_portra_400\"}", 0.40f, 4.0, 0.15},
   };
   for (const Case& c : cases) {
-    const fs::path f = chartPath(c.maxChroma, c.maxChroma > 0.2f ? "chart.jpg" : "chart_low.jpg");
+    if (!wanted(only, c.name)) continue;
+    const std::string sfx = g_colStep > 1 ? "_s" : "";  // the small twin runs beside the full test: its own files
+    const fs::path f = chartPath(c.maxChroma, (std::string(c.maxChroma > 0.2f ? "chart" : "chart_low") + sfx + ".jpg").c_str());
     Session S(f);
     CHECK(S.s != nullptr);
     if (!S.s) return;
-    const Rgb8 p3 = S.exportAs(c.params, "p3", 0, nullptr, "i_p3.jpg");
-    const Rgb8 sr = S.exportAs(c.params, "srgb", 0, nullptr, "i_sr.jpg");
+    const Rgb8 p3 = S.exportAs(c.params, "p3", 0, nullptr, ("i_p3" + sfx + ".jpg").c_str());
+    const Rgb8 sr = S.exportAs(c.params, "srgb", 0, nullptr, ("i_sr" + sfx + ".jpg").c_str());
     Stats st, ex;
     std::size_t nOut = 0, n = 0;
     insideStats(p3, sr, st, ex, &nOut, &n);
@@ -470,6 +485,13 @@ static void testInside() {
     CHECK(ex.max <= c.maxBound);
     CHECK(ex.mean() <= c.meanBound);
   }
+}
+static void testInside() { insideImpl({}); }
+// the film export through the C API in P3 against sRGB on two of the four edits (a negative stock, a blend with a look): in the default run
+static void testInsideSmall() {
+  g_colStep = 3;
+  insideImpl({"film velvia, no grain", "film portra half + teal"});
+  g_colStep = 1;
 }
 
 static void testHue() {
@@ -777,7 +799,9 @@ int main(int argc, char** argv) {
   else if (id == "tags") testTags();
   else if (id == "chroma") testChroma();
   else if (id == "inside") testInside();
+  else if (id == "inside_small") testInsideSmall();
   else if (id == "direct") testInsideDirect();
+  else if (id == "direct_small") testInsideDirectSmall();
   else if (id == "hue") testHue();
   else if (id == "parity") testParity();
   else if (id == "hdr") testHdr();

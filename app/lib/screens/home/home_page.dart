@@ -101,16 +101,20 @@ class _HomePageState extends State<HomePage> {
         else
           for (final g in groups) ...[
             SliverToBoxAdapter(child: _GroupHeader(app: app, group: g)),
-            SliverGrid(
-              delegate: SliverChildBuilderDelegate(
-                (context, i) => PhotoTile(app: app, photo: g.photos[i]),
-                childCount: g.photos.length,
+            // wide windows: the grid keeps the page margins (the title, the cards and the group headers sit on them), both sides
+            SliverPadding(
+              padding: EdgeInsets.symmetric(horizontal: widget.wide ? Sp.l : 0),
+              sliver: SliverGrid(
+                delegate: SliverChildBuilderDelegate(
+                  (context, i) => PhotoTile(app: app, photo: g.photos[i]),
+                  childCount: g.photos.length,
+                ),
+                gridDelegate: widget.wide
+                    ? const SliverGridDelegateWithMaxCrossAxisExtent(
+                        maxCrossAxisExtent: 126, mainAxisSpacing: Sp.grid, crossAxisSpacing: Sp.grid)
+                    : const SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: 3, mainAxisSpacing: Sp.grid, crossAxisSpacing: Sp.grid),
               ),
-              gridDelegate: widget.wide
-                  ? const SliverGridDelegateWithMaxCrossAxisExtent(
-                      maxCrossAxisExtent: 126, mainAxisSpacing: Sp.grid, crossAxisSpacing: Sp.grid)
-                  : const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 3, mainAxisSpacing: Sp.grid, crossAxisSpacing: Sp.grid),
             ),
           ],
         SliverToBoxAdapter(child: SizedBox(height: bottomPad)),

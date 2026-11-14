@@ -57,10 +57,24 @@ class PadDock extends StatelessWidget {
   }
 }
 
+/// Why a greyed dock category has nothing to show right now and what to do, one plain line; null when the category is not greyed
+/// (nothing is said then).
+String? dockDimReason(EditorController ctl, EGroup g) {
+  if (g == EGroup.local) return ctl.edit.local.isEmpty ? '还没有区域，点「+」新建' : null;
+  final pc = PadCatX.ofGroup(g);
+  if (pc == null) return null;
+  if (pc == PadCat.film && ctl.edit.film == null) return '还没有选成像，在面板里选一个';
+  if (padViewOf(ctl.edit, pc, ctl.padCtx).a < 0.02) return '现在是 0，拖动盘面开始调整';
+  return null;
+}
+
 class DockItem extends StatefulWidget {
-  const DockItem({super.key, required this.ctl, required this.group});
+  const DockItem({super.key, required this.ctl, required this.group, this.holdToAdjust = true});
   final EditorController ctl;
   final EGroup group;
+
+  /// False where the hold popup has no place to rise from (the fold layouts' column): a tap still opens the category.
+  final bool holdToAdjust;
 
   @override
   State<DockItem> createState() => _DockItemState();
@@ -84,7 +98,7 @@ class _DockItemState extends State<DockItem> {
 
   void _begin() {
     final c = cat;
-    if (c == null || !_down || _holding) return;
+    if (c == null || !_down || _holding || !widget.holdToAdjust) return;
     _holding = true;
     ctl.holdBegin(c, _startGlobal.dx);
   }
@@ -97,13 +111,13 @@ class _DockItemState extends State<DockItem> {
     _start = e.position;
     _startGlobal = e.position;
     _timer?.cancel();
-    if (cat != null) _timer = Timer(kHoldDelay, _begin);
+    if (cat != null && widget.holdToAdjust) _timer = Timer(kHoldDelay, _begin);
   }
 
   void _onMove(PointerMoveEvent e) {
     if (e.pointer != _pointer) return;
     final d = e.position - _start;
-    if (!_holding && cat != null && d.distance > kHoldSlop) {
+    if (!_holding && cat != null && widget.holdToAdjust && d.distance > kHoldSlop) {
       _timer?.cancel();
       _begin();
     }
@@ -120,7 +134,10 @@ class _DockItemState extends State<DockItem> {
     if (wasHolding) {
       ctl.holdEnd();
     } else if (!cancelled) {
+      final why = dockDimReason(ctl, widget.group);
       ctl.openCategory(widget.group);
+      // after the switch: a tab change clears the previous page's toast
+      if (why != null) ctl.app.showToast(why);
     }
   }
 
@@ -157,7 +174,7 @@ class _DockItemState extends State<DockItem> {
     return Semantics(
       selected: on,
       button: true,
-      label: local ? '$label${areas.isEmpty ? '' : '，${areas.length} 个区域'}${la == null ? '' : '，强度 ${localStripPercent(la, localUiOf(la).a).round()}%'}' : (pc == null ? label : '$label，${padReadout(pc, s, ctx: ctl.padCtx)}${adjusted ? '，已调整' : ''}，按住拖动直接调整'),
+      label: local ? '$label${areas.isEmpty ? '' : '，${areas.length} 个区域'}${la == null ? '' : '，强度 ${localStripPercent(la, localUiOf(la).a).round()}%'}' : (pc == null ? label : '$label，${padReadout(pc, s, ctx: ctl.padCtx)}${adjusted ? '，已调整' : ''}${widget.holdToAdjust ? '，按住拖动直接调整' : ''}'),
       excludeSemantics: true,
       onTap: () => ctl.openCategory(g),
       child: Listener(

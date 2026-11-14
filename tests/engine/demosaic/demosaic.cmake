@@ -25,7 +25,7 @@ foreach(_t flat edges zoneplate blockzone hotpixel hotfilter clip tiles threads 
   set_tests_properties(demosaic.${_t} PROPERTIES TIMEOUT 600)
 endforeach()
 # the decoder's mosaic path on the public sample files (skipped, exit 77, when build/rawsamples is absent)
-foreach(_t wire_region wire_anchor wire_anchor_fast wire_preview wire_cache wire_cancel half_real)
+foreach(_t wire_region wire_region_small wire_anchor wire_anchor_small wire_anchor_fast wire_preview wire_preview_small wire_cache wire_cancel half_real half_real_small)
   add_test(NAME demosaic.${_t} COMMAND dapple_demosaic_tests ${_t} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(demosaic.${_t} PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
 endforeach()

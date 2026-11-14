@@ -27,12 +27,14 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
     private static var viewPlugin: DappleViewPlugin?
     private static var capturePlugin: DappleCapturePlugin?
     private static var livePlugin: DappleLivePlugin?
+    private static var usbCamPlugin: DappleUsbCamPlugin?
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         let p = DappleEnginePlugin()
         viewPlugin = DappleViewPlugin(registrar: registrar)  // dapple/view (zero-copy display)
         capturePlugin = DappleCapturePlugin(registrar: registrar)  // dapple/capture (AVFoundation)
         livePlugin = DappleLivePlugin(registrar: registrar)  // dapple/live (video -> Live Photo tool: AVFoundation)
+        usbCamPlugin = DappleUsbCamPlugin(registrar: registrar)  // dapple/usbcam (camera on the cable: ImageCaptureCore)
         startGpu()
         FlutterMethodChannel(name: "dapple/media", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handleMedia)
         FlutterMethodChannel(name: "dapple/photos", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handlePhotos)
@@ -253,6 +255,14 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         }
     }
 
+    /// Read access as the app sees it. "仅添加" in Settings leaves the read-write level at denied while the add-only level is authorized:
+    /// that is saving allowed, not a refusal, and is reported as "addOnly".
+    private func readStatusName() -> String {
+        let rw = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if rw == .denied && PHPhotoLibrary.authorizationStatus(for: .addOnly) == .authorized { return "addOnly" }
+        return statusName(rw)
+    }
+
     private func topViewController() -> UIViewController? {
         var vc = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.windows.first(where: { $0.isKeyWindow })?.rootViewController }.first
         while let p = vc?.presentedViewController { vc = p }
@@ -264,7 +274,7 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         switch call.method {
         case "authorizationStatus":
             registerObserverIfAllowed()
-            result(statusName(PHPhotoLibrary.authorizationStatus(for: .readWrite)))
+            result(readStatusName())
         case "testRun":
             Self.testRunActive = (a["active"] as? Bool) ?? false
             result(nil)
@@ -272,12 +282,14 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
             // only while this launch is a test run (the Dart side consumed a one-shot trigger and said so): nobody can answer the prompt then.
             // A trigger file in Documents never matters by itself: a normal launch always shows the system prompt.
             if Self.testRunActive {
-                return result(statusName(PHPhotoLibrary.authorizationStatus(for: .readWrite)))
+                return result(readStatusName())
             }
-            PHPhotoLibrary.requestAuthorization(for: .readWrite) { s in DispatchQueue.main.async { self.registerObserverIfAllowed(); result(self.statusName(s)) } }
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { s in DispatchQueue.main.async { self.registerObserverIfAllowed(); result(s == .denied ? self.readStatusName() : self.statusName(s)) } }
         case "presentLimitedLibraryPicker":
             if let vc = topViewController() { PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: vc) }
             result(nil)
+        case "pickVideoFile":
+            DappleVideoPicker.shared.pick(from: topViewController(), result: result)
         case "pick":
             // System picker (PHPicker): runs out of process, needs no permission. The chosen originals are copied into `dest` (the app inbox).
             guard pickResult == nil, let vc = topViewController() else { return result(FlutterError(code: "busy", message: "picker not available", details: nil)) }

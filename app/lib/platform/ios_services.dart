@@ -41,6 +41,11 @@ class _IosVideo implements VideoPlatform {
   bool get available => true;
   @override
   Future<List<VideoItem>> listVideos({int limit = 50}) => LiveBridge.listVideos(limit: limit);
+  // the document picker needs the native call `pickVideoFile` (docs/ios/README.md, "pending native calls"): off until it exists, then true
+  @override
+  bool get canPickVideoFile => false;
+  @override
+  Future<VideoItem?> pickVideoFile() => LiveBridge.pickVideoFile();
   @override
   Future<Map<String, dynamic>> probe(String uri) => LiveBridge.probe(uri);
   @override

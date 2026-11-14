@@ -91,11 +91,8 @@ List<FilmDot> paintOrder(List<FilmDot> dots, Size size, Offset? u, String? sel) 
 }
 
 class FilmMapView extends StatefulWidget {
-  const FilmMapView({super.key, required this.ctl, this.persistent = false});
+  const FilmMapView({super.key, required this.ctl});
   final EditorController ctl;
-
-  /// The map is the category's home (the fold layouts): a choice keeps it open instead of returning to the pad.
-  final bool persistent;
 
   @override
   State<FilmMapView> createState() => _FilmMapViewState();
@@ -194,7 +191,7 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
     if (cancelled) return;
     // the choice is final: once the map has shrunk back, return to the film pad
     shrink.whenComplete(() {
-      if (mounted && !_active && !widget.persistent && ctl.filmMapOpen) ctl.setFilmMap(false);
+      if (mounted && !_active && ctl.filmMapOpen) ctl.setFilmMap(false);
     });
   }
 
