@@ -55,6 +55,10 @@ void main() {
     final before = app.allPhotos.length;
     await tester.tap(find.byKey(const ValueKey('import-button')));
     await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 900));
+    // the "+" sheet (sources and the manual tool entries) opens whenever there is more than one thing to choose
+    if (find.byKey(const ValueKey('import-photos')).evaluate().isNotEmpty) await tester.tap(find.byKey(const ValueKey('import-photos')));
+    await tester.pump(const Duration(milliseconds: 100));
     await tester.pump(const Duration(milliseconds: 600));
     expect(app.allPhotos.length, before + 2);
     expect(find.byType(EditorPage), findsNothing);

@@ -233,10 +233,12 @@ void main() {
       final withTool = stageRect(t);
       void tools(String what) {
         final tr = t.getRect(key('local-tools'));
-        final st = stageRect(t), pn = panelRect(t);
+        final pn = panelRect(t);
         // the stage keeps the symmetric system insets around the photo (photoPad): the drawn photo ends that far above its bottom
-        final photoBottom = st.bottom - (sizes[s]!.$2 > sizes[s]!.$3 ? sizes[s]!.$2 : sizes[s]!.$3);
+        // (the photo is centred in the region above the strip's line and the strip hangs directly under the photo's lower edge)
+        final photoBottom = t.getRect(key('local-handles')).bottom;
         expect(tr.top, greaterThanOrEqualTo(photoBottom - 0.5), reason: '$what: not over the photo (photo ends $photoBottom, strip ${tr.top})');
+        expect(tr.top - photoBottom, lessThan(16), reason: '$what: attached to the photo, no detached gap');
         expect(tr.overlaps(pn.deflate(1)), isFalse, reason: '$what: not over the panel');
         expect(tr.height, greaterThanOrEqualTo(48));
         expect(tr.left, greaterThanOrEqualTo(0));

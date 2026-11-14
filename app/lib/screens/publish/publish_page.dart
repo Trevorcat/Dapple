@@ -570,8 +570,8 @@ class _PublishPageState extends State<PublishPage> {
           if (v != null && mounted) setState(() => _size = v);
         }, sub: _sizeDims()),
         switchRow('row-loc', 'switch-loc', '去除位置信息', _strip, (v) => setState(() => _strip = v)),
-        if (_p3Available) switchRow('row-cs', 'switch-cs', '颜色更鲜艳', _p3, (v) => setState(() => _p3 = v)),
-        if (_hdrAvailable) switchRow('row-hdr', 'switch-hdr', '高光更亮', _hdr, (v) => setState(() => _hdr = v)),
+        if (_p3Available) switchRow('row-cs', 'switch-cs', '广色域（P3）', _p3, (v) => setState(() => _p3 = v)),
+        if (_hdrAvailable) switchRow('row-hdr', 'switch-hdr', 'HDR 输出', _hdr, (v) => setState(() => _hdr = v)),
       ]),
     );
   }

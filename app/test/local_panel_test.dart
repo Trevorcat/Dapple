@@ -463,8 +463,11 @@ void main() {
           await back(t);
           await tapKey(t, 'items-button');
           expect(t.takeException(), isNull, reason: 'items');
+          // a window too low for photo + the itemised panel (landscape phone): the panel body scrolls under the photo's minimum height
+          await t.ensureVisible(find.byKey(const ValueKey('local-group-detail')));
           await tapKey(t, 'local-group-detail');
           expect(t.takeException(), isNull, reason: 'items detail');
+          await t.ensureVisible(find.byKey(const ValueKey('header-back')));
           await tapKey(t, 'header-back');
           await tapKey(t, 'local-add');
           await addViaCard(t, 'brush');

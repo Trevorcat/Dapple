@@ -311,6 +311,8 @@ class _EntryCards extends StatelessWidget {
           subtitle: g.subtitle,
           photos: [for (final id in g.photoIds) ?app.photoById(id)],
           onTap: () => openMergeTool(context, app, app.draftForGroup(g)),
+          // a wrong detection is corrected here (not a group: gone, remembered for this group) or inside the tool (从全部照片中选…)
+          onDismiss: () => app.dismissDetected(g),
         ),
       if (v != null)
         _EntryRow(
@@ -325,16 +327,17 @@ class _EntryCards extends StatelessWidget {
 }
 
 class _EntryRow extends StatelessWidget {
-  const _EntryRow({super.key, required this.title, required this.subtitle, required this.photos, required this.onTap});
+  const _EntryRow({super.key, required this.title, required this.subtitle, required this.photos, required this.onTap, this.onDismiss});
   final String title;
   final String subtitle;
   final List<Photo> photos;
   final VoidCallback onTap;
+  final VoidCallback? onDismiss;
 
   @override
   Widget build(BuildContext context) {
     final c = context.c;
-    return Semantics(
+    final main = Semantics(
       button: true,
       label: '$title，$subtitle',
       excludeSemantics: true,
@@ -383,6 +386,12 @@ class _EntryRow extends StatelessWidget {
         ),
       ),
     );
+    if (onDismiss == null) return main;
+    return Row(children: [
+      Expanded(child: main),
+      KeyedSubtree(key: const ValueKey('entry-dismiss'), child: DIconButton(DI.close, label: '不是一组', color: c.text2, onPressed: onDismiss)),
+      const SizedBox(width: Sp.xs),
+    ]);
   }
 }
 

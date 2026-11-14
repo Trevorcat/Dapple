@@ -322,7 +322,13 @@ class _StylesPageState extends State<StylesPage> {
       children: [
         SizedBox(
           width: 340,
-          child: Padding(padding: const EdgeInsets.all(Sp.l), child: _card(height: 240)),
+          // low windows (phone landscape): the sample column scrolls instead of overflowing, the preview shrinks with the height
+          child: LayoutBuilder(
+            builder: (context, box) => SingleChildScrollView(
+              padding: const EdgeInsets.all(Sp.l),
+              child: _card(height: (box.maxHeight - 2 * Sp.l - 130).clamp(110.0, 240.0)),
+            ),
+          ),
         ),
         Expanded(
           child: ListView(

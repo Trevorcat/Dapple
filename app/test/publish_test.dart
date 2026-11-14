@@ -245,15 +245,15 @@ void main() {
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-hdr')), findsNothing);
-    expect(find.text('高光更亮'), findsNothing);
+    expect(find.text('HDR 输出'), findsNothing);
   });
 
-  testWidgets('HDR (高光更亮) option: off by default, plain words without an explanation, switch toggles', (tester) async {
+  testWidgets('HDR (HDR 输出) option: off by default, plain words without an explanation, switch toggles', (tester) async {
     final app = _HdrApp(1.5);
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-hdr')), findsOneWidget);
-    expect(find.text('高光更亮'), findsOneWidget);
+    expect(find.text('HDR 输出'), findsOneWidget);
     expect(find.byKey(const ValueKey('row-hdr-sub')), findsNothing);
     expect((tester.widget(find.byKey(const ValueKey('switch-hdr'))) as DSwitch).value, isFalse);
     await tester.tap(find.byKey(const ValueKey('switch-hdr')));
@@ -276,7 +276,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-cs')), findsOneWidget);
     expect(csOn(tester), isFalse);
-    expect(find.text('颜色更鲜艳'), findsOneWidget);
+    expect(find.text('广色域（P3）'), findsOneWidget);
     expect(find.byKey(const ValueKey('row-cs-sub')), findsNothing);
     await shot(tester, 'publish_phone_p3');
     await tester.tap(find.byKey(const ValueKey('row-cs')));

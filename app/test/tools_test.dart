@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:dapple/models.dart';
 import 'package:dapple/services/detection.dart';
@@ -8,8 +10,10 @@ import 'package:dapple/services/live_bridge.dart';
 import 'package:dapple/services/merge_engine.dart';
 import 'package:dapple/services/tool_models.dart';
 import 'package:dapple/screens/tools/live_tool_page.dart';
+import 'package:dapple/screens/tools/merge_tool_page.dart';
 import 'package:dapple/state/app_state.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -174,6 +178,84 @@ void main() {
       expect(find.text('0:14 · 截取 3 秒'), findsOneWidget);
       expect(app.detectedCards.length, 2);
       await shot(tester, 'home_cards');
+    });
+  });
+
+  group('manual entries and corrections', () {
+    Future<void> fixShot(WidgetTester tester, String name) async {
+      await tester.runAsync(() async {
+        final boundary = shotKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
+        final image = await boundary.toImage(pixelRatio: 2.0);
+        final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+        final f = File('../build/ui-pages-fix/$name.png');
+        f.parent.createSync(recursive: true);
+        f.writeAsBytesSync(bytes!.buffer.asUint8List());
+      });
+    }
+
+    testWidgets('the + menu has the three tools without any detection; each opens its tool with the picker', (tester) async {
+      final (app, _) = await _open(tester);
+      app.detected = [];
+      app.notifyListeners();
+      await tester.pump(_t);
+      expect(find.byKey(const ValueKey('entry-bracket-y0')), findsNothing, reason: 'nothing detected');
+      expect(find.byKey(const ValueKey('entry-panorama-y3')), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('import-button')));
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('tool-hdr')), findsOneWidget);
+      expect(find.byKey(const ValueKey('tool-pano')), findsOneWidget);
+      expect(find.byKey(const ValueKey('tool-live')), findsOneWidget);
+      await fixShot(tester, 'plus_menu_tools');
+      await tester.tap(find.byKey(const ValueKey('tool-hdr')));
+      await _settle(tester);
+      expect(find.text('HDR 合成'), findsOneWidget);
+      expect(find.text('至少选 2 张'), findsOneWidget);
+      expect(find.byKey(const ValueKey('tool-pick')), findsOneWidget, reason: 'the picker of all photos');
+      await fixShot(tester, 'manual_hdr_empty');
+      await tester.tap(find.byKey(const ValueKey('tool-pick')));
+      await _settle(tester);
+      expect(find.byType(BottomSheet), findsOneWidget);
+      app.navigatorKey.currentState!.pop();
+      await _settle(tester);
+      expect(find.byType(BottomSheet), findsNothing);
+      app.navigatorKey.currentState!.pop();
+      await _settle(tester);
+
+      await tester.tap(find.byKey(const ValueKey('import-button')));
+      await _settle(tester);
+      await tester.tap(find.byKey(const ValueKey('tool-pano')));
+      await _settle(tester);
+      expect(find.text('全景合成'), findsOneWidget);
+      expect(find.byKey(const ValueKey('tool-pick')), findsOneWidget);
+      app.navigatorKey.currentState!.pop();
+      await _settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      expect(find.byType(MergeToolPage), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('import-button')));
+      await _settle(tester);
+      await tester.tap(find.byKey(const ValueKey('tool-live')));
+      await _settle(tester);
+      expect(find.byType(LiveToolPage), findsOneWidget, reason: 'opens without a preselected video: the video picker');
+    });
+
+    testWidgets('a detected card can be dismissed (not a group), remembered; the others stay; members are changed inside the tool', (tester) async {
+      final (app, _) = await _open(tester);
+      expect(find.byKey(const ValueKey('entry-dismiss')), findsNWidgets(2), reason: 'both detected groups, not the video card');
+      await fixShot(tester, 'cards_with_dismiss');
+      await tester.tap(find.descendant(of: find.byKey(const ValueKey('entry-bracket-y0')), matching: find.byKey(const ValueKey('entry-dismiss'))));
+      await _settle(tester);
+      expect(app.detectedCards.length, 1);
+      expect(find.byKey(const ValueKey('entry-bracket-y0')), findsNothing);
+      expect(find.byKey(const ValueKey('entry-panorama-y3')), findsOneWidget);
+      expect(find.byKey(const ValueKey('entry-video')), findsOneWidget);
+      app.notifyListeners();
+      await tester.pump(_t);
+      expect(app.detectedCards.any((g) => g.kind == 'bracket'), isFalse, reason: 'stays dismissed');
+      // wrong members: the tool's own picker
+      await tester.tap(find.byKey(const ValueKey('entry-panorama-y3')));
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('tool-pick')), findsOneWidget);
     });
   });
 

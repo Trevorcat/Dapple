@@ -7,6 +7,7 @@ import 'package:dapple/model/local_adjust.dart';
 import 'package:dapple/model/local_kinds.dart' show AiBits;
 import 'package:dapple/model/portrait.dart';
 import 'package:dapple/screens/editor/local_controller.dart' show LocalBody;
+import 'package:dapple/screens/editor/local_panel.dart' show LocalToolStrip;
 import 'package:dapple/services/local_ai.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -635,6 +636,22 @@ void main() {
           expect(frameRect(t).isEmpty, isFalse);
         });
       }
+    }
+
+    for (final (name, phys, dpr) in windows) {
+      testWidgets('$name: the tool strip hangs directly under the photo, clear of it and of the panel', (t) async {
+        final fake = FakeLocalAi();
+        final r = await openPortrait(t, fake, portraitResult(), phys: phys, dpr: dpr);
+        await toPads(t, r);
+        expect(find.byType(LocalToolStrip), findsOneWidget);
+        final photo = frameRect(t);
+        final strip = t.getRect(key('local-tools'));
+        final panel = t.getRect(find.byKey(const ValueKey('docked-panel')));
+        expect(strip.top, greaterThanOrEqualTo(photo.bottom - 1), reason: 'never over the photo');
+        expect(strip.top - photo.bottom, lessThan(16), reason: 'strip attached to the photo, no detached gap');
+        if (panel.top > photo.center.dy) expect(strip.bottom, lessThanOrEqualTo(panel.top + 1), reason: 'clear of the panel');
+        expect(t.takeException(), isNull);
+      });
     }
 
     testWidgets('large text (1.6) with the chips, dark', (t) async {

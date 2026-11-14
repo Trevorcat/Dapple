@@ -45,6 +45,9 @@ const double kPanelFixedH = kPanelHandleH + kHeaderH + kPanelTopGap + kPanelBott
 /// be wider than tall).
 const double kPadComfortH = 236, kPadMinH = 150;
 
+/// The least height the photo keeps visible above the panel in a window too low for both (the panel gives way, never the photo).
+const double kMinPhotoH = 80;
+
 /// Content height of the itemised view: a radar of 80 dp radius with its names outside, plus the ruler.
 const double kRadarContentH = 290;
 
@@ -256,10 +259,17 @@ class _DockedPanelState extends State<DockedPanel> {
           _Header(ctl: ctl, group: g, cat: cat, side: widget.side, textScale: ts),
         if (!widget.collapsed)
           Expanded(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(Sp.m, kPanelTopGap, Sp.m, kPanelBottomPad),
-              child: local ? LocalBodyView(ctl: ctl, side: widget.side) : (cat == null ? CropBody(ctl: ctl) : _body(cat)),
-            ),
+            // a window too low for photo + panel gives the photo its minimum and the body less than it needs: the body keeps its least
+            // height inside a clipped, scrollable viewport instead of overflowing (docs/design/foldables.md has the real layout for it)
+            child: LayoutBuilder(builder: (context, bc) {
+              final body = Padding(
+                padding: const EdgeInsets.fromLTRB(Sp.m, kPanelTopGap, Sp.m, kPanelBottomPad),
+                child: local ? LocalBodyView(ctl: ctl, side: widget.side) : (cat == null ? CropBody(ctl: ctl) : _body(cat)),
+              );
+              final need = (ctl.itemised ? kRadarContentH : kPadMinH) + kPanelTopGap + kPanelBottomPad;
+              if (widget.side || bc.maxHeight >= need) return body;
+              return SingleChildScrollView(physics: const ClampingScrollPhysics(), child: SizedBox(height: need, child: body));
+            }),
           ),
       ]),
     );

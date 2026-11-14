@@ -87,8 +87,13 @@ class _PublishDonePageState extends State<PublishDonePage> {
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 440),
             child: Padding(
-              padding: EdgeInsets.fromLTRB(24, mq.padding.top + 24, 24, footer),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              // small windows: the page scrolls instead of overflowing; with room the spacers still centre the content
+              child: LayoutBuilder(builder: (context, box) => SingleChildScrollView(
+                  padding: EdgeInsets.only(top: mq.padding.top + 24, bottom: footer),
+                  child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: math.max(0.0, box.maxHeight - (mq.padding.top + 24) - footer)),
+                child: IntrinsicHeight(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 const Spacer(),
                 Container(
                     width: 56,
@@ -110,7 +115,7 @@ class _PublishDonePageState extends State<PublishDonePage> {
                   ),
                 const Spacer(),
                 for (var i = 0; i < buttons.length; i++) ...[if (i > 0) const SizedBox(height: 12), buttons[i]],
-              ]),
+              ]))))),
             ),
           ),
         ),

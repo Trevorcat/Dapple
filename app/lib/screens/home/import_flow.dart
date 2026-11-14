@@ -5,7 +5,9 @@ import 'package:flutter/material.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/icons.dart';
+import '../../services/tool_models.dart';
 import '../editor/editor_page.dart';
+import '../tools/launcher.dart';
 
 bool _busy = false;
 
@@ -24,9 +26,12 @@ Future<void> importAndEdit(BuildContext context, AppState app, {String source = 
 /// Only Android has a second route (the document picker, for RAW types the photo picker does not list).
 bool get canPickFiles => Platform.isAndroid;
 
-/// Top-bar "+": iOS goes straight to the album; Android asks album or files first.
+/// Top-bar "+": the sources (album, files on Android) and, as the manual way in that does not depend on detection, the three tools
+/// (HDR 合成 / 全景拼接 / 视频 → 动态照片; each offers the picker of all photos / videos inside). With nothing to choose from
+/// (iOS today: one source, no tools) it goes straight to the album.
 Future<void> importMenu(BuildContext context, AppState app) async {
-  if (!canPickFiles) return importAndEdit(context, app);
+  final merge = app.engine.available, live = app.videoLayer;
+  if (!canPickFiles && !merge && !live) return importAndEdit(context, app);
   final source = await showModalBottomSheet<String>(
     context: context,
     backgroundColor: context.c.surface,
@@ -51,11 +56,25 @@ Future<void> importMenu(BuildContext context, AppState app) async {
       return SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           row('import-photos', DI.photos, '从相册选…', 'photos'),
-          row('import-files', DI.folder, '从文件选…', 'files'),
+          if (canPickFiles) row('import-files', DI.folder, '从文件选…', 'files'),
+          if (merge || live) Divider(height: Sp.l, color: c.sep),
+          if (merge) row('tool-hdr', DI.merge, 'HDR 合成…', 'tool:hdr'),
+          if (merge) row('tool-pano', DI.merge, '全景拼接…', 'tool:pano'),
+          if (live) row('tool-live', DI.play, '视频 → 动态照片…', 'tool:live'),
           const SizedBox(height: Sp.s),
         ]),
       );
     },
   );
-  if (source != null && context.mounted) await importAndEdit(context, app, source: source);
+  if (source == null || !context.mounted) return;
+  switch (source) {
+    case 'tool:hdr':
+      return openMergeTool(context, app, MergeDraft(kind: ToolKind.hdr, sources: []));
+    case 'tool:pano':
+      return openMergeTool(context, app, MergeDraft(kind: ToolKind.pano, sources: []));
+    case 'tool:live':
+      return openLiveTool(context, app);
+    default:
+      await importAndEdit(context, app, source: source);
+  }
 }

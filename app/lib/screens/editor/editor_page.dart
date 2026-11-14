@@ -319,6 +319,19 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     // 局部: the tool strip (brush, ranges, 点选, 点一下祛斑, the parts) has a line under the photo while a tool that uses it is showing:
     // the region ends above it, the strip never lies over the photo, and with no tool the photo gets the line back (animated)
     var photoRegion = l.photoRegion;
+    // a window too low for photo + panel (flip cover, wide-fold cover): the photo keeps a minimum visible height and the panel gives
+    // way (its body shrinks / scrolls), so the panel never reaches up under the top bar or over the photo
+    if (l.place == PanelPlace.bottom && !w.collapsed) {
+      final regionBottom = dockTop - 8;
+      // 分项 is the precise layer and takes what the window has: only the top bar stays clear of it, no photo minimum
+      final maxH = ctl.itemised ? regionBottom - regionTop : regionBottom - regionTop - 8 - kMinPhotoH;
+      final minH = panelCollapsedH(e.textScale) + (w.group == EGroup.local ? kHeaderH : 0);
+      if (panel.height > maxH && panel.height > minH) {
+        final h = math.min(panel.height, math.max(maxH, minH));
+        panel = Rect.fromLTWH(panel.left, regionBottom - h, panel.width, h);
+        photoRegion = Rect.fromLTRB(photoRegion.left, regionTop, photoRegion.right, math.max(regionTop, panel.top - 8));
+      }
+    }
     if (w.group == EGroup.local && localToolsShown(ctl)) photoRegion = Rect.fromLTRB(photoRegion.left, photoRegion.top, photoRegion.right, math.max(photoRegion.top, photoRegion.bottom - toolStripH(photoRegion.width)));
     return _PanelGeo(
         region: photoRegion,
@@ -547,8 +560,11 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
           final g = _geoNow();
           if (g.group != EGroup.local || !localToolsShown(ctl)) return const SizedBox.shrink();
           final r = g.region;
-          // the reserved line ends the region; a strip that needs a second line (many parts on a narrow photo) grows upward from it
-          return Positioned(left: r.left + 8, width: math.max(0.0, r.width - 16), top: r.bottom + toolStripH(r.width) - 2 * kHit, height: 2 * kHit, child: LocalToolStrip(ctl: ctl));
+          // photo and strip are one group: the strip hangs directly under the photo's lower edge (the photo is centred in the region
+          // that already excludes the strip's line, so the group is centred); a second line grows upward from the line's bottom
+          final pr = _photoRect();
+          final photoBottom = pr.isEmpty ? r.bottom : pr.bottom;
+          return Positioned(left: r.left + 8, width: math.max(0.0, r.width - 16), top: photoBottom + toolStripH(r.width) - 2 * kHit, height: 2 * kHit, child: LocalToolStrip(ctl: ctl));
         },
       ),
       // browse-mode filmstrip on wide screens

@@ -43,10 +43,10 @@
 <text x="484.0" y="238.0" font-size="15" font-weight="400" fill="#111111" text-anchor="start">去除位置信息</text>
 <text x="872.0" y="238.0" font-size="13" font-weight="400" fill="#5E5E63" text-anchor="end">开</text>
 <line x1="484.0" y1="260.0" x2="888.0" y2="260.0" stroke="rgba(0,0,0,0.08)" stroke-width="1"/>
-<text x="484.0" y="294.0" font-size="15" font-weight="400" fill="#111111" text-anchor="start">颜色更鲜艳</text>
+<text x="484.0" y="294.0" font-size="15" font-weight="400" fill="#111111" text-anchor="start">广色域（P3）</text>
 <text x="872.0" y="294.0" font-size="13" font-weight="400" fill="#5E5E63" text-anchor="end">关</text>
 <line x1="484.0" y1="316.0" x2="888.0" y2="316.0" stroke="rgba(0,0,0,0.08)" stroke-width="1"/>
-<text x="484.0" y="350.0" font-size="15" font-weight="400" fill="#111111" text-anchor="start">高光更亮</text>
+<text x="484.0" y="350.0" font-size="15" font-weight="400" fill="#111111" text-anchor="start">HDR 输出</text>
 <text x="872.0" y="350.0" font-size="13" font-weight="400" fill="#5E5E63" text-anchor="end">关</text>
 <rect x="468.0" y="384.0" width="420.0" height="48.0" rx="12" fill="#FFF3E0"/>
 <text x="484.0" y="414.0" font-size="13" font-weight="400" fill="#8A4B00" text-anchor="start">第 3 张暗部噪点较多</text>
