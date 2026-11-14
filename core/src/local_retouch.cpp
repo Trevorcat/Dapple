@@ -577,13 +577,22 @@ void healWindow(const std::vector<SpotPx>& spots, ImageF& img) {
 // ---- retouch planes + combine (twins: local_rt_down.comp, local_retouch.comp) -------------------------------------------------------------
 namespace {
 // amounts of the six retouch W ops at plane index i: smooth, even, redness, under-eye, shine, face light
-inline void rtAmounts(const Frame& f, const AuxTarget& aux, std::size_t i, float k[6]) {
-  for (int c = 0; c < 6; ++c) k[c] = 0.f;
-  for (int c = 0; c < kLocalWindowSlots; ++c) {
-    const int op = f.chanOp[c];
-    if (op < kLoSmooth || op > kLoFaceLight || aux.slot[c] < 0) continue;
-    k[op - kLoSmooth] = aux.data[std::size_t(aux.slot[c]) * aux.plane + i];
+// (the slot -> op map resolved once per window: the amount planes of the retouch ops that have one)
+struct RtMap {
+  int n = 0;
+  const float* plane[kLocalWindowSlots];
+  int op[kLocalWindowSlots];
+  RtMap(const Frame& f, const AuxTarget& aux) {
+    for (int c = 0; c < kLocalWindowSlots; ++c) {
+      const int o = f.chanOp[c];
+      if (o < kLoSmooth || o > kLoFaceLight || aux.slot[c] < 0) continue;
+      plane[n] = aux.data + std::size_t(aux.slot[c]) * aux.plane, op[n++] = o - kLoSmooth;
+    }
   }
+};
+inline void rtAmounts(const RtMap& m, std::size_t i, float k[6]) {
+  for (int c = 0; c < 6; ++c) k[c] = 0.f;
+  for (int c = 0; c < m.n; ++c) k[m.op[c]] = m.plane[c][i];
 }
 
 // the per-pixel retouch (twin of local_retouch.comp main). Colour works on RELATIVE chroma q = (R - Y, B - Y) / Y (a saturation: the same skin
@@ -659,6 +668,29 @@ inline void bilin(const std::vector<float>& g, int lw, int lh, int ch, int x, in
     o[c] = t0 + (t1 - t0) * ty;
   }
 }
+// bilin's corners and weights for pixel (x, y), shared by the three grids of the combine (the same arithmetic as bilin: bit-identical)
+struct BilinAt {
+  std::size_t c00, c01, c10, c11;
+  float tx, ty;
+};
+inline BilinAt bilinAt(int lw, int lh, int x, int y) {
+  const float py = std::clamp((float(y) + 0.5f) / 4.f - 0.5f, 0.f, float(lh - 1));
+  const int y0 = std::min(int(py), lh - 1), y1 = std::min(y0 + 1, lh - 1);
+  const float pxf = std::clamp((float(x) + 0.5f) / 4.f - 0.5f, 0.f, float(lw - 1));
+  const int x0 = std::min(int(pxf), lw - 1), x1 = std::min(x0 + 1, lw - 1);
+  BilinAt b;
+  b.ty = py - float(y0), b.tx = pxf - float(x0);
+  b.c00 = std::size_t(y0) * lw + x0, b.c01 = std::size_t(y0) * lw + x1, b.c10 = std::size_t(y1) * lw + x0, b.c11 = std::size_t(y1) * lw + x1;
+  return b;
+}
+template <int CH>
+inline void bilinW(const float* g, const BilinAt& w, float* o) {
+  for (int c = 0; c < CH; ++c) {
+    const float a0 = g[w.c00 * CH + c], a1 = g[w.c01 * CH + c], b0 = g[w.c10 * CH + c], b1 = g[w.c11 * CH + c];
+    const float t0 = a0 + (a1 - a0) * w.tx, t1 = b0 + (b1 - b0) * w.tx;
+    o[c] = t0 + (t1 - t0) * w.ty;
+  }
+}
 }  // namespace
 
 void retouchPlanes(const Frame& f, const ImageF& img, const AuxTarget& aux, const RetouchRadii& R, RtPlanes& out) {
@@ -678,6 +710,7 @@ void retouchPlanes(const Frame& f, const ImageF& img, const AuxTarget& aux, cons
   std::vector<float>& yy = out.ab;
   std::vector<float>& S = out.S;
   yy.assign(std::size_t(lw) * lh * 2, 0.f), S.assign(std::size_t(lw) * lh * 4, 0.f);
+  const RtMap map(f, aux);
   parallelFor(lh, [&](int ly) {
     for (int lx = 0; lx < lw; ++lx) {
       const int x0 = lx * 4, y0 = ly * 4, x1 = std::min(w, x0 + 4), y1 = std::min(h, y0 + 4);
@@ -687,7 +720,7 @@ void retouchPlanes(const Frame& f, const ImageF& img, const AuxTarget& aux, cons
         for (int x = x0; x < x1; ++x) {
           for (int c = 0; c < 3; ++c) acc[c] += p[3 * x + c];
           float k[6];
-          rtAmounts(f, aux, std::size_t(y) * w + x, k);
+          rtAmounts(map, std::size_t(y) * w + x, k);
           const float om = skinWeight(k[0], k[1], k[2], k[4], k[3]);
           const float Y = kLumaS[0] * p[3 * x] + kLumaS[1] * p[3 * x + 1] + kLumaS[2] * p[3 * x + 2], Yd = std::max(Y, kRtYmin);
           sk[0] += om * Y, sk[1] += om * ((p[3 * x] - Y) / Yd), sk[2] += om * ((p[3 * x + 2] - Y) / Yd), sk[3] += om;
@@ -726,17 +759,19 @@ void retouchCombineWindow(const Frame& f, ImageF& img, const AuxTarget& aux, con
   retouchPlanes(f, img, aux, R, P);
   const int w = img.width, h = img.height, lw = P.lw, lh = P.lh;
   const std::vector<float>&Lf = P.Lf, &yy = P.ab, &S = P.S, &B = P.B;
+  const RtMap map(f, aux);
   parallelFor(h, [&](int y) {
     float* p = img.row(y);
     for (int x = 0; x < w; ++x) {
       const std::size_t i = std::size_t(y) * w + x;
       float k[6];
-      rtAmounts(f, aux, i, k);
+      rtAmounts(map, i, k);
       if (k[0] == 0.f && k[1] == 0.f && k[2] == 0.f && k[3] == 0.f && k[4] == 0.f && k[5] == 0.f) continue;
       float ab[2], ref[4], blot[4];
-      bilin(yy, lw, lh, 2, x, y, ab);
-      bilin(S, lw, lh, 4, x, y, ref);
-      bilin(B, lw, lh, 4, x, y, blot);
+      const BilinAt bw = bilinAt(lw, lh, x, y);
+      bilinW<2>(yy.data(), bw, ab);
+      bilinW<4>(S.data(), bw, ref);
+      bilinW<4>(B.data(), bw, blot);
       const float Lc = ab[0] * Lf[i] + ab[1];
       rtPixel(p + 3 * x, Lf[i], Lc, ref, blot, k);
     }

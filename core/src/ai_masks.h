@@ -127,7 +127,7 @@ ParsedId parseId(const std::string& id);
 std::string makeId(const std::string& photo, const std::string& key);
 
 // ---- cache files ----------------------------------------------------------------------------------------------------------------------
-constexpr int kEpoch = 5;  // algorithm version: bump when a builder changes (old cache files are then misses)
+constexpr int kEpoch = 6;  // algorithm version: bump when a builder changes (old cache files are then misses)
 struct SetEntry {
   std::string key;  // "hair", "f1:lips" ...
   Plane plane;
@@ -166,7 +166,8 @@ struct PersonOut {
   std::vector<std::uint8_t> prob;  // 6 x 256 x 256
 };
 Res person(const Img&, PersonOut&, const std::atomic<bool>* cancel);
-Res faces(const Img&, int maxFaces, std::vector<FaceMesh>&, const std::atomic<bool>* cancel);
+// `personMask` (optional, 0..255 plane of the person group): person regions without a validated face get extra detector windows (small and several faces)
+Res faces(const Img&, const Plane* personMask, int maxFaces, std::vector<FaceMesh>&, const std::atomic<bool>* cancel);
 struct DepthOut {
   int w = 0, h = 0;
   std::vector<float> d;

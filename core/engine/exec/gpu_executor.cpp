@@ -91,6 +91,21 @@ bool Core::ensureStaging(int slot, std::uint64_t bytes, std::string& err) {
   if (dev_->createBuffer({std::max<std::uint64_t>(bytes, 8u << 20), hal::MemKind::Upload, true}, &s.staging) != hal::Status::Ok) return err = dev_->lastError(), false;
   return true;
 }
+std::size_t Core::trimStaging() {
+  std::size_t freed = 0;
+  dev_->waitIdle();
+  for (SlotRes& s : slots_) {
+    if (s.readback) freed += std::size_t(s.readback.bytes), dev_->destroy(s.readback), s.readback = hal::BufferH{};
+    if (s.staging && s.staging.bytes > (8u << 20)) {
+      hal::BufferH small;
+      if (dev_->createBuffer({8u << 20, hal::MemKind::Upload, true}, &small) != hal::Status::Ok) continue;  // keep the large one
+      freed += std::size_t(s.staging.bytes) - (8u << 20);
+      dev_->destroy(s.staging);
+      s.staging = small;
+    }
+  }
+  return freed;
+}
 bool Core::ensureReadback(int slot, std::uint64_t bytes, std::string& err) {
   SlotRes& s = slots_[slot];
   if (s.readback.bytes >= bytes) return true;

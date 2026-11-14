@@ -10,6 +10,11 @@
 //    staging / readback buffers (the slot is idle once begin() returned);
 //  - `CommandList::flushPart()` submits what is recorded so far without a fence and goes on recording (mobile GPUs reset
 //    on submissions of a few seconds, pixel-architecture.md 16 rule 1); the scheduler decides where.
+#include <algorithm>
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <unordered_map>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -17,6 +22,45 @@
 #include <vector>
 
 namespace dapple::hal {
+
+// Device memory the backends hold right now, every device of the process (Vulkan: buffers and images; the memory report of dapple_c.h).
+// Each live allocation keeps a short tag (kind and size) so the report can say what is still held (liveMemSummary).
+inline std::atomic<std::int64_t> g_liveMemBytes{0};
+inline std::atomic<int> g_liveMemAllocs{0};
+struct LiveMemTags {
+  std::mutex m;
+  std::unordered_map<std::uint64_t, std::pair<std::int64_t, std::string>> live;
+};
+inline LiveMemTags& liveMemTags() {
+  static LiveMemTags* t = new LiveMemTags;  // never destroyed (devices may outlive static destruction)
+  return *t;
+}
+inline void liveMemAdd(std::int64_t bytes, int allocs, std::uint64_t key, const std::string* tag) {
+  g_liveMemBytes.fetch_add(bytes, std::memory_order_relaxed);
+  g_liveMemAllocs.fetch_add(allocs, std::memory_order_relaxed);
+  LiveMemTags& t = liveMemTags();
+  std::lock_guard<std::mutex> lk(t.m);
+  if (allocs > 0 && tag) t.live[key] = {bytes, *tag};
+  else if (allocs < 0) t.live.erase(key);
+}
+// "3 x img 4096x2731 f16 (128 MB), ..." largest groups first, at most `maxGroups`.
+inline std::string liveMemSummary(int maxGroups = 8) {
+  std::map<std::string, std::pair<int, std::int64_t>> g;
+  {
+    LiveMemTags& t = liveMemTags();
+    std::lock_guard<std::mutex> lk(t.m);
+    for (const auto& e : t.live) {
+      auto& v = g[e.second.second];
+      ++v.first, v.second += e.second.first;
+    }
+  }
+  std::vector<std::pair<std::int64_t, std::string>> v;
+  for (const auto& e : g) v.push_back({e.second.second, std::to_string(e.second.first) + " x " + e.first + " (" + std::to_string(e.second.second >> 20) + " MB)"});
+  std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::string out;
+  for (int i = 0; i < int(v.size()) && i < maxGroups; ++i) out += (i ? ", " : "") + v[std::size_t(i)].second;
+  return out;
+}
 
 enum class Api : std::uint8_t { Vulkan, Gles31, Metal, Null };
 enum class Status : std::uint8_t { Ok, OutOfMemory, DeviceLost, Unsupported, Timeout, InvalidArgument, Internal };

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="754" height="484" viewBox="0 0 754 484" font-family="Noto Sans SC, PingFang SC, Microsoft YaHei, sans-serif">
+<rect width="754" height="484" fill="#FAFAFA"/>
+<text x="24" y="32" font-size="20" font-weight="700" fill="#111111">B3 竖折式外屏 · 到达监视</text>
+<text x="24" y="54" font-size="13" fill="#5E5E63">外屏约 360×380 dp（示例；各家尺寸与是否允许第三方应用不同）</text>
+<g transform="translate(24,72)">
+<rect x="-6.0" y="-6.0" width="372.0" height="392.0" rx="22" fill="#FFFFFF" stroke="#C9C9CE" stroke-width="2"/>
+<rect x="0.0" y="0.0" width="360.0" height="380.0" rx="14" fill="#F2F2F2"/>
+<defs><linearGradient id="g2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F7B267"/><stop offset="0.42" stop-color="#F9DC9A"/><stop offset="0.46" stop-color="#76668A"/><stop offset="1" stop-color="#2F2B45"/></linearGradient></defs>
+<rect x="0.0" y="0.0" width="360.0" height="380.0" rx="0" fill="url(#g2)"/>
+<text x="180.0" y="273.6" font-size="15" font-weight="600" fill="#FFFFFF" text-anchor="middle">最新到达（铺满）</text>
+<rect x="12.0" y="12.0" width="176.0" height="32.0" rx="16" fill="rgba(0,0,0,0.55)"/>
+<circle cx="28.0" cy="28.0" r="4" fill="#5FD08A"/>
+<text x="40.0" y="33.0" font-size="13" font-weight="400" fill="#FFFFFF" text-anchor="start">接收中 3 / 12</text>
+<rect x="12.0" y="328.0" width="336.0" height="40.0" rx="16" fill="rgba(0,0,0,0.55)"/>
+<text x="24.0" y="353.0" font-size="12" font-weight="400" fill="#FFFFFF" text-anchor="start">DSC04233 · 1/500 · f/4 · 14:33</text>
+<circle cx="156.0" cy="316.0" r="3" fill="#FFFFFF" opacity="0.5"/>
+<circle cx="168.0" cy="316.0" r="3" fill="#FFFFFF" opacity="0.5"/>
+<circle cx="180.0" cy="316.0" r="3" fill="#FFFFFF" opacity="0.5"/>
+<circle cx="192.0" cy="316.0" r="3" fill="#FFFFFF" opacity="0.5"/>
+<circle cx="204.0" cy="316.0" r="3" fill="#FFFFFF" opacity="1"/>
+<circle cx="330.0" cy="60.0" r="11" fill="#1F5FD1" stroke="#FFFFFF" stroke-width="2"/>
+<text x="330.0" y="64.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+<circle cx="330.0" cy="190.0" r="11" fill="#1F5FD1" stroke="#FFFFFF" stroke-width="2"/>
+<text x="330.0" y="194.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+<circle cx="200.0" cy="28.0" r="11" fill="#1F5FD1" stroke="#FFFFFF" stroke-width="2"/>
+<text x="200.0" y="32.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+<circle cx="330.0" cy="290.0" r="11" fill="#1F5FD1" stroke="#FFFFFF" stroke-width="2"/>
+<text x="330.0" y="294.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">4</text>
+</g>
+<text x="424" y="86" font-size="14" font-weight="600" fill="#111111">说明</text>
+<circle cx="434" cy="106" r="10" fill="#1F5FD1"/><text x="434" y="110.5" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+<text x="452" y="110" font-size="13" fill="#111111">只做一件事：看相机刚传来的照片；不编辑、</text>
+<text x="452" y="132" font-size="13" fill="#111111">不发布</text>
+<circle cx="434" cy="150" r="10" fill="#1F5FD1"/><text x="434" y="154.5" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+<text x="452" y="154" font-size="13" fill="#111111">左右划 = 前后翻看最近到达的照片；点 =</text>
+<text x="452" y="176" font-size="13" fill="#111111">显示 / 隐藏信息</text>
+<circle cx="434" cy="194" r="10" fill="#1F5FD1"/><text x="434" y="198.5" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+<text x="452" y="198" font-size="13" fill="#111111">接收进度和连接状态在左上（实底胶囊）；</text>
+<text x="452" y="220" font-size="13" fill="#111111">失败时变成琥珀色并写原因</text>
+<circle cx="434" cy="238" r="10" fill="#1F5FD1"/><text x="434" y="242.5" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle">4</text>
+<text x="452" y="242" font-size="13" fill="#111111">打开手机 = 在内屏的编辑器里接着看这一</text>
+<text x="452" y="264" font-size="13" fill="#111111">张（同一张、同一状态）</text>
+<circle cx="434" cy="282" r="10" fill="#1F5FD1"/><text x="434" y="286.5" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle">5</text>
+<text x="452" y="286" font-size="13" fill="#111111">应用不能上外屏的机型：靠系统通知里的接</text>
+<text x="452" y="308" font-size="13" fill="#111111">收进度，不另做东西</text>
+</svg>

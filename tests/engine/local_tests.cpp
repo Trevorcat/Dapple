@@ -581,6 +581,46 @@ void testCache() {
               (unsigned long long)(c2.brushPrefixHits - c1.brushPrefixHits));
   CHECK(c2.brushBuilds - c1.brushBuilds == 2 && c2.brushPrefixHits - c1.brushPrefixHits == 2);
   CHECK(c2.rasterBuilds == c1.rasterBuilds);
+  // another session of the same photo at half size (the app's preview and zoom sessions): the refinement planes are shared (docs section
+  // 43.11); another picture of the same size and aspect gets its own
+  SourceImage half;
+  half.sceneReferred = true;
+  half.meta = src.meta;
+  half.linear = ImageF(200, 150);
+  for (int y = 0; y < 150; ++y)
+    for (int x = 0; x < 200; ++x)
+      for (int c = 0; c < 3; ++c)
+        half.linear.row(y)[3 * x + c] = 0.25f * (src.linear.row(2 * y)[6 * x + c] + src.linear.row(2 * y)[6 * x + 3 + c] + src.linear.row(2 * y + 1)[6 * x + c] +
+                                                 src.linear.row(2 * y + 1)[6 * x + 3 + c]);
+  SourceImage other = src;
+  for (int y = 0; y < 300; ++y)
+    for (int x = 0; x < 200; ++x)
+      for (int c = 0; c < 3; ++c) other.linear.row(y)[3 * x + c] *= 1.6f;
+  EngineSession es2, es3;
+  FrameResult rh, ro;
+  CHECK(cpuFrame(es2, q, half, true, rh));
+  std::free(rh.rgba);
+  const local::Counters c3 = local::counters();
+  CHECK(cpuFrame(es3, q, other, true, ro));
+  std::free(ro.rgba);
+  const local::Counters c4 = local::counters();
+  std::printf("  a half-size session of the photo: raster builds +%llu (shared); another picture: +%llu\n",
+              (unsigned long long)(c3.rasterBuilds - c2.rasterBuilds), (unsigned long long)(c4.rasterBuilds - c3.rasterBuilds));
+  CHECK(c3.rasterBuilds == c2.rasterBuilds);
+  CHECK(c4.rasterBuilds > c3.rasterBuilds);
+  // the interactive tier takes the exact tier's finer planes once they are cached (no second set of grids, no hand-over change)
+  putEdgeRaster("t_edge_big", 1024, 768, 0.45f, 6.f);
+  EditParams big = p;
+  big.local[4].mask[0].ref = "t_edge_big";
+  FrameResult rx, ri;
+  CHECK(cpuFrame(es, big, src, false, rx));
+  const local::Counters c5 = local::counters();
+  CHECK(cpuFrame(es, big, src, true, ri));
+  const local::Counters c6 = local::counters();
+  std::printf("  1024 px raster: exact frame +%llu raster builds, the interactive frame after it +%llu\n", (unsigned long long)(c5.rasterBuilds - c4.rasterBuilds),
+              (unsigned long long)(c6.rasterBuilds - c5.rasterBuilds));
+  CHECK(c5.rasterBuilds > c4.rasterBuilds && c6.rasterBuilds == c5.rasterBuilds);
+  std::free(rx.rgba), std::free(ri.rgba);
 }
 
 // ---- coords -------------------------------------------------------------------------------------------------------------------------

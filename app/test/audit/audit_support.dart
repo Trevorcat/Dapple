@@ -23,6 +23,7 @@ const sizes = <String, (Size, double, double)>{
   'p': (Size(412, 945), 36, 24),
   'l': (Size(945, 412), 0, 0),
   'f': (Size(840, 760), 36, 24),
+  's': (Size(360, 780), 36, 24), // the narrowest common phone (Samsung 2 pass: header readout at 360 dp)
 };
 
 void win(WidgetTester t, String s) {
@@ -33,6 +34,9 @@ void win(WidgetTester t, String s) {
 /// Write the PNGs (else the sweep only checks that every step lays out without an exception).
 const bool kShots = bool.fromEnvironment('SHOTS');
 
+/// Where the PNGs go (--dart-define=OUT=... for the before / after pairs of build/ui-samsung2).
+const String kOut = String.fromEnvironment('OUT', defaultValue: '../build/ui-audit');
+
 Future<void> audShot(WidgetTester t, String name) async {
   await settle(t, 6);
   expect(t.takeException(), isNull, reason: name);
@@ -41,7 +45,7 @@ Future<void> audShot(WidgetTester t, String name) async {
     final b = shotKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
     final img = await b.toImage(pixelRatio: 2.0);
     final bytes = await img.toByteData(format: ui.ImageByteFormat.png);
-    final f = File('../build/ui-audit/$name.png');
+    final f = File('$kOut/$name.png');
     f.parent.createSync(recursive: true);
     f.writeAsBytesSync(bytes!.buffer.asUint8List());
   });
@@ -49,10 +53,10 @@ Future<void> audShot(WidgetTester t, String name) async {
 
 /// The editor on a demo photo ([title]: 外滩夕阳 is 3:2 landscape, 街角咖啡 is 2:3 portrait).
 Future<({AppState app, String id, LocalController? lc})> audOpen(WidgetTester t, String size, bool dark,
-    {EGroup group = EGroup.local, LocalAi? ai, void Function(AppState, String)? before, String title = '外滩夕阳'}) async {
+    {EGroup group = EGroup.local, LocalAi? ai, void Function(AppState, String)? before, String title = '外滩夕阳', AppState? useApp}) async {
   win(t, size);
   await loadTestFonts();
-  final app = AppState.demo();
+  final app = useApp ?? AppState.demo();
   final id = app.photos.firstWhere((p) => p.title == title && p.id.startsWith('d')).id;
   before?.call(app, id);
   await t.pumpWidget(RepaintBoundary(

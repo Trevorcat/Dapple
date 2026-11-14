@@ -50,6 +50,7 @@ struct VBuffer {
   VkBuffer buf = VK_NULL_HANDLE;
   VkDeviceMemory mem = VK_NULL_HANDLE;
   VkDeviceSize size = 0;
+  VkDeviceSize memBytes = 0;  // the allocation (liveDeviceMemory)
   void* mapped = nullptr;
   bool coherent = true;
   std::uint64_t id = 0;
@@ -59,6 +60,7 @@ struct VImage {
   VkImageView view = VK_NULL_HANDLE;
   VkDeviceMemory mem = VK_NULL_HANDLE;
   VkFormat fmt = VK_FORMAT_UNDEFINED;
+  VkDeviceSize memBytes = 0;  // the allocation (liveDeviceMemory)
   std::uint64_t id = 0;
   bool inited = false;  // moved out of UNDEFINED into GENERAL (lazily, in the first command buffer that uses it)
 };
@@ -620,6 +622,11 @@ Status VkDev::makeBuffer(VBuffer& b, VkDeviceSize size, VkBufferUsageFlags usage
   if ((r = vkAllocateMemory(dev_, &ai, nullptr, &b.mem)) != VK_SUCCESS)
     return destroyBuf(b), fail(vkErr("vkAllocateMemory (buffer)", r), Status::OutOfMemory), Status::OutOfMemory;
   vkBindBufferMemory(dev_, b.buf, b.mem, 0);
+  b.memBytes = mr.size;
+  {
+    const std::string tag = std::string(kind == MemKind::DeviceLocal ? "buf " : "host buf ") + std::to_string(size >> 20) + " MB";
+    liveMemAdd(std::int64_t(mr.size), 1, std::uint64_t(b.mem), &tag);
+  }
   if (kind != MemKind::DeviceLocal) {
     if ((r = vkMapMemory(dev_, b.mem, 0, VK_WHOLE_SIZE, 0, &b.mapped)) != VK_SUCCESS)
       return destroyBuf(b), fail(vkErr("vkMapMemory", r), Status::OutOfMemory), Status::OutOfMemory;
@@ -634,6 +641,7 @@ void VkDev::destroyBuf(VBuffer& b) {
   if (b.mapped) vkUnmapMemory(dev_, b.mem);
   if (b.buf) vkDestroyBuffer(dev_, b.buf, nullptr);
   if (b.mem) vkFreeMemory(dev_, b.mem, nullptr);
+  if (b.memBytes) liveMemAdd(-std::int64_t(b.memBytes), -1, std::uint64_t(b.mem), nullptr);
   b = {};
 }
 
@@ -694,6 +702,12 @@ Status VkDev::createImage(const ImageDesc& d, ImageH* out) {
   ai.memoryTypeIndex = t;
   if ((r = vkAllocateMemory(dev_, &ai, nullptr, &im->mem)) != VK_SUCCESS) return bad(vkErr("vkAllocateMemory (image)", r), Status::OutOfMemory);
   vkBindImageMemory(dev_, im->img, im->mem, 0);
+  im->memBytes = mr.size;
+  {
+    const std::string tag = "img " + std::to_string(d.w) + "x" + std::to_string(d.h) + (d.d > 1 ? "x" + std::to_string(d.d) : std::string()) + " f" +
+                            std::to_string(int(d.fmt));
+    liveMemAdd(std::int64_t(mr.size), 1, std::uint64_t(im->mem), &tag);
+  }
   VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   vi.image = im->img;
   vi.viewType = d.d > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
@@ -716,6 +730,7 @@ void VkDev::destroyImg(VImage& im) {
   if (im.view) vkDestroyImageView(dev_, im.view, nullptr);
   if (im.img) vkDestroyImage(dev_, im.img, nullptr);
   if (im.mem) vkFreeMemory(dev_, im.mem, nullptr);
+  if (im.memBytes) liveMemAdd(-std::int64_t(im.memBytes), -1, std::uint64_t(im.mem), nullptr);
   im = {};
 }
 void VkDev::destroy(ImageH& h) {

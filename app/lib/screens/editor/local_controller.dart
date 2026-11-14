@@ -66,7 +66,22 @@ class LocalController extends ChangeNotifier {
 
   // ------------------------------------------------------------ selection and panel state
 
-  String? selId;
+  String? _selId;
+  String? get selId => _selId;
+  set selId(String? v) {
+    _selId = v;
+    if (v != null) _memory[ctl.id] = v;
+  }
+
+  /// The selected area of each photo, kept while the app runs: reopening a photo, or undoing a delete, comes back to the area that
+  /// was selected before (else the first portrait chip / the last area).
+  static final Expando<Map<String, String>> _remembered = Expando('selected areas');
+  Map<String, String> get _memory => _remembered[ctl.app] ??= {};
+
+  /// The selection that went away with a deleted area and what was chosen instead: an undo that brings the area back restores it,
+  /// unless the user has chosen something in between.
+  String? _lostSel, _autoSel;
+
   int selComp = 0;
   LocalBody body = LocalBody.pads;
 
@@ -102,13 +117,31 @@ class LocalController extends ChangeNotifier {
   void _ensureSel() {
     final l = list;
     if (l.isEmpty) {
-      selId = null;
+      _selId = null;
       selComp = 0;
       return;
     }
-    if (selId == null || l.indexOf(selId!) < 0) {
-      selId = l.items.last.id;
+    // an undo brought back the area that was selected before it was deleted (and nothing was chosen since)
+    if (_lostSel != null && _selId == _autoSel && l.indexOf(_lostSel!) >= 0) {
+      selId = _lostSel;
+      _lostSel = _autoSel = null;
       selComp = 0;
+    }
+    if (_selId == null || l.indexOf(_selId!) < 0) {
+      final gone = _selId;
+      final back = _memory[ctl.id];
+      var pick = back != null && l.indexOf(back) >= 0 ? back : l.items.last.id;
+      // portrait chips: the first chip, not the last one that happens to be at the end of the list
+      final pa = l.items[l.indexOf(pick)];
+      if (portraitOf(pa) != null && !(back != null && pick == back)) {
+        pick = l.items.firstWhere((a) => portraitOf(a) != null).id;
+      }
+      selId = pick;
+      selComp = 0;
+      if (gone != null) {
+        _lostSel = gone;
+        _autoSel = pick;
+      }
     }
     final a = sel!;
     if (selComp >= a.mask.length) selComp = math.max(0, a.mask.length - 1);

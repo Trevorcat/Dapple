@@ -53,10 +53,27 @@ class ThreadPool {
   void run(int n, int chunk, const std::function<void(int, int)>& fn) {
     if (n <= 0) return;
     chunk = std::max(1, chunk);
-    // background work (prefetch, detail session, previews) never takes the pool: it runs on the caller's own
-    // low priority thread so an interactive frame is never queued behind it
+    // background work (prefetch, the zoom detail session, previews) never takes the frame pool, so an interactive frame is never queued
+    // behind it: while no finger is on a control it runs on the background pool (the table bakes' pool, half the cpus, its own submit
+    // lock), else on the caller's own low priority thread. A settled zoomed frame on a phone without the GPU path took 4 s on one
+    // efficiency core (docs/engine/pipeline-architecture.md 43.11).
+    if (sys::inBackground()) {
+      static const bool serial = std::getenv("DAPPLE_BG_SERIAL") != nullptr;  // the old policy (benchmarks: one thread)
+      if (!bg_ && !inJob_ && n > chunk && !serial && !sys::interacting()) {
+        background().runJob(n, chunk, fn, true);
+        return;
+      }
+      fn(0, n);
+      return;
+    }
+    runJob(n, chunk, fn);
+  }
+
+ private:
+  // yieldOnTouch: a background frame's job: the workers stop taking chunks as soon as a finger is on a control (the caller finishes it)
+  void runJob(int n, int chunk, const std::function<void(int, int)>& fn, bool yieldOnTouch = false) {
     const int active = std::min(threads_, limit_.load(std::memory_order_relaxed) - 1);
-    if (active <= 0 || n <= chunk || inJob_ || sys::inBackground()) {
+    if (active <= 0 || n <= chunk || inJob_) {
       fn(0, n);
       return;
     }
@@ -66,6 +83,7 @@ class ThreadPool {
     {
       std::lock_guard<std::mutex> lock(mtx_);
       job_ = &fn;
+      yield_ = yieldOnTouch;
       total_ = n;
       chunk_ = chunk;
       next_.store(0);
@@ -76,7 +94,7 @@ class ThreadPool {
       gen_.store(generation_, std::memory_order_release);
     }
     cvWork_.notify_all();
-    work();
+    work(false);
     // the other threads are finishing their last chunks: spin briefly before sleeping on the condition variable
     const auto spinEnd = std::chrono::steady_clock::now() + std::chrono::microseconds(spinUs_);
     for (int k = 0; pendingA_.load(std::memory_order_acquire) != 0; ) {
@@ -115,10 +133,11 @@ class ThreadPool {
       }).detach();
   }
 
-  void work() {
+  void work(bool worker) {
     const bool was = inJob_;
     inJob_ = true;
     for (;;) {
+      if (worker && yield_ && sys::interacting()) break;  // the caller takes the remaining chunks
       const int start = next_.fetch_add(chunk_);
       if (start >= total_) break;
       if (const auto* cc = cancelCur_.load(std::memory_order_relaxed)) {
@@ -167,7 +186,7 @@ class ThreadPool {
         mine = idx < active_;
       }
       if (!mine) continue;  // this job runs with fewer threads than the pool has
-      work();
+      work(true);
       std::lock_guard<std::mutex> lock(mtx_);
       pendingA_.fetch_sub(1, std::memory_order_release);
       if (--pending_ == 0) cvDone_.notify_one();
@@ -183,6 +202,7 @@ class ThreadPool {
   std::atomic<const std::atomic<std::uint64_t>*> cancelCur_{nullptr};
   std::atomic<std::uint64_t> cancelMine_{0};
   int total_ = 0, chunk_ = 1, pending_ = 0, threads_ = 0;
+  bool yield_ = false;  // set under mtx_ before the generation bump; workers read it after waking (mtx_ / gen_ acquire)
   unsigned generation_ = 0;
   std::atomic<unsigned> gen_{0};      // mirror of generation_ for the lock-free spin
   std::atomic<int> pendingA_{0};      // mirror of pending_ for the caller's spin

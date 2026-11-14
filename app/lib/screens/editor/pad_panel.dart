@@ -69,15 +69,19 @@ double panelCollapsedH(double textScale, {bool side = false}) => kPanelHandleH +
 
 /// Height of the panel under the photo. The rule: the photo's edge stays at least 90 % of its no-panel size whenever the pad
 /// can still be [kPadMinH] tall; below that the photo shrinks further. The panel never gets taller than its comfortable
-/// size, and the itemised view (the precise layer) may be taller, never beyond 46 % of the screen.
+/// size, and the itemised view (the precise layer) may be taller, never beyond 46 % of the screen. Heights follow the content of the
+/// layer (guidelines 15.1-7); the change between layers is animated by the editor page.
 ///
 /// [region]: height between the top bar and the dock; [photoW]: width the photo may use; [aspect]: width / height of the photo.
-double bottomPanelHeight({required double region, required double photoW, required double aspect, required double screenH, double textScale = 1, bool itemised = false, double headerExtra = 0}) {
+///
+/// [bodyNeed]: a layer whose content is shorter than the pad (the portrait chips) says how tall its body is; the panel is as tall as that
+/// (never under the pad's least), so no empty band is left under the content.
+double bottomPanelHeight({required double region, required double photoW, required double aspect, required double screenH, double textScale = 1, bool itemised = false, double headerExtra = 0, double? bodyNeed}) {
   // large text: the header's button line; [headerExtra]: a header with a further line (局部's area chips)
   final extra = math.max(0.0, textScale - 1) * 24 + (headerWraps(textScale) ? kHeaderH : 0) + headerExtra;
   final hRef = math.min(photoW / aspect, region);
   final allowed = region - 8 - 0.9 * hRef; // the photo keeps 90 % of its height
-  final lo = kPanelFixedH + kPadMinH + extra, comfy = kPanelFixedH + kPadComfortH + extra;
+  final lo = kPanelFixedH + kPadMinH + extra, comfy = kPanelFixedH + (bodyNeed == null ? kPadComfortH : math.max(kPadMinH, math.min(kPadComfortH, bodyNeed))) + extra;
   var h = allowed.clamp(lo, comfy).toDouble();
   if (itemised) h = math.max(h, kPanelFixedH + kRadarContentH + extra);
   return math.min(h, math.max(screenH * 0.46, lo));
@@ -111,6 +115,7 @@ PanelNeeds panelNeeds({
   bool collapsed = false,
   bool itemised = false,
   double headerExtra = 0,
+  double? bodyNeed,
 }) {
   // [headerExtra]: a header with a further full line (局部: the area chips are a 48 dp line of their own), in both placements
   final extra = math.max(0.0, textScale - 1) * 24 + (headerWraps(textScale) ? kHeaderH : 0); // large text: the header's button line
@@ -120,7 +125,7 @@ PanelNeeds panelNeeds({
   final sideFixed = kPanelHandleH + kSideHeaderH + kPanelTopGap + kPanelBottomPad + extra + headerExtra;
   final side = sideFixed + (itemised ? kRadarContentH : 176);
   return PanelNeeds(
-    bottom: bottomPanelHeight(region: region, photoW: photoW, aspect: aspect, screenH: screenH, textScale: textScale, itemised: itemised, headerExtra: headerExtra),
+    bottom: bottomPanelHeight(region: region, photoW: photoW, aspect: aspect, screenH: screenH, textScale: textScale, itemised: itemised, headerExtra: headerExtra, bodyNeed: bodyNeed),
     side: side,
     // 分项 in a short side pane (landscape phone): the radar shrinks rather than the pane giving way to a bottom panel that leaves a
     // stamp-sized photo (guidelines 15.8, editor-panel 8: the side radar is small)
@@ -459,7 +464,18 @@ class HeaderReadout extends StatelessWidget {
   @override
   Widget build(BuildContext context) => ListenableBuilder(
         listenable: listenable,
-        builder: (context, _) => Text(text(), key: const ValueKey('header-readout'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.cap(context.c.text2, tabular: true)),
+        builder: (context, _) => LayoutBuilder(builder: (context, cons) {
+          final style = T.cap(context.c.text2, tabular: true);
+          var t = text();
+          // "强度 N%" is the readout (U1) and always stays whole; the pad's directions after it ("· 淡 90 · 亮 64") give way when the
+          // header is narrow (a 360 dp phone with the 成像 button) and stay in the semantics label
+          if (cons.maxWidth.isFinite) {
+            final cut = t.indexOf(' · ');
+            final tp = TextPainter(text: TextSpan(text: t, style: style), maxLines: 1, textDirection: TextDirection.ltr, textScaler: MediaQuery.textScalerOf(context))..layout();
+            if (cut > 0 && tp.width > cons.maxWidth) t = t.substring(0, cut);
+          }
+          return Text(t, key: const ValueKey('header-readout'), maxLines: 1, softWrap: false, overflow: TextOverflow.ellipsis, style: style);
+        }),
       );
 }
 
@@ -568,12 +584,17 @@ class _Header extends StatelessWidget {
             builder: (context, _) {
               final none = ctl.edit.film == null;
               final label = none ? '选成像' : baseNameOf(ctl.app.film, ctl.edit.film);
-              return HeaderButton(
-                  key: const ValueKey('stock-button'),
-                  label: label,
-                  chevron: true,
-                  semantics: none ? '选成像' : '选择成像，当前$label',
-                  onTap: () => ctl.setFilmMap(true));
+              // a press opens the map at once and the same finger can slide into it (press - slide - release selects and closes);
+              // a plain tap leaves it open for a second tap
+              return Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: (e) => ctl.filmPressDown(e.pointer, e.position),
+                  child: HeaderButton(
+                      key: const ValueKey('stock-button'),
+                      label: label,
+                      chevron: true,
+                      semantics: none ? '选成像' : '选择成像，当前$label',
+                      onTap: () => ctl.setFilmMap(true)));
             },
           );
     final sub = stock == null ? readout : Row(mainAxisSize: MainAxisSize.min, children: [stock, const SizedBox(width: Sp.s), Flexible(child: readout!)]);

@@ -311,8 +311,49 @@ static void testApi(const std::string& models, const std::string& id, const Task
   (void)o;
 }
 
+// Faces found with the person mask guided windows (findFaces). Expected counts (mesh-validated faces) were set by looking at the images:
+// p1, p2, p3, p5, p6 one frontal face; p4 strict profile (the mesh model refuses it: face flag -14.7); p7 two women from behind; p8 three girls
+// with the faces partly behind hands and masks; p9 three people frontal.
+static void testFindFaces(const Case& c, const TaskOptions& o) {
+  static const struct { const char* name; int n; } kExpect[] = {
+      {"p1_glasses_flag", 1}, {"p2_dark_skin_dreads", 1}, {"p3_curly_glasses_outdoor", 1}, {"p4_profile_bw", 0}, {"p5_headscarf", 1},
+      {"p6_asian_woman_grey", 1}, {"p7_backs_no_faces", 0}, {"p8_three_girls_busy_bg", 3}, {"p9_three_people_frontal", 3}};
+  PersonParts p;
+  Status st = segmentPerson(c.im, p, o);
+  CHECK(st.ok(), "segmentPerson: %s", st.message.c_str());
+  if (!st) return;
+  std::vector<uint8_t> mask(256 * 256, 0);
+  if (p.trusted)
+    for (size_t i = 0; i < mask.size(); ++i) mask[i] = p.classMap[i] != 0 ? 255 : 0;
+  auto t0 = std::chrono::steady_clock::now();
+  std::vector<FoundFace> a;
+  FaceFindStats fs;
+  st = findFaces(c.im, p.trusted ? mask.data() : nullptr, 256, 256, a, o, &fs);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  CHECK(st.ok(), "findFaces: %s", st.message.c_str());
+  if (!st) return;
+  t0 = std::chrono::steady_clock::now();
+  std::vector<FoundFace> b;
+  st = findFaces(c.im, nullptr, 0, 0, b, o);
+  const double ms0 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  std::printf("  findFaces: %zu faces (whole frame only: %zu), %d detector runs + %d extra meshes, %.0f ms (whole frame only %.0f ms)\n", a.size(), b.size(), fs.passes,
+              fs.crops, ms, ms0);
+  for (const FoundFace& f : a) std::printf("    face at (%.0f,%.0f) box %.0fx%.0f score %.2f mesh flag %.1f\n", f.face.cx, f.face.cy, f.face.w, f.face.h, f.face.score, f.lm.faceFlag);
+  for (const auto& e : kExpect)
+    if (c.name == e.name) CHECK(int(a.size()) == e.n, "%s: %zu faces, expected %d", e.name, a.size(), e.n);
+  // a photo whose first pass already finds its one face gets exactly the old result, no extra detector run
+  if (c.ref.faces == 1 && c.ref.valid == 1 && !a.empty()) {
+    CHECK(fs.passes == 1 && fs.crops == 0, "single face photo ran extra detector passes (%d)", fs.passes);
+    auto ref = readT<float>(c.dir + "landmarks.f32");
+    double ml = 0;
+    for (int k = 0; k < 478 && ref.size() >= 478 * 2; ++k) ml = std::max({ml, double(std::fabs(a[0].lm.xy[k][0] - ref[size_t(k) * 2])), double(std::fabs(a[0].lm.xy[k][1] - ref[size_t(k) * 2 + 1]))});
+    std::printf("    first face landmarks vs the reference: max %.3f px\n", ml);
+    CHECK(ml < 2.0, "single face landmarks moved by %.3f px", ml);
+  }
+}
+
 int main(int argc, char** argv) {
-  std::string apiModel = "face_detector", ref, models, images, only = "pil,face,person,tap,sam,depth,api";
+  std::string apiModel = "face_detector", ref, models, images, only = "pil,face,person,tap,sam,depth,api,findfaces";
   TaskOptions o;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -331,6 +372,7 @@ int main(int argc, char** argv) {
   { std::stringstream s(only); std::string t; while (std::getline(s, t, ',')) want.insert(t); }
   std::vector<std::string> names;
   { std::stringstream s(images); std::string t; while (std::getline(s, t, ',')) if (!t.empty()) names.push_back(t); }
+  if (names.empty() && only == "findfaces") names = {"p1_glasses_flag", "p2_dark_skin_dreads", "p3_curly_glasses_outdoor", "p4_profile_bw", "p5_headscarf", "p6_asian_woman_grey", "p7_backs_no_faces", "p8_three_girls_busy_bg", "p9_three_people_frontal"};
   if (names.empty()) names = {"person", "fruit", "p1_glasses_flag", "p4_profile_bw", "p9_three_people_frontal"};
   for (const auto& n : names) {
     Case c;
@@ -338,6 +380,7 @@ int main(int argc, char** argv) {
     std::printf("%s (%dx%d)\n", n.c_str(), c.im.w, c.im.h);
     if (want.count("pil")) testPil(c);
     if (want.count("face")) testFace(c, o);
+    if (want.count("findfaces")) testFindFaces(c, o);
     if (want.count("person")) testPerson(c, o);
     if (want.count("tap")) testTap(c, o, false);
     if (want.count("sam")) testTap(c, o, true);

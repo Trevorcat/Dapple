@@ -62,6 +62,7 @@
 #ifdef DAPPLE_HAVE_GPU
 #include "engine/exec/gpu_runtime.h"  // optional GPU executor (core/gpu): runtime flag, status; frames go through EngineSession
 #include "engine/nodes/demosaic/demosaic_backend.h"  // GPU Demosaic backend for the decoder (own device, docs 32)
+#include "engine/hal/hal.h"  // live device memory (memory report)
 #endif
 
 #ifndef DAPPLE_VERSION_STRING
@@ -1495,7 +1496,7 @@ int32_t dapple_is_supported_file(const char* path) {
 // One-line stage log (field diagnostics): tag dapple_engine on Android, os_log on Apple, stderr elsewhere.
 static void stageLog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void stageLog(const char* fmt, ...) {
-  char buf[640];  // the export lines carry the memory figures at the end: keep them whole
+  char buf[1536];  // the export and trim lines carry the memory figures at the end: keep them whole
   va_list ap;
   va_start(ap, fmt);
   std::vsnprintf(buf, sizeof buf, fmt, ap);
@@ -3328,16 +3329,25 @@ std::string memoryReport() {
     if (p->memoryInfo(&mi)) pooled = mi.pooled, poolBudget = mi.poolBudget, gpuBudget = mi.budget, gpuUsage = mi.usage, unified = mi.unified ? 1 : 0;
   }
 #endif
+  long long gpuLive = 0;
+  int gpuAllocs = 0;
+#ifdef DAPPLE_HAVE_GPU
+  gpuLive = (long long)hal::g_liveMemBytes.load(), gpuAllocs = hal::g_liveMemAllocs.load();
+#endif
+  int planes = 0, rasters = 0;
+  const std::size_t planeBytes = local::planeCacheBytes(&planes), rasterBytes = local::rasterStoreBytes(&rasters);
   const xstream::Budget bud = xstream::currentBudget();
   std::snprintf(b, sizeof b,
                 "{\"footprint\":%llu,\"available\":%llu,\"deviceTotal\":%llu,\"lowRam\":%s,\"nativeHeap\":{\"allocated\":%llu,\"free\":%llu},"
                 "\"sessions\":{\"count\":%d,\"lazy\":%d,\"pictureBytes\":%llu},\"mosaicCache\":{\"bytes\":%llu,\"budget\":%llu,\"entries\":%d},"
-                "\"gpu\":{\"pooled\":%llu,\"poolBudget\":%llu,\"budget\":%llu,\"usage\":%llu,\"unified\":%d},\"ai\":{\"modelBytes\":%llu},"
+                "\"gpu\":{\"pooled\":%llu,\"poolBudget\":%llu,\"budget\":%llu,\"usage\":%llu,\"unified\":%d,\"deviceMemory\":%lld,\"allocations\":%d},\"ai\":{\"modelBytes\":%llu},"
+                "\"local\":{\"planeBytes\":%llu,\"planes\":%d,\"rasterBytes\":%llu,\"rasters\":%d},"
                 "\"exportBudget\":{\"bytes\":%llu,\"how\":\"%s\"}}",
                 (unsigned long long)mem::footprint(), (unsigned long long)mem::available(), (unsigned long long)mem::deviceTotal(),
                 mem::deviceClass().lowRam.load() ? "true" : "false", heapAlloc, heapRetained, sessions, lazy, (unsigned long long)sessBytes,
-                (unsigned long long)mosBytes, (unsigned long long)mosBudget, mosEntries, pooled, poolBudget, gpuBudget, gpuUsage, unified,
-                (unsigned long long)dapple::aimask::rt::resident(), (unsigned long long)bud.bytes, esc(bud.how).c_str());
+                (unsigned long long)mosBytes, (unsigned long long)mosBudget, mosEntries, pooled, poolBudget, gpuBudget, gpuUsage, unified, gpuLive, gpuAllocs,
+                (unsigned long long)dapple::aimask::rt::resident(), (unsigned long long)planeBytes, planes, (unsigned long long)rasterBytes, rasters,
+                (unsigned long long)bud.bytes, esc(bud.how).c_str());
   (void)sessPx;
   return b;
 }
@@ -3356,20 +3366,32 @@ std::string memoryLine() {
     }
   }
   std::size_t pooled = 0;
+  long long gpuLive = 0;
+  int gpuAllocs = 0;
 #ifdef DAPPLE_HAVE_GPU
   if (dapple::engine::GpuProvider* p = dapple::engine::gpuProvider()) {
     dapple::engine::GpuProvider::MemoryInfo mi;
     if (p->memoryInfo(&mi)) pooled = mi.pooled;
   }
+  gpuLive = (long long)hal::g_liveMemBytes.load(), gpuAllocs = hal::g_liveMemAllocs.load();
 #endif
-  unsigned long long heapAlloc = 0;
+  unsigned long long heapAlloc = 0, heapFree = 0;
 #if defined(__ANDROID__) || defined(__linux__)
-  heapAlloc = (unsigned long long)(unsigned)mallinfo().uordblks;
+  {
+    const struct mallinfo mi = mallinfo();
+    heapAlloc = (unsigned long long)(unsigned)mi.uordblks;
+    heapFree = (unsigned long long)(unsigned)mi.fordblks;
+  }
 #endif
-  char b[320];
-  std::snprintf(b, sizeof b, "footprint %.0f MB, native heap in use %.0f MB, %d sessions (%.0f MB of pictures), mosaic cache %.0f MB (%d), GPU pool %.0f MB, AI models %.0f MB",
-                double(mem::footprint()) / 1048576.0, double(heapAlloc) / 1048576.0, sessions, double(sessBytes) / 1048576.0, double(mosBytes) / 1048576.0,
-                mosEntries, double(pooled) / 1048576.0, double(dapple::aimask::rt::resident()) / 1048576.0);
+  int planes = 0, rasters = 0;
+  const std::size_t planeBytes = local::planeCacheBytes(&planes), rasterBytes = local::rasterStoreBytes(&rasters);
+  char b[448];
+  std::snprintf(b, sizeof b,
+                "footprint %.0f MB, native heap in use %.0f MB (free %.0f), %d sessions (%.0f MB of pictures), mosaic cache %.0f MB (%d), GPU pool %.0f MB (device memory %.0f MB in %d), AI models %.0f MB, "
+                "mask planes %.0f MB (%d), rasters %.0f MB (%d)",
+                double(mem::footprint()) / 1048576.0, double(heapAlloc) / 1048576.0, double(heapFree) / 1048576.0, sessions, double(sessBytes) / 1048576.0, double(mosBytes) / 1048576.0,
+                mosEntries, double(pooled) / 1048576.0, double(gpuLive) / 1048576.0, gpuAllocs, double(dapple::aimask::rt::resident()) / 1048576.0, double(planeBytes) / 1048576.0, planes,
+                double(rasterBytes) / 1048576.0, rasters);
   return b;
 }
 }  // namespace
@@ -3448,8 +3470,13 @@ int64_t dapple_memory_trim(int32_t level) {
 #elif defined(__linux__)
         malloc_trim(0);
 #endif
-        stageLog("memory_trim %d: released %.0f MB of caches%s in %.0f ms; before: %s; after: %s", int(level), double(freed) / 1048576.0,
-                 demosaicDevice ? " and the demosaic GPU device" : "", msSince(t0), before.c_str(), memoryLine().c_str());
+        std::string held;
+#ifdef DAPPLE_HAVE_GPU
+        held = hal::liveMemSummary();
+#endif
+        stageLog("memory_trim %d: released %.0f MB of caches%s in %.0f ms; before: %s; after: %s%s%s", int(level), double(freed) / 1048576.0,
+                 demosaicDevice ? " and the demosaic GPU device" : "", msSince(t0), before.c_str(), memoryLine().c_str(),
+                 held.empty() ? "" : "; device memory held: ", held.c_str());
         return int64_t(freed);
       },
       int64_t(-1));

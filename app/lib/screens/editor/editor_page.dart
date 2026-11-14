@@ -31,8 +31,8 @@ import 'editor_controller.dart';
 import 'editor_overlays.dart';
 import 'gesture_surface.dart';
 import '../../services/local_ai.dart';
+import 'local_panel.dart' show LocalToolStrip, localToolsShown, portraitBodyNeed, toolStripH;
 import 'local_layer.dart';
-import 'local_panel.dart' show LocalToolStrip;
 import 'sync_dialog.dart';
 import 'zoom_view.dart';
 import '../../services/perf_probe.dart';
@@ -119,6 +119,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     app.editTick.addListener(_onApp);
     wm.addListener(_onWm);
     ctl.edits.addListener(_onEdits);
+    ctl.local.addListener(_onEdits); // the tool strip's line is reserved only while a tool shows
     ctl.dragging.addListener(_onDragging);
     _t.addListener(() => _panelRect.value = _geoNow().panel);
     engine.attach(ph, neighbors: _neighborsOf(id));
@@ -150,6 +151,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     app.editTick.removeListener(_onApp);
     wm.removeListener(_onWm);
     ctl.edits.removeListener(_onEdits);
+    ctl.local.removeListener(_onEdits);
     ctl.dragging.removeListener(_onDragging);
     final p = app.photoById(id);
     if (p != null) Future.microtask(() => app.commitEdit(p));
@@ -296,10 +298,15 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     // The panel is as tall as its category needs and never changes height within it; the placement (bottom / side) is
     // decided per category, screen, photo and hand side, never during a drag.
     final region = dockTop - 8 - regionTop;
-    PanelNeeds needsFor({required bool collapsed, required bool itemised}) => panelNeeds(
+    PanelNeeds needsFor({required bool collapsed, required bool itemised, double? bodyNeed}) => panelNeeds(
         screenW: size.width, paneW: sw - e.marginL, screenH: e.size.height, region: region, photoW: size.width - e.photoPad.horizontal, aspect: aspect,
-        textScale: e.textScale, collapsed: collapsed, itemised: itemised, headerExtra: w.group == EGroup.local ? kHeaderH : 0);
-    PanelNeeds needs() => needsFor(collapsed: w.collapsed, itemised: ctl.itemised && (PadCatX.ofGroup(w.group) != null || w.group == EGroup.local));
+        textScale: e.textScale, collapsed: collapsed, itemised: itemised, headerExtra: w.group == EGroup.local ? kHeaderH : 0, bodyNeed: bodyNeed);
+    // heights follow the content of the layer (guidelines 15.1-7); a change between layers is animated by _retarget
+    PanelNeeds needs() => needsFor(
+        collapsed: w.collapsed,
+        itemised: ctl.itemised && (PadCatX.ofGroup(w.group) != null || w.group == EGroup.local),
+        // the portrait chips are shorter than a pad: the panel is as tall as they are, no empty band under them
+        bodyNeed: w.group == EGroup.local && !ctl.itemised ? portraitBodyNeed(ctl.local, math.min(size.width - 2 * e.marginL, kPanelMaxW) - 2 * Sp.m, e.textScale) : null);
     final key = '${w.group.name}|${size.width.round()}x${size.height.round()}|${aspect.toStringAsFixed(3)}|$trailing|$id';
     if (key != _placeKey && !ctl.dragging.value) {
       _placeKey = key;
@@ -309,8 +316,12 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     // a wide screen (the unfolded inner screen, a tablet) does not stretch the panel into a long strip
     var panel = l.panel;
     if (l.place == PanelPlace.bottom && panel.width > kPanelMaxW) panel = Rect.fromCenter(center: panel.center, width: kPanelMaxW, height: panel.height);
+    // 局部: the tool strip (brush, ranges, 点选, 点一下祛斑, the parts) has a line under the photo while a tool that uses it is showing:
+    // the region ends above it, the strip never lies over the photo, and with no tool the photo gets the line back (animated)
+    var photoRegion = l.photoRegion;
+    if (w.group == EGroup.local && localToolsShown(ctl)) photoRegion = Rect.fromLTRB(photoRegion.left, photoRegion.top, photoRegion.right, math.max(photoRegion.top, photoRegion.bottom - toolStripH(photoRegion.width)));
     return _PanelGeo(
-        region: l.photoRegion,
+        region: photoRegion,
         panel: panel,
         dock: l.dock,
         place: l.place,
@@ -491,7 +502,9 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     final marginL = math.max(12.0, gi.left), marginR = math.max(12.0, gi.right);
     final topBarTop = pad.top + 8;
     final topBarBottom = topBarTop + 48;
-    final dockBottom = math.max(pad.bottom, 16.0) + 8;
+    // the system gesture / navigation zone counts as well as the reported inset (some devices report one without the other): the
+    // dock and the controls above it never lie where the system takes the touch (guidelines 15.6)
+    final dockBottom = math.max(math.max(pad.bottom, gi.bottom), 16.0) + 8;
     final dockTop = size.height - dockBottom - 56;
     final keyboard = mq.viewInsets.bottom;
     ctl.availableHeight = size.height - pad.vertical;
@@ -527,16 +540,15 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
           ),
         ),
       ),
-      // 局部: the brush / range tools on the photo's bottom edge
+      // 局部: the tool strip on its reserved line under the photo
       AnimatedBuilder(
         animation: _t,
         builder: (context, _) {
-          final r = _geoNow().region;
-          // room for two lines of 48 dp targets; the strip sits 8 dp above the photo's bottom edge (on the photo, local-adjustments 5;
-          // the region can reach below the photo when system insets pad it) and grows upward
-          final ph = _photoRect();
-          final bottom = ph.isEmpty ? r.bottom : math.min(r.bottom, ph.bottom);
-          return Positioned(left: r.left + 8, width: math.max(0.0, r.width - 16), top: bottom - 8 - 2 * 48, height: 2 * 48, child: LocalToolStrip(ctl: ctl));
+          final g = _geoNow();
+          if (g.group != EGroup.local || !localToolsShown(ctl)) return const SizedBox.shrink();
+          final r = g.region;
+          // the reserved line ends the region; a strip that needs a second line (many parts on a narrow photo) grows upward from it
+          return Positioned(left: r.left + 8, width: math.max(0.0, r.width - 16), top: r.bottom + toolStripH(r.width) - 2 * kHit, height: 2 * kHit, child: LocalToolStrip(ctl: ctl));
         },
       ),
       // browse-mode filmstrip on wide screens

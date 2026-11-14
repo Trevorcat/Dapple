@@ -155,7 +155,20 @@ class _PublishPageState extends State<PublishPage> {
   String get _title => _split ? '第 ${_batch + 1}/$_batches 篇 · ${_cur.length} 张' : '发布 ${_ids.length} 张';
 
   // ------------------------------------------------------------ share
+  bool _handoffOpen = false;
+
   Future<void> _chooseHandoff() async {
+    // one tap = one sheet: a second tap while the sheet is opening or open, or while the export runs, does nothing
+    if (_handoffOpen) return;
+    _handoffOpen = true;
+    try {
+      await _chooseHandoffSheet();
+    } finally {
+      _handoffOpen = false;
+    }
+  }
+
+  Future<void> _chooseHandoffSheet() async {
     final c = context.c;
     final choice = await showModalBottomSheet<String>(
       context: context,
@@ -278,7 +291,8 @@ class _PublishPageState extends State<PublishPage> {
     // landscape phone / unfolded inner screen: two columns (photos and presets | options and the button), audit F45
     final twoCol = size.width >= 720 && size.width >= size.height;
     _stripH = size.height < 480 ? 72 : 104;
-    final footer = math.max(mq.padding.bottom, 16.0);
+    // the system gesture / navigation zone counts as well as the reported inset: the button stays clear of where the system takes touches
+    final footer = math.max(math.max(mq.padding.bottom, mq.systemGestureInsets.bottom), 16.0);
     final top = wide ? 48.0 : mq.padding.top;
     final header = Column(mainAxisSize: MainAxisSize.min, children: [
       // Material sheet header: drag handle, close icon, left-aligned title.

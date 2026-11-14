@@ -22,7 +22,7 @@ Avail availability(const std::string&) {
 }
 static Res off() { return {false, false, "AI masks are not part of this build"}; }
 Res person(const Img&, PersonOut&, const std::atomic<bool>*) { return off(); }
-Res faces(const Img&, int, std::vector<FaceMesh>&, const std::atomic<bool>*) { return off(); }
+Res faces(const Img&, const Plane*, int, std::vector<FaceMesh>&, const std::atomic<bool>*) { return off(); }
 Res depth(const Img&, DepthOut&, const std::atomic<bool>*) { return off(); }
 Res prepareTap(const Img&, const std::string&, std::unique_ptr<TapHandle>&, const std::atomic<bool>*) { return off(); }
 void configure(const std::string&, int) {}
@@ -128,24 +128,17 @@ Res person(const Img& im, PersonOut& out, const std::atomic<bool>* cancel) {
   return {true, false, ""};
 }
 
-Res faces(const Img& im, int maxFaces, std::vector<FaceMesh>& out, const std::atomic<bool>* cancel) {
+Res faces(const Img& im, const Plane* personMask, int maxFaces, std::vector<FaceMesh>& out, const std::atomic<bool>* cancel) {
   out.clear();
-  std::vector<ai::Face> f;
-  ai::Status st = ai::detectFaces(toImage(im), f, 0.5f, opts(cancel));
+  std::vector<ai::FoundFace> f;  // mesh-validated only (profile views and false detections are dropped)
+  const bool hint = personMask && !personMask->empty();
+  const ai::Status st = ai::findFaces(toImage(im), hint ? personMask->px.data() : nullptr, hint ? personMask->w : 0, hint ? personMask->h : 0, f, opts(cancel));
   if (!st.ok()) return fromStatus(st);
-  std::stable_sort(f.begin(), f.end(), [](const ai::Face& a, const ai::Face& b) { return a.w * a.h > b.w * b.h; });  // largest first
-  for (const ai::Face& face : f) {
+  std::stable_sort(f.begin(), f.end(), [](const ai::FoundFace& a, const ai::FoundFace& b) { return a.face.w * a.face.h > b.face.w * b.face.h; });  // largest first
+  for (const ai::FoundFace& ff : f) {
     if (int(out.size()) >= maxFaces) break;
-    if (cancel && cancel->load()) return {false, true, "cancelled"};
-    ai::Landmarks lm;
-    st = ai::faceLandmarks(toImage(im), face, lm, opts(cancel));
-    if (!st.ok()) {
-      if (st.code == ai::Code::Cancelled) return fromStatus(st);
-      continue;
-    }
-    if (!lm.valid) continue;  // profile views and false detections
     FaceMesh m;
-    for (int i = 0; i < 478; ++i) m.xy[i][0] = lm.xy[i][0], m.xy[i][1] = lm.xy[i][1], m.z[i] = lm.z[i];
+    for (int i = 0; i < 478; ++i) m.xy[i][0] = ff.lm.xy[i][0], m.xy[i][1] = ff.lm.xy[i][1], m.z[i] = ff.lm.z[i];
     out.push_back(m);
   }
   return {true, false, ""};

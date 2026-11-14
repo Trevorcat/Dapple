@@ -1,5 +1,5 @@
 // The 局部 panel (docs/design/local-adjustments.md sections 3, 4, 5 and 7): the header with the area chips, the body (the strip and
-// the two pads, the itemised view, the shape card, the area's actions) and the tool strip that floats on the photo's bottom edge for
+// the two pads, the itemised view, the shape card, the area's actions) and the tool strip (a reserved line under the photo, never over it) for
 // the "where" of brushes and ranges. No scrolling lists, no second-level menus: a card replaces the body in place and closes itself.
 import 'dart:math' as math;
 import 'dart:ui' as ui;
@@ -761,6 +761,35 @@ class LocalDockGlyphPainter extends CustomPainter {
 
 /// The "where" fine controls on the photo's bottom edge: the area's parts (when several), the brush sizes and eraser, the tone band
 /// or the hue band. Hidden for a single gradient / circle.
+/// Height of the line reserved under the photo for the tool strip: one line of 48 dp targets, two where the width is too narrow for the
+/// widest tool (the heal tools: the switch, four sizes and the toggle) on one line.
+double toolStripH(double width) => (width < 360 ? 2 : 1) * kHit;
+
+/// Whether the tool strip has anything to show now (a tool, or the part chips of a multi-part area): its line under the photo is
+/// reserved only then. The same conditions as [LocalToolStrip] builds with.
+bool localToolsShown(EditorController ctl) {
+  final lc = ctl.local;
+  final a = lc.sel, m = lc.comp;
+  if (!lc.active || a == null || m == null) return false;
+  if (lc.body != LocalBody.pads && !(lc.body == LocalBody.portrait && lc.selIsPortrait)) return false;
+  if (ctl.compare.value || lc.comparing) return false;
+  if (a.mask.length > 1 && portraitOf(a) == null) return true; // the parts row
+  final pt = portraitOf(a);
+  switch (m.kind) {
+    case MaskKindId.brush:
+    case MaskKindId.luminance:
+    case MaskKindId.color:
+      return true;
+    case MaskKindId.raster:
+      if (lc.missingRefs.contains(m.ref) || lc.repairing) return true;
+      if (pt != null) return pt.$2.id == 'pt-skin';
+      final k = kindOfComponent(m).id;
+      return k == 'tap' || k == 'depth';
+    default:
+      return false;
+  }
+}
+
 class LocalToolStrip extends StatelessWidget {
   const LocalToolStrip({super.key, required this.ctl});
   final EditorController ctl;
@@ -845,8 +874,8 @@ class LocalToolStrip extends StatelessWidget {
           alignment: Alignment.bottomCenter,
           child: Container(
             key: const ValueKey('local-tools'),
-            padding: const EdgeInsets.symmetric(horizontal: Sp.s),
-            decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(Rd.float), boxShadow: Fx.shadowFloat),
+            padding: const EdgeInsets.symmetric(horizontal: Sp.xs),
+            decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(Rd.float)),
             child: Wrap(
               alignment: WrapAlignment.center,
               crossAxisAlignment: WrapCrossAlignment.center,
@@ -974,17 +1003,14 @@ class _BrushTools extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.c;
-    return Row(
-      mainAxisSize: MainAxisSize.min,
+    // a narrow pane wraps the sizes onto a second line (targets keep 48 dp)
+    return Wrap(
+      alignment: WrapAlignment.center,
+      crossAxisAlignment: WrapCrossAlignment.center,
       children: [
         // U2: + paints, − erases (the switch at the left end, as on every add / remove tool)
         AddRemoveSwitch(prefix: 'brush', add: !lc.erase, onChanged: (a) => lc.setErase(!a)),
-        Container(
-          width: 1,
-          height: 24,
-          color: c.sep,
-          margin: const EdgeInsets.symmetric(horizontal: Sp.xs),
-        ),
+        const SizedBox(width: Sp.xs),
         for (var i = 0; i < LocalController.brushRadiiDp.length; i++)
           Semantics(
             button: true,
@@ -1276,6 +1302,23 @@ class _Reanalyse extends StatelessWidget {
 
 /// The simple portrait panel: the strip of the selected chip on the left (bottom 0, middle = the recommended default, top = the recipe's
 /// maximum) and the chips; a face selector only when several frontal faces exist. 分项 shows the chip's parameters.
+/// The height the body of the portrait chips layer needs (the rows of tiles and the face selector), or null when the body is not that
+/// layer. [innerW]: the panel's width inside its padding. Mirrors [PortraitPanel]'s layout (strip 40 + gap, up to four columns of
+/// 56 dp tiles, tile height up to 64 dp).
+double? portraitBodyNeed(LocalController lc, double innerW, double textScale) {
+  if (lc.body != LocalBody.portrait && !(lc.body == LocalBody.pads && lc.selIsPortrait)) return null;
+  if (!lc.portraitAnalysed || !lc.personFound) return null;
+  final n = lc.portraitChips.length;
+  if (n == 0) return null;
+  const gap = Sp.s;
+  final avail = innerW - 40 - Sp.m;
+  final fit = ((avail + gap) / (56 + gap)).floor();
+  final cols = math.max(1, math.min(math.min(4, fit), n));
+  final rows = (n / cols).ceil();
+  final faceRow = lc.frontalFaces.length > 1 && lc.selChip != null ? kHit + Sp.s : 0.0;
+  return rows * 64.0 * textScale.clamp(1.0, 2.0) + gap * (rows - 1) + faceRow;
+}
+
 class PortraitPanel extends StatelessWidget {
   const PortraitPanel({super.key, required this.ctl});
   final EditorController ctl;

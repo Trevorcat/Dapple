@@ -70,11 +70,18 @@ class PlaneCache {
       map_.erase(it);
     }
   }
-  void clear() {
+  std::size_t clear() {
     std::lock_guard<std::mutex> lk(m_);
+    const std::size_t b = bytes_;
     map_.clear();
     lru_.clear();
     bytes_ = 0;
+    return b;
+  }
+  std::size_t bytes(int* entries) {
+    std::lock_guard<std::mutex> lk(m_);
+    if (entries) *entries = int(map_.size());
+    return bytes_;
   }
 
  private:
@@ -160,13 +167,25 @@ void boxRep(std::vector<float>& d, int w, int h, int ch, int r) {
       }
     }
   });
-  parallelFor(w, [&](int x) {
-    for (int c = 0; c < ch; ++c) {
-      double sum = 0;
-      for (int i = -r; i <= r; ++i) sum += t[(std::size_t(std::clamp(i, 0, h - 1)) * w + x) * ch + c];
-      for (int y = 0; y < h; ++y) {
-        d[(std::size_t(y) * w + x) * ch + c] = float(sum * inv);
-        sum += double(t[(std::size_t(std::min(y + r + 1, h - 1)) * w + x) * ch + c]) - double(t[(std::size_t(std::max(y - r, 0)) * w + x) * ch + c]);
+  // vertical pass: the same per-column running sums in the same order, kept for a strip of columns and advanced row by row (row-major memory
+  // access instead of one column at a time: the strided walk missed the cache on every row)
+  const int rowF = w * ch;
+  constexpr int kStrip = 256;
+  parallelFor((rowF + kStrip - 1) / kStrip, [&](int s) {
+    const int i0 = s * kStrip, n = std::min(kStrip, rowF - i0);
+    double sum[kStrip];
+    for (int k = 0; k < n; ++k) sum[k] = 0;
+    for (int i = -r; i <= r; ++i) {
+      const float* row = t.data() + std::size_t(std::clamp(i, 0, h - 1)) * rowF + i0;
+      for (int k = 0; k < n; ++k) sum[k] += row[k];
+    }
+    for (int y = 0; y < h; ++y) {
+      float* o = d.data() + std::size_t(y) * rowF + i0;
+      const float* a = t.data() + std::size_t(std::min(y + r + 1, h - 1)) * rowF + i0;
+      const float* b = t.data() + std::size_t(std::max(y - r, 0)) * rowF + i0;
+      for (int k = 0; k < n; ++k) {
+        o[k] = float(sum[k] * inv);
+        sum[k] += double(a[k]) - double(b[k]);
       }
     }
   });
@@ -179,6 +198,111 @@ struct GuideKey {
 };
 thread_local const GuideCapture* tlGuide = nullptr;  // streaming export (section 42): the captured inputs replace the pixels of the source
 const GuideCapture* guideCaptureFor(const ImageF& im) { return tlGuide && tlGuide->W == im.width && tlGuide->H == im.height ? tlGuide : nullptr; }
+
+// ---- guide families: the sessions of one photo share the refinement planes ----------------------------------------------------------
+// The app keeps several sessions of a photo open (the 2048 px preview, the 4096 px zoom detail session; an export opens another): each has
+// its own source size, hence its own guide key, and the plane cache (96 MB) cannot hold every session's coefficient grids of a 9 - 12 raster
+// portrait (60 - 80 MB each): the sessions evicted each other's planes and every frame re-solved them (and re-ran the heal detection).
+// The grids depend on the photo, not on the session's resolution (photo-normalised grids of at most 1024 px, area means of the source), so
+// a session whose source has the aspect and the 16 x 16 block means of a known photo (within the resampling error of a downscaled decode)
+// takes that photo's key and reference: its frames read the planes the first session built. The difference to solving them from its own
+// pixels is the resampling error of the grid means (~1e-4 of the guide), far below one display level.
+struct GuideFamily {
+  std::uint64_t key = 0;
+  float ref = 1.f, aspect = 1.f;
+  std::vector<float> fp;               // 16 x 16 block means, RGB
+  std::vector<std::uint64_t> members;  // session keys mapped to `key`
+};
+struct GuideFamilies {
+  std::mutex m;
+  std::list<GuideFamily> list;  // most recent first, at most 16
+};
+GuideFamilies& families() {
+  static GuideFamilies* f = new GuideFamilies;
+  return *f;
+}
+constexpr int kFp = 16;
+// exact area means of 16 x 16 blocks of the photo (pixels straddling a block edge split by their overlap), so a downscaled decode of the same
+// photo gives the same numbers up to its resampling filter
+std::vector<float> guideFingerprint(const ImageF& im) {
+  const int W = im.width, H = im.height;
+  // per column / row: the first block it falls in and its weight there (the rest goes to the next block)
+  auto split = [](int n, std::vector<int>& blk, std::vector<double>& wt) {
+    blk.resize(std::size_t(n)), wt.resize(std::size_t(n));
+    const double bw = double(n) / kFp;
+    for (int x = 0; x < n; ++x) {
+      const int b0 = std::min(kFp - 1, int(std::floor(x / bw)));
+      const double edge = double(b0 + 1) * bw;
+      blk[std::size_t(x)] = b0, wt[std::size_t(x)] = b0 + 1 < kFp && x + 1 > edge ? edge - x : 1.0;
+    }
+  };
+  std::vector<int> bx, by;
+  std::vector<double> wx, wy;
+  split(W, bx, wx), split(H, by, wy);
+  std::vector<double> rows(std::size_t(H) * kFp * 3, 0.0);  // per row: the block sums along x
+  parallelFor(H, [&](int y) {
+    const float* r = im.row(y);
+    double* o = rows.data() + std::size_t(y) * kFp * 3;
+    for (int x = 0; x < W; ++x) {
+      const int b = bx[std::size_t(x)];
+      const double w0 = wx[std::size_t(x)], w1 = 1.0 - w0;
+      for (int c = 0; c < 3; ++c) {
+        o[b * 3 + c] += w0 * r[3 * x + c];
+        if (w1 > 0) o[(b + 1) * 3 + c] += w1 * r[3 * x + c];
+      }
+    }
+  });
+  std::vector<double> acc(std::size_t(kFp) * kFp * 3, 0.0);
+  for (int y = 0; y < H; ++y) {
+    const int b = by[std::size_t(y)];
+    const double w0 = wy[std::size_t(y)], w1 = 1.0 - w0;
+    for (int k = 0; k < kFp * 3; ++k) {
+      acc[std::size_t(b) * kFp * 3 + std::size_t(k)] += w0 * rows[std::size_t(y) * kFp * 3 + std::size_t(k)];
+      if (w1 > 0) acc[std::size_t(b + 1) * kFp * 3 + std::size_t(k)] += w1 * rows[std::size_t(y) * kFp * 3 + std::size_t(k)];
+    }
+  }
+  const double area = (double(W) / kFp) * (double(H) / kFp);
+  std::vector<float> fp(acc.size());
+  for (std::size_t i = 0; i < acc.size(); ++i) fp[i] = float(acc[i] / area);
+  return fp;
+}
+bool sameGuide(const GuideFamily& f, float aspect, float ref, const std::vector<float>& fp) {
+  (void)ref;  // not compared: the 99th percentile of point samples follows the per-pixel noise, which a downscaled decode averages away
+  if (std::fabs(f.aspect - aspect) > 2e-3f * f.aspect) return false;
+  double sum = 0;
+  for (std::size_t i = 0; i < fp.size(); ++i) {
+    const float a = f.fp[i], b = fp[i], d = std::fabs(a - b);
+    if (d > 0.03f * 0.5f * (a + b) + 2e-3f * f.ref) return false;  // a block of another picture (or another frame of a clip) differs more
+    sum += d / (0.5 * (a + b) + 1e-3 * f.ref);
+  }
+  return sum / double(fp.size()) < 0.006;
+}
+void guideFamily(const ImageF& im, GuideKey& g) {
+  if (im.width < 64 || im.height < 64 || im.data.size() < std::size_t(im.width) * im.height * 3) return;
+  GuideFamilies& F = families();
+  {
+    std::lock_guard<std::mutex> lk(F.m);
+    for (const GuideFamily& f : F.list)
+      if (std::find(f.members.begin(), f.members.end(), g.key) != f.members.end()) {
+        g.key = f.key, g.ref = f.ref;
+        return;
+      }
+  }
+  const float aspect = float(im.width) / float(im.height);
+  const std::vector<float> fp = guideFingerprint(im);
+  std::lock_guard<std::mutex> lk(F.m);
+  for (auto it = F.list.begin(); it != F.list.end(); ++it)
+    if (sameGuide(*it, aspect, g.ref, fp)) {
+      if (std::find(it->members.begin(), it->members.end(), g.key) == it->members.end()) it->members.push_back(g.key);
+      g.key = it->key, g.ref = it->ref;
+      F.list.splice(F.list.begin(), F.list, it);
+      return;
+    }
+  GuideFamily f;
+  f.key = g.key, f.ref = g.ref, f.aspect = aspect, f.fp = fp, f.members = {g.key};
+  F.list.push_front(std::move(f));
+  if (F.list.size() > 16) F.list.pop_back();
+}
 
 GuideKey guideKeyOf(const SourceImage& src) {
   const ImageF& im = src.linear;
@@ -199,6 +323,7 @@ GuideKey guideKeyOf(const SourceImage& src) {
   std::nth_element(Y.begin(), Y.begin() + long(k), Y.end());
   g.ref = std::max(1e-4f, Y[k]);
   g.key = h;
+  if (!cap) guideFamily(im, g);
   return g;
 }
 
@@ -268,8 +393,9 @@ std::shared_ptr<const Plane> guideStats(const Plane& G, int r) {
   return out;
 }
 
+void planeSupport(Plane& p);
 std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& src, const GuideKey& gk, float sx, float sy, int cap, float refine,
-                                         const MaskComponent& mc) {
+                                         const MaskComponent& mc, bool findOnly = false) {  // findOnly: the cached plane or null
   const int gl = std::clamp(std::max(ra.w, ra.h), 64, cap);
   const int gw = std::max(8, int(std::lround(gl * sx))), gh = std::max(8, int(std::lround(gl * sy)));
   std::uint64_t key = mix64(mix64(ra.hash, gk.key), std::uint64_t(gw) << 32 | std::uint32_t(gh));
@@ -280,6 +406,7 @@ std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& sr
     ++g_planeHits;
     return p;
   }
+  if (findOnly) return nullptr;
   ++g_rasterBuilds;
   const std::size_t N = std::size_t(gw) * gh;
   // the mask on the grid (bilinear from the raster, whatever its own aspect)
@@ -358,6 +485,7 @@ std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& sr
     for (std::size_t i = 0; i < N; ++i)
       for (int c = 0; c < 4; ++c) pl->data[i * 4 + std::size_t(c)] = ab[std::size_t(c)][i];
   }
+  planeSupport(*pl);
   std::shared_ptr<const Plane> out = pl;
   cache().put(key, out);
   return out;
@@ -521,6 +649,67 @@ inline float samplePlane(const Plane& p, int c, float u, float v) {
   const float t0 = a + (b - a) * tx, t1 = e + (g - e) * tx;
   return t0 + (t1 - t0) * ty;
 }
+// The four channels of a raster coefficient plane at (u, v): the same arithmetic per channel as samplePlane (bit-identical), one address
+// computation.
+inline void samplePlane4(const Plane& p, float u, float v, float o[4]) {
+  const float fx = std::clamp(u * float(p.w) - 0.5f, 0.f, float(p.w - 1)), fy = std::clamp(v * float(p.h) - 0.5f, 0.f, float(p.h - 1));
+  const int x0 = std::min(int(fx), p.w - 1), y0 = std::min(int(fy), p.h - 1);
+  const int x1 = std::min(x0 + 1, p.w - 1), y1 = std::min(y0 + 1, p.h - 1);
+  const float tx = fx - float(x0), ty = fy - float(y0);
+  const float* d = p.data.data();
+  const float* A = d + (std::size_t(y0) * p.w + x0) * 4;
+  const float* B = d + (std::size_t(y0) * p.w + x1) * 4;
+  const float* E = d + (std::size_t(y1) * p.w + x0) * 4;
+  const float* G = d + (std::size_t(y1) * p.w + x1) * 4;
+  for (int c = 0; c < 4; ++c) {
+    const float t0 = A[c] + (B[c] - A[c]) * tx, t1 = E[c] + (G[c] - E[c]) * tx;
+    o[c] = t0 + (t1 - t0) * ty;
+  }
+}
+
+// Support of a raster coefficient plane (Plane::sup): the (u, v) range outside which every bilinear corner is negligible (all four channels
+// at most kSupEps: the refined mask there is below 1e-5, the guide being at most 2), so the component evaluates to 0 without sampling.
+constexpr float kSupEps = 1e-6f;
+void planeSupport(Plane& p) {
+  int cx0 = p.w, cy0 = p.h, cx1 = -1, cy1 = -1;
+  for (int y = 0; y < p.h; ++y)
+    for (int x = 0; x < p.w; ++x) {
+      const float* c = p.data.data() + (std::size_t(y) * p.w + x) * 4;
+      if (std::fabs(c[0]) > kSupEps || std::fabs(c[1]) > kSupEps || std::fabs(c[2]) > kSupEps || std::fabs(c[3]) > kSupEps)
+        cx0 = std::min(cx0, x), cx1 = std::max(cx1, x), cy0 = std::min(cy0, y), cy1 = std::max(cy1, y);
+    }
+  if (cx1 < 0) {  // nothing: an empty range
+    p.sup[0] = p.sup[1] = 2.f, p.sup[2] = p.sup[3] = -2.f;
+    return;
+  }
+  // a sample's corners are x0 = floor(clamp(u w - 0.5)) and x0 + 1: they miss [cx0, cx1] when u < (cx0 - 0.5) / w or u >= (cx1 + 1.5) / w
+  // (the clamp at the plane's edges only moves samples onto edge cells, which the range then covers: a margin of one more cell)
+  p.sup[0] = (float(cx0) - 1.5f) / float(p.w), p.sup[1] = (float(cy0) - 1.5f) / float(p.h);
+  p.sup[2] = (float(cx1) + 2.5f) / float(p.w), p.sup[3] = (float(cy1) + 2.5f) / float(p.h);
+  if (cx0 <= 1) p.sup[0] = -1e30f;
+  if (cy0 <= 1) p.sup[1] = -1e30f;
+  if (cx1 >= p.w - 2) p.sup[2] = 1e30f;
+  if (cy1 >= p.h - 2) p.sup[3] = 1e30f;
+}
+
+// Per-pixel state shared by the components of every adjustment of one pixel (applyLinear): the guide of the pixel, the colour ranges, and the
+// raster values by plane (a plane used by several components / adjustments is sampled once). Exact: the same arithmetic as per component.
+struct PixCtx {
+  bool guideDone = false, rangeDone = false;
+  float g[3] = {0, 0, 0};
+  float L = 0, hue = 0, sat = 0;
+  int nMemo = 0;
+  const Plane* memoP[16];
+  float memoV[16];
+  const float* rv = nullptr;  // the raster values of this pixel by Frame::rasters index, evaluated for the block (linearBlock); null: on demand
+};
+// a raster component's refined mask q = a . I + b at (u, v) for the pixel's guide g (0 outside the plane's support: negligible there)
+inline bool outsideSupport(const Plane& P, float u, float v) { return u < P.sup[0] || v < P.sup[1] || u >= P.sup[2] || v >= P.sup[3]; }
+inline float rasterValue(const Plane& P, float u, float v, const float g[3]) {
+  float ab[4];
+  samplePlane4(P, u, v, ab);
+  return std::clamp(ab[0] * g[0] + ab[1] * g[1] + ab[2] * g[2] + ab[3], 0.f, 1.f);
+}
 
 // OKLab via ProPhoto (D50) -> XYZ -> Bradford D65 -> LMS: the combined matrix
 struct Lab3 {
@@ -560,8 +749,22 @@ inline void rangeOf(const float lin[3], float& L, float& hue, float& sat) {
   sat = std::sqrt(A * A + B * B) / std::max(Lo, 0.05f);
 }
 
-inline float compValue(const Frame& f, const Comp& c, float u, float v, float x, float y, const float lin[3], const float src[3], bool& rangeDone,
-                       float& L, float& hue, float& sat) {
+// the hue of rangeOf alone (the same operations: bit-identical)
+inline float hueOf(const float lin[3]) {
+  const float* M = labMatrix().M;
+  const float r = std::max(lin[0], 0.f), g = std::max(lin[1], 0.f), b = std::max(lin[2], 0.f);
+  const float l = std::cbrt(M[0] * r + M[1] * g + M[2] * b), m = std::cbrt(M[3] * r + M[4] * g + M[5] * b),
+              s = std::cbrt(M[6] * r + M[7] * g + M[8] * b);
+  const float A = 1.9779984951f * l - 2.4285922050f * m + 0.4505937099f * s;
+  const float B = 0.0259040371f * l + 0.7827717662f * m - 0.8086757660f * s;
+  float hue = std::atan2(B, A) * 57.29577951f;
+  if (hue < 0.f) hue += 360.f;
+  return hue;
+}
+
+inline float compValue(const Frame& f, const Comp& c, float u, float v, float x, float y, const float lin[3], const float src[3], PixCtx& px) {
+  bool& rangeDone = px.rangeDone;
+  float &L = px.L, &hue = px.hue, &sat = px.sat;
   switch (c.kind) {
     case kCLinear: {
       const float t = ((x - c.p[0]) * c.p[2] + (y - c.p[1]) * c.p[3]) * c.p[4];
@@ -599,10 +802,18 @@ inline float compValue(const Frame& f, const Comp& c, float u, float v, float x,
     case kCBrush: return c.plane ? samplePlane(*c.plane, 0, u, v) : 0.f;
     case kCRaster: {
       if (!c.plane) return 0.f;
-      const float a0 = samplePlane(*c.plane, 0, u, v), a1 = samplePlane(*c.plane, 1, u, v), a2 = samplePlane(*c.plane, 2, u, v),
-                  b = samplePlane(*c.plane, 3, u, v);
-      const float q = a0 * guideCh(src[0], f.guideRef) + a1 * guideCh(src[1], f.guideRef) + a2 * guideCh(src[2], f.guideRef) + b;
-      return std::clamp(q, 0.f, 1.f);
+      if (px.rv && c.raster >= 0) return px.rv[c.raster];
+      const Plane& P = *c.plane;
+      if (outsideSupport(P, u, v)) return 0.f;
+      for (int k = 0; k < px.nMemo; ++k)
+        if (px.memoP[k] == &P) return px.memoV[k];
+      if (!px.guideDone) {
+        for (int k = 0; k < 3; ++k) px.g[k] = guideCh(src[k], f.guideRef);
+        px.guideDone = true;
+      }
+      const float q = rasterValue(P, u, v, px.g);
+      if (px.nMemo < 16) px.memoP[px.nMemo] = &P, px.memoV[px.nMemo++] = q;
+      return q;
     }
     default: return 0.f;
   }
@@ -750,7 +961,14 @@ Counters counters() {
   c.guideBuilds = g_guideBuilds.load(), c.planeHits = g_planeHits.load(), c.binds = g_binds.load();
   return c;
 }
-void resetPlaneCache() { cache().clear(); }
+std::size_t resetPlaneCache() { return cache().clear(); }
+std::size_t planeCacheBytes(int* entries) { return cache().bytes(entries); }
+std::size_t rasterStoreBytes(int* count) {
+  RasterStore& s = rasters();
+  std::lock_guard<std::mutex> lk(s.m);
+  if (count) *count = int(s.map.size());
+  return s.bytes;
+}
 void guideSample(const SourceImage& src, int i, int j, float px[3]) {
   const ImageF& im = src.linear;
   int x, y;
@@ -842,7 +1060,7 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
   GuideKey gk;
   bool gkDone = false;
   int nRaster = 0, nBrush = 0;
-  const int rasterCap = rasterGridCap(list, interactive);
+  const int rasterCap = rasterGridCap(list, interactive), rasterCapFinal = rasterGridCap(list, false);
   std::vector<std::string> rasterRefs;
   std::vector<std::pair<std::uint64_t, int>> planeAt;  // plane key -> offset in the store: a plane used by several components is stored once
   std::uint64_t pk = 0x91A4E5;
@@ -936,7 +1154,10 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
             gkDone = true;
             f->guideRef = gk.ref;
           }
-          c.plane = rasterPlane(*ra, src, gk, f->sx, f->sy, rasterCap, m.refine, m);
+          // interactive tier: the exact tier's finer plane when it is cached (a drag after a settled frame; the drag then shows the exact mask
+          // and the two tiers' grids do not compete for the plane cache), else the interactive grid
+          if (interactive && rasterCapFinal > rasterCap) c.plane = rasterPlane(*ra, src, gk, f->sx, f->sy, rasterCapFinal, m.refine, m, true);
+          if (!c.plane) c.plane = rasterPlane(*ra, src, gk, f->sx, f->sy, rasterCap, m.refine, m);
           f->anyRaster = true;
           break;
         }
@@ -1007,6 +1228,12 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
   if (!f->spots.empty()) f->anyWindow = true;
   if (f->adj.empty() && f->spots.empty()) return nullptr;
   if (f->anyRaster && gkDone) f->guideRef = gk.ref;
+  for (Comp& c : f->comp) {  // the distinct raster planes of the components that remain (each held by its component)
+    if (c.kind != kCRaster || !c.plane) continue;
+    const auto it = std::find(f->rasters.begin(), f->rasters.end(), c.plane.get());
+    c.raster = int(it - f->rasters.begin());
+    if (it == f->rasters.end()) f->rasters.push_back(c.plane.get());
+  }
   f->planesKey = mix64(pk, std::uint64_t(f->planeFloats));
   writeDesc(*f);
   ++g_binds;
@@ -1021,15 +1248,15 @@ std::vector<float> planeStore(const Frame& f) {
 }
 
 // ---- per pixel -------------------------------------------------------------------------------------------------------------------------
-float maskOf(const Frame& f, int a, float u, float v, const float lin[3], const float src[3]) {
+namespace {
+float maskOfCtx(const Frame& f, int a, float u, float v, const float lin[3], const float src[3], PixCtx& px) {
   const Adj& A = f.adj[std::size_t(a)];
   const float x = u * f.sx, y = v * f.sy;
-  bool rangeDone = false;
-  float L = 0, hue = 0, sat = 0;
   float m = 0.f;
   for (int j = 0; j < A.nc; ++j) {
     const Comp& c = f.comp[std::size_t(A.c0 + j)];
-    float cv = compValue(f, c, u, v, x, y, lin, src, rangeDone, L, hue, sat);
+    if (j > 0 && c.op != 0 && m == 0.f) continue;  // subtract / intersect of nothing: stays 0 (every component value is in [0, 1])
+    float cv = compValue(f, c, u, v, x, y, lin, src, px);
     if (c.invert) cv = 1.f - cv;
     if (j == 0 || c.op == 0) m = j == 0 ? cv : std::max(m, cv);
     else if (c.op == 1) m *= 1.f - cv;
@@ -1038,12 +1265,27 @@ float maskOf(const Frame& f, int a, float u, float v, const float lin[3], const 
   if (A.invert) m = 1.f - m;
   return m * A.weight;
 }
+}  // namespace
 
+float maskOf(const Frame& f, int a, float u, float v, const float lin[3], const float src[3]) {
+  PixCtx px;
+  return maskOfCtx(f, a, u, v, lin, src, px);
+}
+
+namespace {
+void applyLinearCtx(const Frame& f, float u, float v, const float src[3], float px[3], float* K, PixCtx& ctx);
+}
 void applyLinear(const Frame& f, float u, float v, const float src[3], float px[3], float* K) {
+  PixCtx ctx;
+  applyLinearCtx(f, u, v, src, px, K, ctx);
+}
+namespace {
+void applyLinearCtx(const Frame& f, float u, float v, const float src[3], float px[3], float* K, PixCtx& ctx) {
   const int n = int(f.adj.size());
   float w[kMaxLocalAdjustments];
   const float in[3] = {px[0], px[1], px[2]};
-  for (int a = 0; a < n; ++a) w[a] = maskOf(f, a, u, v, in, src);
+  // every adjustment sees the same pixel (in, src): ranges, guide and raster values are shared (ctx)
+  for (int a = 0; a < n; ++a) w[a] = maskOfCtx(f, a, u, v, in, src, ctx);
   if (K)
     for (int k = 0; k < kLocalWindowSlots; ++k) K[k] = 0.f;
   for (int a = 0; a < n; ++a) {
@@ -1087,8 +1329,7 @@ void applyLinear(const Frame& f, float u, float v, const float src[3], float px[
     }
     if (l[11] > 0.f) {  // whiten (teeth, eye whites; docs section 43): warm chroma out, a capped lift
       const float t = std::min(l[11] * wa, 1.f);
-      float Lr, hue, sat;
-      rangeOf(px, Lr, hue, sat);
+      const float hue = hueOf(px);
       const float hw = sstep(0.f, 20.f, hue) * (1.f - sstep(115.f, 140.f, hue));
       const float Y = px[0] * kLumaPP[0] + px[1] * kLumaPP[1] + px[2] * kLumaPP[2];
       const float s = 1.f - 0.7f * t * hw;
@@ -1100,17 +1341,46 @@ void applyLinear(const Frame& f, float u, float v, const float src[3], float px[
     }
   }
 }
+}  // namespace
 
 void linearBlock(const Frame& f, const FrameKernels& fk, float* px, int n, int x0, int y, const AuxTarget* aux) {
   float srcBuf[256 * 3];
   if (f.anyRaster) fk.sourceRow(srcBuf, n, x0, y);
   const bool wantK = aux && aux->data && f.anyWindow;
   float K[kLocalWindowSlots];
+  float us[256], vs[256];
+  for (int i = 0; i < n; ++i) fk.srcUV(x0 + i, y, us[i], vs[i]);
+  // the distinct raster planes, plane by plane over the block (one tight loop each instead of per pixel and component; the same values)
+  constexpr int kRv = 16;
+  const int np = int(f.rasters.size());
+  const bool block = np > 0 && np <= kRv && f.anyRaster && n <= 256;
+  float rv[256 * kRv];
+  if (block) {
+    float g[256 * 3];
+    bool gd[256];
+    for (int i = 0; i < n; ++i) gd[i] = false;
+    for (int k = 0; k < np; ++k) {
+      const Plane& P = *f.rasters[std::size_t(k)];
+      for (int i = 0; i < n; ++i) {
+        float q = 0.f;
+        if (!outsideSupport(P, us[i], vs[i])) {
+          float* gi = g + 3 * i;
+          if (!gd[i]) {
+            for (int c = 0; c < 3; ++c) gi[c] = guideCh(srcBuf[3 * i + c], f.guideRef);
+            gd[i] = true;
+          }
+          q = rasterValue(P, us[i], vs[i], gi);
+        }
+        rv[i * np + k] = q;
+      }
+    }
+  }
   for (int i = 0; i < n; ++i) {
-    float u, v;
-    fk.srcUV(x0 + i, y, u, v);
+    const float u = us[i], v = vs[i];
     const float* s = f.anyRaster ? srcBuf + 3 * i : px + 3 * i;
-    applyLinear(f, u, v, s, px + 3 * i, wantK ? K : nullptr);
+    PixCtx ctx;
+    if (block) ctx.rv = rv + i * np;
+    applyLinearCtx(f, u, v, s, px + 3 * i, wantK ? K : nullptr, ctx);
     if (wantK) {
       const std::size_t o = std::size_t(y - aux->oy) * aux->w + std::size_t(x0 + i - aux->ox);
       for (int k = 0; k < kLocalWindowSlots; ++k)

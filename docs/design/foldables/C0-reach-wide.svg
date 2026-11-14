@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="834" height="811" viewBox="0 0 834 811" font-family="Noto Sans SC, PingFang SC, Microsoft YaHei, sans-serif">
+<rect width="834" height="811" fill="#FAFAFA"/>
+<text x="24" y="32" font-size="20" font-weight="700" fill="#111111">C0 阔折叠 · 拇指可达（展开竖持）</text>
+<text x="24" y="54" font-size="13" fill="#5E5E63">屏宽约 70 mm：单手拇指能扫到对边下部；上部 35 % 单手够不到（估计值，待真机测）</text>
+<g transform="translate(24,72)">
+<rect x="-6.0" y="-6.0" width="452.0" height="719.0" rx="22" fill="#FFFFFF" stroke="#C9C9CE" stroke-width="2"/>
+<rect x="0.0" y="0.0" width="440.0" height="707.0" rx="14" fill="#F2F2F2"/>
+<text x="16.0" y="24.0" font-size="12" font-weight="400" fill="#5E5E63" text-anchor="start">9:41</text>
+<rect x="160.0" y="693.0" width="120.0" height="4.0" rx="2" fill="rgba(0,0,0,0.30)"/>
+<rect x="0.0" y="337.5" width="440.0" height="32.0" rx="0" fill="rgba(198,40,40,0.06)"/>
+<line x1="0.0" y1="353.5" x2="440.0" y2="353.5" stroke="rgba(0,0,0,0.28)" stroke-width="1.5" stroke-dasharray="6 5"/>
+<defs><clipPath id="c6"><rect x="0" y="0" width="440" height="707"/></clipPath></defs>
+<g clip-path="url(#c6)"><circle cx="440" cy="523.18" r="410" fill="rgba(31,95,209,0.10)"/><circle cx="440" cy="523.18" r="280" fill="rgba(31,95,209,0.22)"/></g>
+<circle cx="440.0" cy="523.2" r="7" fill="#1F5FD1"/>
+<rect x="8.0" y="387.0" width="424.0" height="224.0" rx="24" fill="none" stroke="#5E5E63" stroke-width="1" stroke-dasharray="4 4"/>
+<rect x="52.0" y="619.0" width="336.0" height="56.0" rx="28" fill="none" stroke="#5E5E63" stroke-width="1" stroke-dasharray="4 4"/>
+<circle cx="410.0" cy="493.2" r="11" fill="#1F5FD1" stroke="#FFFFFF" stroke-width="2"/>
+<text x="410.0" y="497.7" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+<circle cx="40.0" cy="647.0" r="11" fill="#1F5FD1" stroke="#FFFFFF" stroke-width="2"/>
+<text x="40.0" y="651.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+<circle cx="40.0" cy="80.0" r="11" fill="#1F5FD1" stroke="#FFFFFF" stroke-width="2"/>
+<text x="40.0" y="84.5" font-size="12" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+</g>
+<text x="504" y="86" font-size="14" font-weight="600" fill="#111111">说明</text>
+<circle cx="514" cy="106" r="10" fill="#1F5FD1"/><text x="514" y="110.5" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle">1</text>
+<text x="532" y="110" font-size="13" fill="#111111">单手（右手）握在下部：坞、强度条、盘面</text>
+<text x="532" y="132" font-size="13" fill="#111111">都在深蓝区；坞左端在浅蓝区边缘</text>
+<circle cx="514" cy="150" r="10" fill="#1F5FD1"/><text x="514" y="154.5" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle">2</text>
+<text x="532" y="154" font-size="13" fill="#111111">双手握：两个拇指在下角，覆盖整个下半</text>
+<circle cx="514" cy="172" r="10" fill="#1F5FD1"/><text x="514" y="176.5" font-size="11" font-weight="700" fill="#FFFFFF" text-anchor="middle">3</text>
+<text x="532" y="176" font-size="13" fill="#111111">外屏 1:1、约 58 mm 见方：单手拇指整</text>
+<text x="532" y="198" font-size="13" fill="#111111">屏可达</text>
+</svg>

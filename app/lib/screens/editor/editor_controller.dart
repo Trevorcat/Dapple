@@ -3,6 +3,7 @@
 // haptics and handedness bookkeeping. Widgets listen to the small notifiers here instead of rebuilding the page.
 import 'dart:async';
 
+import 'package:flutter/gestures.dart' show GestureBinding, PointerCancelEvent, PointerEvent, PointerMoveEvent, PointerUpEvent;
 import 'package:flutter/widgets.dart';
 
 import '../../editor/gesture_arbiter.dart';
@@ -269,6 +270,31 @@ class EditorController extends ChangeNotifier implements GestureSink {
     itemised = false;
     extra = null;
     _bump();
+  }
+
+  /// A finger that went down on the 选成像 chip, while it is down (global position), else null. The map opens at once; the same
+  /// finger may slide into it (the map follows this, see [FilmMapView]); lifting it inside the map selects and closes, lifting it
+  /// anywhere else leaves the map open for a tap on a stock.
+  final ValueNotifier<({Offset at, bool down})?> filmPress = ValueNotifier(null);
+  int? _filmPointer;
+
+  void filmPressDown(int pointer, Offset at) {
+    if (_filmPointer != null) return;
+    _filmPointer = pointer;
+    GestureBinding.instance.pointerRouter.addRoute(pointer, _filmRoute);
+    filmPress.value = (at: at, down: true);
+    if (!filmMapOpen) setFilmMap(true);
+  }
+
+  void _filmRoute(PointerEvent e) {
+    if (e is PointerMoveEvent) {
+      filmPress.value = (at: e.position, down: true);
+    } else if (e is PointerUpEvent || e is PointerCancelEvent) {
+      GestureBinding.instance.pointerRouter.removeRoute(e.pointer, _filmRoute);
+      _filmPointer = null;
+      filmPress.value = (at: e.position, down: false);
+      filmPress.value = null;
+    }
   }
 
   void openExtra(PanelExtra? e) {
@@ -844,6 +870,8 @@ class EditorController extends ChangeNotifier implements GestureSink {
   @override
   void dispose() {
     edits.removeListener(_maybeRefreshRanges);
+    if (_filmPointer != null) GestureBinding.instance.pointerRouter.removeRoute(_filmPointer!, _filmRoute);
+    filmPress.dispose();
     local.dispose();
     _rangesTimer?.cancel();
     filmRanges.dispose();

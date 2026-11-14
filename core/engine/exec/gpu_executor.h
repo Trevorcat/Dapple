@@ -41,6 +41,9 @@ class Core {
   SlotRes& slot(int i) { return slots_[i]; }
   bool ensureStaging(int slot, std::uint64_t bytes, std::string& err);
   bool ensureReadback(int slot, std::uint64_t bytes, std::string& err);
+  // Gives the slots' grown host buffers back (staging to its initial 8 MB, readback freed; both grow again on use). The device must be idle and
+  // no frame in flight (memory trim: the context mutex held, after waitIdle). Returns the bytes released.
+  std::size_t trimStaging();
   hal::BufferH gBuf, partBuf;  // dehaze statistics + reduction partials (device local)
   bool boxScanOk = true;       // the running-sum box passed its start-up check on this device (else the direct sum is used)
   // Frame statistics of a finished submission

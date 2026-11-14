@@ -41,6 +41,7 @@ struct Plane {
   int w = 0, h = 0, ch = 1;      // brush: 1 channel (coverage); raster: 4 (a.rgb, b)
   std::vector<float> data;       // w * h * ch
   std::uint64_t key = 0;
+  float sup[4] = {-1e30f, -1e30f, 1e30f, 1e30f};  // raster: (u0, v0, u1, v1) outside which the coefficients are negligible (local_eval.cpp)
   std::size_t bytes() const { return data.size() * sizeof(float); }
 };
 
@@ -48,7 +49,9 @@ struct Counters {
   std::uint64_t brushBuilds = 0, brushPrefixHits = 0, rasterBuilds = 0, guideBuilds = 0, planeHits = 0, binds = 0;
 };
 Counters counters();
-void resetPlaneCache();  // tests
+std::size_t resetPlaneCache();  // returns the bytes it held (tests, dapple_memory_trim)
+std::size_t planeCacheBytes(int* entries);  // memory report
+std::size_t rasterStoreBytes(int* count);   // memory report
 
 // ---- the resolved local adjustments of one frame ------------------------------------------------------------------------------------
 enum CompKind : int { kCLinear = 0, kCRadial = 1, kCLum = 2, kCColour = 3, kCBrush = 4, kCRaster = 5 };
@@ -58,6 +61,7 @@ struct Comp {
   float p[8] = {};               // kind parameters in the photo metric space (see local_eval.cpp: resolve)
   std::shared_ptr<const Plane> plane;
   int planeOffset = 0;           // in floats, into the GPU plane store
+  int raster = -1;               // raster: index into Frame::rasters (CPU block evaluation)
 };
 struct Adj {
   bool invert = false;
@@ -90,6 +94,7 @@ struct Frame {
   float iod = 0.f;               // retouch scale of the frame: inter-ocular distance, photo metric (smallest face of the retouch adjustments)
   float srcLong = 0.f;           // long edge of the source the frame was bound for (pixels per photo metric unit without geometry)
   std::vector<SpotM> spots;      // heal spots (manual + automatic), in composition order
+  std::vector<const Plane*> rasters;  // distinct raster coefficient planes of the components (CPU: evaluated once a pixel, a block at a time)
   std::uint64_t descKey = 0, planesKey = 0;
   int planeFloats = 0;           // size of the GPU plane store
   // GPU descriptor block (vec4 units; layout in local.glsl)

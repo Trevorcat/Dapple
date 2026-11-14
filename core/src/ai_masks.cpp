@@ -229,6 +229,7 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
     return i;
   };
   const std::string& ph = src.photoId;
+  Plane personMask;  // the person group's "person" plane (when a person was found): guides the face windows
   Plane depthFar;  // for the sky prior, when available
   const rt::Avail av = rt::availability(modelDir());
 
@@ -286,7 +287,7 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
           }
         } else if (g.bit == kTaskFaces) {
           std::vector<FaceMesh> meshes;
-          res = rt::faces(im, maxFaces, meshes, ctl.cancel);
+          res = rt::faces(im, personMask.empty() ? nullptr : &personMask, maxFaces, meshes, ctl.cancel);
           if (res.ok) {
             std::vector<FaceFeatures> fl;
             for (const FaceMesh& m : meshes) {
@@ -362,6 +363,9 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
       }
       if (g.bit == kTaskDepth)
         for (const SetEntry& e : set.entries) depthFar = e.plane;
+      if (g.bit == kTaskPerson)
+        for (const SetEntry& e : set.entries)
+          if (e.key == "person") personMask = e.plane;
     }
     gs.ms = msSince(tg);
     r.groups.push_back(gs);

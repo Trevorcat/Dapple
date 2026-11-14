@@ -231,6 +231,9 @@ void main() {
       expect(ids(r), isNot(contains('pt-iris')));
       expect(r.app.toast?.message, '已关掉眼睛');
       expect(r.local.length, 5);
+      await settle(t, 10); // the panel eases back to the chips' height
+      r.app.clearToast(r.app.toast!.id); // the toast sits over the lower panel (guidelines 15.7)
+      await settle(t, 3);
       await tapKey(t, 'chip-eyes');
       expect(ids(r), containsAll(['pt-eyewhite', 'pt-iris']));
       expect(r.local.length, 7);

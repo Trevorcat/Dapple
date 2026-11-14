@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -1964,7 +1965,23 @@ std::vector<float> Renderer::bakeOverflow(const SourceImage& source, const Baked
 // ================================================================================================
 // FrameKernels: the per-pixel loop of renderBakedImpl / renderFloat as block fragments (core/engine, src/frame_kernels.h)
 // ================================================================================================
+namespace {
+std::uint64_t nextKernelsId() {
+  static std::atomic<std::uint64_t> n{0};
+  return ++n;
+}
+// The last row fetchRow resampled on this thread: the local adjustments' pre-gain source of the same block (sourceRow) reads it back instead
+// of resampling the source a second time (LocalLinear runs right after Geometry + Gain on the same block).
+struct RowMemo {
+  std::uint64_t id = 0;
+  int x0 = 0, y = 0, n = 0;
+  float px[256 * 3];
+};
+thread_local RowMemo t_rowMemo;
+}  // namespace
+
 struct FrameKernels::Impl {
+  const std::uint64_t id = nextKernelsId();
   const Renderer& r;
   const SourceImage& source;
   const ImageF& in;
@@ -2132,8 +2149,16 @@ FramePlan FrameKernels::framePlan() const {
 
 void FrameKernels::srcUV(int x, int y, float& u, float& v) const { impl_->srcUV(x, y, u, v); }
 void FrameKernels::sourceRow(float* px, int n, int x0, int y) const {
-  if (impl_->useGeo) fetchRow(px, n, x0, y);
-  else copyRow(px, n, x0, y);
+  if (impl_->useGeo) {
+    const RowMemo& m = t_rowMemo;
+    if (m.id == impl_->id && m.x0 == x0 && m.y == y && m.n == n) {
+      std::memcpy(px, m.px, std::size_t(n) * 3 * sizeof(float));
+      return;
+    }
+    fetchRow(px, n, x0, y);
+  } else {
+    copyRow(px, n, x0, y);
+  }
 }
 const local::Frame* FrameKernels::localFrame() const { return impl_->local.get(); }
 
@@ -2172,6 +2197,11 @@ void FrameKernels::sourceRect(int x0, int y0, int x1, int y1, int& sx0, int& sy0
 
 void FrameKernels::fetchRow(float* px, int n, int x0, int y) const {
   for (int i = 0; i < n; ++i) impl_->fetchPixel(x0 + i, y, px + 3 * i);
+  if (n <= 256 && impl_->local) {  // the local adjustments read the same pixels again (sourceRow)
+    RowMemo& m = t_rowMemo;
+    m.id = impl_->id, m.x0 = x0, m.y = y, m.n = n;
+    std::memcpy(m.px, px, std::size_t(n) * 3 * sizeof(float));
+  }
 }
 
 void FrameKernels::gain(float* px, int n) const {

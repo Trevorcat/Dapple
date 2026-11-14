@@ -1,6 +1,6 @@
 // What the app gives back, and when (docs/engine/pipeline-architecture.md 42.9):
 //  - start-up: the device's memory class goes to the engine (export ceiling, mosaic cache budget); the Flutter image cache is bounded
-//  - the editor closed: its sessions (photo, neighbours, 2x / 1:1 detail) are closed and the engine trims its caches (dapple_memory_trim 0)
+//  - the editor closed: its sessions (photo, neighbours, 2x / 1:1 detail) are closed and the engine trims its caches (dapple_memory_trim 1)
 //  - a full-size export: the sessions the export does not use are closed first (the engine trims the rest at the FULL open)
 //  - Android onTrimMemory (MemoryPlugin.kt): engine trim 1 / 2 and the Flutter image cache
 // Nothing here runs periodically.
@@ -62,14 +62,36 @@ class MemoryPolicy {
     if (_app == null) return; // not started (tests, no engine): nothing to release, and no timer left pending
     Timer(const Duration(seconds: 3), () async {
       final app = _app;
-      if (app == null || gen != _editorGen || _editorsOpen > 0) return;
-      await app.whenCommitsDone();
-      if (gen != _editorGen || _editorsOpen > 0) return;
+      if (app == null || gen != _editorGen || _editorsOpen > 0) {
+        debugPrint('dapple mem: editor closed: release skipped (gen ${gen == _editorGen}, editors open $_editorsOpen)');
+        return;
+      }
       final t = Stopwatch()..start();
-      await app.sessions.closeAll();
-      final freed = await MemoryBindings.trim(0);
-      debugPrint('dapple mem: editor closed: sessions closed, engine trim released ${freed >> 20} MB in ${t.elapsedMilliseconds} ms');
+      await _bounded(app.whenCommitsDone(), 'thumbnail commit');
+      if (gen != _editorGen || _editorsOpen > 0) return;
+      final tc = t.elapsedMilliseconds;
+      await _bounded(app.sessions.closeAll(), 'closing the sessions');
+      if (gen != _editorGen || _editorsOpen > 0) return;
+      final ts = t.elapsedMilliseconds;
+      final freed = await MemoryBindings.trim(editorClosedTrimLevel);
+      debugPrint('dapple mem: editor closed: commit $tc ms, sessions closed ${ts - tc} ms, engine trim $editorClosedTrimLevel released ${freed >> 20} MB, '
+          'total ${t.elapsedMilliseconds} ms');
     });
+  }
+
+  /// Engine trim level when the editor has gone: 1 = the caches of level 0 (mosaics, GPU pool, film workspaces) plus every AI model and the
+  /// local-adjustment planes (they are rebuilt on the next use: an AI model loads in ~0.1-0.3 s, a mask plane in tens of ms).
+  static const editorClosedTrimLevel = 1;
+
+  /// A step of the release that must not hold the trim back forever (a session close waits for its work in flight).
+  static Future<void> _bounded(Future<void> f, String what) async {
+    try {
+      await f.timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      debugPrint('dapple mem: editor closed: $what still running after 15 s, trimming anyway');
+    } catch (e) {
+      debugPrint('dapple mem: editor closed: $what failed: $e');
+    }
   }
 
   // ---- export --------------------------------------------------------------------------------------------------------------------------------------

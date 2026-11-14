@@ -62,7 +62,7 @@ class _PublishDonePageState extends State<PublishDonePage> {
   Widget build(BuildContext context) {
     final c = context.c;
     final mq = MediaQuery.of(context);
-    final footer = math.max(mq.padding.bottom, 16.0);
+    final footer = math.max(math.max(mq.padding.bottom, mq.systemGestureInsets.bottom), 16.0);
     final title = widget.fallback ? '已存入相册' : '已交给$_appName';
     final ratio = widget.ratio == 'orig' ? '原比例' : widget.ratio;
     final steps = <String>[

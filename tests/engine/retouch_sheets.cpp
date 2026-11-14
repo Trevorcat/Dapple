@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -661,8 +662,136 @@ int runLumBlock(const fs::path& out, const char* raw, float feather) {
   return bad;
 }
 
+// --bench mode: the zoomed detail frame of the app (detail session at 4096 px, region around the face at ~1340 x 1493, tier full) and the
+// fit frame (864 x 1080 from the 2048 px session), the default portrait recipe, timed after one retouch amount changed (planes and caches warm).
+//   dapple_retouch_sheets --bench <outdir> [name] [reps] [flags]   (flags of the detail frame: 8 = background as the app, 0 = foreground)
+// Writes <outdir>/<name>_zoom.rgb / _fit.rgb (raw RGBA of the last frame) for before / after comparisons.
+double nowMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+int runBench(const fs::path& outDir, const std::string& name, int reps, int zflags) {
+  const fs::path src = fs::path("build/ai-eval/portraits") / (name + ".jpg"), md = fs::path("build/retouch/masks") / name;
+  std::ifstream mf(md / "meta.json");
+  std::stringstream ss;
+  ss << mf.rdbuf();
+  const std::string meta = ss.str();
+  const std::size_t f1 = meta.find("\"faces\"");
+  const auto iodv = numsAfter(meta, "iod", 1, f1), eR = numsAfter(meta, "eyeR", 2, f1), eL = numsAfter(meta, "eyeL", 2, f1);
+  if (iodv.empty() || eR.size() < 2 || eL.size() < 2 || !fs::exists(src)) return std::printf("%s: meta or source missing\n", name.c_str()), 1;
+  std::vector<std::string> have;
+  for (const char* k : {"faceskin", "f1_skin", "f1_undereye", "f1_teeth", "f1_sclera", "f1_iris", "f1_lips", "f1_mouth", "f1_eyes", "f1_brows"}) {
+    const Mask m = loadMask(md / (std::string(k) + ".png"));
+    if (!m.ok()) continue;
+    const std::string id = "rt_" + name + "_" + k;
+    if (dapple_mask_raster_set(id.c_str(), m.w, m.h, m.d.data(), m.w) == DAPPLE_OK) have.push_back(k);
+  }
+  auto has = [&](const char* k) { return std::find(have.begin(), have.end(), k) != have.end(); };
+  auto paramsAt = [&](int smooth) {
+    std::vector<Area> a = recipeR2(true, has("f1_mouth"), has("f1_teeth"));
+    const std::string key = "\"smooth\":30";
+    const std::size_t p = a[0].adjust.find(key);
+    if (p != std::string::npos) a[0].adjust.replace(p, key.size(), "\"smooth\":" + std::to_string(smooth));
+    return paramsR2(name, iodv[0], a);
+  };
+  auto frame = [&](DappleSession* s, const std::string& pj, int longEdge, const float* region, int regionLong, int flags, const fs::path* dump) {
+    DappleFrameRequest rq{};
+    rq.size = sizeof rq, rq.long_edge = longEdge, rq.flags = flags;
+    if (region) {
+      for (int i = 0; i < 4; ++i) rq.region[i] = region[i];
+      rq.region_long_edge = regionLong;
+    }
+    DappleImage im{};
+    const double t0 = nowMs();
+    const int rc = dapple_session_render_frame(s, pj.c_str(), "", &rq, &im, nullptr);
+    const double ms = nowMs() - t0;
+    if (rc != DAPPLE_OK) std::printf("  frame failed: %s\n", dapple_last_error());
+    else {
+      if (dump) {
+        std::ofstream o(*dump, std::ios::binary);
+        o.write(reinterpret_cast<const char*>(&im.width), 4), o.write(reinterpret_cast<const char*>(&im.height), 4);
+        o.write(reinterpret_cast<const char*>(im.rgba), std::streamsize(std::size_t(im.width) * im.height * 4));
+      }
+      std::printf("  %dx%d %.1f ms\n", im.width, im.height, ms);
+      dapple_free_image(&im);
+    }
+    return ms;
+  };
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.empty() ? 0.0 : v[v.size() / 2];
+  };
+  // fit frame: 864 x 1080 from the 2048 session, foreground
+  double fitFirst = 0, zoomFirst = 0;
+  std::vector<double> fitChg, fitRep, zoomChg, zoomRep;
+  {
+    DappleSession* s = dapple_session_open(src.string().c_str(), DAPPLE_QUALITY_PREVIEW, 2048);
+    if (!s) return std::printf("open failed: %s\n", dapple_last_error()), 1;
+    std::printf("fit: first\n");
+    fitFirst = frame(s, paramsAt(30), 1080, nullptr, 0, 0, nullptr);
+    for (int r = 0; r < reps; ++r) {
+      std::printf("fit: change\n");
+      fitChg.push_back(frame(s, paramsAt(31 + (r & 1)), 1080, nullptr, 0, 0, nullptr));
+      std::printf("fit: repeat\n");
+      const fs::path d = outDir / (name + "_fit.rgb");
+      fitRep.push_back(frame(s, paramsAt(31 + (r & 1)), 1080, nullptr, 0, 0, r + 1 == reps ? &d : nullptr));
+    }
+    dapple_session_close(s);
+  }
+  {
+    DappleSession* s = dapple_session_open(src.string().c_str(), DAPPLE_QUALITY_PREVIEW, 4096);
+    if (!s) return std::printf("open failed: %s\n", dapple_last_error()), 1;
+    // 3.5x zoom of a 1340 x 1493 view on the face (the visible rectangle inflated 12 %): region height 0.32 of the picture
+    const double cx = 0.5 * (eR[0] + eL[0]), cy = 0.5 * (eR[1] + eL[1]) + 0.08;
+    const double rh = 0.32, rw = rh * (1340.0 / 1493.0) * (3200.0 / 2560.0);
+    const float region[4] = {float(std::clamp(cx - rw / 2, 0.0, 1.0 - rw)), float(std::clamp(cy - rh / 2, 0.0, 1.0 - rh)), 0, 0};
+    const float rg[4] = {region[0], region[1], float(region[0] + rw), float(region[1] + rh)};
+    std::printf("zoom region %.3f %.3f %.3f %.3f flags %d\n", rg[0], rg[1], rg[2], rg[3], zflags);
+    std::printf("zoom: first\n");
+    zoomFirst = frame(s, paramsAt(30), 0, rg, 1493, zflags, nullptr);
+    for (int r = 0; r < reps; ++r) {
+      std::printf("zoom: change\n");
+      zoomChg.push_back(frame(s, paramsAt(31 + (r & 1)), 0, rg, 1493, zflags, nullptr));
+      std::printf("zoom: repeat\n");
+      const fs::path d = outDir / (name + "_zoom.rgb");
+      zoomRep.push_back(frame(s, paramsAt(31 + (r & 1)), 0, rg, 1493, zflags, r + 1 == reps ? &d : nullptr));
+    }
+    dapple_session_close(s);
+  }
+  std::printf("BENCH %s: fit first %.1f change %.1f repeat %.1f | zoom(flags %d) first %.1f change %.1f repeat %.1f ms (medians of %d)\n", name.c_str(), fitFirst,
+              median(fitChg), median(fitRep), zflags, zoomFirst, median(zoomChg), median(zoomRep), reps);
+  {  // interleaved as in the app: both sessions open; per change an interactive fit frame (the drag), the settled fit frame, the zoomed frame
+    DappleSession* sp = dapple_session_open(src.string().c_str(), DAPPLE_QUALITY_PREVIEW, 2048);
+    DappleSession* sz = dapple_session_open(src.string().c_str(), DAPPLE_QUALITY_PREVIEW, 4096);
+    if (!sp || !sz) return std::printf("open failed: %s\n", dapple_last_error()), 1;
+    const double cx = 0.5 * (eR[0] + eL[0]), cy = 0.5 * (eR[1] + eL[1]) + 0.08;
+    const double rh = 0.32, rw = rh * (1340.0 / 1493.0) * (3200.0 / 2560.0);
+    const float x0 = float(std::clamp(cx - rw / 2, 0.0, 1.0 - rw)), y0 = float(std::clamp(cy - rh / 2, 0.0, 1.0 - rh));
+    const float rg[4] = {x0, y0, float(x0 + rw), float(y0 + rh)};
+    std::vector<double> drag, fit, zoom;
+    for (int r = 0; r <= reps; ++r) {
+      const std::string pj = paramsAt(30 + (r & 1) * 5);
+      std::printf("interleaved %d: drag\n", r);
+      const double a = frame(sp, pj, 1080, nullptr, 0, 1, nullptr);
+      std::printf("interleaved %d: fit\n", r);
+      const double b = frame(sp, pj, 1080, nullptr, 0, 0, nullptr);
+      std::printf("interleaved %d: zoom\n", r);
+      const fs::path d = outDir / (name + "_zoomi.rgb");
+      const double c = frame(sz, pj, 0, rg, 1493, zflags, r == reps ? &d : nullptr);
+      if (r) drag.push_back(a), fit.push_back(b), zoom.push_back(c);
+    }
+    std::printf("BENCH-INTERLEAVED %s: drag %.1f fit %.1f zoom(flags %d) %.1f ms (medians of %d, after a first round)\n", name.c_str(), median(drag), median(fit),
+                zflags, median(zoom), reps);
+    dapple_session_close(sp);
+    dapple_session_close(sz);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc >= 3 && !std::strcmp(argv[1], "--bench")) {
+    const fs::path out = argv[2];
+    fs::create_directories(out);
+    return runBench(out, argc >= 4 ? argv[3] : "p1_glasses_flag", argc >= 5 ? std::atoi(argv[4]) : 5, argc >= 6 ? std::atoi(argv[5]) : 8);
+  }
   if (argc >= 4 && !std::strcmp(argv[1], "--lumblock")) {  // --lumblock <outdir> <raw> [feather...]
     int bad = 0;
     std::vector<float> fs_;

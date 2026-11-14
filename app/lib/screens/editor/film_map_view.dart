@@ -114,6 +114,8 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
   void initState() {
     super.initState();
     _layout();
+    ctl.filmPress.addListener(_follow);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _follow());
     if (FilmMapStore.positions == null) {
       FilmMapStore.load().then((_) {
         if (mounted) setState(_layout);
@@ -125,8 +127,29 @@ class _FilmMapViewState extends State<FilmMapView> with SingleTickerProviderStat
     _dots = layoutFilmMap(ctl.app.film, FilmMapStore.positions ?? const {});
   }
 
+  /// The finger that went down on the 选成像 chip (the controller routes it here): the map is open from the press on; once the finger
+  /// is inside the map it is the map's finger (magnify, slide to a stock); lifting it there selects and closes. Lifted before it
+  /// ever reached the map, the map stays open for a tap.
+  void _follow() {
+    final p = ctl.filmPress.value;
+    if (p == null || !mounted) return;
+    final box = context.findRenderObject();
+    if (box is! RenderBox || !box.hasSize) return;
+    final local = box.globalToLocal(p.at);
+    if (!p.down) {
+      if (_active) _end(local, false);
+      return;
+    }
+    if (_active) {
+      _move(local);
+    } else if ((Offset.zero & _size).contains(local)) {
+      _down(local);
+    }
+  }
+
   @override
   void dispose() {
+    ctl.filmPress.removeListener(_follow);
     if (_active) ctl.stockEnd();
     _finger.dispose();
     _zoom.dispose();

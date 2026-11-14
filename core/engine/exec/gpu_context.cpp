@@ -809,7 +809,9 @@ class ProviderImpl final : public GpuProvider {
     const std::size_t before = c->pooledBytes();
     c->core().pool().trim(keepFree);
     c->core().dev().trim();
-    return before - std::min(before, c->pooledBytes());
+    // the slots' upload / readback buffers grow to the largest frame seen (50 MB and more after a 40 MP photo) and stayed so for the process
+    const std::size_t staging = keepFree == 0 ? c->core().trimStaging() : 0;
+    return before - std::min(before, c->pooledBytes()) + staging;
   }
   bool memoryInfo(MemoryInfo* out) override {
     std::shared_ptr<Context> c = peek();

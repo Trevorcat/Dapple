@@ -838,12 +838,27 @@ class EditorEngine extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// The edit acts on pixels only (nothing refers to the whole picture's geometry): a region session renders it exactly like the full picture.
-  static bool _regionNeutral(Map<String, dynamic> p) {
+  /// Why a region session (the visible rectangle decoded at the picture's native pixels) cannot render this edit like the full picture, or null
+  /// when it can (the edit acts on pixels only).
+  ///  - crop / rotate / straighten / flip / vignette refer to the whole picture's geometry;
+  ///  - local adjustments: their masks live in the whole photo's coordinates and several of their parts are solved on the whole photo (the
+  ///    edge-aware smoothing of tone ranges, the refinement of AI / person masks against the photo, the portrait retouch's face scale and its
+  ///    automatic spots); a region session knows only its own pixels, so it would put or shape the masks differently. They keep the
+  ///    half-resolution detail session (up to 4096 px), which evaluates them on the whole photo like the export does.
+  static String? regionBlocker(Map<String, dynamic> p) {
     num n(String k) => (p[k] is num) ? p[k] as num : 0;
     final crop = p['crop'];
-    // local adjustments place their masks in the whole picture's coordinates: a region session would put them elsewhere
-    return (crop == null || crop == 'orig') && n('rot') == 0 && n('straighten') == 0 && p['flip'] != true && p['flip'] != 1 && n('vignette') == 0 && p['local'] == null;
+    final l = p['local'];
+    final items = l is Map && l['items'] is List ? l['items'] as List : const [];
+    final anyLocal = items.any((a) => a is Map && a['on'] != false && (a['strength'] is! num || (a['strength'] as num) > 0));
+    final why = <String>[
+      if (!(crop == null || crop == 'orig')) 'crop',
+      if (n('rot') != 0 || n('straighten') != 0) 'rotate',
+      if (p['flip'] == true || p['flip'] == 1) 'flip',
+      if (n('vignette') != 0) 'vignette',
+      if (anyLocal) 'local adjustments',
+    ];
+    return why.isEmpty ? null : why.join(' / ');
   }
 
   Future<void> _renderDetail() async {
@@ -880,7 +895,8 @@ class EditorEngine extends ChangeNotifier {
       // True resolution first (RAW files): the visible rectangle at the picture's native pixels, one region at a time. Only for edits that act on pixels
       // alone: crop / rotate / flip / straighten / vignette refer to the whole picture, so they keep the half-resolution detail session below.
       final wp = app.wireParams(ph);
-      final neutral = _regionNeutral(wp);
+      final blocker = regionBlocker(wp);
+      final neutral = blocker == null;
       if (neutral) {
         final rd = await app.sessions.regionDetail(ph, region);
         if (gen != _detailGen || myGen != _gen) return;
@@ -907,7 +923,7 @@ class EditorEngine extends ChangeNotifier {
           return;
         }
       }
-      debugPrint('dapple detail: half-resolution session (${neutral ? 'no region: larger than the region cap, refused or cancelled' : 'region skipped, the edit has crop / rotate / flip / vignette'}) zoom ${_zoom.toStringAsFixed(1)}');
+      debugPrint('dapple detail: half-resolution session (${neutral ? 'no region: larger than the region cap, refused or cancelled' : 'region skipped, the edit has $blocker'}) zoom ${_zoom.toStringAsFixed(1)}');
       final ds = await app.sessions.detail(ph); // decodes lazily the first time (about a second)
       if (ds == null || gen != _detailGen || myGen != _gen) return;
       final frame = await ds.renderFrame(app.wireParams(ph), region: region, regionLongEdge: out, analysis: false, background: true);

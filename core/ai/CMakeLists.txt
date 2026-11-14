@@ -33,6 +33,9 @@ if(DAPPLE_AI_LITERT)
   add_library(dapple_ai_litert SHARED IMPORTED)
   set_target_properties(dapple_ai_litert PROPERTIES IMPORTED_LOCATION ${DAPPLE_AI_LITERT_ROOT}/jni/${_abi}/libtensorflowlite_jni.so
     INTERFACE_INCLUDE_DIRECTORIES "${DAPPLE_AI_LITERT_ROOT}/headers;${DAPPLE_AI_LITERT_ROOT}/headers/external/org_tensorflow")
+  if(WIN32)  # desktop tests: an import library (.lib) of the LiteRT C API DLL sits beside the .so name
+    set_target_properties(dapple_ai_litert PROPERTIES IMPORTED_IMPLIB ${DAPPLE_AI_LITERT_ROOT}/jni/${_abi}/libtensorflowlite_jni.lib)
+  endif()
   target_link_libraries(dapple_ai PUBLIC dapple_ai_litert)
   target_compile_definitions(dapple_ai PUBLIC DAPPLE_AI_LITERT=1)
 endif()

@@ -83,9 +83,13 @@ double iouBox(const float* a, const float* b) {
 
 }  // namespace
 
-Status detectFaces(const Image& im, std::vector<Face>& out, float minScore, const TaskOptions& o) {
-  out.clear();
-  if (auto s = checkImage(im); !s) return s;
+namespace {
+struct Cand {
+  float score, box[4], kp[6][2];
+};
+
+// One BlazeFace pass over `im` (letterboxed to 128): every anchor above minScore, decoded into the pixel frame of `im` shifted by (offX, offY).
+Status detectCands(const Image& im, float minScore, const TaskOptions& o, float offX, float offY, std::vector<Cand>& cand) {
   int ox = 0, oy = 0;
   const img::Rgb sq = img::letterboxSquare(im, ox, oy);
   const int s = sq.w;
@@ -99,10 +103,6 @@ Status detectFaces(const Image& im, std::vector<Face>& out, float minScore, cons
   const Tensor* sc = &res[1];
   if (raw->count() != 896 * 16) std::swap(raw, sc);
   if (raw->count() != 896 * 16 || sc->count() != 896) return {Code::RunFailed, "face_detector: unexpected output shapes"};
-  struct Cand {
-    float score, box[4], kp[6][2];
-  };
-  std::vector<Cand> cand;
   const Anchors& an = anchors();
   for (int i = 0; i < 896; ++i) {
     const float logit = std::min(100.0f, std::max(-100.0f, sc->f32()[i]));
@@ -111,18 +111,22 @@ Status detectFaces(const Image& im, std::vector<Face>& out, float minScore, cons
     const float* r = raw->f32() + size_t(i) * 16;
     Cand c;
     c.score = p;
-    c.box[0] = (r[0] / 128 + an.x[size_t(i)]) * float(s) - float(ox);
-    c.box[1] = (r[1] / 128 + an.y[size_t(i)]) * float(s) - float(oy);
+    c.box[0] = (r[0] / 128 + an.x[size_t(i)]) * float(s) - float(ox) + offX;
+    c.box[1] = (r[1] / 128 + an.y[size_t(i)]) * float(s) - float(oy) + offY;
     c.box[2] = r[2] / 128 * float(s);
     c.box[3] = r[3] / 128 * float(s);
     for (int k = 0; k < 6; ++k) {
-      c.kp[k][0] = (r[4 + 2 * k] / 128 + an.x[size_t(i)]) * float(s) - float(ox);
-      c.kp[k][1] = (r[5 + 2 * k] / 128 + an.y[size_t(i)]) * float(s) - float(oy);
+      c.kp[k][0] = (r[4 + 2 * k] / 128 + an.x[size_t(i)]) * float(s) - float(ox) + offX;
+      c.kp[k][1] = (r[5 + 2 * k] / 128 + an.y[size_t(i)]) * float(s) - float(oy) + offY;
     }
     cand.push_back(c);
   }
+  return {};
+}
+
+// weighted NMS (MediaPipe): every candidate overlapping the best by IoU > 0.3 is merged into it, weighted by score
+void mergeCands(std::vector<Cand> cand, std::vector<Face>& out) {
   std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.score > b.score; });
-  // weighted NMS (MediaPipe): every candidate overlapping the best by IoU > 0.3 is merged into it, weighted by score
   while (!cand.empty()) {
     const Cand best = cand[0];
     std::vector<Cand> grp, rest;
@@ -143,6 +147,122 @@ Status detectFaces(const Image& im, std::vector<Face>& out, float minScore, cons
     for (int k = 0; k < 6; ++k) for (int j = 0; j < 2; ++j) f.kp[k][j] = float(kp[k][j] / wsum);
     out.push_back(f);
     cand = std::move(rest);
+  }
+}
+
+struct Blob {
+  float x0, y0, x1, y1;  // image pixels
+  int area;              // grid cells
+};
+bool insideBox(const Face& f, float x0, float y0, float x1, float y1) { return f.cx >= x0 && f.cx <= x1 && f.cy >= y0 && f.cy <= y1; }
+bool centreInFace(const Face& a, const Face& b) { return std::fabs(a.cx - b.cx) <= b.w / 2 && std::fabs(a.cy - b.cy) <= b.h / 2; }
+
+// 4-connected components of the person mask on a 128 grid; regions of at least 0.4% of the frame, largest first
+std::vector<Blob> personBlobs(const uint8_t* mask, int mw, int mh, int W, int H) {
+  constexpr int G = 128;
+  std::vector<uint8_t> g(size_t(G) * G), seen(size_t(G) * G, 0);
+  for (int y = 0; y < G; ++y)
+    for (int x = 0; x < G; ++x)
+      g[size_t(y) * G + x] = mask[size_t(std::min(mh - 1, (y * 2 + 1) * mh / (2 * G))) * size_t(mw) + size_t(std::min(mw - 1, (x * 2 + 1) * mw / (2 * G)))] > 127;
+  std::vector<Blob> out;
+  std::vector<int> stack;
+  for (int i = 0; i < G * G; ++i) {
+    if (!g[size_t(i)] || seen[size_t(i)]) continue;
+    int x0 = G, y0 = G, x1 = -1, y1 = -1, area = 0;
+    stack.assign(1, i);
+    seen[size_t(i)] = 1;
+    while (!stack.empty()) {
+      const int c = stack.back();
+      stack.pop_back();
+      const int cx = c % G, cy = c / G;
+      ++area, x0 = std::min(x0, cx), x1 = std::max(x1, cx), y0 = std::min(y0, cy), y1 = std::max(y1, cy);
+      const int nb[4][2] = {{cx - 1, cy}, {cx + 1, cy}, {cx, cy - 1}, {cx, cy + 1}};
+      for (auto& n : nb) {
+        if (n[0] < 0 || n[1] < 0 || n[0] >= G || n[1] >= G) continue;
+        const int k = n[1] * G + n[0];
+        if (g[size_t(k)] && !seen[size_t(k)]) seen[size_t(k)] = 1, stack.push_back(k);
+      }
+    }
+    if (area * 250 < G * G) continue;
+    out.push_back({float(x0) * float(W) / G, float(y0) * float(H) / G, float(x1 + 1) * float(W) / G, float(y1 + 1) * float(H) / G, area});
+  }
+  std::stable_sort(out.begin(), out.end(), [](const Blob& a, const Blob& b) { return a.area > b.area; });
+  return out;
+}
+}  // namespace
+
+Status detectFaces(const Image& im, std::vector<Face>& out, float minScore, const TaskOptions& o) {
+  out.clear();
+  if (auto s = checkImage(im); !s) return s;
+  std::vector<Cand> cand;
+  if (auto s = detectCands(im, minScore, o, 0, 0, cand); !s) return s;
+  mergeCands(std::move(cand), out);
+  return {};
+}
+
+Status findFaces(const Image& im, const uint8_t* personMask, int mw, int mh, std::vector<FoundFace>& out, const TaskOptions& o, FaceFindStats* stats) {
+  out.clear();
+  if (stats) *stats = FaceFindStats{};
+  if (auto s = checkImage(im); !s) return s;
+  auto cancelled = [&] { return o.cancel && o.cancel->load(); };
+  std::vector<Face> f0;
+  if (auto s = detectFaces(im, f0, 0.5f, o); !s) return s;
+  if (stats) stats->passes = 1;
+  for (const Face& f : f0) {
+    if (cancelled()) return {Code::Cancelled, "cancelled"};
+    FoundFace ff;
+    ff.face = f;
+    if (auto s = faceLandmarks(im, f, ff.lm, o); !s) return s;
+    if (ff.lm.valid) out.push_back(std::move(ff));  // the rest: too small for a good crop, profiles, false hits
+  }
+  if (!personMask || mw <= 0 || mh <= 0) return {};
+  // a person region is explained when it holds a mesh-validated face and is not much wider than one person (about 4 face widths)
+  std::vector<Blob> todo;
+  for (const Blob& b : personBlobs(personMask, mw, mh, im.w, im.h)) {
+    bool explained = false;
+    for (const FoundFace& ff : out)
+      if (insideBox(ff.face, b.x0, b.y0, b.x1, b.y1) && b.x1 - b.x0 <= 4.0f * ff.face.w) explained = true;
+    if (!explained) todo.push_back(b);
+  }
+  if (todo.empty()) return {};
+  // square windows over the upper part of each unexplained region (side 0.4 of its height, 50% overlap), at most 10 in all
+  const int side = std::min(im.w, im.h);
+  std::vector<Cand> cand;
+  int tiles = 0;
+  for (const Blob& b : todo) {
+    const float bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+    const float S = std::min(float(side), std::max(0.4f * bh, 160.0f));
+    const float y0 = std::min(std::max(0.0f, b.y0 - 0.1f * S), float(im.h) - S);
+    std::vector<float> xs;
+    if (bw <= S) xs.push_back(b.x0 + bw / 2 - S / 2);
+    else
+      for (float x = b.x0; xs.empty() || x < b.x1 - S / 2; x += S / 2) xs.push_back(x);
+    for (float xf : xs) {
+      if (tiles >= 10) break;
+      if (cancelled()) return {Code::Cancelled, "cancelled"};
+      const int ix = int(std::min(std::max(0.0f, xf), float(im.w) - S)), iy = int(y0), is = int(S);
+      const Image w{im.rgb + size_t(iy) * size_t(im.stride) + size_t(ix) * 3, is, is, im.stride};
+      if (auto s = detectCands(w, 0.5f, o, float(ix), float(iy), cand); !s) return s;
+      ++tiles;
+    }
+  }
+  if (stats) stats->passes += tiles;
+  std::vector<Face> ft;
+  mergeCands(std::move(cand), ft);  // sorted by score; a window-clipped duplicate is dropped when its centre lies in a better face's box
+  std::vector<Face> kept;
+  for (const Face& f : ft) {
+    bool dup = false;
+    for (const FoundFace& ff : out) dup |= centreInFace(f, ff.face);
+    for (const Face& k : kept) dup |= centreInFace(f, k) || centreInFace(k, f);
+    if (!dup) kept.push_back(f);
+  }
+  for (const Face& f : kept) {
+    if (cancelled()) return {Code::Cancelled, "cancelled"};
+    FoundFace ff;
+    ff.face = f;
+    if (auto s = faceLandmarks(im, f, ff.lm, o); !s) return s;
+    if (stats) ++stats->crops;
+    if (ff.lm.valid) out.push_back(std::move(ff));
   }
   return {};
 }

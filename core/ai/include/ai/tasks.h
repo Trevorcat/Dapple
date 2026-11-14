@@ -42,6 +42,20 @@ struct Landmarks {
 // Rotated crop around `face` (eye line, 1.5 x box) and Face Mesh v2.
 Status faceLandmarks(const Image& im, const Face& face, Landmarks& out, const TaskOptions& o = {});
 
+// Faces with mesh, for small and several faces. Pass 0: detectFaces on the whole frame + mesh per face. When `personMask` (any size, > 127 = person)
+// is given and some person region is not explained by a mesh-validated face (none inside it, or the region is wider than 4 face widths),
+// BlazeFace also runs on square windows over the upper part of that region (<= 10 windows) and the extra faces get a mesh as well.
+// Only mesh-validated faces are returned (pass-0 faces first, in score order, then the window faces). Single-face photos cost nothing extra.
+struct FoundFace {
+  Face face;
+  Landmarks lm;
+};
+struct FaceFindStats {
+  int passes = 0;  // detector runs (whole frame + windows)
+  int crops = 0;   // extra mesh runs for window faces
+};
+Status findFaces(const Image& im, const uint8_t* personMask, int mw, int mh, std::vector<FoundFace>& out, const TaskOptions& o = {}, FaceFindStats* stats = nullptr);
+
 // ---- person parts -----------------------------------------------------------------------------------------------------------
 enum PersonClass : uint8_t { kBackground = 0, kHair = 1, kBodySkin = 2, kFaceSkin = 3, kClothes = 4, kOthers = 5 };
 struct PersonParts {

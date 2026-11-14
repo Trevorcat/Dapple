@@ -19,6 +19,7 @@ import '../model/pad_model.dart';
 import '../model/params.dart';
 import '../models.dart';
 import '../native/dapple_session.dart';
+import '../native/memory_bindings.dart';
 import 'ingest.dart';
 import '../screens/editor/editor_page.dart';
 import '../state/app_state.dart';
@@ -40,6 +41,13 @@ class DebugOpen {
       final text = await f.readAsString();
       await f.delete();
       final j = jsonDecode(text) as Map<String, dynamic>;
+      if (j['memReport'] == true || j['memTrim'] is int) {
+        // {"memTrim":0|1|2} runs dapple_memory_trim at that level, {"memReport":true} prints dapple_memory_report_json (memory measurements)
+        final lv = j['memTrim'];
+        if (lv is int) debugPrint('debug_open: memTrim $lv released ${(await MemoryBindings.trim(lv)) >> 20} MB');
+        debugPrint('debug_open: memReport ${jsonEncode(MemoryBindings.report())}');
+        return;
+      }
       if (j['convert'] is String) {
         // {"convert":"/abs/photo.heic"}: the platform conversion the library does for such files, then an engine session on the result
         // (logs the colour space the engine detected); the PNG stays in the external files folder as converted.png
