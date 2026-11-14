@@ -147,6 +147,7 @@ class EditorEngine extends ChangeNotifier {
   /// screen resolution from a higher-resolution session (decoded lazily in the background for this
   /// photo, at most [SessionCache.detailLongEdge] px, then cached) and published as [detail].
   void setViewport(ui.Rect normalized, double zoom) {
+    if (normalized != _view || (zoom - _zoom).abs() > 1e-6) _viewMs = _clock.elapsedMilliseconds; // a report of the same view is not a change
     _view = normalized;
     _zoom = zoom;
     _viewVersion++;
@@ -154,7 +155,7 @@ class EditorEngine extends ChangeNotifier {
     if (w > 0) _fullWidthPx = zoom * w;
     if (!live) return;
     _detailTimer?.cancel();
-    if (zoom <= detailMinZoom) {
+    if (_detailZoom <= detailMinZoom) {
       _clearDetail();
       return;
     }
@@ -164,6 +165,15 @@ class EditorEngine extends ChangeNotifier {
   ui.Rect _view = const ui.Rect.fromLTWH(0, 0, 1, 1);
   double _zoom = 1;
   double _fullWidthPx = 0; // displayed device pixels across the whole picture's width
+  int _viewMs = -100000; // when the visible region or the zoom last changed
+
+  /// Device pixels per pixel of the settled frame on screen. [setViewport]'s zoom is relative to [image], which on the zero-copy path is the first
+  /// (readback) frame of the photo and can be larger than the settled frames the texture shows (1280 against 864 on a 1080 px phone): measured against
+  /// it a 2x zoom read 1.3 and never got a detail render. Drag frames are smaller still and do not count (they would ask for a detail at fit zoom).
+  double get _detailZoom {
+    final w = _gpuLive && _gpuSettledW > 0 ? _gpuSettledW : (image?.width ?? 0);
+    return w > 0 && _fullWidthPx > 0 ? _fullWidthPx / w : _zoom;
+  }
   Timer? _detailTimer;
   int _detailGen = 0;
   int _viewVersion = 0;
@@ -253,10 +263,10 @@ class EditorEngine extends ChangeNotifier {
       }
       _releaseMs = _clock.elapsedMilliseconds;
       PerfProbe.dragging = false;
-      PerfProbe.log('release', {'zoom': _zoom, 'final': finalLongEdge, 'needFinal': _needFinal});
+      PerfProbe.log('release', {'zoom': _detailZoom, 'final': finalLongEdge, 'needFinal': _needFinal});
       if (quality.endDrag()) PerfProbe.log('rung', {'to': quality.rung.toString(), 'ema': quality.emaMs, 'at': 'drag end'});
       DappleBindings.instanceOrNull?.setInteraction?.call(0);
-      _scheduleFinal(delay: releaseDelay);
+      _settleNow();
       _schedulePrefetch();
       _pollThermal();
       if (kPerfProbe && !_perfLogged) {
@@ -275,9 +285,25 @@ class EditorEngine extends ChangeNotifier {
 
   bool get _interactiveNow => _drag > 0 || (_burst && _clock.elapsedMilliseconds - _lastEditMs < idleDelay.inMilliseconds);
 
-  /// After an explicit finger-up ([endInteraction]) the full-quality frame starts sooner: the drag is known to be
-  /// over, the delay only absorbs an immediate re-grab. [idleDelay] stays for drags inferred from edit bursts.
-  static const Duration releaseDelay = Duration(milliseconds: 50);
+  /// After an explicit finger-up ([endInteraction]) the full-quality frame is requested at once, in the same call: the drag is known to be over
+  /// (the owner's foldable waited ~1.5 s for the sharp picture; every timer on this path was part of it). A re-grab simply supersedes it: the next
+  /// drag frame waits for at most this one frame. [idleDelay] stays for drags inferred from edit bursts. Zoomed in, the sharp picture is the detail
+  /// render, which starts right away too (in parallel with the settled frame; the view has not moved during a control drag).
+  void _settleNow() {
+    _idle?.cancel();
+    _burst = false;
+    if (_needFinal && live) {
+      _needFinal = false;
+      _dirty = true;
+      PerfProbe.log('final_req', {'sinceRelease': _releaseMs >= 0 ? _clock.elapsedMilliseconds - _releaseMs : -1, 'busy': _busy, 'gpuInFlight': _gpuInFlight});
+      debugSettleRequests++;
+      unawaited(_kick());
+    }
+    if (live && _detailZoom > detailMinZoom) _scheduleDetail();
+  }
+
+  /// Test hook: settled frames requested by a finger-up ([_settleNow]).
+  int debugSettleRequests = 0;
 
   void _scheduleFinal({Duration delay = idleDelay}) {
     _idle?.cancel();
@@ -306,6 +332,7 @@ class EditorEngine extends ChangeNotifier {
   int _gen = 0;
   bool _busy = false, _dirty = false;
   DappleSession? _finalSession; // set while a non-interactive (final) render is in flight: edited() may cancel it
+  bool get _settling => _finalSession != null;
   bool _finalCancelled = false;
   Timer? _tileDebounce;
   int _tileGen = 0;
@@ -469,6 +496,7 @@ class EditorEngine extends ChangeNotifier {
         final interactive = _interactiveNow;
         final params = app.wireParams(ph);
         if (hideLocal) params.remove('local'); // 局部's 对比: the photo without its local areas
+        if (hideLocal) params.remove('reshape'); // ... and without its reshaping (形体 is part of the 人像 work)
         final rung = quality.rung;
         final editUs = _editUs; // newest edit this frame contains
         if (_gpuActive) {
@@ -525,9 +553,9 @@ class EditorEngine extends ChangeNotifier {
       unawaited(_kick());
       return;
     }
-    if (myGen == _gen && !_dirty && !_interactiveNow && _zoom > detailMinZoom) _scheduleDetail();
+    if (myGen == _gen && !_dirty && !_interactiveNow && _detailZoom > detailMinZoom) _scheduleDetail();
     final primePhoto = photo;
-    if (myGen == _gen && !_dirty && !_interactiveNow && _zoom <= detailMinZoom && primePhoto != null) {
+    if (myGen == _gen && !_dirty && !_interactiveNow && _detailZoom <= detailMinZoom && primePhoto != null) {
       _primeTimer?.cancel(); // idle warm-up of the 1:1 path (SessionCache.primeRegion), once per photo
       _primeTimer = Timer(const Duration(milliseconds: 1500), () {
         if (_interactiveNow || _dirty) {
@@ -621,6 +649,7 @@ class EditorEngine extends ChangeNotifier {
   // across isolates. The readback path above stays the permanent fallback (any failure ends in _disableGpu).
   GpuViewBackend? _gpu;
   bool _gpuStarting = false, _gpuDisabled = false, _gpuLive = false, _closed = false;
+  int _gpuSettledW = 0; // width of the newest settled (non-interactive) zero-copy frame
   int _gpuW = 0, _gpuH = 0, _gpuFails = 0, _gpuSubmitted = 0, _gpuDone = 0, _gpuSubmitMs = 0;
   final Map<int, ({bool interactive, int editUs})> _gpuMeta = {};
 
@@ -635,6 +664,9 @@ class EditorEngine extends ChangeNotifier {
 
   bool get _gpuActive => _gpu != null && _gpu!.ready && !_gpuDisabled && image != null;
   bool get _gpuInFlight => _gpuSubmitted > _gpuDone;
+
+  /// A drag frame is in flight on the zero-copy path (a settled frame in flight does not hold the detail render back: both show the same edit).
+  bool get _gpuDragInFlight => _gpuInFlight && _gpuMeta.values.any((m) => m.interactive);
 
   void _maybeStartGpu(ui.Image first) {
     if (_gpu != null || _gpuStarting || _gpuDisabled || !GpuViewBackend.supported) return;
@@ -691,6 +723,7 @@ class EditorEngine extends ChangeNotifier {
         _gpuW = e.width;
         _gpuH = e.height;
         final interactive = meta?.interactive ?? false;
+        if (!interactive) _gpuSettledW = e.width;
         final an = g.takeAnalysis();
         if (an != null) {
           analysis = Analysis.fromJson(an);
@@ -748,7 +781,7 @@ class EditorEngine extends ChangeNotifier {
   /// What `_kick` does once things are idle (zoom detail, before/after picture), for frames that finish natively.
   void _gpuIdleTail() {
     if (_interactiveNow || _busy) return;
-    if (_zoom > detailMinZoom) _scheduleDetail();
+    if (_detailZoom > detailMinZoom) _scheduleDetail();
     if (original == null) {
       _originalTimer?.cancel();
       final g = _gen, ph = photo;
@@ -780,6 +813,7 @@ class EditorEngine extends ChangeNotifier {
 
   void _gpuDetachSession() {
     _gpuLive = false;
+    _gpuSettledW = 0;
     _gpuMeta.clear();
     _gpuSubmitted = _gpuDone = 0;
     final g = _gpu;
@@ -829,9 +863,13 @@ class EditorEngine extends ChangeNotifier {
   // ---- zoom detail ----------------------------------------------------------------------------------
   Timer? _primeTimer;
 
-  void _scheduleDetail() {
+  /// The detail render starts once the view has been still for [detailDelay]: after an edit on a view that has not moved for that long it starts at
+  /// once (it was always another 200 ms). [retry]: the full delay again (the engine was busy).
+  void _scheduleDetail({bool retry = false}) {
     _detailTimer?.cancel();
-    _detailTimer = Timer(detailDelay, () => unawaited(_renderDetail()));
+    final still = _clock.elapsedMilliseconds - _viewMs;
+    final wait = retry ? detailDelay.inMilliseconds : math.max(0, detailDelay.inMilliseconds - still);
+    _detailTimer = Timer(Duration(milliseconds: wait), () => unawaited(_renderDetail()));
   }
 
   void _clearDetail() {
@@ -871,13 +909,13 @@ class EditorEngine extends ChangeNotifier {
   Future<void> _renderDetail() async {
     final ph = photo;
     final img = image;
-    if (ph == null || img == null || !live || _zoom <= detailMinZoom || _fullWidthPx <= 0) {
+    if (ph == null || img == null || !live || _detailZoom <= detailMinZoom || _fullWidthPx <= 0) {
       PerfProbe.log('detail_skip', {'img': img != null, 'zoom': _zoom, 'fw': _fullWidthPx});
       return;
     }
-    if (_busy || _dirty || _interactiveNow || _gpuInFlight) {
+    if (_dirty || _interactiveNow || _gpuDragInFlight || (_busy && !_settling)) {
       PerfProbe.log('detail_wait', {'busy': _busy, 'dirty': _dirty, 'inter': _interactiveNow, 'gpu': _gpuInFlight});
-      _scheduleDetail(); // edits in flight: try again once the view is still
+      _scheduleDetail(retry: true); // edits in flight: try again once the view is still
       return;
     }
     if (_detailBusy) return;
@@ -903,7 +941,7 @@ class EditorEngine extends ChangeNotifier {
     final gen = ++_detailGen, myGen = _gen, version = _viewVersion;
     _detailBusy = true;
     final dt0 = _clock.elapsedMilliseconds;
-    PerfProbe.log('detail_start', {'zoom': _zoom, 'out': out, 'region': [region.left, region.top, region.right, region.bottom]});
+    PerfProbe.log('detail_start', {'zoom': _detailZoom, 'out': out, 'region': [region.left, region.top, region.right, region.bottom]});
     try {
       // True resolution first (RAW files): the visible rectangle at the picture's native pixels, one region at a time. Only for edits that act on pixels
       // alone: crop / rotate / flip / straighten / vignette refer to the whole picture, so they keep the half-resolution detail session below.
@@ -933,7 +971,7 @@ class EditorEngine extends ChangeNotifier {
           detail = im;
           detailRect = region;
           notifyListeners();
-          if (myGen == _gen && _zoom > detailMinZoom && (version != _viewVersion || gen != _detailGen)) _scheduleDetail();
+          if (myGen == _gen && _detailZoom > detailMinZoom && (version != _viewVersion || gen != _detailGen)) _scheduleDetail();
           return;
         }
       }
@@ -961,7 +999,7 @@ class EditorEngine extends ChangeNotifier {
       _detailBusy = false;
     }
     // the view moved (or an edit cleared the detail) while rendering: look again once it is still
-    if (myGen == _gen && _zoom > detailMinZoom && (version != _viewVersion || gen != _detailGen)) _scheduleDetail();
+    if (myGen == _gen && _detailZoom > detailMinZoom && (version != _viewVersion || gen != _detailGen)) _scheduleDetail();
   }
 
   Future<void> _loadOriginal(Photo ph, int gen) async {

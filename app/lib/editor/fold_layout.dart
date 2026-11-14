@@ -64,15 +64,30 @@ bool isNearSquareLarge(Size s) {
 /// Test hook: false keeps the ordinary phone / side-pane layouts on every window (the tests of that placement logic run on fold-sized windows).
 bool debugFoldLayouts = true;
 
-FoldMode foldModeOf(Size size, FoldCrease? crease, double aspect) {
+FoldMode foldModeOf(Size size, FoldCrease? crease, double aspect, {double topInset = 36, double bottomInset = 20}) {
   if (!debugFoldLayouts) return FoldMode.none;
   if (crease != null && crease.horizontal && crease.halfOpened) {
     final y = crease.bounds.center.dy;
     if (y > size.height * 0.25 && y < size.height * 0.8) return FoldMode.half;
   }
-  if (isNearSquareLarge(size)) return aspect >= 1 ? FoldMode.bench : FoldMode.column;
+  if (isNearSquareLarge(size)) {
+    // Not by the photo's orientation alone: on a given window the layout that shows this photo larger wins. A landscape photo
+    // naturally takes the workbench and a portrait one the column; the other is chosen when it shows the photo clearly larger
+    // (a 4:5 photo on a tall window is bigger above a workbench, a 5:4 one on a wide window is bigger beside a column).
+    double area(FoldMode m) {
+      final p = FoldPlan.compute(mode: m, size: size, pad: EdgeInsets.only(top: topInset), bottomInset: bottomInset, crease: crease, aspect: aspect, hand: Hand.right);
+      final r = p.photoRect(aspect);
+      return r.width * r.height;
+    }
+
+    final natural = aspect >= 1 ? FoldMode.bench : FoldMode.column;
+    final other = aspect >= 1 ? FoldMode.column : FoldMode.bench;
+    return area(other) > area(natural) * kFoldSwitchGain ? other : natural;
+  }
   return FoldMode.none;
 }
+
+const double kFoldSwitchGain = 1.06; // the other layout must show the photo this much larger before it replaces the natural one
 
 const double kBenchMin = 236; // the least height of the workbench (the pad keeps 150 dp)
 const double kBenchGap = 48; // the gap between the two halves when there is no fold to tell where it is

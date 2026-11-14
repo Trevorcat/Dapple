@@ -11,6 +11,7 @@ import '../../model/local_kinds.dart';
 import '../../model/local_pad.dart';
 import '../../model/pad_model.dart';
 import '../../model/portrait.dart';
+import '../../model/reshape.dart';
 import '../../services/local_ai.dart' show AiPlane;
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart' show HitBox, kHit;
@@ -922,6 +923,7 @@ double toolStripH(double width) => (width < 360 ? 2 : 1) * kHit;
 /// reserved only then. The same conditions as [LocalToolStrip] builds with.
 bool localToolsShown(EditorController ctl) {
   final lc = ctl.local;
+  if (lc.active && lc.reshapeTool.sel != null && lc.body == LocalBody.portrait && !ctl.compare.value && !lc.comparing) return true;
   final a = lc.sel, m = lc.comp;
   if (!lc.active || a == null || m == null) return false;
   if (lc.body != LocalBody.pads && !(lc.body == LocalBody.portrait && lc.selIsPortrait)) return false;
@@ -954,6 +956,18 @@ class LocalToolStrip extends StatelessWidget {
       listenable: Listenable.merge([ctl.wm, ctl.edits, ctl.app.editTick, lc]),
       builder: (context, _) {
         final a = lc.sel, m = lc.comp;
+        if (lc.active && lc.reshapeTool.sel != null && lc.body == LocalBody.portrait && !ctl.compare.value && !lc.comparing) {
+          final c = context.c;
+          return Align(
+            alignment: Alignment.bottomCenter,
+            child: Container(
+              key: const ValueKey('local-tools'),
+              padding: const EdgeInsets.symmetric(horizontal: Sp.xs),
+              decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(Rd.float)),
+              child: _PushTools(t: lc.reshapeTool),
+            ),
+          );
+        }
         if (!lc.active ||
             a == null ||
             m == null ||
@@ -1097,10 +1111,13 @@ class _PartChip extends StatelessWidget {
 /// left end of the tool strip, + by default. Two 48 dp halves on one 36 dp track; the chosen half is the persistent selection (soft fill
 /// and accent border, U7).
 class AddRemoveSwitch extends StatelessWidget {
-  const AddRemoveSwitch({super.key, required this.prefix, required this.add, required this.onChanged});
+  const AddRemoveSwitch({super.key, required this.prefix, required this.add, required this.onChanged, this.addLabel = '加上', this.subLabel = '去掉'});
   final String prefix;
   final bool add;
   final ValueChanged<bool> onChanged;
+
+  /// Spoken names of the halves (推 / 恢复 for the reshaping brush).
+  final String addLabel, subLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -1111,7 +1128,7 @@ class AddRemoveSwitch extends StatelessWidget {
         button: true,
         inMutuallyExclusiveGroup: true,
         selected: on,
-        label: a ? '加上' : '去掉',
+        label: a ? addLabel : subLabel,
         excludeSemantics: true,
         onTap: () => onChanged(a),
         child: GestureDetector(
@@ -1477,11 +1494,39 @@ double? portraitBodyNeed(LocalController lc, double innerW, double textScale) {
   final avail = innerW - 40 - Sp.m;
   final fit = ((avail + gap) / (56 + gap)).floor();
   final cols = math.max(1, math.min(math.min(4, fit), n));
-  final groupRows = portraitGroupRows(chips, cols);
+  final groupRows = [...portraitGroupRows(chips, cols), ...reshapeGroupRows(lc.reshapeTool, cols)];
+  if (lc.reshapeTool.action != null) return actionTileH(TextScaler.linear(textScale));
   final rows = groupRows.fold<int>(0, (a, b) => a + b);
-  final faceRow = lc.frontalFaces.length > 1 && lc.selChip != null ? kHit + Sp.s : 0.0;
+  final faceRow = (lc.frontalFaces.length > 1 && lc.selChip != null) || reshapeFaceRow(lc) ? kHit + Sp.s : 0.0;
   return rows * 64.0 * textScale.clamp(1.0, 2.0) + gap * (rows - groupRows.length) + groupRows.length * kGroupTitleH + gap * (groupRows.length - 1) + faceRow;
 }
+
+/// 形体 (section 9.2): the reshaping tiles in two groups after the retouch chips, 脸型 and 身体 (3 - 5 tiles each, only what the analysis
+/// supports: the body group needs the pose).
+List<(String, List<ReshapeOp>)> reshapeGroups(ReshapeTool t) => [
+      if (t.faceOps.isNotEmpty) ('脸型', t.faceOps),
+      if (t.bodyOps.isNotEmpty) ('身体', t.bodyOps),
+    ];
+List<int> reshapeGroupRows(ReshapeTool t, int cols) => [for (final g in reshapeGroups(t)) (g.$2.length / cols).ceil()];
+
+/// The face row for a 形体 tile: a selected face operator on a photo with several faces.
+bool reshapeFaceRow(LocalController lc) {
+  final op = lc.reshapeTool.sel;
+  return op != null && !reshapeSpecOf(op).body && lc.reshapeTool.faces.length > 1;
+}
+
+DI reshapeIcon(ReshapeOp o) => switch (o) {
+      ReshapeOp.slim => DI.slimFace,
+      ReshapeOp.small => DI.smallFace,
+      ReshapeOp.chin => DI.chin,
+      ReshapeOp.eyes => DI.bigEyes,
+      ReshapeOp.nose => DI.slimNose,
+      ReshapeOp.waist => DI.waist,
+      ReshapeOp.arms => DI.arms,
+      ReshapeOp.legs => DI.legs,
+      ReshapeOp.longLegs => DI.longLegs,
+      ReshapeOp.head => DI.smallHead,
+    };
 
 class PortraitPanel extends StatelessWidget {
   const PortraitPanel({super.key, required this.ctl});
@@ -1536,9 +1581,48 @@ class PortraitPanel extends StatelessWidget {
       );
     }
     final chips = lc.portraitChips;
-    final selChip = lc.selChip;
+    final rt = lc.reshapeTool;
+    final selShape = rt.sel;
+    final selChip = selShape == null ? lc.selChip : null;
     final faces = lc.frontalFaces;
     final ts = MediaQuery.textScalerOf(context).scale(12) / 12;
+    // a selected 形体 tile tapped again: its action card here (U3: 关掉, with 撤销 on the toast)
+    if (rt.action != null) {
+      final op = rt.action!;
+      return Align(
+        alignment: Alignment.topCenter,
+        child: TileGrid(
+          children: [
+            DTile(
+              key: const ValueKey('act-关掉'),
+              label: '关掉',
+              icon: DI.close,
+              danger: true,
+              width: TileGrid.tileWidth(160, 1),
+              height: actionTileH(MediaQuery.textScalerOf(context)),
+              onTap: () => rt.turnOff(op),
+            ),
+          ],
+        ),
+      );
+    }
+    Widget shapeTile(ReshapeOp op, double w, double h) {
+      final on = rt.on(op), selected = on && selShape == op;
+      final spec = reshapeSpecOf(op);
+      return DTile(
+        key: ValueKey('shape-${op.name}'),
+        label: spec.label,
+        icon: reshapeIcon(op),
+        width: w,
+        height: h,
+        state: selected ? TileState.selected : (on ? TileState.on : TileState.normal),
+        cue: selected,
+        semantics: '${spec.label}${on ? '，已开' : ''}',
+        onTap: () => rt.tap(op),
+      );
+    }
+
+    final rGroups = reshapeGroups(rt);
     // the shared tile (audit U7): applied = soft fill ("on"), the one being adjusted = soft fill + border with the ⌄ cue (U3: a second
     // tap opens its actions, 关掉 is there)
     Widget chip(PortraitChip pc, double w, double h) {
@@ -1563,11 +1647,11 @@ class PortraitPanel extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         StrengthStrip(
-          key: ValueKey('portrait-strip-${lc.selId}'),
+          key: ValueKey('portrait-strip-${selShape?.name ?? lc.selId}'),
           ctl: ctl,
           cat: PadCat.light,
-          source: lc.lightPad,
-          label: selChip == null ? '强度' : '${specOf(selChip).label}强度',
+          source: selShape != null ? ReshapeStripSource(rt) : lc.lightPad,
+          label: selShape != null ? '${reshapeSpecOf(selShape).label}强度' : (selChip == null ? '强度' : '${specOf(selChip).label}强度'),
         ),
         const SizedBox(width: Sp.m),
         Expanded(
@@ -1577,10 +1661,10 @@ class PortraitPanel extends StatelessWidget {
               // never below it (a narrower panel takes fewer columns instead)
               const gap = Sp.s;
               final fit = ((cons.maxWidth + gap) / (56 + gap)).floor();
-              final cols = math.min(math.min(4, fit), math.max(1, chips.length));
-              final groupRows = portraitGroupRows(chips, cols);
-              final rows = groupRows.fold<int>(0, (a, b) => a + b);
-              final faceRow = faces.length > 1 && selChip != null ? kHit + Sp.s : 0.0;
+              final cols = math.max(1, math.min(math.min(4, fit), math.max(chips.length, rGroups.fold<int>(0, (m, g) => math.max(m, g.$2.length)))));
+              final groupRows = [...portraitGroupRows(chips, cols), ...reshapeGroupRows(rt, cols)];
+              final rows = math.max(1, groupRows.fold<int>(0, (a, b) => a + b));
+              final faceRow = (faces.length > 1 && selChip != null) || reshapeFaceRow(lc) ? kHit + Sp.s : 0.0;
               final w = TileGrid.tileWidth(cons.maxWidth, cols, max: 80);
               final fixedH = faceRow + groupRows.length * kGroupTitleH + gap * (rows - groupRows.length) + gap * (groupRows.length - 1);
               // never under what a tile with a note (the room note) needs at this text size
@@ -1599,12 +1683,29 @@ class PortraitPanel extends StatelessWidget {
                       ),
                       const SizedBox(height: Sp.s),
                     ],
+                    // a 形体 face tile: which faces it reshapes (the main person by default)
+                    if (reshapeFaceRow(lc)) ...[
+                      Row(
+                        children: [
+                          for (final f in rt.faces) ...[
+                            _FaceThumb(lc: lc, face: PortraitFace(f.index, const {}, f.iod), on: rt.selFaces.contains(f.index), onTap: () => rt.toggleFace(f.index)),
+                            const SizedBox(width: Sp.xs),
+                          ],
+                        ],
+                      ),
+                      const SizedBox(height: Sp.s),
+                    ],
                     for (final g in kPortraitGroups)
                       if (g.$2.any(chips.contains)) ...[
                         if (g.$1 != kPortraitGroups.first.$1) const SizedBox(height: gap),
                         SizedBox(height: kGroupTitleH, child: Text(g.$1, key: ValueKey('portrait-group-${g.$1}'), style: T.cap(c.text2, w: FontWeight.w500))),
                         Wrap(spacing: gap, runSpacing: gap, children: [for (final pc in g.$2) if (chips.contains(pc)) chip(pc, w, h)]),
                       ],
+                    for (final g in rGroups) ...[
+                      const SizedBox(height: gap),
+                      SizedBox(height: kGroupTitleH, child: Text(g.$1, key: ValueKey('shape-group-${g.$1}'), style: T.cap(c.text2, w: FontWeight.w500))),
+                      Wrap(spacing: gap, runSpacing: gap, children: [for (final op in g.$2) shapeTile(op, w, h)]),
+                    ],
                   ],
                 ),
               );
@@ -1618,10 +1719,11 @@ class PortraitPanel extends StatelessWidget {
 
 /// A detected face as a small round crop of the picture on screen; the ring says the selected chip applies to it.
 class _FaceThumb extends StatelessWidget {
-  const _FaceThumb({required this.lc, required this.face, required this.on});
+  const _FaceThumb({required this.lc, required this.face, required this.on, this.onTap});
   final LocalController lc;
   final PortraitFace face;
   final bool on;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -1636,7 +1738,7 @@ class _FaceThumb extends StatelessWidget {
       child: GestureDetector(
         key: ValueKey('face-${face.n}'),
         behavior: HitTestBehavior.opaque,
-        onTap: () => lc.toggleFace(face.n),
+        onTap: onTap ?? () => lc.toggleFace(face.n),
         child: HitBox(
           child: Container(
             width: 40,
@@ -1737,6 +1839,81 @@ class _HealTools extends StatelessWidget {
                         shape: BoxShape.circle,
                         border: Border.all(color: lc.healSize == i ? c.accent : c.text2, width: 1.5),
                       ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+        toggle,
+      ],
+    );
+  }
+}
+
+/// 形体's tool under the photo (section 9.2): 推 (on: a drag on the photo pushes the picture under a soft brush) with the [+|−] switch at the
+/// left end meaning 推 / 恢复 (U2), and four brush sizes.
+class _PushTools extends StatelessWidget {
+  const _PushTools({required this.t});
+  final ReshapeTool t;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final toggle = Semantics(
+      button: true,
+      toggled: t.pushMode,
+      label: '推',
+      excludeSemantics: true,
+      child: GestureDetector(
+        key: const ValueKey('push-mode'),
+        behavior: HitTestBehavior.opaque,
+        onTap: () => t.setPushMode(!t.pushMode),
+        child: HitBox(
+          child: Container(
+            height: 32,
+            width: t.pushMode ? 36 : null,
+            padding: EdgeInsets.symmetric(horizontal: t.pushMode ? 0 : Sp.m),
+            decoration: BoxDecoration(color: t.pushMode ? c.accentSoft : c.bg, borderRadius: BorderRadius.circular(Rd.cardLg)),
+            child: Center(
+              widthFactor: 1,
+              child: t.pushMode
+                  ? DIcon(DI.close, size: 16, color: c.accent)
+                  : Row(mainAxisSize: MainAxisSize.min, children: [
+                      DIcon(DI.push, size: 16, color: c.text),
+                      const SizedBox(width: Sp.xs),
+                      Text('推', style: T.cap(c.text, w: FontWeight.w500)),
+                    ]),
+            ),
+          ),
+        ),
+      ),
+    );
+    return Wrap(
+      alignment: WrapAlignment.center,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      verticalDirection: VerticalDirection.up,
+      children: [
+        if (t.pushMode) ...[
+          AddRemoveSwitch(prefix: 'push', add: t.pushAdd, onChanged: t.setPushAdd, addLabel: '推', subLabel: '恢复'),
+          for (var i = 0; i < kPushRadius.length; i++)
+            Semantics(
+              button: true,
+              selected: t.pushSize == i,
+              label: kSizeNames[i],
+              excludeSemantics: true,
+              child: GestureDetector(
+                key: ValueKey('push-size-$i'),
+                behavior: HitTestBehavior.opaque,
+                onTap: () => t.setPushSize(i),
+                child: SizedBox(
+                  width: kHit,
+                  height: kHit,
+                  child: Center(
+                    child: Container(
+                      width: 6.0 + i * 4,
+                      height: 6.0 + i * 4,
+                      decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: t.pushSize == i ? c.accent : c.text2, width: 1.5)),
                     ),
                   ),
                 ),

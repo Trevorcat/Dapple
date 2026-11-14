@@ -64,6 +64,18 @@ enum DI {
   teeth,
   lips,
   faceLight,
+  // 形体 (portrait reshaping, docs/design/local-adjustments.md 9.2)
+  slimFace,
+  smallFace,
+  chin,
+  bigEyes,
+  slimNose,
+  waist,
+  arms,
+  legs,
+  longLegs,
+  smallHead,
+  push,
 }
 
 class DIcon extends StatelessWidget {
@@ -506,6 +518,66 @@ class _IconPainter extends CustomPainter {
         canvas.drawLine(const Offset(16.5, 7.5), const Offset(20, 5.5), line);
         canvas.drawLine(const Offset(17.5, 12.5), const Offset(21.5, 12.5), line);
         canvas.drawLine(const Offset(16.5, 17.5), const Offset(20, 19.5), line);
+        break;
+      // ---- 形体: the shape and small arrows where it moves
+      case DI.slimFace:
+        canvas.drawPath(Path()..moveTo(6, 6)..cubicTo(6, 2.5, 18, 2.5, 18, 6)..lineTo(18, 12)..cubicTo(18, 17, 15, 21, 12, 21)..cubicTo(9, 21, 6, 17, 6, 12)..close(), line);
+        canvas.drawPath(poly([1.5, 14, 4, 15.5, 1.5, 17]), line);
+        canvas.drawPath(poly([22.5, 14, 20, 15.5, 22.5, 17]), line);
+        break;
+      case DI.smallFace:
+        canvas.drawOval(Rect.fromCenter(center: const Offset(12, 12), width: 18, height: 21), soft..color = color.withValues(alpha: 0.25));
+        canvas.drawOval(Rect.fromCenter(center: const Offset(12, 12.5), width: 11, height: 13.5), line);
+        break;
+      case DI.chin:
+        canvas.drawPath(Path()..moveTo(5, 3)..lineTo(5, 10)..cubicTo(5, 15, 9, 18, 12, 18)..cubicTo(15, 18, 19, 15, 19, 10)..lineTo(19, 3), line);
+        canvas.drawLine(const Offset(12, 19.5), const Offset(12, 23), line);
+        canvas.drawPath(poly([10, 21.5, 12, 23, 14, 21.5]), line);
+        break;
+      case DI.bigEyes:
+        canvas.drawPath(Path()..moveTo(4, 12)..quadraticBezierTo(12, 4, 20, 12)..quadraticBezierTo(12, 20, 4, 12)..close(), line);
+        canvas.drawCircle(const Offset(12, 12), 2.6, fill);
+        canvas.drawPath(poly([1, 4.5, 1, 1, 4.5, 1]), line);
+        canvas.drawPath(poly([23, 19.5, 23, 23, 19.5, 23]), line);
+        break;
+      case DI.slimNose:
+        canvas.drawPath(Path()..moveTo(12, 3)..lineTo(10, 14)..quadraticBezierTo(7, 18, 10, 19)..quadraticBezierTo(12, 20.5, 14, 19)..quadraticBezierTo(17, 18, 14, 14), line);
+        canvas.drawPath(poly([2, 15, 4.5, 17, 2, 19]), line);
+        canvas.drawPath(poly([22, 15, 19.5, 17, 22, 19]), line);
+        break;
+      case DI.waist:
+        canvas.drawPath(Path()..moveTo(6, 3)..quadraticBezierTo(10, 12, 6, 21), line);
+        canvas.drawPath(Path()..moveTo(18, 3)..quadraticBezierTo(14, 12, 18, 21), line);
+        canvas.drawPath(poly([2, 10, 4.5, 12, 2, 14]), line);
+        canvas.drawPath(poly([22, 10, 19.5, 12, 22, 14]), line);
+        break;
+      case DI.arms:
+        canvas.drawPath(Path()..moveTo(9, 2.5)..lineTo(7.5, 12)..lineTo(10, 21.5), line);
+        canvas.drawPath(Path()..moveTo(15, 2.5)..lineTo(13.5, 12)..lineTo(15, 21.5), line);
+        canvas.drawPath(poly([2.5, 9, 5, 11, 2.5, 13]), line);
+        canvas.drawPath(poly([21.5, 9, 19, 11, 21.5, 13]), line);
+        break;
+      case DI.legs:
+        canvas.drawPath(poly([5, 3, 7, 21, 10.5, 21, 11.5, 9, 12.5, 9, 13.5, 21, 17, 21, 19, 3]), line);
+        canvas.drawPath(poly([1, 10, 3.5, 12, 1, 14]), line);
+        canvas.drawPath(poly([23, 10, 20.5, 12, 23, 14]), line);
+        break;
+      case DI.longLegs:
+        canvas.drawPath(poly([4, 3, 5.5, 21, 8.5, 21, 9.5, 8, 10.5, 8, 11.5, 21, 14.5, 21, 16, 3]), line);
+        canvas.drawLine(const Offset(20.5, 4), const Offset(20.5, 20), line);
+        canvas.drawPath(poly([18.5, 6, 20.5, 4, 22.5, 6]), line);
+        canvas.drawPath(poly([18.5, 18, 20.5, 20, 22.5, 18]), line);
+        break;
+      case DI.smallHead:
+        canvas.drawCircle(const Offset(12, 8), 4, line);
+        canvas.drawPath(Path()..moveTo(3, 22)..quadraticBezierTo(4, 14.5, 12, 14.5)..quadraticBezierTo(20, 14.5, 21, 22), line);
+        canvas.drawPath(poly([4.5, 3, 7, 5, 4.5, 7]), line);
+        canvas.drawPath(poly([19.5, 3, 17, 5, 19.5, 7]), line);
+        break;
+      case DI.push:
+        canvas.drawCircle(const Offset(8.5, 15.5), 5.5, line);
+        canvas.drawLine(const Offset(12.5, 11.5), const Offset(20.5, 3.5), line);
+        canvas.drawPath(poly([15, 3.5, 20.5, 3.5, 20.5, 9]), line);
         break;
       case DI.warn:
         canvas.drawCircle(const Offset(12, 12), 9.5, line);

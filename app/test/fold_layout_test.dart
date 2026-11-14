@@ -502,7 +502,7 @@ void main() {
   });
 
   // ---------------------------------------------------------------------------------------------- the second round (real device)
-  const sizes3 = [Size(984, 1092), Size(904, 832), Size(626, 890)];
+  const sizes3 = [Size(984, 1092), Size(904, 832), Size(749, 827)]; // windows where a portrait photo takes the column (on a narrow tall window such as 626x890 the workbench shows it larger: fold_adapt_test)
   const ratios = {'2:3': 2 / 3, '3:4': 3 / 4, '4:5': 4 / 5, '9:16': 9 / 16};
 
   group('column photo size', () {

@@ -170,7 +170,10 @@ class AiGroup {
 /// One face of a job's `face_list` (the engine's faces meta): 1-based index (largest first), box and centre (frame-normalised), yaw in
 /// degrees, frontal, how open the mouth is (0..1), whether teeth show, iod (fraction of the long edge) and the feature planes it has.
 class AiFace {
-  const AiFace({required this.index, this.box = const [], this.yaw = 0, this.frontal = false, this.mouthOpen = 0, this.teeth = false, this.iod = 0, this.center = const [], this.planes = const []});
+  const AiFace({required this.index, this.box = const [], this.yaw = 0, this.frontal = false, this.mouthOpen = 0, this.teeth = false, this.iod = 0, this.center = const [], this.planes = const [], this.shape = const []});
+
+  /// The reshaping anchors (54 points, photo-normalised x, y pairs; empty from an older engine or cache), docs section 45.
+  final List<double> shape;
   final int index;
   final List<double> box, center;
   final double yaw, mouthOpen, iod;
@@ -189,6 +192,7 @@ class AiFace {
         iod: (j['iod'] as num?)?.toDouble() ?? 0,
         center: _nums(j['center']),
         planes: [for (final p in (j['planes'] as List? ?? const [])) '$p'],
+        shape: _nums(j['shape']),
       );
 }
 

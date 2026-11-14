@@ -4,6 +4,7 @@
 import 'dart:ui' show Offset;
 
 import 'local_adjust.dart';
+import 'reshape.dart';
 import 'pad_model.dart' show migratePalette;
 
 enum EGroup { style, light, color, curve, effects, detail, grade, crop, local }
@@ -266,7 +267,11 @@ class EditState {
     this.flip = false,
     this.pads = const {},
     this.local = LocalList.empty,
+    this.reshape = Reshape.empty,
   });
+
+  /// Portrait reshaping (形体, docs/design/local-adjustments.md 9.2): the engine's "reshape" object. Per photo (never copied or synced).
+  final Reshape reshape;
 
   /// Local adjustments (docs/design/local-adjustments.md): the engine's "local" list plus each area's pad state.
   final LocalList local;
@@ -317,6 +322,7 @@ class EditState {
     bool? flip,
     Map<String, PadState>? pads,
     LocalList? local,
+    Reshape? reshape,
   }) =>
       EditState(
         look: identical(look, _keep) ? this.look : look as String?,
@@ -332,6 +338,7 @@ class EditState {
         flip: flip ?? this.flip,
         pads: pads ?? this.pads,
         local: local ?? this.local,
+        reshape: reshape ?? this.reshape,
       );
 
   static const Object _keep = Object();
@@ -364,7 +371,8 @@ class EditState {
     }
   }
 
-  bool get isAdjusted => styleAdjusted || toneAdjusted || values.isNotEmpty || crop != 'orig' || rot != 0 || flip || !local.isEmpty;
+  bool get isAdjusted =>
+      styleAdjusted || toneAdjusted || values.isNotEmpty || crop != 'orig' || rot != 0 || flip || !local.isEmpty || reshape.active;
 
   bool sameAs(EditState o) =>
       look == o.look &&
@@ -381,7 +389,8 @@ class EditState {
       values.entries.every((e) => o.values[e.key] == e.value) &&
       pads.length == o.pads.length &&
       pads.entries.every((e) => o.pads[e.key]?.same(e.value) ?? false) &&
-      local.same(o.local);
+      local.same(o.local) &&
+      reshape.same(o.reshape);
 
   /// Copy settings (clipboard): everything except crop / rot / flip / straighten.
   EditState withoutCrop() {
@@ -415,7 +424,8 @@ class EditState {
         rot: rot,
         flip: flip,
         pads: clip.pads,
-        local: local);
+        local: local,
+        reshape: reshape);
   }
 
   /// Sync = merge: only what the source overrides, only the chosen categories,
@@ -479,6 +489,8 @@ class EditState {
     if (flip) m['flip'] = true;
     final l = local.toEngineJson();
     if (l != null) m['local'] = l;
+    final r = reshape.toEngineJson();
+    if (r != null) m['reshape'] = r;
     return m;
   }
 
@@ -496,6 +508,7 @@ class EditState {
         'flip': flip,
         if (pads.isNotEmpty) 'pads': {for (final e in pads.entries) e.key: e.value.toJson()},
         if (!local.isEmpty) 'local': local.toAppJson(),
+        if (!reshape.isEmpty) 'reshape': reshape.toAppJson(),
       };
 
   factory EditState.fromJson(Map<String, dynamic> j) {
@@ -516,6 +529,7 @@ class EditState {
       flip: (j['flip'] as bool?) ?? false,
       pads: _padsFromJson(j['pads']),
       local: LocalList.fromJson(j['local']),
+      reshape: Reshape.fromJson(j['reshape']),
     );
     return e.palette == null ? e : migratePalette(e);
   }

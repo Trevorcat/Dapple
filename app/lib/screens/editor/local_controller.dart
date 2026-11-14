@@ -20,6 +20,7 @@ import '../../model/local_kinds.dart';
 import '../../model/local_pad.dart';
 import '../../model/pad_model.dart';
 import '../../model/portrait.dart';
+import '../../model/reshape.dart';
 import '../../model/params.dart';
 import '../../native/local_bindings.dart';
 import '../../models.dart' show Photo;
@@ -27,6 +28,8 @@ import '../../services/local_ai.dart';
 import 'editor_controller.dart';
 import 'itemised_view.dart' show ItemSource;
 import 'pad_widgets.dart' show PadSource;
+
+part 'local_reshape.dart';
 
 /// What the 局部 panel body shows.
 enum LocalBody {
@@ -170,18 +173,25 @@ class LocalController extends ChangeNotifier {
     if (selComp >= a.mask.length) selComp = math.max(0, a.mask.length - 1);
   }
 
+  /// 形体 (section 9.2): the reshaping tiles, their strip and the 推 brush.
+  late final ReshapeTool reshapeTool = ReshapeTool._(this);
+  bool _pushDown = false;
+
   /// What the action card acts on (audit U3): the selected area (both null), one portrait chip, or the whole 人像 group.
   PortraitChip? actionChip;
   bool actionPortraitGroup = false;
 
   /// The action card's subtitle: the area, the chip or 人像.
   String get actionsTitle {
+    if (reshapeTool.action != null) return reshapeSpecOf(reshapeTool.action!).label;
     if (actionChip != null) return specOf(actionChip!).label;
     if (actionPortraitGroup) return '美颜';
     return selIndex < 0 ? '区域' : '区域 ${selIndex + 1}';
   }
 
   void select(String id) {
+    reshapeTool.sel = null;
+    reshapeTool.action = null;
     if (selId == id && (body == LocalBody.pads || body == LocalBody.portrait)) {
       // a second tap on the selected chip: its action card (U3); the 人像 chip stands for the whole group
       actionChip = null;
@@ -208,6 +218,7 @@ class LocalController extends ChangeNotifier {
   void showBody(LocalBody b) {
     body = b;
     if (b != LocalBody.actions) {
+      reshapeTool.action = null;
       actionChip = null;
       actionPortraitGroup = false;
     }
@@ -853,6 +864,8 @@ class LocalController extends ChangeNotifier {
   /// A chip (audit U3): off -> its areas appear (and the first is selected); on but another chip selected -> select it; on and selected
   /// -> its action card (关掉 is there, with 撤销 on the toast; a tap never removes anything).
   void tapChip(PortraitChip c) {
+    reshapeTool.sel = null;
+    reshapeTool.action = null;
     final spec = specOf(c);
     if (!chipOn(c)) {
       _setChips([c], faces: _workFaces);
@@ -933,6 +946,7 @@ class LocalController extends ChangeNotifier {
 
   void setHealMode(bool v) {
     healMode = v;
+    if (v) reshapeTool.pushMode = false;
     tick.value++;
     _changed();
   }
@@ -1481,6 +1495,13 @@ class LocalController extends ChangeNotifier {
     _downP = p;
     _moved = false;
     _begun = false;
+    _pushDown = false;
+    if (reshapeTool.pushing) {
+      // 推 / 恢复 (section 9.2): the drag pushes the picture; no handle, no compare hold
+      _pushDown = true;
+      reshapeTool.down(p);
+      return;
+    }
     if (c == null) {
       _armHold();
       return;
@@ -1550,6 +1571,13 @@ class LocalController extends ChangeNotifier {
   }
 
   void pointerMove(Offset p, int ms) {
+    if (_pushDown) {
+      if (!_multi && (_moved || (p - _downP).distance >= kSlop / zoomScale)) {
+        _moved = true;
+        reshapeTool.move(p);
+      }
+      return;
+    }
     if (_holdCompare) return; // comparing: the finger only holds
     if (_holdTimer != null && (p - _downP).distance >= kSlop / zoomScale) {
       _holdTimer?.cancel();
@@ -1616,6 +1644,11 @@ class LocalController extends ChangeNotifier {
   }
 
   void pointerUp(Offset p, int ms) {
+    if (_pushDown) {
+      _pushDown = false;
+      reshapeTool.up();
+      return;
+    }
     final g = _grab;
     _grab = _Grab.none;
     if (_holdCompare) {
@@ -1657,6 +1690,10 @@ class LocalController extends ChangeNotifier {
   }
 
   void pointerCancel() {
+    if (_pushDown) {
+      _pushDown = false;
+      reshapeTool.cancel();
+    }
     _grab = _Grab.none;
     _endHold();
     _finishGesture();
@@ -1665,6 +1702,10 @@ class LocalController extends ChangeNotifier {
   /// A second finger landed: the photo zooms / pans. A stroke not committed yet is dropped (it was the start of a pinch).
   void secondFinger() {
     _multi = true;
+    if (_pushDown) {
+      _pushDown = false;
+      reshapeTool.cancel();
+    }
     _endHold();
     if (_grab == _Grab.brush && !_brushCommitted) {
       _brush = null;
