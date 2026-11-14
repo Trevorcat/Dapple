@@ -93,7 +93,7 @@ void main() {
             await settle(t, 8);
             expect(t.getRect(find.byKey(const ValueKey('docked-panel'))).height, closeTo(panelH, 0.5));
             expect(photoH(t, aspect), closeTo(ph, 1));
-            await t.tap(find.byKey(const ValueKey('stock-button')));
+            await t.tap(find.byKey(const ValueKey('header-back')));
             await settle(t, 6);
           }
           // the radar (the precise layer) may be taller, never beyond 46 % of the screen
@@ -103,7 +103,7 @@ void main() {
           expect(panel.height, lessThanOrEqualTo(h * 0.46 + 1));
           final radar = t.getRect(find.byKey(const ValueKey('radar')));
           expect(RadarGeo(radar.size, [for (final it in padItems(cat)) it.label]).r1, greaterThanOrEqualTo(80), reason: '$g radar radius');
-          await t.tap(find.byKey(const ValueKey('items-button')));
+          await t.tap(find.byKey(const ValueKey('header-back')));
           await settle(t, 6);
           await tapDock(t, g); // close
         }
@@ -291,19 +291,21 @@ void main() {
   });
 
   group('film map margins and the header', () {
-    testWidgets('the 无 button sits in the header next to the stock button; the edge icons fade while magnified', (t) async {
+    testWidgets('the 无 button sits in the map header on the title line; the edge icons fade while magnified', (t) async {
       FilmMapStore.debugSet(const {});
       addTearDown(() => FilmMapStore.debugSet(null));
       final (app, id) = await openWith(t);
       app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
       await tapDock(t, EGroup.style);
-      final none = t.getRect(find.byKey(const ValueKey('film-none')));
-      final stock = t.getRect(find.byKey(const ValueKey('stock-button')));
-      expect(none.right, lessThanOrEqualTo(stock.left + 1));
-      expect((none.center.dy - stock.center.dy).abs(), lessThan(2));
+      expect(find.byKey(const ValueKey('film-none')), findsNothing, reason: '无 belongs to the map layer, not the pad layer');
       await t.tap(find.byKey(const ValueKey('stock-button')));
       await settle(t, 8);
       final map = t.getRect(find.byKey(const ValueKey('film-map')));
+      final none = t.getRect(find.byKey(const ValueKey('film-none')));
+      final title = t.getRect(find.byKey(const ValueKey('header-title')));
+      expect((none.center.dy - title.center.dy).abs(), lessThan(2), reason: '无 is on the title line, main action at the right end');
+      expect(none.left, greaterThan(title.right));
+      expect(none.bottom, lessThanOrEqualTo(map.top + 1), reason: 'the header sits above the map');
       expect(find.descendant(of: find.byKey(const ValueKey('film-map')), matching: find.text('无')), findsNothing, reason: 'nothing in the map covers the stocks');
       double iconOpacity() => t.widget<Opacity>(find.byKey(const ValueKey('film-map-edges'))).opacity;
       expect(iconOpacity(), 1);

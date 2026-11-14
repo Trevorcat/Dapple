@@ -91,7 +91,21 @@ LocalAdjustment resetLocalOps(LocalAdjustment a) => a.copyWith(ops: const {}, st
 bool localOpsAdjusted(LocalAdjustment a) => a.ops.isNotEmpty || a.strength != 100 || !(a.ui?.same(LocalUi.centre) ?? true);
 
 /// Header readout of the area's pads: 强度 n% · 亮 n · 暖 n (only the directions that are away from the centre).
-String localReadout(LocalUi u) {
+String localReadout(LocalUi u, {LocalAdjustment? area}) {
   String dir(double v, String neg, String pos) => v == 0 ? '' : ' · ${v > 0 ? pos : neg} ${(v.abs() * 100).round()}';
-  return '强度 ${(u.a * 200).round()}%${dir(u.lx, '暗', '亮')}${dir(u.cx, '冷', '暖')}';
+  final pct = area == null ? localStripPercent(null, u.a) : localStripPercent(area, u.a);
+  if (area != null && portraitOf(area) != null) return '强度 ${pct.round()}%';
+  return '强度 ${pct.round()}%${dir(u.lx, '暗', '亮')}${dir(u.cx, '冷', '暖')}';
+}
+
+/// The strip of an area (audit U1): bottom 0, middle 100 % = the recommended amount, top = the most it gives.
+///  an ordinary area: middle = engine strength 100, top = the pads' recipe doubled: 200 %;
+///  a portrait chip: middle = the recipe's recommended values, top = the recipe's maxima, read as the percentage of the recommended value
+///  of the chip's first op (肤质: smoothing 30 -> 100 = 333 %; 牙齿: 30 -> 60 = 200 %).
+double localStripPercent(LocalAdjustment? area, double a) {
+  final t = a.clamp(0.0, 1.0);
+  final pt = area == null ? null : portraitOf(area);
+  if (pt == null) return t * 200;
+  final op = pt.$2.ops.firstWhere((o) => o.def > 0, orElse: () => pt.$2.ops.first);
+  return op.def <= 0 ? t * 200 : op.at(t) / op.def * 100;
 }

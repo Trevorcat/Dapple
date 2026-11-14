@@ -46,7 +46,10 @@ class SessionCache {
   /// photo has no readable source (demo photos).
   Future<DappleSession?> get(Photo ph, {bool background = false, bool speculative = false}) {
     if (!available || ph.demo != null) return Future.value(null);
-    if (!background && !speculative) _warm.remove(ph.id); // claimed by a real open: no longer speculative
+    if (!background && !speculative) {
+      _warm.remove(ph.id); // claimed by a real open: no longer speculative
+      current = ph.id;
+    }
     _lru.remove(ph.id);
     _lru.add(ph.id);
     final f = _open.putIfAbsent(ph.id, () => _openNew(ph, background));
@@ -298,6 +301,27 @@ class SessionCache {
         await File(t).delete();
       } catch (_) {}
     }
+  }
+
+  /// The photo of the last foreground [get] (the one the editor shows), null when none.
+  String? current;
+
+  /// Memory (pipeline-architecture.md 42.9): closes every session but [keep]'s (neighbours, warm opens) and the 2x / 1:1 detail sessions.
+  /// The cached source paths of the closed photos stay (cheap); their temporary copies are deleted.
+  Future<void> closeAllExcept(String? keep) async {
+    _downTimer?.cancel();
+    _downTimer = null;
+    closeDetail();
+    final ids = _open.keys.where((id) => id != keep).toList();
+    _lru.removeWhere(ids.contains);
+    await Future.wait(ids.map(_close));
+  }
+
+  /// Every session closed (the editor has gone): the native pictures go, the next open decodes again (from the engine's mosaic cache when it
+  /// still holds the file).
+  Future<void> closeAll() async {
+    await closeAllExcept(null);
+    current = null;
   }
 
   void dispose() {

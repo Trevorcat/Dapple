@@ -36,4 +36,25 @@ void main() {
     }
     expect(bad, isEmpty, reason: bad.join('\n'));
   });
+
+  test('no Material icons in the editor: the app draws its own line set (guidelines 8, audit F10)', () {
+    final bad = <String>[];
+    for (final f in Directory('lib/screens/editor').listSync().whereType<File>().where((f) => f.path.endsWith('.dart'))) {
+      final lines = f.readAsLinesSync();
+      for (var i = 0; i < lines.length; i++) {
+        if (lines[i].contains('Icons.')) bad.add('${f.path}:${i + 1}: ${lines[i].trim()}');
+      }
+    }
+    expect(bad, isEmpty, reason: bad.join('\n'));
+  });
+
+  test('every panel header is the one header (U6): no header built by hand in the editor', () {
+    // PanelHeader asserts at most three buttons; the category and 局部 headers must go through it
+    for (final f in ['lib/screens/editor/pad_panel.dart', 'lib/screens/editor/local_panel.dart']) {
+      final s = File(f).readAsStringSync();
+      expect(s.contains('PanelHeader('), isTrue, reason: f);
+      expect(RegExp(r"HeaderButton\([^;]*?label: '返回'").hasMatch(s), isFalse, reason: '$f: back is the ‹ of the header, not a button (U6)');
+      expect(s.contains("'对比'"), isFalse, reason: '$f: no compare button (U4)');
+    }
+  });
 }

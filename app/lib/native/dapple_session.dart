@@ -9,6 +9,7 @@ import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import 'dapple_bindings.dart';
+import 'memory_bindings.dart';
 import '../services/perf_probe.dart';
 
 class DappleException implements Exception {
@@ -756,6 +757,7 @@ class DappleSession {
     return Isolate.run(() {
       final b = _b();
       final cp = srcPath.toNativeUtf8();
+      if (full && decodeLongEdge <= 0) MemoryBindings.exportIntent(pj); // the open decides whole frame / bands with the edit known (42.9)
       final s = b.sessionOpen(cp, full ? dappleQualityFull : dappleQualityPreview, decodeLongEdge);
       malloc.free(cp);
       if (s == ffi.nullptr) throw DappleException(_lastError(b));

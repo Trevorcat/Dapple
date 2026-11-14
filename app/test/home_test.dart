@@ -136,12 +136,12 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('nav-1')));
     await tester.pump(_t);
     expect(app.tab, 1);
-    expect(find.textContaining('新照片默认使用'), findsOneWidget);
+    expect(find.textContaining('新照片默认成像'), findsOneWidget);
     await shot(tester, 'styles_phone');
     await tester.tap(find.byKey(const ValueKey('base-modern_vivid')));
     await tester.pump(_t);
     expect(app.settings.defaultBaseId, 'modern_vivid');
-    expect(find.text('新照片默认使用「鲜明」'), findsOneWidget);
+    expect(find.text('新照片默认成像「鲜明」'), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('toast-action')));
     await tester.pump(_t);
     expect(app.settings.defaultBaseId, isNull);
@@ -149,7 +149,7 @@ void main() {
 
     await tester.tap(find.byKey(const ValueKey('nav-2')));
     await tester.pump(_t);
-    expect(find.text('先按明暗轻微增强，再套用默认风格'), findsOneWidget);
+    expect(find.text('自动增强，套用默认成像'), findsOneWidget);
     await shot(tester, 'settings_phone');
     await tester.tap(find.byKey(const ValueKey('sw-auto')));
     await tester.pump(_t);

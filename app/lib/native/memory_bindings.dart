@@ -21,11 +21,13 @@ class MemoryBindings {
       : _configure = lib.providesSymbol('dapple_memory_configure') ? lib.lookupFunction<_Configure, _ConfigureD>('dapple_memory_configure') : null,
         _report = lib.providesSymbol('dapple_memory_report_json') ? lib.lookupFunction<_Report, _Report>('dapple_memory_report_json') : null,
         _trim = lib.providesSymbol('dapple_memory_trim') ? lib.lookupFunction<_Trim, _TrimD>('dapple_memory_trim') : null,
+        _intent = lib.providesSymbol('dapple_export_intent') ? lib.lookupFunction<_Configure, _ConfigureD>('dapple_export_intent') : null,
         _free = lib.lookupFunction<_FreeStr, _FreeStrD>('dapple_free_string');
 
   final _ConfigureD? _configure;
   final _Report? _report;
   final _TrimD? _trim;
+  final _ConfigureD? _intent;
   final _FreeStrD _free;
 
   static MemoryBindings? _instance;
@@ -45,6 +47,19 @@ class MemoryBindings {
     final f = instanceOrNull?._configure;
     if (f == null) return;
     final s = jsonEncode(device).toNativeUtf8();
+    try {
+      f(s);
+    } finally {
+      malloc.free(s);
+    }
+  }
+
+  /// The edit of the export about to open a FULL session on this thread (the same isolate call): the engine takes its whole-frame / bands
+  /// decision at the open with the film stock known.
+  static void exportIntent(String paramsJson) {
+    final f = instanceOrNull?._intent;
+    if (f == null) return;
+    final s = paramsJson.toNativeUtf8();
     try {
       f(s);
     } finally {

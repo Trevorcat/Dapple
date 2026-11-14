@@ -182,7 +182,7 @@ Future<Rig> open(WidgetTester t, FakeLocalAi fake, {bool dark = false, void Func
 void main() {
   group('the shape card', () {
     for (final dark in [false, true]) {
-      testWidgets('${dark ? 'dark' : 'light'}: five shapes, then 人物 背景 点选 天空(粗略) 远近 on a second row', (t) async {
+      testWidgets('${dark ? 'dark' : 'light'}: five shapes, then 人像 人物 背景 点选 天空(粗略) 远近 on the rows under them', (t) async {
         final fake = FakeLocalAi();
         await open(t, fake, dark: dark);
         final shapes = ['linear', 'radial', 'brush', 'luminance', 'color'], ai = ['person', 'background', 'tap', 'sky', 'depth'];
@@ -190,16 +190,18 @@ void main() {
           expect(key('kind-$k'), findsOneWidget, reason: k);
         }
         final y1 = t.getCenter(key('kind-linear')).dy, y2 = t.getCenter(key('kind-person')).dy;
-        expect(y2, greaterThan(y1 + 20), reason: 'second row');
+        expect(y2, greaterThan(y1 + 20), reason: 'the AI kinds start under the shapes');
         for (final k in shapes) {
           expect(t.getCenter(key('kind-$k')).dy, y1, reason: k);
         }
-        var x = -1.0;
-        for (final k in ai) {
+        // tiles are at least 56 dp (U7), so the six AI tiles (人像 first) wrap onto further rows: they keep their order, row by row
+        final ordered = ['portrait', ...ai];
+        var prev = const Offset(-1, 0);
+        for (final k in ordered) {
           final c = t.getCenter(key('kind-$k'));
-          expect(c.dy, y2, reason: k);
-          expect(c.dx, greaterThan(x), reason: 'order $k');
-          x = c.dx;
+          expect(c.dy, greaterThanOrEqualTo(y2 - 0.5), reason: k);
+          expect(c.dy > prev.dy + 20 || (c.dy - prev.dy).abs() < 1 && c.dx > prev.dx, isTrue, reason: 'order $k');
+          prev = c;
         }
         for (final w in ['人物', '背景', '点选', '天空', '远近', '粗略']) {
           expect(find.text(w), findsOneWidget, reason: w);
@@ -444,7 +446,7 @@ void main() {
       expect(fake.log, ['reset']);
       expect(key('tap-add'), findsOneWidget);
       expect(key('tap-sub'), findsOneWidget);
-      expect(key('tap-undo'), findsOneWidget);
+      expect(key('tap-undo'), findsNothing, reason: 'every tap is one step of the global undo');
       expect(key('tap-busy'), findsNothing);
 
       await tapPhoto(t);
@@ -475,7 +477,7 @@ void main() {
       expect(t.takeException(), isNull);
     });
 
-    testWidgets('tap-sub makes the next tap a subtract; tap-undo calls undoTap and takes the last tap off the ref', (t) async {
+    testWidgets('tap-sub makes the next tap a subtract; the global undo and undoTap take the last tap off the ref', (t) async {
       final fake = FakeLocalAi();
       final r = await open(t, fake);
       await tapKey(t, 'kind-tap');
@@ -491,12 +493,18 @@ void main() {
       expect(fake.taps.last.add, isTrue);
       expect(tapsOfId(area(r).mask.single.ref), hasLength(3));
 
-      await tapKey(t, 'tap-undo');
-      expect(fake.log.last, 'undo');
+      // the global undo takes the taps back one by one (the strip has no undo button of its own)
+      r.app.undo(r.id);
+      await settle(t, 3);
       expect(tapsOfId(area(r).mask.single.ref), hasLength(2));
-      await tapKey(t, 'tap-undo');
-      await tapKey(t, 'tap-undo');
-      expect(fake.log.where((e) => e == 'undo'), hasLength(3));
+      r.app.undo(r.id);
+      await settle(t, 3);
+      expect(tapsOfId(area(r).mask.single.ref), hasLength(1));
+      // the controller's own undoTap still asks the engine to drop the last tap
+      r.lc.undoTap();
+      await settle(t, 3);
+      expect(fake.log.last, 'undo');
+      expect(fake.log.where((e) => e == 'undo'), hasLength(1));
       expect(area(r).mask.single.ref, '');
       expect(area(r).on, isFalse, reason: 'no tap left: no plane');
       expect(t.takeException(), isNull);
@@ -563,14 +571,15 @@ void main() {
   });
 
   group('brush correction of an AI area', () {
-    testWidgets('涂抹补充 / 涂抹擦除 add brush parts (subtract / add) and select them', (t) async {
+    testWidgets('加一块… / 减一块… → 画笔 add brush parts (add / subtract) and select them; brushFix reuses a part', (t) async {
       final fake = FakeLocalAi();
       final r = await open(t, fake, before: (app, id) => app.applyEdit(id, (e) => e.copyWith(local: LocalList([aiArea('s1', 'sky')]))));
       expect(key('local-tools'), findsNothing, reason: 'a single sky part: no tools');
       await tapKey(t, 'local-chip-0');
-      expect(key('act-涂抹补充'), findsOneWidget);
-      expect(key('act-涂抹擦除'), findsOneWidget);
-      await tapKey(t, 'act-涂抹擦除');
+      expect(key('act-涂抹补充'), findsNothing, reason: 'U2: the brush correction is a part now');
+      expect(key('act-涂抹擦除'), findsNothing);
+      await tapKey(t, 'act-减一块');
+      await addViaCard(t, 'brush');
       expect(area(r).mask, hasLength(2));
       expect(area(r).mask[1].kind, MaskKindId.brush);
       expect(area(r).mask[1].op, MaskOp.subtract);
@@ -578,10 +587,12 @@ void main() {
       expect(r.lc.body, LocalBody.pads);
       expect(key('local-tools'), findsOneWidget);
       expect(key('brush-size-0'), findsOneWidget);
-      expect(key('brush-erase'), findsOneWidget);
+      expect(key('brush-add'), findsOneWidget);
+      expect(key('brush-sub'), findsOneWidget);
 
       await tapKey(t, 'local-chip-0');
-      await tapKey(t, 'act-涂抹补充');
+      await tapKey(t, 'act-加一块');
+      await addViaCard(t, 'brush');
       expect(area(r).mask, hasLength(3));
       expect(area(r).mask[2].kind, MaskKindId.brush);
       expect(area(r).mask[2].op, MaskOp.add);
@@ -589,9 +600,9 @@ void main() {
       expect(key('brush-size-0'), findsOneWidget);
       expect(t.takeException(), isNull, reason: 'three parts fit the tool strip on a phone');
 
-      // asking again reuses the part
-      await tapKey(t, 'local-chip-0');
-      await tapKey(t, 'act-涂抹擦除');
+      // the controller's brushFix still reuses the part of that kind
+      await r.lc.brushFix(add: false);
+      await settle(t, 3);
       expect(area(r).mask, hasLength(3));
       expect(r.lc.selComp, 1);
       expect(t.takeException(), isNull);
@@ -624,9 +635,11 @@ void main() {
       final fake = FakeLocalAi();
       final r = await open(t, fake, before: (app, id) => app.applyEdit(id, (e) => e.copyWith(local: LocalList([aiArea('s1', 'sky')]))));
       await tapKey(t, 'local-chip-0');
-      await tapKey(t, 'act-涂抹擦除');
+      await tapKey(t, 'act-减一块');
+      await addViaCard(t, 'brush');
       await tapKey(t, 'local-chip-0');
-      await tapKey(t, 'act-涂抹补充');
+      await tapKey(t, 'act-加一块');
+      await addViaCard(t, 'brush');
       expect(area(r).mask, hasLength(3));
       expect(t.takeException(), isNull);
     });
@@ -764,15 +777,16 @@ void main() {
         expect(t.takeException(), isNull, reason: 'area with parts');
 
         await tapKey(t, 'local-chip-0');
-        expect(key('act-涂抹擦除'), findsOneWidget);
+        expect(key('act-减一块'), findsOneWidget);
         expect(t.takeException(), isNull, reason: 'actions with AI tiles');
-        await tapKey(t, 'act-涂抹擦除');
-        expect(key('brush-erase'), findsOneWidget);
+        await tapKey(t, 'act-减一块');
+        await addViaCard(t, 'brush');
+        expect(key('brush-sub'), findsOneWidget);
         expect(t.takeException(), isNull, reason: 'brush fix tools');
 
         await tapKey(t, 'local-add');
         await addViaCard(t, 'tap');
-        expect(key('tap-undo'), findsOneWidget);
+        expect(key('tap-sub'), findsOneWidget);
         expect(t.takeException(), isNull, reason: 'tap tools');
         fake.tapHold = Completer<void>();
         await tapPhoto(t);

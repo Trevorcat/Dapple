@@ -11,6 +11,7 @@ import '../../widgets/controls.dart';
 import '../../widgets/export_size.dart';
 import '../../widgets/icons.dart';
 import '../../widgets/photo_art.dart';
+import '../../widgets/tile_grid.dart';
 import 'publish_done_page.dart';
 
 /// Opens the publish sheet for [ids] (in order). Resolves when the whole flow closes; true when the
@@ -112,6 +113,9 @@ class _PublishPageState extends State<PublishPage> {
   }
 
   List<Photo> get _photos => [for (final id in _cur) if (app.photoById(id) != null) app.photoById(id)!];
+
+  @visibleForTesting
+  void debugSetPresetForTest(Preset p) => _pick(p);
 
   void _pick(Preset p) => setState(() {
         _preset = p;
@@ -405,35 +409,21 @@ class _PublishPageState extends State<PublishPage> {
       label: '平台预设',
       container: true,
       child: LayoutBuilder(builder: (context, cons) {
-        const gap = 8.0;
-        final w = (cons.maxWidth - gap * 2) / 3;
-        return Wrap(spacing: gap, runSpacing: gap, children: [
+        final w = TileGrid.tileWidth(cons.maxWidth, 3, max: double.infinity);
+        // the shared tile (audit U7): text tiles, the chosen preset = soft fill + accent border
+        return TileGrid(alignment: WrapAlignment.start, children: [
           for (final p in presets)
-            Semantics(
-              inMutuallyExclusiveGroup: true,
-              checked: p == _preset,
-              label: '${p.name}，${p.spec}',
-              excludeSemantics: true,
-              child: GestureDetector(
-                key: ValueKey('preset-${p.id}'),
-                behavior: HitTestBehavior.opaque,
-                onTap: () => _pick(p),
-                child: Container(
-                  width: w,
-                  constraints: const BoxConstraints(minHeight: 64),
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: p == _preset ? c.accentSoft : c.surface,
-                    borderRadius: BorderRadius.circular(Rd.card),
-                    border: Border.all(color: p == _preset ? c.accent : c.sep, width: p == _preset ? 2 : 1),
-                  ),
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.center, children: [
-                    Text(p.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: T.body(c.text, w: FontWeight.w500)),
-                    const SizedBox(height: 2),
-                    Text(p.spec, maxLines: 1, overflow: TextOverflow.ellipsis, style: T.mini(c.text2)),
-                  ]),
-                ),
-              ),
+            DTile(
+              key: ValueKey('preset-${p.id}'),
+              label: p.name,
+              note: p.spec,
+              alignStart: true,
+              fill: c.surface,
+              width: w,
+              height: 64,
+              state: p == _preset ? TileState.selected : TileState.normal,
+              semantics: '${p.name}，${p.spec}',
+              onTap: () => _pick(p),
             ),
         ]);
       }),
@@ -447,79 +437,127 @@ class _PublishPageState extends State<PublishPage> {
     return d == null ? null : exportDimsText(d);
   }
 
+  Future<String?> _showRatioSheet() {
+    final c = context.c;
+    return showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: c.surface,
+      showDragHandle: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(Rd.sheet))),
+      constraints: const BoxConstraints(maxWidth: 480),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(Sp.l, 0, Sp.l, Sp.s),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            for (final r in _preset.ratios)
+              Semantics(
+                button: true,
+                checked: r == _ratio,
+                label: ratioName(r),
+                excludeSemantics: true,
+                child: InkWell(
+                  key: ValueKey('ratio-$r'),
+                  onTap: () => Navigator.pop(ctx, r),
+                  child: Container(
+                    constraints: const BoxConstraints(minHeight: 56),
+                    child: Row(children: [
+                      Expanded(child: Text(ratioName(r), style: T.body17(c.text))),
+                      if (r == _ratio) DIcon(DI.check, size: 22, color: c.accent),
+                    ]),
+                  ),
+                ),
+              ),
+          ]),
+        ),
+      ),
+    );
+  }
+
   Widget _infoCard() {
     final c = context.c;
-    Widget row(String key, String label, String value, VoidCallback onTap, {bool last = false, String? sub}) => GestureDetector(
-          key: ValueKey(key),
-          behavior: HitTestBehavior.opaque,
-          onTap: onTap,
-          child: Container(
-            height: 56,
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.sep))),
-            child: Row(children: [
-              Expanded(
-                  child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(label, style: T.body17(c.text)),
-                if (sub != null) Text(sub, key: ValueKey('$key-sub'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.small(c.text2)),
-              ])),
-              Text(value, key: ValueKey('$key-value'), style: T.body17(c.text2, w: FontWeight.w400)),
-              const SizedBox(width: 4),
-              DIcon(DI.forward, size: 18, color: c.text2),
-            ]),
-          ),
-        );
+    // Rows after the first get a top hairline; every row is at least 56 dp tall.
+    var n = 0;
+    Widget shell(String key, Widget child, {VoidCallback? onTap}) {
+      final first = n++ == 0;
+      return GestureDetector(
+        key: ValueKey(key),
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: Container(
+          constraints: const BoxConstraints(minHeight: 56),
+          padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.s),
+          decoration: BoxDecoration(border: first ? null : Border(top: BorderSide(color: c.sep))),
+          child: child,
+        ),
+      );
+    }
+
+    // "opens a sheet" row: value and a chevron (the chevron only ever means a sheet opens)
+    Widget sheetRow(String key, String label, String value, VoidCallback onTap, {String? sub}) => shell(
+        key,
+        Row(children: [
+          Expanded(
+              child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(label, style: T.body17(c.text)),
+            if (sub != null) Text(sub, key: ValueKey('$key-sub'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.small(c.text2)),
+          ])),
+          Text(value, key: ValueKey('$key-value'), style: T.body17(c.text2, w: FontWeight.w400)),
+          const SizedBox(width: 4),
+          DIcon(DI.forward, size: 18, color: c.text2),
+        ]),
+        onTap: onTap);
+
+    // two values: a switch, the whole row toggles it
+    Widget switchRow(String key, String swKey, String label, bool value, ValueChanged<bool> set) => shell(
+        key,
+        Row(children: [
+          Expanded(child: Text(label, style: T.body17(c.text))),
+          const SizedBox(width: Sp.m),
+          DSwitch(key: ValueKey(swKey), value: value, label: label, onChanged: set),
+        ]),
+        onTap: () => set(!value));
+
+    final ratios = _preset.ratios;
     return Container(
       decoration: BoxDecoration(color: c.surface, borderRadius: BorderRadius.circular(Rd.card)),
       clipBehavior: Clip.antiAlias,
       child: Column(children: [
-        row('row-ratio', '比例', ratioName(_ratio), () {
-          final l = _preset.ratios;
-          setState(() => _ratio = l[(l.indexOf(_ratio) + 1) % l.length]);
-        }),
-        row('row-size', '尺寸', exportSizeName(_size), () async {
+        if (ratios.length == 1)
+          shell(
+              'row-ratio',
+              Row(children: [
+                Expanded(child: Text('比例', style: T.body17(c.text))),
+                Text(ratioName(ratios.first), key: const ValueKey('row-ratio-value'), style: T.body17(c.text2, w: FontWeight.w400)),
+              ]))
+        else if (ratios.length <= 3)
+          shell(
+              'row-ratio',
+              Row(children: [
+                Expanded(child: Text('比例', style: T.body17(c.text))),
+                const SizedBox(width: Sp.m),
+                SizedBox(
+                  width: 64.0 * ratios.length + 40,
+                  child: DSegmented(
+                    key: const ValueKey('seg-ratio'),
+                    semanticsLabel: '比例',
+                    labels: [for (final r in ratios) ratioName(r)],
+                    index: math.max(0, ratios.indexOf(_ratio)),
+                    onChanged: (i) => setState(() => _ratio = ratios[i]),
+                  ),
+                ),
+              ]))
+        else
+          sheetRow('row-ratio', '比例', ratioName(_ratio), () async {
+            final v = await _showRatioSheet();
+            if (v != null && mounted) setState(() => _ratio = v);
+          }),
+        sheetRow('row-size', '尺寸', exportSizeName(_size), () async {
           final v = await showExportSizeSheet(context, current: _size, photo: _photos.length == 1 ? _photos.first : null);
           if (v != null && mounted) setState(() => _size = v);
         }, sub: _sizeDims()),
-        row('row-loc', '位置信息', _strip ? '已去除' : '保留', () => setState(() => _strip = !_strip), last: !_hdrAvailable && !_p3Available),
-        if (_p3Available)
-          GestureDetector(
-            key: const ValueKey('row-cs'),
-            behavior: HitTestBehavior.opaque,
-            onTap: () => setState(() => _p3 = !_p3),
-            child: Container(
-              constraints: const BoxConstraints(minHeight: 56),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: Sp.s),
-              decoration: BoxDecoration(border: Border(top: BorderSide(color: c.sep))),
-              child: Row(children: [
-                Expanded(
-                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  // plain words for the colour space (audit C): 更鲜艳 = wide gamut (P3), 标准 = sRGB; no explanation sentence (R17)
-                  Text('颜色', style: T.body17(c.text)),
-                ])),
-                const SizedBox(width: 12),
-                Text(_p3 ? '更鲜艳' : '标准', key: const ValueKey('row-cs-value'), style: T.body17(c.text2, w: FontWeight.w400)),
-                const SizedBox(width: 4),
-                DIcon(DI.forward, size: 18, color: c.text2),
-              ]),
-            ),
-          ),
-        if (_hdrAvailable)
-          Container(
-            key: const ValueKey('row-hdr'),
-            constraints: const BoxConstraints(minHeight: 56),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: Sp.s),
-            decoration: BoxDecoration(border: Border(top: BorderSide(color: c.sep))),
-            child: Row(children: [
-              Expanded(
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                // HDR in plain words (audit C): on a screen that can, the highlights are brighter than white
-                Text('高光更亮', style: T.body17(c.text)),
-              ])),
-              const SizedBox(width: 12),
-              DSwitch(key: const ValueKey('switch-hdr'), value: _hdr, label: '高光更亮', onChanged: (v) => setState(() => _hdr = v)),
-            ]),
-          ),
+        switchRow('row-loc', 'switch-loc', '去除位置信息', _strip, (v) => setState(() => _strip = v)),
+        if (_p3Available) switchRow('row-cs', 'switch-cs', '颜色更鲜艳', _p3, (v) => setState(() => _p3 = v)),
+        if (_hdrAvailable) switchRow('row-hdr', 'switch-hdr', '高光更亮', _hdr, (v) => setState(() => _hdr = v)),
       ]),
     );
   }

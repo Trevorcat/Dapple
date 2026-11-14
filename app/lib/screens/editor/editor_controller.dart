@@ -27,6 +27,9 @@ class ReadoutModel extends ChangeNotifier {
   bool visible = false;
   bool compare = false;
 
+  /// What the compare pill says: 原片 (every category), 无局部调整 (局部: the photo without any area, audit U4).
+  String compareText = '原片';
+
   /// The finger entered the readout area mid-gesture: fade, never move.
   bool dimmed = false;
   String name = '';
@@ -686,14 +689,37 @@ class EditorController extends ChangeNotifier implements GestureSink {
   @override
   void pageCancel() => zoom.pageCancel();
 
+  /// 局部's compare (audit U4): a still hold on the photo that did not start on a handle shows the photo without every area, with the
+  /// pill saying so; letting go returns.
+  void localCompare(bool on) {
+    local.setComparing(on);
+    readout
+      ..compare = on
+      ..compareText = on ? '无局部调整' : '原片'
+      ..visible = on
+      ..dimmed = false;
+    if (on) readout.cancelHide();
+    readout.notify();
+  }
+
+  /// The photo's semantics action (guidelines 12.2: the equivalent of the hold): flips the comparison the open category uses.
+  void toggleCompareA11y() {
+    if (local.active) {
+      localCompare(!local.comparing);
+    } else {
+      longPress(!compare.value);
+    }
+  }
+
   @override
   void longPress(bool on) {
-    if (on && local.active) return; // holding a handle or the brush still must not flip to the original
+    if (on && local.active) return; // 局部 decides its own holds (a hold on a handle is the handle's; see LocalController)
     if (compare.value == on) return;
     wm.setInteracting(on);
     compare.value = on;
     readout
       ..compare = on
+      ..compareText = '原片'
       ..visible = on
       ..dimmed = false;
     if (on) readout.cancelHide();

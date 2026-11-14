@@ -298,7 +298,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     final region = dockTop - 8 - regionTop;
     PanelNeeds needsFor({required bool collapsed, required bool itemised}) => panelNeeds(
         screenW: size.width, paneW: sw - e.marginL, screenH: e.size.height, region: region, photoW: size.width - e.photoPad.horizontal, aspect: aspect,
-        textScale: e.textScale, collapsed: collapsed, itemised: itemised, sideHeaderExtra: w.group == EGroup.local ? 2 * kHeaderH - kSideHeaderH : 0);
+        textScale: e.textScale, collapsed: collapsed, itemised: itemised, headerExtra: w.group == EGroup.local ? kHeaderH : 0);
     PanelNeeds needs() => needsFor(collapsed: w.collapsed, itemised: ctl.itemised && (PadCatX.ofGroup(w.group) != null || w.group == EGroup.local));
     final key = '${w.group.name}|${size.width.round()}x${size.height.round()}|${aspect.toStringAsFixed(3)}|$trailing|$id';
     if (key != _placeKey && !ctl.dragging.value) {
@@ -519,7 +519,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
             child: Semantics(
               label: '照片。双指缩放，双击放大，按住查看原片',
               customSemanticsActions: {
-                const CustomSemanticsAction(label: '显示原片 / 恢复成片'): () => ctl.longPress(!ctl.compare.value),
+                const CustomSemanticsAction(label: '显示原片 / 恢复成片'): ctl.toggleCompareA11y,
                 const CustomSemanticsAction(label: '放大 / 适合'): () => ctl.doubleTap(size.width / 2, size.height / 2),
               },
               child: _photoStage(),

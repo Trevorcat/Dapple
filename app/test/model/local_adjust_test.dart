@@ -288,7 +288,7 @@ void main() {
       final full = LocalList([for (var i = 0; i < 16; i++) LocalAdjustment(id: '$i')]);
       expect(limitFor(full, kindById('radial')), '最多 16 个区域');
       final brushes = LocalList([for (var i = 0; i < 8; i++) LocalAdjustment(id: '$i', mask: const [MaskComponent(kind: MaskKindId.brush)])]);
-      expect(limitFor(brushes, kindById('brush')), '画笔最多 8 个');
+      expect(limitFor(brushes, kindById('brush')), '画笔最多 8 块');
       expect(limitFor(brushes, kindById('radial')), isNull);
     });
   });

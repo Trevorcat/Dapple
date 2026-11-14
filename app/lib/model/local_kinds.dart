@@ -146,7 +146,7 @@ MaskOp opForNew(LocalKind k, {required bool first, required bool subtract}) {
 String? limitFor(LocalList list, LocalKind k, {int? index, int n = 1}) {
   if (index == null && list.length >= kMaxLocalAdjustments) return '最多 $kMaxLocalAdjustments 个区域';
   if (index != null && list.items[index].mask.length + n > kMaxMaskComponents) return '每个区域最多 $kMaxMaskComponents 块';
-  if (k.engine == MaskKindId.brush && list.countKind(MaskKindId.brush) + n > kMaxBrushComponents) return '画笔最多 $kMaxBrushComponents 个';
-  if (k.engine == MaskKindId.raster && list.rasterPlanes + n > kMaxRasterComponents) return '人物、天空、点选这类最多 $kMaxRasterComponents 块';
+  if (k.engine == MaskKindId.brush && list.countKind(MaskKindId.brush) + n > kMaxBrushComponents) return '画笔最多 $kMaxBrushComponents 块';
+  if (k.engine == MaskKindId.raster && list.rasterPlanes + n > kMaxRasterComponents) return '人物、天空、点选最多 $kMaxRasterComponents 块';
   return null;
 }

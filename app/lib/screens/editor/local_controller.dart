@@ -114,9 +114,23 @@ class LocalController extends ChangeNotifier {
     if (selComp >= a.mask.length) selComp = math.max(0, a.mask.length - 1);
   }
 
+  /// What the action card acts on (audit U3): the selected area (both null), one portrait chip, or the whole 人像 group.
+  PortraitChip? actionChip;
+  bool actionPortraitGroup = false;
+
+  /// The action card's subtitle: the area, the chip or 人像.
+  String get actionsTitle {
+    if (actionChip != null) return specOf(actionChip!).label;
+    if (actionPortraitGroup) return '人像';
+    return selIndex < 0 ? '区域' : '区域 ${selIndex + 1}';
+  }
+
   void select(String id) {
-    if (selId == id && body == LocalBody.pads) {
-      body = LocalBody.actions; // a second tap on the selected chip: its actions
+    if (selId == id && (body == LocalBody.pads || body == LocalBody.portrait)) {
+      // a second tap on the selected chip: its action card (U3); the 人像 chip stands for the whole group
+      actionChip = null;
+      actionPortraitGroup = selIsPortrait;
+      body = LocalBody.actions;
     } else if (selId == id) {
       body = LocalBody.pads;
     } else {
@@ -137,6 +151,10 @@ class LocalController extends ChangeNotifier {
 
   void showBody(LocalBody b) {
     body = b;
+    if (b != LocalBody.actions) {
+      actionChip = null;
+      actionPortraitGroup = false;
+    }
     _changed();
   }
 
@@ -264,7 +282,7 @@ class LocalController extends ChangeNotifier {
     }
     final brushes = a.mask.where((c) => c.kind == MaskKindId.brush).length;
     if (brushes > 0 && list.countKind(MaskKindId.brush) + brushes > kMaxBrushComponents) {
-      _toast('画笔最多 $kMaxBrushComponents 个');
+      _toast('画笔最多 $kMaxBrushComponents 块');
       return;
     }
     final id = _newId();
@@ -274,6 +292,19 @@ class LocalController extends ChangeNotifier {
     body = LocalBody.pads;
     flash();
     _changed();
+  }
+
+  /// 删除 on the 人像 action card: every portrait area goes (one undo step, 撤销 on the toast).
+  void deletePortrait() {
+    final pid = ctl.id;
+    ctl.app.applyEdit(pid, (e) => e.copyWith(local: LocalList([for (final a in e.local.items) if (portraitOf(a) == null) a])));
+    healMode = false;
+    selId = null;
+    actionPortraitGroup = false;
+    body = LocalBody.pads;
+    _ensureSel();
+    _changed();
+    ctl.app.showToast('已删除人像', actionLabel: '撤销', onAction: () => ctl.app.undo(pid));
   }
 
   void deleteArea() {
@@ -533,6 +564,15 @@ class LocalController extends ChangeNotifier {
 
   /// Manual heal: taps on the photo add / remove spots of the skin area (rings drawn while on).
   bool healMode = false;
+
+  /// The heal tool's [+|−] switch (audit U2): + adds spots, − removes the one tapped.
+  bool healAdd = true;
+
+  void setHealAdd(bool v) {
+    if (healAdd == v) return;
+    healAdd = v;
+    _changed();
+  }
   int healSize = 1;
 
   /// 对比 is held: the photo without any local area.
@@ -635,7 +675,7 @@ class LocalController extends ChangeNotifier {
           fits.add(c);
         }
       }
-      if (fits.length < chips.length) _toast('人物、天空、点选这类最多 $kMaxRasterComponents 块');
+      if (fits.length < chips.length) _toast('人物、天空、点选最多 $kMaxRasterComponents 块');
       return _setChips([for (final c in chips) if (fits.contains(c)) c], faces: faces);
     }
     var l = list;
@@ -669,7 +709,7 @@ class LocalController extends ChangeNotifier {
       }
     }
     if (l.rasterPlanes > kMaxRasterComponents || identical(l, list)) {
-      if (!identical(l, list) || skipped > 0) _toast('人物、天空、点选这类最多 $kMaxRasterComponents 块');
+      if (!identical(l, list) || skipped > 0) _toast('人物、天空、点选最多 $kMaxRasterComponents 块');
       return false;
     }
     final next = l;
@@ -683,7 +723,8 @@ class LocalController extends ChangeNotifier {
     return true;
   }
 
-  /// A chip: off -> its areas appear (and the first is selected); on but another chip selected -> select it; on and selected -> its areas go.
+  /// A chip (audit U3): off -> its areas appear (and the first is selected); on but another chip selected -> select it; on and selected
+  /// -> its action card (关掉 is there, with 撤销 on the toast; a tap never removes anything).
   void tapChip(PortraitChip c) {
     final spec = specOf(c);
     if (!chipOn(c)) {
@@ -697,12 +738,23 @@ class LocalController extends ChangeNotifier {
       _changed();
       return;
     }
+    actionChip = c;
+    actionPortraitGroup = false;
+    body = LocalBody.actions;
+    _changed();
+  }
+
+  /// 关掉 on a portrait chip's action card: the chip's areas go; the chip stays in the panel, off.
+  void turnOffChip(PortraitChip c) {
+    final spec = specOf(c);
     final ids = {for (final ar in spec.areas) ar.id};
     final pid = ctl.id;
     ctl.app.applyEdit(pid, (e) => e.copyWith(local: LocalList([for (final a in e.local.items) if (!ids.contains(a.id)) a])));
     if (healMode && c == PortraitChip.skin) healMode = false;
+    actionChip = null;
+    body = LocalBody.portrait;
     _changed();
-    ctl.app.showToast('已去掉${spec.label}', actionLabel: '撤销', onAction: () => ctl.app.undo(pid));
+    ctl.app.showToast('已关掉${spec.label}', actionLabel: '撤销', onAction: () => ctl.app.undo(pid));
   }
 
   /// The face selector: the selected chip applies to face [n] or not (at least one face stays).
@@ -774,11 +826,13 @@ class LocalController extends ChangeNotifier {
     final le = s.map.toLE(uv);
     final spots = [...a.spots];
     final hit = spots.lastIndexWhere((h) => (s.map.toLE(Offset(h.x, h.y)) - le).distance <= math.max(h.r, 8 / (s.dpPerLE * zoomScale)));
-    if (hit >= 0) {
+    // U2: the [+|−] switch decides: + always adds a spot (a tap on an existing one adds another), − removes the spot under the finger
+    if (!healAdd) {
+      if (hit < 0) return;
       spots.removeAt(hit);
     } else {
       if (spots.length >= kMaxHealSpots) {
-        _toast('每个区域最多 $kMaxHealSpots 个点');
+        _toast('最多 $kMaxHealSpots 个祛斑点');
         return;
       }
       spots.add(HealSpot(uv.dx, uv.dy, healRadius(a.face, healSize)));
@@ -1195,7 +1249,7 @@ class LocalController extends ChangeNotifier {
   MaskComponent? _start;
   Offset _downP = Offset.zero;
   bool _moved = false, _begun = false, _multi = false;
-  int _downMs = 0;
+
   BrushInput? _brush;
   bool _brushCommitted = false, _brushNewStroke = true, _flushScheduled = false;
   double _brushLE = 0.05;
@@ -1216,19 +1270,58 @@ class LocalController extends ChangeNotifier {
 
   double get _hit => kHit / zoomScale;
 
+  /// A still hold on the photo that did not start on a handle: 局部's compare (audit U4).
+  Timer? _holdTimer;
+  bool _holdCompare = false;
+
+  /// Time a finger must stay still for the compare (the editor's long press, requirements 4.15.6).
+  static const Duration kCompareHold = Duration(milliseconds: 380);
+
+  /// Movement that turns a press into a drag (a brush stroke starts painting only after it, U4).
+  static const double kSlop = 8;
+
+  void _armHold() {
+    _holdTimer?.cancel();
+    _holdTimer = Timer(kCompareHold, () {
+      if (_moved || _multi || _grab == _Grab.none && !active) return;
+      _holdCompare = true;
+      // a hold is never a tap or a dot: drop the stroke that had not started
+      if (_grab == _Grab.brush) {
+        _brush = null;
+        liveStroke.clear();
+        tick.value++;
+      }
+      ctl.localCompare(true);
+    });
+  }
+
+  void _endHold() {
+    _holdTimer?.cancel();
+    _holdTimer = null;
+    if (_holdCompare) {
+      _holdCompare = false;
+      ctl.localCompare(false);
+    }
+  }
+
   /// One finger landed on the photo.
   void pointerDown(Offset p, int ms) {
     _multi = false;
     final c = comp;
     _grab = _Grab.none;
-    if (!active || c == null) return;
+    _endHold();
+    if (!active) return;
     _downP = p;
-    _downMs = ms;
     _moved = false;
     _begun = false;
+    if (c == null) {
+      _armHold();
+      return;
+    }
     _start = c;
     if (_healing) {
-      _grab = _Grab.tap; // heal mode: a tap adds / removes a spot, nothing else moves
+      _grab = _Grab.tap; // heal mode: a tap adds / removes a spot (the [+|−] switch), nothing else moves
+      _armHold();
       return;
     }
     switch (c.kind) {
@@ -1258,6 +1351,9 @@ class LocalController extends ChangeNotifier {
       default:
         _grab = _Grab.none;
     }
+    // a press on a handle belongs to the handle; anywhere else a still hold compares
+    const free = {_Grab.none, _Grab.tap, _Grab.brush, _Grab.linNew, _Grab.radNew};
+    if (free.contains(_grab)) _armHold();
   }
 
   _Grab _hitLinear(MaskComponent c, Offset p) {
@@ -1287,11 +1383,18 @@ class LocalController extends ChangeNotifier {
   }
 
   void pointerMove(Offset p, int ms) {
+    if (_holdCompare) return; // comparing: the finger only holds
+    if (_holdTimer != null && (p - _downP).distance >= kSlop / zoomScale) {
+      _holdTimer?.cancel();
+      _holdTimer = null;
+    }
     if (_multi || _grab == _Grab.none) return;
     final d = p - _downP;
     if (!_moved) {
-      final slop = (_grab == _Grab.brush ? 3 : 8) / zoomScale;
-      if (d.distance < slop && !(_grab == _Grab.brush && ms - _downMs > 90)) {
+      // the brush paints only once the finger has moved 8 dp (a still press may become the compare hold, U4); the points before
+      // are kept, so the stroke still starts where the finger landed
+      final slop = kSlop / zoomScale;
+      if (d.distance < slop) {
         if (_grab == _Grab.brush) _brush?.add(p);
         return;
       }
@@ -1348,6 +1451,14 @@ class LocalController extends ChangeNotifier {
   void pointerUp(Offset p, int ms) {
     final g = _grab;
     _grab = _Grab.none;
+    if (_holdCompare) {
+      // the end of a compare hold: nothing is added, painted or picked
+      _endHold();
+      _brush = null;
+      _finishGesture();
+      return;
+    }
+    _endHold();
     if (_multi) {
       _finishGesture();
       return;
@@ -1380,12 +1491,14 @@ class LocalController extends ChangeNotifier {
 
   void pointerCancel() {
     _grab = _Grab.none;
+    _endHold();
     _finishGesture();
   }
 
   /// A second finger landed: the photo zooms / pans. A stroke not committed yet is dropped (it was the start of a pinch).
   void secondFinger() {
     _multi = true;
+    _endHold();
     if (_grab == _Grab.brush && !_brushCommitted) {
       _brush = null;
       liveStroke.clear();
@@ -1770,7 +1883,10 @@ class LocalPadSource extends PadSource {
   void reset() => lc.resetOps();
 
   @override
-  String get readout => localReadout(_ui);
+  String get readout => localReadout(_ui, area: lc.sel);
+
+  @override
+  double percent(double a) => localStripPercent(lc.sel, a);
 }
 
 /// The itemised view of the selected area: every local op, the pads' recipe as the dashed polygon.

@@ -233,7 +233,7 @@ class _SettingsPageState extends State<SettingsPage> {
       case 2:
         return [
           _row(context, '照片到达后自动处理',
-              sub: '先按明暗轻微增强，再套用默认风格',
+              sub: '自动增强，套用默认成像',
               onTap: () => app.updateSettings((x) => x.autoProcess = !x.autoProcess),
               trailing: DSwitch(
                   key: const ValueKey('sw-auto'),

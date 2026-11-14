@@ -1,3 +1,4 @@
+import 'package:dapple/screens/editor/local_layer.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import '../local_ai_test.dart' show FakeLocalAi;
@@ -11,7 +12,7 @@ void main() {
       if (s != 'p' && dark) continue;
       testWidgets('A1 $s $th', (t) async {
         final fake = FakeLocalAi();
-        await audOpen(t, s, dark, ai: fake);
+        final r = await audOpen(t, s, dark, ai: fake);
         await audShot(t, '01_local_empty_${s}_$th');
         await addViaCard(t, 'radial');
         await tapKey(t, 'local-add');
@@ -27,6 +28,15 @@ void main() {
         await tapKey(t, 'local-add');
         await addViaCard(t, 'color');
         await audShot(t, '06_local_hue_${s}_$th');
+        // U4: a still hold on the photo (not on a handle) shows the photo without any area, with the pill saying so
+        final layer = t.getCenter(find.byType(LocalPhotoLayer));
+        final g = await t.startGesture(layer + const Offset(0, 40));
+        await t.pump(const Duration(milliseconds: 450));
+        expect(r.lc!.comparing, isTrue, reason: 'hold compares');
+        await audShot(t, '07_local_compare_hold_${s}_$th');
+        await g.up();
+        await t.pump();
+        expect(r.lc!.comparing, isFalse);
       });
     }
   }

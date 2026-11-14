@@ -33,6 +33,7 @@ import '../services/ingest_log.dart';
 import '../services/live_bridge.dart';
 import '../services/merge_engine.dart';
 import '../services/session_cache.dart';
+import '../services/memory_policy.dart';
 import '../services/tool_models.dart';
 
 /// A transient message (Snackbar on Android). Single instance, newest replaces older
@@ -597,7 +598,7 @@ class AppState extends ChangeNotifier {
     if (old == baseId) return;
     EditState.defaultBase = baseId;
     updateSettings((s) => s.defaultBaseId = baseId);
-    showToast('新照片默认使用「${baseNameOf(film, baseId)}」', actionLabel: '撤销', onAction: () {
+    showToast('新照片默认成像「${baseNameOf(film, baseId)}」', actionLabel: '撤销', onAction: () {
       EditState.defaultBase = old;
       updateSettings((s) => s.defaultBaseId = old);
     });
@@ -674,6 +675,7 @@ class AppState extends ChangeNotifier {
     await _prefs.setString('ftpPass', settings.ftpPass);
     nativeOk = DappleSession.isAvailable;
     if (!nativeOk) nativeError = '原生库未加载';
+    if (nativeOk) unawaited(MemoryPolicy.start(this)); // device memory class -> engine, onTrimMemory, image cache bound (42.9)
     await _loadFilm();
     await _loadLibrary();
     _repairPaths();
@@ -1287,7 +1289,18 @@ class AppState extends ChangeNotifier {
   }
 
   /// Re-writes the grid thumbnail (2048 px JPEG) after the editor closes.
-  Future<void> commitEdit(Photo ph) async {
+  Future<void> commitEdit(Photo ph) {
+    final f = _commitEdit(ph);
+    _commitsInFlight.add(f);
+    return f.whenComplete(() => _commitsInFlight.remove(f));
+  }
+
+  final Set<Future<void>> _commitsInFlight = {};
+
+  /// Memory (pipeline-architecture.md 42.9): the release after the editor closed waits for its thumbnail commits.
+  Future<void> whenCommitsDone() => Future.wait(_commitsInFlight.toList());
+
+  Future<void> _commitEdit(Photo ph) async {
     ph.exported = false;
     changed();
     if (isDemo || !nativeOk || ph.previewPath == null) return;
@@ -1448,6 +1461,7 @@ class AppState extends ChangeNotifier {
     final out = p.join(exports.path, '${p.basenameWithoutExtension(ph.name)}_dapple_$tag.jpg');
     if (await File(out).exists()) return out;
     final src = await _resolveWithOriginal(ph);
+    if (le == 0 || le > 4096) await MemoryPolicy.beforeExport(ph.id); // full size: the sessions the export does not use go first (42.9)
     try {
       await DappleSession.exportOneShot(src.path, params,
           full: true,

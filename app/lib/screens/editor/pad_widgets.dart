@@ -164,6 +164,9 @@ abstract class PadSource {
   void reset();
   String get readout;
 
+  /// What the strip at [a] reads, in percent of the recommended amount (audit U1); the header readout and the screen reader say it.
+  double percent(double a) => a.clamp(0.0, 1.0) * 200;
+
   /// False: drawn dimmed and ignores the finger (an empty 局部).
   bool get enabled => true;
 }
@@ -189,7 +192,9 @@ class CatPadSource extends PadSource {
   @override
   void reset() => ctl.resetPad(cat);
   @override
-  String get readout => padReadout(cat, ctl.padView(cat));
+  String get readout => padReadout(cat, ctl.padView(cat), ctx: ctl.padCtx);
+  @override
+  double percent(double a) => stripPercent(cat, a, ctx: ctl.padCtx);
 }
 
 /// A pad of [cat]. [interactive] false = a picture of the pad (the hold popup, where the dock glyph takes the finger).
@@ -422,9 +427,10 @@ class _StrengthStripState extends State<StrengthStrip> {
       key: ValueKey('strip-${widget.source == null ? widget.cat.name : 'local'}'),
       slider: true,
       label: widget.label ?? '${widget.cat.label}强度',
-      value: '${(a * 200).round()}%',
-      increasedValue: '${((a + 0.05).clamp(0.0, 1.0) * 200).round()}%',
-      decreasedValue: '${((a - 0.05).clamp(0.0, 1.0) * 200).round()}%',
+      // the same words as the header readout (audit U1)
+      value: '${src.percent(a).round()}%',
+      increasedValue: '${src.percent(a + 0.05).round()}%',
+      decreasedValue: '${src.percent(a - 0.05).round()}%',
       onIncrease: () => _nudge(0.05),
       onDecrease: () => _nudge(-0.05),
       child: SizedBox(
@@ -489,7 +495,7 @@ class _StripPainter extends CustomPainter {
 }
 
 /// A colour look on the pad: a small round thumbnail of the photo with that look on its current base (the engine's rendering), over
-/// a placeholder in the look's own colour until it arrives; white ring, thicker when selected.
+/// a placeholder in the look's own colour until it arrives; white ring; selected (audit U7) = the white ring with an accent ring outside it.
 class LookDot extends StatelessWidget {
   const LookDot({super.key, required this.image, required this.tint, required this.selected, this.size = 26});
   final ui.Image? image;
@@ -504,15 +510,15 @@ class LookDot extends StatelessWidget {
       height: size,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        border: Border.all(color: Colors.white, width: selected ? 2.5 : 1.5),
-        boxShadow: [BoxShadow(color: const Color(0x40000000), blurRadius: 0, spreadRadius: selected ? 1.5 : 1)],
+        border: Border.all(color: Fx.handle, width: selected ? 2 : 1.5),
+        boxShadow: [BoxShadow(color: selected ? context.c.accentBtn : Fx.handleRim, blurRadius: 0, spreadRadius: selected ? 2 : 1)],
       ),
       child: ClipOval(
         child: Stack(fit: StackFit.expand, children: [
           ColoredBox(key: const ValueKey('look-placeholder'), color: tint),
           AnimatedOpacity(
             opacity: image == null ? 0 : 1,
-            duration: const Duration(milliseconds: 180),
+            duration: Mo.small,
             child: image == null ? const SizedBox.shrink() : RawImage(key: const ValueKey('look-image'), image: image, fit: BoxFit.cover, filterQuality: FilterQuality.low),
           ),
         ]),

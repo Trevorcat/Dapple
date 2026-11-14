@@ -30,7 +30,7 @@ void main() {
           await t.tap(find.byKey(const ValueKey('items-button')));
           await settle(t, 6);
           await audShot(t, '21_light_items_${s}_$th');
-          await t.tap(find.byKey(const ValueKey('items-button')));
+          await t.tap(find.byKey(const ValueKey('header-back')));
           await settle(t, 6);
         }
         await dock(t, EGroup.color);

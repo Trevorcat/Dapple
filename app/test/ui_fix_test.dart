@@ -107,7 +107,7 @@ void main() {
       ..tab = 1;
     await pumpDapple(tester, app);
     await tester.pump(_t);
-    expect(find.text('新照片默认使用'), findsOneWidget);
+    expect(find.text('新照片默认成像'), findsOneWidget);
     expect(find.byKey(const ValueKey('sample-pill')), findsOneWidget, reason: 'the sample picture is labelled on the picture, not by a sentence');
     expect(find.byKey(const ValueKey('base-modern_clean')), findsOneWidget);
     expect(find.byType(Image), findsWidgets); // the bundled sample scene, not a flat placeholder

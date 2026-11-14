@@ -72,8 +72,9 @@ double panelCollapsedH(double textScale, {bool side = false}) => kPanelHandleH +
 /// size, and the itemised view (the precise layer) may be taller, never beyond 46 % of the screen.
 ///
 /// [region]: height between the top bar and the dock; [photoW]: width the photo may use; [aspect]: width / height of the photo.
-double bottomPanelHeight({required double region, required double photoW, required double aspect, required double screenH, double textScale = 1, bool itemised = false}) {
-  final extra = math.max(0.0, textScale - 1) * 24 + (headerWraps(textScale) ? kHeaderH : 0); // large text: the header's button line
+double bottomPanelHeight({required double region, required double photoW, required double aspect, required double screenH, double textScale = 1, bool itemised = false, double headerExtra = 0}) {
+  // large text: the header's button line; [headerExtra]: a header with a further line (局部's area chips)
+  final extra = math.max(0.0, textScale - 1) * 24 + (headerWraps(textScale) ? kHeaderH : 0) + headerExtra;
   final hRef = math.min(photoW / aspect, region);
   final allowed = region - 8 - 0.9 * hRef; // the photo keeps 90 % of its height
   final lo = kPanelFixedH + kPadMinH + extra, comfy = kPanelFixedH + kPadComfortH + extra;
@@ -109,21 +110,21 @@ PanelNeeds panelNeeds({
   double textScale = 1,
   bool collapsed = false,
   bool itemised = false,
-  double sideHeaderExtra = 0,
+  double headerExtra = 0,
 }) {
-  // [sideHeaderExtra]: a side-pane header taller than the title + readout lines (局部: the chips are a 48 dp line of their own)
+  // [headerExtra]: a header with a further full line (局部: the area chips are a 48 dp line of their own), in both placements
   final extra = math.max(0.0, textScale - 1) * 24 + (headerWraps(textScale) ? kHeaderH : 0); // large text: the header's button line
   if (collapsed) {
     return PanelNeeds(bottom: panelCollapsedH(textScale), side: panelCollapsedH(textScale, side: true), sideMin: panelCollapsedH(textScale, side: true), growBottom: 0, growSide: 0, growMin: 0, pad: false);
   }
-  final sideFixed = kPanelHandleH + kSideHeaderH + kPanelTopGap + kPanelBottomPad + extra + sideHeaderExtra;
+  final sideFixed = kPanelHandleH + kSideHeaderH + kPanelTopGap + kPanelBottomPad + extra + headerExtra;
   final side = sideFixed + (itemised ? kRadarContentH : 176);
   return PanelNeeds(
-    bottom: bottomPanelHeight(region: region, photoW: photoW, aspect: aspect, screenH: screenH, textScale: textScale, itemised: itemised),
+    bottom: bottomPanelHeight(region: region, photoW: photoW, aspect: aspect, screenH: screenH, textScale: textScale, itemised: itemised, headerExtra: headerExtra),
     side: side,
     // 分项 in a short side pane (landscape phone): the radar shrinks rather than the pane giving way to a bottom panel that leaves a
     // stamp-sized photo (guidelines 15.8, editor-panel 8: the side radar is small)
-    sideMin: itemised ? sideFixed + 180 : side - 20 - sideHeaderExtra,
+    sideMin: itemised ? sideFixed + 180 - headerExtra : side - 20 - headerExtra,
     growBottom: 0,
     growSide: itemised ? 0 : 220,
     growMin: 0,
@@ -360,6 +361,108 @@ class HeaderButton extends StatelessWidget {
   }
 }
 
+/// One header for every panel layer (audit U6, guidelines 15.2.8): `[‹] title · readout or subtitle …… (reset) · main action`. The title is
+/// always the dock item's name; ‹ (left of the title) appears in any layer below the panel's first one and goes back one layer; the
+/// right end holds at most three buttons, the last one being the layer's main action. A narrow side pane puts the readout / subtitle on
+/// a second line; [lines] are further full-width lines (局部's area chips). Large text puts the buttons on a line of their own.
+class PanelHeader extends StatelessWidget {
+  const PanelHeader({
+    super.key,
+    required this.title,
+    required this.side,
+    required this.textScale,
+    this.onBack,
+    this.sub,
+    this.subTappable = false,
+    this.buttons = const [],
+    this.below,
+    this.belowLines = 0,
+  }) : assert(buttons.length <= 3, 'a header holds at most three buttons (U6)');
+  final String title;
+  final bool side;
+  final double textScale;
+  final VoidCallback? onBack;
+
+  /// The readout (强度 N% …) or the subtitle (the card, the editor, the layer); [subTappable]: it holds buttons (48 dp line).
+  final Widget? sub;
+  final bool subTappable;
+  final List<Widget> buttons;
+
+  /// Full-width content under the header, [belowLines] lines of [kHeaderH] (局部's area chips).
+  final Widget? below;
+  final int belowLines;
+
+  /// Height of the header: one line (two in a side pane: 22 dp readout, 48 dp when it holds buttons), the large-text button line, the
+  /// extra lines.
+  static double heightOf({required double textScale, required bool side, bool subTappable = false, int lines = 0}) {
+    final extra = math.max(0.0, textScale - 1) * 24;
+    final first = kHeaderH + extra;
+    final second = side ? (subTappable ? kHeaderH : kSideHeaderH - kHeaderH) : 0.0;
+    return first + second + (headerWraps(textScale) ? kHeaderH : 0) + lines * kHeaderH;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final titleStyle = T.body(c.text, w: FontWeight.w600);
+    final wrap = headerWraps(textScale) && buttons.length > 1;
+    final extra = math.max(0.0, textScale - 1) * 24;
+    final row = Row(mainAxisSize: MainAxisSize.min, children: [for (final b in buttons) ...[const SizedBox(width: Sp.xs), b]]);
+    final back = onBack == null
+        ? null
+        : Semantics(
+            button: true,
+            label: '返回',
+            excludeSemantics: true,
+            onTap: onBack,
+            child: GestureDetector(
+              key: const ValueKey('header-back'),
+              behavior: HitTestBehavior.opaque,
+              onTap: onBack,
+              child: SizedBox(width: 36, height: kHit, child: Align(alignment: Alignment.centerLeft, child: DIcon(DI.back, size: 22 * textScale.clamp(1.0, 2.0), color: c.text))),
+            ),
+          );
+    final titleW = Row(mainAxisSize: MainAxisSize.min, children: [
+      ?back,
+      Text(title, key: const ValueKey('header-title'), style: titleStyle),
+    ]);
+    final h = heightOf(textScale: textScale, side: side, subTappable: subTappable, lines: below == null ? 0 : belowLines);
+    final first = Row(children: [
+      titleW,
+      const SizedBox(width: Sp.m),
+      Expanded(child: side || sub == null ? const SizedBox.shrink() : Align(alignment: Alignment.centerLeft, child: sub)),
+      if (!wrap) Flexible(flex: 0, child: SingleChildScrollView(scrollDirection: Axis.horizontal, reverse: true, child: row)),
+    ]);
+    return SizedBox(
+      height: h,
+      child: Padding(
+        padding: EdgeInsets.only(left: onBack == null ? Sp.l : Sp.s, right: Sp.l),
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          SizedBox(height: kHeaderH + extra, child: first),
+          if (side) SizedBox(height: subTappable ? kHeaderH : kSideHeaderH - kHeaderH, child: Align(alignment: Alignment.centerLeft, child: sub ?? const SizedBox.shrink())),
+          // large text: the buttons keep their words at full size on a line of their own (guidelines 12.6)
+          if (headerWraps(textScale))
+            SizedBox(height: kHeaderH, child: wrap ? Align(alignment: Alignment.centerRight, child: SingleChildScrollView(scrollDirection: Axis.horizontal, reverse: true, child: row)) : null),
+          if (below != null && belowLines > 0) SizedBox(height: belowLines * kHeaderH, child: below),
+        ]),
+      ),
+    );
+  }
+}
+
+/// The readout text of a header (强度 N% · …), repainted from the edit tick only.
+class HeaderReadout extends StatelessWidget {
+  const HeaderReadout({super.key, required this.listenable, required this.text});
+  final Listenable listenable;
+  final String Function() text;
+
+  @override
+  Widget build(BuildContext context) => ListenableBuilder(
+        listenable: listenable,
+        builder: (context, _) => Text(text(), key: const ValueKey('header-readout'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.cap(context.c.text2, tabular: true)),
+      );
+}
+
 class _Header extends StatelessWidget {
   const _Header({required this.ctl, required this.group, required this.cat, required this.side, required this.textScale});
   final EditorController ctl;
@@ -373,131 +476,117 @@ class _Header extends StatelessWidget {
     final c = context.c;
     final cat = this.cat;
     final name = cat?.label ?? '裁切';
-    final title = switch (ctl.extra) {
-      PanelExtra.curve => '$name · 曲线',
-      PanelExtra.hsl => '$name · 分色',
-      PanelExtra.grade => '$name · 分级',
-      PanelExtra.paper => '$name · 相纸',
-      PanelExtra.tone => '$name · 明暗目标',
-      null => name,
-    };
-    final readout = cat == null
-        ? const SizedBox.shrink()
-        : ListenableBuilder(
-            listenable: ctl.app.editTick,
-            builder: (context, _) => Text(padReadout(cat, ctl.padView(cat)), key: const ValueKey('header-readout'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.cap(c.text2, tabular: true)),
-          );
-    final inExtra = ctl.extra != null;
-    final inItems = ctl.itemised && !inExtra;
-    // the itemised view lists the complex editors in the header (where the readout was): the radar keeps the whole panel
-    final extras = <(String, PanelExtra)>[
-      if (cat == PadCat.light) ...[('明暗目标', PanelExtra.tone), ('曲线', PanelExtra.curve)],
-      if (cat == PadCat.color) ...[('分色', PanelExtra.hsl), ('分级', PanelExtra.grade)],
-      if (cat == PadCat.film && (ctl.app.film.stock(ctl.edit.film)?.printed ?? false)) ('相纸', PanelExtra.paper),
-    ];
-    final extraRow = Row(mainAxisSize: MainAxisSize.min, children: [
-      for (final x in extras) ...[
-        HeaderButton(key: ValueKey('extra-${x.$1}'), label: x.$1, chevron: true, trailingChevron: true, onTap: () => ctl.openExtra(x.$2)),
-        const SizedBox(width: Sp.xs),
-      ],
-    ]);
-    final buttons = <Widget>[
-      // 无 clears what is chosen, so it is there only when something is (audit F44); with nothing chosen the one button says what it does
-      if (cat == PadCat.film && !inExtra && !inItems)
-        ListenableBuilder(
-          listenable: ctl.app.editTick,
-          builder: (context, _) => ctl.edit.film == null
-              ? const SizedBox.shrink()
-              : HeaderButton(key: const ValueKey('film-none'), label: '无', semantics: '不使用胶片或现代成像', onTap: ctl.stockNone),
-        ),
-      if (cat == PadCat.film && !inExtra && !inItems)
-        ListenableBuilder(
-          listenable: ctl.app.editTick,
-          builder: (context, _) {
-            final none = ctl.edit.film == null;
-            final name = none ? '选胶片' : baseNameOf(ctl.app.film, ctl.edit.film);
-            final modern = isModernId(ctl.edit.film);
-            return HeaderButton(
-                key: const ValueKey('stock-button'),
-                label: name,
-                chevron: true,
-                pressed: ctl.filmMapOpen,
-                semantics: none ? '选胶片' : '选择${modern ? '成像' : '胶片'}，当前$name',
-                onTap: () => ctl.setFilmMap(!ctl.filmMapOpen));
-          },
-        ),
-      ListenableBuilder(
+    final extra = ctl.extra;
+    final inItems = ctl.itemised && extra == null;
+    final film = cat == PadCat.film;
+    final mapOpen = film && ctl.filmMapOpen && !ctl.itemised;
+    final reset = ListenableBuilder(
+      listenable: ctl.app.editTick,
+      builder: (context, _) {
+        final adjusted = cat == null ? ctl.edit.crop != 'orig' || ctl.edit.rot != 0 || ctl.edit.flip || ctl.edit.values.containsKey('straighten') : padCatAdjusted(ctl.edit, cat, ctl.padCtx);
+        // hidden but in place when nothing is changed: the header does not jump (guidelines 15.8)
+        return Visibility(
+          visible: adjusted,
+          maintainSize: true,
+          maintainAnimation: true,
+          maintainState: true,
+          child: HeaderButton(key: ValueKey('reset-${group.name}'), label: '复位', icon: DI.reset, semantics: '复位$name', onTap: () => cat == null ? ctl.resetCrop() : ctl.resetPad(cat)),
+        );
+      },
+    );
+    final readout = cat == null ? null : HeaderReadout(listenable: ctl.app.editTick, text: () => padReadout(cat, ctl.padView(cat), ctx: ctl.padCtx));
+
+    // 成像, the map: ‹ back to the pad; the subtitle is what is chosen; the main action is 无 (only when something is chosen)
+    if (mapOpen) {
+      return ListenableBuilder(
         listenable: ctl.app.editTick,
         builder: (context, _) {
-          final adjusted = cat == null ? ctl.edit.crop != 'orig' || ctl.edit.rot != 0 || ctl.edit.flip || ctl.edit.values.containsKey('straighten') : padCatAdjusted(ctl.edit, cat, ctl.padCtx);
-          return Visibility(
-            visible: adjusted,
-            maintainSize: true,
-            maintainAnimation: true,
-            maintainState: true,
-            child: HeaderButton(key: ValueKey('reset-${group.name}'), label: '复位', icon: DI.reset, semantics: '复位$name', onTap: () => cat == null ? ctl.resetCrop() : ctl.resetPad(cat)),
+          final none = ctl.edit.film == null;
+          return PanelHeader(
+            title: name,
+            side: side,
+            textScale: textScale,
+            onBack: () => ctl.setFilmMap(false),
+            sub: Text(none ? '选成像' : baseNameOf(ctl.app.film, ctl.edit.film), key: const ValueKey('header-sub'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.cap(c.text2)),
+            buttons: [if (!none) HeaderButton(key: const ValueKey('film-none'), label: '无', semantics: '不用成像', onTap: ctl.stockNone)],
           );
         },
-      ),
-      if (cat != null)
-        HeaderButton(
-          key: const ValueKey('items-button'),
-          label: inExtra ? '返回' : '分项',
-          pressed: ctl.itemised && !inExtra,
-          onTap: () {
-            if (inExtra) {
-              ctl.openExtra(null);
-            } else {
-              ctl.setItemised(!ctl.itemised);
-            }
-          },
-        ),
-    ];
-    // the side pane's second line is a readout (22 dp); in 分项 it holds the editor entries, which are 48 dp targets: the body gives
-    // up the difference (it was an 18 dp overflow, audit F46)
-    final h = headerH(textScale, side: side) + (side && inItems && extras.isNotEmpty ? kHeaderH - (kSideHeaderH - kHeaderH) : 0);
-    final titleStyle = T.body(c.text, w: FontWeight.w600);
-    final titleW = (TextPainter(text: TextSpan(text: title, style: titleStyle), textDirection: TextDirection.ltr, textScaler: MediaQuery.textScalerOf(context))..layout()).width;
-    // 裁切 has one button (复位): it stays beside the title even with large text
-    final wrap = headerWraps(textScale) && cat != null;
-    Widget buttonRow() => Row(mainAxisSize: MainAxisSize.min, children: [for (final b in buttons) ...[const SizedBox(width: Sp.xs), b]]);
-    return SizedBox(
-      height: h,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: Sp.l),
-        child: LayoutBuilder(builder: (context, cons) {
-          final sub = inItems ? SizedBox(width: double.infinity, child: FittedBox(fit: BoxFit.scaleDown, alignment: Alignment.centerLeft, child: extraRow)) : readout;
-          if (wrap) {
-            // large text: the title (and readout) on one line, the buttons at full size on a line of their own (guidelines 12.6)
-            return Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                Text(title, key: const ValueKey('header-title'), style: titleStyle),
-                const SizedBox(width: Sp.m),
-                Expanded(child: side ? const SizedBox.shrink() : sub),
+      );
+    }
+    // a complex editor: ‹ back to 分项; the subtitle names the editor
+    if (extra != null) {
+      final sub = switch (extra) {
+        PanelExtra.curve => '曲线',
+        PanelExtra.hsl => '分色',
+        PanelExtra.grade => '分级',
+        PanelExtra.paper => '相纸',
+        PanelExtra.tone => '明暗目标',
+      };
+      return PanelHeader(
+        title: name,
+        side: side,
+        textScale: textScale,
+        onBack: () => ctl.openExtra(null),
+        sub: Text(sub, key: const ValueKey('header-sub'), maxLines: 1, style: T.cap(c.text2)),
+        buttons: [reset],
+      );
+    }
+    // 分项: ‹ back to the pad; the complex editors are entries where the readout was
+    if (inItems) {
+      final extras = <(String, PanelExtra)>[
+        if (cat == PadCat.light) ...[('明暗目标', PanelExtra.tone), ('曲线', PanelExtra.curve)],
+        if (cat == PadCat.color) ...[('分色', PanelExtra.hsl), ('分级', PanelExtra.grade)],
+        if (cat == PadCat.film && (ctl.app.film.stock(ctl.edit.film)?.printed ?? false)) ('相纸', PanelExtra.paper),
+      ];
+      final entries = extras.isEmpty
+          ? readout
+          : FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                for (final x in extras) ...[
+                  HeaderButton(key: ValueKey('extra-${x.$1}'), label: x.$1, trailingChevron: true, onTap: () => ctl.openExtra(x.$2)),
+                  const SizedBox(width: Sp.xs),
+                ],
               ]),
-              if (side) sub,
-              Align(alignment: Alignment.centerRight, child: SingleChildScrollView(scrollDirection: Axis.horizontal, reverse: true, child: buttonRow())),
-            ]);
-          }
-          // the buttons keep their size and target; the readout / the editor entries beside them give way
-          final room = cons.maxWidth - titleW - (side ? 8 : 12 + 70);
-          Widget group() => ConstrainedBox(
-                constraints: BoxConstraints(maxWidth: math.max(kHit, room)),
-                child: FittedBox(fit: BoxFit.scaleDown, alignment: Alignment.centerRight, child: buttonRow()),
-              );
-          return side
-              ? Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Row(children: [Text(title, key: const ValueKey('header-title'), style: titleStyle), const Spacer(), group()]),
-                  sub,
-                ])
-              : Row(children: [
-                  Text(title, key: const ValueKey('header-title'), style: titleStyle),
-                  const SizedBox(width: Sp.m),
-                  Expanded(child: inItems ? FittedBox(fit: BoxFit.scaleDown, alignment: Alignment.centerLeft, child: extraRow) : readout),
-                  group(),
-                ]);
-        }),
-      ),
+            );
+      return PanelHeader(
+        title: name,
+        side: side,
+        textScale: textScale,
+        onBack: () => ctl.setItemised(false),
+        sub: entries,
+        subTappable: extras.isNotEmpty,
+        buttons: [reset],
+      );
+    }
+    // the pad layer: title · (成像: the chosen base) readout …… (reset) · 分项
+    final stock = !film
+        ? null
+        : ListenableBuilder(
+            listenable: ctl.app.editTick,
+            builder: (context, _) {
+              final none = ctl.edit.film == null;
+              final label = none ? '选成像' : baseNameOf(ctl.app.film, ctl.edit.film);
+              return HeaderButton(
+                  key: const ValueKey('stock-button'),
+                  label: label,
+                  chevron: true,
+                  semantics: none ? '选成像' : '选择成像，当前$label',
+                  onTap: () => ctl.setFilmMap(true));
+            },
+          );
+    final sub = stock == null ? readout : Row(mainAxisSize: MainAxisSize.min, children: [stock, const SizedBox(width: Sp.s), Flexible(child: readout!)]);
+    return PanelHeader(
+      title: name,
+      side: side,
+      textScale: textScale,
+      sub: sub,
+      subTappable: stock != null,
+      buttons: [
+        reset,
+        if (cat != null) HeaderButton(key: const ValueKey('items-button'), label: '分项', onTap: () => ctl.setItemised(true)),
+      ],
     );
   }
 }

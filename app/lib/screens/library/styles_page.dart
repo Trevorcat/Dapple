@@ -199,7 +199,7 @@ class _StylesPageState extends State<StylesPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('新照片默认使用', style: T.small(c.text2)),
+                Text('新照片默认成像', style: T.small(c.text2)),
                 const SizedBox(height: Sp.s),
                 Row(
                   children: [

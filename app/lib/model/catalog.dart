@@ -38,7 +38,7 @@ const dLooks = <DLook>[
   DLook('cool', '冷调', '冷色 · 安静', 'cool', 0.44, 0.74, [Color(0xFFCFE2F7), Color(0xFF6F93BD)]),
   DLook('teal', '青橙', '冷暖互补 · 电影感', 'cool', 0.62, 0.62, [Color(0xFFF0A55E), Color(0xFF2F8A8F)],
       contrast: 1.04, sat: 1.08, sepia: 0.1),
-  DLook('film', '胶片', '偏暖 · 灰黑位 · 颗粒', 'film', 0.46, 0.40, [Color(0xFFEFE1C4), Color(0xFF9C8A6B)],
+  DLook('film', '胶片感', '偏暖 · 灰黑位 · 颗粒', 'film', 0.46, 0.40, [Color(0xFFEFE1C4), Color(0xFF9C8A6B)],
       sepia: 0.22, contrast: 0.94, bright: 1.03),
   DLook('bw', '黑白', '单色 · 高反差', 'bw', 0.50, 0.50, [Color(0xFFF5F5F5), Color(0xFF1C1C1C)], gray: 1, contrast: 1.12),
 ];

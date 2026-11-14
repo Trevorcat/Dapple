@@ -54,6 +54,14 @@ Future<void> toPads(WidgetTester t, Rig r) async {
   await settle(t, 3);
 }
 
+/// A still press on the photo, away from the handles, held past the compare delay (380 ms): audit U4.
+Future<TestGesture> holdPhoto(WidgetTester t) async {
+  final g = await t.startGesture(frameRect(t).topLeft + const Offset(14, 14));
+  await t.pump(const Duration(milliseconds: 400));
+  await t.pump(const Duration(milliseconds: 300)); // the pill fades in
+  return g;
+}
+
 List<String> ids(Rig r) => [for (final a in r.local.items) a.id];
 LocalAdjustment byId(Rig r, String id) => r.local.byId(id)!;
 
@@ -108,7 +116,8 @@ void main() {
       for (final c in ['skin', 'undereye', 'shine', 'teeth', 'eyes', 'lips', 'light']) {
         expect(key('chip-$c'), findsOneWidget, reason: c);
       }
-      expect(find.text('人像'), findsOneWidget, reason: 'the header title');
+      expect(t.widget<Text>(key('header-title')).data, '局部', reason: 'the title is always the dock item');
+      expect(t.widget<Text>(key('header-readout')).data, startsWith('人像'), reason: 'the readout names the layer');
       expect(t.takeException(), isNull);
     });
   });
@@ -187,16 +196,22 @@ void main() {
       expect(ids(r), _defaultIds);
     });
 
-    testWidgets('on + another selected: select; on + selected: remove with the toast; undo brings it back', (t) async {
+    testWidgets('on + another selected: select; on + selected: its action card, 关掉 removes it with the toast; undo brings it back', (t) async {
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult());
       expect(r.lc.selChip, PortraitChip.skin);
       await tapKey(t, 'chip-shine');
       expect(r.lc.selChip, PortraitChip.shine);
+      expect(key('tile-actions-cue'), findsOneWidget, reason: 'the selected chip shows the cue');
       expect(ids(r), _defaultIds, reason: 'selecting changes nothing');
       await tapKey(t, 'chip-shine');
+      expect(ids(r), _defaultIds, reason: 'a second tap does not remove any more');
+      expect(r.lc.body, LocalBody.actions);
+      expect(r.lc.actionChip, PortraitChip.shine);
+      expect(key('act-关掉'), findsOneWidget);
+      await tapKey(t, 'act-关掉');
       expect(ids(r), [for (final i in _defaultIds) if (i != 'pt-shine') i]);
-      expect(r.app.toast?.message, '已去掉油光');
+      expect(r.app.toast?.message, '已关掉油光');
       expect(r.app.toast?.actionLabel, '撤销');
       r.app.toast!.onAction!();
       await settle(t, 3);
@@ -210,9 +225,11 @@ void main() {
       await tapKey(t, 'chip-eyes');
       expect(r.lc.selChip, PortraitChip.eyes);
       await tapKey(t, 'chip-eyes');
+      expect(ids(r), containsAll(['pt-eyewhite', 'pt-iris']), reason: 'the second tap opens the action card');
+      await tapKey(t, 'act-关掉');
       expect(ids(r), isNot(contains('pt-eyewhite')));
       expect(ids(r), isNot(contains('pt-iris')));
-      expect(r.app.toast?.message, '已去掉眼睛');
+      expect(r.app.toast?.message, '已关掉眼睛');
       expect(r.local.length, 5);
       await tapKey(t, 'chip-eyes');
       expect(ids(r), containsAll(['pt-eyewhite', 'pt-iris']));
@@ -228,7 +245,8 @@ void main() {
       final r = await openPortrait(t, fake, portraitResult());
       r.lc.setHealMode(true);
       await settle(t, 2);
-      await tapKey(t, 'chip-skin');
+      await tapKey(t, 'chip-skin'); // selected and on: its action card
+      await tapKey(t, 'act-关掉');
       expect(r.lc.healMode, isFalse);
       expect(ids(r), isNot(contains('pt-skin')));
     });
@@ -309,7 +327,7 @@ void main() {
       expect(t.takeException(), isNull);
 
       // other chips: their own ops, no sensitivity
-      await tapKey(t, 'items-button');
+      await tapKey(t, 'header-back');
       await tapKey(t, 'chip-lips');
       await tapKey(t, 'items-button');
       expect(key('local-radar-pt-lips'), findsOneWidget);
@@ -319,7 +337,7 @@ void main() {
   });
 
   group('点一下祛斑', () {
-    testWidgets('heal mode: two taps add two spots (one undo step each), a tap on a spot removes it, back leaves heal mode first', (t) async {
+    testWidgets('heal mode: two taps add two spots (one undo step each), + adds even on a spot, − removes the spot under the finger, back leaves heal mode first', (t) async {
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult());
       await toPads(t, r);
@@ -349,8 +367,19 @@ void main() {
       await tapPhoto(t, by: const Offset(50, 40));
       expect(byId(r, 'pt-skin').spots, hasLength(2));
 
+      // + mode: a tap ADDS a spot, even on an existing one
       await tapPhoto(t, by: const Offset(50, 40));
-      expect(byId(r, 'pt-skin').spots, hasLength(1), reason: 'a tap on a spot removes it');
+      expect(byId(r, 'pt-skin').spots, hasLength(3), reason: '+ adds on an existing spot too');
+      r.app.undo(r.id);
+      expect(byId(r, 'pt-skin').spots, hasLength(2));
+
+      // − mode: a tap removes the spot under the finger, and does nothing elsewhere
+      expect(key('heal-add'), findsOneWidget);
+      await tapKey(t, 'heal-sub');
+      await tapPhoto(t, by: const Offset(-40, 60));
+      expect(byId(r, 'pt-skin').spots, hasLength(2), reason: '− on an empty place does nothing');
+      await tapPhoto(t, by: const Offset(50, 40));
+      expect(byId(r, 'pt-skin').spots, hasLength(1), reason: '− removes the spot under the finger');
       expect(byId(r, 'pt-skin').spots.single.x, closeTo(s0.x, 1e-9));
       expect(r.local.toEngineJson()!['v'], 2);
       expect(jsonEncode(r.local.toEngineJson()), contains('"spots":[['));
@@ -377,16 +406,17 @@ void main() {
   });
 
   group('对比', () {
-    testWidgets('holding 对比 hides every local area and the overlay; letting go restores', (t) async {
+    testWidgets('holding the photo compares: it hides every local area and the overlay; letting go restores', (t) async {
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult());
       await toPads(t, r);
       final eng = r.lc.ctl.engine;
       expect(eng.hideLocal, isFalse);
       expect(r.lc.comparing, isFalse);
-      final f = await Finger.down(t, t.getCenter(key('local-compare')));
-      await t.pump(const Duration(milliseconds: 50));
+      expect(key('local-compare'), findsNothing, reason: 'the header has no compare button any more');
+      final f = await holdPhoto(t);
       expect(r.lc.comparing, isTrue);
+      expect(find.text('无局部调整'), findsOneWidget, reason: 'the readout pill');
       expect(eng.hideLocal, isTrue);
       expect(r.lc.overlayOn.value, isFalse);
       expect(r.local.length, 7, reason: 'the edit itself is untouched');
@@ -396,6 +426,7 @@ void main() {
       expect(r.lc.comparing, isFalse);
       expect(eng.hideLocal, isFalse);
       expect(r.local.length, 7);
+      expect(byId(r, 'pt-skin').spots, isEmpty, reason: 'letting go of a compare adds and paints nothing');
       expect(t.takeException(), isNull);
     });
   });
@@ -479,10 +510,10 @@ void main() {
       expect(r.local.rasterPlanes, lessThanOrEqualTo(kMaxRasterComponents));
     });
 
-    testWidgets('right after opening 人像 the header has 对比 and 分项 and 肤质 has its heal tool', (t) async {
+    testWidgets('right after opening 人像 the header has 分项 (and no 对比) and 肤质 has its heal tool', (t) async {
       final fake = FakeLocalAi();
       await openPortrait(t, fake, portraitResult());
-      expect(key('local-compare'), findsOneWidget);
+      expect(key('local-compare'), findsNothing);
       expect(key('items-button'), findsOneWidget);
       expect(key('heal-mode'), findsOneWidget);
     });
@@ -532,9 +563,10 @@ void main() {
       expect(ids(r), first);
       expect(r.lc.selFaces, {1});
       // every chip off and on again
-      await tapKey(t, 'chip-undereye');
-      await tapKey(t, 'chip-undereye');
-      await tapKey(t, 'chip-undereye');
+      await tapKey(t, 'chip-undereye'); // select
+      await tapKey(t, 'chip-undereye'); // its action card
+      await tapKey(t, 'act-关掉');
+      await tapKey(t, 'chip-undereye'); // on again
       await tapKey(t, 'chip-light');
       final all = ids(r);
       expect(all.toSet(), hasLength(all.length), reason: 'never duplicated');
@@ -589,10 +621,10 @@ void main() {
           await tapKey(t, 'items-button');
           expect(key('local-radar-pt-skin'), findsOneWidget);
           expect(t.takeException(), isNull, reason: '分项');
-          await tapKey(t, 'items-button');
+          await tapKey(t, 'header-back');
 
-          final f = await Finger.down(t, t.getCenter(key('local-compare')));
-          await t.pump(const Duration(milliseconds: 50));
+          final f = await holdPhoto(t);
+          expect(r.lc.comparing, isTrue);
           expect(t.takeException(), isNull, reason: '对比');
           await f.up();
           await settle(t, 3);

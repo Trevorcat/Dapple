@@ -205,7 +205,7 @@ class _ReadoutOverlayState extends State<ReadoutOverlay> with SingleTickerProvid
         key: const ValueKey('original-pill'),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
         decoration: BoxDecoration(color: Fx.overlay60, borderRadius: BorderRadius.circular(14)),
-        child: Text('原片', style: T.body(Colors.white, w: FontWeight.w600)),
+        child: Text(r.compareText, style: T.body(Fx.onPhoto, w: FontWeight.w600)),
       );
     }
     return Container(

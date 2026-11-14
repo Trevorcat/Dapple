@@ -21,6 +21,10 @@ void main() {
         fake.finish(portraitResult());
         await settle(t, 4);
         await audShot(t, '11_portrait_chips_${s}_$th');
+        // U3: a second tap on the selected chip opens its actions (关掉 is there)
+        await tapKey(t, 'chip-skin');
+        await audShot(t, '16_portrait_chip_actions_${s}_$th');
+        await tapKey(t, 'header-back');
         r.lc!.showBody(LocalBody.pads);
         await settle(t, 3);
         await audShot(t, '12_portrait_skin_heal_${s}_$th');

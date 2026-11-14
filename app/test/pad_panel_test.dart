@@ -47,7 +47,7 @@ void main() {
   group('dock', () {
     testWidgets('five items; the first four are live glyphs (dot = pad position, bar = strength), 裁切 is an icon', (t) async {
       final (app, id) = await openFilm(t);
-      for (final l in ['光线', '颜色', '胶片', '质地', '裁切']) {
+      for (final l in ['光线', '颜色', '成像', '质地', '裁切']) {
         expect(find.text(l), findsWidgets, reason: l);
       }
       expect(find.byKey(const ValueKey('docked-panel')), findsNothing);
@@ -95,6 +95,8 @@ void main() {
       await t.tap(find.byKey(const ValueKey('stock-button')));
       await settle(t, 8);
       expect(t.getRect(find.byKey(const ValueKey('docked-panel'))).height, closeTo(h0, 0.5));
+      await t.tap(find.byKey(const ValueKey('header-back')));
+      await settle(t, 8);
       await t.tap(find.byKey(const ValueKey('items-button')));
       await settle(t, 8);
       final h1 = t.getRect(find.byKey(const ValueKey('docked-panel'))).height;
@@ -310,12 +312,21 @@ void main() {
       expect(find.byKey(const ValueKey('film-none')), findsOneWidget);
       // every catalog stock is a dot; without magnification only the selected one is named
       expect(find.byKey(const ValueKey('stock-kodak_ektar_100')), findsOneWidget);
-      expect(find.text('N400C'), findsNWidgets(2), reason: 'the button and the selected dot');
+      expect(t.widget<Text>(find.byKey(const ValueKey('header-sub'))).data, 'N400C', reason: 'the header names the chosen stock');
+      expect(find.text('N400C'), findsNWidgets(2), reason: 'the subtitle and the selected dot');
+      expect(find.byKey(const ValueKey('header-title')), findsOneWidget);
+      expect(t.widget<Text>(find.byKey(const ValueKey('header-title'))).data, '成像');
       expect(find.text('N100'), findsNothing);
       await dump(t, 'v3_film_map_idle');
+      await t.tap(find.byKey(const ValueKey('header-back')));
+      await settle(t, 6);
+      expect(find.byKey(const ValueKey('pad-film')), findsOneWidget, reason: 'the back chevron returns to the pad');
+      expect(find.byKey(const ValueKey('header-back')), findsNothing, reason: 'the pad is the first layer');
       await t.tap(find.byKey(const ValueKey('stock-button')));
       await settle(t, 6);
-      expect(find.byKey(const ValueKey('pad-film')), findsOneWidget, reason: 'the button toggles back to the pad');
+      expect(find.byKey(const ValueKey('film-map')), findsOneWidget, reason: 'the stock button only opens the map');
+      await t.tap(find.byKey(const ValueKey('header-back')));
+      await settle(t, 6);
     });
 
     testWidgets('pressing magnifies about 2.4x around the finger and names appear; sliding picks the nearest stock live; release keeps it', (t) async {
@@ -396,8 +407,12 @@ void main() {
       await settle(t, 3);
       expect(app.editOf(id).film, isNull);
       expect(app.editOf(id).values.containsKey('film_grain'), isFalse);
-      // nothing chosen: one button that says what it does, and no 无 (audit F44)
-      expect(find.descendant(of: find.byKey(const ValueKey('stock-button')), matching: find.text('选胶片')), findsOneWidget);
+      // nothing chosen: the subtitle says so and there is no 无 (audit F44); back to the pad: the stock button says what it does
+      expect(t.widget<Text>(find.byKey(const ValueKey('header-sub'))).data, '选成像');
+      expect(find.byKey(const ValueKey('film-none')), findsNothing);
+      await t.tap(find.byKey(const ValueKey('header-back')));
+      await settle(t, 6);
+      expect(find.descendant(of: find.byKey(const ValueKey('stock-button')), matching: find.text('选成像')), findsOneWidget);
       expect(find.byKey(const ValueKey('film-none')), findsNothing);
     });
 
@@ -518,7 +533,7 @@ void main() {
       final g = await Finger.down(t, Offset(cp.left + cp.width * 0.88, cp.top + cp.height * 0.8));
       await g.up();
       expect(app.editOf(id).value('cv_rgb_H'), lessThan(-40));
-      await t.tap(find.byKey(const ValueKey('items-button'))); // 返回
+      await t.tap(find.byKey(const ValueKey('header-back'))); // back from the editor to 分项
       await settle(t, 4);
       expect(find.byKey(const ValueKey('curve-pad')), findsNothing);
       expect(find.byKey(const ValueKey('radar')), findsOneWidget);
@@ -532,7 +547,7 @@ void main() {
       await t.tap(find.byKey(const ValueKey('band-3')));
       await settle(t, 3);
       _noHorizontalScroll(t);
-      await t.tap(find.byKey(const ValueKey('items-button')));
+      await t.tap(find.byKey(const ValueKey('header-back')));
       await settle(t, 4);
       await t.tap(find.byKey(const ValueKey('extra-分级')));
       await settle(t, 6);
@@ -706,6 +721,8 @@ void _noHorizontalScroll(WidgetTester t) {
   final panel = find.byKey(const ValueKey('docked-panel'));
   for (final e in find.descendant(of: panel, matching: find.byType(Scrollable)).evaluate()) {
     final s = (e.widget as Scrollable);
+    // the header's button row is a one-line safety valve against overflow (PanelHeader), not a scrolling picker
+    if (find.ancestor(of: find.byWidget(s), matching: find.byType(PanelHeader)).evaluate().isNotEmpty) continue;
     expect(s.axis, isNot(Axis.horizontal), reason: 'horizontal scrolling in the panel');
   }
   expect(find.descendant(of: panel, matching: find.byType(ListView)), findsNothing);

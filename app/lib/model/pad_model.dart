@@ -16,7 +16,7 @@ import 'params.dart';
 enum PadCat { light, color, film, texture }
 
 extension PadCatX on PadCat {
-  String get label => const {PadCat.light: '光线', PadCat.color: '颜色', PadCat.film: '胶片', PadCat.texture: '质地'}[this]!;
+  String get label => const {PadCat.light: '光线', PadCat.color: '颜色', PadCat.film: '成像', PadCat.texture: '质地'}[this]!;
 
   /// The editor's category (window manager / deep link / sync) this pad category lives under.
   EGroup get group => const {PadCat.light: EGroup.light, PadCat.color: EGroup.color, PadCat.film: EGroup.style, PadCat.texture: EGroup.effects}[this]!;
@@ -124,7 +124,7 @@ List<PadItem> padItems(PadCat cat, {bool printed = true, bool modern = false}) {
       return [
         _s('film_shoot', '拍摄曝光', _sg100, step: 0.01),
         _s('film_print', '冲印深浅', _sg100, step: 0.01),
-        _s('film_strength', '胶片强度', _pct),
+        _s('film_strength', '强度', _pct),
         _s('film_grain', '颗粒', _pct),
         _s('film_halation', '光晕', _pct),
         _s('film_black', '黑位', _sg100, step: 0.01),
@@ -455,8 +455,33 @@ class PadLimits {
 // ------------------------------------------------------------------------------------------------ readouts
 
 /// The line in the panel header: strength, then the two directions.
-String padReadout(PadCat cat, PadState s) {
+String padReadout(PadCat cat, PadState s, {PadCtx ctx = const PadCtx()}) {
   final w = cat.edgeWords;
   String dir(double v, String neg, String pos) => v == 0 ? '' : ' · ${v > 0 ? pos : neg} ${(v.abs() * 100).round()}';
-  return '强度 ${(s.a * 200).round()}%${dir(s.x, w[0], w[1])}${dir(s.y, w[2], w[3])}';
+  return '${stripReadout(stripPercent(cat, s.a, ctx: ctx))}${dir(s.x, w[0], w[1])}${dir(s.y, w[2], w[3])}';
 }
+
+/// The strength strip, one meaning everywhere (guidelines 15.1-5, audit U1): the bottom is no effect, the middle is the amount Dapple
+/// recommends and reads 100 %, the top is the most this control gives, read as its real percentage of the recommended amount. The
+/// strip's mapping to the parameters is unchanged (saved edits look the same); only what it reads changed:
+///  光线  middle = the user's default tone strength (settings, 60 unless changed), top = tone strength 100: 100 / default (167 %);
+///  颜色  middle = style strength 100; the upper half adds vividness and saturation on top: 200 % at the top;
+///  成像  middle = the full film effect (film strength 100); the upper half grows grain and halation to their range maxima (2x) and
+///        lifts the black: 200 % at the top;
+///  质地  middle = the default sharpening and noise reduction, top = 1.8x of them: 180 %.
+double stripPercent(PadCat cat, double a, {PadCtx ctx = const PadCtx()}) {
+  final t = a.clamp(0.0, 1.0);
+  switch (cat) {
+    case PadCat.light:
+      final def = ctx.defaultTone;
+      return def <= 0 ? t * 200 : toneStrengthOf(t, def) / def * 100;
+    case PadCat.color:
+    case PadCat.film:
+      return t * 200;
+    case PadCat.texture:
+      return (t <= 0.5 ? t * 2 : 1 + (t * 2 - 1) * 0.8) * 100;
+  }
+}
+
+/// The header readout and the strip's screen-reader value: the same words (guidelines 12.3).
+String stripReadout(double percent) => '强度 ${percent.round()}%';

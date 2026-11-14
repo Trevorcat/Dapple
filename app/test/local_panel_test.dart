@@ -50,6 +50,8 @@ Future<Rig> openLocal(WidgetTester t,
 Finder key(String k) => find.byKey(ValueKey(k));
 
 Future<void> tapKey(WidgetTester t, String k) async {
+  // a short side pane scrolls the shape card and the portrait chips rather than shrinking their 56 dp tiles (U7)
+  if (k.startsWith('kind-') || k.startsWith('face-') || k.startsWith('chip-')) await t.ensureVisible(key(k));
   await t.tap(key(k));
   await settle(t, 4);
 }
@@ -130,7 +132,7 @@ void main() {
       expect(key('brush-size-0'), findsOneWidget);
       await tapKey(t, 'brush-size-3');
       expect(r.lc.brushSize, 3);
-      await tapKey(t, 'brush-erase');
+      await tapKey(t, 'brush-sub');
       expect(r.lc.erase, isTrue);
       await tapKey(t, 'local-add');
       await addViaCard(t, 'luminance');
@@ -251,7 +253,7 @@ void main() {
       final r = await openLocal(t);
       await tapKey(t, 'local-add');
       await addViaCard(t, 'brush');
-      await tapKey(t, 'brush-erase');
+      await tapKey(t, 'brush-sub');
       final fr = frameRect(t);
       final g = await t.startGesture(fr.center);
       for (var i = 0; i < 8; i++) {
@@ -434,7 +436,7 @@ void main() {
       );
       await settle(t, 4);
       await r.lc.addArea(kindById('brush'));
-      expect(r.app.toast?.message, '画笔最多 $kMaxBrushComponents 个');
+      expect(r.app.toast?.message, '画笔最多 $kMaxBrushComponents 块');
       expect(r.local.length, kMaxBrushComponents);
     });
   });
@@ -463,7 +465,7 @@ void main() {
           expect(t.takeException(), isNull, reason: 'items');
           await tapKey(t, 'local-group-detail');
           expect(t.takeException(), isNull, reason: 'items detail');
-          await tapKey(t, 'items-button');
+          await tapKey(t, 'header-back');
           await tapKey(t, 'local-add');
           await addViaCard(t, 'brush');
           expect(key('local-tools'), findsOneWidget);

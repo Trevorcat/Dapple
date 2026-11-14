@@ -15,6 +15,7 @@ import '../native/dapple_session.dart';
 import 'adaptive_quality.dart';
 import 'edit_interaction.dart';
 import 'gpu_view_backend.dart';
+import 'memory_policy.dart';
 import 'perf_probe.dart';
 import 'session_cache.dart';
 
@@ -112,6 +113,7 @@ class EditorEngine extends ChangeNotifier {
   EditorEngine(this.app) {
     EditInteraction.depth.addListener(_onInteractionDepth);
     PerfProbe.start();
+    MemoryPolicy.editorOpened(); // memory (pipeline-architecture.md 42.9): a release pending for a closed editor is called off
   }
   final AppState app;
 
@@ -1026,6 +1028,7 @@ class EditorEngine extends ChangeNotifier {
     _detailTimer?.cancel();
     _tileDebounce?.cancel();
     _disposeImages();
+    MemoryPolicy.editorClosed(); // after the thumbnail commit: the sessions close and the engine trims its caches (42.9)
     super.dispose();
   }
 }

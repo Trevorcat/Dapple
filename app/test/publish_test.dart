@@ -117,6 +117,10 @@ Future<void> step(WidgetTester t) async {
   await t.pump(const Duration(milliseconds: 400));
 }
 
+int segIndex(WidgetTester t) => (t.widget(find.byKey(const ValueKey('seg-ratio'))) as DSegmented).index;
+bool locOn(WidgetTester t) => (t.widget(find.byKey(const ValueKey('switch-loc'))) as DSwitch).value;
+bool csOn(WidgetTester t) => (t.widget(find.byKey(const ValueKey('switch-cs'))) as DSwitch).value;
+
 String valueOf(WidgetTester t, String key) => (t.widget(find.byKey(ValueKey('$key-value'))) as Text).data!;
 
 void main() {
@@ -130,12 +134,12 @@ void main() {
     final app = AppState.demo();
     await open(tester, app, idsOf(app, 2));
     expect(find.text('发布 2 张'), findsOneWidget);
-    expect(valueOf(tester, 'row-ratio'), '原比例');
+    expect(find.byKey(const ValueKey('seg-ratio')), findsOneWidget);
     expect(valueOf(tester, 'row-size'), '适合社交平台');
     await shot(tester, 'publish_phone');
     await tester.tap(find.byKey(const ValueKey('preset-xhs')));
     await tester.pump();
-    expect(valueOf(tester, 'row-ratio'), '3:4');
+    expect(find.byKey(const ValueKey('seg-ratio')), findsOneWidget);
     expect(valueOf(tester, 'row-size'), '适合社交平台');
     await tester.tap(find.byKey(const ValueKey('row-size')));
     await tester.pump();
@@ -144,12 +148,13 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 400));
     expect(valueOf(tester, 'row-size'), '原图大小');
-    await tester.tap(find.byKey(const ValueKey('row-ratio')));
+    expect(segIndex(tester), 0);
+    await tester.tap(find.text('原比例'));
     await tester.pump();
-    expect(valueOf(tester, 'row-ratio'), '原比例');
+    expect(segIndex(tester), 1);
     await tester.tap(find.byKey(const ValueKey('row-loc')));
     await tester.pump();
-    expect(valueOf(tester, 'row-loc'), '保留');
+    expect(locOn(tester), isFalse);
     await tester.tap(find.byKey(const ValueKey('preset-xhs')));
     await tester.pump();
     await shot(tester, 'publish_phone_xhs');
@@ -262,7 +267,7 @@ void main() {
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-cs')), findsNothing);
-    expect(find.text('颜色'), findsNothing);
+    expect(find.byKey(const ValueKey('switch-cs')), findsNothing);
   });
 
   testWidgets('colour space option (颜色): 标准 (sRGB) by default, no explanation, tap switches to 更鲜艳 (P3) and reaches the export', (tester) async {
@@ -270,12 +275,13 @@ void main() {
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-cs')), findsOneWidget);
-    expect((tester.widget(find.byKey(const ValueKey('row-cs-value'))) as Text).data, '标准');
+    expect(csOn(tester), isFalse);
+    expect(find.text('颜色更鲜艳'), findsOneWidget);
     expect(find.byKey(const ValueKey('row-cs-sub')), findsNothing);
     await shot(tester, 'publish_phone_p3');
     await tester.tap(find.byKey(const ValueKey('row-cs')));
     await tester.pump();
-    expect((tester.widget(find.byKey(const ValueKey('row-cs-value'))) as Text).data, '更鲜艳');
+    expect(csOn(tester), isTrue);
     await tester.tap(find.byKey(const ValueKey('publish-share')));
     await step(tester);
     await tester.tap(find.byKey(const ValueKey('handoff-system')));
@@ -291,7 +297,7 @@ void main() {
   testWidgets('去除位置信息 reaches the export call (share and gallery paths)', (tester) async {
     final app = _SpyApp();
     await open(tester, app, idsOf(app, 2));
-    expect(valueOf(tester, 'row-loc'), '已去除'); // the setting's default: strip
+    expect(locOn(tester), isTrue); // the setting's default: strip
     await tester.tap(find.byKey(const ValueKey('publish-share')));
     await step(tester);
     await tester.tap(find.byKey(const ValueKey('handoff-system')));
@@ -303,7 +309,7 @@ void main() {
     await step(tester);
     await tester.tap(find.byKey(const ValueKey('row-loc')));
     await tester.pump();
-    expect(valueOf(tester, 'row-loc'), '保留');
+    expect(locOn(tester), isFalse);
     await tester.tap(find.byKey(const ValueKey('publish-share')));
     await step(tester);
     await tester.tap(find.byKey(const ValueKey('handoff-system')));
@@ -327,6 +333,39 @@ void main() {
     final a = jsonDecode(AppState.exportMetaJson(original: '/a/b.heic', stripLocation: true)) as Map;
     expect(a, {'metaSource': '/a/b.heic', 'stripLocation': true, 'colorSpace': 'srgb'});
     expect((jsonDecode(AppState.exportMetaJson(original: 'x', stripLocation: false)) as Map)['stripLocation'], isFalse);
+  });
+
+  testWidgets('no row cycles: <= 3 ratios give a segmented control, tapping a segment picks it', (tester) async {
+    final app = AppState.demo();
+    await open(tester, app, idsOf(app, 2));
+    await tester.tap(find.byKey(const ValueKey('preset-ig')));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('seg-ratio')), findsOneWidget);
+    expect(segIndex(tester), 0);
+    await tester.tap(find.byKey(const ValueKey('row-ratio'))); // the row itself does nothing
+    await tester.pump();
+    expect(segIndex(tester), 0);
+    await tester.tap(find.text('1:1'));
+    await tester.pump();
+    expect(segIndex(tester), 1);
+  });
+
+  testWidgets('more than 3 ratios: the row opens a sheet with radio rows', (tester) async {
+    const four = Preset('four', '四种', '', null, 'orig', ['orig', '1:1', '4:5', '3:4'], null, null);
+    final app = AppState.demo();
+    await open(tester, app, idsOf(app, 1));
+    final st = tester.state(find.byType(PublishPage)) as dynamic;
+    st.debugSetPresetForTest(four);
+    await tester.pump();
+    expect(find.byKey(const ValueKey('seg-ratio')), findsNothing);
+    expect(valueOf(tester, 'row-ratio'), '原比例');
+    await tester.tap(find.byKey(const ValueKey('row-ratio')));
+    await step(tester);
+    expect(find.byKey(const ValueKey('ratio-4:5')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('ratio-4:5')));
+    await step(tester);
+    expect(find.byKey(const ValueKey('ratio-4:5')), findsNothing);
+    expect(valueOf(tester, 'row-ratio'), '4:5');
   });
 
   test('platform presets: ids, open-app data, Instagram limits', () {

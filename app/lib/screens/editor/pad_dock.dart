@@ -15,6 +15,7 @@ import 'editor_controller.dart';
 import 'editor_overlays.dart' show GlassCapsule;
 import 'local_panel.dart' show LocalDockGlyphPainter;
 import '../../model/local_kinds.dart';
+import '../../model/local_pad.dart' show localStripPercent, localUiOf;
 import 'pad_widgets.dart';
 
 /// The dock's categories, in order.
@@ -148,14 +149,14 @@ class _DockItemState extends State<DockItem> {
                 child: CustomPaint(
                     key: const ValueKey('glyph-local'),
                     painter: LocalDockGlyphPainter(la == null || la.mask.isEmpty ? LocalGlyph.radial : kindOfComponent(la.mask.first).glyph, areas.length, fg,
-                        ink: c.surface, textScale: MediaQuery.textScalerOf(context).scale(11) / 11, base: DefaultTextStyle.of(context).style))))
+                        ink: c.surface, textScale: MediaQuery.textScalerOf(context).scale(11) / 11, base: DefaultTextStyle.of(context).style, strength: la == null ? null : localUiOf(la).a))))
         : pc == null
         ? DIcon(DI.crop, size: 24, color: fg, stroke: 1.9)
         : Opacity(opacity: dim ? 0.38 : 1, child: SizedBox(width: 34, height: 26, child: CustomPaint(key: ValueKey('glyph-${pc.name}'), painter: GlyphPainter(s.x, s.y, s.a, pc == PadCat.film, fg))));
     return Semantics(
       selected: on,
       button: true,
-      label: local ? '$label${areas.isEmpty ? '' : '，${areas.length} 个区域'}' : (pc == null ? label : '$label，${padReadout(pc, s)}${adjusted ? '，已调整' : ''}，按住拖动直接调整'),
+      label: local ? '$label${areas.isEmpty ? '' : '，${areas.length} 个区域'}${la == null ? '' : '，强度 ${localStripPercent(la, localUiOf(la).a).round()}%'}' : (pc == null ? label : '$label，${padReadout(pc, s, ctx: ctl.padCtx)}${adjusted ? '，已调整' : ''}，按住拖动直接调整'),
       excludeSemantics: true,
       onTap: () => ctl.openCategory(g),
       child: Listener(
