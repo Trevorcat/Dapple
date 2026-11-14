@@ -130,6 +130,24 @@ inline std::size_t physical() {
 #endif
 }
 
+// The device's memory class as the app reports it at start-up (dapple_memory_configure; Android: ActivityManager.MemoryInfo.totalMem,
+// getMemoryClass / getLargeMemoryClass, isLowRamDevice). Zero / false = not configured: physical() and no low-RAM flag are used. Read by the
+// export budget (pipeline-architecture.md 42.9) and the cache budgets. Lock-free: written once at configure time, read anywhere.
+struct DeviceClass {
+  std::atomic<std::size_t> totalBytes{0};
+  std::atomic<int> memoryClassMb{0}, largeMemoryClassMb{0};
+  std::atomic<bool> lowRam{false};
+};
+inline DeviceClass& deviceClass() {
+  static DeviceClass d;
+  return d;
+}
+// Total memory of the device: what the app reported, else physical().
+inline std::size_t deviceTotal() {
+  const std::size_t t = deviceClass().totalBytes.load(std::memory_order_relaxed);
+  return t ? t : physical();
+}
+
 // Samples footprint() every millisecond on its own thread while alive. stage() labels what follows; peaks are kept per label (in order of
 // first use). Thread-safe; the sampling loop allocates nothing.
 class Sampler {

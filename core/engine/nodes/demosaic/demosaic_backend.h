@@ -19,6 +19,9 @@ class GpuBackend {
   virtual bool prefer(const Desc& d, Rect roi, std::string& why) { (void)d, (void)roi, (void)why; return true; }
   // Demosaic `roi` into out (interleaved float RGB). False = failed / unavailable: the caller falls back to the CPU node.
   virtual bool run(const Desc& d, Rect roi, float* out, std::size_t strideFloats, std::string& why) = 0;
+  // Memory (pipeline-architecture.md 42.9): gives the backend's device and its tile buffers back (created again on the next run). Waits for a run in
+  // flight. True when something was released.
+  virtual bool trim() { return false; }
 };
 
 void setGpuBackend(GpuBackend* b);

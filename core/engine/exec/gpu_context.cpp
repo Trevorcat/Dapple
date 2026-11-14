@@ -802,6 +802,33 @@ class ProviderImpl final : public GpuProvider {
     std::shared_ptr<Context> c = context(nullptr);
     return c ? c->pooledBytes() : 0;
   }
+  std::size_t trimPool(std::size_t keepFree) override {
+    std::shared_ptr<Context> c = peek();
+    if (!c || c->deviceLost()) return 0;
+    std::lock_guard<std::mutex> lk(c->mutex());  // the executors hold it for a whole frame: the pool is not in use while we hold it
+    const std::size_t before = c->pooledBytes();
+    c->core().pool().trim(keepFree);
+    c->core().dev().trim();
+    return before - std::min(before, c->pooledBytes());
+  }
+  bool memoryInfo(MemoryInfo* out) override {
+    std::shared_ptr<Context> c = peek();
+    if (!c || !out) return false;
+    const hal::Device& d = c->core().dev();
+    out->unified = d.caps().unifiedMemory;
+    out->deviceLocal = d.caps().deviceLocalBytes;
+    out->poolBudget = d.poolBudget();
+    out->pooled = c->pooledBytes();
+    out->budget = out->usage = 0;
+    std::uint64_t b = 0, u = 0;
+    if (d.memoryBudget(&b, &u)) out->budget = b, out->usage = u;
+    return true;
+  }
+  // the active context without creating one (a memory query must not start a device)
+  std::shared_ptr<Context> peek() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return broken_.load() ? nullptr : ctx_;
+  }
   bool nativeHandles(hal::NativeHandles* out) override {
     std::shared_ptr<Context> c = context(nullptr);
     return c && c->nativeHandles(out);

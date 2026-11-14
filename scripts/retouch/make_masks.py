@@ -183,6 +183,7 @@ def process(name):
                 info['teeth'] = True; save(d, f'f{n}_teeth.png', teeth)
             r = 0.01 * fw
             mouth = p8(poly_plane(w, h, [[tuple(p) for p in xy[LIPS_I]]], max(0.5, 0.004 * fw)))  # the open mouth (teeth, tongue) is not skin
+            if mopen >= MOUTH_OPEN: save(d, f'f{n}_mouth.png', poly_plane(w, h, [[tuple(p) for p in xy[LIPS_I]]], sM))  # app/engine 'mouth' plane (sigma 0.008 x face width)
             excl = 1 - (1 - grow(eyes, r)) * (1 - grow(brows, r)) * (1 - grow(lips, r)) * (1 - grow(mouth, r))
             skin = fskin * face * (1 - excl)
             for nm, a in (('eyes', eyes), ('iris', iris), ('sclera', sclera), ('lips', lips), ('brows', brows), ('undereye', ue), ('skin', skin)): save(d, f'f{n}_{nm}.png', a)

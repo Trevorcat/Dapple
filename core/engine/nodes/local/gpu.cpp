@@ -149,7 +149,8 @@ H recordRetouch(GpuRecorder& r, const LocalDetailNode& n, H D, bool last) {
   }
   const H ab = r.blur(2, 2, ab0, lw, lh, {R.rc, R.rc, R.rc, R.rc}, 1, 0, kF32);
   const H sref = r.blur(2, 2, s4, lw, lh, {R.rs, R.rs, R.rs, R.rs}, 2, 0, kF32);
-  if (ab < 0 || sref < 0) return -1;
+  const H sblot = r.blur(2, 2, s4, lw, lh, {R.rb, R.rb, R.rb, R.rb}, 2, 0, kF32);  // the blotch-scale colour mean
+  if (ab < 0 || sref < 0 || sblot < 0) return -1;
   const hal::PipelineH p = r.pl("local_retouch", {{10, last ? 1 : 0}, {11, last && n.ep.grain ? 1 : 0}});
   if (!p) return -1;
   const H out = last ? -1 : r.tr(kF16, n.W, n.Hh);
@@ -159,7 +160,7 @@ H recordRetouch(GpuRecorder& r, const LocalDetailNode& n, H D, bool last) {
   u.grain[0] = n.ep.amp, u.grain[1] = n.ep.period;
   for (int k = 0; k < 4; ++k) u.ch[k] = ch[k], u.ch2[k] = ch2[k];
   r.g.dispatch("local_retouch", p,
-               {GpuGraph::R(D), GpuGraph::R(n.aux0), GpuGraph::R(n.aux1), GpuGraph::R(lf), GpuGraph::R(ab), GpuGraph::R(sref),
+               {GpuGraph::R(D), GpuGraph::R(n.aux0), GpuGraph::R(n.aux1), GpuGraph::R(lf), GpuGraph::R(ab), GpuGraph::R(sref), GpuGraph::R(sblot),
                 out >= 0 ? GpuGraph::W(out) : GpuGraph::R(r.dummy(kF16)), last ? GpuGraph::W(n.ep.out8) : GpuGraph::R(r.dummy(kU8))},
                r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
   return last ? D : out;

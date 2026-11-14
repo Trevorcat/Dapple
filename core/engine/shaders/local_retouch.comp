@@ -20,8 +20,9 @@ layout(binding = 3) uniform sampler2D uAux1;
 layout(binding = 4) uniform sampler2D uLf;
 layout(binding = 5) uniform sampler2D uAb;
 layout(binding = 6) uniform sampler2D uS;
-layout(binding = 7, rgba16f) uniform writeonly image2D uOut;
-layout(binding = 8, rgba8) uniform writeonly image2D uOut8;
+layout(binding = 7) uniform sampler2D uB;
+layout(binding = 8, rgba16f) uniform writeonly image2D uOut;
+layout(binding = 9, rgba8) uniform writeonly image2D uOut8;
 
 float chan(int c, vec4 a0, vec4 a1) { return c < 0 ? 0.0 : c < 4 ? a0[c] : a1[c - 4]; }
 float rss(float e0, float e1, float x) {
@@ -50,53 +51,57 @@ void main() {
     const float Lf = texelFetch(uLf, p, 0).r;
     const vec2 ab = grid(uAb, p).xy;
     const float Lc = ab.x * Lf + ab.y;
-    const vec4 S = grid(uS, p);
+    const vec4 S = grid(uS, p), B = grid(uB, p);
     const float Y = lumaOf(c);
-    float cr = c.r - Y, cb = c.b - Y;
-    float rY = Lf, rCr = cr, rCb = cb;
+    const float Yd = max(Y, 0.05);
+    float qr = (c.r - Y) / Yd, qb = (c.b - Y) / Yd;
+    float rY = Lf, rqr = qr, rqb = qb, bqr = qr, bqb = qb;
     if (S.w > 1e-6) {
       rY = S.x / S.w;
-      rCr = S.y / S.w;
-      rCb = S.z / S.w;
+      rqr = S.y / S.w;
+      rqb = S.z / S.w;
     }
+    if (B.w > 1e-6) {
+      bqr = B.y / B.w;
+      bqb = B.z / B.w;
+    }
+    const float dr = bqr - rqr, db = bqb - rqb;
+    const float rs = max(sqrt(rqr * rqr + rqb * rqb), 0.05);
+    const float far = 1.0 - rss(0.6, 1.2, sqrt((qr - rqr) * (qr - rqr) + (qb - rqb) * (qb - rqb)) / rs);
     const float M = Lf - Lc;
     const float g = 1.0 / (1.0 + (M * 12.5) * (M * 12.5));
     float dY = -min(0.92, 0.9 * ks + 0.4 * ke) * g * M;
     if (ku > 0.0) {
       const float d = rY - (Lf + dY);
       dY += 0.8 * ku * clamp(d, 0.0, 0.25) * rss(0.0, 0.03, d);
+      qr -= 0.8 * ku * dr;
+      qb -= 0.8 * ku * db;
     }
-    float sg = 0.0;
     if (kh > 0.0) {
-      const float e = Lf + dY - rY;
-      const float chp = sqrt(cr * cr + cb * cb), chr = sqrt(rCr * rCr + rCb * rCb);
-      sg = rss(0.01, 0.12, e) * (1.0 - 0.6 * rss(0.6, 1.3, chp / max(chr, 0.01)));
-      dY -= 0.5 * kh * sg * max(e, 0.0);
+      const float e = Lf + dY - rY, x = max(e - 0.05, 0.0);
+      const float pale = 1.0 - rss(0.5, 0.9, sqrt(bqr * bqr + bqb * bqb) / rs);
+      dY -= 0.6 * kh * (0.4 + 0.6 * pale) * x * x / (x + 0.08);
+      const float t = 0.8 * kh * pale * rss(0.05, 0.15, e);
+      qr += (rqr - qr) * t;
+      qb += (rqb - qb) * t;
     }
-    const float far = 1.0 - rss(0.08, 0.16, sqrt((cr - rCr) * (cr - rCr) + (cb - rCb) * (cb - rCb)));
-    if (ke > 0.0) {
-      const float t = 0.65 * ke * far;
-      cr += (rCr - cr) * t;
-      cb += (rCb - cb) * t;
+    const float te = ke > 0.0 ? 0.75 * ke * far : 0.0;
+    const float tr = kr > 0.0 ? min(1.0, 1.5 * kr * far * max(0.0, 1.0 - 0.15 / max((0.95 * dr + 0.31 * db) / rs, 1e-3))) : 0.0;
+    if (te + tr > 0.0) {
+      const float ur = rqr / rs, ub = rqb / rs, dRad = dr * ur + db * ub;
+      const float tanR = dr - dRad * ur, tanB = db - dRad * ub;
+      const float tt = min(te + tr, 1.0), trad = min(0.3 * te + tr, 1.0);
+      const float m0 = sqrt(qr * qr + qb * qb);
+      qr -= tt * tanR + trad * dRad * ur;
+      qb -= tt * tanB + trad * dRad * ub;
+      const float m1 = sqrt(qr * qr + qb * qb), m = max(m0 - trad * dRad, 0.0);
+      if (m1 > 1e-4) {
+        qr *= m / m1;
+        qb *= m / m1;
+      }
     }
-    if (kr > 0.0) {
-      const float dr = cr - rCr, db = cb - rCb;
-      const float t = 0.75 * kr * far * rss(0.008, 0.04, 0.95 * dr + 0.31 * db);
-      cr -= t * dr;
-      cb -= t * db;
-    }
-    if (ku > 0.0) {
-      const float t = 0.7 * ku * far;
-      cr += (rCr - cr) * t;
-      cb += (rCb - cb) * t;
-    }
-    const float Y2 = Y + dY;
-    if (kh > 0.0) {
-      const float t = 0.8 * kh * sg, s = clamp(Y2 / max(rY, 0.02), 0.5, 1.5);
-      cr += (rCr * s - cr) * t;
-      cb += (rCb * s - cb) * t;
-    }
-    float r = Y2 + cr, b = Y2 + cb;
+    const float Y2 = Y + dY, Y2d = Y >= 0.05 ? max(Y2, 0.0) : Yd;
+    float r = Y2 + qr * Y2d, b = Y2 + qb * Y2d;
     float gg = (Y2 - kLuma.r * r - kLuma.b * b) / kLuma.g;
     if (kl > 0.0) {
       const float G = 1.0 + 0.45 * kl * (1.0 - rss(0.15, 0.75, Lc)), sc = sqrt(G);

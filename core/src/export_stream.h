@@ -29,10 +29,40 @@ namespace dapple::xstream {
 enum class Mode { Off, On, Auto };
 Mode envMode();
 
-// Bytes an export may still allocate on this device: the process's own headroom where the OS reports it (iOS os_proc_available_memory), else a
-// conservative share of the memory available to the system (Android / Linux MemAvailable * 0.5, desktop * 0.5), minus a reserve for the app.
-// DAPPLE_EXPORT_BUDGET_MB overrides (tests).
+// ---- the export memory policy (pipeline-architecture.md 42.9) ----
+// budget = min(share, ceiling, room):
+//   share    what the OS says is free: iOS os_proc_available_memory x 0.6 (this process's own jetsam headroom), Android / desktop MemAvailable
+//            (available physical memory) x 0.5, minus 96 MB for the app's own growth; when the query fails a quarter of the device minus half
+//            of what the process holds, clamped to [256 MB, 1 GB]
+//   ceiling  phones only, independent of what is free right now: what one export may add on top of the app = min(total / 4, 1.5 GB)
+//            (low-RAM devices: min(total / 8, 384 MB)). MemAvailable on a 12 GB phone says 5 GB, but lmkd and the GPU driver do not let one app
+//            take 4 GB reliably (Note10+: a 3.9 GB whole-frame film export, 4 failed vkAllocateMemory)
+//   room     Android only: the whole process stays under 35 % of the device (low-RAM 25 %): that cap minus the current footprint
+// The band row cache (42.8) gets at most min(budget - machinery, budget / 2) and, on phones, at most 256 MB (low-RAM 96 MB).
+// DAPPLE_EXPORT_BUDGET_MB overrides the whole rule (tests); DAPPLE_EXPORT_DEVICE_MB=<total> applies the phone rule (Android variant) on any
+// platform with that device size (tests, desktop emulation).
+struct BudgetInputs {
+  std::size_t available = 0;  // OS figure, 0 = unknown
+  std::size_t total = 0;      // device memory
+  std::size_t footprint = 0;  // what the process holds now
+  bool lowRam = false;
+  int platform = 0;  // 0 desktop, 1 Android, 2 iOS
+};
+struct Budget {
+  std::size_t bytes = 0;  // what an export may still add
+  std::size_t share = 0, ceiling = 0, room = 0;  // the terms (ceiling / room = SIZE_MAX where they do not apply)
+  std::size_t rowCacheCap = 0;                   // SIZE_MAX = only the budget limits the row cache
+  std::string how;                               // log text: "available memory 5455 MB x 0.5 - 96 = 2631, ceiling 1536, room 2465 -> 1536 MB"
+};
+Budget computeBudget(const BudgetInputs& in);
+BudgetInputs currentInputs();  // this device now
+Budget currentBudget();
+// Bytes an export may still allocate on this device (currentBudget().bytes); `how` = the rule's terms for the log. DAPPLE_EXPORT_BUDGET_MB overrides.
 std::size_t budgetBytes(std::string* how = nullptr);
+// Extra bytes per pixel of a whole-frame export when the GPU executor renders it on unified memory (phones: the GPU's images come out of the same
+// RAM): the resident RGBA16F source (8 B/px, shared with what the CPU path drops: ~2 B/px net) and, with a film stock, the frame-sized film images
+// (~24 B/px; M1 Metal vs CPU: 26 MP +643 MB, 40 MP +936 MB); plus the executor pool (<= 320 MB at tile 1024).
+std::size_t predictGpuExtra(int W, int H, bool film, std::size_t poolBytes);
 // Releases what an export can do without before the budget is taken: the cached mosaics / pictures of other photos, the frame-sized film
 // workspaces of earlier renders. Bytes released (what the process may then reuse; the OS footprint drops when the allocator returns them).
 std::size_t trimForExport(const std::uint64_t keepMosaic[2]);
@@ -43,7 +73,7 @@ std::size_t predictWholePeak(int W, int H, bool film);
 // ~30 B/px measured on a 12 MP linear DNG).
 std::size_t predictWholeDecodePeak(int W, int H);
 // At a FULL open: open lazily (keep the mosaic, no float picture)? `why` says on what grounds (log line).
-bool openLazy(int W, int H, std::string* why = nullptr);
+bool openLazy(int W, int H, std::string* why = nullptr, std::size_t extraBytes = 0, bool film = false);  // extraBytes: what the GPU adds (predictGpuExtra); film: the edit is known (dapple_export_intent) and has a stock
 
 // The oriented, cropped full-resolution picture of a cached mosaic, read in windows: the same Demosaic node the full decode would run (pinned for
 // the whole picture), then the shadow-chroma floor when the picture-wide decision says so. One window is kept (valid until the next call).

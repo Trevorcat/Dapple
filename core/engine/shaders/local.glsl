@@ -57,7 +57,18 @@ float lcomp(int ci, vec2 uv, vec2 xy, vec3 lin, vec3 src, inout bool rangeDone, 
       rng = lrange(lin);
       rangeDone = true;
     }
-    if (kind == 2) return lss(p0.x - p0.z, p0.x, rng.x) * (1.0 - lss(p0.y, p0.y + p0.z, rng.x));
+    if (kind == 2) {
+      float Lc = rng.x;
+      const int pw2 = int(pd.x);
+      if (pw2 > 0) {  // spatial coherence (section 40.10): L* of the edge-aware smoothed luminance, the pixel's own gain kept
+        const int off2 = int(h.w) * 4096 + int(pd.w), ph2 = int(pd.y);
+        const float ys = max(dot(src, kLumaPP), 1e-6), yl = max(dot(lin, kLumaPP), 0.0);
+        const float ls = log2(ys);
+        const float Y = clamp(yl * exp2(lplane(off2, pw2, ph2, 2, 0, uv) * ls + lplane(off2, pw2, ph2, 2, 1, uv) - ls), 0.0, 1.0);
+        Lc = Y > 0.008856 ? 1.16 * lcbrt(Y) - 0.16 : 9.033 * Y;
+      }
+      return lss(p0.x - p0.z, p0.x, Lc) * (1.0 - lss(p0.y, p0.y + p0.z, Lc));
+    }
     float dh = abs(rng.y - p0.x);
     dh = min(dh, 360.0 - dh);
     return (1.0 - lss(p0.y, p0.y + p0.z, dh)) * lss(0.5 * p0.w, p0.w + 0.005, rng.z);

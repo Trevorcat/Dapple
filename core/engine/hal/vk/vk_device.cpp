@@ -181,6 +181,20 @@ class VkDev final : public Device {
   void trim() override;
   double splitGroups() const override { return splitGroups_; }
   std::size_t poolBudget() const override { return budget_; }
+  bool memoryBudget(std::uint64_t* budget, std::uint64_t* usage) const override {
+    if (!memBudgetExt_ || !vkGetPhysicalDeviceMemoryProperties2) return false;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    mp.pNext = &mb;
+    vkGetPhysicalDeviceMemoryProperties2(phys_, &mp);
+    std::uint64_t b = 0, u = 0;
+    for (std::uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; ++i)
+      if (mp.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) b += mb.heapBudget[i], u += mb.heapUsage[i];
+    if (b == 0) return false;
+    if (budget) *budget = b;
+    if (usage) *usage = u;
+    return true;
+  }
 
  private:
   friend class VkCmd;
@@ -223,7 +237,7 @@ class VkDev final : public Device {
   Slot slots_[kSlots];
   int nextSlot_ = 0, pinned_ = -1;
   std::uint64_t nextId_ = 1;
-  bool lost_ = false, swapchain_ = false;
+  bool lost_ = false, swapchain_ = false, memBudgetExt_ = false;
   double gpuAccum_ = 0;
   double splitGroups_ = 250000;
   std::size_t budget_ = 0;
@@ -432,6 +446,19 @@ bool VkDev::init(const DeviceOptions& opt, std::string& err) {
       if (!std::strcmp(x.extensionName, "VK_KHR_swapchain")) devExt.push_back("VK_KHR_swapchain");
     swapchain_ = !devExt.empty();
     caps_.surfacePresent = swapchain_;
+  }
+  {  // VK_EXT_memory_budget (Vulkan 1.1 query): what the driver lets this process still allocate, for the export memory policy
+    std::uint32_t en = 0;
+    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &en, nullptr);
+    std::vector<VkExtensionProperties> ex(en);
+    vkEnumerateDeviceExtensionProperties(phys_, nullptr, &en, ex.data());
+    VkPhysicalDeviceProperties pp;
+    vkGetPhysicalDeviceProperties(phys_, &pp);
+    for (auto& x : ex)
+      if (!std::strcmp(x.extensionName, "VK_EXT_memory_budget") && pp.apiVersion >= VK_API_VERSION_1_1 && vkGetPhysicalDeviceMemoryProperties2) {
+        devExt.push_back("VK_EXT_memory_budget");
+        memBudgetExt_ = true;
+      }
   }
   caps_.externalImageWrite = true;
   dci.enabledExtensionCount = std::uint32_t(devExt.size());

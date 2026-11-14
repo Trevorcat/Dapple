@@ -18,6 +18,8 @@ namespace dapple::local {
 constexpr float kRtFine = 0.010f;     // L_f box radius (2 passes) = 1 % of the inter-ocular distance (pores, fine hair stay above it)
 constexpr float kRtCoarse = 0.12f;    // L_c guided-filter box radius on the 1/4 grid, in inter-ocular distances
 constexpr float kRtRef = 0.20f;       // skin reference: box radius (2 passes) on the 1/4 grid, in inter-ocular distances
+constexpr float kRtBlot = 0.025f;     // blotch-scale colour mean: box radius (2 passes) on the 1/4 grid, in inter-ocular distances
+constexpr float kRtYmin = 0.05f;      // relative chroma q = (R - Y, B - Y) / max(Y, kRtYmin)
 constexpr float kRtEps = 0.04f * 0.04f;  // guided filter eps of L_c (display luminance units)
 // whiten (stage L, scene-linear after the global gain): the lift (at most +0.5 EV) never takes a pixel above 1.4 EV over mid grey
 constexpr float kWhitenCeiling = 0.18f * 2.6390158f;
@@ -53,7 +55,7 @@ float haloPpu(const Frame& f, float scale);
 float retouchPpu(const Frame& f, float scale, const FramePlan& P);
 
 struct RetouchRadii {
-  int rf = 1, rc = 1, rs = 1;  // L_f box (full resolution, 2 passes), L_c guided box and skin reference box (1/4 grid)
+  int rf = 1, rc = 1, rs = 1, rb = 1;  // L_f box (full resolution, 2 passes), L_c guided box, skin reference box, blotch-scale box (1/4 grid)
   float iodPx = 0;
 };
 RetouchRadii retouchRadii(float iodPx);
@@ -72,7 +74,7 @@ void healWindow(const std::vector<SpotPx>& spots, ImageF& img);
 // The shared retouch planes of a window: L_f (full resolution), the guided coefficients of L_c and the skin reference S (1/4 grid).
 struct RtPlanes {
   int w = 0, h = 0, lw = 0, lh = 0;
-  std::vector<float> Lf, ab, S;  // ab: (a, b) a cell, L_c = a L_f + b; S: (w Y, w Cr, w Cb, w)
+  std::vector<float> Lf, ab, S, B;  // ab: (a, b) a cell, L_c = a L_f + b; S / B: (w Y, w qr, w qb, w) at the reference / blotch radius
   float Lc(int x, int y) const;
 };
 void retouchPlanes(const Frame& f, const ImageF& img, const AuxTarget& aux, const RetouchRadii& R, RtPlanes& out);

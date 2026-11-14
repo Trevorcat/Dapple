@@ -256,6 +256,34 @@ std::size_t MosaicCache::trimExcept(std::uint64_t k0, std::uint64_t k1) {
   }
   return freed;
 }
+void MosaicCache::setBudget(std::size_t bytes) {
+  std::lock_guard<std::mutex> lk(mu_);
+  budget_ = bytes;
+  while (bytes_ > budget_ && lru_.size() > 1) {  // the newest entry always stays (as insert())
+    bytes_ -= lru_.back().bytes;
+    lru_.pop_back();
+    ++st_.evictions;
+  }
+}
+std::size_t MosaicCache::budget() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return budget_;
+}
+std::size_t MosaicCache::trimTo(std::size_t keepBytes) {
+  std::lock_guard<std::mutex> lk(mu_);
+  std::size_t freed = 0;
+  while (bytes_ > keepBytes && !lru_.empty()) {
+    freed += lru_.back().bytes;
+    bytes_ -= lru_.back().bytes;
+    lru_.pop_back();
+    ++st_.evictions;
+  }
+  return freed;
+}
+int MosaicCache::entries() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return int(lru_.size());
+}
 void MosaicCache::clear() {
   std::lock_guard<std::mutex> lk(mu_);
   lru_.clear();

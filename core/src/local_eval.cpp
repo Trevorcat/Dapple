@@ -363,6 +363,50 @@ std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& sr
   return out;
 }
 
+// ---- luminance-range coherence (section 40.10) ------------------------------------------------------------------------------------------
+// Guided-filter coefficients (a, b) of the photo's log2 luminance against itself on a grid (edge-aware smoothing: texture below the radius and
+// below ~eps is averaged, edges kept). The pixel's smoothed luminance is Y_lin 2^(a l + b - l), l = log2 of its pre-gain luminance: the
+// global gain / HDR factor of the pixel (Y_lin / Y_src) is kept exactly, only the texture is smoothed.
+std::shared_ptr<const Plane> rangePlane(const SourceImage& src, const GuideKey& gk, float sx, float sy, int cap, float refine) {
+  const int L = std::max(src.linear.width, src.linear.height);
+  const int gl = std::clamp(L, 64, cap);
+  const int gw = std::max(8, int(std::lround(gl * sx))), gh = std::max(8, int(std::lround(gl * sy)));
+  const std::uint64_t key = mixf(mix64(mix64(gk.key, 0x4A4CE), std::uint64_t(gw) << 32 | std::uint32_t(gh)), refine);
+  if (auto p = cache().find(key)) {
+    ++g_planeHits;
+    return p;
+  }
+  const std::shared_ptr<const Plane> G = guideGrid(src, gk, gw, gh);
+  const std::size_t N = std::size_t(gw) * gh;
+  std::vector<float> l(N), ll(N);
+  for (std::size_t i = 0; i < N; ++i) {
+    const float* g = G->data.data() + i * 3;
+    const float Y = (g[0] * g[0] * kLumaPP[0] + g[1] * g[1] * kLumaPP[1] + g[2] * g[2] * kLumaPP[2]) * gk.ref;
+    l[i] = std::log2(std::max(Y, 1e-6f));
+    ll[i] = l[i] * l[i];
+  }
+  const int r = std::max(1, int(std::lround(float(gl) * (0.0015f + 0.004f * refine / 100.f))));
+  const float e = 0.5f + 2.5f * refine / 100.f, eps = e * e;  // log2 units: texture below ~e stops is smoothed (refine 50: 1.75 EV)
+  std::vector<float> ml = l;
+  boxMeanN(ml, gw, gh, r);
+  boxMeanN(ll, gw, gh, r);
+  std::vector<float> A(N), B(N);
+  for (std::size_t i = 0; i < N; ++i) {
+    const float v = std::max(0.f, ll[i] - ml[i] * ml[i]);
+    A[i] = v / (v + eps);
+    B[i] = ml[i] - A[i] * ml[i];
+  }
+  boxMeanN(A, gw, gh, r);
+  boxMeanN(B, gw, gh, r);
+  auto pl = std::make_shared<Plane>();
+  pl->w = gw, pl->h = gh, pl->ch = 2, pl->key = key;
+  pl->data.resize(N * 2);
+  for (std::size_t i = 0; i < N; ++i) pl->data[2 * i] = A[i], pl->data[2 * i + 1] = B[i];
+  std::shared_ptr<const Plane> out = pl;
+  cache().put(key, out);
+  return out;
+}
+
 // ---- brush planes ------------------------------------------------------------------------------------------------------------------
 std::uint64_t strokeHash(std::uint64_t h, const BrushStroke& s) {
   h = mixf(mixf(mixf(h, s.size), s.hardness), s.flow);
@@ -535,7 +579,17 @@ inline float compValue(const Frame& f, const Comp& c, float u, float v, float x,
         rangeOf(lin, L, hue, sat);
         rangeDone = true;
       }
-      if (c.kind == kCLum) return sstep(c.p[0] - c.p[2], c.p[0], L) * (1.f - sstep(c.p[1], c.p[1] + c.p[2], L));
+      if (c.kind == kCLum) {
+        float Lc = L;
+        if (c.plane) {  // spatial coherence (section 40.10): L* of the edge-aware smoothed luminance, the pixel's own gain kept
+          const float ys = std::max(src[0] * kLumaPP[0] + src[1] * kLumaPP[1] + src[2] * kLumaPP[2], 1e-6f);
+          const float yl = std::max(lin[0] * kLumaPP[0] + lin[1] * kLumaPP[1] + lin[2] * kLumaPP[2], 0.f);
+          const float ls = std::log2(ys);
+          const float Y = std::clamp(yl * std::exp2(samplePlane(*c.plane, 0, u, v) * ls + samplePlane(*c.plane, 1, u, v) - ls), 0.f, 1.f);
+          Lc = Y > 0.008856f ? 1.16f * std::cbrt(Y) - 0.16f : 9.033f * Y;
+        }
+        return sstep(c.p[0] - c.p[2], c.p[0], Lc) * (1.f - sstep(c.p[1], c.p[1] + c.p[2], Lc));
+      }
       float dh = std::fabs(hue - c.p[0]);
       dh = std::min(dh, 360.f - dh);
       const float ch = 1.f - sstep(c.p[1], c.p[1] + c.p[2], dh);
@@ -755,6 +809,14 @@ std::vector<std::pair<int, int>> guideGridSizes(const std::vector<LocalAdjustmen
       const std::pair<int, int> s{std::max(8, int(std::lround(gl * sx))), std::max(8, int(std::lround(gl * sy)))};
       if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
     }
+  // luminance-range coherence (section 40.10): the luminance grid
+  for (const LocalAdjustment& a : list)
+    for (const MaskComponent& m : a.mask) {
+      if (m.kind != MaskKind::Luminance || m.refine <= 0.f) continue;
+      const int gl = std::clamp(std::max(W, H), 64, interactive ? 512 : 1024);
+      const std::pair<int, int> s{std::max(8, int(std::lround(gl * sx))), std::max(8, int(std::lround(gl * sy)))};
+      if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+    }
   // portrait retouch (docs section 43): the grid the heal spots are detected / searched on
   for (const LocalAdjustment& a : list) {
     if (!a.enabled || a.strength <= 0.f) continue;
@@ -784,7 +846,7 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
   std::vector<std::string> rasterRefs;
   std::vector<std::pair<std::uint64_t, int>> planeAt;  // plane key -> offset in the store: a plane used by several components is stored once
   std::uint64_t pk = 0x91A4E5;
-  float iodMin = 0.f;
+  float iodMin = 0.f;  // the frame retouch scale: the largest face of the retouch adjustments
   for (std::size_t ai = 0; ai < list.size(); ++ai) {
     const LocalAdjustment& a = list[ai];
     if (!preview && (!a.enabled || a.strength <= 0.f)) continue;
@@ -832,6 +894,15 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
         case MaskKind::Luminance:
           c.kind = kCLum;
           c.p[0] = m.lo / 100.f, c.p[1] = m.hi / 100.f, c.p[2] = std::max(m.lumFeather / 100.f, 1e-4f);
+          if (m.refine > 0.f) {  // spatial coherence (section 40.10)
+            if (!gkDone) {
+              gk = guideKeyOf(src);
+              gkDone = true;
+              f->guideRef = gk.ref;
+            }
+            c.plane = rangePlane(src, gk, f->sx, f->sy, interactive ? 512 : 1024, m.refine);
+            f->anyRaster = true;  // the point pass needs the pre-gain source pixel
+          }
           break;
         case MaskKind::Colour:
           c.kind = kCColour;
@@ -897,7 +968,7 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
     for (int k = kLocalRetouchFirst; k <= kLoFaceLight; ++k) rtW = rtW || v[std::size_t(k)] != 0.f;
     if (rtW || heal) {
       const float iod = retouchIodOf(a, *f, self, src);
-      if (rtW) iodMin = iodMin > 0.f ? std::min(iodMin, iod) : iod;
+      if (rtW) iodMin = std::max(iodMin, iod);  // the LARGEST face (section 43.1: a smaller scale would cut into the near face texture)
       if (heal) healSpotsOf(a, *f, self, src, iod, f->spots);
     }
     if (!lin && !win && !preview) {  // heal only: nothing to evaluate per pixel

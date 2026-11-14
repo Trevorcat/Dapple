@@ -28,6 +28,7 @@
 #include "dapple/dapple_c.h"
 #include "dapple/edit_params.h"
 #include "dapple/local_adjust.h"
+#include "json_value.h"
 #include "local_eval.h"
 
 namespace fs = std::filesystem;
@@ -391,6 +392,101 @@ static void testCache() {
   CHECK(left == 2 && !fs::exists(root / "ai_masks" / "00000000000000a1") && fs::exists(root / "ai_masks" / "00000000000000a4"));
 }
 
+// ---- mouth plane, faces JSON, meta cache round trip -------------------------------------------------------------------------------------------
+static void testMouth() {
+  const int W = 400, H = 480;
+  const FaceMesh open = syntheticMesh(14.f, 0.f), closed = syntheticMesh(1.f, 0.f);
+  FaceFeatures fo, fc, fd;
+  const auto dark = flat(W, H, 40, 12, 14);
+  CHECK(faceFeatures(open, W, H, dark.data(), W * 3, fo) && fo.mouth.w == W && fo.mouth.h == H);
+  CHECK(!fo.open && fo.teeth.empty());  // a dark opening shows no teeth, the mouth plane exists nevertheless
+  const double inner = shoelace(ringOf(open, kLipsInner, 20));
+  CHECK_NEAR(planeSum(fo.mouth), inner, 0.05 * inner);
+  CHECK(fo.mouth.px[330 * W + 200] > 250 && fo.mouth.px[330 * W + 200 + 60] == 0 && fo.mouth.px[250 * W + 200] == 0 && fo.mouth.px[330 * W + 200 - 52] < 5);
+  CHECK(faceFeatures(closed, W, H, nullptr, 0, fc) && fc.mouth.empty());
+  CHECK(faceFeatures(syntheticMesh(14.f, 200.f), W, H, nullptr, 0, fd) && fd.mouth.empty());  // turned head: no mouth plane
+  const ParsedId pid = parseId(makeId("00000000000000a1", "f2:mouth"));
+  CHECK(pid.ok && pid.group == "faces" && pid.face == 2 && pid.feature == "mouth");
+  CHECK(kEpoch == 5);
+}
+
+// a mesh whose unused points sit at the face centre and with iris centres (468 / 473), as a real mesh has
+static FaceMesh fullMesh(float mouthRy, float yawZ) {
+  FaceMesh m = syntheticMesh(mouthRy, yawZ);
+  for (int i = 0; i < 478; ++i)
+    if (m.xy[i][0] == 0.f && m.xy[i][1] == 0.f) m.xy[i][0] = 200.f, m.xy[i][1] = 240.f;
+  m.xy[468][0] = 150.f, m.xy[468][1] = 200.f, m.xy[473][0] = 250.f, m.xy[473][1] = 200.f;
+  return m;
+}
+static void testFacesJson() {
+  using dapple::jsonlite::JParser;
+  using dapple::jsonlite::JValue;
+  const int W = 400, H = 480;
+  FaceFeatures a, b, c;
+  CHECK(faceFeatures(fullMesh(14.f, 0.f), W, H, nullptr, 0, a));     // open, frontal (teeth = inner polygon)
+  CHECK(faceFeatures(fullMesh(1.f, 0.f), W, H, nullptr, 0, b));      // closed, frontal
+  CHECK(faceFeatures(fullMesh(14.f, 200.f), W, H, nullptr, 0, c));   // turned
+  const std::string meta = facesMetaJson({a, b, c}, W, H);
+  JValue v;
+  JParser p(meta);
+  CHECK(p.parse(v));
+  const JValue* cnt = v.get("count");
+  const JValue* list = v.get("list");
+  CHECK(cnt && cnt->number == 3 && list && list->kind == JValue::Array && list->items.size() == 3);
+  if (!list || list->items.size() != 3) return;
+  const JValue& f1 = list->items[0];
+  CHECK(f1.get("index") && f1.get("index")->number == 1 && list->items[2].get("index")->number == 3);
+  const JValue* box = f1.get("box");
+  CHECK(box && box->items.size() == 4 && box->items[0].number < box->items[2].number && box->items[1].number < box->items[3].number);
+  CHECK(box && box->items[0].number >= 0 && box->items[2].number <= 1 && box->items[3].number <= 1);
+  // the synthetic oval spans x 80..320, y 80..400 of 400 x 480
+  CHECK_NEAR(box->items[0].number, 80.0 / W, 0.02);
+  CHECK_NEAR(box->items[3].number, 400.0 / H, 0.02);
+  CHECK_NEAR(f1.get("iod")->number, 100.0 / 480.0, 0.002);  // iris centres 100 px apart, long edge 480
+  const JValue* ctr = f1.get("center");
+  CHECK(ctr && ctr->items.size() == 2);
+  CHECK_NEAR(ctr->items[0].number, 200.0 / W, 0.002);
+  CHECK_NEAR(ctr->items[1].number, 200.0 / H, 0.002);
+  CHECK(f1.get("frontal")->boolean && !list->items[2].get("frontal")->boolean && f1.get("yaw") && f1.get("mouth_open") && f1.get("teeth"));
+  auto keys = [&](const JValue& f) {
+    std::string k;
+    for (const JValue& x : f.get("planes")->items) k += x.str + ",";
+    return k;
+  };
+  CHECK(keys(f1) == "face,eyes,iris,sclera,lips,teeth,mouth,brows,undereye,");
+  CHECK(keys(list->items[1]) == "face,eyes,iris,sclera,lips,brows,undereye,");  // closed mouth: no teeth, no mouth
+  CHECK(keys(list->items[2]) == "face,");
+  CHECK(facesListOfMeta(meta).front() == '[' && facesListOfMeta(meta).back() == ']' && facesListOfMeta("{\"found\":true}") == "[]");
+  JValue lv;
+  const std::string listText = facesListOfMeta(meta);
+  JParser lp(listText);
+  CHECK(lp.parse(lv) && lv.items.size() == 3);
+  JValue ev;
+  const std::string emptyText = facesMetaJson({}, W, H);
+  JParser ep(emptyText);
+  CHECK(ep.parse(ev) && ev.get("count")->number == 0 && ev.get("list")->items.empty());
+}
+
+static void testFacesCache() {
+  FaceFeatures a, b;
+  CHECK(faceFeatures(syntheticMesh(14.f, 0.f), 400, 480, nullptr, 0, a) && faceFeatures(syntheticMesh(1.f, 0.f), 400, 480, nullptr, 0, b));
+  PlaneSet s;
+  s.entries = {{"f1:face", a.face}, {"f1:mouth", a.mouth}, {"f2:face", b.face}};
+  s.meta = facesMetaJson({a, b}, 400, 480);
+  std::vector<std::uint8_t> bytes = packSet(s);
+  PlaneSet back;
+  CHECK(unpackSet(bytes.data(), bytes.size(), back) && back.meta == s.meta && back.entries.size() == 3);
+  CHECK(facesListOfMeta(back.meta) == facesListOfMeta(s.meta));
+  const fs::path root = tmpRoot();
+  fs::remove_all(root);
+  configure("", root.string());
+  CHECK(storeGroup("00000000000000b1", "faces", s));
+  std::ifstream in(root / "ai_masks" / "00000000000000b1" / "faces.dpl", std::ios::binary);
+  std::vector<std::uint8_t> disk((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  PlaneSet fromDisk;
+  CHECK(!disk.empty() && unpackSet(disk.data(), disk.size(), fromDisk) && fromDisk.meta == s.meta);
+}
+
 // ---- ensure ----------------------------------------------------------------------------------------------------------------------------------------
 static void testEnsure() {
   const fs::path root = tmpRoot();
@@ -600,7 +696,8 @@ int main(int argc, char** argv) {
     void (*fn)();
   };
   const T tests[] = {{"polygon", testPolygon}, {"faces", testFaces}, {"parts", testParts}, {"taps", testTaps}, {"depth", testDepth},
-                     {"cache", testCache},     {"ensure", testEnsure}, {"export", testExport}, {"sky", testSky}, {"status", testStatus}};
+                     {"cache", testCache},     {"ensure", testEnsure}, {"export", testExport}, {"sky", testSky}, {"status", testStatus},
+                     {"mouth", testMouth}, {"facesjson", testFacesJson}, {"facescache", testFacesCache}};
   if (argc < 2) {
     for (const T& t : tests) std::printf("%s\n", t.id);
     return 0;

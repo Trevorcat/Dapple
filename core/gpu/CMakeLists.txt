@@ -41,7 +41,7 @@ set(DAPPLE_GPU_SHADERS
   "local_film_in|local_film_in.comp||SIBBII"
   "local_heal|local_heal.comp||SBII"
   "local_rt_down|local_rt_down.comp||SSSII"
-  "local_retouch|local_retouch.comp||SSSSSSII"
+  "local_retouch|local_retouch.comp||SSSSSSSII"
   "sep_d2y|sepconv.comp|IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
   "sep_d2y_v|sepconv.comp|BIGV=1,IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"
   "sep_d2y_s|sepconv.comp|SMALL=1,IN_FMT=rgba16f,OUT_FMT=r32f,IN_MODE=1,SCALAR=1|SIB"

@@ -128,6 +128,16 @@ class GpuProvider {
   virtual bool lease(DeviceLease* out) { (void)out; return false; }
   // Why enabled() is false (diagnostics, FrameResult::why): "GPU disabled (debug.dapple.gpu=0)", "GPU self-test running", "GPU self-test failed: ...".
   virtual std::string inactiveReason() { return "GPU disabled"; }
+  // Memory (pipeline-architecture.md 42.9): frees the free images of the active device's pool beyond `keepFree` bytes (0 = all) and the
+  // device's descriptor caches; returns the bytes released. Waits for the frame in flight (context mutex).
+  virtual std::size_t trimPool(std::size_t keepFree) { (void)keepFree; return 0; }
+  // The active device: unified memory?, the pool's budget, and the driver's budget / usage of the device-local heaps where the backend
+  // reports them (VK_EXT_memory_budget; *budget = 0 when unknown). False = no active device.
+  struct MemoryInfo {
+    bool unified = false;
+    std::uint64_t poolBudget = 0, pooled = 0, budget = 0, usage = 0, deviceLocal = 0;
+  };
+  virtual bool memoryInfo(MemoryInfo* out) { (void)out; return false; }
 };
 
 void installGpuProvider(GpuProvider* p);

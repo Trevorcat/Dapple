@@ -38,12 +38,14 @@ struct MaskComponent {
   // radial: centre, radii (fractions of the long edge), rotation (degrees, clockwise in the photo), feather 0..100
   float cx = 0.5f, cy = 0.5f, rx = 0.25f, ry = 0.25f, angle = 0.f, feather = 50.f;
   // luminance: L* range 0..100 with a soft edge 0..50 (uses `feather` above as its edge width when kind == Luminance: field lumFeather)
-  float lo = 0.f, hi = 100.f, lumFeather = 10.f;
+  float lo = 0.f, hi = 100.f, lumFeather = 15.f;  // (default feather 15 L*: a threshold never looks binary; `refine` below smooths the L* it reads)
   // color: OKLab hue centre (degrees), half width 0..180, feather 0..90, minimum saturation 0..100
   float hue = 0.f, hueRange = 30.f, hueFeather = 20.f, satMin = 10.f;
   // brush
   std::vector<BrushStroke> strokes;
-  // raster: plane id (dapple_mask_raster_set) and edge-aware refinement 0..100 (0 = bilinear upsampling only)
+  // raster: plane id (dapple_mask_raster_set) and edge-aware refinement 0..100 (0 = bilinear upsampling only). luminance: the same key = spatial
+  // coherence 0..100 (0 = per-pixel L*, the old behaviour; > 0 = L* of an edge-aware smoothing of the photo, so a range on foliage selects regions,
+  // not single pixels: section 40.10)
   std::string ref;
   float refine = 50.f;
   // raster with range (depth, AI planes): the plane's value 0..100 is first ranged like a luminance (lo..hi with a soft edge), then refined. The

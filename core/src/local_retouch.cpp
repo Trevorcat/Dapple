@@ -147,7 +147,17 @@ std::vector<Blob> detectBlobs(const float* rgb, const float* mask, int w, int h,
     for (int x = 1; x + 1 < w; ++x) {
       const std::size_t i = std::size_t(y) * w + x;
       const float z = zmax[i];
-      if (z < 0.6f * z0 || smax[i] < smin || M[i] < 0.5f) continue;
+      // a blemish is a moderate spot inside skin: much darker than ~30 % (nostrils, eye and mouth corners, a scarf or hair edge) is a feature
+      if (z < 0.6f * z0 || smax[i] < smin || smax[i] > 0.5f || M[i] < 0.5f) continue;
+      {  // the whole spot and its ring inside the mask (the mask's own edge next to a dark feature is not a blemish)
+        const float rad = 1.6f * std::max(1.5f, 2.4f * scales[jmax[i]]);
+        bool inside = true;
+        for (int q = 0; q < 16 && inside; ++q) {
+          const int xx = int(std::floor(float(x) + 0.5f + rad * kRing[q][0])), yy = int(std::floor(float(y) + 0.5f + rad * kRing[q][1]));
+          inside = xx >= 0 && yy >= 0 && xx < w && yy < h && M[std::size_t(yy) * w + xx] >= 0.5f;
+        }
+        if (!inside) continue;
+      }
       const int rr = std::max(1, int(std::lround(scales[jmax[i]])));
       bool peak = true;
       for (int dy = -rr; dy <= rr && peak; ++dy)
@@ -473,6 +483,7 @@ RetouchRadii retouchRadii(float iodPx) {
   r.rf = std::clamp(int(std::lround(kRtFine * iodPx)), 1, 64);
   r.rc = std::clamp(int(std::lround(kRtCoarse * iodPx / 4.f)), 1, 64);
   r.rs = std::clamp(int(std::lround(kRtRef * iodPx / 4.f)), 1, 64);
+  r.rb = std::clamp(int(std::lround(kRtBlot * iodPx / 4.f)), 1, 64);
   return r;
 }
 int retouchPlanesHalo(const RetouchRadii& r) { return std::max({2 * r.rf + 2, 4 * (2 * r.rc + 2) + 4, 4 * (2 * r.rs + 2) + 4}); }
@@ -575,52 +586,56 @@ inline void rtAmounts(const Frame& f, const AuxTarget& aux, std::size_t i, float
   }
 }
 
-// the per-pixel retouch (twin of local_retouch.comp main)
-inline void rtPixel(float p[3], float Lf, float Lc, const float ref[4], const float kin[6]) {
+// the per-pixel retouch (twin of local_retouch.comp main). Colour works on RELATIVE chroma q = (R - Y, B - Y) / Y (a saturation: the same skin
+// in light and in shade has the same q), and only on its mid-scale deviation d = q_b - q_ref (the blotch-scale mean minus the skin reference):
+// mean-free over the skin by construction, so the complexion (mean hue, saturation, lightness) does not move; per-pixel colour texture and
+// the low-frequency blush (inside q_ref) are kept. Luminance changes keep q, i.e. the saturation.
+inline void rtPixel(float p[3], float Lf, float Lc, const float ref[4], const float blot[4], const float kin[6]) {
   const float Y = p[0] * kLumaS[0] + p[1] * kLumaS[1] + p[2] * kLumaS[2];
-  float cr = p[0] - Y, cb = p[2] - Y;
+  const float Yd = std::max(Y, kRtYmin);
+  float qr = (p[0] - Y) / Yd, qb = (p[2] - Y) / Yd;
   float k[6];
   for (int c = 0; c < 6; ++c) k[c] = std::clamp(kin[c], 0.f, 1.f);
   const float ks = k[0], ke = k[1], kr = k[2], ku = k[3], kh = k[4], kl = k[5];
-  float rY = Lf, rCr = cr, rCb = cb;
-  if (ref[3] > 1e-6f) rY = ref[0] / ref[3], rCr = ref[1] / ref[3], rCb = ref[2] / ref[3];
+  float rY = Lf, rqr = qr, rqb = qb, bqr = qr, bqb = qb;
+  if (ref[3] > 1e-6f) rY = ref[0] / ref[3], rqr = ref[1] / ref[3], rqb = ref[2] / ref[3];
+  if (blot[3] > 1e-6f) bqr = blot[1] / blot[3], bqb = blot[2] / blot[3];
+  const float dr = bqr - rqr, db = bqb - rqb;                          // mid-scale chroma deviation
+  const float rs = std::max(std::sqrt(rqr * rqr + rqb * rqb), 0.05f);  // the skin's saturation (relative distances)
+  // colours far from the skin (a glasses frame, lips, hair the mask leaks onto) are not blotches: left alone
+  const float far = 1.f - sstep(0.6f, 1.2f, std::sqrt((qr - rqr) * (qr - rqr) + (qb - rqb) * (qb - rqb)) / rs);
   // smoothing / even tone: the mid band L_f - L_c, gated off at strong edges (|M| >> 0.08: jaw, eyes, nostrils)
   const float M = Lf - Lc;
   const float g = 1.f / (1.f + (M * 12.5f) * (M * 12.5f));
   float dY = -std::min(0.92f, 0.9f * ks + 0.4f * ke) * g * M;
-  if (ku > 0.f) {  // under-eye: lift the low band toward the surrounding skin
+  if (ku > 0.f) {  // under-eye: lift the low band toward the surrounding skin, its colour to the skin colour (a mid-scale shift: texture kept)
     const float d = rY - (Lf + dY);
     dY += 0.8f * ku * std::clamp(d, 0.f, 0.25f) * sstep(0.f, 0.03f, d);
+    qr -= 0.8f * ku * dr, qb -= 0.8f * ku * db;
   }
-  float sg = 0.f;
-  if (kh > 0.f) {  // shine: highlights brighter than the skin and paler than it
-    const float e = Lf + dY - rY;
-    const float chp = std::sqrt(cr * cr + cb * cb), chr = std::sqrt(rCr * rCr + rCb * rCb);
-    // a smooth, monotone compression from the skin level up (no ring where a highlight's shoulder meets the treated core)
-    sg = sstep(0.01f, 0.12f, e) * (1.f - 0.6f * sstep(0.6f, 1.3f, chp / std::max(chr, 0.01f)));
-    dY -= 0.5f * kh * sg * std::max(e, 0.f);
+  if (kh > 0.f) {  // shine: only highlights well above the skin; a monotone compression; pale (specular) ones regain the skin colour
+    const float e = Lf + dY - rY, x = std::max(e - 0.05f, 0.f);
+    const float pale = 1.f - sstep(0.5f, 0.9f, std::sqrt(bqr * bqr + bqb * bqb) / rs);
+    dY -= 0.6f * kh * (0.4f + 0.6f * pale) * x * x / (x + 0.08f);
+    const float t = 0.8f * kh * pale * sstep(0.05f, 0.15f, e);
+    qr += (rqr - qr) * t, qb += (rqb - qb) * t;
   }
-  // colours far from the skin reference (glasses frames, lips, hair the mask leaks onto) are not skin blotches: they are left alone
-  const float far = 1.f - sstep(0.08f, 0.16f, std::sqrt((cr - rCr) * (cr - rCr) + (cb - rCb) * (cb - rCb)));
-  if (ke > 0.f) {
-    const float t = 0.65f * ke * far;
-    cr += (rCr - cr) * t, cb += (rCb - cb) * t;
+  // even: the mid-scale HUE mottling fully, its saturation part only a little (darker skin is legitimately richer in its shadows: evening the
+  // saturation there takes the colour depth); redness: where the mid-scale colour is redder than the skin (blotches), a soft threshold (only the
+  // excess over 15 % of the skin saturation). The saturation |q| changes only by the removed radial part (no |mean| < mean |.| loss).
+  const float te = ke > 0.f ? 0.75f * ke * far : 0.f;
+  const float tr = kr > 0.f ? std::min(1.f, 1.5f * kr * far * std::max(0.f, 1.f - 0.15f / std::max((0.95f * dr + 0.31f * db) / rs, 1e-3f))) : 0.f;
+  if (te + tr > 0.f) {
+    const float ur = rqr / rs, ub = rqb / rs, dRad = dr * ur + db * ub;
+    const float tanR = dr - dRad * ur, tanB = db - dRad * ub;
+    const float tt = std::min(te + tr, 1.f), trad = std::min(0.3f * te + tr, 1.f);
+    const float m0 = std::sqrt(qr * qr + qb * qb);
+    qr -= tt * tanR + trad * dRad * ur, qb -= tt * tanB + trad * dRad * ub;
+    const float m1 = std::sqrt(qr * qr + qb * qb), m = std::max(m0 - trad * dRad, 0.f);
+    if (m1 > 1e-4f) qr *= m / m1, qb *= m / m1;
   }
-  if (kr > 0.f) {  // redness: only the pixels redder than the skin around them
-    const float dr = cr - rCr, db = cb - rCb;
-    const float t = 0.75f * kr * far * sstep(0.008f, 0.04f, 0.95f * dr + 0.31f * db);
-    cr -= t * dr, cb -= t * db;
-  }
-  if (ku > 0.f) {
-    const float t = 0.7f * ku * far;
-    cr += (rCr - cr) * t, cb += (rCb - cb) * t;
-  }
-  const float Y2 = Y + dY;
-  if (kh > 0.f) {  // the specular's chroma toward the skin's at the new lightness (a shine becomes lit skin, not a grey patch)
-    const float t = 0.8f * kh * sg, s = std::clamp(Y2 / std::max(rY, 0.02f), 0.5f, 1.5f);
-    cr += (rCr * s - cr) * t, cb += (rCb * s - cb) * t;
-  }
-  float r = Y2 + cr, b = Y2 + cb;
+  const float Y2 = Y + dY, Y2d = Y >= kRtYmin ? std::max(Y2, 0.f) : Yd;
+  float r = Y2 + qr * Y2d, b = Y2 + qb * Y2d;
   float gg = (Y2 - kLumaS[0] * r - kLumaS[2] * b) / kLumaS[1];
   if (kl > 0.f) {  // face light: a broad luminance gain from the coarse base (dodge), chroma by its square root (no orange push on dark skin)
     const float G = 1.f + 0.45f * kl * (1.f - sstep(0.15f, 0.75f, Lc)), sc = std::sqrt(G);
@@ -674,8 +689,8 @@ void retouchPlanes(const Frame& f, const ImageF& img, const AuxTarget& aux, cons
           float k[6];
           rtAmounts(f, aux, std::size_t(y) * w + x, k);
           const float om = skinWeight(k[0], k[1], k[2], k[4], k[3]);
-          const float Y = kLumaS[0] * p[3 * x] + kLumaS[1] * p[3 * x + 1] + kLumaS[2] * p[3 * x + 2];
-          sk[0] += om * Y, sk[1] += om * (p[3 * x] - Y), sk[2] += om * (p[3 * x + 2] - Y), sk[3] += om;
+          const float Y = kLumaS[0] * p[3 * x] + kLumaS[1] * p[3 * x + 1] + kLumaS[2] * p[3 * x + 2], Yd = std::max(Y, kRtYmin);
+          sk[0] += om * Y, sk[1] += om * ((p[3 * x] - Y) / Yd), sk[2] += om * ((p[3 * x + 2] - Y) / Yd), sk[3] += om;
         }
       }
       const float inv = 1.f / float((y1 - y0) * (x1 - x0));
@@ -693,6 +708,9 @@ void retouchPlanes(const Frame& f, const ImageF& img, const AuxTarget& aux, cons
     yy[2 * i + 1] = m - a * m;
   }
   boxRepeat(yy, lw, lh, 2, R.rc);
+  out.B = S;  // the blotch-scale mean (small radius) and the skin reference (large radius) of the same weighted sums
+  boxRepeat(out.B, lw, lh, 4, R.rb);
+  boxRepeat(out.B, lw, lh, 4, R.rb);
   boxRepeat(S, lw, lh, 4, R.rs);
   boxRepeat(S, lw, lh, 4, R.rs);
 }
@@ -707,7 +725,7 @@ void retouchCombineWindow(const Frame& f, ImageF& img, const AuxTarget& aux, con
   RtPlanes P;
   retouchPlanes(f, img, aux, R, P);
   const int w = img.width, h = img.height, lw = P.lw, lh = P.lh;
-  const std::vector<float>&Lf = P.Lf, &yy = P.ab, &S = P.S;
+  const std::vector<float>&Lf = P.Lf, &yy = P.ab, &S = P.S, &B = P.B;
   parallelFor(h, [&](int y) {
     float* p = img.row(y);
     for (int x = 0; x < w; ++x) {
@@ -715,11 +733,12 @@ void retouchCombineWindow(const Frame& f, ImageF& img, const AuxTarget& aux, con
       float k[6];
       rtAmounts(f, aux, i, k);
       if (k[0] == 0.f && k[1] == 0.f && k[2] == 0.f && k[3] == 0.f && k[4] == 0.f && k[5] == 0.f) continue;
-      float ab[2], ref[4];
+      float ab[2], ref[4], blot[4];
       bilin(yy, lw, lh, 2, x, y, ab);
       bilin(S, lw, lh, 4, x, y, ref);
+      bilin(B, lw, lh, 4, x, y, blot);
       const float Lc = ab[0] * Lf[i] + ab[1];
-      rtPixel(p + 3 * x, Lf[i], Lc, ref, k);
+      rtPixel(p + 3 * x, Lf[i], Lc, ref, blot, k);
     }
   });
 }

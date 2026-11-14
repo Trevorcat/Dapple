@@ -263,6 +263,12 @@ bool faceFeatures(const FaceMesh& m, int w, int h, const std::uint8_t* rgb, int 
   const float width = std::max(1e-3f, std::hypot(m.xy[78][0] - m.xy[308][0], m.xy[78][1] - m.xy[308][1]));
   out.mouthOpen = gap / width;
   out.iod = std::hypot(m.xy[473][0] - m.xy[468][0], m.xy[473][1] - m.xy[468][1]);
+  out.cx = 0.5f * (m.xy[473][0] + m.xy[468][0]), out.cy = 0.5f * (m.xy[473][1] + m.xy[468][1]);
+  out.box[0] = out.box[2] = m.xy[0][0], out.box[1] = out.box[3] = m.xy[0][1];
+  for (int i = 1; i < 478; ++i) {
+    out.box[0] = std::min(out.box[0], m.xy[i][0]), out.box[2] = std::max(out.box[2], m.xy[i][0]);
+    out.box[1] = std::min(out.box[1], m.xy[i][1]), out.box[3] = std::max(out.box[3], m.xy[i][1]);
+  }
   if (!out.frontal) return true;
   const float sEye = std::max(0.6f, 0.006f * faceW), sMouth = std::max(0.6f, 0.008f * faceW);
   out.eyes = polygonPlane(w, h, {ring(m, kEyeRight), ring(m, kEyeLeft)}, sEye);
@@ -297,6 +303,7 @@ bool faceFeatures(const FaceMesh& m, int w, int h, const std::uint8_t* rgb, int 
     out.brows = polygonPlane(w, h, rings, std::max(0.6f, 0.008f * faceW));
   }
   if (out.mouthOpen >= kMouthOpen) {
+    out.mouth = polygonPlane(w, h, {ring(m, kLipsInner)}, sMouth);  // the open-mouth interior, teeth or not
     Plane inner = polygonPlane(w, h, {ring(m, kLipsInner)}, std::max(0.5f, 0.004f * faceW));
     if (rgb) {
       // keep the bright, unsaturated pixels of the opening (teeth); tongue and the dark mouth interior drop out
@@ -335,6 +342,44 @@ bool faceFeatures(const FaceMesh& m, int w, int h, const std::uint8_t* rgb, int 
     out.open = true;
   }
   return true;
+}
+
+std::vector<std::string> faceFeatureKeys(const FaceFeatures& f) {
+  std::vector<std::string> k = {"face"};
+  if (!f.frontal) return k;
+  for (const char* n : {"eyes", "iris", "sclera", "lips"}) k.push_back(n);
+  if (f.open && !f.teeth.empty()) k.push_back("teeth");
+  if (!f.mouth.empty()) k.push_back("mouth");
+  k.push_back("brows");
+  if (!f.undereye.empty()) k.push_back("undereye");
+  return k;
+}
+
+std::string facesMetaJson(const std::vector<FaceFeatures>& faces, int w, int h) {
+  const float W = float(std::max(1, w)), H = float(std::max(1, h)), L = float(std::max(1, std::max(w, h)));
+  auto c01 = [](float v) { return std::clamp(v, 0.f, 1.f); };
+  std::string j = "{\"count\":" + std::to_string(faces.size()) + ",\"list\":[";
+  for (std::size_t i = 0; i < faces.size(); ++i) {
+    const FaceFeatures& f = faces[i];
+    char b[360];
+    std::snprintf(b, sizeof b,
+                  "%s{\"index\":%zu,\"box\":[%.4f,%.4f,%.4f,%.4f],\"yaw\":%.1f,\"frontal\":%s,\"mouth_open\":%.3f,\"teeth\":%s,\"iod\":%.5f,\"center\":[%.4f,%.4f],\"planes\":[",
+                  i ? "," : "", i + 1, c01(f.box[0] / W), c01(f.box[1] / H), c01(f.box[2] / W), c01(f.box[3] / H), f.yawDeg, f.frontal ? "true" : "false",
+                  f.mouthOpen, f.open && !f.teeth.empty() ? "true" : "false", f.iod / L, c01(f.cx / W), c01(f.cy / H));
+    j += b;
+    const std::vector<std::string> keys = faceFeatureKeys(f);
+    for (std::size_t k = 0; k < keys.size(); ++k) j += (k ? ",\"" : "\"") + keys[k] + "\"";
+    j += "]}";
+  }
+  return j + "]}";
+}
+
+std::string facesListOfMeta(const std::string& meta) {
+  const auto k = meta.find("\"list\":");
+  if (k == std::string::npos) return "[]";
+  const std::size_t a = meta.find('[', k);
+  const std::size_t e = meta.rfind(']');
+  return a == std::string::npos || e == std::string::npos || e < a ? "[]" : meta.substr(a, e - a + 1);
 }
 
 // ---- person parts ---------------------------------------------------------------------------------------------------------------------------
@@ -500,7 +545,7 @@ ParsedId parseId(const std::string& id) {
   if (k == "depth") p.group = "depth";
   if (k == "sky") p.group = "sky";
   if (k.size() > 3 && k[0] == 'f' && k[1] >= '1' && k[1] <= '9' && k[2] == ':') {
-    static const char* kFeat[] = {"face", "eyes", "iris", "sclera", "lips", "teeth", "brows", "undereye"};
+    static const char* kFeat[] = {"face", "eyes", "iris", "sclera", "lips", "teeth", "mouth", "brows", "undereye"};
     for (const char* n : kFeat)
       if (k.substr(3) == n) p.group = "faces", p.face = k[1] - '0', p.feature = n;
     if (p.face > kMaxFaces) p.group.clear();

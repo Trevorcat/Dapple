@@ -37,8 +37,8 @@ void main() {
       const float kh = chan(u.ch2.x, a0, a1);
       const float s = clamp(ks + ke + kr + kh, 0.0, 1.0), uu = clamp(ku, 0.0, 1.0);
       const float om = (s + 0.02) * (1.0 - uu);
-      const float Y = lumaOf(c);
-      sk += om * vec4(Y, c.r - Y, c.b - Y, 1.0);
+      const float Y = lumaOf(c), Yd = max(Y, 0.05);
+      sk += om * vec4(Y, (c.r - Y) / Yd, (c.b - Y) / Yd, 1.0);
     }
   const float inv = 1.0 / float((y1 - y0) * (x1 - x0));
   const float yv = lumaOf(acc * inv);

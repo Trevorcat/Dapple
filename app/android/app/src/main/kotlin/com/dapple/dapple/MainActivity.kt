@@ -33,6 +33,7 @@ class MainActivity : FlutterActivity() {
     private var capturePlugin: CapturePlugin? = null
     private var pickPlugin: PhotoPickPlugin? = null
     private var usbPlugin: UsbCameraPlugin? = null
+    private var memoryPlugin: MemoryPlugin? = null
 
     private val extensions = listOf("arw", "raf", "dng", "jpg", "jpeg")
 
@@ -49,6 +50,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         usbPlugin?.dispose()
+        memoryPlugin?.dispose()
         super.onDestroy()
     }
 
@@ -73,6 +75,10 @@ class MainActivity : FlutterActivity() {
 
         // AI masks: the bundled model files are copied to app storage on first use (AiModelsPlugin.kt), channel dapple/ai
         AiModelsPlugin(applicationContext, messenger)
+
+        // Memory class of the device + onTrimMemory for the engine's caches (MemoryPlugin.kt), channel dapple/memory
+        memoryPlugin?.dispose()
+        memoryPlugin = MemoryPlugin(applicationContext, messenger)
 
         // Editor landmark haptics (requirements 4.15.9): View.performHapticFeedback with the
         // finest constant the OS offers. Numeric values so this compiles against any compileSdk.

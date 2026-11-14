@@ -603,11 +603,11 @@ static int testPolicy() {
   const std::size_t b = xstream::budgetBytes(&how);
   setEnv("DAPPLE_EXPORT_AVAILABLE_FAILS", nullptr);
   std::printf("  available() failing: budget %.0f MB (%s); physical %.0f MB\n", double(b) / 1048576.0, how.c_str(), double(mem::physical()) / 1048576.0);
-  CHECK(how.find("physical") != std::string::npos && b >= (std::size_t(256) << 20) && b <= (std::size_t(1) << 30));
+  CHECK(how.find("unknown") != std::string::npos && b >= (std::size_t(256) << 20) && b <= (std::size_t(1) << 30));
   std::string how2;
   const std::size_t b2 = xstream::budgetBytes(&how2);
   std::printf("  available() working: budget %.0f MB (%s), available %.0f MB\n", double(b2) / 1048576.0, how2.c_str(), double(mem::available()) / 1048576.0);
-  CHECK(how2 == "available memory" && b2 > 0);
+  CHECK(how2.rfind("available memory", 0) == 0 && b2 > 0);
   // 2. a RAW the band path cannot read (linear DNG) that does not fit is refused cleanly at the open (auto mode)
   const fs::path lin = root() / "build/rawsamples/Apple/iPhone-12-Pro/IMG_1361.DNG";
   if (fs::exists(lin)) {
@@ -667,6 +667,134 @@ static int testPolicy() {
               double(f1) / 1048576.0, hits1 > hits0 && miss1 == miss0 ? "yes" : "NO");
   CHECK(freed >= std::size_t(20) << 20);  // the 33 MP mosaic of a (66 MB)
   CHECK(hits1 > hits0 && miss1 == miss0);
+  return 0;
+}
+
+// ---- budget: the export memory policy on phones (pipeline-architecture.md 42.9), the decision table -----------------------------------------
+static int testBudget() {
+  constexpr std::size_t MB = std::size_t(1) << 20;
+  struct Dev {
+    const char* name;
+    std::size_t total;  // MemTotal as the phones report it
+    std::size_t pool;   // GPU pool budget (vk_device: min(max(deviceLocal / 4, 256 MB), 512 MB) on unified memory)
+    bool lowRam;
+  } devs[] = {{"3 GB", 2816 * MB, 256 * MB, false}, {"6 GB", 5632 * MB, 512 * MB, false}, {"8 GB", 7578 * MB, 512 * MB, false},
+              {"12 GB", 11360 * MB, 512 * MB, false}, {"16 GB", 15258 * MB, 512 * MB, false}};
+  struct Pic {
+    const char* name;
+    int w, h;
+  } pics[] = {{"26 MP", 6240, 4160}, {"40 MP", 7752, 5178}, {"61 MP", 9568, 6376}};
+  // a quiet phone (MemAvailable = 55 % of the device) with the app idle at 450 MB, and a busy one (MemAvailable = 25 %)
+  for (double availShare : {0.55, 0.25}) {
+    std::printf("  MemAvailable = %.0f %% of the device, app footprint 450 MB, GPU on (unified memory):\n", availShare * 100);
+    std::printf("  %-6s %-8s %-8s %-8s | %-22s | %-22s | %-22s\n", "device", "budget", "ceiling", "room", pics[0].name, pics[1].name, pics[2].name);
+    for (const Dev& d : devs) {
+      xstream::BudgetInputs in;
+      in.available = std::size_t(double(d.total) * availShare);
+      in.total = d.total;
+      in.footprint = 450 * MB;
+      in.lowRam = d.lowRam;
+      in.platform = 1;
+      const xstream::Budget b = xstream::computeBudget(in);
+      std::string cells;
+      for (const Pic& p : pics) {
+        char c[64];
+        const std::size_t std0 = xstream::predictWholePeak(p.w, p.h, false) + xstream::predictGpuExtra(p.w, p.h, false, d.pool);
+        const std::size_t film = xstream::predictWholePeak(p.w, p.h, true) + xstream::predictGpuExtra(p.w, p.h, true, d.pool);
+        std::snprintf(c, sizeof c, "| %-5s %4.0f / %-5s %4.0f ", std0 <= b.bytes ? "whole" : "bands", double(std0) / MB, film <= b.bytes ? "whole" : "bands",
+                      double(film) / MB);
+        cells += c;
+      }
+      std::printf("  %-6s %-8.0f %-8.0f %-8.0f %s\n", d.name, double(b.bytes) / MB, double(b.ceiling) / MB, double(b.room) / MB, cells.c_str());
+      if (availShare > 0.5) {
+        if (d.total >= 11000 * MB) {
+          CHECK(b.bytes == 1536 * MB);  // the ceiling, not 2.6 GB from MemAvailable
+          CHECK(xstream::predictWholePeak(7752, 5178, true) > b.bytes);  // the Note10+ case: 40 MP film streams
+          CHECK(xstream::predictWholePeak(7752, 5178, false) + xstream::predictGpuExtra(7752, 5178, false, d.pool) <= b.bytes);  // 40 MP std stays whole (X-Trans: bands cost 1.4-2x)
+        }
+        if (d.total < 3000 * MB) CHECK(xstream::predictWholePeak(7752, 5178, false) > b.bytes);  // a 3 GB phone streams 40 MP
+      }
+    }
+  }
+  // the old rule (no ceiling) on the desktop: unchanged
+  xstream::BudgetInputs desk;
+  desk.available = 8000 * MB, desk.total = 32000 * MB, desk.footprint = 500 * MB;
+  const xstream::Budget bd = xstream::computeBudget(desk);
+  CHECK(bd.bytes == 4000 * MB - 96 * MB);
+  // low-RAM devices: 384 MB at most, the row cache 96 MB
+  xstream::BudgetInputs lr;
+  lr.available = 1500 * MB, lr.total = 2000 * MB, lr.footprint = 200 * MB, lr.lowRam = true, lr.platform = 1;
+  const xstream::Budget bl = xstream::computeBudget(lr);
+  std::printf("  low-RAM 2 GB: %s\n", bl.how.c_str());
+  CHECK(bl.bytes <= 250 * MB && bl.rowCacheCap == 96 * MB);
+  return 0;
+}
+
+// ---- gpuoom: a GPU allocation failure during a whole-frame export switches the export to bands (42.9) ------------------------------------------------
+static int testGpuOom() {
+  const fs::path xr = sampleRaw();
+  if (xr.empty()) {
+    std::printf("  SKIP: sample missing\n");
+    return 77;
+  }
+  if (dapple_gpu_set_enabled(1) != 1) {
+    std::printf("  SKIP: no GPU executor here\n");
+    return 77;
+  }
+  const fs::path out = root() / "build" / "exp-out" / "gpuoom.jpg";
+  fs::create_directories(out.parent_path());
+  fs::remove(out);
+  setEnv("DAPPLE_EXPORT_STREAM", "auto");
+  setEnv("DAPPLE_EXPORT_BUDGET_MB", "20000");  // the whole frame fits the CPU budget: only the GPU failure can switch it
+  DappleSession* s = dapple_session_open(xr.string().c_str(), DAPPLE_QUALITY_FULL, 0);
+  CHECK(s && dapple_session_is_streaming(s) == 0);
+  if (s) {
+    setEnv("DAPPLE_EXPORT_GPU_OOM", "1");
+    const int rc = dapple_session_export_jpeg(s, "{}", nullptr, 0, 92, out.string().c_str());
+    setEnv("DAPPLE_EXPORT_GPU_OOM", nullptr);
+    std::printf("  whole-frame session, GPU allocation fails: rc %d, %s, file %s\n", rc, dapple_session_is_streaming(s) == 1 ? "switched to bands" : "NOT switched",
+                fs::exists(out) ? "written" : "MISSING");
+    CHECK(rc == DAPPLE_OK && dapple_session_is_streaming(s) == 1 && fs::exists(out) && fs::file_size(out) > 100000);
+    dapple_session_close(s);
+  }
+  setEnv("DAPPLE_EXPORT_BUDGET_MB", nullptr);
+  setEnv("DAPPLE_EXPORT_STREAM", nullptr);
+  return 0;
+}
+
+// ---- memtrim: the memory report and the trim levels (dapple_memory_report_json / dapple_memory_trim) -------------------------------------------------
+static int testMemTrim() {
+  const fs::path a = sampleRaw();
+  if (a.empty()) {
+    std::printf("  SKIP: sample missing\n");
+    return 77;
+  }
+  CHECK(dapple_memory_configure(R"({"totalBytes":12000000000,"memoryClassMb":256,"largeMemoryClassMb":512,"lowRam":false})") == DAPPLE_OK);
+  DappleSession* s = dapple_session_open(a.string().c_str(), DAPPLE_QUALITY_PREVIEW, 1024);  // caches the mosaic
+  CHECK(s != nullptr);
+  auto report = [] {
+    char* j = dapple_memory_report_json();
+    std::string r = j ? j : "";
+    dapple_free_string(j);
+    return r;
+  };
+  const std::string r1 = report();
+  std::printf("  open: %s\n", r1.c_str());
+  CHECK(r1.find("\"sessions\":{\"count\":1") != std::string::npos);
+  CHECK(r1.find("\"deviceTotal\":12000000000") != std::string::npos);
+  if (s) dapple_session_close(s);
+  const std::string r2 = report();
+  CHECK(r2.find("\"sessions\":{\"count\":0") != std::string::npos);
+  CHECK(r2.find("\"mosaicCache\":{\"bytes\":0") == std::string::npos);  // the mosaic is still cached after the close
+  const long long f0 = dapple_memory_trim(0);
+  const std::string r3 = report();
+  std::printf("  trim 0 released %.0f MB: %s\n", double(f0) / 1048576.0, r3.c_str());
+  CHECK(f0 >= 0);
+  const long long f1 = dapple_memory_trim(1);
+  const std::string r4 = report();
+  std::printf("  trim 1 released %.0f MB: %s\n", double(f1) / 1048576.0, r4.c_str());
+  CHECK(r4.find("\"mosaicCache\":{\"bytes\":0") != std::string::npos);
+  CHECK(dapple_memory_trim(2) >= 0);
   return 0;
 }
 
@@ -884,6 +1012,9 @@ int main(int argc, char** argv) {
   else if (id == "capi") rc = testCapi();
   else if (id == "cancel") rc = testCancel();
   else if (id == "policy") rc = testPolicy();
+  else if (id == "budget") rc = testBudget();
+  else if (id == "memtrim") rc = testMemTrim();
+  else if (id == "gpuoom") rc = testGpuOom();
   else {
     std::printf("unknown test %s\n", id.c_str());
     return 2;

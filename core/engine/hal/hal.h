@@ -216,6 +216,10 @@ class Device {
   virtual void trim() = 0;  // release descriptor caches etc.
   virtual double splitGroups() const = 0;
   virtual std::size_t poolBudget() const = 0;
+  // What the driver says this process may still allocate on the device-local heaps (Vulkan VK_EXT_memory_budget: the sum of
+  // heapBudget and of heapUsage over the device-local heaps; the export memory policy, pipeline-architecture.md 42.9). False where
+  // the backend cannot tell (GLES, Vulkan without the extension).
+  virtual bool memoryBudget(std::uint64_t* budget, std::uint64_t* usage) const { (void)budget; (void)usage; return false; }
 };
 
 // Null + `err` set when there is no usable device.

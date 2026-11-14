@@ -30,32 +30,84 @@ Mode envMode() {
   return Mode::Auto;
 }
 
-std::size_t budgetBytes(std::string* how) {
-  if (const char* e = std::getenv("DAPPLE_EXPORT_BUDGET_MB"); e && e[0]) {
-    if (how) *how = "DAPPLE_EXPORT_BUDGET_MB";
-    return std::size_t(std::max(0L, std::atol(e))) << 20;
+Budget computeBudget(const BudgetInputs& in) {
+  constexpr std::size_t MB = std::size_t(1) << 20, kNone = ~std::size_t(0);
+  Budget b;
+  char t[200];
+  if (in.available == 0) {
+    // the query failed (some contexts return 0): a quarter of the device minus half of what the process already holds, in [256 MB, 1 GB]
+    std::size_t s = in.total ? in.total / 4 : 384 * MB;
+    s = s > in.footprint ? s - std::min(in.footprint, s / 2) : s / 2;
+    b.share = std::clamp(s, 256 * MB, 1024 * MB);
+    std::snprintf(t, sizeof t, "available memory unknown: from the device size %.0f MB", double(b.share) / MB);
+  } else {
+    // iOS: os_proc_available_memory is this process's own headroom before jetsam; elsewhere the figure is shared with every other process
+    const double share = in.platform == 2 ? 0.6 : 0.5;
+    const std::size_t reserve = 96 * MB;  // the app's own growth while the export runs (UI, decode of thumbnails)
+    const std::size_t s = std::size_t(double(in.available) * share);
+    b.share = s > reserve ? s - reserve : 0;
+    std::snprintf(t, sizeof t, "available memory %.0f MB x %.1f - 96 = %.0f", double(in.available) / MB, share, double(b.share) / MB);
   }
-  const std::size_t avail = std::getenv("DAPPLE_EXPORT_AVAILABLE_FAILS") ? 0 : mem::available();  // (env: the fallback, tests)
-  if (avail == 0) {
-    // the query failed (some contexts return 0): a quarter of the physical memory minus what the process already holds, at most 1 GB, at
-    // least 256 MB (a 3 GB phone: ~500 MB, enough for any streamed export)
-    const std::size_t phys = mem::physical(), foot = mem::footprint();
-    std::size_t b = phys ? phys / 4 : std::size_t(384) << 20;
-    b = b > foot ? b - std::min(foot, b / 2) : b / 2;
-    b = std::clamp(b, std::size_t(256) << 20, std::size_t(1) << 30);
-    if (how) *how = "available memory unknown: from physical memory";
+  b.how = t;
+  b.ceiling = b.room = b.rowCacheCap = kNone;
+  b.bytes = b.share;
+  if (in.platform != 0 && in.total > 0) {
+    b.ceiling = in.lowRam ? std::min(in.total / 8, 384 * MB) : std::min(in.total / 4, 1536 * MB);
+    b.rowCacheCap = in.lowRam ? 96 * MB : 256 * MB;
+    b.bytes = std::min(b.bytes, b.ceiling);
+    std::snprintf(t, sizeof t, ", ceiling %.0f (device %.0f MB%s)", double(b.ceiling) / MB, double(in.total) / MB, in.lowRam ? ", low RAM" : "");
+    b.how += t;
+    if (in.platform == 1) {
+      const std::size_t cap = std::size_t(double(in.total) * (in.lowRam ? 0.25 : 0.35));
+      b.room = cap > in.footprint ? cap - in.footprint : 0;
+      b.bytes = std::min(b.bytes, b.room);
+      std::snprintf(t, sizeof t, ", room %.0f (process cap %.0f - footprint %.0f)", double(b.room) / MB, double(cap) / MB, double(in.footprint) / MB);
+      b.how += t;
+    }
+  }
+  std::snprintf(t, sizeof t, " -> %.0f MB", double(b.bytes) / MB);
+  b.how += t;
+  return b;
+}
+
+BudgetInputs currentInputs() {
+  BudgetInputs in;
+  in.available = std::getenv("DAPPLE_EXPORT_AVAILABLE_FAILS") ? 0 : mem::available();  // (env: the fallback, tests)
+  in.total = mem::deviceTotal();
+  in.footprint = mem::footprint();
+  in.lowRam = mem::deviceClass().lowRam.load(std::memory_order_relaxed);
+#if defined(__ANDROID__)
+  in.platform = 1;
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+  in.platform = 2;
+#endif
+  if (const char* e = std::getenv("DAPPLE_EXPORT_DEVICE_MB"); e && std::atol(e) > 0) {  // the phone rule on any platform (tests)
+    in.platform = 1;
+    in.total = std::size_t(std::atol(e)) << 20;
+  }
+  return in;
+}
+
+Budget currentBudget() {
+  if (const char* e = std::getenv("DAPPLE_EXPORT_BUDGET_MB"); e && e[0]) {
+    Budget b;
+    b.bytes = b.share = std::size_t(std::max(0L, std::atol(e))) << 20;
+    b.ceiling = b.room = b.rowCacheCap = ~std::size_t(0);
+    b.how = "DAPPLE_EXPORT_BUDGET_MB";
     return b;
   }
-  if (how) *how = "available memory";
-#if defined(__APPLE__)
-  // os_proc_available_memory is this process's own headroom before jetsam (iOS); macOS reports half the machine
-  const double share = 0.6;
-#else
-  const double share = 0.5;  // MemAvailable / available physical memory is shared with every other process
-#endif
-  const std::size_t reserve = std::size_t(96) << 20;  // the app's own growth while the export runs (UI, decode of thumbnails)
-  const std::size_t b = std::size_t(double(avail) * share);
-  return b > reserve ? b - reserve : 0;
+  return computeBudget(currentInputs());
+}
+
+std::size_t budgetBytes(std::string* how) {
+  Budget b = currentBudget();
+  if (how) *how = std::move(b.how);
+  return b.bytes;
+}
+
+std::size_t predictGpuExtra(int W, int H, bool film, std::size_t poolBytes) {
+  const double px = double(std::max(W, 0)) * double(std::max(H, 0));
+  return std::size_t(px * (film ? 24.0 : 2.0)) + std::min(poolBytes, std::size_t(320) << 20);
 }
 
 std::size_t trimForExport(const std::uint64_t keepMosaic[2]) {
@@ -71,7 +123,7 @@ std::size_t predictWholePeak(int W, int H, bool film) {
   return std::size_t(px * (12.0 + 3.0 + 4.0 + (film ? 55.0 : 0.0)));  // calibrated on the desktop runs (6 threads): 61 MP std +1.05 GB, film +4.3 GB
 }
 
-bool openLazy(int W, int H, std::string* why) {
+bool openLazy(int W, int H, std::string* why, std::size_t extraBytes, bool film) {
   const Mode m = envMode();
   char b[160];
   if (m == Mode::Off) {
@@ -83,9 +135,10 @@ bool openLazy(int W, int H, std::string* why) {
     return true;
   }
   std::string how;
-  const std::size_t need = predictWholePeak(W, H, false), budget = budgetBytes(&how);
-  std::snprintf(b, sizeof b, "whole-frame peak %.0f MB vs budget %.0f MB (%s)", double(need) / 1048576.0, double(budget) / 1048576.0, how.c_str());
-  if (why) *why = b;
+  const std::size_t need = predictWholePeak(W, H, film) + extraBytes, budget = budgetBytes(&how);
+  std::snprintf(b, sizeof b, "whole-frame peak %.0f MB (%sGPU %.0f) vs budget %.0f MB", double(need) / 1048576.0, film ? "film, " : "", double(extraBytes) / 1048576.0,
+                double(budget) / 1048576.0);
+  if (why) *why = std::string(b) + " (" + how + ")";
   return need > budget;
 }
 

@@ -421,6 +421,14 @@ class DeviceBackend final : public GpuBackend {
     if (!gpu) why = std::string("slower than the CPU node here (") + it->second.note + ")";
     return gpu;
   }
+  bool trim() override {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!gpu_ && !dev_) return false;
+    if (dev_) dev_->waitIdle();
+    gpu_.reset();  // its buffers first (they live on dev_)
+    dev_.reset();  // the second device of the process (the executor has its own): driver memory, pipelines, descriptor pools
+    return true;
+  }
   bool run(const Desc& d, Rect roi, float* out, std::size_t stride, std::string& why) override {
     std::lock_guard<std::mutex> lk(mu_);
     if (!ensure(why)) return false;

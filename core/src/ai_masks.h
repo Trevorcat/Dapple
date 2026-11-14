@@ -4,7 +4,7 @@
 // classical prior (sky), registered in the raster store of the local adjustments (local_eval.h) under stable string ids
 //
 //   ai:<photo>:<key>      <photo> = 16 hex digits of photoIdOf(); key = hair faceskin bodyskin clothes person background | depth | sky |
-//                         f<N>:face|eyes|iris|sclera|lips|teeth|brows (N = 1.. faces, largest first) | tap:<taps>  (taps = "+412,531;-200,700")
+//                         f<N>:face|eyes|iris|sclera|lips|teeth|mouth|brows|undereye (N = 1.. faces, largest first) | tap:<taps>  (taps = "+412,531;-200,700")
 //
 // The id alone says what to compute, so a plane that is missing (cache wipe, another device) can be re-created from its id.
 //
@@ -62,6 +62,9 @@ struct FaceFeatures {
   bool open = false;      // mouthOpen >= kMouthOpen and the inner polygon holds visible teeth
   Plane face;             // always (oval)
   Plane eyes, iris, sclera, lips, teeth, brows;  // frontal faces only (teeth: open mouth with bright low-chroma pixels inside)
+  Plane mouth;            // frontal faces, open mouth (mouthOpen >= kMouthOpen): the filled inner-lip loop, whether or not teeth show (43.4/43.6)
+  float box[4] = {0, 0, 0, 0};  // mesh extent, pixels of the input image: x0 y0 x1 y1
+  float cx = 0, cy = 0;   // midpoint of the iris centres, pixels
   Plane undereye;         // frontal faces only: the crescent below each eye (portrait retouch, docs/engine/pipeline-architecture.md 43.4)
   float iod = 0;          // inter-ocular distance (iris centres 468 / 473), pixels of the input image
 };
@@ -71,6 +74,14 @@ constexpr float kFrontalYawDeg = 28.f;
 constexpr float kMouthOpen = 0.10f;
 // rgb may be null (the teeth plane is then the inner mouth polygon of an open mouth, unrefined).
 bool faceFeatures(const FaceMesh& m, int w, int h, const std::uint8_t* rgb, int stride, FaceFeatures& out);
+
+// The feature keys ("face", "eyes", ...) of a face that exist as planes: the entries of the faces group, in this order.
+std::vector<std::string> faceFeatureKeys(const FaceFeatures& f);
+// Group meta of the faces group: {"count":n,"list":[{"index":1,"box":[x0,y0,x1,y1],"yaw":..,"frontal":..,"mouth_open":..,"teeth":..,"iod":..,"center":[x,y],"planes":[..]}]}
+// (photo normalised; iod = inter-ocular distance / long edge; index = 1-based, largest first). `faces` in the order of the planes ids f1, f2 ...
+std::string facesMetaJson(const std::vector<FaceFeatures>& faces, int w, int h);
+// The "list":[...] array text of a faces meta ("[]" when absent).
+std::string facesListOfMeta(const std::string& meta);
 
 struct PartPlanes {
   Plane hair, faceSkin, bodySkin, clothes, person, background;
@@ -116,7 +127,7 @@ ParsedId parseId(const std::string& id);
 std::string makeId(const std::string& photo, const std::string& key);
 
 // ---- cache files ----------------------------------------------------------------------------------------------------------------------
-constexpr int kEpoch = 4;  // algorithm version: bump when a builder changes (old cache files are then misses)
+constexpr int kEpoch = 5;  // algorithm version: bump when a builder changes (old cache files are then misses)
 struct SetEntry {
   std::string key;  // "hair", "f1:lips" ...
   Plane plane;
@@ -212,6 +223,7 @@ struct Result {
   std::vector<GroupStatus> groups;
   bool personFound = false;
   int faceCount = 0;
+  std::string facesList;  // JSON array of the faces (facesMetaJson "list"), "face_list" of the job JSON
   bool skyFound = false;
   double renderMs = 0, totalMs = 0;
   std::string json() const;

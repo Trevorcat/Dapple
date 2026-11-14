@@ -3,6 +3,7 @@
 #include "dapple/dapple_c.h"
 #include "file_util.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -49,6 +50,10 @@
 #include "color.h"
 #include "export_stream.h"  // streaming (band) export, docs/engine/pipeline-architecture.md section 42
 #include "mem_probe.h"
+#include "engine/nodes/film/film_nodes.h"  // releaseFrameWorkspaces (dapple_memory_trim)
+#if defined(__ANDROID__) || defined(__linux__)
+#include <malloc.h>
+#endif
 #if defined(__ANDROID__)
 #include <android/log.h>
 #elif defined(__APPLE__)
@@ -66,7 +71,24 @@
 static void stageLog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));  // defined below (streaming export logs, section 42)
 static double msSince(std::chrono::steady_clock::time_point t0);
 
+struct DappleSession;
+// Live sessions (dapple_memory_report_json, pipeline-architecture.md 42.9): registered for their whole lifetime.
+static std::mutex& sessionRegistryMutex() {
+  static std::mutex m;
+  return m;
+}
+static std::vector<DappleSession*>& sessionRegistry() {
+  static std::vector<DappleSession*> v;
+  return v;
+}
+
 struct DappleSession {
+  DappleSession() {
+    std::lock_guard<std::mutex> lk(sessionRegistryMutex());
+    sessionRegistry().push_back(this);
+  }
+  DappleSession(const DappleSession&) = delete;
+  DappleSession& operator=(const DappleSession&) = delete;
   dapple::SourceImage source;
   const dapple::CameraProfile* camera = nullptr;  // &cameraOwned: the profile with this file's exposure anchor
   dapple::CameraProfile cameraOwned;
@@ -107,6 +129,11 @@ struct DappleSession {
   std::atomic<bool> hintRunning{false};
   std::atomic<std::uint64_t> swatchSeq{0};  // dapple_session_base_previews: the newest request (or cancel) wins
   ~DappleSession() {
+    {
+      std::lock_guard<std::mutex> lk(sessionRegistryMutex());
+      auto& v = sessionRegistry();
+      v.erase(std::remove(v.begin(), v.end(), this), v.end());
+    }
     dapple::aimask::cancelOwner(this);  // AI mask jobs hold a pointer to this session
     dapple::aimask::waitOwner(this);
     for (int i = 0; i < 5000 && matchBusy.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -124,6 +151,8 @@ struct DappleSession {
   std::shared_ptr<dapple::xstream::Analyses> streamA;  // exact reductions of the lazy picture (first streamed render)
   std::shared_ptr<dapple::xstream::BandSource> bands;  // the band source of the export in flight: its row cache carries the analysis pass's rows to the render
   bool streamFilm = false;                             // the export in flight is a film edit (its bands need more memory: a smaller row cache)
+  bool gpuOom = false;                                 // the last GPU export of this session failed to allocate on the device (42.9)
+  bool retryBands = false;                             // ... and the whole-frame render gave up for the export to switch to bands
   std::filesystem::path fullRawPath;                   // a FULL open of a RAW at natural size (an export may switch it to bands: demoteToStream)
   DappleProgressFn exportProgress = nullptr;           // dapple_session_set_export_progress
   void* exportProgressUser = nullptr;
@@ -136,6 +165,13 @@ namespace fs = std::filesystem;
 
 thread_local std::string g_lastError;
 thread_local bool tlHintFrame = false;  // set on the touch-hint worker: its frames are not real frames
+thread_local int tlExportFilm = -1;     // dapple_export_intent: the next FULL open on this thread exports an edit with (1) / without (0) a film stock
+thread_local bool tlExportCall = false;  // inside dapple_session_export_jpeg(_hdr)(_ex): a GPU allocation failure may switch the export to bands (42.9)
+struct ExportCallScope {
+  bool prev = tlExportCall;
+  ExportCallScope() { tlExportCall = true; }
+  ~ExportCallScope() { tlExportCall = prev; }
+};
 
 void setError(std::string message) { g_lastError = std::move(message); }
 
@@ -493,7 +529,42 @@ bool gpuExport(DappleSession* s, const EditParams& params, Renderer& renderer, c
     }
     return true;
   };
-  return s->exportEngine.exportGpu(e, nullptr, nullptr) == 0;
+  if (const char* t = std::getenv("DAPPLE_EXPORT_GPU_OOM"); t && t[0] == '1') {  // tests: the device allocation fails (export_stream.gpuoom)
+    s->gpuOom = true;
+    return false;
+  }
+  std::string err;
+  const int r = s->exportEngine.exportGpu(e, nullptr, &err);
+  // an allocation failure on the device (pipeline-architecture.md 42.9): the caller switches a full-size export to bands instead of a slower whole-frame
+  // CPU render that needs even more memory
+  if (r != 0 && (err.find("out of memory") != std::string::npos || err.find("OutOfMemory") != std::string::npos ||
+                 err.find("vkAllocateMemory") != std::string::npos || err.find("VkResult -2") != std::string::npos))
+    s->gpuOom = true;
+  return r == 0;
+}
+
+// What a whole-frame GPU export of a W x H picture adds on this device (42.9). `extra` counts on unified memory (the GPU's images come out of the RAM
+// the CPU budget is about); `fits` = false when the driver's budget (VK_EXT_memory_budget) cannot hold the resident source, the film images and the
+// pool. No active device: nothing to add, fits.
+struct GpuWhole {
+  bool active = false, unified = false, fits = true;
+  std::size_t extra = 0, need = 0, free = 0;
+};
+GpuWhole gpuWholeCheck(int W, int H, bool film) {
+  GpuWhole g;
+  if (!dapple::engine::gpu::runtimeEnabled()) return g;
+  dapple::engine::GpuProvider* p = dapple::engine::gpuProvider();
+  dapple::engine::GpuProvider::MemoryInfo mi;
+  if (!p || !p->enabled() || !p->memoryInfo(&mi)) return g;
+  g.active = true;
+  g.unified = mi.unified;
+  g.need = std::size_t(double(W) * double(H) * (film ? 32.0 : 8.0)) + std::min<std::size_t>(mi.poolBudget, std::size_t(320) << 20);
+  if (mi.unified) g.extra = xstream::predictGpuExtra(W, H, film, mi.poolBudget);
+  if (mi.budget > 0) {
+    g.free = mi.budget > mi.usage ? std::size_t(mi.budget - mi.usage) : 0;
+    g.fits = g.need <= g.free;
+  }
+  return g;
 }
 #endif
 
@@ -549,7 +620,25 @@ bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const cha
   renderer.setToneReach(toneReach);
 #ifdef DAPPLE_HAVE_GPU
   dapple::engine::gpu::installProvider();
-  if (dapple::engine::gpu::runtimeEnabled() && toneReach == 1.f && (outLongEdge <= 0 || outLongEdge >= 1500) && gpuExport(s, params, renderer, lut.get(), outLongEdge, out)) return true;
+  if (dapple::engine::gpu::runtimeEnabled() && toneReach == 1.f && (outLongEdge <= 0 || outLongEdge >= 1500)) {
+    const int W = s->source.linear.width, H = s->source.linear.height;
+    const bool fullSize = outLongEdge <= 0 || outLongEdge >= std::max(W, H);
+    const GpuWhole g = fullSize ? gpuWholeCheck(W, H, renderer.filmActive()) : GpuWhole{};
+    if (!g.fits) {  // the driver's budget cannot hold it: no attempt (an allocation failure halfway costs seconds and memory)
+      stageLog("export: the GPU has %.0f MB free for this %dx%d frame, it needs ~%.0f MB: not tried on the GPU", double(g.free) / 1048576.0, W, H,
+               double(g.need) / 1048576.0);
+      s->gpuOom = true;
+    } else {
+      s->gpuOom = false;
+      if (gpuExport(s, params, renderer, lut.get(), outLongEdge, out)) return true;
+    }
+    if (s->gpuOom && fullSize && tlExportCall && !s->fullRawPath.empty() && !s->lazyOpen.load() && xstream::envMode() != xstream::Mode::Off) {
+      // full size, and the session can stream: the export switches to bands (the caller: retryInBands) rather than a whole-frame CPU render
+      s->retryBands = true;
+      setError("the GPU ran out of memory: the export continues in bands");
+      return false;
+    }
+  }
 #endif
   if (outLongEdge > 0 && std::max(s->source.linear.width, s->source.linear.height) > outLongEdge) {
     // the Resize node of the engine (exports and previews do not keep large copies)
@@ -623,9 +712,17 @@ std::shared_ptr<const xstream::Analyses> lazyAnalyses(DappleSession* s, xstream:
   xstream::BandSource& bs = *s->bands;
   {  // the row cache: what the budget leaves after the streaming machinery itself (measured on a phone: ~2700 full-width float rows, ~4100 for a
      // film: 310 / 470 MB at 61 MP), at most half the budget; DAPPLE_EXPORT_CACHE_MB overrides (0 = off)
-    const std::size_t budget = xstream::budgetBytes();
+    // phones: at most 256 MB (42.9): the cache buys 10-40 % of the time, the peak is what gets an app killed
+    const xstream::Budget bud = xstream::currentBudget();
+    const std::size_t budget = bud.bytes;
     const std::size_t machinery = std::size_t(s->lazy->width) * (s->streamFilm ? 4100u : 2700u) * 12u;
-    std::size_t cb = budget > machinery ? std::min(budget - machinery, budget / 2) : 0;
+    // X-Trans: a window demosaiced again costs ~4x a Bayer one (Note10+, 40 MP film: 29 windows = 26 s of 45 s with a 227 MB cache), so the whole
+    // picture is cached when it is at most 512 MB (40 MP: 481 MB) and the budget has room for it
+    std::size_t cap = bud.rowCacheCap;
+    const std::size_t whole = std::size_t(s->lazy->width) * std::size_t(s->lazy->height) * 12u;
+    if (s->lazy->mosaic && s->lazy->mosaic->cfa == CfaKind::XTrans && whole <= (std::size_t(512) << 20) && !mem::deviceClass().lowRam.load())
+      cap = std::max(cap, whole);
+    std::size_t cb = budget > machinery ? std::min({budget - machinery, budget / 2, cap}) : 0;
     if (const char* e = std::getenv("DAPPLE_EXPORT_CACHE_MB")) cb = std::size_t(std::max(0L, std::atol(e))) << 20;
     bs.setCacheBudget(cb);
   }
@@ -1427,10 +1524,29 @@ static DappleSession* openLazySession(const fs::path& p, const DecodeOptions& op
   // the budget is what is available NOW, after dropping what the export can do without (other photos' mosaics, film workspaces, idle AI models)
   const std::size_t foot0 = mem::footprint();
   std::size_t trimmed = xstream::trimForExport(z->mosaic->key);
-  dapple_ai_release(0);
+  dapple_ai_release(1);  // every model (42.9: an export never runs one, except to re-create a missing plane, which loads it again)
+#ifdef DAPPLE_HAVE_GPU
+  if (engine::GpuProvider* gp = engine::gpuProvider()) trimmed += gp->trimPool(0);  // the editor's free pool images (up to 512 MB on a phone)
+#endif
+#if defined(__ANDROID__) && defined(M_PURGE)
+  mallopt(M_PURGE, 0);  // the pages freed above go back to the OS before the footprint is read
+#endif
   const std::size_t foot1 = mem::footprint();
   std::string policy;
-  const bool lazy = xstream::openLazy(z->width, z->height, &policy);
+  // the edit when the app announced it (dapple_export_intent on this thread): a film export decides here instead of decoding the whole picture
+  // first and giving it back at the export (demoteToStream)
+  const bool film = tlExportFilm == 1;
+  tlExportFilm = -1;
+  std::size_t gpuExtra = 0;
+  bool gpuFits = true;
+#ifdef DAPPLE_HAVE_GPU
+  {
+    const GpuWhole g = gpuWholeCheck(z->width, z->height, film);  // unified memory: the GPU export's images come out of the same RAM (42.9)
+    gpuExtra = g.extra;
+    gpuFits = g.fits;
+  }
+#endif
+  const bool lazy = xstream::openLazy(z->width, z->height, &policy, gpuExtra, film) || (!gpuFits && xstream::envMode() == xstream::Mode::Auto);
   stageLog("session_open %s: trim before the export decision released %.0f MB of caches (footprint %.0f -> %.0f MB); %s -> %s", pathToUtf8(p.filename()).c_str(),
            double(trimmed) / 1048576.0, double(foot0) / 1048576.0, double(foot1) / 1048576.0, policy.c_str(), lazy ? "stream" : "whole frame");
   if (!lazy) return nullptr;
@@ -2436,7 +2552,8 @@ int streamExportJpeg(DappleSession* s, const EditParams& ep, const char* lutPath
                      const char* exportJson, bool hdr, float headroom, DappleHdrInfo* info);
 // An edit that cannot stream on a lazy session: the whole frame if it fits the device, else a clean error (never a kill by the OS).
 bool wholeFrameFits(DappleSession* s, const EditParams& ep);
-void demoteToStream(DappleSession* s, const EditParams& ep);
+void demoteToStream(DappleSession* s, const EditParams& ep, bool force = false);
+bool retryInBands(DappleSession* s, const EditParams& ep);
 }  // namespace
 
 int32_t dapple_session_export_jpeg(DappleSession* session, const char* params_json, const char* lut_path,
@@ -2474,7 +2591,12 @@ int32_t exportJpegImpl(DappleSession* session, const char* params_json, const ch
             if (r != 0) return r > 0 ? DAPPLE_OK : DAPPLE_ERROR;
             if (!wholeFrameFits(session, ep)) return DAPPLE_ERROR;
           }
-          if (!renderSessionParams(session, ep, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
+          const ExportCallScope exportCall;
+          if (!renderSessionParams(session, ep, lut_path, out_long_edge, img)) {
+            if (!retryInBands(session, ep)) return DAPPLE_ERROR;
+            const int r = streamExportJpeg(session, ep, lut_path, out_long_edge, jpeg_quality, out_path, export_json, false, 0.f, nullptr);  // 42.9
+            return r > 0 ? DAPPLE_OK : DAPPLE_ERROR;
+          }
         }
         const double renderMs = msSince(t0);
         JpegOptions jo;
@@ -2597,14 +2719,24 @@ bool writeBytesAtomic(const fs::path& path, const std::vector<std::uint8_t>& byt
 // ---- streaming export (section 42): the JPEG / Ultra HDR export of a lazy session -------------------------------------------------------------
 // An edit the open did not foresee (a film stock: ~55 B/px more than a plain export) on a session that holds the whole float picture: when the
 // whole-frame export would not fit, the session gives its picture back and exports in bands from the cached mosaic (same pixels).
-void demoteToStream(DappleSession* s, const EditParams& ep) {
-  if (s->lazyOpen.load() || s->fullRawPath.empty() || xstream::envMode() != xstream::Mode::Auto || dapple::engine::mode() != dapple::engine::Mode::Full) return;
+void demoteToStream(DappleSession* s, const EditParams& ep, bool force) {
+  if (s->lazyOpen.load() || s->fullRawPath.empty() || dapple::engine::mode() != dapple::engine::Mode::Full) return;
+  if (xstream::envMode() == xstream::Mode::Off || (xstream::envMode() == xstream::Mode::On && !force)) return;
   const int W = s->source.linear.width, H = s->source.linear.height;
   const std::size_t held = std::size_t(W) * H * 12;  // the float picture is already there
-  const std::size_t need = xstream::predictWholePeak(W, H, Renderer(ep, *s->camera, nullptr).filmActive());
+  const bool film = Renderer(ep, *s->camera, nullptr).filmActive();
+  std::size_t need = xstream::predictWholePeak(W, H, film);
+  bool gpuFits = true;
+#ifdef DAPPLE_HAVE_GPU
+  {  // the GPU executor renders a whole-frame export where it can: on unified memory its images come out of the same RAM; its own heap must hold it
+    const GpuWhole g = gpuWholeCheck(W, H, film);
+    need += g.extra;
+    gpuFits = g.fits;
+  }
+#endif
   std::string how;
   const std::size_t budget = xstream::budgetBytes(&how);
-  if (need <= held + budget) return;
+  if (!force && gpuFits && need <= held + budget) return;
   std::string why;
   auto z = openFullLazy(s->fullRawPath, DecodeOptions{}, &why);
   if (!z || z->width != W || z->height != H) return;
@@ -2613,8 +2745,20 @@ void demoteToStream(DappleSession* s, const EditParams& ep) {
   s->source.linear = ImageF();
   s->lazy = std::make_unique<LazyFull>(std::move(*z));
   s->lazyOpen = true;
-  stageLog("export: whole frame needs %.0f MB more, the device has %.0f MB (%s): the session switches to bands (picture released)", double(need - held) / 1048576.0,
-           double(budget) / 1048576.0, how.c_str());
+  if (force) stageLog("export: the GPU could not allocate the whole frame: the session switches to bands (picture released)");
+  else if (!gpuFits) stageLog("export: the GPU's memory budget cannot hold the whole frame: the session switches to bands (picture released)");
+  else
+    stageLog("export: whole frame needs %.0f MB more, the device has %.0f MB (%s): the session switches to bands (picture released)", double(need - held) / 1048576.0,
+             double(budget) / 1048576.0, how.c_str());
+}
+
+// A whole-frame render gave up because the GPU ran out of memory (renderSessionParams set retryBands): switch the session to bands. True = the
+// export continues with streamExportJpeg.
+bool retryInBands(DappleSession* s, const EditParams& ep) {
+  if (!s->retryBands) return false;
+  s->retryBands = false;
+  demoteToStream(s, ep, true);
+  return s->lazyOpen.load();
 }
 
 bool wholeFrameFits(DappleSession* s, const EditParams& ep) {
@@ -2822,7 +2966,14 @@ int32_t exportJpegHdrImpl(DappleSession* session, const char* params_json, const
           if (!wholeFrameFits(session, params)) return DAPPLE_ERROR;
         }
         Image8 img;
-        if (!renderSessionParams(session, params, lut_path, out_long_edge, img)) return DAPPLE_ERROR;
+        {
+          const ExportCallScope exportCall;
+          if (!renderSessionParams(session, params, lut_path, out_long_edge, img)) {
+            if (!retryInBands(session, params)) return DAPPLE_ERROR;
+            const int r = streamExportJpeg(session, params, lut_path, out_long_edge, jpeg_quality, out_path, export_json, true, headroom_stops, info);  // 42.9
+            return r > 0 ? DAPPLE_OK : DAPPLE_ERROR;
+          }
+        }
         JpegOptions jo;
         if (jpeg_quality > 0) jo.quality = jpeg_quality > 100 ? 100 : jpeg_quality;
         if (!applyExportMeta(session, export_json, img, jo)) return DAPPLE_ERROR;
@@ -3136,6 +3287,173 @@ char* dapple_memory_json(void) {
 }
 
 int32_t dapple_session_is_streaming(DappleSession* session) { return session && session->lazyOpen.load() ? 1 : 0; }
+
+// ---- memory: device class, report, trim (pipeline-architecture.md 42.9) ---------------------------------------------------------------------
+namespace {
+// The mosaic cache's budget on a phone: one 61 MP mosaic (121 MB) and a neighbour, never more than 1/32 of the device (3 GB: 96 MB, 8 GB: 256 MB).
+[[maybe_unused]] std::size_t mosaicBudgetFor(std::size_t total, bool lowRam) {
+  constexpr std::size_t MB = std::size_t(1) << 20;
+  return lowRam ? std::size_t(64) * MB : std::clamp(total / 32, std::size_t(96) * MB, std::size_t(320) * MB);
+}
+std::string memoryReport() {
+  char b[1024];
+  std::size_t sessPx = 0, sessBytes = 0;
+  int sessions = 0, lazy = 0;
+  {
+    std::lock_guard<std::mutex> lk(sessionRegistryMutex());
+    for (DappleSession* s : sessionRegistry()) {
+      ++sessions;
+      const std::size_t px = std::size_t(std::max(0, s->source.linear.width)) * std::size_t(std::max(0, s->source.linear.height));
+      sessPx += px;
+      sessBytes += px * 12;
+      if (s->lazyOpen.load()) ++lazy;
+    }
+  }
+  std::size_t mosBytes = 0, mosBudget = 0;
+  int mosEntries = 0;
+  mosaicCacheUsage(&mosBytes, &mosBudget, &mosEntries);
+  unsigned long long heapAlloc = 0, heapRetained = 0;
+#if defined(__ANDROID__) || defined(__linux__)
+  {
+    const struct mallinfo mi = mallinfo();
+    heapAlloc = (unsigned long long)(unsigned)mi.uordblks;
+    heapRetained = (unsigned long long)(unsigned)mi.fordblks;
+  }
+#endif
+  unsigned long long pooled = 0, poolBudget = 0, gpuBudget = 0, gpuUsage = 0;
+  int unified = -1;
+#ifdef DAPPLE_HAVE_GPU
+  if (dapple::engine::GpuProvider* p = dapple::engine::gpuProvider()) {
+    dapple::engine::GpuProvider::MemoryInfo mi;
+    if (p->memoryInfo(&mi)) pooled = mi.pooled, poolBudget = mi.poolBudget, gpuBudget = mi.budget, gpuUsage = mi.usage, unified = mi.unified ? 1 : 0;
+  }
+#endif
+  const xstream::Budget bud = xstream::currentBudget();
+  std::snprintf(b, sizeof b,
+                "{\"footprint\":%llu,\"available\":%llu,\"deviceTotal\":%llu,\"lowRam\":%s,\"nativeHeap\":{\"allocated\":%llu,\"free\":%llu},"
+                "\"sessions\":{\"count\":%d,\"lazy\":%d,\"pictureBytes\":%llu},\"mosaicCache\":{\"bytes\":%llu,\"budget\":%llu,\"entries\":%d},"
+                "\"gpu\":{\"pooled\":%llu,\"poolBudget\":%llu,\"budget\":%llu,\"usage\":%llu,\"unified\":%d},\"ai\":{\"modelBytes\":%llu},"
+                "\"exportBudget\":{\"bytes\":%llu,\"how\":\"%s\"}}",
+                (unsigned long long)mem::footprint(), (unsigned long long)mem::available(), (unsigned long long)mem::deviceTotal(),
+                mem::deviceClass().lowRam.load() ? "true" : "false", heapAlloc, heapRetained, sessions, lazy, (unsigned long long)sessBytes,
+                (unsigned long long)mosBytes, (unsigned long long)mosBudget, mosEntries, pooled, poolBudget, gpuBudget, gpuUsage, unified,
+                (unsigned long long)dapple::aimask::rt::resident(), (unsigned long long)bud.bytes, esc(bud.how).c_str());
+  (void)sessPx;
+  return b;
+}
+// One short line for the log: the figures that move.
+std::string memoryLine() {
+  std::size_t mosBytes = 0;
+  int mosEntries = 0;
+  mosaicCacheUsage(&mosBytes, nullptr, &mosEntries);
+  int sessions = 0;
+  std::size_t sessBytes = 0;
+  {
+    std::lock_guard<std::mutex> lk(sessionRegistryMutex());
+    for (DappleSession* s : sessionRegistry()) {
+      ++sessions;
+      sessBytes += std::size_t(std::max(0, s->source.linear.width)) * std::size_t(std::max(0, s->source.linear.height)) * 12;
+    }
+  }
+  std::size_t pooled = 0;
+#ifdef DAPPLE_HAVE_GPU
+  if (dapple::engine::GpuProvider* p = dapple::engine::gpuProvider()) {
+    dapple::engine::GpuProvider::MemoryInfo mi;
+    if (p->memoryInfo(&mi)) pooled = mi.pooled;
+  }
+#endif
+  unsigned long long heapAlloc = 0;
+#if defined(__ANDROID__) || defined(__linux__)
+  heapAlloc = (unsigned long long)(unsigned)mallinfo().uordblks;
+#endif
+  char b[320];
+  std::snprintf(b, sizeof b, "footprint %.0f MB, native heap in use %.0f MB, %d sessions (%.0f MB of pictures), mosaic cache %.0f MB (%d), GPU pool %.0f MB, AI models %.0f MB",
+                double(mem::footprint()) / 1048576.0, double(heapAlloc) / 1048576.0, sessions, double(sessBytes) / 1048576.0, double(mosBytes) / 1048576.0,
+                mosEntries, double(pooled) / 1048576.0, double(dapple::aimask::rt::resident()) / 1048576.0);
+  return b;
+}
+}  // namespace
+
+int32_t dapple_export_intent(const char* params_json) {
+  return guarded(
+      [&]() -> int32_t {
+        tlExportFilm = -1;
+        EditParams ep;
+        if (!params_json || !parseParams(params_json, ep)) return DAPPLE_ERROR;
+        const CameraProfile cam;
+        tlExportFilm = Renderer(ep, cam, nullptr).filmActive() ? 1 : 0;
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+int32_t dapple_memory_configure(const char* json) {
+  return guarded(
+      [&]() -> int32_t {
+        if (!json) return DAPPLE_ERROR;
+        const std::string j = json;
+        auto num = [&](const char* key, double* out) {
+          const std::string k = std::string("\"") + key + "\"";
+          const std::size_t p = j.find(k);
+          if (p == std::string::npos) return false;
+          const std::size_t c = j.find(':', p + k.size());
+          if (c == std::string::npos) return false;
+          char* end = nullptr;
+          const double v = std::strtod(j.c_str() + c + 1, &end);
+          if (end == j.c_str() + c + 1) return false;
+          *out = v;
+          return true;
+        };
+        mem::DeviceClass& d = mem::deviceClass();
+        double v = 0;
+        if (num("totalBytes", &v) && v > 0) d.totalBytes.store(std::size_t(v));
+        if (num("memoryClassMb", &v)) d.memoryClassMb.store(int(v));
+        if (num("largeMemoryClassMb", &v)) d.largeMemoryClassMb.store(int(v));
+        if (const std::size_t p = j.find("\"lowRam\""); p != std::string::npos) d.lowRam.store(j.find("true", p) == j.find_first_not_of(" :", p + 8));
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+        setMosaicCacheBudget(mosaicBudgetFor(mem::deviceTotal(), d.lowRam.load()));
+#endif
+        const xstream::Budget bud = xstream::currentBudget();
+        stageLog("memory_configure: device %.0f MB%s, memory class %d / %d MB; export budget now %s", double(mem::deviceTotal()) / 1048576.0,
+                 d.lowRam.load() ? " (low RAM)" : "", d.memoryClassMb.load(), d.largeMemoryClassMb.load(), bud.how.c_str());
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
+}
+
+char* dapple_memory_report_json(void) {
+  return guarded([&]() -> char* { return dupString(memoryReport()); }, static_cast<char*>(nullptr));
+}
+
+int64_t dapple_memory_trim(int32_t level) {
+  return guarded(
+      [&]() -> int64_t {
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string before = memoryLine();
+        std::size_t freed = 0;
+        // the cached mosaics (80 - 121 MB each): reopening a photo unpacks it again (~1 s), the editor closed or memory is short
+        freed += trimMosaicCache(0);
+        if (level >= 2) clearMosaicCache();  // and the exposure anchors
+        freed += engine::filmnode::releaseFrameWorkspaces();
+#ifdef DAPPLE_HAVE_GPU
+        if (engine::GpuProvider* p = engine::gpuProvider()) freed += p->trimPool(0);
+        const bool demosaicDevice = demosaic::gpuBackend() && demosaic::gpuBackend()->trim();  // the decoder's own GPU device (created again on use)
+#else
+        const bool demosaicDevice = false;
+#endif
+        dapple_ai_release(level >= 1 ? 1 : 0);
+        if (level >= 1) local::resetPlaneCache();
+#if defined(__ANDROID__) && defined(M_PURGE)
+        mallopt(M_PURGE, 0);  // hand the allocator's free pages back to the OS (scudo / jemalloc purge)
+#elif defined(__linux__)
+        malloc_trim(0);
+#endif
+        stageLog("memory_trim %d: released %.0f MB of caches%s in %.0f ms; before: %s; after: %s", int(level), double(freed) / 1048576.0,
+                 demosaicDevice ? " and the demosaic GPU device" : "", msSince(t0), before.c_str(), memoryLine().c_str());
+        return int64_t(freed);
+      },
+      int64_t(-1));
+}
 
 // Not part of the C API (not in dapple_c.h): the test suite reads the bright-rendition shift of a modern rendering (EV, see modernWhiteEv).
 extern "C" float dapple_internal_modern_white_ev(DappleSession* session, const char* params_json) {

@@ -42,7 +42,7 @@ struct Label {
 const Label kLabels[] = {{"hair", "头发"},     {"faceskin", "脸部皮肤"}, {"bodyskin", "身体皮肤"}, {"clothes", "衣服"}, {"person", "人物"},
                          {"background", "背景"}, {"depth", "深度"},       {"sky", "天空 (粗略)"},  {"face", "脸"},       {"eyes", "眼睛"},
                          {"iris", "虹膜"},       {"sclera", "眼白"},      {"lips", "嘴唇"},        {"teeth", "牙齿"},     {"brows", "眉毛"},
-                         {"undereye", "眼下"}};
+                         {"undereye", "眼下"}, {"mouth", "口腔"}};
 std::string labelOf(const std::string& key) {
   std::string k = key;
   if (k.size() > 3 && k[0] == 'f' && k[2] == ':') k = k.substr(3);
@@ -174,6 +174,7 @@ std::string Result::json() const {
   std::string j = "{\"state\":\"" + state + "\",\"message\":\"" + esc(message) + "\",\"person_found\":" + (personFound ? "true" : "false");
   std::snprintf(b, sizeof b, ",\"faces\":%d,\"sky_found\":%s,\"render_ms\":%.1f,\"total_ms\":%.1f", faceCount, skyFound ? "true" : "false", renderMs, totalMs);
   j += b;
+  j += ",\"face_list\":" + (facesList.empty() ? std::string("[]") : facesList);
   j += ",\"groups\":[";
   for (std::size_t i = 0; i < groups.size(); ++i) {
     std::snprintf(b, sizeof b, ",\"ms\":%.1f}", groups[i].ms);
@@ -287,31 +288,21 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
           std::vector<FaceMesh> meshes;
           res = rt::faces(im, maxFaces, meshes, ctl.cancel);
           if (res.ok) {
-            std::string fj;
-            int n = 0;
+            std::vector<FaceFeatures> fl;
             for (const FaceMesh& m : meshes) {
               FaceFeatures ff;
               if (!faceFeatures(m, rend.w, rend.h, rend.rgb.data(), rend.w * 3, ff)) continue;
-              ++n;
-              const std::string p = "f" + std::to_string(n) + ":";
-              set.entries.push_back({p + "face", ff.face});
-              if (ff.frontal) {
-                set.entries.push_back({p + "eyes", ff.eyes});
-                set.entries.push_back({p + "iris", ff.iris});
-                set.entries.push_back({p + "sclera", ff.sclera});
-                set.entries.push_back({p + "lips", ff.lips});
-                if (ff.open && !ff.teeth.empty()) set.entries.push_back({p + "teeth", ff.teeth});
-                set.entries.push_back({p + "brows", ff.brows});
-                if (!ff.undereye.empty()) set.entries.push_back({p + "undereye", ff.undereye});
+              const std::string p = "f" + std::to_string(fl.size() + 1) + ":";
+              const std::vector<std::string> keys = faceFeatureKeys(ff);
+              for (const std::string& k : keys) {
+                const Plane* pl = k == "face" ? &ff.face : k == "eyes" ? &ff.eyes : k == "iris" ? &ff.iris : k == "sclera" ? &ff.sclera : k == "lips" ? &ff.lips
+                                  : k == "teeth" ? &ff.teeth : k == "mouth" ? &ff.mouth : k == "brows" ? &ff.brows : &ff.undereye;
+                set.entries.push_back({p + k, *pl});
               }
-              char b[200];
-              // iod: inter-ocular distance as a fraction of the photo's long edge = the "face" scale of a retouch adjustment (docs section 43.5)
-              std::snprintf(b, sizeof b, "%s{\"yaw\":%.1f,\"frontal\":%s,\"mouth_open\":%.3f,\"teeth\":%s,\"iod\":%.5f}", fj.empty() ? "" : ",",
-                            ff.yawDeg, ff.frontal ? "true" : "false", ff.mouthOpen, ff.open && !ff.teeth.empty() ? "true" : "false",
-                            ff.iod / float(std::max(1, std::max(rend.w, rend.h))));
-              fj += b;
+              fl.push_back(std::move(ff));
             }
-            set.meta = "{\"count\":" + std::to_string(n) + ",\"list\":[" + fj + "]}";
+            // iod: inter-ocular distance as a fraction of the photo's long edge = the "face" scale of a retouch adjustment (docs section 43.5)
+            set.meta = facesMetaJson(fl, rend.w, rend.h);
           }
         } else if (g.bit == kTaskDepth) {
           rt::DepthOut d;
@@ -362,6 +353,7 @@ Result compute(const Source& src, int tasks, int maxFaces, bool force, const Con
       if (g.bit == kTaskFaces) {
         const auto k = set.meta.find("\"count\":");
         r.faceCount = k == std::string::npos ? 0 : std::atoi(set.meta.c_str() + k + 8);
+        r.facesList = facesListOfMeta(set.meta);
         if (!r.faceCount) gs.message = "no face mesh found";
       }
       if (sky) {

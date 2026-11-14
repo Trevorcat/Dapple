@@ -375,6 +375,15 @@ void logMosaicRefusal(const std::string& reason) {  // once per reason
 
 std::size_t trimMosaicCacheExcept(const std::uint64_t key[2]) { return mosaicCache().trimExcept(key[0], key[1]); }
 
+void setMosaicCacheBudget(std::size_t bytes) { mosaicCache().setBudget(bytes); }
+void mosaicCacheUsage(std::size_t* bytes, std::size_t* budget, int* entries) {
+  const demosaic::CacheStats st = mosaicCache().stats();
+  if (bytes) *bytes = st.bytes;
+  if (budget) *budget = mosaicCache().budget();
+  if (entries) *entries = mosaicCache().entries();
+}
+std::size_t trimMosaicCache(std::size_t keepBytes) { return mosaicCache().trimTo(keepBytes); }
+
 void clearMosaicCache() {
   mosaicCache().clear();
   std::lock_guard<std::mutex> lk(g_anchorMu);

@@ -74,6 +74,12 @@ Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, i
 void clearMosaicCache();
 // Drops every cached mosaic / demosaiced picture but the mosaic of `key` (MosaicImage::key): the trim before a streaming export. Bytes released.
 std::size_t trimMosaicCacheExcept(const std::uint64_t key[2]);
+// Memory (docs/engine/pipeline-architecture.md 42.9): the process-wide cache's budget (default 700 MB on the desktop; dapple_memory_configure sets a
+// phone's from its memory: min(total / 32, 320 MB), at least one 61 MP mosaic), what it holds, and an eviction down to `keepBytes` (least recently used
+// first; 0 = everything). The exposure anchors (a few hundred bytes per file) are dropped by clearMosaicCache only.
+void setMosaicCacheBudget(std::size_t bytes);
+void mosaicCacheUsage(std::size_t* bytes, std::size_t* budget, int* entries);
+std::size_t trimMosaicCache(std::size_t keepBytes);
 // Entries the cache served without decoding / decoded (tests).
 void mosaicCacheCounters(unsigned long long* hits, unsigned long long* misses);
 

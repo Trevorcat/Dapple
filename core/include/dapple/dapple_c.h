@@ -571,6 +571,27 @@ DAPPLE_API int32_t dapple_session_is_streaming(DappleSession* session);
  * the export policy derives from it. Free with dapple_free_string. */
 DAPPLE_API char* dapple_memory_json(void);
 
+/* ---- Memory: device class, report, trim (docs/engine/pipeline-architecture.md 42.9) -------------------------------------------------------
+ * The device's memory class as the app knows it, once at start-up (Android: ActivityManager.MemoryInfo.totalMem, getMemoryClass(),
+ * getLargeMemoryClass(), isLowRamDevice()): {"totalBytes":12000000000,"memoryClassMb":256,"largeMemoryClassMb":512,"lowRam":false}. Missing keys
+ * keep their value; without a call the engine reads the physical memory itself. Sets the export ceiling (42.9) and the mosaic cache budget.
+ * DAPPLE_OK, DAPPLE_ERROR on malformed JSON. */
+DAPPLE_API int32_t dapple_memory_configure(const char* json);
+/* What the engine holds, per cache / pool, in bytes: {"footprint":..,"available":..,"nativeHeap":{"allocated":..,"retained":..},
+ * "sessions":{"count":..,"pictureBytes":..},"mosaicCache":{"bytes":..,"budget":..,"entries":..},"gpu":{"pooled":..,"poolBudget":..,"budget":..,
+ * "usage":..,"unified":..},"film":{"frameWorkspaces":..},"ai":{"modelBytes":..},"exportBudget":{"bytes":..,"how":".."}}. Free with dapple_free_string. */
+DAPPLE_API char* dapple_memory_report_json(void);
+/* Gives memory back. level 0 = idle (the editor closed): the cached mosaics, the GPU pool's free images, the film workspaces and idle AI models
+ * freed, the allocator's free pages returned; 1 = pressure (Android TRIM_MEMORY_RUNNING_LOW / UI_HIDDEN): also every AI model and the mask plane
+ * cache; 2 = critical (RUNNING_CRITICAL / BACKGROUND / COMPLETE): also the per-file exposure anchors. Never touches
+ * what open sessions hold. Returns the bytes released (cache accounting; the process footprint drops when the allocator returns the pages), and
+ * logs one line with the report before / after. */
+DAPPLE_API int64_t dapple_memory_trim(int32_t level);
+/* The edit of the export that follows: the next DAPPLE_QUALITY_FULL dapple_session_open on THIS thread takes its whole-frame / bands decision with
+ * the edit known (a film stock needs ~55 B/px more) instead of decoding the whole picture first and giving it back at the export. Optional; consumed
+ * by that open. DAPPLE_OK, DAPPLE_ERROR on malformed params. */
+DAPPLE_API int32_t dapple_export_intent(const char* params_json);
+
 #ifdef __cplusplus
 }
 #endif

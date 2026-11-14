@@ -97,7 +97,7 @@ bool readComponent(const JValue& c, MaskComponent& m) {
       rd(c, "cx", m.cx), rd(c, "cy", m.cy), rd(c, "rx", m.rx), rd(c, "ry", m.ry), rd(c, "angle", m.angle), rd(c, "feather", m.feather);
       break;
     case MaskKind::Luminance:
-      rd(c, "lo", m.lo), rd(c, "hi", m.hi), rd(c, "feather", m.lumFeather);
+      rd(c, "lo", m.lo), rd(c, "hi", m.hi), rd(c, "feather", m.lumFeather), rd(c, "refine", m.refine);
       break;
     case MaskKind::Colour:
       rd(c, "hue", m.hue), rd(c, "range", m.hueRange), rd(c, "feather", m.hueFeather), rd(c, "satMin", m.satMin);
@@ -214,7 +214,7 @@ void writeComponent(std::string& o, const MaskComponent& m) {
   switch (m.kind) {
     case MaskKind::Linear: f("x0", m.x0), f("y0", m.y0), f("x1", m.x1), f("y1", m.y1); break;
     case MaskKind::Radial: f("cx", m.cx), f("cy", m.cy), f("rx", m.rx), f("ry", m.ry), f("angle", m.angle), f("feather", m.feather); break;
-    case MaskKind::Luminance: f("lo", m.lo), f("hi", m.hi), f("feather", m.lumFeather); break;
+    case MaskKind::Luminance: f("lo", m.lo), f("hi", m.hi), f("feather", m.lumFeather), f("refine", m.refine); break;
     case MaskKind::Colour: f("hue", m.hue), f("range", m.hueRange), f("feather", m.hueFeather), f("satMin", m.satMin); break;
     case MaskKind::Brush:
       o += ",\"strokes\":[";
@@ -498,7 +498,7 @@ std::uint64_t localHash(const std::vector<LocalAdjustment>& list) {
       switch (m.kind) {
         case MaskKind::Linear: f(m.x0), f(m.y0), f(m.x1), f(m.y1); break;
         case MaskKind::Radial: f(m.cx), f(m.cy), f(m.rx), f(m.ry), f(m.angle), f(m.feather); break;
-        case MaskKind::Luminance: f(m.lo), f(m.hi), f(m.lumFeather); break;
+        case MaskKind::Luminance: f(m.lo), f(m.hi), f(m.lumFeather), f(m.refine); break;
         case MaskKind::Colour: f(m.hue), f(m.hueRange), f(m.hueFeather), f(m.satMin); break;
         case MaskKind::Brush:
           mix(m.strokes.size());

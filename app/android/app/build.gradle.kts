@@ -78,10 +78,11 @@ android {
     // model files are stored as they are: copied once to app storage at first use (AiModelsPlugin.kt); deflate would save about 7 % and cost start-up time
     androidResources {
         noCompress += listOf("tflite", "ort")
+        // packaging.resources.excludes does not apply to assets; the aapt ignore-assets pattern does (merged assets of every variant)
+        if (!aiDepth) ignoreAssetsPatterns += "!depth.ort"
     }
 
     packaging {
-        if (!aiDepth) resources.excludes += "assets/ai-models/depth.ort"  // -Pdapple.aiDepth=false
         jniLibs {
             excludes += if (project.hasProperty("dapple.x86"))
                 listOf("lib/armeabi-v7a/**", "lib/x86/**")
@@ -90,6 +91,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Native engine is always optimised (AGP would otherwise pass CMAKE_BUILD_TYPE=Debug: -O0, unusable speed). Same flags as release;
+            // -g (added below for every variant) keeps symbols in the unstripped libs for crash symbolisation.
+            externalNativeBuild { cmake { arguments("-DCMAKE_BUILD_TYPE=Release") } }
+        }
         release {
             // Debug keys so `flutter run --release` works; replace for real distribution.
             signingConfig = signingConfigs.getByName("debug")

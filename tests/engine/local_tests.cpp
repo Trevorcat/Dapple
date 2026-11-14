@@ -320,6 +320,7 @@ void testComponents() {
   {
     MaskComponent m;
     m.kind = MaskKind::Luminance;
+    m.refine = 0.f;  // per-pixel L* (the analytic formula); spatial coherence (section 40.10) is tested in retouch_tests rangesmooth
     m.lo = 40.f, m.hi = 70.f, m.lumFeather = 10.f;
     auto f = local::bind(one(m), src, false);
     for (float Y : {0.02f, 0.1f, 0.18f, 0.3f, 0.45f, 0.6f, 0.9f}) {

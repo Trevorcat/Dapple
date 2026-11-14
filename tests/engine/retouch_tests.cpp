@@ -397,6 +397,328 @@ void testBands() {
   CHECK(std::memcmp(out.row(0), in.row(0), std::size_t(in.width) * in.height * 3 * sizeof(float)) == 0);
 }
 
+// ---- complexion invariance (section 43, round 2) --------------------------------------------------------------------------------------------
+// several ops in one frame, each on its own channel, amount k inside the face ellipse
+void unitFrameOps(UnitFrame& u, const ImageF& img, const std::vector<std::pair<int, float>>& ops) {
+  u.f = local::Frame{};
+  u.f.retouchW = true;
+  u.f.anyWindow = true;
+  const int w = img.width, h = img.height;
+  const std::size_t N = std::size_t(w) * h;
+  u.data.assign(N * ops.size(), 0.f);
+  const float L = float(std::max(w, h)), sx = float(w) / L, sy = float(h) / L;
+  for (int& s : u.aux.slot) s = -1;
+  for (std::size_t c = 0; c < ops.size(); ++c) {
+    u.f.chanOp[c] = ops[c].first;
+    u.f.winUsed[ops[c].first - kLocalWindowFirst] = true;
+    u.aux.slot[c] = int(c);
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        const float X = (x + 0.5f) / L, Y = (y + 0.5f) / L;
+        const float fx = (X - kP.cx * sx) / kP.ax(), fy = (Y - kP.cy * sy) / kP.ay();
+        u.data[c * N + std::size_t(y) * w + x] = ops[c].second * std::clamp((0.9f - std::sqrt(fx * fx + fy * fy)) / 0.1f, 0.f, 1.f);
+      }
+  }
+  u.aux.data = u.data.data();
+  u.aux.ox = 0, u.aux.oy = 0, u.aux.w = w, u.aux.h = h;
+  u.aux.plane = N;
+}
+
+// OKLab of an sRGB-encoded pixel
+void okLab(const float* p, float o[3]) {
+  float l[3];
+  for (int c = 0; c < 3; ++c) l[c] = p[c] <= 0.04045f ? p[c] / 12.92f : std::pow((p[c] + 0.055f) / 1.055f, 2.4f);
+  const float L = std::cbrt(0.4122214708f * l[0] + 0.5363325363f * l[1] + 0.0514459929f * l[2]);
+  const float M = std::cbrt(0.2119034982f * l[0] + 0.6806995451f * l[1] + 0.1073969566f * l[2]);
+  const float S = std::cbrt(0.0883024619f * l[0] + 0.2817188376f * l[1] + 0.6299787005f * l[2]);
+  o[0] = 0.2104542553f * L + 0.7936177850f * M - 0.0040720468f * S;
+  o[1] = 1.9779984951f * L - 2.4285922050f * M + 0.4505937099f * S;
+  o[2] = 0.0259040371f * L + 0.7827717662f * M - 0.8086757660f * S;
+}
+struct Complexion {
+  double L = 0, a = 0, b = 0, sat = 0, n = 0;
+};
+// mean OKLab and mean saturation (chroma / lightness) over the pixels where `w` >= 0.99 (and optionally inside a disc to skip)
+Complexion complexionOf(const ImageF& im, const std::vector<float>& w, float skipX = -1, float skipY = -1, float skipR = 0) {
+  Complexion c;
+  for (int y = 0; y < im.height; ++y)
+    for (int x = 0; x < im.width; ++x) {
+      if (w[std::size_t(y) * im.width + x] < 0.99f) continue;
+      if (skipR > 0 && (x - skipX) * (x - skipX) + (y - skipY) * (y - skipY) < skipR * skipR) continue;
+      float o[3];
+      okLab(im.row(y) + 3 * std::size_t(x), o);
+      c.L += o[0], c.a += o[1], c.b += o[2], c.sat += std::sqrt(o[1] * o[1] + o[2] * o[2]) / std::max(o[0], 0.05f), c.n += 1;
+    }
+  if (c.n > 0) c.L /= c.n, c.a /= c.n, c.b /= c.n, c.sat /= c.n;
+  return c;
+}
+double dE(const Complexion& p, const Complexion& q) { return 100.0 * std::sqrt((p.L - q.L) * (p.L - q.L) + (p.a - q.a) * (p.a - q.a) + (p.b - q.b) * (p.b - q.b)); }
+
+// tan skin: shading, a cheek blush (low frequency, part of the face), pores, mild mottling and two red blotches; display-encoded
+ImageF tanPatch(int w, int h, float iodPx, bool blotches) {
+  ImageF im(w, h);
+  const float cx = 0.5f * w, cy = 0.5f * h;
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const float dx = (x - cx) / iodPx, dy = (y - cy) / iodPx;
+      const float shade = 1.f - 0.10f * dx - 0.05f * (dx * dx + dy * dy);
+      const float blush = std::exp(-((dx - 0.3f) * (dx - 0.3f) + (dy - 0.2f) * (dy - 0.2f)) / (2 * 0.3f * 0.3f));
+      float r = 0.80f * shade + 0.05f * blush, g = 0.60f * shade - 0.02f * blush, b = 0.47f * shade - 0.01f * blush;
+      const float n = 0.02f * (hash01(std::uint32_t(x), std::uint32_t(y), 21) - 0.5f) + 0.012f * vnoise(float(x), float(y), 0.1f * iodPx, 22);
+      r += n, g += n, b += n;
+      if (blotches) {
+        const float bl[2][2] = {{-0.35f, -0.2f}, {0.15f, 0.35f}};
+        for (const auto& q : bl) {
+          const float e = ((dx - q[0]) * (dx - q[0]) + (dy - q[1]) * (dy - q[1])) / (0.05f * 0.05f);
+          const float wgt = std::exp(-0.5f * e);
+          r += 0.04f * wgt, g -= 0.07f * wgt, b -= 0.04f * wgt;
+        }
+      }
+      float* p = im.row(y) + 3 * std::size_t(x);
+      p[0] = std::clamp(r, 0.f, 1.f), p[1] = std::clamp(g, 0.f, 1.f), p[2] = std::clamp(b, 0.f, 1.f);
+    }
+  return im;
+}
+// red excess (OKLab a) of a disc relative to a ring around it
+double redExcess(const ImageF& im, float cx, float cy, float r) {
+  double in = 0, ring = 0;
+  int ni = 0, nr = 0;
+  for (int y = int(cy - 2.5f * r); y <= int(cy + 2.5f * r); ++y)
+    for (int x = int(cx - 2.5f * r); x <= int(cx + 2.5f * r); ++x) {
+      if (x < 0 || y < 0 || x >= im.width || y >= im.height) continue;
+      const float d = std::hypot(x - cx, y - cy);
+      float o[3];
+      okLab(im.row(y) + 3 * std::size_t(x), o);
+      if (d < r) in += o[1], ++ni;
+      else if (d > 1.8f * r && d < 2.5f * r) ring += o[1], ++nr;
+    }
+  return ni && nr ? in / ni - ring / nr : 0;
+}
+
+// per-channel pixel noise (sensor / demosaic chroma noise and the colour texture of real skin: pores are slightly redder, fine capillaries)
+void addChromaNoise(ImageF& im, float amp) {
+  for (int y = 0; y < im.height; ++y)
+    for (int x = 0; x < im.width; ++x)
+      for (int c = 0; c < 3; ++c) {
+        float& v = im.row(y)[3 * x + c];
+        v = std::clamp(v + amp * (hash01(std::uint32_t(x), std::uint32_t(y), 40u + std::uint32_t(c)) - 0.5f), 0.f, 1.f);
+      }
+}
+
+void testComplexion() {
+  // (a) tan patch: the blotches go, the blush and the tan stay
+  const int w = 600, h = 600;
+  const float iod = 300.f;
+  for (float k : {0.5f, 1.f}) {
+    ImageF in = tanPatch(w, h, iod, true), clean = tanPatch(w, h, iod, false);
+    addChromaNoise(in, 0.05f), addChromaNoise(clean, 0.05f);
+    std::vector<float> all(std::size_t(w) * h, 1.f);
+    UnitFrame u;
+    u.f = local::Frame{};
+    unitFrameOps(u, in, {{kLoEven, k}, {kLoRedness, k}});
+    std::fill(u.data.begin(), u.data.end(), k);  // the whole patch is skin
+    ImageF out = in;
+    local::retouchCombineWindow(u.f, out, u.aux, local::retouchRadii(iod));
+    const Complexion c0 = complexionOf(in, all), c1 = complexionOf(out, all), cc = complexionOf(clean, all);
+    const float bx = 0.5f * w + (-0.35f) * iod, by = 0.5f * h + (-0.2f) * iod, br = 0.05f * iod;
+    const double ex0 = redExcess(in, bx, by, br), ex1 = redExcess(out, bx, by, br);
+    const float ux = 0.5f * w + 0.3f * iod, uy = 0.5f * h + 0.2f * iod;  // blush centre vs the far side of the patch
+    float ob0[3], ob1[3], of0[3], of1[3];
+    okLab(in.row(int(uy)) + 3 * std::size_t(ux), ob0), okLab(out.row(int(uy)) + 3 * std::size_t(ux), ob1);
+    okLab(in.row(int(0.5f * h - 0.3f * iod)) + 3 * std::size_t(0.5f * w - 0.6f * iod), of0);
+    okLab(out.row(int(0.5f * h - 0.3f * iod)) + 3 * std::size_t(0.5f * w - 0.6f * iod), of1);
+    const double blush0 = ob0[1] - of0[1], blush1 = ob1[1] - of1[1];
+    std::printf("  tan patch, even + redness %3.0f: skin mean dE %.2f (vs the clean patch %.2f), saturation ratio %.4f; blotch red excess %.4f -> %.4f (%.0f %% "
+                "removed); blush (a) %.4f -> %.4f\n",
+                k * 100, dE(c0, c1), dE(cc, c1), c1.sat / c0.sat, ex0, ex1, 100 * (1 - ex1 / ex0), blush0, blush1);
+    CHECK(dE(c0, c1) <= 1.0);
+    CHECK(std::fabs(c1.sat / c0.sat - 1.0) <= 0.02);
+    CHECK(ex1 < (k >= 1.f ? 0.4 : 0.7) * ex0);
+    CHECK(blush1 > 0.8 * blush0);
+  }
+  // (b) the synthetic portrait at the app's default recipe and at the maxima: each op alone and together
+  const SourceImage s = makePortrait(800, 1000, false);
+  ImageF in = displayPatch(s);
+  addChromaNoise(in, 0.05f);
+  const local::RetouchRadii R = local::retouchRadii(kP.iod * 1000.f);
+  struct Case {
+    const char* name;
+    std::vector<std::pair<int, float>> ops;
+  };
+  const Case cases[] = {{"default skin recipe (30 / 25 / 30)", {{kLoSmooth, 0.3f}, {kLoEven, 0.25f}, {kLoRedness, 0.3f}}},
+                        {"maxima (100 / 60 / 70)", {{kLoSmooth, 1.f}, {kLoEven, 0.6f}, {kLoRedness, 0.7f}}},
+                        {"even 100", {{kLoEven, 1.f}}},
+                        {"redness 100", {{kLoRedness, 1.f}}},
+                        {"smooth 100", {{kLoSmooth, 1.f}}},
+                        {"shine 80 (skin outside the forehead shine)", {{kLoShine, 0.8f}}}};
+  for (const Case& c : cases) {
+    UnitFrame u;
+    unitFrameOps(u, in, c.ops);
+    ImageF out = in;
+    local::retouchCombineWindow(u.f, out, u.aux, R);
+    std::vector<float> inner(u.aux.plane);
+    for (std::size_t i = 0; i < inner.size(); ++i) inner[i] = u.data[i] >= c.ops[0].second * 0.999f ? 1.f : 0.f;
+    // shine: measure the skin outside the specular patch (forehead, 0.95 iod above the centre)
+    const float sx = kP.cx * 800.f, sy = (kP.cy - 0.95f * kP.iod) * 1000.f, sr = c.ops[0].first == kLoShine ? 0.4f * kP.iod * 1000.f : 0.f;
+    const Complexion c0 = complexionOf(in, inner, sx, sy, sr), c1 = complexionOf(out, inner, sx, sy, sr);
+    std::printf("  portrait, %-44s skin mean dE %.2f, L %+.4f, saturation ratio %.4f\n", c.name, dE(c0, c1), c1.L - c0.L, c1.sat / c0.sat);
+    CHECK(dE(c0, c1) <= 1.0);
+    CHECK(std::fabs(c1.sat / c0.sat - 1.0) <= 0.02);
+  }
+}
+
+// ---- one retouch scale for a near and a far face (section 43.1) --------------------------------------------------------------------------------
+// A near face (iod 160 px) and a far face (iod 53 px, a third) retouched at their own scale, at the near face's and at the far face's scale:
+// the high-band change (texture) and the mid-band reduction (the retouch) of each face. Writes build/retouch/r2/twoscales.ppm (rows: near,
+// far; columns: original | own scale | near-face scale | far-face scale) when DAPPLE_RETOUCH_SHEETS is set.
+struct BandEffect {
+  double hChange = 0, mRemoved = 0;
+};
+BandEffect smoothAt(const ImageF& in, float iodRun, float iodTruth, ImageF* outImg) {
+  UnitFrame u;
+  unitFrame(u, in, kLoSmooth, 1.f);
+  ImageF out = in;
+  local::retouchCombineWindow(u.f, out, u.aux, local::retouchRadii(iodRun));
+  // measured with the face's TRUE bands (its own scale)
+  const local::RetouchRadii T = local::retouchRadii(iodTruth);
+  local::RtPlanes P0, P1;
+  local::retouchPlanes(u.f, in, u.aux, T, P0);
+  local::retouchPlanes(u.f, out, u.aux, T, P1);
+  const std::vector<float> Y0 = lumaOf(in), Y1 = lumaOf(out);
+  double h2 = 0, dh2 = 0, m0 = 0, m1 = 0, n = 0;
+  for (int y = 0; y < in.height; ++y)
+    for (int x = 0; x < in.width; ++x) {
+      const std::size_t i = std::size_t(y) * in.width + x;
+      if (u.data[i] < 1.f) continue;
+      const double H0 = Y0[i] - P0.Lf[i], H1 = Y1[i] - P1.Lf[i], M0 = P0.Lf[i] - P0.Lc(x, y), M1 = P1.Lf[i] - P0.Lc(x, y);
+      h2 += H0 * H0, dh2 += (H1 - H0) * (H1 - H0), m0 += M0 * M0, m1 += M1 * M1, n += 1;
+    }
+  if (outImg) *outImg = out;
+  BandEffect e;
+  e.hChange = std::sqrt(dh2 / h2), e.mRemoved = 1.0 - std::sqrt(m1 / m0);
+  return e;
+}
+void testTwoScales() {
+  const SourceImage nearS = makePortrait(800, 1000, false), farS = makePortrait(267, 333, false);
+  ImageF nearI = displayPatch(nearS), farI = displayPatch(farS);
+  addChromaNoise(nearI, 0.03f), addChromaNoise(farI, 0.03f);
+  const float iN = kP.iod * 1000.f, iF = kP.iod * 333.f;
+  ImageF tiles[2][4];
+  tiles[0][0] = nearI, tiles[1][0] = farI;
+  const float runs[3] = {0, iN, iF};
+  const char* names[3] = {"own scale", "near-face scale", "far-face scale"};
+  BandEffect e[2][3];
+  for (int face = 0; face < 2; ++face)
+    for (int r = 0; r < 3; ++r) {
+      const ImageF& in = face ? farI : nearI;
+      const float truth = face ? iF : iN;
+      e[face][r] = smoothAt(in, r == 0 ? truth : runs[r], truth, &tiles[face][r + 1]);
+      std::printf("  %s face (iod %3.0f px) smoothed 100 at the %-16s: high band changed %5.1f %%, mid band removed %5.1f %%\n", face ? "far " : "near", truth,
+                  names[r], 100 * e[face][r].hChange, 100 * e[face][r].mRemoved);
+    }
+  // the rule (the largest face): the near face is exact; the far face keeps its texture and is retouched less
+  CHECK(e[0][1].hChange < 0.05 && e[1][1].hChange < 0.05);
+  CHECK(e[1][1].mRemoved > 0.4);
+  if (std::getenv("DAPPLE_RETOUCH_SHEETS")) {  // a sheet: rows near / far (far upscaled 3x nearest), columns original | own | near | far
+    const int tw = 800, th = 1000;
+    std::vector<std::uint8_t> px(std::size_t(4 * tw) * (2 * th) * 3, 255);
+    for (int face = 0; face < 2; ++face)
+      for (int c = 0; c < 4; ++c) {
+        const ImageF& im = tiles[face][c];
+        const int sc = face ? 3 : 1;
+        for (int y = 0; y < th; ++y)
+          for (int x = 0; x < tw; ++x) {
+            const int sx = x / sc, sy = y / sc;
+            if (sx >= im.width || sy >= im.height) continue;
+            for (int k = 0; k < 3; ++k)
+              px[(std::size_t(face * th + y) * 4 * tw + std::size_t(c * tw + x)) * 3 + k] = std::uint8_t(std::clamp(im.row(sy)[3 * sx + k], 0.f, 1.f) * 255.f + 0.5f);
+          }
+      }
+    std::FILE* fp = std::fopen("build/retouch/r2/twoscales.ppm", "wb");
+    if (fp) {
+      std::fprintf(fp, "P6\n%d %d\n255\n", 4 * tw, 2 * th);
+      std::fwrite(px.data(), 1, px.size(), fp);
+      std::fclose(fp);
+    }
+  }
+}
+
+// ---- luminance-range mask coherence (section 40.10; the phone report: "blocky / dithered" range masks on foliage) --------------------------
+// A foliage-like texture (pixel-scale luminance swinging +-1 EV around the range's edge) below a bright sky: mask of a luminance range with a
+// narrow feather, per pixel (refine 0) vs coherent (refine 50). Metrics: pixel-scale change / 4-px-scale change of the mask (~1 for a
+// pixel-binary dither, << 1 for coherent regions), the share of the change on 2- and 3-px block boundaries (1 = no block structure), the
+// sky / tree edge position.
+double scaleRatio(const std::vector<float>& m, int w, int h, int x0, int x1, int y0, int y1) {
+  double e1 = 0, e4 = 0;
+  for (int y = y0; y < y1; ++y)
+    for (int x = x0; x + 4 < x1; ++x) {
+      const float a = m[std::size_t(y) * w + x];
+      e1 += std::fabs(m[std::size_t(y) * w + x + 1] - a), e4 += std::fabs(m[std::size_t(y) * w + x + 4] - a);
+    }
+  return e4 > 0 ? e1 / e4 : 0;
+}
+double blockShare(const std::vector<float>& m, int w, int h, int n) {
+  std::vector<double> e(std::size_t(n), 0.0);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x + 1 < w; ++x) e[std::size_t((x + 1) % n)] += std::fabs(m[std::size_t(y) * w + x + 1] - m[std::size_t(y) * w + x]);
+  double tot = 0, mx = 0;
+  for (double v : e) tot += v, mx = std::max(mx, v);
+  return tot > 0 ? mx / tot * n : 1.0;
+}
+void testRangeSmooth() {
+  const int W = 1024, H = 768;
+  SourceImage src;
+  src.sceneReferred = true;
+  src.linear = ImageF(W, H);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      float Y;
+      if (y < H / 3) Y = 0.6f;  // sky
+      else Y = 0.035f * std::exp2(2.f * (hash01(std::uint32_t(x), std::uint32_t(y), 7) - 0.5f) + 0.6f * vnoise(float(x), float(y), 40.f, 8));
+      float* p = src.linear.row(y) + 3 * std::size_t(x);
+      p[0] = Y * 0.9f, p[1] = Y * 1.05f, p[2] = Y * (y < H / 3 ? 1.3f : 0.6f);
+    }
+  double e1Pixel = 0;
+  for (float refine : {0.f, 50.f}) {
+    std::vector<LocalAdjustment> L(1);
+    L[0].id = "lum";
+    MaskComponent m;
+    m.kind = MaskKind::Luminance;
+    m.lo = 22.f, m.hi = 100.f, m.lumFeather = 4.f, m.refine = refine;  // a narrow feather: the threshold sits inside the foliage's swing
+    L[0].mask.push_back(m);
+    L[0].ops.v[kLoExposure] = 1.f;
+    const std::shared_ptr<const local::Frame> f = local::bind(L, src, false);
+    CHECK(f != nullptr);
+    if (!f) return;
+    std::vector<float> mk(std::size_t(W) * H);
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x) {
+        const float* p = src.linear.row(y) + 3 * std::size_t(x);
+        mk[std::size_t(y) * W + x] = local::maskOf(*f, 0, (x + 0.5f) / W, (y + 0.5f) / H, p, p);
+      }
+    const double ratio = scaleRatio(mk, W, H, 0, W, H / 2, H);
+    double e1 = 0, mean = 0;
+    for (int y = H / 2; y < H; ++y)
+      for (int x = 0; x + 1 < W; ++x) e1 += std::fabs(mk[std::size_t(y) * W + x + 1] - mk[std::size_t(y) * W + x]), mean += mk[std::size_t(y) * W + x];
+    std::printf("  refine %3.0f: foliage mean mask %.3f, mean pixel-to-pixel change %.4f\n", refine, mean / (double(W - 1) * (H / 2)), e1 / (double(W - 1) * (H / 2)));
+    const double b2 = blockShare(mk, W, H, 2), b3 = blockShare(mk, W, H, 3);
+    // the sky / tree edge: the row where the column mean drops below 0.5 (sky = selected)
+    int edge = -1;
+    for (int y = 0; y < H && edge < 0; ++y) {
+      double s = 0;
+      for (int x = 0; x < W; ++x) s += mk[std::size_t(y) * W + x];
+      if (s / W < 0.5) edge = y;
+    }
+    std::printf("  refine %3.0f: pixel / 4-px change %.2f (foliage), block share n=2 %.2f n=3 %.2f, sky edge at row %d (true %d)\n", refine, ratio, b2, b3, edge,
+                H / 3);
+    CHECK(b2 < 1.1 && b3 < 1.1);  // no 2x2 / 3x3 block structure
+    if (refine == 0.f) e1Pixel = e1;
+    if (refine > 0.f) {
+      CHECK(e1 < 0.25 * e1Pixel);  // the mask changes pixel to pixel at least 4x less: regions, not a per-pixel dither
+    }
+  }
+}
+
 // ---- scale invariance ------------------------------------------------------------------------------------------------------------------
 ImageF downsample2(const ImageF& a) {
   ImageF o(a.width / 2, a.height / 2);
@@ -1032,7 +1354,7 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"json", testJson},   {"bands", testBands},       {"scale", testScale},       {"blobs", testBlobs},
                      {"heal", testHeal},   {"whiten", testWhiten},     {"identity", testIdentity}, {"tiles", testTiles},
-                     {"interactive", testInteractive}, {"undereye", testUnderEye}, {"rasters", testRasters},
+                     {"interactive", testInteractive}, {"undereye", testUnderEye}, {"rasters", testRasters}, {"complexion", testComplexion}, {"twoscales", testTwoScales}, {"rangesmooth", testRangeSmooth},
 #ifdef DAPPLE_RETOUCH_GPU
                      {"parity", testParity},
 #endif

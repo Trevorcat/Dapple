@@ -59,6 +59,12 @@ class MosaicCache {
   // Drops every entry but the mosaic of key (k0, k1) (a streaming export frees what other photos left; entries in use stay alive through their
   // shared_ptr). Returns the bytes the cache no longer holds.
   std::size_t trimExcept(std::uint64_t k0, std::uint64_t k1);
+  // Memory (pipeline-architecture.md 42.9): the budget (evicts at once down to it), and an eviction of the least recently used entries until at most
+  // `keepBytes` remain (0 = all; entries in use stay alive through their shared_ptr). trimTo returns the bytes the cache no longer holds.
+  void setBudget(std::size_t bytes);
+  std::size_t budget() const;
+  std::size_t trimTo(std::size_t keepBytes);
+  int entries() const;
 
  private:
   struct Entry {
