@@ -96,7 +96,7 @@ endif()
 
 # ---------------------------------------------------------------------------
 # AI masks (core/ai, core/src/ai_masks.cpp; docs/engine/pipeline-architecture.md section 41).
-#   DAPPLE_AI = ON | OFF | AUTO. AUTO: ON for Android arm64-v8a / x86_64 when the runtime libraries are staged under tools/ai-rt, OFF on desktop.
+#   DAPPLE_AI = ON | OFF | AUTO. AUTO: ON for Android arm64-v8a / x86_64 when the runtime libraries are staged under tools/ai-rt, OFF on desktop and on Apple (iOS / macOS: pass -DDAPPLE_AI=ON, scripts/ios/build-engine.sh does).
 #   Desktop ON needs the official onnxruntime-win-x64 package (tools/ai-rt/dl/ort_win_x64): only depth / MobileSAM tap run there (no LiteRT desktop
 #   library exists); with DAPPLE_AI OFF the C API functions exist and report "unavailable".
 # Runtime libraries per ABI (tools/ai-rt/jniLibs/<abi>/, the same files Gradle packages): arm64-v8a LiteRT 1.4 + the minimal ONNX Runtime build
@@ -120,6 +120,11 @@ if(_ai_enable)
     set(DAPPLE_AI_LITERT_ROOT ${_ai_rt}/dl/litert_1_4 CACHE PATH "" FORCE)
     set(DAPPLE_AI_ORT_INCLUDE ${_ai_rt}/dl/ort_android/headers CACHE PATH "" FORCE)
     set(DAPPLE_AI_ORT_LIB ${_ai_rt}/jniLibs/${ANDROID_ABI}/libonnxruntime.so CACHE FILEPATH "" FORCE)
+  elseif(APPLE)
+    # Apple: official prebuilts linked statically (library paths and slices are chosen in core/ai/CMakeLists.txt, docs/research/ai-runtime.md "iOS and macOS").
+    #   CPU / XNNPACK only: no CoreML, Metal or GPU delegate is created anywhere.
+    set(DAPPLE_AI_ORT ON CACHE BOOL "" FORCE)
+    set(DAPPLE_AI_LITERT ON CACHE BOOL "" FORCE)  # core/ai switches it off with a warning when the TFLite C library of the platform is not staged
   else()
     set(DAPPLE_AI_LITERT OFF CACHE BOOL "" FORCE)  # no LiteRT desktop C library
     set(DAPPLE_AI_ORT ON CACHE BOOL "" FORCE)

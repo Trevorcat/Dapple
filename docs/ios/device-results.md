@@ -202,3 +202,61 @@ Findings (not fixed, product code untouched):
 * WDA hangs (HTTP calls never return) while a Photos permission prompt of the app is on screen or after answering a limited / full access prompt; recovery: `ios_setup --stop-wda`, `ios_setup`, relaunch the app. The first "额外访问" (read) prompt after an add-only grant is not harmless on the XR (see table).
 * Two screenshots of the system photo picker (with the owner's library) were taken by mistake while navigating (the "导入照片…" button is the "+" on iOS) and were deleted at once; the picker was cancelled each time.
 Cleanup: Documents/Photos, `DAPPLE_OPEN`, `autotest*`, `previews/`, `library2.json` of both apps removed; no exports other than one JPEG in the X's album "Dapple" (1 file, the app has no delete; the owner may remove it; the two `DAP_20261113_224008.*` files on the XR were left); WDA stopped on both phones, USB forwards killed, nothing running on the Mac. No settings changed, no reboot.
+
+## Round 6 (2026-11-14): working tree with AI masks, portrait retouch, OpenCV tools, Live Photo plumbing (uncommitted), both iPhones
+
+Build: tree synced to the Mac (`sync-worktree.sh`), `build-engine.sh ios-device on` + xcframework + `flutter build ios --release --no-codesign --dart-define=DAPPLE_IOS_AUTOTEST=true`, ipa 111.7 MB (`build/ios-r6/Dapple-r6-unsigned.ipa`; the engine framework is 56 MB with OpenCV, 7 AI models bundled, no depth model). Signed with plumesign, Dapple's own two bundle ids uninstalled (XR first) and installed; both profiles signed 2026-11-14 ~08:45 UTC, expiry about 2026-11-21 (not read from the mobileprovision). Driven through WDA, public CC0 test files only (p2, p3, p6, p8 portraits, `lake.jpg`), brought in with `apps push` + `Documents/DAPPLE_OPEN`. Evidence `build/ios-r6/` (`xr_*`, `x_*` png, `x_autotest_log.txt`, scripts `seq.py`, `timemask.py`, `ai_time.py`, `sky_time.py`, `pinch.py`).
+
+| check | iPhone XR (iOS 18.7.10) | iPhone X (iOS 16.7.16) |
+|---|---|---|
+| 局部 on iOS now offers 美颜 / 人物 / 背景 / 点选 / 天空（粗略） | pass (`xr_01`); no 远近 (depth not bundled) | pass (`x_panel_scrolled`) |
+| 人物 on p6 | pass: chips 整个人 / 脸部皮肤 / 身体皮肤 / 头发 / 衣服 + 脸 row (眼睛 ... 牙齿); 加上 gives a person mask overlay (`xr_added_0`) | pass (`x_add_5`), overlay within about 1.0-1.4 s of tapping 加上 |
+| 人物 on p8 (3 faces) | pass: 脸 1 / 2 / 3 rows (`xr_tmwhole_0`) | not run |
+| 天空 on lake.jpg | pass: sky mask on the clouds, not the bright band at the horizon, label says 粗略 (`xr_sky_3`) | pass, first use after launch: overlay between 1.4 and 1.9 s after the tap, WDA latency 0.4 s (`x_sky_5`) |
+| 点选 (tap on the face) | pass: person mask in about 0.3 s after the tap, + / - strip under the photo (`xr_tapsel_2`) | not run |
+| 美颜 chips and default recipe | pass: 肤质 / 眼下 / 油光 / 补光, 眼睛 / 嘴唇 / 牙齿, badge 8 (`xr_beauty_1`); mean RGB of cheeks, forehead and background before / after the default recipe differs by 0.0-0.3 levels (L, R cheek 170.7/117.6/101.4 -> 170.7/117.4/101.1), texture std down about 1 level: complexion unchanged | chips shown (`x_beauty_b`, badge 8); complexion not measured |
+| analysis times | the person / face / sky analyses are finished before the tile row is reached (chips are there 0.8 s after the 人物 tap, mask 0.2-0.3 s after 加上); no log line in release (`local ai:` print is `kDebugMode` only), so the numbers are UI-observed, resolution about 0.4 s | see above |
+| save to the app album "Dapple" | pass after answering the second prompt with "允许完全访问": toast 已存入相册「Dapple」, green save icon (`xr_s8_0`) | pass after "好" then "允许访问所有照片": icon changes to 已保存到相册 (`x_saved_3`) |
+| editor back: fresh open, no panel | one tap leaves; a pinch zoom is not a layer, one tap leaves from the 1:1 view (`xr_zoomed`, tree after) | same, one tap after zoom |
+| editor back with 局部 panel open | first tap closes the panel, second leaves (XR); with a 点选 strip, 点选 mode first, still two taps | three taps (strip, panel, leave) |
+
+Timings, iPhone X, autotest (round 5 in brackets): sample.jpg open 119 (109), first film frame 414 (396), final 140 (139), strength drag 33.5 (35), exposure drag 41 (44); IMG_1105.dng open 612 (590), first 257 (297), final 175 (175), strength 29 (35), exposure 49 (46); xs10.RAF open 956 (721; round 7 measured 826 - 991), first 237 (243), final 166 (165), strength 29 (29), exposure 46 (44); maxRss 348 MB (304). No regression beyond noise; RAF open is in round 7's range.
+
+Not run, and why:
+* HDR merge, panorama: there are no bracket or panorama samples under `build/rawsamples` (none in `MANIFEST.md`). The "+" sheet shows the entries (HDR 合成… / 全景拼接… / 视频 → 动态照片…, `xr_plus_sheet.png`), but every tool starts with the system photo picker, which shows the owner's library; it was opened once to read its element tree (no screenshot) and cancelled. Merge on iOS is therefore only verified by the Mac run in the tools report.
+* Live Photo export: needs a video from the photo library (none that is public) and was not run; the PhotoKit pair write was not exercised.
+* Foldable work: the phone layouts look like round 5 (capsule bar, header, pad, 成像 readout unchanged; the 局部 list view is taller by the new 按内容选 rows). Not pixel-compared with the round 5 screenshots.
+
+Defects found (product code untouched):
+* On both phones the 局部 list view is clipped at the panel bottom: the 按内容选 row (美颜 / 人物 / 背景 / 点选 / 天空) is cut through the middle (X, landscape photo: `xr`-less `x_panel_scrolled` was taken after a scroll; before it the tiles show only their top half) and on a portrait-shaped photo (p2 on the XR) even the 明暗 / 颜色 tiles are cut and the AI row is off screen. It scrolls, but nothing says so. Panel height should fit the content or the AI row should come first.
+* XR: with Photos "仅添加" kept (the default answer of WDA's `alert accept` picked it, we believe) 存相册 reports 保存失败 for every photo, edited or not (`xr_save4_5`, deleted). Add-only access should be enough to save; the app seems to need the read grant. After "允许完全访问" the save works.
+* On the X a stale "限制访问" grant survived the uninstall / install and the first launch asked "选择更多照片… / 保留当前所选内容" instead of the full prompt.
+* A tap on the photo in the editor hides all chrome including 返回 (a second tap shows it again); a tester who taps the photo sees a screen with no way out. Existing behaviour, not new.
+* After full access the home screen lists two library photos from yesterday under 昨天 · 手机相册 (the 7-day PhotoKit scan; not looked at). My own saved exports also come back into the app library as new photos.
+
+Cleanup: both apps uninstalled and reinstalled clean (all test imports and autotest files gone); WDA stopped on both phones, USB forwards and helper processes killed. Files left in the phones' Photos album "Dapple" (the app has no delete; the owner may remove them): XR 2 JPEGs of p3_curly_glasses_outdoor (one save, one accidental second save), X 1 JPEG of p6_asian_woman_grey with the default 美颜 recipe. The earlier `DAP_20261113_224008.*` files of round 3 are still on the XR.
+
+## Round 7 (2026-11-14): HDR merge, panorama, video -> Live Photo on both iPhones (working tree of round 6, already installed, nothing rebuilt)
+
+Test material (public, synthetic; evidence and sources in `build/ios-r7/`, `src/`): bracket = `IMG_1105.dng` (iPhone XS, public) developed with the desktop CLI at -2 / 0 / +2 EV (`--no-auto --params {"exposureEv":..}`, 2016x1512, mean luma 54 / 115 / 185): a **synthetic bracket**, perfectly aligned, no motion, no EXIF exposure differences. Panorama = three 840x1400 crops of the same developed image, x step 588 (30 % overlap), y offsets 0 / 30 / 15 px (synthetic: no parallax, no lens distortion). Video = 5 s 1280x720 MP4 (ffmpeg zoom/pan over `lake.jpg`), made but **not usable**: there is no way to put a video into the phones' Photos from here (the app has no video save, no Files source; I did not write into `/var/mobile/Media/DCIM` through AFC: Photos does not index it and the owner could not remove it). Photos reached the app through `Documents/Photos` + `DAPPLE_OPEN` (debug ingest). The tools' in-app pick sheet shows only the app's own library (no owner photos); the system picker was opened once on the X (only "相簿" and the "Dapple" album with my 4 items were opened; no screenshot of the owner's library).
+
+| check | iPhone XR (iOS 18.7.10) | iPhone X (iOS 16.7.16) |
+|---|---|---|
+| HDR 合成: opens, accepts 3 items, preview, progress, result | pass: tool page with live preview (`xr_06`), progress dialog "对齐 → 合并 → 处理", 10 % at 0.7 s (`xr_07a`), result tile in the grid about 2 - 3 s after the tap; looks right: exposure balanced, no ghosting, no misalignment (`xr_08_hdr_editor`) | pass: 58 % at about 3 s (`x_05`), done in about 4 s; result tile with HDR badge; looks right (`x_22`, the chrome was hidden by a stray tap on the photo). The first try used the pano tiles by mistake: the merged result is a ghost mess, as expected for non-bracket input; the app gave no warning that the frames are not a bracket |
+| HDR result edited and saved | edit pass (光线 pad drag, 光线 badge 亮 42 / 反差 43, `xr_09`, `xr_15`); save **fail** (see defect 2) | save pass for the pano result (icon 已保存到相册, `x_14`) and 3 selection saves ("已存入相册「Dapple」· 3 张", `x_15`) |
+| 全景拼接: opens, 3 items, projection choice, progress, result | pass: 球形 / 柱形 / 平面, 自动裁切, 补全空白边缘 (`xr_18`), result in under 4 s (`xr_20_pano_editor`): no visible seam or step, columns straight, cropped to about 1.47:1 | pass, same (`x_12_pano_editor`) |
+| system picker ("+" -> 从相册选…) | not tested (add-only state, nothing of mine in Photos) | pass: picker opens, album "Dapple" with 4 items, 3 picked, 添加 -> 3 new tiles `*_dapple` in the grid after about 4 s; they merge to a good HDR (`x_19`..`x_22`, 4 s) |
+| 视频 -> 动态照片 | tool opens, empty state "相册里没有视频" (`xr_21`), 选择视频 only reopens the same empty list | not run |
+| peak memory | no number: the release build writes none and `dvt` was not attached; no jetsam or crash seen | same |
+
+Live Photo: **not tested** (no video available; PhotoKit pair write and the "one asset, Photos treats as Live Photo" check remain open). Peak memory of the merge: not measured.
+
+Re-check of the round 6 defects:
+1. 局部 list clipped at the panel bottom: **still reproduces on a portrait-shaped photo** (a pano tile on the XR: 明暗 / 颜色 tiles cut through, 按内容选 row off screen, `xr_23_local_portrait`); on a landscape photo the whole list fits (`xr_22_local`).
+2. XR add-only save: **still reproduces**, and it is worse than "needs read": after 允许 (add) the app asks "额外访问", answering 保持"仅添加" gives 保存失败 for every save (`xr_16b`) and the banner becomes "还不能读取照片，已被系统拒绝" for good (no second prompt, only Settings could fix it; I did not touch Settings, so the XR stays in that state until Dapple is reinstalled). On the X the two prompts (添加 -> 允许访问所有照片) work and saving passes. The video tool shows "相册里没有视频" in that state (misleading: the phone has 50 videos, the app just may not read them), as does the home banner.
+3. X stale "限制访问" grant after reinstall: **not reproduced** this round (fresh state: normal add prompt, then "选择照片… / 允许访问所有照片 / 不允许"); the state was not stale this time, so this is not a fix proof.
+4. Tap on the photo hides all chrome including 返回: **still reproduces** (XR `xr_24` deleted, X again by a stray tap; a second tap on the photo brings it back).
+Also: WDA hung again after the XR's "额外访问" prompt (recovery as in round 5).
+
+Items left in the phones' Photos (the app cannot delete them): iPhone X, album "Dapple": 4 new items from this round, 3 JPEGs of the synthetic bracket (brk_m2 / brk_z / brk_p2) and the JPEG of the pano result (PANO_20261114_163542); plus the older ones of rounds 5 and 6. iPhone XR: nothing from this round (all saves failed). No video was placed anywhere.
+Cleanup: `Documents/Photos`, `merged`, `inbox`, `live`, `previews`, `library2.json`, `detected1.json`, `DAPPLE_OPEN` removed from both apps (only `film_swatches.json` remains); WDA stopped on both phones, the two USB forwards of this round killed, nothing running on the Mac; no settings changed, no reboot, nothing uninstalled, no Mac sync, product code untouched.

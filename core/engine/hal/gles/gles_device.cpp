@@ -1132,6 +1132,13 @@ void GlesDev::exec(Slot& s, std::vector<Cmd>& cmds) {
   const GLbitfield kAllBits = GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
                               GL_BUFFER_UPDATE_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT |
                               GL_PIXEL_BUFFER_BARRIER_BIT | GL_COMMAND_BARRIER_BIT;
+  // DAPPLE_GLES_STAT=1: per list, wall time of the upload prologue and of the whole list with a glFinish at each end (serialises: diagnostics only)
+  static const bool listStat = envStr("DAPPLE_GLES_STAT")[0] == '1';
+  std::chrono::steady_clock::time_point statT0, statT1;
+  if (listStat) {
+    gl_.glFinish();
+    statT0 = std::chrono::steady_clock::now();
+  }
   gl_.glMemoryBarrier(kAllBits);  // list boundary: previous lists' writes visible
   // Upload buffers are host shadows (no persistent mapping in ES 3.1). The HAL contract of the Vulkan backend (host-coherent memory)
   // lets callers write through map() without flush(), so every Upload buffer the list reads is re-sent in full here.
@@ -1149,6 +1156,10 @@ void GlesDev::exec(Slot& s, std::vector<Cmd>& cmds) {
       gl_.glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(b->size), b->shadow);
     }
     if (!ups.empty()) gl_.glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+  }
+  if (listStat) {
+    gl_.glFinish();
+    statT1 = std::chrono::steady_clock::now();
   }
   if (debugErrors)
     while (const GLenum ge = gl_.glGetError()) std::fprintf(stderr, "dapple gles: GL error 0x%x in list prologue (param / upload buffers)\n", ge);
@@ -1319,6 +1330,12 @@ void GlesDev::exec(Slot& s, std::vector<Cmd>& cmds) {
       const GLenum ge = gl_.glGetError();
       if (ge) std::fprintf(stderr, "dapple gles: GL error 0x%x after op %d (shader %s)\n", ge, int(c.op), pipe ? pipe->key.c_str() : "-");
     }
+  }
+  if (listStat) {
+    gl_.glFinish();
+    const auto t2 = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "dapple gles list: %zu cmds, upload prologue %.2f ms, rest %.2f ms\n", cmds.size(),
+                 std::chrono::duration<double, std::milli>(statT1 - statT0).count(), std::chrono::duration<double, std::milli>(t2 - statT1).count());
   }
   gl_.glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
   if (s.sync) gl_.glDeleteSync(s.sync);

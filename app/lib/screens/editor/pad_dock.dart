@@ -40,11 +40,12 @@ class PadDock extends StatelessWidget {
         // six items of at least 48 dp (the touch target, guidelines 6): the side-pane dock on a landscape phone is ~288 dp; a still
         // narrower window scrolls the dock (guidelines 15.2.2) rather than shrinking the items
         final iw = (cons.maxWidth / n).clamp(kHit, 76.0).toDouble();
+        final dh = padDockH(MediaQuery.textScalerOf(context).scale(15) / 15);
         final row = SizedBox(
           width: iw * n,
-          height: 56,
+          height: dh,
           child: Row(children: [
-            for (final g in padDockOrder) SizedBox(width: iw, height: 56, child: DockItem(key: ValueKey('dock-$g'), ctl: ctl, group: g)),
+            for (final g in padDockOrder) SizedBox(width: iw, height: dh, child: DockItem(key: ValueKey('dock-$g'), ctl: ctl, group: g)),
           ]),
         );
         return GlassCapsule(
@@ -171,13 +172,17 @@ class _DockItemState extends State<DockItem> {
           child: Column(mainAxisAlignment: MainAxisAlignment.center, mainAxisSize: MainAxisSize.min, children: [
             glyph,
             const SizedBox(height: 3),
-            Text(label, style: T.mini(fg, w: on ? FontWeight.w600 : FontWeight.w400)),
+            // one line at any text size: a long word shrinks to the item rather than wrapping under it (text scale 2.0)
+            FittedBox(fit: BoxFit.scaleDown, child: Text(label, maxLines: 1, softWrap: false, style: T.cap(fg, w: on ? FontWeight.w600 : FontWeight.w400))),
           ]),
         ),
       ),
     );
   }
 }
+
+/// Dock height: 56, taller when the label (12 / 16, guidelines 3.2) grows with the system text size (glyph 26 + gap 3 + label + margin 4).
+double padDockH(double textScale) => textScale <= 1.0 ? 56.0 : 34 + 16 * textScale;
 
 /// The dock glyph: a rounded square (a circle for film) with a dot at the pad position and a thin bar for the strength.
 class GlyphPainter extends CustomPainter {

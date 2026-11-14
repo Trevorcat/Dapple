@@ -106,7 +106,9 @@ void main() {
     expect(find.text('Sony α7R V · 未连接'), findsOneWidget);
     expect(find.byKey(const ValueKey('select-toggle')), findsNothing);
     await shot(tester, 'home_phone_empty');
-    await tester.tap(find.byKey(const ValueKey('empty-connect')));
+    // one main button: connecting lives on the connection card (not a third time in the middle)
+    expect(find.byKey(const ValueKey('empty-connect')), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('conn-action')));
     await tester.pump(_t);
     expect(app.toast?.message, '已连接');
   });

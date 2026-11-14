@@ -296,13 +296,13 @@ class _IconPainter extends CustomPainter {
   void _code(Canvas cv, CanisterSpec sp, Rect area, Color col) {
     if (area.width < 8 || area.height < 4) return;
     TextPainter tp(double f) => TextPainter(
-          text: TextSpan(text: sp.code, style: TextStyle(fontFamily: family, fontSize: f, height: 1.0, fontWeight: FontWeight.w700, color: col, letterSpacing: 0)),
+          text: TextSpan(text: sp.code, style: TextStyle(fontFamily: family, fontSize: f, height: 1.0, fontWeight: FontWeight.w600, color: col, letterSpacing: 0)),
           textDirection: TextDirection.ltr,
         )..layout();
     final maxW = area.width * 0.78;
     // one size for all the codes (the width of a five-character one sets it), only longer ones shrink
     var fs = area.height * 0.8;
-    final ref = TextPainter(text: TextSpan(text: 'N400A', style: TextStyle(fontFamily: family, fontSize: fs, fontWeight: FontWeight.w700, letterSpacing: 0)), textDirection: TextDirection.ltr)..layout();
+    final ref = TextPainter(text: TextSpan(text: 'N400A', style: TextStyle(fontFamily: family, fontSize: fs, fontWeight: FontWeight.w600, letterSpacing: 0)), textDirection: TextDirection.ltr)..layout();
     if (ref.width > maxW) fs = fs * maxW / ref.width;
     var t = tp(fs);
     if (t.width > maxW) {

@@ -239,6 +239,14 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   // ------------------------------------------------------------ panel layers
 
+  /// The controls are a permanent part of the layout (the fold layouts: workbench, column, below the fold): an open category is
+  /// the home, not a transient layer, so back never closes it, the film map is the home layer of 成像 and a tap on the photo does not
+  /// fold anything.
+  bool controlsHome = false;
+
+  /// The side of the cluster / column was chosen by hand this session: the passive handedness inference stops moving it.
+  bool handPinned = false;
+
   bool itemised = false;
   bool filmMapOpen = false;
   PanelExtra? extra;
@@ -310,6 +318,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   void openCategory(EGroup g) {
     final was = wm.focused?.group;
+    if (controlsHome && was == g) return; // the controls stay open in the fold layouts
     wm.toggle(g);
     if (was != g) _resetLayers();
     _bump();
@@ -649,7 +658,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
   static const double kHoldSpan = 94;
 
   void holdBegin(PadCat cat, double anchorX) {
-    wm.closeAll();
+    if (!controlsHome) wm.closeAll();
     _resetLayers();
     hold.value = HoldPopup(cat, anchorX);
     _holdStart = padView(cat);
@@ -770,6 +779,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
   @override
   void tap(double x, double y) {
     if (local.active) return; // the handle layer owns taps (picking a tone / colour)
+    if (controlsHome) return; // the fold layouts keep their controls: nothing to fold, no immersive
     if (editingRow.value != null) {
       editingRow.value = null; // the entry widget commits on losing focus
       _bump();
@@ -801,7 +811,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   void _evaluateHand() {
     if (wm.interacting || editingRow.value != null || dragging.value || compare.value) return;
-    if (app.settings.handedness != 0) return;
+    if (app.settings.handedness != 0 || handPinned) return;
     if (hand.evaluate(DateTime.now().millisecondsSinceEpoch)) {
       final side = hand.side;
       if (wm.setSide(side)) {
@@ -837,13 +847,13 @@ class EditorController extends ChangeNotifier implements GestureSink {
       openExtra(null);
       return true;
     }
-    if (itemised || filmMapOpen) {
+    if (itemised || _mapIsLayer) {
       itemised = false;
-      filmMapOpen = false;
+      if (!controlsHome) filmMapOpen = false;
       _bump();
       return true;
     }
-    if (wm.closeLatest()) {
+    if (!controlsHome && wm.closeLatest()) {
       _resetLayers();
       _bump();
       return true;
@@ -857,7 +867,10 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   /// Something transient is open that one back would close (the route must not pop then).
   bool get hasTransient =>
-      editingRow.value != null || local.hasCard || extra != null || itemised || filmMapOpen || wm.adjustMode || immersive.value;
+      editingRow.value != null || local.hasCard || extra != null || itemised || _mapIsLayer || (wm.adjustMode && !controlsHome) || immersive.value;
+
+  /// The film map is a layer (back closes it) unless it is 成像's home layer.
+  bool get _mapIsLayer => filmMapOpen && !(controlsHome && openCat == PadCat.film);
 
   bool get canPop => !hasTransient;
 

@@ -86,11 +86,11 @@ void win(WidgetTester t, Sz z, {ui.DisplayFeatureState posture = ui.DisplayFeatu
   useWindow(t, z.size, top: z.top, bottom: z.bottom);
   _posture = posture;
   _marker = marker;
-  final dpr = t.view.devicePixelRatio;
+  // display features are in logical pixels (the engine divides by the device pixel ratio before the framework sees them)
   t.view.displayFeatures = switch (z.fold) {
     Fold.none => const [],
-    Fold.vertical => [ui.DisplayFeature(bounds: Rect.fromLTWH(z.w / 2 * dpr, 0, 0, z.h * dpr), type: ui.DisplayFeatureType.fold, state: posture)],
-    Fold.horizontal => [ui.DisplayFeature(bounds: Rect.fromLTWH(0, z.h / 2 * dpr, z.w * dpr, 0), type: ui.DisplayFeatureType.fold, state: posture)],
+    Fold.vertical => [ui.DisplayFeature(bounds: Rect.fromLTWH(z.w / 2, 0, 0, z.h), type: ui.DisplayFeatureType.fold, state: posture)],
+    Fold.horizontal => [ui.DisplayFeature(bounds: Rect.fromLTWH(0, z.h / 2, z.w, 0), type: ui.DisplayFeatureType.fold, state: posture)],
   };
 }
 
@@ -159,7 +159,10 @@ Future<void> tapK(WidgetTester t, String k, {int n = 4}) async {
 }
 
 Future<void> dock(WidgetTester t, EGroup g) async {
-  await t.tap(find.byKey(ValueKey('dock-$g')));
+  // the fold layouts have no dock: the category grid of the column, the rail of the cluster
+  final d = find.byKey(ValueKey('dock-$g'));
+  final f = d.evaluate().isNotEmpty ? d : (find.byKey(ValueKey('fold-cat-${g.name}')).evaluate().isNotEmpty ? find.byKey(ValueKey('fold-cat-${g.name}')) : find.byKey(ValueKey('cluster-cat-${g.name}')));
+  await t.tap(f);
   await settle(t, 8);
 }
 
@@ -256,7 +259,7 @@ void main() {
       }
     }
     b.writeln('\n## Display features\n');
-    b.writeln('Book-style sizes carry a vertical fold in the middle (landscape: horizontal), flip-open a horizontal fold in the middle, all passed through the view as `displayFeatures` (flat posture). The `*-halfopen` folders (flip-open and wide-fold-open portrait) repeats a few screens in half-opened posture with a red 2 px line drawn over the fold. The app code does not read `displayFeatures` (no `DisplayFeatureSubScreen` / hinge handling in app/lib), so the layout does not change with it; screenshots in these folders carry the note in brackets.');
+    b.writeln('Book-style sizes carry a vertical fold in the middle (landscape: horizontal), flip-open a horizontal fold in the middle, all passed through the view as `displayFeatures` (logical pixels, flat posture). The `*-halfopen` folders (flip-open and wide-fold-open portrait) repeat a few screens in half-opened posture with a red 2 px line drawn over the fold. The editor reads `displayFeatures` (docs/design/foldables.md): near-square inner screens get the workbench / column layouts, a half-opened horizontal fold puts the photo above the fold and the controls below it; the `*-fold` folders show those layouts; screenshots in these folders carry the fold note in brackets.');
     b.writeln('\n## Steps that could not be reached\n');
     if (unreached.isEmpty) b.writeln('- none recorded');
     for (final u in unreached) {
@@ -516,6 +519,12 @@ void main() {
         await t.tap(key('preset-xhs'));
         await t.pump(const Duration(milliseconds: 300));
         await snap(t, z, 'publish_preset_xhs', '发布 page: preset 小红书 selected, ratio and size rows');
+        final more = find.byKey(const ValueKey('row-more'));
+        if (more.evaluate().isNotEmpty) {
+          await t.ensureVisible(more);
+          await t.tap(more);
+          await t.pump(const Duration(milliseconds: 200));
+        }
         final sw = key('switch-hdr');
         if (sw.evaluate().isNotEmpty) {
           await t.ensureVisible(sw);
@@ -711,6 +720,104 @@ void main() {
       await step(t, z, 'portrait items', () async {
         await tapK(t, 'items-button');
         await snap(t, z, 'portrait_items', '编辑 人像 分项 layer');
+      });
+      await drain(t);
+    });
+  }
+
+  // ---------------------------------------------------------------------------------------------------- fold layouts (docs/design/foldables.md)
+  const foldSizes = <Sz>[
+    Sz('book-inner-984x1092', 984, 1092, fold: Fold.vertical),
+    Sz('book-inner-904x832', 904, 832, fold: Fold.vertical),
+    Sz('wide-fold-inner-626x890', 626, 890, fold: Fold.horizontal),
+    Sz('wide-fold-inner-landscape-890x626', 890, 626, fold: Fold.vertical),
+  ];
+  for (final z in foldSizes) {
+    const sfx = '-fold';
+    testWidgets('fold workbench ${z.dir}', (t) async {
+      win(t, z);
+      final fake = FakeLocalAi()..setFace(1, iod: 0.125);
+      await openEd(t, z, group: EGroup.light, before: filmSetup, ai: fake);
+      await step(t, z, '光线', () async => snap(t, z, 'bench_light', '工作台 光线: histogram + title row left, strip + pad right, the cluster on the photo', suffix: sfx));
+      await step(t, z, '分项', () async {
+        await t.tap(key('items-button'));
+        await settle(t, 8);
+        await snap(t, z, 'bench_light_items', '工作台 光线 分项 (swaps with the pad)', suffix: sfx);
+        await t.tap(key('header-back'));
+        await settle(t, 6);
+      });
+      await step(t, z, 'ball push', () async {
+        final c = t.getCenter(key('cluster-ball'));
+        final g = await t.startGesture(c);
+        await t.pump(const Duration(milliseconds: 50));
+        await g.moveBy(const Offset(34, -20));
+        await g.moveBy(const Offset(12, -8));
+        await t.pump(const Duration(milliseconds: 100));
+        await snap(t, z, 'bench_ball_push', '工作台: pushing the ball moves the pad cursor relatively', suffix: sfx);
+        await g.up();
+        await settle(t, 4);
+      });
+      await step(t, z, '颜色', () async {
+        await dock(t, EGroup.color);
+        await snap(t, z, 'bench_color', '工作台 颜色', suffix: sfx);
+      });
+      await step(t, z, '成像', () async {
+        await dock(t, EGroup.style);
+        await settle(t, 8);
+        await snap(t, z, 'bench_film', '工作台 成像: the film map', suffix: sfx);
+      });
+      await step(t, z, '质地', () async {
+        await dock(t, EGroup.effects);
+        await snap(t, z, 'bench_texture', '工作台 质地', suffix: sfx);
+      });
+      await step(t, z, '裁切', () async {
+        await dock(t, EGroup.crop);
+        await snap(t, z, 'bench_crop', '工作台 裁切: ratio chips + straighten ruler', suffix: sfx);
+      });
+      await step(t, z, '局部', () async {
+        await dock(t, EGroup.local);
+        await snap(t, z, 'bench_local_empty', '工作台 局部: the area-type tiles', suffix: sfx);
+        await tapK(t, 'kind-radial');
+        await snap(t, z, 'bench_local_circle', '工作台 局部: circle area, strip + pad with the 光线/颜色/质地 switch', suffix: sfx);
+      });
+      await drain(t);
+    });
+    testWidgets('fold workbench left hand ${z.dir}', (t) async {
+      win(t, z);
+      await openEd(t, z, group: EGroup.light, before: (app, id) => app.settings.handedness = 1);
+      await step(t, z, 'left hand', () async => snap(t, z, 'bench_light_left', '工作台 光线, left hand: the pad on the left, the cluster at the left edge', suffix: sfx));
+      await drain(t);
+    });
+    testWidgets('fold column ${z.dir}', (t) async {
+      win(t, z);
+      await openEd(t, z, group: EGroup.light, before: filmSetup, title: '街角咖啡');
+      await step(t, z, '光线', () async => snap(t, z, 'column_light', '竖构图 光线: one column on the holding side', suffix: sfx));
+      await step(t, z, '分项', () async {
+        await t.tap(key('items-button'));
+        await settle(t, 8);
+        await snap(t, z, 'column_light_items', '竖构图 光线 分项', suffix: sfx);
+        await t.tap(key('header-back'));
+        await settle(t, 6);
+      });
+      await step(t, z, '成像', () async {
+        await dock(t, EGroup.style);
+        await settle(t, 8);
+        await snap(t, z, 'column_film', '竖构图 成像: the film map', suffix: sfx);
+      });
+      await step(t, z, '裁切', () async {
+        await dock(t, EGroup.crop);
+        await snap(t, z, 'column_crop', '竖构图 裁切', suffix: sfx);
+      });
+      await step(t, z, '局部', () async {
+        await dock(t, EGroup.local);
+        await snap(t, z, 'column_local_empty', '竖构图 局部', suffix: sfx);
+        await tapK(t, 'kind-radial');
+        await snap(t, z, 'column_local_circle', '竖构图 局部 circle', suffix: sfx);
+      });
+      await step(t, z, 'swap', () async {
+        await t.drag(key('fold-swap'), const Offset(-150, 0));
+        await settle(t, 8);
+        await snap(t, z, 'column_swapped', '竖构图: the column moved to the other side', suffix: sfx);
       });
       await drain(t);
     });

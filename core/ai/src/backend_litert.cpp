@@ -6,7 +6,11 @@
 #include <cstring>
 
 #include "affinity.h"
-#include "tflite/c/c_api.h"
+#if __has_include("tflite/c/c_api.h")
+#include "tflite/c/c_api.h"  // LiteRT 1.4 AAR headers (Android)
+#else
+#include "c_api.h"  // TensorFlow Lite C headers (Apple: the flat Headers/ folder of TensorFlowLiteC.framework)
+#endif
 
 namespace dapple::ai {
 namespace {

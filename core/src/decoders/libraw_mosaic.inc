@@ -503,6 +503,37 @@ Result<SourceImage> decodePreviewFromMosaic(const std::filesystem::path& path, c
   return out;
 }
 
+// The whole picture as the guide of a region source's local adjustments (docs section 44): the cached mosaic's block reduction, at most 2048 px long
+// edge, kept for the last two files (a pan opens a new region of the same picture every time).
+std::shared_ptr<const SourceImage> regionParentPhoto(const std::filesystem::path& path, const DecodeOptions& options) {
+  static std::mutex mu;
+  static std::vector<std::pair<std::string, std::shared_ptr<const SourceImage>>> keep;
+  const std::string key = pathToUtf8(path);
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    for (auto it = keep.begin(); it != keep.end(); ++it)
+      if (it->first == key) {
+        auto v = it->second;
+        std::rotate(keep.begin(), it, it + 1);
+        return v;
+      }
+  }
+  DecodeOptions o = options;
+  o.quality = DecodeQuality::Preview;
+  o.wantLongEdge = 2048;
+  std::string why;
+  auto pr = decodePreviewFromMosaic(path, o, &why);
+  if (!pr || pr->linear.empty()) return nullptr;
+  auto ph = std::make_shared<SourceImage>();
+  ph->meta = pr->meta;
+  ph->sceneReferred = pr->sceneReferred;
+  ph->linear = std::max(pr->linear.width, pr->linear.height) > 2048 ? resizeToLongEdge(pr->linear, 2048) : std::move(pr->linear);
+  std::lock_guard<std::mutex> lk(mu);
+  keep.insert(keep.begin(), {key, ph});
+  if (keep.size() > 2) keep.pop_back();
+  return ph;
+}
+
 Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, int y0, int x1, int y1, const DecodeOptions& options, std::string* reason,
                                     const std::atomic<std::uint64_t>* cancelCur, std::uint64_t cancelMine) {
   auto refuse = [&](const std::string& why) {
@@ -527,6 +558,13 @@ Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, i
   if (cancelCur && cancelCur->load() != cancelMine) return refuse("cancelled");
   if (out.linear.empty()) return refuse("empty region");
   out.meta.dngCorrections = m->dngCorrections;
+  {
+    auto rp = std::make_shared<RegionParent>();
+    demosaic::orientedSize(*m, &rp->fullW, &rp->fullH);
+    rp->x0 = x0, rp->y0 = y0;
+    rp->photo = [path, options] { return regionParentPhoto(path, options); };
+    out.parent = std::move(rp);
+  }
   const auto tr2 = std::chrono::steady_clock::now();
   attachMosaicAnchor(out.meta, *m, path, options, embedded.valid() ? &embedded : nullptr);
   {  // one-line stage log: mosaic fetch (decompress when not cached), demosaic of the region, exposure anchor

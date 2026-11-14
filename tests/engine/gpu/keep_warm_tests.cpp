@@ -18,6 +18,7 @@
 #include "dapple/dapple_c.h"
 #include "engine/exec/gpu_executor.h"
 #include "engine/exec/gpu_runtime.h"
+#include "../../test_tmp.h"
 
 namespace eg = dapple::engine::gpu;
 namespace fs = std::filesystem;
@@ -56,7 +57,7 @@ fs::path syntheticJpeg() {
       unsigned char* p = &px[(std::size_t(y) * w + x) * 3];
       p[0] = (unsigned char)(255 * x / w), p[1] = (unsigned char)(255 * y / h), p[2] = (unsigned char)((x * y) % 251);
     }
-  const fs::path f = fs::temp_directory_path() / "dapple_keep_warm_test.jpg";
+  const fs::path f = fs::temp_directory_path() / ("dapple_keep_warm_test_" + testUniqueTag() + ".jpg");
   stbi_write_jpg(f.string().c_str(), w, h, 3, px.data(), 95);
   return f;
 }

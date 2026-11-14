@@ -1,6 +1,7 @@
 // 局部 (local adjustments) on the real editor: the shape card, adding an area, the pads and the strength strip, the on-photo gestures
 // (radial move / new circle, brush batching), the area actions, the itemised view, back, the area limit and a layout smoke test over
 // the window shapes (docs/design/local-adjustments.md).
+import 'package:dapple/editor/fold_layout.dart' show debugFoldLayouts;
 import 'package:dapple/model/local_adjust.dart';
 import 'package:dapple/model/local_kinds.dart';
 import 'package:dapple/model/params.dart';
@@ -29,8 +30,8 @@ class Rig {
 
 /// The editor on a demo photo with the 局部 panel open.
 Future<Rig> openLocal(WidgetTester t,
-    {Size phys = phonePhys, double dpr = phoneDpr, bool dark = false, LocalAi? ai, void Function(AppState app, String id)? before}) async {
-  setView(t, phys, dpr);
+    {Size phys = phonePhys, double dpr = phoneDpr, bool dark = false, LocalAi? ai, void Function(AppState app, String id)? before, double top = 28, double bottom = 20}) async {
+  setView(t, phys, dpr, top: top, bottom: bottom);
   await loadTestFonts();
   final app = AppState.demo();
   final id = app.photos.firstWhere((p) => p.title == '外滩夕阳' && p.id.startsWith('d')).id;
@@ -74,6 +75,9 @@ Future<void> back(WidgetTester t) async {
 }
 
 void main() {
+  // these tests are about the ordinary panel placement (side pane on a wide window); the fold layouts have their own tests (fold_layout_test.dart)
+  setUp(() => debugFoldLayouts = false);
+  tearDown(() => debugFoldLayouts = true);
   group('shape card and adding', () {
     testWidgets('no area: the shape card with exactly the five kinds, the photo layer and six dock items', (t) async {
       final r = await openLocal(t);
@@ -81,7 +85,10 @@ void main() {
       for (final k in ['linear', 'radial', 'brush', 'luminance', 'color']) {
         expect(key('kind-$k'), findsOneWidget, reason: k);
       }
-      expect(find.byWidgetPredicate((w) => w.key is ValueKey && (w.key! as ValueKey).value.toString().startsWith('kind-')), findsNWidgets(5));
+      expect(find.byWidgetPredicate((w) => w.key is ValueKey && (w.key! as ValueKey).value.toString().startsWith('kind-') && !(w.key! as ValueKey).value.toString().startsWith('kind-group-')), findsNWidgets(5));
+      expect(key('kind-group-shape'), findsOneWidget);
+      expect(key('kind-group-range'), findsOneWidget);
+      expect(key('kind-group-content'), findsNothing, reason: 'no AI: no content group');
       expect(pickableKinds.map((k) => k.id), ['linear', 'radial', 'brush', 'luminance', 'color']);
       expect(key('local-handles'), findsOneWidget);
       expect(key('local-pad-light'), findsNothing);
@@ -484,8 +491,8 @@ void main() {
     }
 
     for (final (phys, dpr) in [(phonePhys, phoneDpr), (n5Phys, n5Dpr)]) {
-      testWidgets('large text (1.6) at ${phys.width.round()} px wide, dark', (t) async {
-        t.platformDispatcher.textScaleFactorTestValue = 1.6;
+      testWidgets('large text (2.0) at ${phys.width.round()} px wide, dark', (t) async {
+        t.platformDispatcher.textScaleFactorTestValue = 2.0;
         addTearDown(t.platformDispatcher.clearTextScaleFactorTestValue);
         final r = await openLocal(t, phys: phys, dpr: dpr, dark: true);
         await addViaCard(t, 'radial');

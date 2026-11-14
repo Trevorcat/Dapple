@@ -182,30 +182,41 @@ Future<Rig> open(WidgetTester t, FakeLocalAi fake, {bool dark = false, void Func
 void main() {
   group('the shape card', () {
     for (final dark in [false, true]) {
-      testWidgets('${dark ? 'dark' : 'light'}: five shapes, then 人像 人物 背景 点选 天空(粗略) 远近 on the rows under them', (t) async {
+      testWidgets('${dark ? 'dark' : 'light'}: three groups under small titles (画一个范围 / 按明暗或颜色选 / 按内容选), each three to five tiles, in order', (t) async {
         final fake = FakeLocalAi();
         await open(t, fake, dark: dark);
-        final shapes = ['linear', 'radial', 'brush', 'luminance', 'color'], ai = ['person', 'background', 'tap', 'sky', 'depth'];
-        for (final k in [...shapes, ...ai]) {
-          expect(key('kind-$k'), findsOneWidget, reason: k);
+        const groups = [
+          ('shape', ['linear', 'radial', 'brush', 'depth']),
+          ('range', ['luminance', 'color']),
+          ('content', ['portrait', 'person', 'background', 'tap', 'sky']),
+        ];
+        for (final g in groups) {
+          expect(key('kind-group-${g.$1}'), findsOneWidget, reason: g.$1);
+          for (final k in g.$2) {
+            expect(key('kind-$k'), findsOneWidget, reason: k);
+          }
         }
-        final y1 = t.getCenter(key('kind-linear')).dy, y2 = t.getCenter(key('kind-person')).dy;
-        expect(y2, greaterThan(y1 + 20), reason: 'the AI kinds start under the shapes');
-        for (final k in shapes) {
-          expect(t.getCenter(key('kind-$k')).dy, y1, reason: k);
-        }
-        // tiles are at least 56 dp (U7), so the six AI tiles (人像 first) wrap onto further rows: they keep their order, row by row
-        final ordered = ['portrait', ...ai];
-        var prev = const Offset(-1, 0);
-        for (final k in ordered) {
-          final c = t.getCenter(key('kind-$k'));
-          expect(c.dy, greaterThanOrEqualTo(y2 - 0.5), reason: k);
-          expect(c.dy > prev.dy + 20 || (c.dy - prev.dy).abs() < 1 && c.dx > prev.dx, isTrue, reason: 'order $k');
-          prev = c;
-        }
-        for (final w in ['人物', '背景', '点选', '天空', '远近', '粗略']) {
+        for (final w in ['画一个范围', '按明暗或颜色选', '按内容选']) {
           expect(find.text(w), findsOneWidget, reason: w);
         }
+        // the groups stack in order, and inside a group the tiles keep their order row by row
+        var prevGroupY = -1.0;
+        for (final g in groups) {
+          final ty = t.getCenter(key('kind-group-${g.$1}')).dy;
+          expect(ty, greaterThan(prevGroupY), reason: 'group ${g.$1} under the one before');
+          var prev = Offset(-1, ty);
+          for (final k in g.$2) {
+            final c = t.getCenter(key('kind-$k'));
+            expect(c.dy, greaterThan(ty), reason: '$k under its title');
+            expect(c.dy > prev.dy + 20 || (c.dy - prev.dy).abs() < 1 && c.dx > prev.dx || prev.dx < 0, isTrue, reason: 'order $k');
+            prev = c;
+          }
+          prevGroupY = t.getCenter(key('kind-${g.$2.last}')).dy;
+        }
+        for (final w in ['美颜', '人物', '背景', '点选', '天空', '远近', '粗略']) {
+          expect(find.text(w), findsOneWidget, reason: w);
+        }
+        expect(find.text('人像'), findsNothing, reason: '人像 and 人物 were not told apart: the retouch entry says what it does');
         expect(find.descendant(of: key('kind-sky'), matching: find.text('粗略')), findsOneWidget);
         expect(find.descendant(of: key('kind-depth'), matching: find.text('粗略')), findsNothing);
         expect(t.takeException(), isNull);

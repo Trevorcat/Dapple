@@ -25,7 +25,7 @@ import 'editor_controller.dart';
 import 'editor_widgets.dart' show CurvePainter, curveY;
 import 'film_map_view.dart';
 import 'itemised_view.dart';
-import 'local_panel.dart' show LocalBodyView, LocalHeader;
+import 'local_panel.dart' show LocalBodyView, LocalHeader, kGroupTitleH, localActionsShown;
 import 'mini_maps.dart' show BandDots, WheelMini;
 import 'pad_gestures.dart';
 import 'pad_widgets.dart';
@@ -79,12 +79,14 @@ double panelCollapsedH(double textScale, {bool side = false}) => kPanelHandleH +
 ///
 /// [bodyNeed]: a layer whose content is shorter than the pad (the portrait chips) says how tall its body is; the panel is as tall as that
 /// (never under the pad's least), so no empty band is left under the content.
-double bottomPanelHeight({required double region, required double photoW, required double aspect, required double screenH, double textScale = 1, bool itemised = false, double headerExtra = 0, double? bodyNeed}) {
+double bottomPanelHeight({required double region, required double photoW, required double aspect, required double screenH, double textScale = 1, bool itemised = false, double headerExtra = 0, double? bodyNeed, bool shortBody = false}) {
   // large text: the header's button line; [headerExtra]: a header with a further line (局部's area chips)
   final extra = math.max(0.0, textScale - 1) * 24 + (headerWraps(textScale) ? kHeaderH : 0) + headerExtra;
   final hRef = math.min(photoW / aspect, region);
   final allowed = region - 8 - 0.9 * hRef; // the photo keeps 90 % of its height
-  final lo = kPanelFixedH + kPadMinH + extra, comfy = kPanelFixedH + (bodyNeed == null ? kPadComfortH : math.max(kPadMinH, math.min(kPadComfortH, bodyNeed))) + extra;
+  // [shortBody]: a body that is its own content (the action card) may be shorter than a pad: the panel is exactly as tall as it
+  final floor = shortBody && bodyNeed != null ? bodyNeed : kPadMinH;
+  final lo = kPanelFixedH + floor + extra, comfy = kPanelFixedH + (bodyNeed == null ? kPadComfortH : math.max(floor, math.min(kPadComfortH + 2 * kGroupTitleH, bodyNeed))) + extra;
   var h = allowed.clamp(lo, comfy).toDouble();
   if (itemised) h = math.max(h, kPanelFixedH + kRadarContentH + extra);
   return math.min(h, math.max(screenH * 0.46, lo));
@@ -119,6 +121,7 @@ PanelNeeds panelNeeds({
   bool itemised = false,
   double headerExtra = 0,
   double? bodyNeed,
+  bool shortBody = false,
 }) {
   // [headerExtra]: a header with a further full line (局部: the area chips are a 48 dp line of their own), in both placements
   final extra = math.max(0.0, textScale - 1) * 24 + (headerWraps(textScale) ? kHeaderH : 0); // large text: the header's button line
@@ -128,7 +131,7 @@ PanelNeeds panelNeeds({
   final sideFixed = kPanelHandleH + kSideHeaderH + kPanelTopGap + kPanelBottomPad + extra + headerExtra;
   final side = sideFixed + (itemised ? kRadarContentH : 176);
   return PanelNeeds(
-    bottom: bottomPanelHeight(region: region, photoW: photoW, aspect: aspect, screenH: screenH, textScale: textScale, itemised: itemised, headerExtra: headerExtra, bodyNeed: bodyNeed),
+    bottom: bottomPanelHeight(region: region, photoW: photoW, aspect: aspect, screenH: screenH, textScale: textScale, itemised: itemised, headerExtra: headerExtra, bodyNeed: bodyNeed, shortBody: shortBody),
     side: side,
     // 分项 in a short side pane (landscape phone): the radar shrinks rather than the pane giving way to a bottom panel that leaves a
     // stamp-sized photo (guidelines 15.8, editor-panel 8: the side radar is small)
@@ -253,36 +256,63 @@ class _DockedPanelState extends State<DockedPanel> {
       label: '${local ? '局部' : cat?.label ?? '裁切'}调整面板',
       child: Column(key: ValueKey('panel-${g.name}'), children: [
         _Handle(ctl: ctl, group: g, collapsed: widget.collapsed),
-        if (local)
-          LocalHeader(ctl: ctl, side: widget.side, textScale: ts, collapsed: widget.collapsed)
-        else
-          _Header(ctl: ctl, group: g, cat: cat, side: widget.side, textScale: ts),
-        if (!widget.collapsed)
-          Expanded(
-            // a window too low for photo + panel gives the photo its minimum and the body less than it needs: the body keeps its least
-            // height inside a clipped, scrollable viewport instead of overflowing (docs/design/foldables.md has the real layout for it)
-            child: LayoutBuilder(builder: (context, bc) {
-              final body = Padding(
-                padding: const EdgeInsets.fromLTRB(Sp.m, kPanelTopGap, Sp.m, kPanelBottomPad),
-                child: local ? LocalBodyView(ctl: ctl, side: widget.side) : (cat == null ? CropBody(ctl: ctl) : _body(cat)),
-              );
-              final need = (ctl.itemised ? kRadarContentH : kPadMinH) + kPanelTopGap + kPanelBottomPad;
-              if (widget.side || bc.maxHeight >= need) return body;
-              return SingleChildScrollView(physics: const ClampingScrollPhysics(), child: SizedBox(height: need, child: body));
-            }),
-          ),
+        PanelHeaderOf(ctl: ctl, group: g, side: widget.side, textScale: ts, collapsed: widget.collapsed),
+        if (!widget.collapsed) Expanded(child: PanelBodyOf(ctl: ctl, group: g, side: widget.side)),
       ]),
     );
   }
+}
 
-  Widget _body(PadCat cat) {
+/// The header of the open category: title, readout, 复位 and 分项 (局部: its own, with the area chips). [filmHome]: the film map is
+/// the category's home layer (the fold layouts keep it open), so it has no ‹ and keeps 分项 beside 无.
+class PanelHeaderOf extends StatelessWidget {
+  const PanelHeaderOf({super.key, required this.ctl, required this.group, required this.side, required this.textScale, this.collapsed = false, this.filmHome = false});
+  final EditorController ctl;
+  final EGroup group;
+  final bool side, collapsed, filmHome;
+  final double textScale;
+
+  @override
+  Widget build(BuildContext context) => group == EGroup.local
+      ? LocalHeader(ctl: ctl, side: side, textScale: textScale, collapsed: collapsed)
+      : _Header(ctl: ctl, group: group, cat: PadCatX.ofGroup(group), side: side, textScale: textScale, filmHome: filmHome);
+}
+
+/// The body of the open category (the pad row, the film map, 分项, a complex editor, 裁切's chips and ruler, 局部's cards and pad). A window too
+/// low for the least height scrolls the body instead of overflowing it.
+class PanelBodyOf extends StatelessWidget {
+  const PanelBodyOf({super.key, required this.ctl, required this.group, required this.side});
+  final EditorController ctl;
+  final EGroup group;
+  final bool side;
+
+  Widget _inner(PadCat? cat) {
+    if (group == EGroup.local) return LocalBodyView(ctl: ctl, side: side);
+    if (cat == null) return CropBody(ctl: ctl);
     final extra = ctl.extra;
     if (extra != null) return ExtraEditor(ctl: ctl, cat: cat, extra: extra);
     if (ctl.itemised) return ItemisedView(ctl: ctl, cat: cat);
-    if (cat == PadCat.film && ctl.filmMapOpen) return FilmMapView(key: const ValueKey('film-map'), ctl: ctl);
+    if (cat == PadCat.film && ctl.filmMapOpen) return FilmMapView(key: const ValueKey('film-map'), ctl: ctl, persistent: ctl.controlsHome);
     return PadRow(ctl: ctl, cat: cat);
   }
 
+  @override
+  Widget build(BuildContext context) {
+    final cat = PadCatX.ofGroup(group);
+    final local = group == EGroup.local;
+    return LayoutBuilder(builder: (context, bc) {
+      // a window too low for photo + panel gives the photo its minimum and the body less than it needs: the body keeps its least
+      // height inside a clipped, scrollable viewport instead of overflowing (docs/design/foldables.md has the real layout for it)
+      final body = Padding(
+        padding: const EdgeInsets.fromLTRB(Sp.m, kPanelTopGap, Sp.m, kPanelBottomPad),
+        child: _inner(cat),
+      );
+      final actions = local && localActionsShown(ctl.local);
+      final need = (ctl.itemised ? kRadarContentH : (actions ? 72.0 : kPadMinH)) + kPanelTopGap + kPanelBottomPad;
+      if (side || bc.maxHeight >= need) return body;
+      return SingleChildScrollView(physics: const ClampingScrollPhysics(), child: SizedBox(height: need, child: body));
+    });
+  }
 }
 
 // ------------------------------------------------------------------ handle
@@ -490,11 +520,11 @@ class HeaderReadout extends StatelessWidget {
 }
 
 class _Header extends StatelessWidget {
-  const _Header({required this.ctl, required this.group, required this.cat, required this.side, required this.textScale});
+  const _Header({required this.ctl, required this.group, required this.cat, required this.side, required this.textScale, this.filmHome = false});
   final EditorController ctl;
   final EGroup group;
   final PadCat? cat;
-  final bool side;
+  final bool side, filmHome;
   final double textScale;
 
   @override
@@ -532,9 +562,12 @@ class _Header extends StatelessWidget {
             title: name,
             side: side,
             textScale: textScale,
-            onBack: () => ctl.setFilmMap(false),
+            onBack: filmHome ? null : () => ctl.setFilmMap(false),
             sub: Text(none ? '选成像' : baseNameOf(ctl.app.film, ctl.edit.film), key: const ValueKey('header-sub'), maxLines: 1, overflow: TextOverflow.ellipsis, style: T.cap(c.text2)),
-            buttons: [if (!none) HeaderButton(key: const ValueKey('film-none'), label: '无', semantics: '不用成像', onTap: ctl.stockNone)],
+            buttons: [
+              if (!none) HeaderButton(key: const ValueKey('film-none'), label: '无', semantics: '不用成像', onTap: ctl.stockNone),
+              if (filmHome) HeaderButton(key: const ValueKey('items-button'), label: '分项', onTap: () => ctl.setItemised(true)),
+            ],
           );
         },
       );

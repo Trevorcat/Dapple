@@ -106,6 +106,7 @@ float lmask(int a, vec2 uv, vec3 lin, vec3 src) {
 }
 // stage L of one pixel: masks on the input, ops in list order; K0 / K1 = summed stage-W amounts
 void localApply(inout vec3 v, vec2 uv, vec3 src, out vec4 K0, out vec4 K1) {
+  uv = uv * ld[5].xy + ld[5].zw;  // window -> photo fractions (a region source, section 44; identity for a whole photo)
   const int n = int(ld[0].x);
   float w[16];
   const vec3 lin = v;

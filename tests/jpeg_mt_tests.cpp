@@ -14,6 +14,7 @@
 
 #include "dapple/encode.h"
 #include "decoders/jpeg_dc.h"
+#include "test_tmp.h"
 
 namespace {
 int g_fail = 0;
@@ -71,7 +72,7 @@ int main() {
       dapple::JpegDcImage da, db;  // independent decoder: restart handling
       const bool oka = dapple::decodeJpegDcScale(a->data(), a->size(), da), okb = dapple::decodeJpegDcScale(b.data(), b.size(), db);
       CHECK(oka && okb && da.width == db.width && da.height == db.height && da.rgb == db.rgb, "second decoder: reduced pictures differ (%d %d)", oka, okb);
-      const auto path = std::filesystem::temp_directory_path() / "dapple_jpeg_mt.jpg";
+      const auto path = std::filesystem::temp_directory_path() / ("dapple_jpeg_mt_" + testUniqueTag() + ".jpg");
       CHECK(bool(dapple::writeJpeg(im, path, jo)), "writeJpeg");
       std::ifstream f(path, std::ios::binary);
       std::vector<std::uint8_t> fb((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());

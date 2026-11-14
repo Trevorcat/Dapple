@@ -89,7 +89,7 @@ class _LicensesPageState extends State<LicensesPage> {
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(title, style: T.body17(c.text)),
             const SizedBox(height: Sp.xs),
-            SelectableText(body, key: ValueKey(key), style: T.small(c.text2)),
+            SelectableText(body, key: ValueKey(key), style: T.smallL(c.text2)),
           ]),
         );
     return Scaffold(

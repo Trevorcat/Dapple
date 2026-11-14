@@ -32,6 +32,7 @@
 #include <sstream>
 
 #include "dapple/look.h"
+#include "../../test_tmp.h"
 
 namespace {
 
@@ -950,7 +951,7 @@ int selfcheckOneShot(bool haveFilm) {
 int selfcheckMergedDng() {
   int bad = 0;
   const SourceImage src = makeScene(480, 320, 5, true);
-  const std::filesystem::path path = std::filesystem::temp_directory_path() / "dapple_golden_merged.dng";
+  const std::filesystem::path path = std::filesystem::temp_directory_path() / ("dapple_golden_merged_" + testUniqueTag() + ".dng");
   if (auto w = writeLinearDng(src, path); !w) {
     std::printf("  merged DNG write failed: %s\n", w.error().message.c_str());
     return 1;

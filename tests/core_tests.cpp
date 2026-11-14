@@ -1434,21 +1434,37 @@ void testBakedPath() {
 void testSchedulingPolicy() {
   using dapple::sys::classify;
   using dapple::sys::poolCpus;
-  // Snapdragon 680: 4x A73 (cap 1024) + 4x A53 (~400) -> pool on the 4 big cores
+  // classify() is the same everywhere; poolCpus() is not: Darwin has no cpu capacity files and no affinity API, so the pool size there is
+  // the performance-core count of the device (sysperf.h applePerfCores), capped by the cpu total, whatever the topology says.
+  // Snapdragon 680: 4x A73 (cap 1024) + 4x A53 (~400)
   auto sd680 = classify({400, 400, 400, 400, 1024, 1024, 1024, 1024});
   CHECK(sd680.hetero() && sd680.perf.size() == 4 && sd680.efficient.size() == 4);
-  CHECK(poolCpus(sd680) == std::vector<int>({4, 5, 6, 7}));
-  // Helio G85: 2x A75 + 6x A55 -> too few big cores: every cpu takes part
+  // Helio G85: 2x A75 + 6x A55
   auto g85 = classify({430, 430, 430, 430, 430, 430, 1024, 1024});
   CHECK(g85.hetero() && g85.perf.size() == 2);
-  CHECK(poolCpus(g85).size() == 8);
-  // 8 Elite (2 prime + 6 performance, all >= 60% of the prime): homogeneous for our purpose, no pinning
+  // 8 Elite (2 prime + 6 performance, all >= 60% of the prime): homogeneous for our purpose
   auto elite = classify({870, 870, 870, 870, 870, 870, 1024, 1024});
-  CHECK(!elite.hetero() && poolCpus(elite).size() == 8);
+  CHECK(!elite.hetero());
   // unknown capacities (emulator, desktop): no split
   auto unk = classify({-1, -1, -1, -1});
-  CHECK(!unk.hetero() && poolCpus(unk).size() == 4);
+  CHECK(!unk.hetero());
   CHECK(classify({}).total == 0);
+#if defined(__APPLE__)
+  {
+    const std::size_t perfCores = std::size_t(dapple::sys::applePerfCores());
+    CHECK(perfCores >= 1);
+    for (const auto* t : {&sd680, &g85, &elite, &unk})
+      CHECK(poolCpus(*t).size() == std::min<std::size_t>(perfCores, std::size_t(std::max(1, t->total))));
+    CHECK(poolCpus(classify({})).size() == 1);  // an empty topology still gets one worker
+    CHECK(poolCpus(classify({-1})).size() == 1);
+  }
+#else
+  // the Android / Linux policy (injected topologies)
+  CHECK(poolCpus(sd680) == std::vector<int>({4, 5, 6, 7}));  // 4 big cores: the pool lives on them
+  CHECK(poolCpus(g85).size() == 8);                           // too few big cores: every cpu takes part
+  CHECK(poolCpus(elite).size() == 8);                         // homogeneous: no pinning
+  CHECK(poolCpus(unk).size() == 4);
+#endif
   // many tiny jobs back to back (exercises the spin / wake hand-off)
   std::vector<int> v(997, 0);
   long long want = 0;

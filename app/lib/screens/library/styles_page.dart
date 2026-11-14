@@ -190,7 +190,7 @@ class _StylesPageState extends State<StylesPage> {
                     padding: const EdgeInsets.symmetric(horizontal: Sp.s),
                     alignment: Alignment.center,
                     decoration: BoxDecoration(color: Fx.overlay55, borderRadius: BorderRadius.circular(Rd.thumb)),
-                    child: Text('示例', style: T.mini(Fx.onPhoto, w: FontWeight.w500)),
+                    child: Text('示例', style: T.cap(Fx.onPhoto, w: FontWeight.w500)),
                   ),
                 ),
             ]),
@@ -290,10 +290,10 @@ class _StylesPageState extends State<StylesPage> {
   Widget _grid(double width) {
     const size = 64.0;
     final film = app.film;
-    // the standard and the three modern renderings first (four tiles), then the film library
+    // the standard and the three modern renderings first (four tiles in one group), then the film library
     final sections = <Widget>[
-      _group('标准', [_tile(null, '标准', size: size)], key: 'group-none'),
-      _group('现代', [for (final m in kModernBases) _tile(m.id, m.name, size: size)], key: 'group-modern'),
+      // one tile is not a group: 标准 leads the modern renderings (the card above already says what is chosen)
+      _group('标准与现代', [_tile(null, '标准', size: size), for (final m in kModernBases) _tile(m.id, m.name, size: size)], key: 'group-modern'),
       if (!film.isEmpty)
         for (final g in FilmGroup.values)
           if (film.inGroup(g).isNotEmpty)

@@ -16,6 +16,7 @@
 #include "dapple/encode.h"
 #include "dapple/motion_photo.h"
 #include "dapple/ultrahdr.h"
+#include "../test_tmp.h"
 
 namespace fs = std::filesystem;
 using Bytes = std::vector<std::uint8_t>;
@@ -100,7 +101,7 @@ static Run cover(const fs::path& sdr, const fs::path& out, float patch, int kind
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const std::string dir = argc > 1 ? argv[1] : std::string(DAPPLE_SOURCE_DIR) + "/tests/data/video";
-  const fs::path tmp = fs::temp_directory_path() / "dapple_cover_uhdr";
+  const fs::path tmp = fs::temp_directory_path() / ("dapple_cover_uhdr_" + testUniqueTag());
   fs::create_directories(tmp);
   const Bytes base = sdrCover(tmp / "sdr.jpg");
 

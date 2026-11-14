@@ -28,6 +28,27 @@ previous assumption (requirements 4.11.2 [待验]); the UI does not say so.
 - 抖音图文: no Douyin source found. TikTok (international) photo mode: up to 35 photos, 9:16 recommended, 1:1 and 4:5 accepted
   (https://postfa.st/sizes/tiktok/carousel); Douyin may differ. 3:4 is the Douyin Shop product-image ratio, not a post rule. Unverified, count left unlimited.
 
+## Verification round 2 (2026-11-14): figure, source, official or not
+
+No platform help page could be read as text (Instagram's help article renders by script and returned only topic headings; no official WeChat, Xiaohongshu, Weibo or
+Douyin documentation was found). Every figure below is therefore third-party at best.
+
+| Platform | Figure | Source | Official? | Status |
+|---|---|---|---|---|
+| Instagram | 1080 px wide kept, ratio 1.91:1 to 4:5 not cropped | https://help.instagram.com/1631821640426723 (via search text) | official (text not re-read) | confirmed earlier |
+| Instagram | carousel 20 | https://petapixel.com/2024/08/09/instagram-users-can-now-share-20-photos-videos-in-a-post-carousel-photodump | third-party | confirmed (two sources) |
+| Instagram | 3:4 (1080x1440) accepted in-app; file cap 30 MB | https://www.hopperhq.com/blog/correct-instagram-dimensions/, https://postfa.st/sizes/instagram/feed | third-party, sources disagree | unverified; 4:5 default kept, 3:4 not added |
+| 小红书 | ratios 3:4, 1:1, 4:3, one per note | https://www.canva.cn/sizes/little-red-book/, https://www.woshipm.com/marketing/5572030.html, https://www.digitaling.com/articles/395591.html | third-party (three) | accepted; 1:1 added to the preset; 4:3 not in `cropRatios`, not added |
+| 小红书 | 18 images, 750x1000 px, 20 MB per image | https://www.tixiaolu.com/v2/posts/v2-3f3331b3.html | third-party (one) | unverified, 18 and 2048 kept |
+| 抖音 | 长图文 up to 30 inline images (a separate feature) | https://www.stdaily.com/web/gdxw/2025-12/26/content_453850.html | news report | not the plain 图文 post; count left unlimited |
+| 抖音 | 3:4 / 9:16 ratios, 2048 px | none found | n/a | unverified, kept |
+| 抖音 (TikTok photo mode, for reference) | 4 to 35 photos, 9:16, 1:1, 4:5 | https://postfa.st/sizes/tiktok/carousel | third-party | different product, not applied |
+| 微博 | count 18, size cap, original-size option | none found (only a 2011 note on 9-image stitching) | n/a | unverified, kept |
+| 朋友圈 | 9 photos; more than 9 become a slideshow video (iOS 8.0.18) | https://www.ithome.com/0/600/690.htm | news report | confirmed as photo limit |
+| 朋友圈 | 1440 px long edge, recompression, 1:1 | none found | n/a | unverified, kept |
+
+HDR and wide-gamut handling: not documented by any of the platforms in what was found; unconfirmed everywhere. Not changed: export behaviour, 抖音, 微博, 朋友圈 values.
+
 ## iOS URL schemes for the "open the app" fallback (data in `Preset.iosScheme`)
 
 | App | Scheme | Source / confidence |

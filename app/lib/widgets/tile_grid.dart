@@ -83,14 +83,14 @@ class _DTileState extends State<DTile> {
     final fg2 = held ? c.onAccent : (w.danger ? c.danger : (active ? c.accent : c.text2));
     final bg = held ? c.accentBtn : (active ? c.accentSoft : (w.fill ?? c.bg));
     final ts = MediaQuery.textScalerOf(context).scale(12) / 12;
-    final labelH = 16 * ts, noteH = w.note == null ? 0.0 : 14 * ts;
+    final labelH = 16 * ts, noteH = w.note == null ? 0.0 : 16 * ts;
     final iconSize = (w.icon == null && w.iconWidget == null) ? 0.0 : (w.height - 12 - labelH - noteH).clamp(12.0, 24 * ts).toDouble();
     final label = Text(w.label,
         maxLines: 1,
         softWrap: false,
         overflow: TextOverflow.fade,
         style: w.labelStyle?.copyWith(color: fg) ?? (w.alignStart ? T.body(fg, w: FontWeight.w500) : T.cap(fg2, w: active ? FontWeight.w600 : FontWeight.w400)));
-    final note = w.note == null ? null : Text(w.note!, maxLines: 1, overflow: TextOverflow.ellipsis, style: T.mini(fg2.withValues(alpha: held || active ? 1 : 0.75)));
+    final note = w.note == null ? null : Text(w.note!, maxLines: 1, overflow: TextOverflow.ellipsis, style: T.cap(fg2.withValues(alpha: held || active ? 1 : 0.75)));
     final pic = w.icon != null
         ? DIcon(w.icon!, size: iconSize, color: fg)
         : (w.iconWidget != null ? w.iconWidget!(fg, iconSize) : null);

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# One-command verification. Usage: tools/check-all.sh [--quick] [--android] [--emu] [--keep-going(default)] [--fail-fast]
-#   default : desktop core build (GPU on, SwiftShader) + ctest, flutter analyze, flutter test, JVM unit tests, host video tests
-#   (+ an OpenCV-ON desktop build running merge_tests: SKIP line when tools/_dl/opencv is absent)
+# One-command verification. Usage: tools/check-all.sh [--heavy] [--quick] [--android] [--emu] [--keep-going(default)] [--fail-fast]
+#   default : desktop core build (GPU on, SwiftShader) + the default ctest set (label heavy excluded; budget: about 25 s), golden selfcheck,
+#             flutter analyze, flutter test, host video tests
+#   --heavy   also the tests labelled heavy (full-size exports, software-GPU runs: many minutes), the OpenCV-ON build with merge_tests, JVM unit tests
 #   --quick   skip slow suites (gpu_parity_swiftshader, JVM unit tests, flutter test)
 #   --android NDK arm64-v8a + x86_64 core builds and debug APK builds
 #   --emu     on-emulator native video suite + dapple_golden selfcheck (free port; starts/stops its own emulator)
@@ -9,9 +10,9 @@
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)"; R="$(cd "$HERE/.." && pwd -W)"
 source "$HERE/env.sh"
 export MSYS_NO_PATHCONV=1
-QUICK=0; ANDROID=0; EMU=0; FAILFAST=0
+QUICK=0; ANDROID=0; EMU=0; FAILFAST=0; HEAVY=0
 for a in "$@"; do case "$a" in
-  --quick) QUICK=1;; --android) ANDROID=1;; --emu) EMU=1;; --fail-fast) FAILFAST=1;;
+  --quick) QUICK=1;; --heavy) HEAVY=1;; --android) ANDROID=1;; --emu) EMU=1;; --fail-fast) FAILFAST=1;;
   -h|--help) sed -n 2,8p "$0"; exit 0;; *) echo "unknown flag $a"; exit 2;; esac; done
 LOGS="$R/build/check/logs"; mkdir -p "$LOGS"; rm -f "$LOGS"/*.log "$LOGS/summary.txt"
 RES=(); FAILED=0; NJ="${JOBS:-$(nproc)}"
@@ -51,8 +52,9 @@ desktop_cfg() {
 }
 desktop_build() { cmake --build "$BD" -j "$NJ"; }
 desktop_ctest() {
-  local ex=(); [ $QUICK = 1 ] && ex=(-E gpu_parity_swiftshader)
-  ( cd "$BD" && ctest --output-on-failure -j "${CTEST_JOBS:-4}" "${ex[@]}" )
+  local nj=$(( $(nproc) > 6 ? $(nproc) - 4 : 2 ))
+  local ex=(-LE heavy --timeout 60); [ $HEAVY = 1 ] && ex=()
+  ( cd "$BD" && OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" ctest --output-on-failure -j "${CTEST_JOBS:-$nj}" "${ex[@]}" )
 }
 # HDR merge / panorama / sequence detection need OpenCV (DAPPLE_HAVE_OPENCV); the main desktop build above has it OFF, so merge_tests' OpenCV blocks are
 # compiled out there. This step builds a second tree with OpenCV ON (GPU off, tests only; sources in tools/_dl/opencv, built static, ~650 objects the first
@@ -80,10 +82,11 @@ step ctest desktop_ctest
 # regression in it is visible in the summary. Same binary runs on the emulator / phones (see the --emu step and docs/engine/old-pipeline-removal.md).
 golden_selfcheck() { ( cd "$R" && "$BD/bin/dapple_golden" selfcheck ); }
 step golden-selfcheck golden_selfcheck
-step desktop-opencv desktop_opencv
+if [ $HEAVY = 1 ]; then step desktop-opencv desktop_opencv; else skip desktop-opencv "only with --heavy"; fi
 step flutter-analyze flutter_analyze
 if [ $QUICK = 1 ]; then skip flutter-test "--quick"; skip jvm-unit-tests "--quick"; else
-  step flutter-test flutter_test; step jvm-unit-tests jvm_tests; fi
+  step flutter-test flutter_test
+  if [ $HEAVY = 1 ]; then step jvm-unit-tests jvm_tests; else skip jvm-unit-tests "only with --heavy"; fi; fi
 step video-host video_host
 
 if [ $ANDROID = 1 ]; then

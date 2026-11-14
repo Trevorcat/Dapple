@@ -225,7 +225,7 @@ class Mo {
   static const multiSelect = Duration(milliseconds: 450);
 }
 
-/// Type scale (guidelines 3.1). Android weights 400 / 500 (nav selected 700).
+/// Type scale (guidelines 3.1). Android weights 400 / 500; never above 600 (3.2).
 class T {
   static const _tab = [FontFeature.tabularFigures()];
   static TextStyle _s(double size, double h, Color color, FontWeight w, {bool tabular = false}) => TextStyle(
@@ -247,7 +247,15 @@ class T {
       _s(13, 18, c, w, tabular: tabular);
   static TextStyle cap(Color c, {FontWeight w = FontWeight.w400, bool tabular = false}) =>
       _s(12, 16, c, w, tabular: tabular);
+  /// 11 is for pure digits / Latin only (counts, badge numbers, ticks, times); Chinese is 12 or larger (guidelines 3.2).
   static TextStyle mini(Color c, {FontWeight w = FontWeight.w400}) => _s(11, 14, c, w);
+
+  // Multi-line Chinese (guidelines 3.2): descriptions, dialog bodies, empty states, hints, warning bodies. Single-line labels,
+  // buttons and values keep the 3.1 heights above.
+  static TextStyle body17L(Color c, {FontWeight w = FontWeight.w400, bool tabular = false}) => _s(17, 28, c, w, tabular: tabular);
+  static TextStyle bodyL(Color c, {FontWeight w = FontWeight.w400, bool tabular = false}) => _s(15, 24, c, w, tabular: tabular);
+  static TextStyle smallL(Color c, {FontWeight w = FontWeight.w400, bool tabular = false}) => _s(13, 20, c, w, tabular: tabular);
+  static TextStyle capL(Color c, {FontWeight w = FontWeight.w400, bool tabular = false}) => _s(12, 18, c, w, tabular: tabular);
 }
 
 ThemeData buildTheme(Brightness b) {

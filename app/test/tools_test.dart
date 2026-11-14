@@ -77,12 +77,18 @@ class _NoMergeEngine extends FakeEngine {
   bool get available => false;
 }
 
-Future<(AppState, FakeEngine)> _open(WidgetTester tester) async {
+/// [expand]: also opens the folded "还有 N 个可合成" line, so every card is on screen (the cards show one at a time).
+Future<(AppState, FakeEngine)> _open(WidgetTester tester, {bool expand = true}) async {
   useWindow(tester, phoneSize);
   final app = AppState.demo();
   final eng = FakeEngine();
   app.engine = eng;
   await pumpDapple(tester, app);
+  final more = find.byKey(const ValueKey('entry-more'));
+  if (expand && more.evaluate().isNotEmpty) {
+    await tester.tap(more);
+    await tester.pump(const Duration(milliseconds: 200));
+  }
   return (app, eng);
 }
 
@@ -170,6 +176,23 @@ void main() {
   });
 
   group('home cards', () {
+    testWidgets('one card at a time, the rest fold into "还有 N 个可合成"; every card (video too) can be closed and stays closed', (tester) async {
+      final (app, _) = await _open(tester, expand: false);
+      expect(find.byKey(const ValueKey('entry-dismiss')), findsOneWidget, reason: 'one card shows');
+      expect(find.text('还有 2 个可合成'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('entry-more')));
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(find.byKey(const ValueKey('entry-dismiss')), findsNWidgets(3), reason: 'the video card closes like the others');
+      expect(find.text('还有 2 个可合成'), findsNothing);
+      await tester.tap(find.descendant(of: find.byKey(const ValueKey('entry-video')), matching: find.byKey(const ValueKey('entry-dismiss'))));
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(find.byKey(const ValueKey('entry-video')), findsNothing);
+      expect(app.videoCard, isNull);
+      app.notifyListeners();
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(find.byKey(const ValueKey('entry-video')), findsNothing, reason: 'stays closed');
+    });
+
     testWidgets('detected HDR / panorama / video cards', (tester) async {
       final (app, _) = await _open(tester);
       expect(find.text('HDR · 3 张包围曝光'), findsOneWidget);
@@ -245,7 +268,7 @@ void main() {
 
     testWidgets('a detected card can be dismissed (not a group), remembered; the others stay; members are changed inside the tool', (tester) async {
       final (app, _) = await _open(tester);
-      expect(find.byKey(const ValueKey('entry-dismiss')), findsNWidgets(2), reason: 'both detected groups, not the video card');
+      expect(find.byKey(const ValueKey('entry-dismiss')), findsNWidgets(3), reason: 'both detected groups and the video card');
       await fixShot(tester, 'cards_with_dismiss');
       await tester.tap(find.descendant(of: find.byKey(const ValueKey('entry-bracket-y0')), matching: find.byKey(const ValueKey('entry-dismiss'))));
       await _settle(tester);
@@ -271,7 +294,8 @@ void main() {
       expect(find.text('HDR 合成'), findsOneWidget);
       expect(find.text('参与合成 · 3 张'), findsOneWidget);
       expect(find.text('已识别 3 张包围曝光'), findsOneWidget);
-      expect(find.text('识别'), findsNWidgets(3));
+      expect(find.text('识别'), findsNothing, reason: 'the group line says it once; the tiles carry no 识别 tag');
+      expect(find.byKey(const ValueKey('tool-base-hint')), findsOneWidget);
       expect(find.text('开始合成'), findsOneWidget);
       await shot(tester, 'tool_hdr');
 
@@ -279,7 +303,8 @@ void main() {
       String star(String id) => find.byKey(ValueKey('base-$id')).evaluate().isEmpty ? '设为基准帧' : '基准帧';
       expect(star('y1'), '基准帧');
       expect(star('y0'), '设为基准帧');
-      await tester.tap(find.byKey(const ValueKey('star-y0')));
+      // the base frame carries a star (not a button); a long press on another photo makes it the base
+      await tester.longPress(find.byKey(const ValueKey('src-y0')));
       await tester.pump(_t);
       expect(star('y0'), '基准帧');
       expect(star('y1'), '设为基准帧');
@@ -440,7 +465,12 @@ void main() {
       expect(find.text('1/4'), findsOneWidget);
       expect(find.text('开始拼接'), findsOneWidget);
       await shot(tester, 'tool_pano');
-      await tester.tap(find.descendant(of: find.byKey(const ValueKey('tool-projection')), matching: find.text('球面')));
+      await tester.tap(find.descendant(of: find.byKey(const ValueKey('tool-projection')), matching: find.text('球形')));
+      expect(find.byKey(const ValueKey('tool-projection-hint')), findsOneWidget, reason: 'one sentence says what the choice looks like');
+      await tester.tap(find.descendant(of: find.byKey(const ValueKey('tool-projection')), matching: find.text('平面')));
+      await tester.pump(_t);
+      expect(find.textContaining('平面：'), findsOneWidget);
+      await tester.tap(find.descendant(of: find.byKey(const ValueKey('tool-projection')), matching: find.text('球形')));
       await tester.pump(_t);
       await tester.tap(find.byKey(const ValueKey('tool-crop')));
       await tester.pump(_t);

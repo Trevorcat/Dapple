@@ -110,7 +110,7 @@ class _PublishDonePageState extends State<PublishDonePage> {
                     child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       DIcon(DI.check, size: 18, color: c.okIcon, stroke: 2.4),
                       const SizedBox(width: 12),
-                      Expanded(child: Text(s, style: T.body(c.text))),
+                      Expanded(child: Text(s, style: T.bodyL(c.text))),
                     ]),
                   ),
                 const Spacer(),

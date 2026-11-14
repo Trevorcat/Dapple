@@ -29,6 +29,7 @@
 
 #if defined(_WIN32)
 #include <stdlib.h>
+#include "../../test_tmp.h"
 static void setEnv(const char* k, const char* v) { _putenv_s(k, v); }
 static void unsetEnv(const char* k) { _putenv((std::string(k) + "=").c_str()); }
 #else
@@ -632,7 +633,7 @@ int probeChild(const std::string& dir) {
 int testDefaultProbe(const char* argv0) {
   std::printf("== default-on GPU: background probe, persisted verdicts, crash marker, kill switch ==\n");
   namespace fs = std::filesystem;
-  const fs::path dir = fs::temp_directory_path() / ("dapple_gpu_probe_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  const fs::path dir = fs::temp_directory_path() / ("dapple_gpu_probe_" + testUniqueTag());
   fs::create_directories(dir);
   const fs::path out = dir / "child.out";
   auto child = [&](const char* gpuEnv, const char* api) -> std::string {

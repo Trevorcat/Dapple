@@ -26,11 +26,13 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
 
     private static var viewPlugin: DappleViewPlugin?
     private static var capturePlugin: DappleCapturePlugin?
+    private static var livePlugin: DappleLivePlugin?
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         let p = DappleEnginePlugin()
         viewPlugin = DappleViewPlugin(registrar: registrar)  // dapple/view (zero-copy display)
         capturePlugin = DappleCapturePlugin(registrar: registrar)  // dapple/capture (AVFoundation)
+        livePlugin = DappleLivePlugin(registrar: registrar)  // dapple/live (video -> Live Photo tool: AVFoundation)
         startGpu()
         FlutterMethodChannel(name: "dapple/media", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handleMedia)
         FlutterMethodChannel(name: "dapple/photos", binaryMessenger: registrar.messenger()).setMethodCallHandler(p.handlePhotos)
@@ -38,6 +40,16 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
         FlutterMethodChannel(name: "dapple/log", binaryMessenger: registrar.messenger()).setMethodCallHandler { call, result in
             if call.method == "line", let l = call.arguments as? String { NSLog("dapple ingest: %@", l) }
             result(nil)
+        }
+        // AI masks (docs/legal/ai-models.md): the models are bundled by the Runner build phase "Bundle AI models" as <app>/ai-models and read in place
+        // by the engine (no copy: bundle files are ordinary readable files). `prepare` -> the directory, or null when the app carries no models.
+        FlutterMethodChannel(name: "dapple/ai", binaryMessenger: registrar.messenger()).setMethodCallHandler { call, result in
+            guard call.method == "prepare" else { result(FlutterMethodNotImplemented); return }
+            let dir = (Bundle.main.resourcePath ?? "") + "/ai-models"
+            var isDir: ObjCBool = false
+            let ok = FileManager.default.fileExists(atPath: dir, isDirectory: &isDir) && isDir.boolValue
+                && ((try? FileManager.default.contentsOfDirectory(atPath: dir))?.isEmpty == false)
+            result(ok ? dir : nil)
         }
         FlutterEventChannel(name: "dapple/media_events", binaryMessenger: registrar.messenger()).setStreamHandler(p)
         registrar.publish(p)
@@ -196,11 +208,20 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
             guard st == .authorized || st == .limited else { return done(FlutterError(code: "denied", message: "no permission to add photos", details: nil)) }
             var assetPh: PHObjectPlaceholder?
             var albumPh: PHObjectPlaceholder?
+            // A Motion Photo made by the engine (`*_MP.jpg`: JPEG + MP4) is saved as a Live Photo: still + paired MOV with one content identifier, one asset.
+            let live: LivePhoto.Parts? = name.hasSuffix("_MP.jpg") ? LivePhoto.prepare(path: path) : nil
             PHPhotoLibrary.shared().performChanges({
                 let req = PHAssetCreationRequest.forAsset()
                 let o = PHAssetResourceCreationOptions()
                 o.originalFilename = name
-                req.addResource(with: .photo, fileURL: URL(fileURLWithPath: path), options: o)
+                if let l = live {
+                    req.addResource(with: .photo, fileURL: l.stillURL, options: o)
+                    let mo = PHAssetResourceCreationOptions()
+                    mo.originalFilename = (name as NSString).deletingPathExtension + ".mov"
+                    req.addResource(with: .pairedVideo, fileURL: l.movieURL, options: mo)
+                } else {
+                    req.addResource(with: .photo, fileURL: URL(fileURLWithPath: path), options: o)
+                }
                 assetPh = req.placeholderForCreatedAsset
                 guard let ph = assetPh else { return }
                 var album: PHAssetCollection?
@@ -212,6 +233,7 @@ public final class DappleEnginePlugin: NSObject, FlutterPlugin, FlutterStreamHan
                     albumPh = cr.placeholderForCreatedAssetCollection
                 }
             }) { ok, err in
+                if let l = live { LivePhoto.cleanup(l) }
                 if let a = albumPh?.localIdentifier { UserDefaults.standard.set(a, forKey: albumKey) }
                 if ok, let id = assetPh?.localIdentifier { done("ph://\(id)#0") }
                 else { done(FlutterError(code: "save", message: err?.localizedDescription ?? "save failed", details: nil)) }

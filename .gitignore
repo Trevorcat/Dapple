@@ -31,3 +31,7 @@ compile_commands.json
 /.claude/settings.local.json
 __pycache__/
 *.pyc
+
+# Android release signing (keystore + passwords): never commit
+/app/android/key.properties
+/app/android/build/

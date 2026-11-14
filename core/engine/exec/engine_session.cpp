@@ -190,6 +190,8 @@ void localRequest(PlanRequest& rq, const local::Frame* lf) {
 
 // The resolved local adjustments of a GPU frame (the CPU frames get theirs from FrameKernels). Film frames: none in v1 (40.7).
 void bindLocal(FramePlan& fp, const Renderer& r, const SourceImage& src, bool interactive) {
+  if (src.parent && src.parent->fullW > 0 && src.parent->fullH > 0 && fp.srcW > 0 && fp.srcH > 0)  // a region source (docs section 44): radii are fractions of the parent picture
+    fp.spatialScale *= float(std::max(src.parent->fullW, src.parent->fullH)) / float(std::max(fp.srcW, fp.srcH));
   if (r.params().local.empty()) return;
   fp.local = local::bind(r.params().local, src, interactive);
   fp.localDetail = fp.local && fp.local->anyWindow;

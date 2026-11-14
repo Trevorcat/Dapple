@@ -2765,7 +2765,7 @@ void testPrintConstants() {
   CHECK(lib != nullptr);
   if (!lib) return;
   // disk round trip: the constants written for one library object are found by another one (the disk key has no library pointer)
-  const fs::path dir = fs::temp_directory_path() / "dapple_calib_test";
+  const fs::path dir = fs::temp_directory_path() / ("dapple_calib_test_" + testUniqueTag());
   std::error_code ec;
   fs::remove_all(dir, ec);
   setFilmCalibrationDisk(dir.string(), "test");

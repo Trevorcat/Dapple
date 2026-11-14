@@ -9,8 +9,11 @@ import 'usb_picker_page.dart';
 
 /// Connection card (requirements 4.2.2): dot, title, status line, optional action, progress bar.
 class ConnCard extends StatelessWidget {
-  const ConnCard({super.key, required this.app});
+  const ConnCard({super.key, required this.app, this.compact = false});
   final AppState app;
+
+  /// Selection mode: one quiet line (dot and status), no progress bar, no action: the user is choosing photos, not managing the camera.
+  final bool compact;
 
   /// A camera on the cable: the ready card opens the list of the card's photos; the other wired states ask again.
   void _act(BuildContext context) {
@@ -36,6 +39,20 @@ class ConnCard extends StatelessWidget {
     final wired = app.usbCardActive;
     final prog = wired ? app.usb.cardProgress : (st == ConnState.connected ? app.arrivingProgress : null);
     final action = app.connAction;
+    if (compact) {
+      return Padding(
+        key: const ValueKey('conn-card-compact'),
+        padding: const EdgeInsets.symmetric(horizontal: Sp.l, vertical: Sp.xs),
+        child: Row(children: [
+          Dot(dot, size: 8),
+          const SizedBox(width: Sp.s),
+          Expanded(
+            child: Text([app.connTitle, if (app.connLine.isNotEmpty) app.connLine].join(' · '),
+                maxLines: 1, overflow: TextOverflow.ellipsis, style: T.small(c.text2, tabular: true)),
+          ),
+        ]),
+      );
+    }
     return Semantics(
       container: true,
       label: [app.connTitle, if (app.connLine.isNotEmpty) app.connLine].join('，'),
@@ -61,7 +78,7 @@ class ConnCard extends StatelessWidget {
                     Text(app.connTitle, style: T.body17(c.text)),
                     if (app.connLine.isNotEmpty) ...[
                       const SizedBox(height: 2),
-                      Text(app.connLine, style: T.body(st == ConnState.interrupted ? c.warn : c.text2, tabular: true)),
+                      Text(app.connLine, style: T.bodyL(st == ConnState.interrupted ? c.warn : c.text2, tabular: true)),
                     ],
                     if (prog != null) ...[const SizedBox(height: 8), Padding(padding: const EdgeInsets.only(right: Sp.s), child: DProgress(prog))],
                   ]),

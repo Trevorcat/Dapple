@@ -3,6 +3,7 @@
 // layout across window shapes. The AI service is the fully controllable [FakeLocalAi] of local_ai_test.dart.
 import 'dart:convert';
 
+import 'package:dapple/editor/fold_layout.dart' show debugFoldLayouts;
 import 'package:dapple/model/local_adjust.dart';
 import 'package:dapple/model/local_kinds.dart' show AiBits;
 import 'package:dapple/model/portrait.dart';
@@ -67,6 +68,9 @@ List<String> ids(Rig r) => [for (final a in r.local.items) a.id];
 LocalAdjustment byId(Rig r, String id) => r.local.byId(id)!;
 
 void main() {
+  // these tests are about the ordinary panel placement (side pane on a wide window); the fold layouts have their own tests (fold_layout_test.dart)
+  setUp(() => debugFoldLayouts = false);
+  tearDown(() => debugFoldLayouts = true);
   group('the tile and the analysis', () {
     testWidgets('a device without AI has no 人像 tile', (t) async {
       final off = FakeLocalAi()..avail = const AiAvailability();
@@ -79,7 +83,7 @@ void main() {
       final fake = FakeLocalAi();
       final r = await open(t, fake);
       expect(key('kind-portrait'), findsOneWidget);
-      expect(find.text('人像'), findsOneWidget);
+      expect(find.text('美颜'), findsOneWidget);
       await tapKey(t, 'kind-portrait');
       fake.finish(portraitResult(person: false, faces: 0));
       await settle(t, 3);
@@ -118,7 +122,7 @@ void main() {
         expect(key('chip-$c'), findsOneWidget, reason: c);
       }
       expect(t.widget<Text>(key('header-title')).data, '局部', reason: 'the title is always the dock item');
-      expect(t.widget<Text>(key('header-readout')).data, startsWith('人像'), reason: 'the readout names the layer');
+      expect(t.widget<Text>(key('header-readout')).data, startsWith('美颜'), reason: 'the readout names the layer');
       expect(t.takeException(), isNull);
     });
   });
@@ -481,13 +485,14 @@ void main() {
       expect(t.takeException(), isNull);
     });
 
-    testWidgets('two faces with open mouths: 补光 would be the 13th plane: refused with the toast, nothing changes', (t) async {
+    testWidgets('two faces with open mouths: everything fits, so every chip is on for both faces and there is no narrowing toast', (t) async {
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult(faces: 2), faces: 2);
-      expect(r.local.rasterPlanes, 11);
-      await tapKey(t, 'chip-light');
-      expect(r.app.toast?.message, contains('12'));
-      expect(ids(r), _defaultIds, reason: '补光 would be the 13th plane');
+      expect(r.app.toast?.message, isNot(kGroupMainOnly));
+      for (final c in [PortraitChip.skin, PortraitChip.undereye, PortraitChip.shine, PortraitChip.teeth, PortraitChip.eyes, PortraitChip.lips]) {
+        expect(r.lc.chipOn(c), isTrue, reason: '$c');
+      }
+      expect(r.lc.selFaces, {1, 2});
       expect(r.local.rasterPlanes, lessThanOrEqualTo(kMaxRasterComponents));
       expect(t.takeException(), isNull);
     });
@@ -499,12 +504,26 @@ void main() {
       expect(r.lc.selFaces, {1});
     });
 
-    testWidgets('three faces: the plane budget (12) is exceeded, the user gets the toast and nothing is half-made', (t) async {
+    testWidgets('three faces: main face only, every chip on, plain toast, nothing half-made', (t) async {
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult(faces: 3), faces: 3);
       expect(r.local.rasterPlanes, lessThanOrEqualTo(kMaxRasterComponents));
-      expect(r.app.toast?.message, contains('12'));
+      expect(r.app.toast?.message, kGroupMainOnly);
+      expect(r.app.toast?.message, isNot(contains('12')));
+      for (final c in [PortraitChip.skin, PortraitChip.undereye, PortraitChip.shine, PortraitChip.teeth, PortraitChip.eyes, PortraitChip.lips]) {
+        expect(r.lc.chipOn(c), isTrue, reason: '$c');
+      }
+      expect(r.lc.chipOn(PortraitChip.eyes) && r.lc.chipBlocked(PortraitChip.eyes), isFalse);
       expect(t.takeException(), isNull);
+    });
+
+    testWidgets('three faces: opening again keeps the saved edit unchanged', (t) async {
+      final r = await openPortrait(t, FakeLocalAi(), portraitResult(faces: 3), faces: 3);
+      final before = r.local.toEngineJson();
+      r.lc.cancelAnalysis();
+      r.lc.showBody(LocalBody.pads);
+      await t.pump(const Duration(milliseconds: 300));
+      expect(r.local.toEngineJson(), before);
     });
 
     testWidgets('眼睛 default, one face: on, and no "full" note', (t) async {
@@ -514,13 +533,14 @@ void main() {
       expect(find.text('块数已满'), findsNothing);
     });
 
-    testWidgets('眼睛 default, a group: off by design (12-plane budget) and the chip says why', (t) async {
+    testWidgets('眼睛 default, a group: on for the main face; no tile says 块数已满 and no wording names the limit', (t) async {
       final group = await openPortrait(t, FakeLocalAi(), portraitResult(faces: 3), faces: 3);
-      expect(group.lc.chipOn(PortraitChip.eyes), isFalse, reason: 'two planes per face do not fit the 12 planes next to the skin');
-      expect(group.lc.chipBlocked(PortraitChip.eyes), isTrue);
+      expect(group.lc.chipOn(PortraitChip.eyes), isTrue);
+      expect(group.lc.chipBlocked(PortraitChip.eyes), isFalse);
       await t.pump(const Duration(milliseconds: 300));
-      expect(find.descendant(of: find.byKey(const ValueKey('chip-eyes')), matching: find.text('块数已满')), findsOneWidget);
-      expect(find.descendant(of: find.byKey(const ValueKey('chip-skin')), matching: find.text('块数已满')), findsNothing);
+      expect(find.text('块数已满'), findsNothing);
+      expect(kRoomMsg, isNot(contains('块')));
+      expect(kRoomMsg, isNot(contains('$kMaxRasterComponents')));
     });
 
     testWidgets('three faces: at least the skin is made (a group photo is the common case)', (t) async {
@@ -670,8 +690,8 @@ void main() {
       });
     }
 
-    testWidgets('large text (1.6) with the chips, dark', (t) async {
-      t.platformDispatcher.textScaleFactorTestValue = 1.6;
+    testWidgets('large text (2.0) with the chips, dark', (t) async {
+      t.platformDispatcher.textScaleFactorTestValue = 2.0;
       addTearDown(t.platformDispatcher.clearTextScaleFactorTestValue);
       final fake = FakeLocalAi();
       final r = await openPortrait(t, fake, portraitResult(faces: 2), dark: true, faces: 2);

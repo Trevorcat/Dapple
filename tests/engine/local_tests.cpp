@@ -9,7 +9,9 @@
 //     parity      GPU executor vs CPU executor (frames and a tiled GPU export vs its whole frame)
 //     coords      a hard disc stays at its photo point and stays a disc under crop / rotate / flip / straighten
 //     interactive the interactive-tier planes vs the exact planes (hand-over bound)
-//   not in ctest: bench (N adjustments x op sets, GPU / CPU, 1080 interactive and full), jsoncost (brush JSON / hash / bind cost)
+//     region      a region source (a window of the photo at its own pixels, SourceImage::parent, section 44) renders every kind of local component
+//                 like the same pixels of the whole-frame render (CPU; GPU parity ids below)
+//   not in ctest: regionfilm (a film frame: the window against the whole frame, without and with a local edit: not equal even without it), bench (N adjustments x op sets, GPU / CPU, 1080 interactive and full), jsoncost (brush JSON / hash / bind cost)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -938,6 +940,252 @@ void testParity() {
 }
 #endif
 
+
+// ---- region (section 44) ---------------------------------------------------------------------------------------------------------
+// The window [x0, x1) x [y0, y1) of `src` as a region source whose parent is `src` itself.
+SourceImage windowOf(const SourceImage& src, int x0, int y0, int x1, int y1) {
+  SourceImage w;
+  w.meta = src.meta;
+  w.sceneReferred = src.sceneReferred;
+  w.linear = ImageF(x1 - x0, y1 - y0);
+  for (int y = y0; y < y1; ++y) std::memcpy(w.linear.row(y - y0), src.linear.row(y) + 3 * std::size_t(x0), std::size_t(x1 - x0) * 3 * sizeof(float));
+  auto rp = std::make_shared<RegionParent>();
+  rp->fullW = src.linear.width, rp->fullH = src.linear.height, rp->x0 = x0, rp->y0 = y0;
+  auto photo = std::make_shared<SourceImage>(src);
+  rp->photo = [photo] { return photo; };
+  w.parent = rp;
+  return w;
+}
+
+struct CropDiff {
+  int maxCode = 0;
+  std::size_t over1 = 0, n = 0;
+};
+// the window frame `win` (ww x wh, `ch` bytes a pixel) against the same pixels of the whole frame, `margin` px in from the window's edges
+CropDiff cropDiff(const std::uint8_t* whole, int fw, const std::uint8_t* win, int ww, int wh, int x0, int y0, int margin, int ch) {
+  CropDiff d;
+  for (int y = margin; y < wh - margin; ++y)
+    for (int x = margin; x < ww - margin; ++x)
+      for (int c = 0; c < std::min(ch, 3); ++c) {
+        const int a = whole[(std::size_t(y + y0) * fw + (x + x0)) * ch + c], b = win[(std::size_t(y) * ww + x) * ch + c];
+        const int e = std::abs(a - b);
+        d.maxCode = std::max(d.maxCode, e);
+        d.over1 += e > 1;
+        ++d.n;
+      }
+  return d;
+}
+
+LocalAdjustment oneComp(const char* id, const MaskComponent& m, float ev) {
+  LocalAdjustment a;
+  a.id = id;
+  a.mask.push_back(m);
+  a.ops.v[kLoExposure] = ev;
+  a.ops.v[kLoSaturation] = 20.f;
+  return a;
+}
+
+struct RegionCase {
+  const char* name;
+  std::vector<LocalAdjustment> list;
+};
+// every component kind alone, each window op alone, and the rich edit
+std::vector<RegionCase> regionCases() {
+  using Case = RegionCase;
+  std::vector<Case> cases;
+  {
+    MaskComponent m;
+    m.kind = MaskKind::Linear;
+    m.x0 = 0.5f, m.y0 = 0.2f, m.x1 = 0.5f, m.y1 = 0.55f;
+    cases.push_back({"linear", {oneComp("lin", m, -0.7f)}});
+  }
+  cases.push_back({"radial", {radialAdj(0.55f, 0.5f, 0.25f, 0.8f)}});
+  for (float refine : {0.f, 50.f}) {
+    MaskComponent m;
+    m.kind = MaskKind::Luminance;
+    m.lo = 30.f, m.hi = 100.f, m.lumFeather = 15.f, m.refine = refine;
+    cases.push_back({refine > 0 ? "luminance refine 50" : "luminance refine 0", {oneComp("lum", m, -0.8f)}});
+  }
+  {
+    MaskComponent m;
+    m.kind = MaskKind::Colour;
+    m.hue = 140.f, m.hueRange = 40.f, m.hueFeather = 20.f, m.satMin = 5.f;
+    cases.push_back({"colour", {oneComp("col", m, 0.6f)}});
+  }
+  {
+    MaskComponent b;
+    b.kind = MaskKind::Brush;
+    BrushStroke s;
+    s.size = 0.06f, s.hardness = 40.f, s.flow = 90.f;
+    for (int i = 0; i <= 24; ++i) s.pts.push_back(0.2f + 0.025f * i), s.pts.push_back(0.55f + 0.1f * std::sin(0.25f * i));
+    b.strokes.push_back(s);
+    cases.push_back({"brush", {oneComp("br", b, 0.7f)}});
+  }
+  for (float refine : {0.f, 60.f}) {
+    MaskComponent r;
+    r.kind = MaskKind::Raster;
+    r.ref = "t_edge";
+    r.refine = refine;
+    cases.push_back({refine > 0 ? "raster refine 60" : "raster refine 0", {oneComp("ras", r, 0.6f)}});
+  }
+  {  // each window op (clarity, texture, sharpen, noise, dehaze) on a procedural mask
+    MaskComponent m;
+    m.kind = MaskKind::Radial;
+    m.cx = 0.5f, m.cy = 0.55f, m.rx = 0.3f, m.ry = 0.25f, m.feather = 70.f;
+    struct Op {
+      const char* name;
+      int k;
+      float v;
+    };
+    static const char* names[5] = {"window op clarity", "window op texture", "window op sharpen", "window op noise", "window op dehaze"};
+    const Op ops[5] = {{names[0], kLoClarity, 50.f}, {names[1], kLoTexture, 40.f}, {names[2], kLoSharpen, 40.f}, {names[3], kLoNoise, 40.f}, {names[4], kLoDehaze, 30.f}};
+    for (const Op& o : ops) {
+      LocalAdjustment a = oneComp("win", m, 0.f);
+      a.ops.v[std::size_t(o.k)] = o.v;
+      cases.push_back({o.name, {a}});
+    }
+  }
+  cases.push_back({"every kind and op (richEdit)", richEdit()});
+  return cases;
+}
+
+void testRegion() {
+  const int W = 960, H = 640;
+  const SourceImage src = makeScene(W, H);
+  putEdgeRaster("t_edge", 200, 140, 0.55f, 2.f);
+  const std::vector<RegionCase> cases = regionCases();
+  using Case = RegionCase;
+  struct Win {
+    int x0, y0, x1, y1;
+    const char* what;
+    int tol;  // allowed max code: 1 when the origin is on the 4 px grid of the window nodes, else the grid phase of the 1/4 guided bases (as global clarity)
+  };
+  const Win wins[] = {{240, 160, 720, 480, "window 480x320 at (240,160), origin on the 4 px grid", 1}, {0, 0, 480, 320, "window at the photo's corner", 1}, {243, 161, 723, 481, "window at (243,161), origin off the 4 px grid", 3}};
+  EditParams base;
+  base.exposure = 0.2f;
+  base.clarity = 20.f;
+  for (const Win& w : wins) {
+    const SourceImage ws = windowOf(src, w.x0, w.y0, w.x1, w.y1);
+    // control: no local adjustments (what the window and the whole frame already differ by, apart from the local ones)
+    {
+      EngineSession a, b;
+      Image8 wh, rg;
+      CHECK(exactRender(a, base, src, ExecMode::Whole, 0, wh));
+      CHECK(exactRender(b, base, ws, ExecMode::Whole, 0, rg));
+      const CropDiff d = cropDiff(wh.data.data(), wh.width, rg.data.data(), rg.width, rg.height, w.x0, w.y0, 64, 3);
+      std::printf("  [%s] control (no local): max code %d\n", w.what, d.maxCode);
+      CHECK(d.maxCode <= w.tol);
+    }
+    for (const Case& c : cases) {
+      EditParams p = base;
+      p.local = c.list;
+      EngineSession a, b;
+      Image8 wh, rg;
+      CHECK(exactRender(a, p, src, ExecMode::Whole, 0, wh));
+      CHECK(exactRender(b, p, ws, ExecMode::Whole, 0, rg));
+      CHECK(rg.width == w.x1 - w.x0 && rg.height == w.y1 - w.y0);
+      if (rg.width != w.x1 - w.x0) continue;
+      const CropDiff d = cropDiff(wh.data.data(), wh.width, rg.data.data(), rg.width, rg.height, w.x0, w.y0, 64, 3);
+      // did the local edit do anything at all in the window (so that "equal" is not "both unchanged")?
+      EditParams q = base;
+      EngineSession z;
+      Image8 none;
+      CHECK(exactRender(z, q, ws, ExecMode::Whole, 0, none));
+      std::size_t changed = 0;
+      for (std::size_t i = 0; i < none.data.size() && i < rg.data.size(); ++i) changed += std::abs(int(none.data[i]) - int(rg.data[i])) > 2;
+      std::printf("  %-30s max code %d, over 1: %zu of %zu, local edit changed %zu bytes\n", c.name, d.maxCode, d.over1, d.n, changed);
+      CHECK(d.maxCode <= w.tol);
+      CHECK(double(d.over1) <= 0.001 * double(d.n));
+      CHECK(changed > 500);
+    }
+  }
+}
+
+#ifdef DAPPLE_LOCAL_GPU
+// GPU: the region source's frame against the same pixels of the whole source's frame (both on the GPU executor), and against the CPU region frame
+void testRegionGpu() {
+  auto ctx = gpuContext();
+  filmLibrary();
+  const int W = 960, H = 640;
+  const SourceImage src = makeScene(W, H);
+  putEdgeRaster("t_edge", 200, 140, 0.55f, 2.f);
+  const SourceImage ws = windowOf(src, 240, 160, 720, 480);
+  dapple::gpu::Rig whole(ctx, src, cam()), win(ctx, ws, cam());
+  EngineSession cpuEs;
+  std::vector<RegionCase> gcases = regionCases();
+  gcases.insert(gcases.begin(), RegionCase{"control (no local)", {}});
+  for (const RegionCase& c : gcases) {
+    EditParams p;
+    p.exposure = 0.2f;
+    p.clarity = 20.f;
+    p.local = c.list;
+    FastOptions fo;
+    fo.spatial = SpatialQuality::Full;
+    fo.noise = false;
+    std::string err1, err2;
+    int gw = 0, gh = 0, rw = 0, rh = 0;
+    Renderer r1(p, cam(), nullptr), r2(p, cam(), nullptr);
+    std::uint8_t* a = whole.render(p, r1, src, fo, 33, gw, gh, nullptr, err1);
+    std::uint8_t* b = win.render(p, r2, ws, fo, 33, rw, rh, nullptr, err2);
+    FrameResult res;
+    const bool okCpu = cpuFrame(cpuEs, p, ws, false, res);
+    if (!a || !b || !okCpu || rw != 480 || rh != 320 || res.w != rw || res.h != rh) {
+      std::printf("  %-30s render failed (%s %s %s)\n", c.name, err1.c_str(), err2.c_str(), res.error.c_str());
+      ++g_failures;
+    } else {
+      const CropDiff d = cropDiff(a, gw, b, rw, rh, 240, 160, 64, 4);
+      const dapple::gpu::DeStats cd = dapple::gpu::compareRgba8(b, res.rgba, std::size_t(rw) * rh);
+      std::printf("  %-30s GPU window vs GPU whole crop: max code %d, over 1: %zu of %zu;  GPU window vs CPU window: mean %.4f p99 %.3f\n", c.name, d.maxCode, d.over1, d.n, cd.mean, cd.p99);
+      CHECK(d.maxCode <= 2 && double(d.over1) <= 0.001 * double(d.n));
+      CHECK(cd.mean <= 0.15 && cd.p99 <= 1.5);
+    }
+    std::free(a);
+    std::free(b);
+    std::free(res.rgba);
+  }
+}
+#endif
+
+
+// a film frame (stage L on the film's scene input, stage W after the film): the window against the whole frame, with and without the local edit
+void testRegionFilm() {
+  if (!filmLibrary()) {
+    std::printf("  no film library: skipped\n");
+    std::exit(77);
+  }
+  const SourceImage src = makeScene(960, 640);
+  const SourceImage ws = windowOf(src, 240, 160, 720, 480);
+  for (float strength : {100.f, 50.f}) {
+    EditParams a;
+    a.filmStock = "kodak_portra_400";
+    a.filmStrength = strength;
+    a.filmGrain = 0.f;
+    a.filmHalation = 0.f;
+    EditParams b = a;
+    b.local = {radialAdj(0.55f, 0.5f, 0.25f, 1.f)};
+    b.local[0].ops.v[kLoClarity] = 40.f;
+    b.local[0].ops.v[kLoShadows] = 30.f;
+    int mx[2] = {0, 0};
+    for (int k = 0; k < 2; ++k) {
+      const EditParams& p = k ? b : a;
+      EngineSession e1, e2;
+      FrameResult rw, rr;
+      CHECK(cpuFrame(e1, p, src, false, rw) && cpuFrame(e2, p, ws, false, rr));
+      if (!rw.rgba || !rr.rgba || rr.w != 480 || rr.h != 320) {
+        ++g_failures;
+        continue;
+      }
+      const CropDiff d = cropDiff(rw.rgba, rw.w, rr.rgba, rr.w, rr.h, 240, 160, 64, 4);
+      mx[k] = d.maxCode;
+      std::printf("  film strength %3.0f, %s: window vs whole crop max code %d, over 1: %zu of %zu\n", strength, k ? "with the local edit" : "control (no local)", d.maxCode,
+                  d.over1, d.n);
+      std::free(rw.rgba);
+      std::free(rr.rgba);
+    }
+    (void)mx;  // evidence only: a film frame of a region source already differs from the whole frame's without local adjustments
+  }
+}
+
 // ---- bench (not in ctest) -------------------------------------------------------------------------------------------------------------
 std::vector<LocalAdjustment> benchList(int n, bool window) {
   std::vector<LocalAdjustment> L;
@@ -1092,9 +1340,9 @@ int main(int argc, char** argv) {
     void (*fn)();
   };
   const T tests[] = {{"json", testJson}, {"components", testComponents}, {"identity", testIdentity}, {"raster", testRaster}, {"tiles", testTiles},
-                     {"cache", testCache}, {"coords", testCoords}, {"interactive", testInteractive}, {"film", testFilm},
+                     {"cache", testCache}, {"coords", testCoords}, {"interactive", testInteractive}, {"film", testFilm}, {"region", testRegion}, {"regionfilm", testRegionFilm},
 #ifdef DAPPLE_LOCAL_GPU
-                     {"parity", testParity},
+                     {"parity", testParity}, {"regiongpu", testRegionGpu},
 #endif
   };
   const std::string id = argc > 1 ? argv[1] : "";

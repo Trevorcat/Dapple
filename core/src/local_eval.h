@@ -93,6 +93,10 @@ struct Frame {
   // portrait retouch (docs section 43)
   float iod = 0.f;               // retouch scale of the frame: inter-ocular distance, photo metric (smallest face of the retouch adjustments)
   float srcLong = 0.f;           // long edge of the source the frame was bound for (pixels per photo metric unit without geometry)
+  // region source (SourceImage::parent, docs section 44): the frame's (u, v) are fractions of the window; photo (parent) fractions are
+  // (u pmap[0] + pmap[2], v pmap[1] + pmap[3]). Identity (1, 1, 0, 0) and parentW 0 for a whole photo.
+  float pmap[4] = {1.f, 1.f, 0.f, 0.f};
+  int parentW = 0, parentH = 0, parentX0 = 0, parentY0 = 0;
   std::vector<SpotM> spots;      // heal spots (manual + automatic), in composition order
   std::vector<const Plane*> rasters;  // distinct raster coefficient planes of the components (CPU: evaluated once a pixel, a block at a time)
   std::uint64_t descKey = 0, planesKey = 0;

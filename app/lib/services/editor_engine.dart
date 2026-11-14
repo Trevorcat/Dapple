@@ -841,22 +841,24 @@ class EditorEngine extends ChangeNotifier {
   /// Why a region session (the visible rectangle decoded at the picture's native pixels) cannot render this edit like the full picture, or null
   /// when it can (the edit acts on pixels only).
   ///  - crop / rotate / straighten / flip / vignette refer to the whole picture's geometry;
-  ///  - local adjustments: their masks live in the whole photo's coordinates and several of their parts are solved on the whole photo (the
-  ///    edge-aware smoothing of tone ranges, the refinement of AI / person masks against the photo, the portrait retouch's face scale and its
-  ///    automatic spots); a region session knows only its own pixels, so it would put or shape the masks differently. They keep the
-  ///    half-resolution detail session (up to 4096 px), which evaluates them on the whole photo like the export does.
+  ///  - local adjustments on a film frame: the region session renders a film frame differently from the whole picture even without them (the film's
+  ///    own whole-frame solves, measured up to 60 codes), so the local edit on top cannot be shown equal; they keep the half-resolution detail session.
+  ///    On a plain frame the region session carries its window in the parent photo's coordinates (SourceImage::parent, docs/engine/pipeline-architecture.md
+  ///    section 44): masks are evaluated in parent coordinates and the whole-photo planes (refined AI masks, smoothed ranges, retouch face scale and
+  ///    automatic spots) come from the parent photo, so every kind of local component renders like the same pixels of the whole-frame render.
   static String? regionBlocker(Map<String, dynamic> p) {
     num n(String k) => (p[k] is num) ? p[k] as num : 0;
     final crop = p['crop'];
     final l = p['local'];
     final items = l is Map && l['items'] is List ? l['items'] as List : const [];
+    final film = p['film'] is String && (p['film'] as String).isNotEmpty && p['film'] != 'none';
     final anyLocal = items.any((a) => a is Map && a['on'] != false && (a['strength'] is! num || (a['strength'] as num) > 0));
     final why = <String>[
       if (!(crop == null || crop == 'orig')) 'crop',
       if (n('rot') != 0 || n('straighten') != 0) 'rotate',
       if (p['flip'] == true || p['flip'] == 1) 'flip',
       if (n('vignette') != 0) 'vignette',
-      if (anyLocal) 'local adjustments',
+      if (anyLocal && film) 'local adjustments on a film frame',
     ];
     return why.isEmpty ? null : why.join(' / ');
   }

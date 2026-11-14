@@ -1,3 +1,4 @@
+import 'package:dapple/editor/fold_layout.dart' show debugFoldLayouts;
 import 'package:dapple/screens/editor/film_map_view.dart';
 import 'package:dapple/model/params.dart';
 import 'package:flutter/material.dart';
@@ -13,6 +14,9 @@ Future<void> dock(WidgetTester t, EGroup g) async {
 }
 
 void main() {
+  // these tests are about the ordinary panel placement (side pane on a wide window); the fold layouts have their own tests (fold_layout_test.dart)
+  setUp(() => debugFoldLayouts = false);
+  tearDown(() => debugFoldLayouts = true);
   for (final s in ['p', 'l', 'f']) {
     for (final dark in [false, true]) {
       final th = dark ? 'dark' : 'light';

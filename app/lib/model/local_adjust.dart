@@ -17,6 +17,10 @@ const int kMaxMaskComponents = 8;
 /// Distinct raster planes per edit (the engine counts a plane used twice once; section 43.5 raised it from 4).
 const int kMaxRasterComponents = 12;
 
+/// Wording for the raster-plane limit (guide 13: what happened, then the way out; no internals).
+const String kRoomNote = '放不下';
+const String kRoomMsg = '放不下，先关掉别的项或区域';
+
 /// Manual heal spots per adjustment (section 43.3).
 const int kMaxHealSpots = 64;
 const int kMaxBrushComponents = 8;

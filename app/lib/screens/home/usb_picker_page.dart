@@ -131,7 +131,7 @@ class _UsbPickerPageState extends State<UsbPickerPage> {
       if (_loading) return const Center(child: Spinner(key: ValueKey('usb-loading')));
       return Center(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text(_failed ? '读不到卡里的照片' : '卡里没有照片', style: T.body(c.text2)),
+          Text(_failed ? '读不到卡里的照片' : '卡里没有照片', style: T.bodyL(c.text2)),
           if (_failed) ...[
             const SizedBox(height: Sp.s),
             SizedBox(width: 200, child: KeyedSubtree(key: const ValueKey('usb-retry'), child: SecondaryButton('重试', height: kHit, onPressed: _loadMore))),
@@ -179,7 +179,7 @@ class _UsbPickerPageState extends State<UsbPickerPage> {
       padding: EdgeInsets.fromLTRB(Sp.l, Sp.s, Sp.l, Sp.l + pad),
       // nothing picked: the button names its action and waits (not a hint in place of a button, audit F23)
       child: PrimaryButton(
-        _picked.isEmpty ? '导入' : '导入 ${_picked.length} 张',
+        _picked.isEmpty ? '选择要导入的照片' : '导入 ${_picked.length} 张',
         key: const ValueKey('usb-import'),
         onPressed: _picked.isEmpty || gone ? null : _import,
       ),
@@ -239,7 +239,7 @@ class _TileState extends State<_Tile> {
                   padding: const EdgeInsets.symmetric(horizontal: Sp.s),
                   alignment: Alignment.center,
                   decoration: BoxDecoration(color: Fx.overlay55, borderRadius: BorderRadius.circular(Rd.thumb)),
-                  child: Text('已导入', style: T.mini(Fx.onPhoto, w: FontWeight.w500)),
+                  child: Text('已导入', style: T.cap(Fx.onPhoto, w: FontWeight.w500)),
                 ),
               ),
             if (!widget.known) Positioned(right: 6, top: 6, child: SelectDot(number: widget.number, size: 24)),

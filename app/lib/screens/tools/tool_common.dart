@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
+import '../../widgets/icons.dart';
 
 /// Full-screen tool layout (requirements 4.9.1): 取消 / title / spacer on top, scrolling body,
 /// fixed main button with a hairline above it.
@@ -33,7 +34,7 @@ class ToolScaffold extends StatelessWidget {
           padding: EdgeInsets.only(top: top, left: 4, right: 4),
           child: Row(children: Theme.of(context).platform == TargetPlatform.android
               ? [
-                  IconButton(tooltip: '关闭', icon: const Icon(Icons.close), color: c.text, onPressed: onCancel),
+                  DIconButton(DI.back, label: '返回', color: c.text, onPressed: onCancel),
                   const SizedBox(width: 4),
                   Expanded(child: Text(title, style: T.h2(c.text))),
                 ]

@@ -62,7 +62,7 @@ class DappleShell extends StatelessWidget {
             ),
             Positioned(left: 0, right: 0, bottom: 0, child: bar),
             // the toast rides above the capsule when there is one
-            ToastLayer(app: app, bottom: capsule ? floatBarBase(context) + kFloatBarGap + kFloatBarH + Sp.m : 24),
+            ToastLayer(app: app, bottom: capsule ? floatBarBase(context) + kFloatBarGap + floatBarH(context) + Sp.m : 24),
           ]),
         );
       },
@@ -105,7 +105,7 @@ class _NavItem extends StatelessWidget {
         child: DIcon(icon, size: 24, color: selected ? c.onSecContainer : c.text2, filled: selected),
       ),
       const SizedBox(height: 4),
-      Text(label, style: T.cap(selected ? c.onSecContainer : c.text2, w: selected ? FontWeight.w700 : FontWeight.w500)),
+      Text(label, style: T.cap(selected ? c.onSecContainer : c.text2, w: selected ? FontWeight.w500 : FontWeight.w400)),
     ]);
   }
 }
@@ -162,7 +162,7 @@ class _SelectBar extends StatelessWidget {
   void _compose(BuildContext context) {
     final n = app.selectedIds.length;
     if (n < 2) {
-      app.showToast('至少选 2 张');
+      app.showToast('合成至少选 2 张');
       return;
     }
     showModalBottomSheet<void>(
@@ -182,43 +182,28 @@ class _SelectBar extends StatelessWidget {
     );
   }
 
+  static const double _selW = 84;
+
   @override
   Widget build(BuildContext context) {
-    final c = context.c;
     final on = app.selectedIds.isNotEmpty;
     return FloatBar(
       capsuleKey: const ValueKey('select-bar'),
       children: [
-        FloatBarItem(key: const ValueKey('sel-save'), label: '存相册', icon: DI.save, width: 72, onTap: on ? () => _save(context) : null),
+        // three items of one width, one icon-over-word layout; 发布 is the filled one
+        FloatBarItem(key: const ValueKey('sel-save'), label: '存相册', icon: DI.save, width: _selW, onTap: on ? () => _save(context) : null),
         // HDR / panorama need the engine's merge build (not on iOS yet): no entry rather than a tool that can only fail.
-        if (app.engine.available) FloatBarItem(key: const ValueKey('sel-compose'), label: '合成', icon: DI.merge, width: 72, onTap: on ? () => _compose(context) : null),
-        const SizedBox(width: 4),
-        Semantics(
-          button: true,
-          enabled: on,
-          label: '发布',
-          excludeSemantics: true,
-          onTap: on ? () => _publish(context) : null,
-          child: Opacity(
-            opacity: on ? 1 : 0.4,
-            child: GestureDetector(
-              key: const ValueKey('sel-publish'),
-              behavior: HitTestBehavior.opaque,
-              onTap: on ? () => _publish(context) : null,
-              child: Container(
-                height: kFloatBarH - 8,
-                margin: const EdgeInsets.only(right: 4),
-                padding: const EdgeInsets.symmetric(horizontal: 18),
-                decoration: BoxDecoration(color: c.primaryContainer, borderRadius: BorderRadius.circular(kFloatBarRadius - 4)),
-                child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  DIcon(DI.publish, size: 22, color: c.onPrimaryContainer),
-                  const SizedBox(width: 6),
-                  Text('发布', style: T.body17(c.onPrimaryContainer, w: FontWeight.w500)),
-                ]),
-              ),
-            ),
-          ),
-        ),
+        // always there (the row does not change with the count); with fewer than two photos it is drawn off and the tap says why
+        if (app.engine.available)
+          FloatBarItem(
+              key: const ValueKey('sel-compose'),
+              label: '合成',
+              icon: DI.merge,
+              width: _selW,
+              dimmed: app.selectedIds.length < 2,
+              semantics: app.selectedIds.length < 2 ? '合成，至少选 2 张' : '合成',
+              onTap: () => _compose(context)),
+        FloatBarItem(key: const ValueKey('sel-publish'), label: '发布', icon: DI.publish, width: _selW, primary: true, onTap: on ? () => _publish(context) : null),
       ],
     );
   }
@@ -242,7 +227,7 @@ class _ComposeSheet extends StatelessWidget {
               Expanded(
                 child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Text(t, style: T.body17(c.text)),
-                  Text(sub, style: T.small(c.text2)),
+                  Text(sub, style: T.smallL(c.text2)),
                 ]),
               ),
               DIcon(DI.forward, size: 18, color: c.text2),

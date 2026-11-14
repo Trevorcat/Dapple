@@ -30,6 +30,16 @@ enum LocalPlace {
   aiPortrait,
 }
 
+/// How the shape card groups the kinds, by what the user does: draw a range, pick by tone or colour, pick by what is in the picture.
+enum LocalGroup {
+  shape('画一个范围'),
+  range('按明暗或颜色选'),
+  content('按内容选');
+
+  const LocalGroup(this.title);
+  final String title;
+}
+
 /// The glyph drawn for a kind (local_glyphs.dart).
 enum LocalGlyph { linear, radial, brush, luminance, color, subject, sky, person, depth, raster, background, tap, portrait }
 
@@ -39,8 +49,11 @@ abstract final class AiBits {
 }
 
 class LocalKind {
-  const LocalKind(this.id, this.label, this.engine, this.glyph, this.place, {this.visible = true, this.aiKey, this.aiTasks = 0, this.note, this.overlayFollowsStale = false});
+  const LocalKind(this.id, this.label, this.engine, this.glyph, this.place, {this.visible = true, this.aiKey, this.aiTasks = 0, this.note, this.overlayFollowsStale = false, this.group = LocalGroup.shape});
   final String id;
+
+  /// The group the kind sits in on the shape card (a small title above its tiles; three to five tiles a group).
+  final LocalGroup group;
 
   /// The word under the icon on the shape card (plain Chinese, no jargon).
   final String label;
@@ -75,13 +88,13 @@ const List<LocalKind> localKinds = [
   LocalKind('linear', '渐变', MaskKindId.linear, LocalGlyph.linear, LocalPlace.handles),
   LocalKind('radial', '圆形', MaskKindId.radial, LocalGlyph.radial, LocalPlace.handles),
   LocalKind('brush', '画笔', MaskKindId.brush, LocalGlyph.brush, LocalPlace.paint),
-  LocalKind('luminance', '明暗', MaskKindId.luminance, LocalGlyph.luminance, LocalPlace.sample, overlayFollowsStale: true),
-  LocalKind('color', '颜色', MaskKindId.color, LocalGlyph.color, LocalPlace.sample, overlayFollowsStale: true),
-  LocalKind('portrait', '人像', MaskKindId.raster, LocalGlyph.portrait, LocalPlace.aiPortrait, aiTasks: AiBits.person | AiBits.faces),
-  LocalKind('person', '人物', MaskKindId.raster, LocalGlyph.person, LocalPlace.aiParts, aiTasks: AiBits.person | AiBits.faces),
-  LocalKind('background', '背景', MaskKindId.raster, LocalGlyph.background, LocalPlace.aiPlane, aiKey: 'background', aiTasks: AiBits.person),
-  LocalKind('tap', '点选', MaskKindId.raster, LocalGlyph.tap, LocalPlace.aiTap, aiKey: 'tap', aiTasks: AiBits.tapPrepare),
-  LocalKind('sky', '天空', MaskKindId.raster, LocalGlyph.sky, LocalPlace.aiPlane, aiKey: 'sky', aiTasks: AiBits.sky, note: '粗略'),
+  LocalKind('luminance', '明暗', MaskKindId.luminance, LocalGlyph.luminance, LocalPlace.sample, overlayFollowsStale: true, group: LocalGroup.range),
+  LocalKind('color', '颜色', MaskKindId.color, LocalGlyph.color, LocalPlace.sample, overlayFollowsStale: true, group: LocalGroup.range),
+  LocalKind('portrait', '美颜', MaskKindId.raster, LocalGlyph.portrait, LocalPlace.aiPortrait, aiTasks: AiBits.person | AiBits.faces, group: LocalGroup.content),
+  LocalKind('person', '人物', MaskKindId.raster, LocalGlyph.person, LocalPlace.aiParts, aiTasks: AiBits.person | AiBits.faces, group: LocalGroup.content),
+  LocalKind('background', '背景', MaskKindId.raster, LocalGlyph.background, LocalPlace.aiPlane, aiKey: 'background', aiTasks: AiBits.person, group: LocalGroup.content),
+  LocalKind('tap', '点选', MaskKindId.raster, LocalGlyph.tap, LocalPlace.aiTap, aiKey: 'tap', aiTasks: AiBits.tapPrepare, group: LocalGroup.content),
+  LocalKind('sky', '天空', MaskKindId.raster, LocalGlyph.sky, LocalPlace.aiPlane, aiKey: 'sky', aiTasks: AiBits.sky, note: '粗略', group: LocalGroup.content),
   LocalKind('depth', '远近', MaskKindId.raster, LocalGlyph.depth, LocalPlace.aiDepth, aiKey: 'depth', aiTasks: AiBits.depth, overlayFollowsStale: true),
 ];
 
@@ -147,6 +160,6 @@ String? limitFor(LocalList list, LocalKind k, {int? index, int n = 1}) {
   if (index == null && list.length >= kMaxLocalAdjustments) return '最多 $kMaxLocalAdjustments 个区域';
   if (index != null && list.items[index].mask.length + n > kMaxMaskComponents) return '每个区域最多 $kMaxMaskComponents 块';
   if (k.engine == MaskKindId.brush && list.countKind(MaskKindId.brush) + n > kMaxBrushComponents) return '画笔最多 $kMaxBrushComponents 块';
-  if (k.engine == MaskKindId.raster && list.rasterPlanes + n > kMaxRasterComponents) return '人物、天空、点选最多 $kMaxRasterComponents 块';
+  if (k.engine == MaskKindId.raster && list.rasterPlanes + n > kMaxRasterComponents) return kRoomMsg;
   return null;
 }

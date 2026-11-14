@@ -164,8 +164,9 @@ class _MergeToolPageState extends State<MergeToolPage> {
     final size = MediaQuery.sizeOf(context);
     final base = app.photoById(d.effectiveBaseId ?? '');
     final boxW = size.width - 32;
-    final aspect = isHdr ? 1.5 : 3.0;
-    final maxH = size.height * 0.30;
+    // the preview is the most important thing on the page: a panorama box is 2.2 : 1 (it was 3 : 1, about 100 dp high) and may take more of the height
+    final aspect = isHdr ? 1.5 : 2.2;
+    final maxH = size.height * 0.36;
     var w = boxW, h = boxW / aspect;
     if (h > maxH) {
       h = maxH;
@@ -211,7 +212,7 @@ class _MergeToolPageState extends State<MergeToolPage> {
         if (d.note != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(Sp.l, 0, Sp.l, Sp.s),
-            child: Text(d.note!, key: const ValueKey('tool-note'), style: T.small(c.text2)),
+            child: Text(d.note!, key: const ValueKey('tool-note'), style: T.smallL(c.text2)),
           ),
         SizedBox(
           height: 66 + 8 + 20 + 6,
@@ -229,7 +230,12 @@ class _MergeToolPageState extends State<MergeToolPage> {
             ),
           ),
         ),
-        const SizedBox(height: Sp.m),
+        if (n >= 2)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(Sp.l, 0, Sp.l, Sp.s),
+            child: Text('长按一张，设为基准帧', key: const ValueKey('tool-base-hint'), style: T.smallL(c.text2)),
+          ),
+        const SizedBox(height: Sp.s),
         ToolBlock(children: [
           if (isHdr) ...[
             Text('去鬼影', style: T.body17(c.text)),
@@ -255,18 +261,31 @@ class _MergeToolPageState extends State<MergeToolPage> {
                   _changed();
                 }),
           ] else ...[
-            Text('投影', style: T.body17(c.text)),
+            Text('拼成', style: T.body17(c.text)),
             const SizedBox(height: Sp.s),
             KeyedSubtree(
               key: const ValueKey('tool-projection'),
               child: DSegmented(
-                semanticsLabel: '投影',
-                labels: const ['球面', '圆柱', '透视'],
+                semanticsLabel: '拼成',
+                labels: const ['球形', '柱形', '平面'],
                 index: const ['sph', 'cyl', 'persp'].indexOf(d.projection),
                 onChanged: (i) {
                   d.projection = const ['sph', 'cyl', 'persp'][i];
                   _changed();
                 },
+              ),
+            ),
+            // one sentence of what the choice looks like, instead of a technical word
+            Padding(
+              padding: const EdgeInsets.only(top: Sp.s),
+              child: Text(
+                switch (d.projection) {
+                  'cyl' => '柱形：横向长景，竖直的线保持竖直',
+                  'persp' => '平面：适合建筑和窄的视角，边缘会被拉伸',
+                  _ => '球形：适合视野很大的全景，边缘自然弯曲',
+                },
+                key: const ValueKey('tool-projection-hint'),
+                style: T.smallL(c.text2),
               ),
             ),
             ToolSwitchRow(
@@ -279,7 +298,7 @@ class _MergeToolPageState extends State<MergeToolPage> {
                 }),
             ToolSwitchRow(
                 switchKey: const ValueKey('tool-fill'),
-                label: '填充边缘',
+                label: '补全空白边缘',
                 value: d.fill,
                 onChanged: (v) {
                   d.fill = v;
@@ -292,7 +311,7 @@ class _MergeToolPageState extends State<MergeToolPage> {
   }
 }
 
-/// One candidate of the strip: 88 x 66, check toggle, 识别 tag, base-frame star, bottom label.
+/// One candidate of the strip: 88 x 66, check toggle, a star on the base frame (long press sets it), bottom label.
 class _SourceTile extends StatelessWidget {
   const _SourceTile({required this.app, required this.draft, required this.source, required this.onChanged});
   final AppState app;
@@ -322,9 +341,20 @@ class _SourceTile extends StatelessWidget {
                     source.checked = !source.checked;
                     onChanged();
                   },
+                  onLongPress: () {
+                    // 设为基准: checks the photo if it was off
+                    source.checked = true;
+                    draft.baseId = source.photoId;
+                    onChanged();
+                  },
                   child: Semantics(
                     checked: source.checked,
-                    label: '${source.label}，${source.checked ? '已选' : '未选'}',
+                    onLongPress: () {
+                      source.checked = true;
+                      draft.baseId = source.photoId;
+                      onChanged();
+                    },
+                    label: '${source.label}，${source.checked ? '已选' : '未选'}${isBase ? '，基准帧' : ''}',
                     excludeSemantics: true,
                     child: Container(
                       decoration: BoxDecoration(
@@ -352,48 +382,18 @@ class _SourceTile extends StatelessWidget {
                 ),
               ),
             ),
-            if (source.detected)
+            // the base frame carries a small star (not a button): long press a photo to make it the base
+            if (isBase)
               Positioned(
                 left: 4,
-                top: 4,
+                bottom: 4,
                 child: IgnorePointer(
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(color: Fx.overlay55, borderRadius: BorderRadius.circular(8)),
-                    child: Text('识别', style: T.mini(Colors.white, w: FontWeight.w500)),
-                  ),
-                ),
-              ),
-            if (source.checked)
-              Positioned(
-                left: 0,
-                bottom: 0,
-                child: Semantics(
-                  button: true,
-                  selected: isBase,
-                  label: isBase ? '基准帧' : '设为基准帧',
-                  excludeSemantics: true,
-                  child: GestureDetector(
-                    key: ValueKey('star-${source.photoId}'),
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () {
-                      draft.baseId = source.photoId;
-                      onChanged();
-                    },
-                    child: SizedBox(
-                      key: isBase ? ValueKey('base-${source.photoId}') : null,
-                      width: 44,
-                      height: 44,
-                      child: Center(
-                        child: Container(
-                          width: 26,
-                          height: 26,
-                          decoration: BoxDecoration(shape: BoxShape.circle, color: isBase ? Fx.star : Fx.overlay55),
-                          child: Center(
-                              child: DIcon(DI.star, size: 14, color: isBase ? Fx.onStar : Colors.white, filled: isBase, stroke: 1.8)),
-                        ),
-                      ),
-                    ),
+                    key: ValueKey('base-${source.photoId}'),
+                    width: 22,
+                    height: 22,
+                    decoration: const BoxDecoration(shape: BoxShape.circle, color: Fx.star),
+                    child: const Center(child: DIcon(DI.star, size: 13, color: Fx.onStar, filled: true, stroke: 1.8)),
                   ),
                 ),
               ),

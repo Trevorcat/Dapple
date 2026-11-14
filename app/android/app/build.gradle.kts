@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -9,6 +11,18 @@ plugins {
 val aiRt = file("../../../tools/ai-rt")
 val aiEnabled = project.findProperty("dapple.ai") != "false" && file("$aiRt/jniLibs").isDirectory
 val aiDepth = project.findProperty("dapple.aiDepth") == "true"
+
+// Release signing (docs/release/android.md): app/android/key.properties (git-ignored, never committed) holds storeFile, storePassword, keyAlias,
+// keyPassword. Absent or incomplete: the release build falls back to the debug key and says so loudly (such an APK cannot be published).
+val keyProps = Properties().apply {
+    val f = rootProject.file("key.properties")
+    if (f.isFile) f.inputStream().use { load(it) }
+}
+val haveReleaseKey = listOf("storeFile", "storePassword", "keyAlias", "keyPassword").all { !keyProps.getProperty(it).isNullOrBlank() } &&
+    rootProject.file(keyProps.getProperty("storeFile", "")).isFile
+// ABIs in the package. Default arm64-v8a only. Emulator: -Pdapple.x86=true adds x86_64. Explicit list: -Pdapple.abis=arm64-v8a,x86_64
+val packAbis: List<String> = (project.findProperty("dapple.abis") as String?)?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+    ?: if (project.hasProperty("dapple.x86")) listOf("arm64-v8a", "x86_64") else listOf("arm64-v8a")
 
 android {
     namespace = "com.dapple.dapple"
@@ -32,9 +46,9 @@ android {
         versionName = flutter.versionName
 
         ndk {
-            abiFilters += listOf("arm64-v8a")
-            // Emulator testing: flutter build apk --debug -Pdapple.x86=true
-            if (project.hasProperty("dapple.x86")) abiFilters += listOf("x86_64")
+            abiFilters += packAbis
+            // AAB: native debug symbols (symbol table) go into the bundle so the Play Console can symbolise native crashes.
+            debugSymbolLevel = "SYMBOL_TABLE"
         }
         externalNativeBuild {
             cmake {
@@ -84,9 +98,18 @@ android {
 
     packaging {
         jniLibs {
-            excludes += if (project.hasProperty("dapple.x86"))
-                listOf("lib/armeabi-v7a/**", "lib/x86/**")
-            else listOf("lib/armeabi-v7a/**", "lib/x86_64/**", "lib/x86/**")
+            excludes += listOf("lib/armeabi-v7a/**", "lib/x86/**", "lib/arm64-v8a/**", "lib/x86_64/**").filter { e -> packAbis.none { e.startsWith("lib/$it/") } }
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            if (haveReleaseKey) {
+                storeFile = rootProject.file(keyProps.getProperty("storeFile"))
+                storePassword = keyProps.getProperty("storePassword")
+                keyAlias = keyProps.getProperty("keyAlias")
+                keyPassword = keyProps.getProperty("keyPassword")
+            }
         }
     }
 
@@ -97,8 +120,17 @@ android {
             externalNativeBuild { cmake { arguments("-DCMAKE_BUILD_TYPE=Release") } }
         }
         release {
-            // Debug keys so `flutter run --release` works; replace for real distribution.
-            signingConfig = signingConfigs.getByName("debug")
+            if (haveReleaseKey) {
+                signingConfig = signingConfigs.getByName("release")
+            } else {
+                // Debug keys so `flutter run --release` and local release tests work. NOT publishable.
+                signingConfig = signingConfigs.getByName("debug")
+                logger.warn("!!!!!!!! WARNING: app/android/key.properties missing or incomplete: the RELEASE build is signed with the DEBUG key. Do not publish it. See docs/release/android.md !!!!!!!!")
+            }
+            // R8 code shrinking + resource shrinking. Keep rules for JNI and the native plugins: proguard-rules.pro.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 }

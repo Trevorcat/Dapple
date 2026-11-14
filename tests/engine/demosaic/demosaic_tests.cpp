@@ -3,6 +3,7 @@
 // Synthetic scenes have a known answer; "real" tests use the public sample files under build/rawsamples when present (exit 77 = skipped).
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <thread>
 #include <array>
 #include <chrono>
@@ -641,17 +642,35 @@ int testWireCancel() {
     auto r = decodeRawRegion(f, 0, 0, 3000, 2000, {}, &why, &other, 1);
     CHECK(!r && why == "cancelled", "a cancelled open must fail with 'cancelled' (%s)", why.c_str());
   }
-  auto t0 = std::chrono::steady_clock::now();
-  std::thread th([&] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    gen.store(2);
-  });
-  auto r = decodeRawRegion(f, 0, 0, 7752, 5178, {}, &why, &gen, 1);  // the whole frame on this thread pool: seconds without the cancel
-  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  th.join();
-  CHECK(!r, "the open was not cancelled");
-  CHECK(ms < 800.0, "cancel took %.0f ms to take effect", ms);
-  std::printf("  cancelled a whole-frame open after 30 ms: returned after %.0f ms (%s)\n", ms, why.c_str());
+  // The cancel latency is measured from the moment the flag is flipped, not from the start of the call: the old check (whole call < 800 ms) also counted the
+  // 30 ms sleep, the thread start and every scheduler delay, so it failed now and then on a loaded machine (ctest -j, a build running next door) while the
+  // cancel path itself was fine. A timing bound is one-sided, so a slow attempt is retried (the first attempt that meets it passes); each attempt prints what
+  // it saw, so a real regression (every attempt slow) shows with numbers. An attempt where the whole frame finished before the flag was flipped means the
+  // machine was too slow to test anything (the flipping thread was starved): it is retried too, and fails only if all attempts do.
+  double bestLatency = 1e9;
+  bool cancelledOnce = false, sawNotCancelled = false;
+  for (int attempt = 0; attempt < 3 && !(cancelledOnce && bestLatency < 800.0); ++attempt) {
+    gen.store(1);
+    std::atomic<std::int64_t> cancelAtNs{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread th([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      cancelAtNs.store(std::chrono::steady_clock::now().time_since_epoch().count());
+      gen.store(2);
+    });
+    auto r = decodeRawRegion(f, 0, 0, 7752, 5178, {}, &why, &gen, 1);  // the whole frame on this thread pool: seconds without the cancel
+    const auto t1 = std::chrono::steady_clock::now();
+    th.join();
+    const double total = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const std::int64_t c = cancelAtNs.load();
+    const double latency = c ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::duration(t1.time_since_epoch().count() - c)).count() : -1.0;
+    std::printf("  attempt %d: whole-frame open returned after %.0f ms total, %.0f ms after the cancel flag (%s, %s)\n", attempt + 1, total, latency, r ? "NOT cancelled" : "cancelled", why.c_str());
+    if (r) { sawNotCancelled = true; continue; }
+    cancelledOnce = true;
+    if (latency >= 0 && latency < bestLatency) bestLatency = latency;
+  }
+  CHECK(cancelledOnce, "the open was not cancelled in any attempt%s", sawNotCancelled ? " (the whole frame finished before the cancel flag was set: machine too loaded?)" : "");
+  CHECK(!cancelledOnce || bestLatency < 800.0, "cancel took %.0f ms to take effect (best of 3)", bestLatency);
   return g_fail ? 1 : 0;
 }
 

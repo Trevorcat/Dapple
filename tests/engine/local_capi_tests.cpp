@@ -4,6 +4,8 @@
 //     render   dapple_session_render with and without a local radial (+2 EV): brighter inside, unchanged far outside
 //     exports  export_jpeg, export_jpeg_ex (p3), export_jpeg_hdr and the base previews: the same check on decoded files
 //     ui       mask preview (output frame / photo space), map_point round trips, mask_sample_json, raster store
+//     region   a region session (dapple_session_open_region, a window of the photo at its own pixels) with local adjustments of every kind renders like the
+//              same pixels of the whole session's render (section 44)
 //     video    the video-frame render path of a Motion Photo cover (dapple_video_edit_render, no RAW needed)
 #include <stb_image.h>
 
@@ -18,6 +20,8 @@
 #include <vector>
 
 #include "dapple/dapple_c.h"
+#include "dapple/edit_params.h"
+#include "dapple/local_adjust.h"
 
 namespace fs = std::filesystem;
 
@@ -291,6 +295,138 @@ static std::uint16_t toHalf(float f) {
   return std::uint16_t(r);
 }
 
+
+// ---- region (docs section 44) -----------------------------------------------------------------------------------------------------------
+static void testRegion() {
+  skipWithoutRaw();
+  using namespace dapple;
+  const std::string path = rafPath().string();
+  // the whole photo at its own pixels (the reference): a full session, its frame is the picture
+  DappleSession* full = dapple_session_open(path.c_str(), DAPPLE_QUALITY_FULL, 0);
+  CHECK(full != nullptr);
+  if (!full) return;
+  // a soft elliptical raster mask (like a model's), supplied once by id
+  {
+    const int w = 256, h = 171;
+    std::vector<std::uint8_t> px(std::size_t(w) * h);
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        const float dx = (x + 0.5f) / w - 0.5f, dy = (y + 0.5f) / h - 0.5f;
+        px[std::size_t(y) * w + x] = std::uint8_t(std::clamp(1.f - (std::sqrt(dx * dx / 0.09f + dy * dy / 0.05f) - 0.8f) / 0.4f, 0.f, 1.f) * 255.f + 0.5f);
+      }
+    CHECK(dapple_mask_raster_set("t_region_ell", w, h, px.data(), w) == DAPPLE_OK);
+  }
+  EditParams p;
+  p.exposure = 0.2f;
+  p.clarity = 20.f;
+  auto add = [&](const char* id, MaskComponent m, float ev) {
+    LocalAdjustment a;
+    a.id = id;
+    a.mask.push_back(m);
+    a.ops.v[kLoExposure] = ev;
+    a.ops.v[kLoSaturation] = 20.f;
+    a.ops.v[kLoClarity] = 30.f;
+    a.ops.v[kLoTexture] = 20.f;
+    p.local.push_back(a);
+  };
+  {
+    MaskComponent m;
+    m.kind = MaskKind::Linear;
+    m.x0 = 0.5f, m.y0 = 0.3f, m.x1 = 0.5f, m.y1 = 0.6f;
+    add("lin", m, -0.6f);
+    MaskComponent r;
+    r.kind = MaskKind::Radial;
+    r.cx = 0.5f, r.cy = 0.5f, r.rx = 0.2f, r.ry = 0.15f, r.feather = 60.f;
+    add("rad", r, 0.5f);
+    MaskComponent l;
+    l.kind = MaskKind::Luminance;
+    l.lo = 25.f, l.hi = 80.f, l.lumFeather = 15.f, l.refine = 50.f;
+    add("lum", l, -0.5f);
+    MaskComponent c;
+    c.kind = MaskKind::Colour;
+    c.hue = 120.f, c.hueRange = 60.f, c.hueFeather = 30.f, c.satMin = 3.f;
+    add("col", c, 0.4f);
+    MaskComponent b;
+    b.kind = MaskKind::Brush;
+    BrushStroke st;
+    st.size = 0.05f, st.hardness = 40.f, st.flow = 90.f;
+    for (int i = 0; i <= 30; ++i) st.pts.push_back(0.3f + 0.015f * i), st.pts.push_back(0.5f + 0.08f * std::sin(0.3f * i));
+    b.strokes.push_back(st);
+    add("brush", b, 0.6f);
+    MaskComponent ra;
+    ra.kind = MaskKind::Raster;
+    ra.ref = "t_region_ell";
+    ra.refine = 60.f;
+    add("ras", ra, 0.5f);
+  }
+  EditParams p0 = p;
+  p0.local.clear();
+  const std::string pj = toJson(p), pj0 = toJson(p0);
+  DappleFrameRequest rq{};
+  rq.size = sizeof rq;
+  rq.bake_size = 33;
+  DappleImage whole{};
+  DappleImage whole0{};
+  CHECK(dapple_session_render_frame(full, pj.c_str(), "", &rq, &whole, nullptr) == DAPPLE_OK);
+  CHECK(dapple_session_render_frame(full, pj0.c_str(), "", &rq, &whole0, nullptr) == DAPPLE_OK);
+  const Pic W = fromImage(whole), W0 = fromImage(whole0);
+  CHECK(W.ok());
+  if (!W.ok()) return dapple_session_close(full);
+  const std::pair<int, int> origins[] = {{(W.w / 2) / 4 * 4 - 1200, (W.h / 2) / 4 * 4 - 800}, {0, 0}};
+  for (const auto& o : origins) {
+    const int x0 = std::max(0, o.first), y0 = std::max(0, o.second), x1 = std::min(W.w, x0 + 2400), y1 = std::min(W.h, y0 + 1600);
+    DappleSession* rs = dapple_session_open_region(path.c_str(), x0, y0, x1, y1);
+    if (!rs) std::printf("  region open: %s\n", dapple_last_error());
+    CHECK(rs != nullptr);
+    if (!rs) continue;
+    DappleImage ri{};
+    const int rc = dapple_session_render_frame(rs, pj.c_str(), "", &rq, &ri, nullptr);
+    if (rc != DAPPLE_OK) std::printf("  region render: %s\n", dapple_last_error());
+    CHECK(rc == DAPPLE_OK);
+    const Pic R = fromImage(ri);
+    {  // control: the same window without local adjustments (what the decoded window and the whole picture already differ by)
+      DappleImage ci{};
+      CHECK(dapple_session_render_frame(rs, pj0.c_str(), "", &rq, &ci, nullptr) == DAPPLE_OK);
+      const Pic C = fromImage(ci);
+      int cm = 0;
+      std::size_t co = 0;
+      for (int y = 64; C.ok() && y < C.h - 64; ++y)
+        for (int x = 64; x < C.w - 64; ++x)
+          for (int c = 0; c < 3; ++c) {
+            const int e = std::abs(int(W0.d[(std::size_t(y + y0) * W.w + (x + x0)) * 4 + c]) - int(C.d[(std::size_t(y) * C.w + x) * 4 + c]));
+            cm = std::max(cm, e), co += e > 1;
+          }
+      std::printf("  control (no local) max code %d, over 1: %zu\n", cm, co);
+    }
+    CHECK(R.ok() && R.w == x1 - x0 && R.h == y1 - y0);
+    if (R.ok() && R.w == x1 - x0) {
+      // the error by distance from the window's edge: the window ops (clarity, texture ...) see replicated edges within their halo
+      const int bands[] = {0, 64, 160, 320, 480};
+      int mx[5] = {0, 0, 0, 0, 0};
+      std::size_t over1[5] = {0, 0, 0, 0, 0}, n[5] = {0, 0, 0, 0, 0}, changed = 0;
+      for (int y = 0; y < R.h; ++y)
+        for (int x = 0; x < R.w; ++x) {
+          const int dist = std::min(std::min(x, y), std::min(R.w - 1 - x, R.h - 1 - y));
+          int band = 0;
+          while (band < 4 && dist >= bands[band + 1]) ++band;
+          for (int c = 0; c < 3; ++c) {
+            const std::size_t o = (std::size_t(y + y0) * W.w + (x + x0)) * 4 + std::size_t(c);
+            const int e = std::abs(int(W.d[o]) - int(R.d[(std::size_t(y) * R.w + x) * 4 + c]));
+            mx[band] = std::max(mx[band], e), over1[band] += e > 1, ++n[band];
+            if (dist >= 320) changed += std::abs(int(W0.d[o]) - int(W.d[o])) > 2;
+          }
+        }
+      std::printf("  region (%d,%d) %dx%d of %dx%d, six local kinds, max code / values over 1 by distance from the window's edge:", x0, y0, R.w, R.h, W.w, W.h);
+      for (int k = 0; k < 5; ++k) std::printf("  %d+: %d / %zu", bands[k], mx[k], over1[k]);
+      std::printf("  (local edit changed %zu interior values)\n", changed);
+      CHECK(mx[3] <= 1 && mx[4] <= 1);
+      CHECK(changed > 10000);
+    }
+    dapple_session_close(rs);
+  }
+  dapple_session_close(full);
+}
+
 static void testVideo() {
   const int w = 320, h = 180;
   std::vector<std::uint16_t> px(std::size_t(w) * h * 4);
@@ -340,7 +476,7 @@ int main(int argc, char** argv) {
     const char* id;
     void (*fn)();
   };
-  const T tests[] = {{"render", testRender}, {"exports", testExports}, {"ui", testUi}, {"video", testVideo}};
+  const T tests[] = {{"render", testRender}, {"exports", testExports}, {"ui", testUi}, {"region", testRegion}, {"video", testVideo}};
   const std::string id = argc > 1 ? argv[1] : "";
   bool ran = false;
   for (const T& t : tests)

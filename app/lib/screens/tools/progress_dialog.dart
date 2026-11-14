@@ -98,11 +98,11 @@ class _ToolProgressDialogState extends State<_ToolProgressDialog> {
                 Text(title, key: const ValueKey('tool-dialog-title'), style: T.h2(c.text)),
                 if (failed && isLive && j.error != null) ...[
                   const SizedBox(height: Sp.s),
-                  Text(j.error!, maxLines: 3, overflow: TextOverflow.ellipsis, style: T.body(c.text2)),
+                  Text(j.error!, maxLines: 3, overflow: TextOverflow.ellipsis, style: T.bodyL(c.text2)),
                 ],
                 if (!failed) ...[
                   const SizedBox(height: Sp.m),
-                  Text('${j.stepLine} · ${j.step}', key: const ValueKey('tool-dialog-step'), style: T.body(c.text2)),
+                  Text('${j.stepLine} · ${j.step}', key: const ValueKey('tool-dialog-step'), style: T.bodyL(c.text2)),
                   const SizedBox(height: Sp.m),
                   Semantics(
                       label: _stalled ? j.step : '${j.percent}%',

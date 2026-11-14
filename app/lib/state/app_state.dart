@@ -45,7 +45,7 @@ class Toast {
   final String message;
   final String? actionLabel;
   final VoidCallback? onAction;
-  Duration get duration => Duration(milliseconds: actionLabel != null ? 8000 : 2400);
+  Duration get duration => Duration(milliseconds: actionLabel != null ? 4000 : 2400);
 }
 
 /// A day section of the home grid.
@@ -1636,6 +1636,18 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// The latest video as a home card, unless the user closed it ("video:ID" is remembered like a dismissed group).
+  VideoItem? get videoCard {
+    final v = videoLayer ? latestVideo : null;
+    return v == null || _dismissed.contains('video:${v.id}') ? null : v;
+  }
+
+  void dismissVideo(VideoItem v) {
+    _dismissed.add('video:${v.id}');
+    _saveDetection();
+    notifyListeners();
+  }
+
   void _scheduleDetect() {
     if (isDemo || !ready) return;
     _detectTimer?.cancel();
@@ -1877,7 +1889,7 @@ class AppState extends ChangeNotifier {
   List<VideoItem> videos = [];
 
   Future<void> refreshVideos() async {
-    if (isDemo || !Platform.isAndroid) return;
+    if (isDemo || !(Platform.isAndroid || Platform.isIOS)) return;
     try {
       videos = await LiveBridge.listVideos(limit: 40);
       latestVideo = videos.isEmpty ? null : videos.first;
@@ -2038,7 +2050,7 @@ class AppState extends ChangeNotifier {
   /// source video (found by file name in MediaStore) with the default centred window; when the source is gone the item is
   /// removed with a message. Items whose clip is fine are only stamped with the current revision.
   Future<void> auditLive() async {
-    if (isDemo || !Platform.isAndroid) return;
+    if (isDemo || !(Platform.isAndroid || Platform.isIOS)) return;
     final stale = [for (final e in _photos.values) if (e.kind == PhotoKind.live && e.liveGen < Photo.liveGenCurrent) e];
     var rebuilt = 0;
     final removed = <String>[];

@@ -282,7 +282,7 @@ class _LiveToolPageState extends State<LiveToolPage> {
           key: const ValueKey('live-undecodable'),
           padding: const EdgeInsets.fromLTRB(Sp.l, 0, Sp.l, Sp.m),
           child: Text('这段视频的格式（$bad）在此设备上无法正确解码，无法生成动态照片。请换一段视频。',
-              style: T.body(c.text2)),
+              style: T.bodyL(c.text2)),
         ),
       Center(
         child: GestureDetector(
@@ -377,7 +377,7 @@ class _LiveToolPageState extends State<LiveToolPage> {
         ),
         if (_slogNote != null && cur.source == LiveSource.auto) ...[
           const SizedBox(height: Sp.s),
-          Text('检测到相机的 $_slogNote 标记，按 S-Log3 转成标准色彩', key: const ValueKey('live-slog-note'), style: T.small(c.text2)),
+          Text('检测到相机的 $_slogNote 标记，按 S-Log3 转成标准色彩', key: const ValueKey('live-slog-note'), style: T.smallL(c.text2)),
         ],
       ]),
     ]);

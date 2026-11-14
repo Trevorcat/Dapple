@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -26,6 +27,8 @@ struct DecodeOptions {
   int wantLongEdge = 0;
 };
 
+struct RegionParent;
+
 // Output of every decoder, whatever the source format.
 struct SourceImage {
   // Linear ProPhoto RGB, white-balanced with the as-shot white balance.
@@ -35,6 +38,17 @@ struct SourceImage {
   // RAW data is scene-referred and still needs a base tone curve; JPEG/HEIF
   // from the camera are already display-referred.
   bool sceneReferred = true;
+  // Set on a region source only (a window of a larger picture at its own pixels, docs/engine/pipeline-architecture.md section 44): where the window sits
+  // in the parent picture. Local adjustments are evaluated in the parent's coordinates against the parent's whole-photo planes.
+  std::shared_ptr<const RegionParent> parent;
+};
+
+// The parent picture of a region source. The window is `linear.width x linear.height` pixels at (x0, y0) of the fullW x fullH picture (oriented,
+// cropped, native pixels). `photo` returns the whole picture at any scale up to 2048 px long edge (the guide of the whole-photo planes: refined
+// masks, smoothed ranges, retouch face scale and automatic spots), built on first use; null when it cannot be had.
+struct RegionParent {
+  int fullW = 0, fullH = 0, x0 = 0, y0 = 0;
+  std::function<std::shared_ptr<const SourceImage>()> photo;
 };
 
 class ImageDecoder {

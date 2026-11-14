@@ -36,7 +36,7 @@ class AiMasks {
   /// What the engine can do on this device (after [prepare]).
   AiAvailability get availability => _availability;
 
-  /// Copies the bundled model files to app storage on first use (Android; a no-op after the first time), tells the engine where the models and
+  /// Copies the bundled model files to app storage on first use (Android; a no-op after the first time; iOS reads them in place from the app bundle), tells the engine where the models and
   /// the cache directory are, and returns the availability. Idempotent. On desktop the models come from DAPPLE_AI_MODELS (development only).
   Future<AiAvailability> prepare({String? modelDir, String? cacheDir}) => _preparing ??= _prepare(modelDir, cacheDir);
 
@@ -44,7 +44,7 @@ class AiMasks {
     if (!AiBindings.present) return _availability = AiAvailability.none;
     var models = modelDir ?? '';
     if (models.isEmpty) {
-      if (Platform.isAndroid) {
+      if (Platform.isAndroid || Platform.isIOS) {
         try {
           models = (await _channel.invokeMethod<String>('prepare')) ?? '';
         } catch (_) {}

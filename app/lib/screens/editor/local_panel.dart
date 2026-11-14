@@ -100,7 +100,7 @@ class LocalHeader extends StatelessWidget {
         final s = lc.sel;
         if (s == null) return '';
         final r = localReadout(localUiOf(s), area: s, pad: lc.padCat);
-        return portraitOf(s) != null ? '人像 · $r' : r;
+        return portraitOf(s) != null ? '美颜 · $r' : r;
       },
     );
     if (emptyCard) {
@@ -137,7 +137,7 @@ class LocalHeader extends StatelessWidget {
       sub = readout;
       if (a != null) buttons.add(reset);
     } else {
-      sub = portraitPanel && a == null ? subText('人像') : readout;
+      sub = portraitPanel && a == null ? subText('美颜') : readout;
       if (a != null) {
         buttons
           ..add(reset)
@@ -371,7 +371,7 @@ class _AreaChip extends StatelessWidget {
     final glyph = portraitOf(a) != null ? LocalGlyph.portrait : (a.mask.isEmpty ? LocalGlyph.raster : kindOfComponent(a.mask.first).glyph);
     final fg = selected ? c.accent : c.text;
     final label = [
-      portrait ? '人像' : '区域 ${index + 1}',
+      portrait ? '美颜' : '区域 ${index + 1}',
       if (!portrait && a.mask.isNotEmpty) kindOfComponent(a.mask.first).label,
       if (!portrait && a.mask.length > 1) '${a.mask.length} 块',
       if (a.invert) '反选',
@@ -423,7 +423,7 @@ class _AreaChip extends StatelessWidget {
                       top: 1,
                       child: Text(
                         '+',
-                        style: TextStyle(fontSize: size * 0.32, height: 1, fontWeight: FontWeight.w700, color: fg),
+                        style: TextStyle(fontSize: size * 0.32, height: 1, fontWeight: FontWeight.w600, color: fg),
                       ),
                     ),
                   if (a.invert)
@@ -517,16 +517,11 @@ class ShapeCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = context.c;
     final kinds = lc.offered;
-    final rows = <List<LocalKind>>[
-      [
-        for (final k in kinds)
-          if (!k.ai) k,
-      ],
-      [
-        for (final k in kinds)
-          if (k.ai) k,
-      ],
-    ]..removeWhere((r) => r.isEmpty);
+    // three groups by what the user does (a title over each; necessity before count): draw a range, pick by tone or colour, pick by content
+    final groups = <LocalGroup, List<LocalKind>>{
+      for (final g in LocalGroup.values) g: [for (final k in kinds) if (k.group == g) k],
+    }..removeWhere((g, r) => r.isEmpty);
+    final rows = groups.values.toList();
     return LayoutBuilder(
       builder: (context, cons) {
         // tiles never go under 56 dp (U7): a row that does not fit wraps, and the tiles get lower so every line stays in the card
@@ -534,7 +529,12 @@ class ShapeCard extends StatelessWidget {
         final perRow = math.min(fitN, rows.fold<int>(1, (n, r) => math.max(n, r.length)));
         final lines = rows.fold<int>(0, (n, r) => n + (r.length / perRow).ceil());
         final tileW = TileGrid.tileWidth(cons.maxWidth, perRow);
-        final tileH = math.max(56.0, math.min(84.0, (cons.maxHeight - TileGrid.gap * (lines - 1)) / lines));
+        const titleH = 20.0;
+        final titles = rows.length * titleH;
+        // a tile with a note (天空 粗略) under large text needs more than 56 dp for its icon, word and note
+        final ts = MediaQuery.textScalerOf(context).scale(12) / 12;
+        final minH = math.max(56.0, 18 + (kinds.any((k) => k.note != null) ? 32 : 16) * ts);
+        final tileH = math.max(minH, math.min(84.0, (cons.maxHeight - titles - TileGrid.gap * (lines - 1)) / lines));
         // the shared tile (audit U7): the kind's glyph, its word, the note (粗略); a running analysis draws its ring on the tile
         Widget tile(LocalKind k) {
           final running = lc.runningFor(k);
@@ -566,16 +566,26 @@ class ShapeCard extends StatelessWidget {
 
         final grid = Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             for (var i = 0; i < rows.length; i++) ...[
               if (i > 0) const SizedBox(height: TileGrid.gap),
-              TileGrid(children: [for (final k in rows[i]) tile(k)]),
+              SizedBox(
+                height: titleH,
+                child: Text(groups.keys.elementAt(i).title, key: ValueKey('kind-group-${groups.keys.elementAt(i).name}'), style: T.cap(c.text2, w: FontWeight.w500)),
+              ),
+              TileGrid(alignment: WrapAlignment.start, children: [for (final k in rows[i]) tile(k)]),
             ],
           ],
         );
-        // a short side pane (landscape phone) that cannot hold every line of 56 dp tiles: the card scrolls rather than shrinking them
-        final fits = lines * 56.0 + TileGrid.gap * (lines - 1) <= cons.maxHeight;
-        return fits ? Center(child: grid) : SingleChildScrollView(child: Center(child: grid));
+        // a short side pane (landscape phone) that cannot hold every line of 56 dp tiles: the card scrolls (the cut-off row is the hint)
+        // rather than shrinking them
+        final fits = lines * minH + titles + TileGrid.gap * (lines - 1) <= cons.maxHeight;
+        // with area chips above (the add-area view of an edit that has areas) the tiles hang directly under them at the panel's normal
+        // spacing; a taller panel (an iPhone's) leaves its spare room below, not as a block between chips and tiles. The empty state has no
+        // chips row: the card stays centred.
+        final align = lc.list.isEmpty ? Alignment.center : Alignment.topCenter;
+        return fits ? Align(alignment: align, child: grid) : SingleChildScrollView(child: grid);
       },
     );
   }
@@ -661,6 +671,55 @@ class AiPartsCard extends StatelessWidget {
   }
 }
 
+/// Height of an action tile (grows with large text).
+/// How tall the shape card is (three titled groups of 56 dp tiles), so the panel gives it the room instead of cutting the last row; null when
+/// the body is not the shape card.
+double? shapeCardBodyNeed(LocalController lc, double innerW, TextScaler scaler) {
+  final card = lc.body == LocalBody.addArea || lc.body == LocalBody.addPart || lc.body == LocalBody.subPart || lc.list.isEmpty && lc.body != LocalBody.aiParts && lc.body != LocalBody.portrait;
+  if (!card) return null;
+  final counts = <int>[
+    for (final g in LocalGroup.values) lc.offered.where((k) => k.group == g).length,
+  ].where((n) => n > 0).toList();
+  if (counts.isEmpty) return null;
+  final perRow = math.min(TileGrid.fit(innerW), counts.reduce(math.max));
+  final lines = counts.fold<int>(0, (n, c) => n + (c / perRow).ceil());
+  final ts = scaler.scale(12) / 12;
+  final minH = math.max(56.0, 16 + (lc.offered.any((k) => k.note != null) ? 32 : 16) * ts);
+  return lines * minH + counts.length * 20.0 + TileGrid.gap * (lines - 1);
+}
+
+/// True while the action card is the panel's body (it is as tall as its tiles, not as a pad).
+bool localActionsShown(LocalController lc) => lc.body == LocalBody.actions && !lc.list.isEmpty;
+
+double actionTileH(TextScaler scaler) => 72 + math.max(0.0, scaler.scale(12) / 12 - 1) * 26;
+
+/// Tiles to a row on the action card: as many as fit with their word on one line (a narrow pane takes two or three rows), balanced.
+int actionsPerRow(List<String> labels, double width, TextScaler scaler) {
+  final need = labels.fold<double>(
+    kHit,
+    (m, l) => math.max(m, (TextPainter(text: TextSpan(text: l, style: T.cap(Colors.transparent)), textDirection: TextDirection.ltr, textScaler: scaler)..layout()).width + Sp.l),
+  );
+  final n = labels.length;
+  final fit = math.max(1, ((width + Sp.s) / (need + Sp.s)).floor());
+  final rows = (n / math.min(fit, n > 5 ? (n / 2).ceil() : n)).ceil();
+  return (n / rows).ceil();
+}
+
+/// How tall the action card is (the panel is as tall as its content: no empty band between the chips and the buttons), or null when the
+/// body is not the action card.
+double? actionsBodyNeed(LocalController lc, double innerW, TextScaler scaler) {
+  if (!localActionsShown(lc)) return null;
+  final a = lc.sel;
+  final labels = lc.actionChip != null
+      ? ['关掉']
+      : lc.actionPortraitGroup
+          ? ['删除']
+          : ['加一块…', '减一块…', '反选', '复制', if (a != null && a.mask.length > 1) '去掉这块', '删除'];
+  final perRow = actionsPerRow(labels, innerW, scaler);
+  final rows = (labels.length / perRow).ceil();
+  return rows * actionTileH(scaler) + TileGrid.gap * (rows - 1);
+}
+
 /// The selected area's actions: one row of icon tiles (加一块 / 减一块 / 反选 / 复制 / 删除).
 class AreaActions extends StatelessWidget {
   const AreaActions({super.key, required this.lc});
@@ -668,7 +727,6 @@ class AreaActions extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final c = context.c;
     final a = lc.sel;
     final full = a != null && a.mask.length >= kMaxMaskComponents;
     // labels that open the shape card end with "…" (guidelines 13.2). U2: no 涂抹补充 / 擦除 here: 加一块… / 减一块… → 画笔, and the brush's
@@ -689,26 +747,11 @@ class AreaActions extends StatelessWidget {
           ];
     return LayoutBuilder(
       builder: (context, cons) {
-        // as many to a row as fit with their word on one line (a narrow side pane takes two or three rows), at most 84 dp wide
-        final scaler = MediaQuery.textScalerOf(context);
-        final need = acts.fold<double>(
-          kHit,
-          (m, x) => math.max(
-            m,
-            (TextPainter(
-                  text: TextSpan(text: x.$1, style: T.cap(c.text2)),
-                  textDirection: TextDirection.ltr,
-                  textScaler: scaler,
-                )..layout()).width +
-                Sp.l,
-          ),
-        );
-        final fit = math.max(1, ((cons.maxWidth + Sp.s) / (need + Sp.s)).floor());
-        final rows = (acts.length / math.min(fit, acts.length > 5 ? (acts.length / 2).ceil() : acts.length)).ceil();
-        final perRow = (acts.length / rows).ceil();
+        final perRow = actionsPerRow([for (final x in acts) x.$1], cons.maxWidth, MediaQuery.textScalerOf(context));
         final w = TileGrid.tileWidth(cons.maxWidth, perRow);
         // the shared tile (audit U7); the destructive one in `danger`
-        return Center(
+        return Align(
+          alignment: Alignment.topCenter,
           child: TileGrid(
             children: [
               for (final x in acts)
@@ -718,7 +761,7 @@ class AreaActions extends StatelessWidget {
                   icon: x.$2,
                   danger: x.$4,
                   width: w,
-                  height: 72 + math.max(0.0, MediaQuery.textScalerOf(context).scale(12) / 12 - 1) * 26,
+                  height: actionTileH(MediaQuery.textScalerOf(context)),
                   onTap: x.$3,
                 ),
             ],
@@ -951,11 +994,11 @@ class LocalToolStrip extends StatelessWidget {
               tool = Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text('近', style: T.mini(c.text2)),
+                  Text('近', style: T.cap(c.text2)),
                   const SizedBox(width: 4),
                   _RangeBar(lc: lc, hue: false, depth: true),
                   const SizedBox(width: 4),
-                  Text('远', style: T.mini(c.text2)),
+                  Text('远', style: T.cap(c.text2)),
                 ],
               );
             } else {
@@ -1039,7 +1082,7 @@ class _PartChip extends StatelessWidget {
                   Positioned(
                     left: Sp.xs,
                     top: 2,
-                    child: Text(sign, style: T.mini(fg, w: FontWeight.w700).copyWith(height: 1)),
+                    child: Text(sign, style: T.mini(fg, w: FontWeight.w600).copyWith(height: 1)),
                   ),
               ],
             ),
@@ -1410,23 +1453,34 @@ class _Reanalyse extends StatelessWidget {
 
 // ------------------------------------------------------------------ 人像
 
-/// The simple portrait panel: the strip of the selected chip on the left (bottom 0, middle = the recommended default, top = the recipe's
-/// maximum) and the chips; a face selector only when several frontal faces exist. 分项 shows the chip's parameters.
-/// The height the body of the portrait chips layer needs (the rows of tiles and the face selector), or null when the body is not that
-/// layer. [innerW]: the panel's width inside its padding. Mirrors [PortraitPanel]'s layout (strip 40 + gap, up to four columns of
-/// 56 dp tiles, tile height up to 64 dp).
+/// The portrait chips in two groups, each under a small title (necessity before count: 脸部 = skin, under-eye, shine, fill light; 五官 =
+/// eyes, lips, teeth).
+const List<(String, List<PortraitChip>)> kPortraitGroups = [
+  ('脸部', [PortraitChip.skin, PortraitChip.undereye, PortraitChip.shine, PortraitChip.light]),
+  ('五官', [PortraitChip.eyes, PortraitChip.lips, PortraitChip.teeth]),
+];
+const double kGroupTitleH = 20;
+
+/// Rows of chips per non-empty group, for [cols] columns.
+List<int> portraitGroupRows(List<PortraitChip> chips, int cols) => [
+      for (final g in kPortraitGroups)
+        if (g.$2.any(chips.contains)) (g.$2.where(chips.contains).length / cols).ceil(),
+    ];
+
 double? portraitBodyNeed(LocalController lc, double innerW, double textScale) {
   if (lc.body != LocalBody.portrait && !(lc.body == LocalBody.pads && lc.selIsPortrait)) return null;
   if (!lc.portraitAnalysed || !lc.personFound) return null;
-  final n = lc.portraitChips.length;
+  final chips = lc.portraitChips;
+  final n = chips.length;
   if (n == 0) return null;
   const gap = Sp.s;
   final avail = innerW - 40 - Sp.m;
   final fit = ((avail + gap) / (56 + gap)).floor();
   final cols = math.max(1, math.min(math.min(4, fit), n));
-  final rows = (n / cols).ceil();
+  final groupRows = portraitGroupRows(chips, cols);
+  final rows = groupRows.fold<int>(0, (a, b) => a + b);
   final faceRow = lc.frontalFaces.length > 1 && lc.selChip != null ? kHit + Sp.s : 0.0;
-  return rows * 64.0 * textScale.clamp(1.0, 2.0) + gap * (rows - 1) + faceRow;
+  return rows * 64.0 * textScale.clamp(1.0, 2.0) + gap * (rows - groupRows.length) + groupRows.length * kGroupTitleH + gap * (groupRows.length - 1) + faceRow;
 }
 
 class PortraitPanel extends StatelessWidget {
@@ -1495,12 +1549,12 @@ class PortraitPanel extends StatelessWidget {
         key: ValueKey('chip-${pc.name}'),
         label: spec.label,
         icon: iconOf(pc),
-        note: blocked ? '块数已满' : null,
+        note: blocked ? kRoomNote : null,
         width: w,
         height: h,
         state: selected ? TileState.selected : (on ? TileState.on : TileState.normal),
         cue: selected,
-        semantics: '${spec.label}${on ? '，已开' : ''}${blocked ? '，块数已满，人物、天空、点选最多 $kMaxRasterComponents 块' : ''}',
+        semantics: '${spec.label}${on ? '，已开' : ''}${blocked ? '，$kRoomNote，$kRoomMsg' : ''}',
         onTap: () => lc.tapChip(pc),
       );
     }
@@ -1524,15 +1578,24 @@ class PortraitPanel extends StatelessWidget {
               const gap = Sp.s;
               final fit = ((cons.maxWidth + gap) / (56 + gap)).floor();
               final cols = math.min(math.min(4, fit), math.max(1, chips.length));
-              final rows = (chips.length / cols).ceil();
+              final groupRows = portraitGroupRows(chips, cols);
+              final rows = groupRows.fold<int>(0, (a, b) => a + b);
               final faceRow = faces.length > 1 && selChip != null ? kHit + Sp.s : 0.0;
               final w = TileGrid.tileWidth(cons.maxWidth, cols, max: 80);
-              final h = ((cons.maxHeight - faceRow - gap * (rows - 1)) / rows).clamp(56.0, 64.0 * ts).toDouble();
+              final fixedH = faceRow + groupRows.length * kGroupTitleH + gap * (rows - groupRows.length) + gap * (groupRows.length - 1);
+              // never under what a tile with a note (the room note) needs at this text size
+              final minH = math.max(56.0, 18 + 32 * ts);
+              final h = ((cons.maxHeight - fixedH) / rows).clamp(minH, math.max(minH, 64.0 * ts)).toDouble();
               return SingleChildScrollView(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Wrap(spacing: gap, runSpacing: gap, children: [for (final pc in chips) chip(pc, w, h)]),
+                    for (final g in kPortraitGroups)
+                      if (g.$2.any(chips.contains)) ...[
+                        if (g.$1 != kPortraitGroups.first.$1) const SizedBox(height: gap),
+                        SizedBox(height: kGroupTitleH, child: Text(g.$1, key: ValueKey('portrait-group-${g.$1}'), style: T.cap(c.text2, w: FontWeight.w500))),
+                        Wrap(spacing: gap, runSpacing: gap, children: [for (final pc in g.$2) if (chips.contains(pc)) chip(pc, w, h)]),
+                      ],
                     if (faces.length > 1 && selChip != null) ...[
                       const SizedBox(height: Sp.s),
                       Row(

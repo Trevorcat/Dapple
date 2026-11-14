@@ -32,7 +32,8 @@ void main() {
       await _open(tester, (_) => [], sc: DemoScenario.empty, size: size);
       expect(find.byKey(const ValueKey('empty-import')), findsOneWidget);
       expect(find.text('从相册选…'), findsWidgets);
-      expect(find.byKey(const ValueKey('empty-connect')), findsOneWidget);
+      expect(find.byKey(const ValueKey('empty-connect')), findsNothing, reason: 'one main button; 连接 is on the connection card');
+      expect(find.byKey(const ValueKey('conn-action')), findsOneWidget);
       expect(find.byKey(const ValueKey('import-button')), findsOneWidget);
       await _open(tester, (_) => [], size: size);
       expect(find.byKey(const ValueKey('empty-import')), findsNothing);

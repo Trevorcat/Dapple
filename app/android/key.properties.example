@@ -1,0 +1,6 @@
+# Copy to app/android/key.properties (git-ignored) and fill in. Never commit the real file or the keystore.
+# storeFile is relative to app/android/.
+storeFile=../../tools/release-keys/dapple-upload.jks
+storePassword=CHANGE_ME
+keyAlias=dapple-upload
+keyPassword=CHANGE_ME

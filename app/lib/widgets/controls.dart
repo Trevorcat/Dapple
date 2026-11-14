@@ -674,16 +674,20 @@ class _ToastLayerState extends State<ToastLayer> {
             label: t?.message,
             child: t == null
                 ? const SizedBox.shrink()
-                : Material(
-                    color: c.snackBg,
-                    elevation: 3,
-                    borderRadius: BorderRadius.circular(4),
+                // the floating capsule's surface (white / panel fill, hairline, soft shadow), not a hard dark bar
+                : Container(
+                    decoration: BoxDecoration(
+                      color: c.surface,
+                      borderRadius: BorderRadius.circular(Rd.chip),
+                      border: Border.all(color: c.sep),
+                      boxShadow: Fx.shadowPanel,
+                    ),
                     child: ConstrainedBox(
                       constraints: const BoxConstraints(minHeight: 48),
                       child: Padding(
                         padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
                         child: Row(children: [
-                          Expanded(child: Text(t.message, style: T.small(c.snackText))),
+                          Expanded(child: Text(t.message, style: T.smallL(c.text))),
                           if (t.actionLabel != null)
                             GestureDetector(
                               key: const ValueKey('toast-action'),
@@ -698,7 +702,7 @@ class _ToastLayerState extends State<ToastLayer> {
                                     widthFactor: 1,
                                     child: Padding(
                                         padding: const EdgeInsets.symmetric(horizontal: 12),
-                                        child: Text(t.actionLabel!, style: T.small(c.snackAct, w: FontWeight.w500)))),
+                                        child: Text(t.actionLabel!, style: T.small(c.accent, w: FontWeight.w500)))),
                               ),
                             ),
                         ]),

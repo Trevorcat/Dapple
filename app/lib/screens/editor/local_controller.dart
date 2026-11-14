@@ -177,7 +177,7 @@ class LocalController extends ChangeNotifier {
   /// The action card's subtitle: the area, the chip or 人像.
   String get actionsTitle {
     if (actionChip != null) return specOf(actionChip!).label;
-    if (actionPortraitGroup) return '人像';
+    if (actionPortraitGroup) return '美颜';
     return selIndex < 0 ? '区域' : '区域 ${selIndex + 1}';
   }
 
@@ -360,7 +360,7 @@ class LocalController extends ChangeNotifier {
     body = LocalBody.pads;
     _ensureSel();
     _changed();
-    ctl.app.showToast('已删除人像', actionLabel: '撤销', onAction: () => ctl.app.undo(pid));
+    ctl.app.showToast('已删除美颜', actionLabel: '撤销', onAction: () => ctl.app.undo(pid));
   }
 
   void deleteArea() {
@@ -709,23 +709,67 @@ class LocalController extends ChangeNotifier {
     final any = portraitSpecs.any((s) => chipOn(s.chip));
     if (!any) {
       final chips = [for (final c in portraitChips) if (specOf(c).onByDefault) c];
-      _setChips(chips, fill: true);
+      final sel = _defaultFaces(chips);
+      final all = portraitFaces.length;
+      _setChips(chips, faces: sel, fill: true);
+      if (sel.length < all) _toast(kGroupMainOnly);
     }
     _aiNotify();
   }
 
   String? _planeId(String key) => aiPlanes[key]?.id;
 
-  /// An off chip whose areas would not fit the edit's 12 raster planes (a group photo: 眼睛 is two planes per face). The default set
-  /// leaves such a chip off by design (priority order, [kPortraitPriority]); the chip says why (`块数已满`) and a tap shows the toast.
+  /// The faces the default portrait set works on. Every chip for every face when the edit's raster planes hold them; otherwise the
+  /// LARGEST face (all six chips are then available for it), and further faces, largest first, while they still fit. A one-face photo
+  /// and a group that fits are untouched.
+  Set<int> _defaultFaces(List<PortraitChip> chips) {
+    final fs = portraitFaces;
+    final all = {for (final f in fs) f.n};
+    if (fs.length < 2) return all;
+    bool fits(Set<int> sel) {
+      var u = list;
+      for (final c in chips) {
+        for (final ar in specOf(c).areas) {
+          final mask = portraitMask(ar, fs, sel, _planeId);
+          if (mask.isEmpty || u.indexOf(ar.id) >= 0) continue;
+          u = u.add(LocalAdjustment(id: ar.id, mask: mask));
+        }
+      }
+      return u.rasterPlanes <= kMaxRasterComponents && u.length <= kMaxLocalAdjustments;
+    }
+
+    if (fits(all)) return all;
+    final sel = {fs.first.n};
+    if (!fits(sel)) return sel;
+    for (final f in fs.skip(1)) {
+      if (fits({...sel, f.n})) sel.add(f.n);
+    }
+    return sel;
+  }
+
+  /// The faces the portrait group works on now: the ones its existing areas apply to (all faces before anything exists).
+  Set<int> get _workFaces {
+    final fs = portraitFaces;
+    final out = <int>{};
+    var found = false;
+    for (final a in list.items) {
+      if (portraitOf(a) == null) continue;
+      found = true;
+      out.addAll(facesOfMask(a, fs));
+    }
+    return found && out.isNotEmpty ? out : {for (final f in fs) f.n};
+  }
+
+  /// An off chip whose areas would not fit the edit's raster planes next to what is already there (for the faces the group works on).
+  /// The tile says so ([kRoomNote]) and a tap shows the toast.
   bool chipBlocked(PortraitChip c) {
     if (chipOn(c)) return false;
     final fs = portraitFaces;
-    final all = {for (final f in fs) f.n};
+    final sel = _workFaces;
     var u = list;
     var any = false;
     for (final ar in specOf(c).areas) {
-      final mask = portraitMask(ar, fs, all, _planeId);
+      final mask = portraitMask(ar, fs, sel, _planeId);
       if (mask.isEmpty || u.indexOf(ar.id) >= 0) continue;
       any = true;
       u = u.add(LocalAdjustment(id: ar.id, mask: mask));
@@ -758,7 +802,7 @@ class LocalController extends ChangeNotifier {
           fits.add(c);
         }
       }
-      if (fits.length < chips.length) _toast('人物、天空、点选最多 $kMaxRasterComponents 块');
+      if (fits.length < chips.length) _toast(kRoomMsg);
       return _setChips([for (final c in chips) if (fits.contains(c)) c], faces: faces);
     }
     var l = list;
@@ -792,7 +836,7 @@ class LocalController extends ChangeNotifier {
       }
     }
     if (l.rasterPlanes > kMaxRasterComponents || identical(l, list)) {
-      if (!identical(l, list) || skipped > 0) _toast('人物、天空、点选最多 $kMaxRasterComponents 块');
+      if (!identical(l, list) || skipped > 0) _toast(kRoomMsg);
       return false;
     }
     final next = l;
@@ -811,7 +855,7 @@ class LocalController extends ChangeNotifier {
   void tapChip(PortraitChip c) {
     final spec = specOf(c);
     if (!chipOn(c)) {
-      _setChips([c]);
+      _setChips([c], faces: _workFaces);
       return;
     }
     if (selChip != c) {
@@ -1388,6 +1432,46 @@ class LocalController extends ChangeNotifier {
   }
 
   /// One finger landed on the photo.
+  // ------------------------------------------------------------ the one-thumb ball moves the selected area (fold layouts)
+
+  MaskComponent? _remote;
+
+  /// The selected area's shape can be moved by a push on the ball (a circle or a gradient; a brush or a mask of the photo has no centre).
+  bool get canMoveRemote {
+    final c = comp;
+    return active && c != null && !_healing && (c.kind == MaskKindId.radial || c.kind == MaskKindId.linear);
+  }
+
+  void remoteMoveBegin() {
+    final c = comp;
+    if (c == null || !canMoveRemote) return;
+    _remote = c;
+    ctl.gestureBegin('local-shape', param: null);
+    shaping = true;
+    _updateVis();
+  }
+
+  /// [d]: the shape's travel since [remoteMoveBegin], in frame dp.
+  void remoteMoveBy(Offset d) {
+    final s = _remote;
+    if (s == null) return;
+    final sp = space;
+    if (s.kind == MaskKindId.radial) {
+      _writeComp((_) => RadialHandles(sp, s).moved(d));
+    } else {
+      final h = LinearHandles(sp, s);
+      _writeComp((_) => linearFrom(sp, s, h.p0 + d, h.p1 + d));
+    }
+  }
+
+  void remoteMoveEnd() {
+    if (_remote == null) return;
+    _remote = null;
+    ctl.gestureEnd();
+    shaping = false;
+    flash();
+  }
+
   void pointerDown(Offset p, int ms) {
     _multi = false;
     final c = comp;

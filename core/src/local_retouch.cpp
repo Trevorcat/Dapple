@@ -440,7 +440,9 @@ void healSpotsOf(const LocalAdjustment& a, const Frame& f, int adj, const Source
 // ---- frame geometry -----------------------------------------------------------------------------------------------------------------------
 namespace {
 void framePoint(const FramePlan& P, double x, double y, double& X, double& Y) {
-  const double L = double(std::max(P.srcW, P.srcH));
+  const Frame* lf = P.local.get();
+  const bool win = lf && lf->parentW > 0 && lf->parentH > 0;  // a region source: the metric is the parent picture's (section 44)
+  const double L = win ? double(std::max(lf->parentW, lf->parentH)) : double(std::max(P.srcW, P.srcH));
   double sx, sy;
   if (!P.useGeo) {
     sx = x + 0.5, sy = y + 0.5;
@@ -456,6 +458,7 @@ void framePoint(const FramePlan& P, double x, double y, double& X, double& Y) {
     else if (P.rot == 2) sx = sW - fx, sy = sH - fy;
     else sx = sW - fy, sy = fx;
   }
+  if (win) sx += double(lf->parentX0), sy += double(lf->parentY0);
   X = sx / L, Y = sy / L;
 }
 }  // namespace

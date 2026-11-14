@@ -10,6 +10,8 @@
 //     tiles        CPU tiled == whole with every retouch op + heal + a legacy op, plain and under crop / rotate / straighten / flip
 //     interactive  interactive frame vs the exact frame downsampled (bound)
 //     undereye     the under-eye crescent plane builder (AI service) on a synthetic mesh
+//     region       a region source (a window of the portrait at its own pixels, SourceImage::parent, section 44) renders the retouch (every op, heal spots
+//                  incl. the automatic ones, face scale from the mask in the parent) like the same pixels of the whole frame
 //     parity       GPU executor vs CPU executor, and a tiled GPU export vs one tile
 //   not in ctest: bench (added cost per op, 1080 interactive and 24 MP, GPU and CPU)
 #include <algorithm>
@@ -1018,6 +1020,65 @@ void testTiles() {
   }
 }
 
+
+// ---- region (section 44) ----------------------------------------------------------------------------------------------------------
+void testRegion() {
+  const int W = 800, H = 1000;
+  const SourceImage src = makePortrait(W, H, true);
+  putRasters(W, H);
+  struct Win {
+    int x0, y0, x1, y1;
+  };
+  const Win wins[] = {{100, 200, 700, 900}, {0, 0, 600, 700}};
+  auto photo = std::make_shared<SourceImage>(src);
+  for (int variant = 0; variant < 2; ++variant) {
+    EditParams p;
+    p.local = retouchEdit(variant == 0);  // 0: with a legacy op (texture) too
+    if (variant == 1) p.local[0].face = 0.f;  // the face scale from the mask's area on the parent photo (no explicit scale)
+    EngineSession es;
+    Image8 whole, base;
+    CHECK(exactRender(es, p, src, ExecMode::Whole, 0, whole));
+    EditParams p0;
+    CHECK(exactRender(es, p0, src, ExecMode::Whole, 0, base));
+    for (const Win& w : wins) {
+      SourceImage ws;
+      ws.meta = src.meta, ws.sceneReferred = true;
+      ws.linear = ImageF(w.x1 - w.x0, w.y1 - w.y0);
+      for (int y = w.y0; y < w.y1; ++y) std::memcpy(ws.linear.row(y - w.y0), src.linear.row(y) + 3 * std::size_t(w.x0), std::size_t(w.x1 - w.x0) * 3 * sizeof(float));
+      auto rp = std::make_shared<RegionParent>();
+      rp->fullW = W, rp->fullH = H, rp->x0 = w.x0, rp->y0 = w.y0;
+      rp->photo = [photo] { return photo; };
+      ws.parent = rp;
+      Image8 rg;
+      EngineSession es2;
+      CHECK(exactRender(es2, p, ws, ExecMode::Whole, 0, rg));
+      CHECK(rg.width == w.x1 - w.x0 && rg.height == w.y1 - w.y0);
+      if (rg.width != w.x1 - w.x0) continue;
+      const int bands[] = {0, 32, 64, 128};
+      int mx[4] = {0, 0, 0, 0};
+      std::size_t over1[4] = {0, 0, 0, 0}, changed = 0;
+      for (int y = 0; y < rg.height; ++y)
+        for (int x = 0; x < rg.width; ++x) {
+          const int dist = std::min(std::min(x, y), std::min(rg.width - 1 - x, rg.height - 1 - y));
+          int band = 0;
+          while (band < 3 && dist >= bands[band + 1]) ++band;
+          for (int c = 0; c < 3; ++c) {
+            const std::size_t o = (std::size_t(y + w.y0) * W + std::size_t(x + w.x0)) * 3 + std::size_t(c);
+            const int e = std::abs(int(whole.data[o]) - int(rg.data[(std::size_t(y) * rg.width + x) * 3 + c]));
+            mx[band] = std::max(mx[band], e), over1[band] += e > 1;
+            if (dist >= 128) changed += std::abs(int(whole.data[o]) - int(base.data[o])) > 2;
+          }
+        }
+      std::printf("  %s, window (%d,%d) %dx%d: max code / values over 1 by distance from the window's edge:", variant ? "face scale from the mask" : "explicit scale + texture", w.x0, w.y0,
+                  w.x1 - w.x0, w.y1 - w.y0);
+      for (int k = 0; k < 4; ++k) std::printf("  %d+: %d / %zu", bands[k], mx[k], over1[k]);
+      std::printf("  (retouch changed %zu interior values)\n", changed);
+      CHECK(mx[3] <= 1);
+      CHECK(changed > 1000);
+    }
+  }
+}
+
 // ---- interactive ---------------------------------------------------------------------------------------------------------------------------
 double meanDiffDown(const std::uint8_t* small, int sw, int sh, const Image8& big) {
   // big (exact) area-averaged to small's size, mean absolute difference in levels over RGB
@@ -1260,6 +1321,54 @@ void testParity() {
 }
 #endif
 
+#ifdef DAPPLE_RETOUCH_GPU
+// GPU: the portrait retouch of a region source against the same pixels of the whole frame (both on the GPU executor)
+void testRegionGpu() {
+  auto ctx = gpuContext();
+  const int W = 800, H = 1000;
+  const SourceImage src = makePortrait(W, H, true);
+  putRasters(W, H);
+  const int x0 = 100, y0 = 200, x1 = 700, y1 = 900;
+  SourceImage ws;
+  ws.meta = src.meta, ws.sceneReferred = true;
+  ws.linear = ImageF(x1 - x0, y1 - y0);
+  for (int y = y0; y < y1; ++y) std::memcpy(ws.linear.row(y - y0), src.linear.row(y) + 3 * std::size_t(x0), std::size_t(x1 - x0) * 3 * sizeof(float));
+  auto rp = std::make_shared<RegionParent>();
+  auto photo = std::make_shared<SourceImage>(src);
+  rp->fullW = W, rp->fullH = H, rp->x0 = x0, rp->y0 = y0;
+  rp->photo = [photo] { return photo; };
+  ws.parent = rp;
+  dapple::gpu::Rig whole(ctx, src, cam()), win(ctx, ws, cam());
+  EditParams p;
+  p.local = retouchEdit();
+  FastOptions fo;
+  fo.spatial = SpatialQuality::Full;
+  fo.noise = false;
+  std::string e1, e2;
+  int gw = 0, gh = 0, rw = 0, rh = 0;
+  Renderer r1(p, cam(), nullptr), r2(p, cam(), nullptr);
+  std::uint8_t* a = whole.render(p, r1, src, fo, 33, gw, gh, nullptr, e1);
+  std::uint8_t* b = win.render(p, r2, ws, fo, 33, rw, rh, nullptr, e2);
+  if (!a || !b || rw != x1 - x0 || rh != y1 - y0) {
+    std::printf("  render failed (%s %s)\n", e1.c_str(), e2.c_str());
+    ++g_failures;
+  } else {
+    int mx = 0;
+    std::size_t over1 = 0, n = 0;
+    for (int y = 128; y < rh - 128; ++y)
+      for (int x = 128; x < rw - 128; ++x)
+        for (int c = 0; c < 3; ++c) {
+          const int e = std::abs(int(a[(std::size_t(y + y0) * gw + x + x0) * 4 + c]) - int(b[(std::size_t(y) * rw + x) * 4 + c]));
+          mx = std::max(mx, e), over1 += e > 1, ++n;
+        }
+    std::printf("  GPU retouch, window (%d,%d) %dx%d vs the whole frame, 128 px in: max code %d, over 1: %zu of %zu\n", x0, y0, rw, rh, mx, over1, n);
+    CHECK(mx <= 2 && double(over1) <= 0.001 * double(n));
+  }
+  std::free(a);
+  std::free(b);
+}
+#endif
+
 // ---- bench (not in ctest) ----------------------------------------------------------------------------------------------------------------
 double median(std::vector<double> v) {
   std::sort(v.begin(), v.end());
@@ -1354,9 +1463,9 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"json", testJson},   {"bands", testBands},       {"scale", testScale},       {"blobs", testBlobs},
                      {"heal", testHeal},   {"whiten", testWhiten},     {"identity", testIdentity}, {"tiles", testTiles},
-                     {"interactive", testInteractive}, {"undereye", testUnderEye}, {"rasters", testRasters}, {"complexion", testComplexion}, {"twoscales", testTwoScales}, {"rangesmooth", testRangeSmooth},
+                     {"interactive", testInteractive}, {"undereye", testUnderEye}, {"rasters", testRasters}, {"complexion", testComplexion}, {"twoscales", testTwoScales}, {"rangesmooth", testRangeSmooth}, {"region", testRegion},
 #ifdef DAPPLE_RETOUCH_GPU
-                     {"parity", testParity},
+                     {"parity", testParity}, {"regiongpu", testRegionGpu},
 #endif
   };
   const std::string id = argc > 1 ? argv[1] : "";

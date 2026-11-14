@@ -93,6 +93,12 @@ void main() {
         await t.pump();
         await t.pump(const Duration(milliseconds: 800));
         await audShot(t, '60_publish_${s}_$th');
+        final more = find.byKey(const ValueKey('row-more'));
+        if (more.evaluate().isNotEmpty) {
+          await t.ensureVisible(more);
+          await t.tap(more);
+          await t.pump(const Duration(milliseconds: 200));
+        }
         final sw = find.byKey(const ValueKey('switch-hdr'));
         if (sw.evaluate().isNotEmpty) {
           await t.ensureVisible(sw);

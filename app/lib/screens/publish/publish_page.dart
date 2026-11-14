@@ -58,6 +58,7 @@ class _PublishPageState extends State<PublishPage> {
   int _batch = 0;
   // "HDR 照片" (Ultra HDR gain-map JPEG): offered only when at least one photo has highlights worth encoding; off by default.
   bool _hdr = false;
+  bool _moreOpen = false;
   bool _hdrAvailable = false;
   String _hdrFor = '';
   // "色彩空间": sRGB (default) or 广色域 P3; offered only when at least one photo has colour outside sRGB worth keeping (AppState.wideGamutOf).
@@ -377,7 +378,7 @@ class _PublishPageState extends State<PublishPage> {
         separatorBuilder: (_, _) => const SizedBox(width: 12),
         itemBuilder: (_, i) {
           final ph = ps[i];
-          final w = _stripH * _ratioOf(_ratio, ph);
+          final w = math.max(56.0, _stripH * _ratioOf(_ratio, ph));
           return SizedBox(
             width: w,
             height: _stripH,
@@ -430,7 +431,8 @@ class _PublishPageState extends State<PublishPage> {
             DTile(
               key: ValueKey('preset-${p.id}'),
               label: p.name,
-              note: p.spec,
+              // one item (the ratio), not the whole spec: a long second item was cut off on a small phone
+              note: p.spec.split(' · ').first,
               alignStart: true,
               fill: c.surface,
               width: w,
@@ -570,8 +572,21 @@ class _PublishPageState extends State<PublishPage> {
           if (v != null && mounted) setState(() => _size = v);
         }, sub: _sizeDims()),
         switchRow('row-loc', 'switch-loc', '去除位置信息', _strip, (v) => setState(() => _strip = v)),
-        if (_p3Available) switchRow('row-cs', 'switch-cs', '广色域（P3）', _p3, (v) => setState(() => _p3 = v)),
-        if (_hdrAvailable) switchRow('row-hdr', 'switch-hdr', 'HDR 输出', _hdr, (v) => setState(() => _hdr = v)),
+        // the two output options are for people who know what they want: behind one 更多 row (it says which are on)
+        if (_p3Available || _hdrAvailable)
+          shell(
+              'row-more',
+              Row(children: [
+                Expanded(child: Text('更多', style: T.body17(c.text))),
+                if (!_moreOpen && (_p3 && _p3Available || _hdr && _hdrAvailable))
+                  Text([if (_p3 && _p3Available) '广色域', if (_hdr && _hdrAvailable) 'HDR'].join(' · '),
+                      key: const ValueKey('row-more-value'), style: T.body17(c.text2, w: FontWeight.w400)),
+                const SizedBox(width: 4),
+                DIcon(_moreOpen ? DI.up : DI.down, size: 18, color: c.text2),
+              ]),
+              onTap: () => setState(() => _moreOpen = !_moreOpen)),
+        if (_moreOpen && _p3Available) switchRow('row-cs', 'switch-cs', '广色域（P3）', _p3, (v) => setState(() => _p3 = v)),
+        if (_moreOpen && _hdrAvailable) switchRow('row-hdr', 'switch-hdr', 'HDR 输出', _hdr, (v) => setState(() => _hdr = v)),
       ]),
     );
   }
@@ -596,7 +611,7 @@ class _WarnCard extends StatelessWidget {
       child: Row(children: [
         DIcon(DI.warn, size: 20, color: c.warn),
         const SizedBox(width: 12),
-        Expanded(child: Text(w.text, style: T.small(c.warn))),
+        Expanded(child: Text(w.text, style: T.smallL(c.warn))),
         if (w.actionLabel != null)
           GestureDetector(
             key: const ValueKey('warn-split'),

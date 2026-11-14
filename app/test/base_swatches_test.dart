@@ -430,10 +430,10 @@ void main() {
       return (app, src);
     }
 
-    testWidgets('groups 胶片 / 现代 / 标准 as icons (no engine swatches), tap sets the default and the card follows', (t) async {
+    testWidgets('groups 胶片 / 标准与现代 as icons (no engine swatches), tap sets the default and the card follows', (t) async {
       final gate = Completer<void>();
       final (app, src) = await openPage(t, gate: gate.future);
-      for (final k in ['group-negative', 'group-slide', 'group-modern', 'group-none']) {
+      for (final k in ['group-negative', 'group-slide', 'group-modern']) {
         await t.scrollUntilVisible(find.byKey(ValueKey(k)), 200, scrollable: find.byType(Scrollable).first);
         expect(find.byKey(ValueKey(k)), findsOneWidget, reason: k);
       }

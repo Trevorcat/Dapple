@@ -11,6 +11,7 @@ import 'package:path_provider/path_provider.dart';
 import '../services/capture.dart';
 import '../services/ftp_ingest.dart';
 import '../services/ingest.dart';
+import '../services/live_bridge.dart';
 import '../services/media_permission.dart';
 import '../services/share_service.dart';
 import 'ios_capture.dart';
@@ -26,11 +27,26 @@ class IosPlatformServices implements PlatformServices {
   @override
   final FtpBackend wirelessTransfer = NullFtpBackend();
   @override
-  final VideoPlatform video = NullVideoPlatform();
+  final VideoPlatform video = _IosVideo();
   @override
   ShareService get share => ShareService.instance;
   @override
   bool get gpuView => false;
+}
+
+/// Video side on iOS (DappleLivePlugin.swift, channel `dapple/live`): PhotoKit videos, AVFoundation frames and trim. The finished Motion Photo is saved as a
+/// Live Photo by `MediaBridge.saveToGallery` (LivePhoto.swift), the same Dart call as on Android.
+class _IosVideo implements VideoPlatform {
+  @override
+  bool get available => true;
+  @override
+  Future<List<VideoItem>> listVideos({int limit = 50}) => LiveBridge.listVideos(limit: limit);
+  @override
+  Future<Map<String, dynamic>> probe(String uri) => LiveBridge.probe(uri);
+  @override
+  Future<String> codecReport({bool run = false, bool force = false}) => LiveBridge.codecReport(run: run, force: force);
+  @override
+  Future<Map<String, dynamic>> capabilities() => LiveBridge.capabilities();
 }
 
 const _photoExt = ['.arw', '.raf', '.dng', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.jpg', '.jpeg', '.heic', '.heif', '.png', '.tif', '.tiff'];

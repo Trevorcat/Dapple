@@ -5,6 +5,7 @@ import 'package:dapple/screens/home/shell.dart' show kWideBreakpoint;
 import 'package:dapple/services/merge_engine.dart';
 import 'package:dapple/state/app_state.dart';
 import 'package:dapple/widgets/float_bar.dart';
+import 'package:dapple/widgets/icons.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -28,6 +29,7 @@ const _t = Duration(milliseconds: 100);
 Finder key(String k) => find.byKey(ValueKey(k));
 
 void main() {
+  textScale2();
   testWidgets('the tabs are a floating capsule: centred, above the bottom inset, 48 dp items, one selected pill', (t) async {
     final app = await _open(t);
     final screen = t.view.physicalSize / t.view.devicePixelRatio;
@@ -116,6 +118,37 @@ void main() {
     expect(key('nav-bar'), findsOneWidget, reason: 'the tabs come back');
   });
 
+  for (final size in const [Size(412, 915), Size(360, 780), Size(915, 700)]) {
+    testWidgets('selection capsule at ${size.width.toInt()} wide: three items of one width, icons and words on common lines, inside the screen', (t) async {
+      final app = await _open(t, size: size);
+      final done = app.photos.firstWhere((p) => p.status.name == 'done' && p.kind.name == 'photo');
+      await t.longPress(key('tile-${done.id}'));
+      await t.pump(_t);
+      final bar = t.getRect(key('select-bar'));
+      expect(bar.left, greaterThanOrEqualTo(16 - 0.5));
+      expect(bar.right, lessThanOrEqualTo(size.width - 16 + 0.5));
+      final keys = ['sel-save', 'sel-compose', 'sel-publish'];
+      final widths = {for (final k in keys) t.getSize(key(k)).width};
+      expect(widths.length, 1, reason: 'equal widths: $widths');
+      final icons = <double>{}, words = <double>{};
+      for (final k in keys) {
+        final item = key(k);
+        expect(t.getRect(item).top, bar.top, reason: k);
+        expect(t.getRect(item).height, bar.height, reason: k);
+        final ic = find.descendant(of: item, matching: find.byType(DIcon));
+        final tx = find.descendant(of: item, matching: find.byType(Text));
+        expect(ic, findsOneWidget, reason: k);
+        icons.add(t.getCenter(ic).dy.roundToDouble());
+        words.add(t.getCenter(tx).dy.roundToDouble());
+        expect(t.getCenter(ic).dx, closeTo(t.getCenter(item).dx, 0.5), reason: '$k icon centred');
+        expect(t.getCenter(tx).dx, closeTo(t.getCenter(item).dx, 0.5), reason: '$k word centred');
+      }
+      expect(icons.length, 1, reason: 'one icon line: $icons');
+      expect(words.length, 1, reason: 'one word line: $words');
+      expect(t.takeException(), isNull);
+    });
+  }
+
   testWidgets('with nothing selected the actions are off', (t) async {
     final app = await _open(t);
     final done = app.photos.firstWhere((p) => p.status.name == 'done' && p.kind.name == 'photo');
@@ -178,5 +211,21 @@ void main() {
   test('the clearance pages keep at their end covers the inset, the gap and the capsule', () {
     expect(kFloatBarH, 56);
     expect(kFloatBarRadius, 28, reason: 'the dock capsule radius');
+  });
+}
+
+void textScale2() {
+  testWidgets('text scale 2.0: the tab labels (12 / 16, Chinese never smaller) fit the capsule without overflow', (t) async {
+    t.platformDispatcher.textScaleFactorTestValue = 2.0;
+    addTearDown(t.platformDispatcher.clearTextScaleFactorTestValue);
+    for (final size in [phoneSize, const Size(360, 640)]) {
+      await _open(t, size: size);
+      for (var i = 0; i < 3; i++) {
+        await t.tap(key('nav-$i'));
+        await t.pump(_t);
+        await t.pump(_t);
+      }
+      expect(t.takeException(), isNull, reason: '$size');
+    }
   });
 }

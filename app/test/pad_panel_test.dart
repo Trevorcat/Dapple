@@ -1,6 +1,7 @@
 // The control panel of the editor, version 0.6 (docs/design/editor-panel.md): the dock glyphs, the hold popup, the pad and the
 // strength strip (absolute mapping), the film map, the itemised view (radar + ruler), the complex editors, old edits, the
 // adaptive placement, and that nothing in the panel scrolls sideways. Screenshots go to test/goldens/editor_v2/v3_*.png.
+import 'package:dapple/editor/fold_layout.dart' show debugFoldLayouts;
 import 'package:dapple/model/film_map.dart';
 import 'package:dapple/model/pad_model.dart';
 import 'package:dapple/model/params.dart';
@@ -44,6 +45,9 @@ Offset padAt(WidgetTester t, PadCat c, double x, double y) {
 PadState viewOf(AppState app, String id, PadCat c) => padViewOf(app.editOf(id), c, ctx);
 
 void main() {
+  // these tests are about the ordinary panel placement (side pane on a wide window); the fold layouts have their own tests (fold_layout_test.dart)
+  setUp(() => debugFoldLayouts = false);
+  tearDown(() => debugFoldLayouts = true);
   group('dock', () {
     testWidgets('five items; the first four are live glyphs (dot = pad position, bar = strength), 裁切 is an icon', (t) async {
       final (app, id) = await openFilm(t);
@@ -696,7 +700,7 @@ void main() {
 
     testWidgets('dark mode and large text: no overflow anywhere in the panel', (t) async {
       setView(t, ownerPhys, ownerDpr);
-      t.platformDispatcher.textScaleFactorTestValue = 1.6;
+      t.platformDispatcher.textScaleFactorTestValue = 2.0;
       addTearDown(t.platformDispatcher.clearTextScaleFactorTestValue);
       final (app, id) = await openFilm(t, dark: true);
       app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));

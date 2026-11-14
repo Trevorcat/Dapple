@@ -149,9 +149,9 @@ void main() {
     await tester.pump(const Duration(milliseconds: 400));
     expect(valueOf(tester, 'row-size'), '原图大小');
     expect(segIndex(tester), 0);
-    await tester.tap(find.text('原比例'));
+    await tester.tap(find.descendant(of: find.byKey(const ValueKey('seg-ratio')), matching: find.text('原比例')));
     await tester.pump();
-    expect(segIndex(tester), 1);
+    expect(segIndex(tester), 2); // xhs ratios: 3:4, 1:1, orig
     await tester.tap(find.byKey(const ValueKey('row-loc')));
     await tester.pump();
     expect(locOn(tester), isFalse);
@@ -245,6 +245,7 @@ void main() {
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.byKey(const ValueKey('row-hdr')), findsNothing);
+    expect(find.byKey(const ValueKey('row-more')), findsNothing, reason: 'nothing to put behind 更多');
     expect(find.text('HDR 输出'), findsNothing);
   });
 
@@ -252,6 +253,10 @@ void main() {
     final app = _HdrApp(1.5);
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
+    // the output options sit behind one 更多 row
+    expect(find.byKey(const ValueKey('row-hdr')), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('row-more')));
+    await tester.pump();
     expect(find.byKey(const ValueKey('row-hdr')), findsOneWidget);
     expect(find.text('HDR 输出'), findsOneWidget);
     expect(find.byKey(const ValueKey('row-hdr-sub')), findsNothing);
@@ -274,6 +279,8 @@ void main() {
     final app = _WideApp(0.2);
     await open(tester, app, idsOf(app, 2));
     await tester.pump(const Duration(milliseconds: 50));
+    await tester.tap(find.byKey(const ValueKey('row-more')));
+    await tester.pump();
     expect(find.byKey(const ValueKey('row-cs')), findsOneWidget);
     expect(csOn(tester), isFalse);
     expect(find.text('广色域（P3）'), findsOneWidget);
@@ -378,6 +385,8 @@ void main() {
     expect(ig.maxCount, 20); // carousel limit since August 2024
     expect(ig.defRatio, '4:5'); // inside 1.91:1 .. 4:5, so the feed does not crop
     expect(presets.firstWhere((p) => p.id == 'wechat').maxCount, 9);
+    // 小红书 accepts 3:4, 1:1 and 4:3 (several independent secondary sources); 4:3 is not in cropRatios.
+    expect(presets.firstWhere((p) => p.id == 'xhs').ratios, containsAll(['3:4', '1:1']));
     for (final p in presets) {
       expect(p.ratios, contains(p.defRatio), reason: p.id);
     }

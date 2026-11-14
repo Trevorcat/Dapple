@@ -372,7 +372,7 @@ class _PadFaceState extends State<PadFace> {
               padding: const EdgeInsets.symmetric(horizontal: 6),
               alignment: Alignment.center,
               decoration: BoxDecoration(color: Fx.padLabel, borderRadius: BorderRadius.circular(Rd.thumb), boxShadow: const [BoxShadow(color: Color(0x26000000), blurRadius: 3)]),
-              child: Text(p.name, style: T.mini(Fx.onPadLabel, w: FontWeight.w600)),
+              child: Text(p.name, style: T.cap(Fx.onPadLabel, w: FontWeight.w600)),
             ),
           ),
         ));

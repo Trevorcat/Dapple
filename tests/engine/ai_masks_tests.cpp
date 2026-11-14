@@ -30,6 +30,7 @@
 #include "dapple/local_adjust.h"
 #include "json_value.h"
 #include "local_eval.h"
+#include "../test_tmp.h"
 
 namespace fs = std::filesystem;
 using namespace dapple;
@@ -335,7 +336,7 @@ static void testDepth() {
 
 // ---- cache ---------------------------------------------------------------------------------------------------------------------------------------
 static fs::path tmpRoot() {
-  static const fs::path p = fs::temp_directory_path() / ("dapple_ai_masks_test_" + std::to_string(std::uint64_t(std::time(nullptr)) ^ std::uint64_t(std::rand())));
+  static const fs::path p = fs::temp_directory_path() / ("dapple_ai_masks_test_" + testUniqueTag());
   return p;
 }
 static PlaneSet sampleSet() {
@@ -770,6 +771,44 @@ static void testSky() {
       if (y < H / 2) p[0] = 60, p[1] = 50, p[2] = 40, p[0] += std::uint8_t((x * 5 + y * 11) % 50);  // textured top
     }
   CHECK(skyPrior(low.data(), W, H, W * 3, nullptr, &c2).empty());
+
+  // a thin dark branch standing in the blue sky is carved out at full resolution (the coarse grid alone would paint over it)
+  std::vector<std::uint8_t> br = sky;
+  for (int y = H / 5; y < H * 55 / 100; ++y)
+    for (int x = W / 2 - 1; x <= W / 2 + 1; ++x) {
+      std::uint8_t* p = &br[(std::size_t(y) * W + x) * 3];
+      p[0] = 50, p[1] = 45, p[2] = 30;
+    }
+  const Plane sb = skyPrior(br.data(), W, H, W * 3, nullptr, &c2);
+  CHECK(!sb.empty());
+  if (!sb.empty()) CHECK(sb.px[(H * 2 / 5) * W + W / 2] < 90 && sb.px[(H * 2 / 5) * W + W / 4] > 230);
+
+  // overcast: bright, cool, softly varying grey above dark ground is a sky only when the depth far plane agrees; the same picture without it is not
+  std::vector<std::uint8_t> oc(std::size_t(W) * H * 3);
+  Plane farP;
+  farP.w = W, farP.h = H, farP.px.assign(std::size_t(W) * H, 0);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      std::uint8_t* p = &oc[(std::size_t(y) * W + x) * 3];
+      if (y < H * 55 / 100) {
+        const int v = 190 + int(35.0 * std::sin(x * 0.045) * std::sin(y * 0.06 + 1.0)) + y / 8;
+        p[0] = std::uint8_t(v - 6), p[1] = std::uint8_t(v), p[2] = std::uint8_t(v + 6);
+        farP.px[std::size_t(y) * W + x] = 255;
+      } else {
+        const int t = ((x / 3) * 7 + (y / 3) * 13) % 60;
+        p[0] = std::uint8_t(40 + t), p[1] = std::uint8_t(60 + t), p[2] = std::uint8_t(30 + t / 2);
+        farP.px[std::size_t(y) * W + x] = 60;
+      }
+    }
+  const Plane so = skyPrior(oc.data(), W, H, W * 3, &farP, &c2);
+  CHECK(!so.empty());
+  if (!so.empty()) CHECK(so.px[(H / 5) * W + W / 2] > 200 && so.px[(H * 85 / 100) * W + W / 2] < 20);
+  CHECK(skyPrior(oc.data(), W, H, W * 3, nullptr, &c2).empty());
+  // the same bright cool region with a flat tone (a wall, a backdrop) is refused even with a far plane
+  std::vector<std::uint8_t> flat = oc;
+  for (int y = 0; y < H * 55 / 100; ++y)
+    for (int x = 0; x < W; ++x) flat[(std::size_t(y) * W + x) * 3] = 190, flat[(std::size_t(y) * W + x) * 3 + 1] = 196, flat[(std::size_t(y) * W + x) * 3 + 2] = 202;
+  CHECK(skyPrior(flat.data(), W, H, W * 3, &farP, &c2).empty());
 }
 
 static void testStatus() {

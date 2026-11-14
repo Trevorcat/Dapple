@@ -134,7 +134,7 @@ class _PickSheetState extends State<_PickSheet> {
                       padding: const EdgeInsets.symmetric(horizontal: 8),
                       alignment: Alignment.center,
                       decoration: BoxDecoration(color: Fx.overlay55, borderRadius: BorderRadius.circular(8)),
-                      child: Text(widget.app.candidateLabel(ph), style: T.mini(Colors.white, w: FontWeight.w500)),
+                      child: Text(widget.app.candidateLabel(ph), style: T.cap(Colors.white, w: FontWeight.w500)),
                     ),
                   ),
                 ]),

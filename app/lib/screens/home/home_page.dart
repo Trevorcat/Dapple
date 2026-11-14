@@ -92,7 +92,7 @@ class _HomePageState extends State<HomePage> {
       slivers: [
         const SliverToBoxAdapter(child: SizedBox(height: Sp.s)),
         // wide layouts show the status in the title row; the card only appears when something needs attention
-        if (!widget.wide || app.connState != ConnState.connected || app.usbCardActive) SliverToBoxAdapter(child: ConnCard(app: app)),
+        if (!widget.wide || app.connState != ConnState.connected || app.usbCardActive) SliverToBoxAdapter(child: ConnCard(app: app, compact: app.selectMode)),
         if (app.hasBackgroundJob) SliverToBoxAdapter(child: _TaskBar(job: app.job!)),
         if (app.importing) const SliverToBoxAdapter(child: _ImportBar()),
         if (!app.isEmpty && !app.selectMode) SliverToBoxAdapter(child: _EntryCards(app: app)),
@@ -294,18 +294,27 @@ class _ImportBar extends StatelessWidget {
   }
 }
 
-/// Composite entry cards: detected HDR sets / panorama sequences and the latest video (requirements 4.2.4).
-class _EntryCards extends StatelessWidget {
+/// Composite entry cards: detected HDR sets / panorama sequences and the latest video (requirements 4.2.4). Every card can be closed (and
+/// stays closed for the same photos); one shows at a time and the rest fold into one line, "还有 N 个可合成", so the grid is not pushed down.
+class _EntryCards extends StatefulWidget {
   const _EntryCards({required this.app});
   final AppState app;
 
   @override
+  State<_EntryCards> createState() => _EntryCardsState();
+}
+
+class _EntryCardsState extends State<_EntryCards> {
+  bool _more = false;
+
+  @override
   Widget build(BuildContext context) {
+    final app = widget.app;
+    final c = context.c;
     // Merge cards need the engine's merge build; the video card needs the platform's video layer (iOS has neither today).
     final cards = app.engine.available ? app.detectedCards : const <DetectedGroup>[];
-    final v = app.videoLayer ? app.latestVideo : null;
-    if (cards.isEmpty && v == null) return const SizedBox.shrink();
-    return Column(key: const ValueKey('entry-cards'), children: [
+    final v = app.videoCard;
+    final rows = <Widget>[
       for (final g in cards)
         _EntryRow(
           key: ValueKey('entry-${g.kind}-${g.photoIds.first}'),
@@ -323,6 +332,29 @@ class _EntryCards extends StatelessWidget {
           subtitle: '${LiveDraft.clock(v.seconds)} · 截取 3 秒',
           photos: const [],
           onTap: () => openLiveTool(context, app, video: v),
+          onDismiss: () => app.dismissVideo(v),
+        ),
+    ];
+    if (rows.isEmpty) return const SizedBox.shrink();
+    final shown = _more ? rows : rows.take(1).toList();
+    final rest = rows.length - shown.length;
+    return Column(key: const ValueKey('entry-cards'), children: [
+      ...shown,
+      if (rest > 0)
+        Semantics(
+          button: true,
+          label: '还有 $rest 个可合成',
+          excludeSemantics: true,
+          child: InkWell(
+            key: const ValueKey('entry-more'),
+            onTap: () => setState(() => _more = true),
+            child: Container(
+              constraints: const BoxConstraints(minHeight: kHit),
+              padding: const EdgeInsets.symmetric(horizontal: Sp.l),
+              alignment: Alignment.centerLeft,
+              child: Text('还有 $rest 个可合成', style: T.small(c.accent, w: FontWeight.w500)),
+            ),
+          ),
         ),
     ]);
   }
@@ -418,13 +450,7 @@ class _Empty extends StatelessWidget {
               key: const ValueKey('empty-import'),
               child: PrimaryButton('从相册选…', height: 48, onPressed: () => importAndEdit(context, app))),
         ),
-        const SizedBox(height: Sp.s),
-        SizedBox(
-          width: 200,
-          child: KeyedSubtree(
-              key: const ValueKey('empty-connect'),
-              child: SecondaryButton('连接相机', height: 48, onPressed: () => app.connectAction())),
-        ),
+        // one main action: connecting the camera lives on the connection card and the top bar's camera icon, not a third time here
         if (app.mediaLimited)
           KeyedSubtree(
               key: const ValueKey('empty-more'),

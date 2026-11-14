@@ -72,7 +72,7 @@ class Preset {
 // Counts / sizes / ratios: see docs/design/publish-presets.md for what is verified (Instagram) and what is still an assumption (requirements 4.11.2 [待验]).
 const presets = <Preset>[
   Preset('wechat', '朋友圈', '原比例 · 九宫格', 9, 'orig', ['orig', '1:1'], 1440, '微信', package: 'com.tencent.mm', iosScheme: 'weixin://'),
-  Preset('xhs', '小红书', '3:4 · 多图', 18, '3:4', ['3:4', 'orig'], 2048, '小红书', package: 'com.xingin.xhs', iosScheme: 'xhsdiscover://'),
+  Preset('xhs', '小红书', '3:4 · 多图', 18, '3:4', ['3:4', '1:1', 'orig'], 2048, '小红书', package: 'com.xingin.xhs', iosScheme: 'xhsdiscover://'),
   Preset('weibo', '微博', '原比例 · 多图', 18, 'orig', ['orig', '1:1'], null, '微博', package: 'com.sina.weibo', iosScheme: 'sinaweibo://'),
   Preset('douyin', '抖音图文', '3:4 · 图文', null, '3:4', ['3:4', '9:16'], 2048, '抖音',
       package: 'com.ss.android.ugc.aweme', iosScheme: 'snssdk1128://'),

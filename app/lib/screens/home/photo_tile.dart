@@ -144,7 +144,7 @@ class PhotoTile extends StatelessWidget {
                   padding: const EdgeInsets.symmetric(horizontal: Sp.s, vertical: 2),
                   decoration: BoxDecoration(color: Fx.amber, borderRadius: BorderRadius.circular(Rd.thumb)),
                   child: Text(photo.developFailed ? photo.failReason : '传输中断',
-                      maxLines: 2, overflow: TextOverflow.ellipsis, style: T.mini(Fx.onAmber, w: FontWeight.w500)),
+                      maxLines: 2, overflow: TextOverflow.ellipsis, style: T.cap(Fx.onAmber, w: FontWeight.w500)),
                 ),
               ),
             ),
@@ -201,7 +201,7 @@ class PhotoTile extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 8),
           alignment: Alignment.center,
           decoration: BoxDecoration(color: accent ? c.accentBtn : Fx.overlay55, borderRadius: BorderRadius.circular(Rd.thumb)),
-          child: Text(t, style: T.mini(Fx.onPhoto, w: FontWeight.w500)),
+          child: Text(t, style: T.cap(Fx.onPhoto, w: FontWeight.w500)),
         );
     switch (photo.kind) {
       case PhotoKind.bracket:

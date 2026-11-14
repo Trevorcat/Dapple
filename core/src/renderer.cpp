@@ -2038,6 +2038,11 @@ struct FrameKernels::Impl {
       exactOp.emplace(r.makePointOp(source, nullptr));
       sp = opt.spatial == SpatialQuality::Off ? SpatialParams{} : makeSpatial(r.p_, source.sceneReferred, exactOp->style);
     }
+    if (source.parent && source.parent->fullW > 0 && source.parent->fullH > 0 && !in.empty()) {
+      // a region source (docs section 44): the neighbourhood radii are fractions of the PARENT picture (like the export's), not of the window
+      const float k = float(std::max(source.parent->fullW, source.parent->fullH)) / float(std::max(in.width, in.height));
+      sp.scale = (sp.scale > 0.f ? sp.scale : float(std::max(d.w, d.h)) / 2048.f) * k;
+    }
     vig = r.p_.vignette / 100.f;
     useGeo = geo.active || region;
     exactMap = geo.exact && !region;

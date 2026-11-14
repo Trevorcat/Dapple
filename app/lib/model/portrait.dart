@@ -71,7 +71,7 @@ const List<PortraitSpec> portraitSpecs = [
 
 PortraitSpec specOf(PortraitChip c) => portraitSpecs.firstWhere((s) => s.chip == c);
 
-/// The order the default set is filled in when the edit's 12 planes cannot hold every chip (a group photo): the shared skin first.
+/// The order the default set is filled in when even the largest face's chips do not fit next to the other areas: the shared skin first.
 const List<PortraitChip> kPortraitPriority = [
   PortraitChip.skin,
   PortraitChip.shine,
@@ -81,6 +81,9 @@ const List<PortraitChip> kPortraitPriority = [
   PortraitChip.eyes,
   PortraitChip.light,
 ];
+
+/// The toast when a group photo's default set works on the main (largest) face only; the face strip adds the others.
+const String kGroupMainOnly = '合影只修了最大的人脸，其他人在下方加';
 
 /// The area name that marks a portrait area: `portrait:` + the area id.
 String portraitName(String areaId) => 'portrait:$areaId';

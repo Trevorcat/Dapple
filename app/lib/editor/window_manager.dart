@@ -95,7 +95,7 @@ class WindowManager extends ChangeNotifier {
   /// Applies a new dominant side (which edge the side pane uses, which end the category reset sits on). Refused
   /// (false) while an interaction is in progress.
   bool setSide(Hand h, {bool manual = false}) {
-    if (_interacting) return false;
+    if (_interacting && !manual) return false;
     if (h == _side && !manual) return true;
     _side = h;
     notifyListeners();

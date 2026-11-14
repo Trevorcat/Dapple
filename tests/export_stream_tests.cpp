@@ -561,6 +561,77 @@ static int testCapi() {
   return 0;
 }
 
+// ---- filmgpu: where does a film export differ between the whole frame and bands, GPU and CPU (42.6) -------------------------------------------
+// The band export runs the film on the CPU (the GPU film keeps frame-sized images), the whole-frame export on the GPU executor: the difference of
+// the two is the GPU / CPU film parity, not a band dependence. Four exports per preset: whole / bands x GPU / CPU; bands (GPU on) must equal the
+// CPU exports (film on the CPU in both; the demosaic differs only by its own GPU / CPU parity), and the whole-frame GPU export must stay within
+// the film GPU / CPU parity bound of the CPU one.
+// mean |a - b| in codes after a 4 x 4 box downscale (grain differs per pixel between the executors; the parity budget of the film GPU tests is on the box)
+static double meanAbs4x(const Image8& a, const Image8& b) {
+  if (a.width != b.width || a.height != b.height) return 999;
+  double sum = 0;
+  std::size_t n = 0;
+  for (int y = 0; y + 4 <= a.height; y += 4)
+    for (int x = 0; x + 4 <= a.width; x += 4)
+      for (int c = 0; c < 3; ++c) {
+        double ma = 0, mb = 0;
+        for (int j = 0; j < 4; ++j)
+          for (int i = 0; i < 4; ++i) {
+            const std::size_t k = (std::size_t(y + j) * a.width + x + i) * 3 + c;
+            ma += a.data[k], mb += b.data[k];
+          }
+        sum += std::fabs(ma - mb) / 16.0, ++n;
+      }
+  return n ? sum / double(n) : 0;
+}
+
+static int testFilmGpu() {
+  const fs::path raw = std::getenv("DAPPLE_STREAM_TEST_RAW") ? fs::path(std::getenv("DAPPLE_STREAM_TEST_RAW")) : sampleRaw();
+  if (raw.empty() || !fs::exists(raw)) {
+    std::printf("  SKIP: no RAW sample under build/rawsamples\n");
+    return 77;
+  }
+  if (dapple_gpu_set_enabled(1) != 1) {
+    std::printf("  SKIP: no GPU executor here\n");
+    return 77;
+  }
+  const fs::path dir = root() / "build" / "exp-out" / "filmgpu";
+  fs::create_directories(dir);
+  setEnv("DAPPLE_ENGINE_TILE", "512");
+  setEnv("DAPPLE_EXPORT_STREAM_TILE", "512");
+  setEnv("DAPPLE_FILM_TILES", "1");
+  const Preset cases[] = {{"film", R"({"film":"kodak_portra_400","film_grain":100,"film_halation":100})"},
+                          {"film_nograin", R"({"film":"kodak_portra_400","film_grain":0,"film_halation":0})"},
+                          {"film_cine", R"({"film":"kodak_vision3_500t","film_grain":100,"film_halation":100})"}};
+  const char* only = std::getenv("DAPPLE_STREAM_TEST_PRESETS");
+  for (const Preset& p : cases) {
+    if (only && !std::strstr(only, p.id)) continue;
+    Image8 im[4];  // whole GPU, bands GPU, whole CPU, bands CPU
+    bool ok = true;
+    for (int k = 0; k < 4; ++k) {
+      dapple_gpu_set_enabled(k < 2 ? 1 : 0);
+      setEnv("DAPPLE_EXPORT_STREAM", (k & 1) ? "on" : "off");
+      const fs::path f = dir / (std::string(p.id) + "_" + std::to_string(k) + ".jpg");
+      ok = ok && exportOnce(raw.string(), p, f.string()) == DAPPLE_OK;
+      im[k] = decodeJpeg(readAll(f));
+    }
+    CHECK(ok);
+    if (!ok) continue;
+    const Diff wc_bc = diff(im[2], im[3]), wg_bg = diff(im[0], im[1]), wg_wc = diff(im[0], im[2]), bg_bc = diff(im[1], im[3]);
+    const double mg = meanAbs4x(im[0], im[1]), mw = meanAbs4x(im[0], im[2]), mb = meanAbs4x(im[1], im[3]);
+    std::printf("  %-13s CPU whole vs bands: max %d (%zu px) | bands (GPU demosaic, film on the CPU) vs CPU bands: max %d, 4x mean %.3f | whole GPU vs bands: max %d, 4x mean %.3f | "
+                "whole GPU vs whole CPU: max %d, 4x mean %.3f\n",
+                p.id, wc_bc.maxCode, wc_bc.differing, bg_bc.maxCode, mb, wg_bg.maxCode, mg, wg_wc.maxCode, mw);
+    CHECK(wc_bc.sizeOk && wc_bc.maxCode == 0);  // bands are tile-exact on the CPU
+    // the band export runs the film on the CPU (42.6), the whole-frame one on the GPU executor: their difference is the film GPU / CPU parity
+    // (the same on the CPU and the bands, within the budget of film_gpu_tests: whole film frame mean <= 0.3 after a 4 x downscale), not a band effect
+    CHECK(mg <= 1.0 && mw <= 1.0 && std::fabs(mg - mw) <= 0.25);
+  }
+  dapple_gpu_set_enabled(0);
+  for (const char* v : {"DAPPLE_ENGINE_TILE", "DAPPLE_EXPORT_STREAM_TILE", "DAPPLE_FILM_TILES", "DAPPLE_EXPORT_STREAM"}) setEnv(v, nullptr);
+  return 0;
+}
+
 // ---- cancel -------------------------------------------------------------------------------------------------------------------------------
 static int testCancel() {
   const fs::path raw = sampleRaw();
@@ -1010,6 +1081,7 @@ int main(int argc, char** argv) {
   else if (id == "synthetic") testSynthetic();
   else if (id == "peak") testPeak();
   else if (id == "capi") rc = testCapi();
+  else if (id == "filmgpu") rc = testFilmGpu();
   else if (id == "cancel") rc = testCancel();
   else if (id == "policy") rc = testPolicy();
   else if (id == "budget") rc = testBudget();

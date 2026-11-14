@@ -10,6 +10,7 @@
 #include <cstring>
 #include <list>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 #if defined(__ANDROID__)
@@ -531,8 +532,7 @@ std::shared_ptr<const Plane> rasterPlane(const Raster& ra, const SourceImage& sr
 // Guided-filter coefficients (a, b) of the photo's log2 luminance against itself on a grid (edge-aware smoothing: texture below the radius and
 // below ~eps is averaged, edges kept). The pixel's smoothed luminance is Y_lin 2^(a l + b - l), l = log2 of its pre-gain luminance: the
 // global gain / HDR factor of the pixel (Y_lin / Y_src) is kept exactly, only the texture is smoothed.
-std::shared_ptr<const Plane> rangePlane(const SourceImage& src, const GuideKey& gk, float sx, float sy, int cap, float refine) {
-  const int L = std::max(src.linear.width, src.linear.height);
+std::shared_ptr<const Plane> rangePlane(const SourceImage& src, int L, const GuideKey& gk, float sx, float sy, int cap, float refine) {  // L: the photo's long edge
   const int gl = std::clamp(L, 64, cap);
   const int gw = std::max(8, int(std::lround(gl * sx))), gh = std::max(8, int(std::lround(gl * sy)));
   const std::uint64_t key = mixf(mix64(mix64(gk.key, 0x4A4CE), std::uint64_t(gw) << 32 | std::uint32_t(gh)), refine);
@@ -863,6 +863,7 @@ void writeDesc(Frame& f) {
   auto V = [&](int i) { return f.desc.data() + std::size_t(i) * 4; };
   V(0)[0] = float(nAdj), V(0)[1] = f.anyWindow ? 1.f : 0.f, V(0)[2] = f.sx, V(0)[3] = f.sy;
   V(1)[0] = f.guideRef;
+  V(5)[0] = f.pmap[0], V(5)[1] = f.pmap[1], V(5)[2] = f.pmap[2], V(5)[3] = f.pmap[3];  // window -> photo (identity for a whole photo)
   const float* M = labMatrix().M;
   for (int r = 0; r < 3; ++r)
     for (int c = 0; c < 3; ++c) V(2 + r)[c] = M[3 * r + c];
@@ -1087,7 +1088,21 @@ void setGuideCapture(const GuideCapture* c) { tlGuide = c; }
 std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, const SourceImage& src, bool interactive, bool preview) {
   if (list.empty() || src.linear.empty()) return nullptr;
   auto f = std::make_shared<Frame>();
-  const int W = src.linear.width, H = src.linear.height, L = std::max(W, H);
+  // A region source (docs section 44): the masks live in the parent picture's metric, and every whole-photo plane (guide grids, refined masks,
+  // smoothed ranges, retouch face scale, automatic spots) is solved from the parent picture (the same planes its whole-frame renders use: the guide
+  // families share them); only the per-pixel evaluation reads the window's own pixels.
+  std::shared_ptr<const SourceImage> parentPhoto;
+  int W = src.linear.width, H = src.linear.height;
+  if (src.parent) {
+    parentPhoto = src.parent->photo ? src.parent->photo() : nullptr;
+    if (!parentPhoto || parentPhoto->linear.empty()) throw std::runtime_error("local adjustments in a region: the parent picture is not available");
+    W = src.parent->fullW, H = src.parent->fullH;
+    f->parentW = W, f->parentH = H, f->parentX0 = src.parent->x0, f->parentY0 = src.parent->y0;
+    f->pmap[0] = float(src.linear.width) / float(W), f->pmap[1] = float(src.linear.height) / float(H);
+    f->pmap[2] = float(src.parent->x0) / float(W), f->pmap[3] = float(src.parent->y0) / float(H);
+  }
+  const SourceImage& gsrc = parentPhoto ? *parentPhoto : src;  // the picture the whole-photo planes are solved from
+  const int L = std::max(W, H);
   f->sx = float(W) / float(L);
   f->sy = float(H) / float(L);
   f->srcLong = float(L);
@@ -1104,7 +1119,7 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
     if (!preview && (!a.enabled || a.strength <= 0.f)) continue;
     const bool heal = !preview && (a.ops.v[kLoHeal] > 0.f || !a.spots.empty());
     if (a.mask.empty()) {  // manual heal spots need no mask
-      if (heal && !a.spots.empty()) healSpotsOf(a, *f, -1, src, retouchIodOf(a, *f, -1, src), f->spots);
+      if (heal && !a.spots.empty()) healSpotsOf(a, *f, -1, gsrc, retouchIodOf(a, *f, -1, gsrc), f->spots);
       continue;
     }
     const bool lin = a.ops.anyLinear() && !preview, win = a.ops.anyWindow() && !preview;
@@ -1148,11 +1163,11 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
           c.p[0] = m.lo / 100.f, c.p[1] = m.hi / 100.f, c.p[2] = std::max(m.lumFeather / 100.f, 1e-4f);
           if (m.refine > 0.f) {  // spatial coherence (section 40.10)
             if (!gkDone) {
-              gk = guideKeyOf(src);
+              gk = guideKeyOf(gsrc);
               gkDone = true;
               f->guideRef = gk.ref;
             }
-            c.plane = rangePlane(src, gk, f->sx, f->sy, interactive ? 512 : 1024, m.refine);
+            c.plane = rangePlane(gsrc, L, gk, f->sx, f->sy, interactive ? 512 : 1024, m.refine);
             f->anyRaster = true;  // the point pass needs the pre-gain source pixel
           }
           break;
@@ -1184,14 +1199,14 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
             break;
           }
           if (!gkDone) {
-            gk = guideKeyOf(src);
+            gk = guideKeyOf(gsrc);
             gkDone = true;
             f->guideRef = gk.ref;
           }
           // interactive tier: the exact tier's finer plane when it is cached (a drag after a settled frame; the drag then shows the exact mask
           // and the two tiers' grids do not compete for the plane cache), else the interactive grid
-          if (interactive && rasterCapFinal > rasterCap) c.plane = rasterPlane(*ra, src, gk, f->sx, f->sy, rasterCapFinal, m.refine, m, true);
-          if (!c.plane) c.plane = rasterPlane(*ra, src, gk, f->sx, f->sy, rasterCap, m.refine, m);
+          if (interactive && rasterCapFinal > rasterCap) c.plane = rasterPlane(*ra, gsrc, gk, f->sx, f->sy, rasterCapFinal, m.refine, m, true);
+          if (!c.plane) c.plane = rasterPlane(*ra, gsrc, gk, f->sx, f->sy, rasterCap, m.refine, m);
           f->anyRaster = true;
           break;
         }
@@ -1213,7 +1228,7 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
     }
     A.nc = int(f->comp.size()) - A.c0;
     if (A.nc == 0) {
-      if (heal && !a.spots.empty()) healSpotsOf(a, *f, -1, src, retouchIodOf(a, *f, -1, src), f->spots);
+      if (heal && !a.spots.empty()) healSpotsOf(a, *f, -1, gsrc, retouchIodOf(a, *f, -1, gsrc), f->spots);
       continue;
     }
     f->adj.push_back(A);
@@ -1222,9 +1237,9 @@ std::shared_ptr<const Frame> bind(const std::vector<LocalAdjustment>& list, cons
     bool rtW = false;
     for (int k = kLocalRetouchFirst; k <= kLoFaceLight; ++k) rtW = rtW || v[std::size_t(k)] != 0.f;
     if (rtW || heal) {
-      const float iod = retouchIodOf(a, *f, self, src);
+      const float iod = retouchIodOf(a, *f, self, gsrc);
       if (rtW) iodMin = std::max(iodMin, iod);  // the LARGEST face (section 43.1: a smaller scale would cut into the near face texture)
-      if (heal) healSpotsOf(a, *f, self, src, iod, f->spots);
+      if (heal) healSpotsOf(a, *f, self, gsrc, iod, f->spots);
     }
     if (!lin && !win && !preview) {  // heal only: nothing to evaluate per pixel
       f->adj.pop_back();
@@ -1310,6 +1325,7 @@ namespace {
 void applyLinearCtx(const Frame& f, float u, float v, const float src[3], float px[3], float* K, PixCtx& ctx);
 }
 void applyLinear(const Frame& f, float u, float v, const float src[3], float px[3], float* K) {
+  u = u * f.pmap[0] + f.pmap[2], v = v * f.pmap[1] + f.pmap[3];  // window -> photo (identity for a whole photo)
   PixCtx ctx;
   applyLinearCtx(f, u, v, src, px, K, ctx);
 }
@@ -1383,7 +1399,10 @@ void linearBlock(const Frame& f, const FrameKernels& fk, float* px, int n, int x
   const bool wantK = aux && aux->data && f.anyWindow;
   float K[kLocalWindowSlots];
   float us[256], vs[256];
-  for (int i = 0; i < n; ++i) fk.srcUV(x0 + i, y, us[i], vs[i]);
+  for (int i = 0; i < n; ++i) {
+    fk.srcUV(x0 + i, y, us[i], vs[i]);
+    us[i] = us[i] * f.pmap[0] + f.pmap[2], vs[i] = vs[i] * f.pmap[1] + f.pmap[3];  // window -> photo (identity for a whole photo)
+  }
   // the distinct raster planes, plane by plane over the block (one tight loop each instead of per pixel and component; the same values)
   constexpr int kRv = 16;
   const int np = int(f.rasters.size());
@@ -1603,6 +1622,7 @@ void maskRow(const Frame& f, const FrameKernels& fk, int index, int y, std::uint
     for (int i = 0; i < n; ++i) {
       float u, v;
       fk.srcUV(x0 + i, y, u, v);
+      u = u * f.pmap[0] + f.pmap[2], v = v * f.pmap[1] + f.pmap[3];
       const float m = ai >= 0 ? maskOf(f, ai, u, v, lin + 3 * i, src + 3 * i) : 0.f;
       out[x0 + i] = std::uint8_t(std::clamp(m, 0.f, 1.f) * 255.f + 0.5f);
     }

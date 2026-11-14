@@ -233,12 +233,12 @@ if(MSVC)
 else()
   target_compile_options(dapple_local_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-set(_local_ids json components identity raster tiles cache coords interactive film)
+set(_local_ids json components identity raster tiles cache coords interactive film region)
 if(TARGET dapple_gpu)
   target_link_libraries(dapple_local_tests PRIVATE dapple_gpu)
   target_include_directories(dapple_local_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src)
   target_compile_definitions(dapple_local_tests PRIVATE DAPPLE_LOCAL_GPU=1)
-  set(_local_ids ${_local_ids} parity)
+  set(_local_ids ${_local_ids} parity regiongpu)
 endif()
 foreach(id ${_local_ids})
   add_test(NAME engine.local_${id} COMMAND dapple_local_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -254,12 +254,12 @@ if(MSVC)
 else()
   target_compile_options(dapple_retouch_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-set(_retouch_ids json bands scale blobs heal whiten identity tiles interactive undereye rasters complexion twoscales rangesmooth)
+set(_retouch_ids json bands scale blobs heal whiten identity tiles interactive undereye rasters complexion twoscales rangesmooth region)
 if(TARGET dapple_gpu)
   target_link_libraries(dapple_retouch_tests PRIVATE dapple_gpu)
   target_include_directories(dapple_retouch_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src)
   target_compile_definitions(dapple_retouch_tests PRIVATE DAPPLE_RETOUCH_GPU=1)
-  set(_retouch_ids ${_retouch_ids} parity)
+  set(_retouch_ids ${_retouch_ids} parity regiongpu)
 endif()
 foreach(id ${_retouch_ids})
   add_test(NAME engine.retouch_${id} COMMAND dapple_retouch_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -284,7 +284,7 @@ foreach(_t dapple_local_capi_tests dapple_local_sheets)
     target_compile_options(${_t} PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
 endforeach()
-foreach(id render exports ui video)
+foreach(id render exports ui region video)
   add_test(NAME local_capi.${id} COMMAND dapple_local_capi_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(local_capi.${id} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
 endforeach()
@@ -540,7 +540,7 @@ endif()
 if(TARGET dapple_gpu)  # the GPU executor ids need the GPU export path (DAPPLE_HAVE_GPU comes from this link)
   target_link_libraries(dapple_export_stream_tests PRIVATE dapple_gpu)
 endif()
-foreach(id region reductions encoder mixbands filmbands synthetic peak capi cancel policy budget memtrim)
+foreach(id region reductions encoder mixbands filmbands synthetic peak capi filmgpu cancel policy budget memtrim)
   add_test(NAME export_stream.${id} COMMAND dapple_export_stream_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(export_stream.${id} PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77)
 endforeach()
@@ -552,3 +552,73 @@ if(TARGET dapple_gpu AND _ss_icd)  # the same matrix on the GPU executor (SwiftS
   set_tests_properties(export_stream.gpuoom_swiftshader PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77
     ENVIRONMENT "VK_DRIVER_FILES=${_ss_icd};VK_ICD_FILENAMES=${_ss_icd};DAPPLE_GPU_SOFTWARE=1")
 endif()
+
+# Default-run budget: `ctest -LE heavy` (what tools/check-all.sh runs) finishes in about 25 s on the development machine. A test that needs more than
+# about 2.5 s on its own (full-size exports, software-GPU runs, full-frame demosaic comparisons) is labelled heavy and runs only with
+# `tools/check-all.sh --heavy` or `ctest -L heavy`. New slow tests go on this list; prefer making a test small instead.
+set(_dapple_heavy
+  demosaic.gpu_real_swiftshader
+  demosaic.half_real
+  demosaic.wire_anchor
+  demosaic.wire_anchor_fast
+  demosaic.wire_gpu
+  demosaic.wire_preview
+  demosaic.wire_region
+  dng.jxl
+  engine.conformance
+  engine.exec_tiles
+  engine.golden_full
+  engine.golden_off
+  engine.gpu_box
+  engine.gpu_box_swiftshader
+  engine.gpu_external
+  engine.gpu_external_swiftshader
+  engine.gpu_hal
+  engine.gpu_hal_swiftshader
+  engine.gpu_keepwarm
+  engine.gpu_keepwarm_swiftshader
+  engine.gpu_probe
+  engine.gpu_probe_swiftshader
+  engine.gpu_select_swiftshader
+  engine.hdr_parity
+  engine.local_coords
+  engine.local_parity
+  engine.local_regiongpu
+  engine.match_cache_seq
+  engine.modern_parity
+  engine.overhead
+  engine.retouch_parity
+  engine.retouch_tiles
+  engine.reuse
+  engine.selfcheck
+  export_stream.cancel
+  export_stream.capi
+  export_stream.capi_gpu_swiftshader
+  export_stream.filmbands
+  export_stream.filmgpu
+  export_stream.gpuoom_swiftshader
+  export_stream.peak
+  export_stream.policy
+  export_stream.synthetic
+  film.film_match
+  film.pack_format
+  film.print_const
+  film.validation
+  film_disk.tables
+  film_gpu.frames
+  film_gpu.parity
+  film_nodes.fx
+  film_nodes.grain_scale
+  film_nodes.keys
+  gpu_parity
+  gpu_parity_swiftshader
+  local_capi.region
+  p3.direct
+  p3.inside
+  present.loop_view
+)
+foreach(_t ${_dapple_heavy})
+  if(TEST ${_t})
+    set_property(TEST ${_t} APPEND PROPERTY LABELS heavy)
+  endif()
+endforeach()

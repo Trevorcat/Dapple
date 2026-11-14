@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 
 import '../../services/base_swatches.dart' show SwatchSource;
+import '../../editor/fold_layout.dart';
 import '../../editor/handedness.dart';
 import '../../editor/haptics.dart';
 import '../../editor/springs.dart';
@@ -25,13 +26,15 @@ import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
 import '../../widgets/photo_art.dart';
 import '../publish/publish_page.dart';
+import 'fold_cluster.dart';
+import 'fold_panels.dart';
 import 'pad_dock.dart';
 import 'pad_panel.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart';
 import 'gesture_surface.dart';
 import '../../services/local_ai.dart';
-import 'local_panel.dart' show LocalHeader, LocalToolStrip, localToolsShown, portraitBodyNeed, toolStripH;
+import 'local_panel.dart' show LocalHeader, LocalToolStrip, actionsBodyNeed, localToolsShown, portraitBodyNeed, shapeCardBodyNeed, toolStripH;
 import 'local_layer.dart';
 import 'sync_dialog.dart';
 import 'zoom_view.dart';
@@ -86,6 +89,11 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
   /// Progress of the layout transition (photo region, panel and dock move from the previous geometry to the target).
   late final SpringValue _t = SpringValue(this, initial: 1);
   double _lastAspect = 0;
+
+  /// The fold layout of this build (docs/design/foldables.md), the fold the window reports, the cluster's place along the holding edge.
+  FoldPlan _plan = FoldPlan.none;
+  final ValueNotifier<double> _ballT = ValueNotifier(0.5);
+  bool _lastPortrait = false, _lastPortraitKnown = false;
   bool menuOpen = false;
   int lastRev = 0;
   bool _resampling = false;
@@ -158,6 +166,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     zoom.dispose();
     _t.dispose();
     _geoRev.dispose();
+    _ballT.dispose();
     _panelRect.dispose();
     ctl.dispose();
     wm.dispose();
@@ -215,7 +224,15 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     if (!ctl.dragging.value && mounted) WidgetsBinding.instance.addPostFrameCallback((_) => _retarget());
   }
 
+  EGroup? _toastGroup;
   void _onWm() {
+    // a tab switch ends the "已复位光线" style toast: it is about the page the user just left
+    final g = wm.focused?.group;
+    if (g != _toastGroup) {
+      _toastGroup = g;
+      final t = app.toast;
+      if (t != null) app.clearToast(t.id);
+    }
     if (mounted) WidgetsBinding.instance.addPostFrameCallback((_) => _retarget());
   }
 
@@ -251,9 +268,10 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
   /// chosen per category from its tallest control, so moving between its parameters never flips it; it is
   /// re-evaluated when the photo, the screen size, the category or the hand side changes, never during a drag.
   _PanelGeo _targetGeo() {
+    if (_plan.mode != FoldMode.none) return _foldGeo(_plan);
     final e = _env!;
     final w = wm.focused;
-    final dockH = 56.0;
+    final dockH = padDockH(e.textScale);
     final kb = e.keyboard > 0;
     final size = kb ? Size(e.size.width, e.size.height - e.keyboard) : e.size;
     final dockBottom = kb ? 8.0 : e.dockBottom;
@@ -308,15 +326,23 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
       ctl.local.headerInnerW = inner;
       localHeaderExtra = LocalHeader.belowLinesFor(ctl.local, inner, e.textScale) * kHeaderH;
     }
-    PanelNeeds needsFor({required bool collapsed, required bool itemised, double? bodyNeed}) => panelNeeds(
+    PanelNeeds needsFor({required bool collapsed, required bool itemised, double? bodyNeed, bool shortBody = false}) => panelNeeds(
         screenW: size.width, paneW: sw - e.marginL, screenH: e.size.height, region: region, photoW: size.width - e.photoPad.horizontal, aspect: aspect,
-        textScale: e.textScale, collapsed: collapsed, itemised: itemised, headerExtra: localHeaderExtra, bodyNeed: bodyNeed);
+        textScale: e.textScale, collapsed: collapsed, itemised: itemised, headerExtra: localHeaderExtra, bodyNeed: bodyNeed, shortBody: shortBody);
     // heights follow the content of the layer (guidelines 15.1-7); a change between layers is animated by _retarget
+    final bodyW = math.min(size.width - 2 * e.marginL, kPanelMaxW) - 2 * Sp.m;
+    final localFlat = w.group == EGroup.local && !ctl.itemised;
+    final portraitNeed = localFlat ? portraitBodyNeed(ctl.local, bodyW, e.textScale) : null;
+    // the action card is as tall as its tiles, hung under the chips: no empty band where the pad was
+    final actionsNeed = localFlat && portraitNeed == null ? actionsBodyNeed(ctl.local, bodyW, TextScaler.linear(e.textScale)) : null;
+    // the shape card shows all three of its groups when the window has the room (its own scroll is for the rest)
+    final cardNeed = localFlat && portraitNeed == null && actionsNeed == null ? shapeCardBodyNeed(ctl.local, bodyW, TextScaler.linear(e.textScale)) : null;
     PanelNeeds needs() => needsFor(
         collapsed: w.collapsed,
         itemised: ctl.itemised && (PadCatX.ofGroup(w.group) != null || w.group == EGroup.local),
         // the portrait chips are shorter than a pad: the panel is as tall as they are, no empty band under them
-        bodyNeed: w.group == EGroup.local && !ctl.itemised ? portraitBodyNeed(ctl.local, math.min(size.width - 2 * e.marginL, kPanelMaxW) - 2 * Sp.m, e.textScale) : null);
+        bodyNeed: portraitNeed ?? actionsNeed ?? cardNeed,
+        shortBody: actionsNeed != null);
     final key = '${w.group.name}|${size.width.round()}x${size.height.round()}|${aspect.toStringAsFixed(3)}|$trailing|$id';
     if (key != _placeKey && !ctl.dragging.value) {
       _placeKey = key;
@@ -353,8 +379,63 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
         collapsed: w.collapsed);
   }
 
+  /// The fold layouts: the photo region from the plan (the workbench, the column and the cluster are their own widgets); below the fold the
+  /// ordinary panel and dock are laid into the area under it.
+  _PanelGeo _foldGeo(FoldPlan p) {
+    final e = _env!;
+    final w = wm.focused;
+    var region = p.photo;
+    var panel = Rect.zero;
+    // the dock keeps its phone place in every layout (not drawn in the workbench and the column), so the geometry never animates it from nothing
+    final dockH = padDockH(e.textScale);
+    final dockTop = e.size.height - e.dockBottom - dockH;
+    final dock = Rect.fromLTWH(e.marginL, dockTop, e.size.width - e.marginL - e.marginR, dockH);
+    if (p.mode == FoldMode.half) {
+      final cw = math.min(p.controls.width - e.marginL - e.marginR, kPanelMaxW);
+      final left = p.controls.left + (p.controls.width - cw) / 2;
+      panel = Rect.fromLTWH(left, p.controls.top, cw, math.max(0.0, dockTop - 8 - p.controls.top));
+      ctl.local.headerInnerW = cw - 2 * Sp.l;
+    }
+    // 局部's tool strip hangs under the photo, as on the phone
+    if (w?.group == EGroup.local && localToolsShown(ctl)) region = Rect.fromLTRB(region.left, region.top, region.right, math.max(region.top, region.bottom - toolStripH(region.width)));
+    return _PanelGeo(region: region, panel: panel, dock: dock, place: PanelPlace.bottom, open: w != null, group: w?.group, collapsed: false);
+  }
+
+  /// The grip moved the cluster by [dy] along the edge.
+  void _slideCluster(double dy) {
+    final pr = _photoRect();
+    if (pr.isEmpty) return;
+    final (lo, hi) = BallGeo.range(pr);
+    if (hi > lo) _ballT.value = (_ballT.value + dy / (hi - lo)).clamp(0.0, 1.0);
+  }
+
+  /// The grip was let go at [gx]: past the middle of the photo the cluster changes sides.
+  void _dropCluster(double gx) => _setHand(gx < _photoRect().center.dx ? Hand.left : Hand.right);
+
+  /// A hand side chosen by hand (the grip past the middle, the column's button): kept for the session and the next editor; the passive
+  /// inference stops moving it.
+  void _setHand(Hand side) {
+    ctl.handPinned = true;
+    if (side == wm.side) return;
+    wm.setSide(side, manual: true);
+    final s = app.settings;
+    s.handSide = side == Hand.left ? 0 : 1;
+    if (s.handedness != 0) s.handedness = side == Hand.left ? 1 : 2;
+    app.updateSettings((_) {});
+  }
+
+  /// What the fold layout was computed from: the page body is not rebuilt by the panel's own notifications, so a change here rebuilds it.
+  String _foldSig = '';
+
+  String _foldSigNow() {
+    final g = wm.focused?.group;
+    final lines = _plan.mode == FoldMode.bench && g == EGroup.local && _env != null ? foldHeaderLines(ctl, _plan.info.width - 2 * Sp.l, _env!.textScale) : 0;
+    return '${wm.side.name}|${g?.name}|$lines|${_frameRatio(ph, false).toStringAsFixed(3)}';
+  }
+
   void _retarget() {
     if (!mounted || _env == null) return;
+    if (_foldSigNow() != _foldSig) setState(() {});
     final next = _targetGeo();
     if (next == _to) return;
     _from = _to == null ? next : _geoNow();
@@ -528,22 +609,46 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     // the system gesture / navigation zone counts as well as the reported inset (some devices report one without the other): the
     // dock and the controls above it never lie where the system takes the touch (guidelines 15.6)
     final dockBottom = math.max(math.max(pad.bottom, gi.bottom), 16.0) + 8;
-    final dockTop = size.height - dockBottom - 56;
+    final dockTop = size.height - dockBottom - padDockH(textScale);
     final keyboard = mq.viewInsets.bottom;
     ctl.availableHeight = size.height - pad.vertical;
     ctl.readoutArea = Rect.fromLTWH(size.width / 2 - 130, topBarBottom + 8, 260, 96);
-    final photoPad = EdgeInsets.symmetric(vertical: math.max(pad.top, pad.bottom), horizontal: math.max(pad.left, pad.right));
+    // the fold layouts (docs/design/foldables.md): chosen by window size class and posture, never by device model
+    final crease = creaseOf(mq.displayFeatures, size);
+    final grp = wm.focused?.group;
+    final realAspect = _frameRatio(ph, false);
+    if (grp != EGroup.crop) {
+      _lastPortrait = realAspect < 1;
+      _lastPortraitKnown = true;
+    }
+    // while cropping the photo's orientation is the one it had: choosing a ratio does not turn the layout over
+    final modeAspect = grp == EGroup.crop && _lastPortraitKnown ? (_lastPortrait ? 0.75 : 1.5) : realAspect;
+    final foldBottom = math.max(math.max(pad.bottom, gi.bottom), 8.0);
+    final mode = foldModeOf(size, crease, modeAspect);
+    FoldPlan plan({double extra = 0}) => FoldPlan.compute(mode: mode, size: size, pad: pad, bottomInset: foldBottom, crease: crease, aspect: realAspect, hand: wm.side, textScale: textScale, benchExtra: extra);
+    var fp = plan();
+    if (mode == FoldMode.bench && grp == EGroup.local) {
+      final lines = foldHeaderLines(ctl, fp.info.width - 2 * Sp.l, textScale);
+      if (lines > 0) fp = plan(extra: lines * kHeaderH);
+    }
+    _plan = fp;
+    ctl.controlsHome = mode != FoldMode.none;
+    final fold = mode != FoldMode.none;
+    // in the fold layouts the photo's region already excludes the system insets: the zoom view needs none of its own
+    final photoPad = fold ? EdgeInsets.zero : EdgeInsets.symmetric(vertical: math.max(pad.top, pad.bottom), horizontal: math.max(pad.left, pad.right));
     final c = context.c;
     // The controls are always the panel (docked under the photo or as a side pane, whichever leaves the larger photo).
     ctl.docked = true;
     _env = _Env(size, pad, marginL, marginR, topBarBottom, dockBottom, keyboard, textScale, photoPad);
+    _foldSig = _foldSigNow();
     if (_to == null) {
       _to = _targetGeo();
       _from = _to!;
       _panelRect.value = _to!.panel;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) => _retarget());
-    final wide = size.width >= 600;
+    final wide = size.width >= 600 && !fold;
+    if (fold) WidgetsBinding.instance.addPostFrameCallback((_) { if (mounted && _plan.mode != FoldMode.none) foldSync(ctl); });
 
     return Stack(children: [
       // 0 photo + the single gesture surface
@@ -578,7 +683,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
         },
       ),
       // browse-mode filmstrip on wide screens
-      if (wide) _filmstrip(bottom: dockBottom + 56 + 12, left: marginL, right: marginR),
+      if (wide) _filmstrip(bottom: dockBottom + padDockH(textScale) + 12, left: marginL, right: marginR),
       // 1 the control panel: under the photo or beside it
       ListenableBuilder(
         listenable: Listenable.merge([wm, ctl.edits, _geoRev]),
@@ -595,6 +700,19 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
           );
         },
       ),
+      // the workbench under a landscape photo, the column beside a portrait one
+      if (fp.mode == FoldMode.bench) FoldBench(ctl: ctl, plan: fp, textScale: textScale),
+      if (fp.mode == FoldMode.column) FoldColumn(ctl: ctl, plan: fp, textScale: textScale, hand: wm.side, onSwap: () => _setHand(otherHand(wm.side))),
+      // the one-thumb cluster: over the photo only
+      if (fp.mode == FoldMode.bench)
+        AnimatedBuilder(
+          animation: Listenable.merge([_t, _ballT, wm]),
+          builder: (context, _) {
+            final pr = _photoRect();
+            if (pr.isEmpty) return const SizedBox.shrink();
+            return Positioned.fill(child: FoldCluster(ctl: ctl, geo: BallGeo.of(pr, wm.side, _ballT.value), onSlide: _slideCluster, onDrop: _dropCluster));
+          },
+        ),
       // 2 readout: counters and the original pill; for a 2D value driven by the photo, the live readout too
       ListenableBuilder(
         listenable: ctl.readout,
@@ -603,7 +721,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
           return Positioned(
             left: 0,
             right: 0,
-            top: topBarBottom + 8,
+            top: fold ? _photoRect().top + 8 : topBarBottom + 8,
             child: Center(
               child: Visibility(
                 visible: show,
@@ -642,6 +760,16 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
                 listenable: _geoRev,
                 builder: (context, _) {
                   final to = _to!;
+                  if (fold) {
+                    // back and the rest float on the photo's corners: no separate top bar
+                    return AnimatedBuilder(
+                      animation: _t,
+                      builder: (context, _) {
+                        final pr = _photoRect();
+                        return Positioned(top: pr.top + 8, left: pr.left + 8, width: math.max(0.0, pr.width - 16), child: EditorTopBar(app: app, photoId: () => id, onBack: () => Navigator.of(context).maybePop(), onMore: _toggleMenu));
+                      },
+                    );
+                  }
                   final sideOpen = to.open && to.place == PanelPlace.side;
                   final bar = EditorTopBar(app: app, photoId: () => id, onBack: () => Navigator.of(context).maybePop(), onMore: _toggleMenu, vertical: sideOpen);
                   if (sideOpen) {
@@ -652,7 +780,8 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
                   return Positioned(top: topBarTop, left: marginL, right: marginR, child: bar);
                 },
               ),
-              AnimatedBuilder(
+              if (fp.mode == FoldMode.none || fp.mode == FoldMode.half)
+                AnimatedBuilder(
                 animation: _t,
                 builder: (context, _) => Positioned.fromRect(
                   rect: _geoNow().dock,
@@ -663,9 +792,13 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
           ),
         ),
       ),
-      ToastLayer(app: app, bottom: size.height - dockTop + 12, maxWidth: 480),
+      // on the photo, just above its lower edge: never over the pad, the dock or the join of photo and panel
+      AnimatedBuilder(
+        animation: _t,
+        builder: (context, _) => ToastLayer(app: app, bottom: size.height - _geoNow().region.bottom + 8, maxWidth: 480),
+      ),
             HoldPopupLayer(ctl: ctl, dockTop: dockTop, screenW: size.width),
-      if (menuOpen) _menu(size, _geoNow().dock, const []),
+      if (menuOpen) _menu(size, fold && fp.mode != FoldMode.half ? Rect.fromLTRB(_photoRect().left, _photoRect().bottom, _photoRect().right - 8, _photoRect().bottom) : _geoNow().dock, const []),
     ]);
   }
 

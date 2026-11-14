@@ -2,6 +2,7 @@
 // 360 dp phone, a panel height that is constant within a category, the portrait chip that is selected again after reopening / undo, the
 // tool strip on a reserved line under the photo, the 发布 sheet's 分享… button, and the 选成像 chip that opens the map under a sliding
 // finger. With --dart-define=SHOTS=true [--dart-define=OUT=<dir>] the steps are also written as PNGs (build/ui-samsung2).
+import 'package:dapple/editor/fold_layout.dart' show debugFoldLayouts;
 import 'package:dapple/model/film_map.dart';
 import 'package:dapple/model/pad_model.dart';
 import 'package:dapple/model/params.dart';
@@ -38,6 +39,9 @@ Future<void> dock(WidgetTester t, EGroup g) async {
 (Rect, Rect) frame(WidgetTester t) => (panelRect(t), stageRect(t));
 
 void main() {
+  // these tests are about the ordinary panel placement (side pane on a wide window); the fold layouts have their own tests (fold_layout_test.dart)
+  setUp(() => debugFoldLayouts = false);
+  tearDown(() => debugFoldLayouts = true);
   setUp(() => FilmMapStore.debugSet({
         'kodak_portra_400': const Offset(-0.5, -0.3),
         'kodak_ektar_100': const Offset(0.6, 0.5),

@@ -156,6 +156,7 @@
 				97C146EA1CF9000F007C117D /* Sources */,
 				97C146EB1CF9000F007C117D /* Frameworks */,
 				97C146EC1CF9000F007C117D /* Resources */,
+				A1B2C3D4E5F60718293A4B5C /* Bundle AI models */,
 				9705A1C41CF9048500538489 /* Embed Frameworks */,
 				3B06AD1E1E4923F5004D2608 /* Thin Binary */,
 			);
@@ -265,6 +266,21 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "/bin/sh \"$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh\" build";
+		};
+		A1B2C3D4E5F60718293A4B5C /* Bundle AI models */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Bundle AI models";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# AI masks (docs/legal/ai-models.md): the model files of tools/ai-rt/ai-models are copied into the app bundle as <app>/ai-models and read from there by the engine (DappleEnginePlugin, channel dapple/ai). The 99 MB depth model is left out unless DAPPLE_AI_DEPTH=1 (same default as the Android APK). No staged models: nothing is bundled and the engine reports AI unavailable.\nSRC=\"$SRCROOT/../../tools/ai-rt/ai-models\"\nDST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/ai-models\"\nrm -rf \"$DST\"\n[ -d \"$SRC\" ] || exit 0\nmkdir -p \"$DST\"\nfor f in \"$SRC\"/*; do\n  n=$(basename \"$f\")\n  if [ \"$n\" = depth.ort ] && [ \"${DAPPLE_AI_DEPTH:-}\" != 1 ]; then continue; fi\n  cp -f \"$f\" \"$DST/$n\"\ndone\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

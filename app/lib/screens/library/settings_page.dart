@@ -93,6 +93,21 @@ class _SettingsPageState extends State<SettingsPage> {
     ]);
   }
 
+  /// A reset is quiet but never silent: the toast says what happened and 撤销 puts the learned values back.
+  void _resetHand() {
+    final hand = app.settings.handSide, layout = app.settings.editorLayout;
+    app.updateSettings((x) {
+      x.handSide = 1;
+      x.editorLayout = '';
+    });
+    app.showToast('已重置自动判断', actionLabel: '撤销', onAction: () {
+      app.updateSettings((x) {
+        x.handSide = hand;
+        x.editorLayout = layout;
+      });
+    });
+  }
+
   Widget _row(BuildContext context, String title, {String? sub, Widget? trailing, VoidCallback? onTap, VoidCallback? onLongPress, Widget? leading, String? key}) {
     final c = context.c;
     return InkWell(
@@ -107,7 +122,7 @@ class _SettingsPageState extends State<SettingsPage> {
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
               Text(title, style: T.body17(c.text)),
-              if (sub != null) Text(sub, style: T.small(c.text2)),
+              if (sub != null) Text(sub, style: T.smallL(c.text2)),
             ]),
           ),
           ?trailing,
@@ -175,13 +190,13 @@ class _SettingsPageState extends State<SettingsPage> {
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text('α7R V 的 FTP 设置', style: T.body17(c.text, w: FontWeight.w500)),
             const SizedBox(height: Sp.s),
-            Text('网络 › FTP 传输功能 › 服务器设置', style: T.small(c.text2)),
+            Text('网络 › FTP 传输功能 › 服务器设置', style: T.smallL(c.text2)),
             const SizedBox(height: 4),
             Text('主机名 $host　端口 ${s.ftpPort}', style: T.body(c.text, tabular: true)),
             Text('用户 ${s.ftpUser}　密码 ${s.ftpPass}', style: T.body(c.text, tabular: true)),
             Text('被动模式 开　安全协议 关', style: T.body(c.text)),
             const SizedBox(height: Sp.s),
-            Text('相机与手机连同一 Wi-Fi，或连手机热点', style: T.small(c.text2)),
+            Text('相机与手机连同一 Wi-Fi，或连手机热点', style: T.smallL(c.text2)),
           ]),
         ),
       ],
@@ -283,13 +298,9 @@ class _SettingsPageState extends State<SettingsPage> {
           if (s.handedness == 0 && handSideMatters(MediaQuery.sizeOf(context)))
             _row(context, '重置自动判断',
                 key: 'reset-hand',
-                onTap: () {
-                  app.updateSettings((x) {
-                    x.handSide = 1;
-                    x.editorLayout = '';
-                  });
-                  app.showToast('已重置自动判断');
-                }),
+                sub: '清除已学到的左右手习惯，重新判断',
+                onTap: _resetHand,
+                trailing: ActionChip32('重置', onPressed: _resetHand)),
         ];
       case 5:
         return [
