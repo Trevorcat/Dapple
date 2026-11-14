@@ -335,12 +335,12 @@ void testBounded() {
       {"eyes 100", [&](ReshapeParams& r) { ReshapeFace f = f0; f.eyes = 100; r.faces = {f}; }, 3},
       {"nose 100", [&](ReshapeParams& r) { ReshapeFace f = f0; f.nose = 100; r.faces = {f}; }, 3},
       {"face all 100", [&](ReshapeParams& r) { ReshapeFace f = f0; f.slim = f.small = f.chin = f.eyes = f.nose = 100; r.faces = {f}; }, 40},
-      {"waist 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.waist = 100; r.bodies = {b}; }, 14},
-      {"arms 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.arms = 100; r.bodies = {b}; }, 8},
-      {"legs 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.legs = 100; r.bodies = {b}; }, 8},
-      {"long legs 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.longLegs = 100; r.bodies = {b}; }, 45},
-      {"head 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.head = 100; r.bodies = {b}; }, 20},
-      {"body all 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.waist = b.arms = b.legs = b.longLegs = b.head = 100; r.bodies = {b}; }, 60},
+      {"waist 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.waist = 100; r.bodies = {b}; }, 28},
+      {"arms 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.arms = 100; r.bodies = {b}; }, 24},
+      {"legs 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.legs = 100; r.bodies = {b}; }, 24},
+      {"long legs 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.longLegs = 100; r.bodies = {b}; }, 55},
+      {"head 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.head = 100; r.bodies = {b}; }, 34},
+      {"body all 100", [&](ReshapeParams& r) { ReshapeBody b = b0; b.waist = b.arms = b.legs = b.longLegs = b.head = 100; r.bodies = {b}; }, 70},
   };
   for (const Op& o : ops) {
     ReshapeParams r;
@@ -350,7 +350,7 @@ void testBounded() {
     CHECK(s.maxDisp > 0);
     CHECK(s.maxDisp * L <= o.boundPx);
     CHECK(s.grad < 0.75f || (s.limited && s.grad <= 0.75f));
-    CHECK(!s.limited || std::strstr(o.name, "all"));
+    CHECK(!s.limited);  // section 48: no operator is clipped by the fold limit at 100, the combination included
     CHECK(s.asym * L < 0.02);
   }
 }
@@ -410,6 +410,7 @@ ReshapeBody figure(int W, int H, double xL, double sc) {
   return b;
 }
 void testBody() {
+  warp::setLegMode(0);  // this block is about the windowed variant W (main person only); the default is the whole stretch B (testLegs)
   const int W = 1800, H = 1000;
   const double L = 1800, B = double(H) / L;
   ReshapeBody a = figure(W, H, 0.30, 0.55);
@@ -665,6 +666,7 @@ void testInteractive() {
     std::printf("  interactive (grid %d) vs exact (grid %d) frame %dx%d: mean %.3f levels, max %d\n", warp::kGridInteractive, warp::kGridExact, a.w, a.h, s, mx);
     CHECK(s < 1.0);
   }
+  warp::setLayered(false);  // the hand-over of the smooth field; the layered blend baked at the nodes jumps at the person's edge by design (CPU reads the layers per pixel)
   auto fi = warp::bind(p.reshape, W, H, true), fe = warp::bind(p.reshape, W, H, false);
   if (fi && fe) {
     double m = 0;
@@ -678,6 +680,7 @@ void testInteractive() {
     std::printf("  field hand-over: max |B_int - B_exact| %.3f px of the 1200 px long edge\n", m * 1200);
     CHECK(m * 1200 < 1.0);
   }
+  warp::setLayered(true);
   std::free(a.rgba);
   std::free(b.rgba);
 }
@@ -687,6 +690,7 @@ void testMapPoint() {
   const int W = 900, H = 1200;
   putMatte("rs_matte", W, H);
   ReshapeParams r = richEdit(W, H, true).reshape;
+  warp::setLayered(false);  // the smooth field is invertible; a layered field has no preimage in the strip the person leaves
   auto f = warp::bind(r, W, H, false);
   CHECK(f != nullptr);
   if (!f) return;
@@ -885,6 +889,27 @@ void testBench() {
   EditParams face = faceEdit(W, H, 60, 30, 30, 40, 40);
   face.reshape.matte = "rs_matte";
   EditParams all = richEdit(W, H, true);
+  EditParams body;  // body operators at 100 with the person plane, no push: layered (section 48) and, for comparison, the earlier single field
+  {
+    ReshapeBody b = synthBody(W, H);
+    b.waist = b.arms = b.legs = b.head = 100;
+    body.reshape.bodies = {b};
+    body.reshape.matte = "rs_matte";
+  }
+  for (int layered = 1; layered >= 0; --layered)
+    for (int tier = 0; tier < 2; ++tier) {
+      warp::setLayered(layered != 0);
+      std::vector<double> v;
+      for (int i = 0; i < 5; ++i) {
+        warp::resetCache();
+        const auto t0 = Clock::now();
+        warp::bind(body.reshape, W, H, tier == 0);
+        v.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+      }
+      std::printf("  field build (body ops at 100 + matte), %s, %s grid %d: %.1f ms\n", layered ? "layered" : "earlier single field", tier == 0 ? "interactive" : "exact",
+                  tier == 0 ? warp::kGridInteractive : warp::kGridExact, median(v));
+    }
+  warp::setLayered(true);
   // field build times
   for (int tier = 0; tier < 2; ++tier) {
     std::vector<double> v;
@@ -902,9 +927,11 @@ void testBench() {
   dapple::gpu::Rig rig(ctx, big, cam());
 #endif
   std::printf("  %-26s | %-15s | %-14s | %-11s | %-18s\n", "edit", "GPU 1080 int ms", "GPU 24 MP ms", "CPU 1080 ms", "CPU exact 24 MP ms");
-  const std::pair<const char*, const EditParams*> eds[] = {{"none", &none}, {"face ops", &face}, {"all ops + push + matte", &all}};
+  const std::pair<const char*, const EditParams*> eds[] = {{"none", &none}, {"face ops", &face}, {"all ops + push + matte", &all},
+                                                            {"body ops, layered", &body}, {"body ops, earlier field", &body}};
   for (const auto& e : eds) {
     const EditParams& p = *e.second;
+    warp::setLayered(std::strcmp(e.first, "body ops, earlier field") != 0);
     double gi = -1, gf = -1, ci = -1, cf = -1;
 #ifdef DAPPLE_RESHAPE_GPU
     Renderer rd(p, cam(), nullptr);
@@ -953,6 +980,225 @@ void testBench() {
   }
 }
 
+
+// ---- layered mode (section 48) ----------------------------------------------------------------------------------------------------------------------
+EditParams layeredEdit(int W, int H) {
+  EditParams p;
+  ReshapeBody b = synthBody(W, H);
+  b.waist = b.arms = b.legs = b.head = 100;
+  p.reshape.bodies = {b};
+  p.reshape.matte = "rs_matte";
+  return p;
+}
+void testLayered() {
+  warp::setLayered(true);
+  const int W = 600, H = 800;
+  const double L = 800;
+  const SourceImage src = makeScene(W, H);
+  putMatte("rs_matte", W, H);
+  const EditParams p = layeredEdit(W, H);
+  EngineSession es;
+  Image8 base, e;
+  CHECK(exactRender(es, EditParams{}, src, ExecMode::Whole, 0, base));
+  CHECK(exactRender(es, p, src, ExecMode::Whole, 0, e));
+  auto f = warp::bind(p.reshape, W, H, false);
+  CHECK(f && f->layered && !f->gradLimited);
+  // the background outside the silhouette (plane > 0.15) dilated by 10 px is bit-identical; inside, the person moved
+  auto mt = local::rasterGet("rs_matte");
+  CHECK(bool(mt));
+  if (!mt) return;
+  std::vector<std::uint8_t> inS(std::size_t(W) * H, 0), near(std::size_t(W) * H, 0);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) inS[std::size_t(y) * W + x] = mt->px[std::size_t(y * mt->h / H) * mt->w + x * mt->w / W] > 38;
+  const int R = 10;
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x)
+      if (inS[std::size_t(y) * W + x])
+        for (int j = std::max(0, y - R); j <= std::min(H - 1, y + R); ++j)
+          for (int i = std::max(0, x - R); i <= std::min(W - 1, x + R); ++i) near[std::size_t(j) * W + i] = 1;
+  std::size_t outside = 0, outsideDiff = 0, inside = 0, insideDiff = 0;
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x) {
+      bool diff = false;
+      for (int c = 0; c < 3; ++c) diff |= base.data[(std::size_t(y) * W + x) * 3 + c] != e.data[(std::size_t(y) * W + x) * 3 + c];
+      if (near[std::size_t(y) * W + x]) ++inside, insideDiff += diff;
+      else {
+        ++outside, outsideDiff += diff;
+        if (diff) std::printf("  outside diff at (%d, %d)\n", x, y);
+      }
+    }
+  std::printf("  layered, body ops at 100: %zu of %zu background px outside the 10 px dilated silhouette changed; %zu of %zu px inside changed\n", outsideDiff, outside, insideDiff, inside);
+  CHECK(outsideDiff == 0 && insideDiff > 500);
+  // the same with the earlier single field: the background beyond the silhouette moves
+  warp::setLayered(false);
+  Image8 o;
+  CHECK(exactRender(es, p, src, ExecMode::Whole, 0, o));
+  warp::setLayered(true);
+  std::size_t oldDiff = 0;
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x)
+      if (!near[std::size_t(y) * W + x])
+        for (int c = 0; c < 3; ++c)
+          if (base.data[(std::size_t(y) * W + x) * 3 + c] != o.data[(std::size_t(y) * W + x) * 3 + c]) {
+            ++oldDiff;
+            break;
+          }
+  std::printf("  the earlier single field: %zu of %zu background px outside the dilated silhouette changed\n", oldDiff, outside);
+  CHECK(oldDiff > 0);
+
+  // fold-free at the new maxima, every operator alone and all together (not clipped), and the peak moves are the doubled ones
+  ReshapeBody b0 = synthBody(W, H);
+  struct Op {
+    const char* name;
+    std::function<void(ReshapeBody&)> set;
+    double minPx;
+  };
+  const Op ops[] = {{"waist", [](ReshapeBody& b) { b.waist = 100; }, 18}, {"arms", [](ReshapeBody& b) { b.arms = 100; }, 8},
+                    {"legs", [](ReshapeBody& b) { b.legs = 100; }, 8},    {"head", [](ReshapeBody& b) { b.head = 100; }, 15},
+                    {"all", [](ReshapeBody& b) { b.waist = b.arms = b.legs = b.head = 100; }, 18}};
+  for (const Op& op : ops) {
+    ReshapeBody b = b0;
+    op.set(b);
+    ReshapeParams r;
+    r.bodies = {b};
+    r.matte = "rs_matte";
+    auto g = warp::bind(r, W, H, false);
+    CHECK(g && g->layered);
+    if (!g) continue;
+    std::printf("  %-6s 100: raw grad %.3f%s, person layer peak move %.1f px (of an 800 px long edge)\n", op.name, g->rawGrad, g->gradLimited ? " LIMITED" : "", g->maxMove * L);
+    CHECK(!g->gradLimited && g->rawGrad < 0.75f);
+    CHECK(g->maxMove * L > op.minPx);
+  }
+  // no seam across tiles, and a region window (preview) agrees with the whole render away from its border
+  for (int tile : {96, 200}) {
+    Image8 t;
+    std::size_t d = 0;
+    CHECK(exactRender(es, p, src, ExecMode::TiledExport, tile, t));
+    const double m = maxDiff(e, t, &d);
+    std::printf("  layered tile %3d: max code %.0f, differing bytes %zu of %zu\n", tile, m, d, e.data.size());
+    CHECK(m <= 1);
+  }
+  // the layers together with the whole stretch of the long legs (B, outermost): still no seam across tiles, and the stretch is in the field
+  {
+    EditParams pl = p;
+    pl.reshape.bodies[0].longLegs = 100;
+    auto g = warp::bind(pl.reshape, W, H, false);
+    CHECK(g && g->layered && !g->bs.empty());
+    Image8 w2, t2;
+    CHECK(exactRender(es, pl, src, ExecMode::Whole, 0, w2));
+    CHECK(exactRender(es, pl, src, ExecMode::TiledExport, 96, t2));
+    std::size_t d = 0;
+    const double m = maxDiff(w2, t2, &d);
+    std::printf("  layers + whole stretch, tile 96: max code %.0f, differing bytes %zu\n", m, d);
+    CHECK(m <= 1);
+  }
+  // the version-1 strengths halve: an edit saved before section 48 looks the same
+  auto q = fromJson(R"({"reshape":{"v":1,"bodies":[{"waist":100,"arms":60,"legs":40,"longlegs":80,"head":20,"pts":[]}]}})");
+  CHECK(bool(q) && q->reshape.bodies.size() == 1);
+  if (q && q->reshape.bodies.size() == 1) {
+    const ReshapeBody& b = q->reshape.bodies[0];
+    CHECK(b.waist == 50.f && b.arms == 30.f && b.legs == 20.f && b.head == 10.f && b.longLegs == 80.f);
+    CHECK(reshapeToJson(q->reshape).rfind("{\"v\":2", 0) == 0);
+  }
+  auto q2 = fromJson(R"({"reshape":{"v":2,"bodies":[{"waist":100,"pts":[]}]}})");
+  CHECK(bool(q2) && q2->reshape.bodies.size() == 1 && q2->reshape.bodies[0].waist == 100.f);
+  // a matte that does not cover the person: the earlier behaviour (no layers)
+  {
+    ReshapeParams r = p.reshape;
+    std::vector<std::uint8_t> zero(64 * 64, 0);
+    local::rasterSet("rs_empty2", 64, 64, zero.data(), 64);
+    r.matte = "rs_empty2";
+    auto g = warp::bind(r, W, H, false);
+    CHECK(g == nullptr || g->maxDisp == 0);  // the body is not covered: the protected operators are off
+  }
+}
+
+// ---- long legs as a whole stretch (variants A / B, section 48) ----------------------------------------------------------------------------------------
+void testLegs() {
+  const int W = 900, H = 1200;
+  const double L = 1200;
+  ReshapeBody b = synthBody(W, H);
+  b.longLegs = 100;
+  ReshapeParams r;
+  r.bodies = {b};
+  warp::setLegMode(3);
+  auto f = warp::bind(r, W, H, false);
+  CHECK(f != nullptr);
+  if (!f) return;
+  // B: the field depends on the row only (every line along a row stays straight and horizontal), is exactly 0 below the shoes, never folds
+  double xvar = 0, dxmax = 0, below = 0, steepest = 0, peak = 0;
+  for (int j = 0; j <= 400; ++j) {
+    const double v = j / 400.0;
+    double d0x, d0y;
+    warp::sampleUV(*f, 0.01, v, d0x, d0y);
+    peak = std::max(peak, std::fabs(d0y));
+    for (int i = 0; i <= 300; i += 7) {
+      double dx, dy;
+      warp::sampleUV(*f, i / 300.0, v, dx, dy);
+      xvar = std::max(xvar, std::fabs(dy - d0y)), dxmax = std::max(dxmax, std::fabs(dx));
+    }
+    if (v > 0.975) below = std::max(below, std::fabs(d0y));
+  }
+  for (int j = 1; j <= 400; ++j) {
+    double a0, a1, b0, b1;
+    warp::sampleUV(*f, 0.4, (j - 1) / 400.0, a0, a1);
+    warp::sampleUV(*f, 0.4, j / 400.0, b0, b1);
+    steepest = std::max(steepest, std::fabs(b1 - a1) * 400.0 / (double(H) / L));
+  }
+  std::printf("  B: dy varies %.2e px along a row, dx %.2e, below the shoes %.2e px, peak %.1f px, steepest d(dy)/dy %.3f\n", xvar * L, dxmax * L, below * L, peak * L, steepest);
+  CHECK(xvar * L < 1e-4 && dxmax == 0.0);
+  CHECK(below * L < 1e-4);
+  CHECK(peak * L > 8 && steepest < 0.2 && !f->gradLimited);
+  // the legs get longer (hips to shoes) by 8 % or more; the shoes (and the ground) stay, the head goes up by at most 0.6 of the room above it
+  double hu, hv, fu, fv, tu, tv;
+  warp::forwardUV(*f, b.pts[3 * 23], b.pts[3 * 23 + 1], hu, hv);
+  warp::forwardUV(*f, b.pts[3 * 27], b.pts[3 * 27 + 1], fu, fv);
+  warp::forwardUV(*f, b.pts[3 * 0], b.pts[3 * 0 + 1], tu, tv);
+  const double len0 = b.pts[3 * 27 + 1] - b.pts[3 * 23 + 1], len1 = fv - hv;
+  std::printf("  B: hips -> ankles %.4f -> %.4f (x %.3f), ankle moves %.2f px, head moves %.1f px up (room above %.0f px)\n", len0, len1, len1 / len0, std::fabs(fv - b.pts[3 * 27 + 1]) * L,
+              (b.pts[3 * 0 + 1] - tv) * L, b.pts[3 * 0 + 1] * L);
+  CHECK(len1 / len0 > 1.08 && std::fabs(fv - b.pts[3 * 27 + 1]) * L < 6.0);  // the ease at the shoes starts a little above the ankle
+  CHECK((b.pts[3 * 0 + 1] - tv) * L > 5 && (b.pts[3 * 0 + 1] - tv) <= 0.6 * b.pts[3 * 0 + 1] + 1e-6);
+  // A: a leaning body (both legs turned 12 degrees about the hips) follows its axis (the field has an x part); at 35 degrees, or with the legs spread, it is B
+  auto turned = [&](double deg, double deg2) {
+    ReshapeBody t = b;
+    for (int k : {23, 25, 27, 24, 26, 28}) {
+      const double a = (k % 2 ? deg : deg2) * 3.14159265358979 / 180;  // 23, 25, 27 are odd = the first leg
+      const double hx = b.pts[3 * (k % 2 ? 23 : 24)], hy = b.pts[3 * (k % 2 ? 23 : 24) + 1];
+      const double dx = b.pts[3 * k] - hx, dy = b.pts[3 * k + 1] - hy;
+      t.pts[3 * k] = float(hx + dx * std::cos(a) - dy * std::sin(a));
+      t.pts[3 * k + 1] = float(hy + dx * std::sin(a) + dy * std::cos(a));
+    }
+    return t;
+  };
+  auto xpart = [&](const ReshapeBody& t, int mode) {
+    ReshapeParams q;
+    q.bodies = {t};
+    warp::setLegMode(mode);
+    auto g = warp::bind(q, W, H, false);
+    double m = 0, mv = 0;
+    if (g)
+      for (int j = 0; j <= 100; ++j) {
+        double dx, dy;
+        warp::sampleUV(*g, 0.5, j / 100.0, dx, dy);
+        m = std::max(m, std::fabs(dx)), mv = std::max(mv, std::fabs(dy));
+      }
+    warp::setLegMode(3);
+    return std::pair<double, double>(m * L, mv * L);
+  };
+  const auto a12 = xpart(turned(-12, -12), 2), a35 = xpart(turned(-35, -35), 2), spread = xpart(turned(-12, 12), 2), seatedLike = [&] {
+    ReshapeBody t = b;  // thighs near horizontal: seated, nothing to lengthen
+    t.pts[3 * 25] = t.pts[3 * 23] - 0.12f * float(L) / W, t.pts[3 * 25 + 1] = t.pts[3 * 23 + 1] + 0.01f;
+    return xpart(t, 2);
+  }();
+  std::printf("  A at 12 degrees: sideways part %.2f px (peak %.1f); at 35 degrees %.2f px; legs spread %.2f px; seated-like peak %.2f px\n", a12.first, a12.second, a35.first, spread.first, seatedLike.second);
+  CHECK(a12.first > 0.5 && a12.second > 5);
+  CHECK(a35.first == 0.0 && a35.second > 5);
+  CHECK(spread.first == 0.0 && spread.second > 5);
+  CHECK(seatedLike.second == 0.0);
+  warp::setLegMode(3);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -963,11 +1209,13 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"json", testJson},       {"identity", testIdentity}, {"bounded", testBounded},         {"protect", testProtect},
                      {"push", testPush},       {"tiles", testTiles},       {"region", testRegion},           {"interactive", testInteractive},
-                     {"mappoint", testMapPoint}, {"sharpness", testSharpness}, {"body", testBody},
+                     {"mappoint", testMapPoint}, {"sharpness", testSharpness}, {"body", testBody}, {"layered", testLayered}, {"legs", testLegs},
 #ifdef DAPPLE_RESHAPE_GPU
                      {"parity", testParity},
 #endif
   };
+  warp::setLayered(true);
+  warp::setLegMode(3);
   const std::string id = argc > 1 ? argv[1] : "";
   if (id == "bench") {
     testBench();

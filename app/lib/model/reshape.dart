@@ -36,6 +36,9 @@ ReshapeSpec reshapeSpecOf(ReshapeOp o) => reshapeSpecs.firstWhere((s) => s.op ==
 /// The strip: 0 at the bottom, the recommended amount in the middle (what a first tap sets), the engine's 100 at the top (the believable
 /// maximum on the test set, section 45).
 const double kReshapeDefault = 50;
+
+/// The version of the saved reshape object (2: 瘦腰 瘦手臂 瘦腿 小头 at twice the earlier strength, section 48).
+const int kReshapeVersion = 2;
 double reshapeFromStrip(double a) => (a.clamp(0.0, 1.0) * 100).toDouble();
 double reshapeToStrip(double v) => (v / 100).clamp(0.0, 1.0).toDouble();
 
@@ -86,13 +89,16 @@ class ReshapeBody {
   }
 
   Map<String, dynamic> toJson() => {...v, 'pts': pts};
-  static ReshapeBody? fromJson(Object? j) {
+  /// [version] = the "v" of the saved reshape object. Before version 2 the strengths of 瘦腰 瘦手臂 瘦腿 小头 meant half of what they mean now (the engine
+  /// doubled them, section 48): older values are halved on load so a saved edit looks the same. 长腿 is unchanged.
+  static ReshapeBody? fromJson(Object? j, {int version = kReshapeVersion}) {
     if (j is! Map) return null;
     final pts = [for (final x in (j['pts'] as List? ?? const [])) if (x is num) x.toDouble()];
     if (pts.length != 99) return null;
     return ReshapeBody(pts: pts, v: {
       for (final s in reshapeSpecs)
-        if (s.body && j[s.key] is num && (j[s.key] as num) != 0) s.key: (j[s.key] as num).toDouble(),
+        if (s.body && j[s.key] is num && (j[s.key] as num) != 0)
+          s.key: (j[s.key] as num).toDouble() * (version < 2 && s.op != ReshapeOp.longLegs ? 0.5 : 1.0),
     });
   }
 }
@@ -189,7 +195,7 @@ class Reshape {
   Map<String, dynamic>? toEngineJson() {
     if (isEmpty) return null;
     return {
-      'v': 1,
+      'v': kReshapeVersion,
       if (matte != null) 'matte': matte,
       if (faces.isNotEmpty) 'faces': [for (final f in faces) f.toJson()],
       if (body != null) 'bodies': [body!.toJson()],
@@ -206,7 +212,7 @@ class Reshape {
     return Reshape(
       matte: j['matte'] as String?,
       faces: [for (final f in (j['faces'] as List? ?? const [])) ?ReshapeFace.fromJson(f)],
-      body: bodies is List && bodies.isNotEmpty ? ReshapeBody.fromJson(bodies.first) : null,
+      body: bodies is List && bodies.isNotEmpty ? ReshapeBody.fromJson(bodies.first, version: j['v'] is num ? (j['v'] as num).toInt() : 1) : null,
       push: [for (final s in (j['push'] as List? ?? const [])) ?PushStroke.fromJson(s)],
     );
   }

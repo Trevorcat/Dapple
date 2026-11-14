@@ -84,7 +84,7 @@ void main() {
           .withValue(ReshapeOp.chin, -30, sel: {1, 2})
           .copyWith(push: [const PushStroke(r: 0.04, pts: [0.1, 0.1, 0.2, 0.2]), const PushStroke(r: 0.03, pts: [0.2, 0.2, 0.3, 0.3], restore: true)]);
       final j = r.toEngineJson()!;
-      expect(j['v'], 1);
+      expect(j['v'], 2);
       expect(j['matte'], 'ai:abc:person');
       final faces = j['faces'] as List;
       expect(faces.length, 2);
@@ -98,6 +98,27 @@ void main() {
       expect(r.on(ReshapeOp.slim), isTrue);
       expect(r.facesOf(ReshapeOp.slim), {1});
       expect(r.value(ReshapeOp.chin), -30);
+    });
+    test('version 1 strengths (before the doubling of 瘦腰 瘦手臂 瘦腿 小头) are halved on load, 长腿 and faces are not; version 2 is read as is', () {
+      final pose = List<double>.generate(99, (i) => i % 3 == 2 ? 0.9 : 0.5);
+      final old = {
+        'v': 1,
+        'bodies': [
+          {'waist': 100, 'arms': 60, 'legs': 40, 'longlegs': 80, 'head': 20, 'pts': pose},
+        ],
+      };
+      final v1 = Reshape.fromJson(old);
+      expect(v1.body!.v, {'waist': 50.0, 'arms': 30.0, 'legs': 20.0, 'longlegs': 80.0, 'head': 10.0});
+      expect(v1.toEngineJson()!['v'], 2);
+      final v2 = Reshape.fromJson({
+        'v': 2,
+        'bodies': [
+          {'waist': 100, 'longlegs': 80, 'pts': pose},
+        ],
+      });
+      expect(v2.body!.v, {'waist': 100.0, 'longlegs': 80.0});
+      // an object without a version is a version 1 one
+      expect(Reshape.fromJson({'bodies': [{'waist': 100, 'pts': pose}]}).body!.v, {'waist': 50.0});
     });
     test('the edit carries it: engine params, persisted JSON, isAdjusted, sameAs, paste keeps the target\'s own', () {
       final r = Reshape.empty.withAnchors(faces: [(1, shapeAt(0.5))]).withValue(ReshapeOp.eyes, 40);

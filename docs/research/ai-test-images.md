@@ -79,3 +79,25 @@ Licence lines as Wikimedia Commons reports them on 2026-11-14 (`LicenseShortName
 | b4_cadet_leaning_wall | full length, leaning, arms against the body, brick wall (black and white) | https://commons.wikimedia.org/wiki/File:Cadet_Mac_S.jpg | GP377 | CC0 |
 | b5_couple_wall | two adults holding children, full length, corrugated wall (black and white, historic) | https://commons.wikimedia.org/wiki/File:Man_and_woman_standing_in_front_of_a_building_-_both_the_man_and_woman_are_holding_a_young_child(GN04384).jpg | State Government Photographer (History Trust of South Australia) | CC0 |
 | b6_three_women_street | three women standing full length, brick facade and windows | https://commons.wikimedia.org/wiki/File:Street_photography_of_talking_and_laughing_women_in_the_street,_on_the_side_of_the_Hermitage_museum_building_in_Amsterdam;_free_photo_by_Fons_Heijnsbroek,_2007.tif | Fons Heijnsbroek | CC0 |
+
+
+## Body / shadow images added 2026-11-15 (reshape background and shadow evidence, `docs/engine/pipeline-architecture.md` section 48)
+Licence lines from the Commons API (`extmetadata`, fetched 2026-11-15): all three are "CC0 / Creative Commons Zero, Public Domain Dedication". Local test input only, kept under `build/ai-eval/body/` and `build/reshape-bg/` (git-ignored), not redistributed.
+
+## b7_guard_shadow
+- Content: a guard in profile in low sun, a long cast shadow on the cobbles and a large shadow on the wall behind him (contact shadow at the shoes, cast shadow on the ground, shadow on a wall)
+- Page: https://commons.wikimedia.org/wiki/File:Two_of_Kongelige_livgarde_Amalienborg_Copenhagen_Denmark.jpg
+- Author (Commons field): Jebulon
+- Licence line: CC0 (Creative Commons Zero, Public Domain Dedication)
+- Original size: 3916x5874; used: the 1280x1920 thumbnail
+
+## b8_walker_street
+- Content: a man walking away down a narrow street with strong vertical building edges (crop 700x920 of the thumbnail)
+- Page: https://commons.wikimedia.org/wiki/File:Man_walking_down_Rue_Coquerez,_Lille,_2026.jpg
+- Author (Commons field): DimiTalen
+- Licence line: CC0 (Creative Commons Zero, Public Domain Dedication)
+- Original size: 3488x5232
+
+## b9_walker_tilt
+- Content: b8 rotated by 11 degrees (a derived test image: leaning legs); not a photograph of a leaning person
+- Source and licence: as b8

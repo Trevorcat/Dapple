@@ -63,7 +63,8 @@ struct ReshapeParams {
 constexpr int kReshapeMaxFaces = 8, kReshapeMaxBodies = 4, kReshapeMaxStrokes = 64, kReshapeMaxStrokePts = 1024;
 
 void clampReshape(ReshapeParams& r);
-// {"v":1, "matte":..., "faces":[...], "bodies":[...], "push":[...]} in a fixed key order; only non-default values.
+// {"v":2, "matte":..., "faces":[...], "bodies":[...], "push":[...]} in a fixed key order; only non-default values. Version 2: 瘦腰 瘦手臂 瘦腿 小头 at twice the
+// version 1 strength; a version 1 (or unversioned) object has those four halved on read (docs/engine/pipeline-architecture.md section 48).
 std::string reshapeToJson(const ReshapeParams& r);
 // Hash of everything that changes pixels (0 when inactive; includes the matte plane's content hash).
 std::uint64_t reshapeHash(const ReshapeParams& r);

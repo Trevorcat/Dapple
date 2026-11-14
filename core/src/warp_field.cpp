@@ -232,21 +232,25 @@ double halfWidth(const Matte* M, V c, V n, double est) {
   const double a = M->edge(c, n, 2.5 * est), b = M->edge(c, n * -1.0, 2.5 * est);
   return std::clamp(0.5 * (a + b), 0.6 * est, 1.6 * est);
 }
+// Strengths of 瘦腰 瘦手臂 瘦腿 小头 were doubled (section 48). Measured on real poses (b3, b6) the doubled field was clipped by the fold limit (raw grad
+// 0.77 - 1.0) with the earlier shape: the cross profile now decays over 2.2 half widths (instead of 1) and the ends taper over 0.4 of the segment (instead
+// of 0.3), and the layered mode needs no protection band around the matte (its multiplication added F / delta to the gradient): raw grad <= 0.61 at 100.
+constexpr double kLimbDecay = 2.2, kAxW = 0.4, kWaistAx = 0.5, kHeadDec = 0.9, kHeadR = 1.9;
 // compress a capsule a -> b toward its axis: content at the edge (half width hw) moves in by amt * hw. `side`: 0 = both edges, +1 / -1 = only the
 // edge on the + / - side of the axis (n = perp(unit(b - a))), moved in by `boost` times as much: a limb pressed against the torso or the other
 // leg keeps its inner edge (the neighbour is not pulled along), the outer edge does the thinning.
-void limb(Grid& F, V a, V b, double hw, double amt, int side = 0, double boost = 1.0) {
+void limb(Grid& F, V a, V b, double hw, double amt, int side = 0, double boost = 1.0, double decay = 1.0) {
   const double L = len(b - a);
   if (L < 1e-5 || hw < 1e-5) return;
   const V u = unit(b - a), n = perp(u);
-  const double R = 2.0 * hw;
-  F.splat(std::min(a.x, b.x) - R - 0.3 * L, std::min(a.y, b.y) - R - 0.3 * L, std::max(a.x, b.x) + R + 0.3 * L, std::max(a.y, b.y) + R + 0.3 * L,
+  const double R = (1.0 + decay) * hw;
+  F.splat(std::min(a.x, b.x) - R - kAxW * L, std::min(a.y, b.y) - R - kAxW * L, std::max(a.x, b.x) + R + kAxW * L, std::max(a.y, b.y) + R + kAxW * L,
           [&](V p) {
             const double t = dot(p - a, u) / L, q = dot(p - a, n);
             if (side * q < 0) return V{};
-            const double G = t < 0.15 ? K((0.15 - t) / 0.3) : (t > 0.85 ? K((t - 0.85) / 0.3) : 1.0);
+            const double G = t < 0.15 ? K((0.15 - t) / kAxW) : (t > 0.85 ? K((t - 0.85) / kAxW) : 1.0);
             if (G <= 0) return V{};
-            const double H = plateau(std::fabs(q) / hw, 1.0, 1.0);
+            const double H = plateau(std::fabs(q) / hw, 1.0, decay);
             return H > 0 ? n * (-amt * (side ? boost : 1.0) * q * H * G) : V{};
           });
 }
@@ -259,13 +263,13 @@ void opWaist(Grid& F, const BodyGeo& g, const Matte* M, double s) {
   const V t = unit(Hm - S), n = perp(t);
   const V w = S + t * (0.75 * Lt);
   const double hw = halfWidth(M, w, n, 0.42 * std::max(g.sh, 1.4 * g.hipd));
-  const double R = 2.0 * hw;
-  F.splat(w.x - R - Lt, w.y - R - Lt, w.x + R + Lt, w.y + R + Lt, [&](V p) {
+  const double R = (1.0 + kLimbDecay) * hw;
+  F.splat(w.x - R - 2 * Lt, w.y - R - 2 * Lt, w.x + R + 2 * Lt, w.y + R + 2 * Lt, [&](V p) {
     const double a = dot(p - S, t) / Lt, q = dot(p - S, n);
-    const double G = K(std::fabs(a - 0.75) / 0.5);
+    const double G = K(std::fabs(a - 0.75) / kWaistAx);
     if (G <= 0) return V{};
-    const double H = plateau(std::fabs(q) / hw, 1.0, 1.0);
-    return H > 0 ? n * (-s * 0.08 * q * H * G) : V{};
+    const double H = plateau(std::fabs(q) / hw, 1.0, kLimbDecay);
+    return H > 0 ? n * (-s * 0.16 * q * H * G) : V{};
   });
 }
 
@@ -293,7 +297,7 @@ void opArms(Grid& F, const BodyGeo& g, const Matte* M, double s) {
         side = dot(toTorso, n) > 0 ? -1 : 1;
       }
     }
-    limb(F, g.P[a], g.P[b], hw, s * 0.12, side, 1.6);
+    limb(F, g.P[a], g.P[b], hw, s * 0.24, side, 1.6, kLimbDecay);
   }
 }
 
@@ -319,7 +323,7 @@ void opLegs(Grid& F, const BodyGeo& g, const Matte* M, double s) {
     int side = 0;
     const int o = k < 2 ? k + 2 : k - 2;  // the same segment of the other leg
     if (ok[o] && len(mid[k] - mid[o]) < 1.4 * (hwv[k] + hwv[o])) side = dot(mid[o] - mid[k], n) > 0 ? -1 : 1;
-    limb(F, g.P[a], g.P[b], hwv[k], s * 0.10, side, 1.6);
+    limb(F, g.P[a], g.P[b], hwv[k], s * 0.20, side, 1.6, kLimbDecay);
   }
 }
 
@@ -332,10 +336,10 @@ void opHead(Grid& F, const BodyGeo& g, double s) {
   V down{0, 1};
   if (g.ok(11) && g.ok(12)) down = unit((g.P[11] + g.P[12]) * 0.5 - hc);
   const V nk = hc + down * Rh;
-  const double R = 1.9 * Rh;
+  const double R = kHeadR * Rh;
   F.splat(hc.x - R, hc.y - R, hc.x + R, hc.y + R, [&](V p) {
-    const double e = plateau(len(p - hc) / Rh, 1.0, 0.9);
-    return e > 0 ? (p - nk) * (-s * 0.06 * e) : V{};
+    const double e = plateau(len(p - hc) / Rh, 1.0, kHeadDec);
+    return e > 0 ? (p - nk) * (-s * 0.12 * e) : V{};
   });
 }
 
@@ -347,7 +351,7 @@ void opHead(Grid& F, const BodyGeo& g, double s) {
 // edge) keeps that slope at 0.19 (about 11 degrees) or less, 0.27 at the cap. Vertical lines bend by the same amount; horizontal lines stay
 // horizontal inside the window. Fold-free: grad F = [[0, 0], [fy W', fy' W]] with fy' <= 0.12 and fy W' <= 0.27.
 // Only for an upright body whose feet are in the picture with room below them (>= 1 % of the height below the shoes).
-void opLongLegs(Grid& F, const BodyGeo& g, const Matte* M, double s) {
+void opLongLegs(Grid& F, const BodyGeo& g, const Matte* M, double s, bool layered) {
   if (!(g.ok(23) && g.ok(24))) return;
   if (g.ok(11) && g.ok(12)) {
     const V t = unit((g.P[23] + g.P[24]) * 0.5 - (g.P[11] + g.P[12]) * 0.5);
@@ -366,7 +370,7 @@ void opLongLegs(Grid& F, const BodyGeo& g, const Matte* M, double s) {
   if (footY - hipY < 0.05 * B) return;
   double k = s * 0.12;
   const double m = 0.06 * (footY - hipY);
-  const bool ground = true;
+  const bool ground = !layered;  // layered: the person layer only moves, the ground below the feet is not touched (feet stay put, the body grows upward)
   double c = 0;
   if (ground) {
     c = k * (footY - hipY) / (B - footY);
@@ -392,8 +396,17 @@ void opLongLegs(Grid& F, const BodyGeo& g, const Matte* M, double s) {
   const double scale = ground && N[n - 1] < 0 ? -P[n - 1] / N[n - 1] : 0.0;
   std::vector<double> fy(n, 0.0);
   double peak = 0;
+  // layered: feet anchored, everything above them moves up by the total stretch D = P(B) (forward field P(y) - D: 0 below the feet, -D above the
+  // hips); D is limited to 0.6 of the room above the head (the person plane's top above the nose) so the head stays in the picture
+  double capk = 1.0;
+  if (layered) {
+    double top = 0;
+    if (g.ok(0) && M && M->r) top = std::max(0.0, g.P[0].y - M->edge(g.P[0], V{0, -1}, g.P[0].y));
+    else top = std::max(0.0, g.P[0].y - 0.15 * B);
+    if (g.ok(0) && P[n - 1] > 1e-9) capk = std::min(1.0, 0.6 * top / P[n - 1]);
+  }
   for (int j = 0; j < n; ++j) {
-    double v = P[j] + scale * N[j];
+    double v = layered ? (P[j] - P[n - 1]) * capk : P[j] + scale * N[j];
     if (j == n - 1 && ground) v = 0;
     fy[j] = v;
     peak = std::max(peak, std::fabs(v));
@@ -422,6 +435,114 @@ void opLongLegs(Grid& F, const BodyGeo& g, const Matte* M, double s) {
       if (w > 0) F.f[2 * (std::size_t(j) * F.gw + i) + 1] += fy[j] * w;
     }
   }
+}
+
+// 长腿 as a geometry-stable whole stretch (variants A and B of section 48): the displacement is a function of ONE coordinate s along an axis u only, the
+// same across the whole frame perpendicular to it: F(p) = u * a(s), a(s) = C(s) - C(infinity) with C the integral of the stretch rate
+// r(s) = 0.12 * strength * smoothstep(hips) * (1 - smoothstep(feet)). Below the feet a = 0 (the ground, the feet and their shadow do not move), above
+// the hips a = -D (everything above translates by D along -u, rigidly: the top of the frame is lost), between them the content stretches by up to
+// 12 %. |grad F| = r <= 0.12: always fold-free. A straight line stays straight across the whole frame; only a line that crosses an eased end changes its
+// slope gently. A: u = hips -> ankles; B: u = (0, 1). A needs a sound axis: tilt <= 25 degrees from the vertical, both legs pointing the same way (within
+// 20 degrees), thighs not near horizontal (seated: nothing), and a sideways shift D |u_x| <= 1 % of the long edge (the field reads past the frame's side
+// edge by that much: edge replicate); otherwise it is B. D is limited to 0.6 of the room above the head.
+// Returns 0 = nothing, 1 = A, 2 = B (for the log / sheets).
+struct Stretch {
+  V H, u;
+  double smin = 0, smax = 0, sf = 0;
+};
+void stretchSetup(const Grid& F, const BodyGeo& g, V u, Stretch& st) {
+  st.u = u;
+  st.H = (g.P[23] + g.P[24]) * 0.5;
+  const double cs[4][2] = {{0, 0}, {F.AX, 0}, {0, F.AY}, {F.AX, F.AY}};
+  st.smin = 1e9, st.smax = -1e9;
+  for (const auto& c : cs) {
+    const double v = dot(V{c[0], c[1]} - st.H, u);
+    st.smin = std::min(st.smin, v), st.smax = std::max(st.smax, v);
+  }
+  st.sf = 0;
+  for (int k = 27; k <= 32; ++k)
+    if (g.ok(k)) st.sf = std::max(st.sf, dot(g.P[k] - st.H, u));
+  st.sf += 0.03 * F.AY * u.y;
+}
+int opStretchLegs(Grid& F, const BodyGeo& g, const Matte* M, double s, bool wantAxis) {
+  if (!(g.ok(23) && g.ok(24))) return 0;
+  if (g.ok(11) && g.ok(12)) {
+    const V t = unit((g.P[23] + g.P[24]) * 0.5 - (g.P[11] + g.P[12]) * 0.5);
+    if (t.y < std::cos(30.0 * 3.14159265358979 / 180.0)) return 0;
+  }
+  const V H = (g.P[23] + g.P[24]) * 0.5;
+  double footY = -1;
+  for (int k = 27; k <= 32; ++k)
+    if (g.ok(k)) footY = std::max(footY, g.P[k].y);
+  const double Bt = F.AY;
+  if (footY < 0) return 0;
+  footY = std::min(footY + 0.03 * Bt, Bt);
+  if (Bt - footY < 0.01 * Bt) return 0;
+  if (footY - H.y < 0.05 * Bt) return 0;
+  const double rad = 3.14159265358979 / 180.0;
+  for (int k = 0; k < 2; ++k) {  // seated: a thigh near horizontal
+    const int hip = k ? 24 : 23, knee = k ? 26 : 25;
+    if (g.ok(hip) && g.ok(knee) && unit(g.P[knee] - g.P[hip]).y < std::cos(60.0 * rad)) return 0;
+  }
+  V u{0, 1};
+  bool axis = false;
+  if (wantAxis) {
+    V A{0, 0};
+    int na = 0;
+    for (int k : {27, 28})
+      if (g.ok(k)) A = A + g.P[k], ++na;
+    if (na) {
+      const V ua = unit(A * (1.0 / na) - H);
+      bool ok = ua.y >= std::cos(25.0 * rad);
+      if (g.ok(27) && g.ok(28)) {
+        const V l = unit(g.P[27] - g.P[23]), r = unit(g.P[28] - g.P[24]);
+        if (dot(l, r) < std::cos(20.0 * rad)) ok = false;
+      }
+      if (ok) u = ua, axis = true;
+    }
+  }
+  const double k0 = s * 0.12;
+  const int N = 4096;
+  std::vector<double> C;
+  Stretch st;
+  double D = 0;
+  auto build = [&]() {
+    stretchSetup(F, g, u, st);
+    const double m = 0.06 * st.sf, ds = (st.smax - st.smin) / N;
+    C.assign(N + 1, 0.0);
+    for (int i = 1; i <= N; ++i) {
+      const double v = st.smin + (i - 0.5) * ds;
+      C[i] = C[i - 1] + k0 * sstep(-m, m, v) * (1.0 - sstep(st.sf - m, st.sf + m, v)) * ds;
+    }
+    D = C[N];
+  };
+  build();
+  if (st.sf < 0.05 * Bt || D < 1e-9) return 0;
+  double top = 0.15 * Bt;
+  if (g.ok(0)) top = M && M->r ? std::max(0.0, g.P[0].y - M->edge(g.P[0], V{0, -1}, g.P[0].y)) : std::max(0.0, g.P[0].y - 0.15 * Bt);
+  auto capFor = [&]() { return g.ok(0) ? 0.6 * top / std::max(u.y, 1e-6) : D; };
+  double cap = capFor();
+  if (axis && std::fabs(u.x) > 1e-4) {
+    const double capx = 0.01 / std::fabs(u.x);
+    if (capx < 0.5 * std::min(D, cap)) {  // the sideways shift would show at the border: fall back to B
+      u = V{0, 1}, axis = false;
+      build();
+      cap = capFor();
+    } else {
+      cap = std::min(cap, capx);
+    }
+  }
+  const double scale = std::min(1.0, cap / std::max(D, 1e-12));
+  for (int j = 0; j < F.gh; ++j)
+    for (int i = 0; i < F.gw; ++i) {
+      const double sv = dot(V{F.X(i), F.Y(j)} - st.H, u);
+      const double f = std::clamp((sv - st.smin) / (st.smax - st.smin) * N, 0.0, double(N));
+      const int a = std::min(int(f), N - 1);
+      const double d = (C[a] + (C[a + 1] - C[a]) * (f - a) - D) * scale;  // <= 0: up / against u
+      F.f[2 * (std::size_t(j) * F.gw + i)] += u.x * d;
+      F.f[2 * (std::size_t(j) * F.gw + i) + 1] += u.y * d;
+    }
+  return axis ? 1 : 2;
 }
 
 // ---- protection weight: 1 inside the matte, smooth decay over `delta` outside (chamfer distance on the grid) ---------------------------
@@ -559,6 +680,37 @@ void composePush(Grid& B, const std::vector<ReshapePush>& strokes) {
   }
 }
 
+// ---- layered mode: the background fill field -----------------------------------------------------------------------------------------
+// Nearest-outside vectors by two-pass propagation (8SSEDT): for every node inside `in`, the vector to the nearest node outside it.
+void nearestOutside(const Grid& G, const std::vector<char>& in, std::vector<float>& vx, std::vector<float>& vy) {
+  const int w = G.gw, h = G.gh;
+  const float INF = 1e9f;
+  vx.assign(std::size_t(w) * h, 0.f), vy.assign(std::size_t(w) * h, 0.f);
+  for (std::size_t k = 0; k < in.size(); ++k)
+    if (in[k]) vx[k] = INF, vy[k] = 0;
+  auto d2 = [&](std::size_t k) { return vx[k] >= INF ? 1e30f : vx[k] * vx[k] + vy[k] * vy[k]; };
+  auto cmp = [&](int x, int y, int dx, int dy) {
+    const int nx = x + dx, ny = y + dy;
+    if (nx < 0 || ny < 0 || nx >= w || ny >= h) return;
+    const std::size_t a = std::size_t(y) * w + x, b = std::size_t(ny) * w + nx;
+    if (vx[b] >= INF) return;
+    const float cx = vx[b] + dx, cy = vy[b] + dy;
+    if (cx * cx + cy * cy < d2(a)) vx[a] = cx, vy[a] = cy;
+  };
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) cmp(x, y, -1, 0), cmp(x, y, 0, -1), cmp(x, y, -1, -1), cmp(x, y, 1, -1);
+    for (int x = w - 1; x >= 0; --x) cmp(x, y, 1, 0);
+  }
+  for (int y = h - 1; y >= 0; --y) {
+    for (int x = w - 1; x >= 0; --x) cmp(x, y, 1, 0), cmp(x, y, 0, 1), cmp(x, y, -1, 1), cmp(x, y, 1, 1);
+    for (int x = 0; x < w; ++x) cmp(x, y, -1, 0);
+  }
+}
+
+bool g_layered = true;
+int g_leg = 3;  // 长腿 variant: 0 = W windowed + compressed ground (earlier), 1 = windowed on the person layer (layered), 2 = A stretch along the leg axis, 3 = B vertical stretch (default)
+double g_band = 0;  // evidence hook: protection band override (long-edge units), 0 = the default
+
 // ---- cache --------------------------------------------------------------------------------------------------------------------------
 std::mutex g_mu;
 std::list<std::shared_ptr<const Field>> g_cache;
@@ -581,6 +733,18 @@ Counters counters() {
   std::lock_guard<std::mutex> lk(g_mu);
   return g_counters;
 }
+void setBandOverride(double b) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_band = b;
+}
+void setLegMode(int m) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_leg = m;
+}
+void setLayered(bool on) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_layered = on;
+}
 void resetCache() {
   std::lock_guard<std::mutex> lk(g_mu);
   g_cache.clear();
@@ -598,6 +762,9 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
   std::uint64_t key = reshapeHash(r);
   key = (key ^ std::uint64_t(G.gw) * 0x9E3779B97F4A7C15ull) * 1099511628211ull;
   key = (key ^ std::uint64_t(G.gh) * 0xC2B2AE3D27D4EB4Full) * 1099511628211ull;
+  key = (key ^ std::uint64_t(g_layered ? 0x51ull : 0x17ull)) * 1099511628211ull;
+  key = (key ^ std::uint64_t(g_band * 1e6)) * 1099511628211ull;
+  key = (key ^ std::uint64_t(g_leg + 7)) * 1099511628211ull;
   {
     std::lock_guard<std::mutex> lk(g_mu);
     for (auto it = g_cache.begin(); it != g_cache.end(); ++it)
@@ -657,6 +824,32 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
       local::logLine("reshape: the person plane does not cover the reshaped person: no background protection");
     }
   }
+  // Layered mode (section 48): needs the person plane to cover every body that is lengthened as well (its legs); otherwise the earlier single field.
+  bool layered = Mp && g_layered;
+  bool anyLong = false;
+  for (const ReshapeBody& b : r.bodies) anyLong = anyLong || (b.active() && b.longLegs != 0);
+  if (anyLong && g_leg == 0) layered = false;  // W: the earlier single field with the compressed ground (A, B: a separate whole-frame stretch, composed below)
+  Grid S = G;  // A / B stretch (forward), applied last, i.e. outermost
+  S.zero();
+  bool stretch = false;
+  if (layered)
+    for (std::size_t bi = 0; bi < r.bodies.size(); ++bi) {
+      const ReshapeBody& b = r.bodies[bi];
+      if (!b.active() || !b.longLegs) continue;
+      const BodyGeo g = bodyGeo(b, G.AX, G.AY);
+      int n = 0, in = 0;
+      for (int k = 23; k <= 28; ++k)
+        if (g.ok(k)) {
+          ++n;
+          bool hit = M.at(g.P[k]) >= 0.5;  // a landmark within 1.2 % of the long edge of the plane counts (thin legs, landmark noise)
+          for (int q = 0; q < 8 && !hit; ++q) hit = M.at(g.P[k] + V{std::cos(q * 0.785398), std::sin(q * 0.785398)} * 0.012) >= 0.5;
+          in += hit;
+        }
+      if (n == 0 || 4 * in < 3 * n) {
+        layered = false;
+        local::logLine("reshape: the person plane does not cover the legs: background not layered");
+      }
+    }
   Grid F = G;
   F.zero();
   double scale = 0;
@@ -686,8 +879,9 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
     band = band || b.longLegs != 0;
   }
   // 2. background protection
-  if (Mp && scale > 0) {
-    const double delta = std::clamp(scale, 0.006, 0.05);
+  if (layered) out->matteUsed = true;  // layered: the background is frozen by construction, the person field needs no decay band around the matte
+  if (Mp && scale > 0 && !layered) {
+    const double delta = g_band > 0 ? g_band : std::clamp(scale, 0.006, 0.05);
     const std::vector<double> w = protection(G, M, delta);
     for (std::size_t k = 0; k < w.size(); ++k) F.f[2 * k] *= w[k], F.f[2 * k + 1] *= w[k];
     out->delta = float(delta);
@@ -695,9 +889,18 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
   }
   if (band)
     for (const ReshapeBody& b : r.bodies)
-      if (b.active() && b.longLegs) opLongLegs(F, bodyGeo(b, G.AX, G.AY), M.r ? &M : nullptr, b.longLegs / 100.0);
+      if (b.active() && b.longLegs) {
+        if (g_leg >= 2) {
+          const int mode = opStretchLegs(S, bodyGeo(b, G.AX, G.AY), M.r ? &M : nullptr, b.longLegs / 100.0, g_leg == 2);
+          stretch = stretch || mode != 0;
+          if (mode) local::logLine(std::string("reshape: long legs as a whole stretch, axis ") + (mode == 1 ? "along the legs (A)" : "vertical (B)"));
+        } else {
+          opLongLegs(F, bodyGeo(b, G.AX, G.AY), M.r ? &M : nullptr, b.longLegs / 100.0, layered);
+        }
+      }
   // 3. fold-free
   double gmax = maxGradient(F);
+  out->rawGrad = float(gmax);
   if (gmax > 0.75) {
     const double k = 0.75 / gmax;
     for (double& v : F.f) v *= k;
@@ -724,6 +927,80 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
       double* d = &B.f[2 * (std::size_t(j) * G.gw + i)];
       d[0] = q.x - p.x, d[1] = q.y - p.y;
     }
+  // 4b. layered: the background fill field and the blend at the nodes (the GPU twin / mapping field)
+  std::vector<double> Bp;
+  std::vector<float> bgf;
+  if (layered) {
+    Bp = B.f;
+    const std::size_t NN = std::size_t(G.gw) * G.gh;
+    std::vector<char> inS(NN, 0);
+    for (int j = 0; j < G.gh; ++j)
+      for (int i = 0; i < G.gw; ++i) inS[std::size_t(j) * G.gw + i] = M.at(V{G.X(i), G.Y(j)}) >= 0.04;
+    std::vector<float> vx, vy;
+    nearestOutside(G, inS, vx, vy);
+    bgf.assign(NN * 2, 0.f);
+    const double lo = 0.0004, hi = 0.0016, cap = 0.1, h = 0.5 * (G.hX + G.hY);
+    for (std::size_t k = 0; k < NN; ++k) {
+      if (!inS[k] || vx[k] >= 1e8f) continue;
+      const double pm = std::hypot(Bp[2 * k], Bp[2 * k + 1]);
+      const double gain = sstep(lo, hi, pm);
+      if (gain <= 0) continue;
+      // vx, vy are in cells: scale by the cell size per axis
+      const V v{vx[k] * G.hX, vy[k] * G.hY};
+      const double D = len(v);
+      if (D < 1e-12) continue;
+      const double mag = std::min(cap, std::max(0.0, 2 * D - h));
+      bgf[2 * k] = float(v.x / D * mag * gain), bgf[2 * k + 1] = float(v.y / D * mag * gain);
+    }
+    for (int j = 0; j < G.gh; ++j)
+      for (int i = 0; i < G.gw; ++i) {
+        const std::size_t k = std::size_t(j) * G.gw + i;
+        const V q{G.X(i), G.Y(j)};
+        const double t = sstep(0.55, 0.85, M.at(V{q.x + Bp[2 * k], q.y + Bp[2 * k + 1]}));
+        const double bx = bgf[2 * k], by = bgf[2 * k + 1];
+        B.f[2 * k] = bx + t * (Bp[2 * k] - bx), B.f[2 * k + 1] = by + t * (Bp[2 * k + 1] - by);
+      }
+    if (!r.push.empty()) {
+      layered = false;  // strokes are composed on the baked field (no per-pixel layers)
+      Bp.clear(), bgf.clear();
+    }
+  }
+  // 4c. whole-frame stretch (A / B), outermost: output q -> p = q + Bs(q) -> the operators' fields at p. B becomes the composition (baked).
+  std::vector<float> bsf;
+  double bsPeak = 0;
+  if (stretch) {
+    Grid Bs = G;
+    Bs.zero();
+    for (int j = 0; j < G.gh; ++j)
+      for (int i = 0; i < G.gw; ++i) {
+        const double* fp = &S.f[2 * (std::size_t(j) * G.gw + i)];
+        const V p{G.X(i), G.Y(j)};
+        V q = p - V{fp[0], fp[1]};
+        if (q.x == p.x && q.y == p.y) continue;
+        for (int it = 0; it < 30; ++it) {
+          const V nq = p - S.at(q.x, q.y);
+          const bool done = std::fabs(nq.x - q.x) + std::fabs(nq.y - q.y) < 1e-10;
+          q = nq;
+          if (done) break;
+        }
+        double* d = &Bs.f[2 * (std::size_t(j) * G.gw + i)];
+        d[0] = q.x - p.x, d[1] = q.y - p.y;
+      }
+    Grid Bc = B;
+    for (int j = 0; j < G.gh; ++j)
+      for (int i = 0; i < G.gw; ++i) {
+        const std::size_t k = std::size_t(j) * G.gw + i;
+        const V bs{Bs.f[2 * k], Bs.f[2 * k + 1]};
+        const V o = B.at(G.X(i) + bs.x, G.Y(j) + bs.y);
+        Bc.f[2 * k] = bs.x + o.x, Bc.f[2 * k + 1] = bs.y + o.y;
+        bsPeak = std::max(bsPeak, std::hypot(bs.x, bs.y));
+      }
+    B = Bc;
+    if (r.push.empty() && layered) {
+      bsf.resize(Bs.f.size());
+      for (std::size_t k = 0; k < Bs.f.size(); ++k) bsf[k] = float(Bs.f[k]);
+    }
+  }
   // 5. manual strokes
   if (!r.push.empty()) composePush(B, r.push);
 
@@ -734,6 +1011,20 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
     mx = std::max(mx, std::hypot(B.f[k], B.f[k + 1]));
   }
   out->maxDisp = float(mx);
+  out->maxMove = float(mx);
+  if (layered) {
+    out->layered = true;
+    out->dp.resize(Bp.size()), out->bg = std::move(bgf);
+    for (std::size_t k = 0; k < Bp.size(); ++k) out->dp[k] = float(Bp[k]);
+    out->mw = M.r->w, out->mh = M.r->h, out->mp = M.r->px;
+    double mp = 0;
+    for (std::size_t k = 0; k < Bp.size(); k += 2) mp = std::max(mp, std::hypot(Bp[k], Bp[k + 1]));
+    const double mpers = mp;
+    for (std::size_t k = 0; k < out->bg.size(); k += 2) mp = std::max(mp, double(std::hypot(out->bg[k], out->bg[k + 1])));
+    out->maxMove = float(mpers + bsPeak);
+    out->maxDisp = float(std::max(mp + bsPeak, mx));
+    out->bs = std::move(bsf);  // the read window of a tile must cover every layer
+  }
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   {
     std::lock_guard<std::mutex> lk(g_mu);
@@ -752,6 +1043,14 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
 }
 
 void sampleUV(const Field& f, double u, double v, double& dx, double& dy) {
+  if (f.layered) {  // the same per-pixel choice between the layers as the renderer's displace()
+    const Map m = makeMap(f, f.photoW, f.photoH, f.photoW, f.photoH, 0, 0);
+    float sx = float(u * f.photoW), sy = float(v * f.photoH);
+    const float ox = sx, oy = sy;
+    dx = dy = 0;
+    if (displace(f, m, sx, sy)) dx = double(sx - ox) / m.lpx, dy = double(sy - oy) / m.lpx;
+    return;
+  }
   double gx = std::clamp(u * (f.gw - 1), 0.0, double(f.gw - 1)), gy = std::clamp(v * (f.gh - 1), 0.0, double(f.gh - 1));
   const int i = std::min(int(gx), f.gw - 2), j = std::min(int(gy), f.gh - 2);
   const double fx = gx - i, fy = gy - j;

@@ -107,7 +107,7 @@ void clampReshape(ReshapeParams& r) {
 }
 
 std::string reshapeToJson(const ReshapeParams& r) {
-  std::string o = "{\"v\":1";
+  std::string o = "{\"v\":2";
   if (!r.matte.empty()) {
     o += ",\"matte\":";
     str(o, r.matte);
@@ -135,7 +135,7 @@ std::string reshapeToJson(const ReshapeParams& r) {
     for (std::size_t i = 0; i < r.bodies.size(); ++i) {
       const ReshapeBody& b = r.bodies[i];
       if (i) o += ',';
-      o += "{\"v\":1";
+      o += "{\"v\":2";
       if (b.waist != 0) num(o, "waist", b.waist);
       if (b.arms != 0) num(o, "arms", b.arms);
       if (b.legs != 0) num(o, "legs", b.legs);
@@ -173,10 +173,14 @@ std::string reshapeToJson(const ReshapeParams& r) {
 bool reshapeFromValue(const jsonlite::JValue& v, ReshapeParams& r) {
   r = ReshapeParams{};
   if (v.kind != jsonlite::JValue::Object) return false;
+  int ver = 1;  // v1 (before the strength doubling of 瘦腰 瘦手臂 瘦腿 小头) is converted below
+  if (const jsonlite::JValue* vv = v.get("v"); vv && vv->kind == jsonlite::JValue::Number) ver = int(vv->number);
   for (const auto& m : v.members) {
     const std::string& k = m.first;
     const jsonlite::JValue& x = m.second;
-    if (k == "v") continue;
+    if (k == "v") {
+      continue;
+    }
     if (k == "matte") {
       if (x.kind == jsonlite::JValue::String) r.matte = x.str;
     } else if (k == "faces" && x.kind == jsonlite::JValue::Array) {
@@ -204,6 +208,7 @@ bool reshapeFromValue(const jsonlite::JValue& v, ReshapeParams& r) {
         readF(it, "longlegs", b.longLegs);
         readF(it, "head", b.head);
         readPts(it.get("pts"), b.pts);
+        if (ver < 2) b.waist *= 0.5f, b.arms *= 0.5f, b.legs *= 0.5f, b.head *= 0.5f;  // v1 strengths looked like half of today's: same picture
         r.bodies.push_back(std::move(b));
       }
     } else if (k == "push" && x.kind == jsonlite::JValue::Array) {
