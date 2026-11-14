@@ -633,7 +633,14 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
 
   /// The photo at fit zoom inside the animated photo region.
   Rect _photoRect() {
-    final r = _geoNow().region;
+    var r = _geoNow().region;
+    // the zoom view keeps the symmetric system insets of the stage (photoPad): where the region reaches into them the photo is fitted in
+    // less (the side pane on the unfolded inner screen: ~24 dp less at the bottom); the tool strip and the preview pill follow the real photo
+    final e = _env;
+    if (e != null) {
+      final b = e.photoPad;
+      r = Rect.fromLTRB(math.max(r.left, b.left), math.max(r.top, b.top), math.min(r.right, e.size.width - b.right), math.min(r.bottom, e.size.height - b.bottom));
+    }
     if (r.isEmpty) return Rect.zero;
     final a = _frameRatio(ph, false);
     final h = math.min(r.width / a, r.height);

@@ -344,7 +344,7 @@ class LocalController extends ChangeNotifier {
         if (k.engine == MaskKindId.luminance) {
           final l = smp?.l ?? 70;
           final lo = (l - 15).clamp(0.0, 70.0).toDouble();
-          return MaskComponent(kind: MaskKindId.luminance, op: op, lo: lo.roundToDouble(), hi: (lo + 30).roundToDouble(), lumFeather: 10);
+          return MaskComponent(kind: MaskKindId.luminance, op: op, lo: lo.roundToDouble(), hi: (lo + 30).roundToDouble(), lumFeather: 15, refine: 50);
         }
         return MaskComponent(kind: MaskKindId.color, op: op, hue: (smp?.hue ?? 230).roundToDouble(), range: 25, hueFeather: 20, satMin: 10);
       case LocalPlace.aiParts:
@@ -422,6 +422,7 @@ class LocalController extends ChangeNotifier {
     aiPlanes.clear();
     personFound = skyFound = false;
     faces = 0;
+    faceList = const [];
     _tapSessionRef = '';
     missingRefs.clear();
   }
@@ -467,7 +468,10 @@ class LocalController extends ChangeNotifier {
         aiPlanes[pl.key] = pl;
       }
       if ((tasks & AiBits.person) != 0) personFound = r.personFound;
-      if ((tasks & AiBits.faces) != 0) faces = r.faces;
+      if ((tasks & AiBits.faces) != 0) {
+        faces = r.faces;
+        if (r.faceList.isNotEmpty) faceList = r.faceList;
+      }
       if ((tasks & AiBits.sky) != 0) skyFound = r.skyFound;
     } else if (r != null && r.state == 'error') {
       // what happened plus the step that can help (audit F21 / U9): the same analysis once more
@@ -578,14 +582,20 @@ class LocalController extends ChangeNotifier {
   /// 对比 is held: the photo without any local area.
   bool comparing = false;
 
-  /// The faces of the analysis (with their scale from the eye / iris planes).
+  /// The engine's face list of the last analysis (`face_list`: iod, mouth, teeth per face); empty with an older engine or cache.
+  List<AiFace> faceList = const [];
+
+  /// The faces of the analysis with their scale: the engine's iod from `face_list`; only when that is missing (an older cache) the
+  /// app's estimate from the eye / iris planes.
   List<PortraitFace> get portraitFaces {
     if (_portraitFacesDirty) {
       _portraitFacesDirty = false;
       final base = facesOf(aiPlanes.keys);
       final iods = <int, double>{};
+      final byIndex = {for (final f in faceList) f.index: f.iod};
       for (final f in base) {
-        iods[f.n] = _iodOf(f);
+        final known = byIndex[f.n] ?? 0;
+        iods[f.n] = known > 0 ? known : _iodOf(f);
       }
       _faces = facesOf(aiPlanes.keys, iods: iods);
     }

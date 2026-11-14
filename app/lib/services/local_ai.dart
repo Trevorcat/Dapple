@@ -7,7 +7,7 @@ import '../models.dart' show Photo;
 import '../state/app_state.dart';
 import 'ai_masks.dart';
 
-export 'ai_masks.dart' show AiTask, AiAvailability, AiPlane, AiGroup, AiJobResult, AiProgress, AiTapResult, AiMissing, AiPlanePreview;
+export 'ai_masks.dart' show AiTask, AiAvailability, AiPlane, AiGroup, AiFace, AiJobResult, AiProgress, AiTapResult, AiMissing, AiPlanePreview;
 
 abstract class LocalAi {
   /// What this device can do (models bundled, runtimes present). Never throws.

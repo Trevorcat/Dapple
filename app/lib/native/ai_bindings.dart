@@ -167,8 +167,36 @@ class AiGroup {
   final double ms;
 }
 
+/// One face of a job's `face_list` (the engine's faces meta): 1-based index (largest first), box and centre (frame-normalised), yaw in
+/// degrees, frontal, how open the mouth is (0..1), whether teeth show, iod (fraction of the long edge) and the feature planes it has.
+class AiFace {
+  const AiFace({required this.index, this.box = const [], this.yaw = 0, this.frontal = false, this.mouthOpen = 0, this.teeth = false, this.iod = 0, this.center = const [], this.planes = const []});
+  final int index;
+  final List<double> box, center;
+  final double yaw, mouthOpen, iod;
+  final bool frontal, teeth;
+  final List<String> planes;
+
+  static List<double> _nums(Object? v) => [for (final x in (v as List? ?? const [])) if (x is num) x.toDouble()];
+
+  factory AiFace.fromJson(Map<String, Object?> j) => AiFace(
+        index: (j['index'] as num?)?.toInt() ?? 0,
+        box: _nums(j['box']),
+        yaw: (j['yaw'] as num?)?.toDouble() ?? 0,
+        frontal: j['frontal'] == true,
+        mouthOpen: (j['mouth_open'] as num?)?.toDouble() ?? 0,
+        teeth: j['teeth'] == true,
+        iod: (j['iod'] as num?)?.toDouble() ?? 0,
+        center: _nums(j['center']),
+        planes: [for (final p in (j['planes'] as List? ?? const [])) '$p'],
+      );
+}
+
 class AiJobResult {
-  const AiJobResult({required this.state, required this.message, required this.planes, required this.groups, required this.personFound, required this.faces, required this.skyFound, required this.totalMs});
+  const AiJobResult({required this.state, required this.message, required this.planes, required this.groups, required this.personFound, required this.faces, required this.skyFound, required this.totalMs, this.faceList = const []});
+
+  /// The faces of the analysis (`face_list`); empty from an engine / cache that does not write it (the app then estimates the scale).
+  final List<AiFace> faceList;
   final String state; // done | cancelled | error
   final String message;
   final List<AiPlane> planes;
@@ -202,6 +230,7 @@ class AiJobResult {
       faces: (j['faces'] as num?)?.toInt() ?? 0,
       skyFound: j['sky_found'] == true,
       totalMs: (j['total_ms'] as num?)?.toDouble() ?? 0,
+      faceList: [for (final f in (j['face_list'] as List? ?? const [])) if (f is Map) AiFace.fromJson(Map<String, Object?>.from(f))],
     );
   }
 }

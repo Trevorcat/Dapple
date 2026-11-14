@@ -55,6 +55,9 @@ void main() {
       expect(portraitRecipe(skin, 0.5)['smooth'], 30);
       expect(portraitRecipe(skin, 1.0)['smooth'], 100);
       expect(portraitRecipe(skin, 0.25)['smooth'], 15);
+      // redness: recommended 30, maximum 50 (the engine's new maximum)
+      expect(portraitRecipe(skin, 0.5)['redness'], 30);
+      expect(portraitRecipe(skin, 1.0)['redness'], 50);
     });
   });
 

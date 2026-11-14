@@ -299,7 +299,7 @@ void main() {
       expect(key('local-group-detail'), findsNothing, reason: 'no groups for a portrait area');
       final items = r.lc.portraitItems();
       expect([for (final i in items) i.label], ['磨皮', '匀肤', '去红', '祛斑', '纹理', '祛斑范围']);
-      expect([for (final i in items) i.max], [100, 60, 70, 100, 20, 100]);
+      expect([for (final i in items) i.max], [100, 60, 50, 100, 20, 100]);
       expect(items.firstWhere((i) => i.id == 'texture').min, -20);
       for (final w in ['磨皮', '匀肤', '去红', '祛斑', '纹理', '祛斑范围']) {
         expect(find.text(w), findsWidgets, reason: w);

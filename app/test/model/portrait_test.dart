@@ -224,11 +224,21 @@ void main() {
       expect(iodFromFaceOval(gray(10, 10, (x, y) => false), 10, 10), 0);
     });
 
-    test('portraitFaceScale: the smallest known iod of the selected faces', () {
+    test('portraitFaceScale: the LARGEST known iod of the frame (the engine retouches a frame at one scale, the largest face)', () {
       const fs = [PortraitFace(1, {'face'}, 0.12), PortraitFace(2, {'face'}, 0.08), PortraitFace(3, {'face'}, 0)];
-      expect(portraitFaceScale(fs, {1, 2, 3}), 0.08);
-      expect(portraitFaceScale(fs, {1}), 0.12);
-      expect(portraitFaceScale(fs, {3}), 0);
+      expect(portraitFaceScale(fs, {1, 2, 3}), 0.12);
+      expect(portraitFaceScale(fs, {2}), 0.12, reason: 'one scale per frame, whatever faces the chip applies to');
+      expect(portraitFaceScale(fs), 0.12);
+      expect(portraitFaceScale(const [PortraitFace(1, {'face'}, 0)]), 0);
+    });
+
+    test('the skin mask takes out the open-mouth interior (f<N>:mouth) of every face that has it, with the lips and teeth', () {
+      const fs = [PortraitFace(1, {'face', 'lips', 'teeth', 'mouth'}, 0.1), PortraitFace(2, {'face', 'lips'}, 0.05)];
+      String? pid(String k) => 'ai:p:$k';
+      final m = portraitMask(specOf(PortraitChip.skin).areas.first, fs, {1, 2}, pid);
+      final out = [for (final c in m) if (c.op == MaskOp.subtract) c.ref];
+      expect(out, containsAll(['ai:p:f1:lips', 'ai:p:f1:teeth', 'ai:p:f1:mouth', 'ai:p:f2:lips']));
+      expect(out, isNot(contains('ai:p:f2:mouth')), reason: 'face 2 has no open mouth');
     });
 
     test('healRadius: sizes grow, clamped to 0.0005 .. 0.02, unknown face = 0.06', () {
@@ -319,7 +329,7 @@ void main() {
       final a = fresh('pt-skin');
       expect(setLocalItem(a, 'smooth', 150).ops['smooth'], 100);
       expect(setLocalItem(a, 'even', 90).ops['even'], 60);
-      expect(setLocalItem(a, 'redness', 90).ops['redness'], 70);
+      expect(setLocalItem(a, 'redness', 90).ops['redness'], 50, reason: 'the engine maximum of redness is 50');
       expect(setLocalItem(a, 'even', 40).ops['even'], 40);
       expect(setLocalItem(a, 'even', 90).strength, 100);
       expect(setLocalItem(a, 'even', 10).ops['smooth'], 30);

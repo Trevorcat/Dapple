@@ -42,7 +42,7 @@ const List<PortraitSpec> portraitSpecs = [
     PortraitAreaSpec('pt-skin', [
       PortraitOp('smooth', 30, 100),
       PortraitOp('even', 25, 60),
-      PortraitOp('redness', 30, 70),
+      PortraitOp('redness', 30, 50),
       PortraitOp('heal', 50, 100),
       PortraitOp('texture', 0, 20),
     ], null),
@@ -147,7 +147,8 @@ List<PortraitChip> availableChips(Set<String> planeKeys, List<PortraitFace> face
 
 /// The mask of [ar] for the faces [sel] (face numbers; the chip applies to these). [planeId] maps a key to its plane id.
 ///
-/// Skin (and shine): face skin + body skin, minus each face's lips and teeth (the open mouth: shine reduction would grey the teeth) and,
+/// Skin (and shine): face skin + body skin, minus each face's lips, teeth and open-mouth interior (`mouth`: shine reduction would grey the
+/// teeth and the inside of the mouth) and,
 /// with room, eyes and brows; faces not selected are taken out with their face oval. At most 8 parts (the engine's cap), distinct planes
 /// are what count against the edit's 12.
 List<MaskComponent> portraitMask(PortraitAreaSpec ar, List<PortraitFace> faces, Set<int> sel, String? Function(String key) planeId) {
@@ -168,9 +169,9 @@ List<MaskComponent> portraitMask(PortraitAreaSpec ar, List<PortraitFace> faces, 
   if (out.isEmpty) return out;
   add('bodyskin', MaskOp.add);
   final inSel = [for (final f in faces) if (sel.contains(f.n)) f];
-  // the mouth first (required), then the eyes and brows while the 8 parts last
+  // the mouth first (required: lips, teeth and the open-mouth interior `mouth`), then the eyes and brows while the 8 parts last
   for (final f in inSel) {
-    for (final k in const ['lips', 'teeth']) {
+    for (final k in const ['lips', 'teeth', 'mouth']) {
       if (f.keys.contains(k)) add('f${f.n}:$k', MaskOp.subtract);
     }
   }
@@ -186,10 +187,11 @@ List<MaskComponent> portraitMask(PortraitAreaSpec ar, List<PortraitFace> faces, 
   return out;
 }
 
-/// The face scale of an area: the smallest known iod of its faces (the engine retouches a frame at the smallest face anyway).
-double portraitFaceScale(List<PortraitFace> faces, Set<int> sel) {
-  final v = [for (final f in faces) if (sel.contains(f.n) && f.iod > 0) f.iod];
-  return v.isEmpty ? 0 : v.reduce(math.min);
+/// The face scale written to `retouch.face`: the LARGEST face's iod of the frame (the engine retouches a frame at one scale, the largest
+/// face's; docs/engine/pipeline-architecture.md section 43). [sel] is not used for the scale (kept for the call sites).
+double portraitFaceScale(List<PortraitFace> faces, [Set<int>? sel]) {
+  final v = [for (final f in faces) if (f.iod > 0) f.iod];
+  return v.isEmpty ? 0 : v.reduce(math.max);
 }
 
 /// The faces an area applies to, read back from its mask (per-face planes added, or for skin: every face not taken out).

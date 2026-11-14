@@ -332,7 +332,8 @@ class MaskComponent {
       feather: isLum || isCol ? 50 : c('feather', 0, 100, 50),
       lo: lo,
       hi: hi,
-      lumFeather: isLum ? c('feather', 0, 50, 10) : 10,
+      // the engine's defaults when a key is absent: luminance feather 15, a raster's range feather 10
+      lumFeather: isLum ? c('feather', 0, 50, kind == MaskKindId.luminance ? 15 : 10) : 10,
       hue: hue0,
       range: c('range', 0, 180, 30),
       hueFeather: isCol ? c('feather', 0, 90, 20) : 20,
@@ -348,7 +349,7 @@ class MaskComponent {
   static final Map<MaskKindId, Set<String>> _knownKeys = {
     MaskKindId.linear: {..._common, 'x0', 'y0', 'x1', 'y1'},
     MaskKindId.radial: {..._common, 'cx', 'cy', 'rx', 'ry', 'angle', 'feather'},
-    MaskKindId.luminance: {..._common, 'lo', 'hi', 'feather'},
+    MaskKindId.luminance: {..._common, 'lo', 'hi', 'feather', 'refine'},
     MaskKindId.color: {..._common, 'hue', 'range', 'feather', 'satMin'},
     MaskKindId.brush: {..._common, 'strokes'},
     MaskKindId.raster: {..._common, 'ref', 'refine', 'lo', 'hi', 'feather'},
@@ -380,7 +381,8 @@ class MaskComponent {
       case MaskKindId.radial:
         o.addAll({'cx': jnum(cx), 'cy': jnum(cy), 'rx': jnum(rx), 'ry': jnum(ry), 'angle': jnum(angle), 'feather': jnum(feather)});
       case MaskKindId.luminance:
-        o.addAll({'lo': jnum(lo), 'hi': jnum(hi), 'feather': jnum(lumFeather)});
+        // refine: spatial coherence of the L* read (0 = per pixel); the engine's default is 50 when absent, so writing it changes nothing
+        o.addAll({'lo': jnum(lo), 'hi': jnum(hi), 'feather': jnum(lumFeather), 'refine': jnum(refine)});
       case MaskKindId.color:
         o.addAll({'hue': jnum(hue), 'range': jnum(range), 'feather': jnum(hueFeather), 'satMin': jnum(satMin)});
       case MaskKindId.brush:
