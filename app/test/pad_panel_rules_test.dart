@@ -44,7 +44,7 @@ Future<(AppState, String)> openWith(WidgetTester t, {String title = '外滩夕�
 }
 
 Future<void> tapDock(WidgetTester t, EGroup g) async {
-  await t.tap(find.byKey(ValueKey('dock-$g')));
+  await t.tap(find.byKey(ValueKey(g == EGroup.crop ? 'toolbar-crop' : 'dock-$g')));
   await settle(t, 8);
 }
 

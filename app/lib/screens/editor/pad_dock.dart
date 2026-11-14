@@ -1,7 +1,9 @@
-// The category dock (docs/design/editor-panel.md section 2): five items. The first four are live glyphs: a small square (the
-// film one a circle) with a dot at the pad position and a thin bar for the strength, so one element is the entry, the state
-// and the readout. A tap opens the panel; a press-and-hold (or starting to drag on the glyph) pops the pad up above the dock
-// and the drag moves the value relative to where it started; releasing closes the popup.
+// The category dock (guidelines 15.2.2): five items, 光线 颜色 成像 质地 局部, each a static line icon over its word. The same item
+// ([DockItem]) stands in every layout: the phone's dock, the fold column's row and the one-thumb cluster's rail. A category changed from
+// its default carries a small accent dot at the icon's corner; 局部 shows its number of areas there instead. Nothing on the item moves
+// while a value is dragged. A tap opens the panel; on the phone's dock a press-and-hold (or starting to drag on the item) pops the pad
+// up above the dock and the drag moves the value relative to where it started; releasing closes the popup. 裁切 is not a category:
+// its entry is the top bar's crop button (editor_overlays.dart).
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -13,15 +15,25 @@ import '../../widgets/controls.dart' show kHit;
 import '../../widgets/icons.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart' show GlassCapsule;
-import 'local_panel.dart' show LocalDockGlyphPainter;
-import '../../model/local_kinds.dart';
 import '../../model/local_pad.dart' show localStripPercent, localUiOf;
 import 'pad_widgets.dart';
 
 /// The dock's categories, in order.
-const List<EGroup> padDockOrder = [EGroup.light, EGroup.color, EGroup.style, EGroup.effects, EGroup.local, EGroup.crop];
+const List<EGroup> padDockOrder = [EGroup.light, EGroup.color, EGroup.style, EGroup.effects, EGroup.local];
 
+/// The word of a category (裁切 included: the cluster's ball names the open tool).
 String dockLabel(EGroup g) => g == EGroup.crop ? '裁切' : (g == EGroup.local ? '局部' : PadCatX.ofGroup(g)!.label);
+
+/// The icon of a dock category (guidelines 8): sun, drop, three circles, a square of grain from fine to coarse, a frame with one part
+/// marked.
+DI dockIcon(EGroup g) => switch (g) {
+      EGroup.light => DI.light,
+      EGroup.color => DI.color,
+      EGroup.style => DI.styles,
+      EGroup.effects => DI.texture,
+      EGroup.local => DI.local,
+      _ => DI.crop,
+    };
 
 /// Hold time before the popup appears (a drag beyond [kHoldSlop] starts it at once).
 const Duration kHoldDelay = Mo.hold;
@@ -37,8 +49,8 @@ class PadDock extends StatelessWidget {
       listenable: Listenable.merge([ctl.wm, ctl.app.editTick, ctl.hold, ctl.local]),
       builder: (context, _) => LayoutBuilder(builder: (context, cons) {
         final n = padDockOrder.length;
-        // six items of at least 48 dp (the touch target, guidelines 6): the side-pane dock on a landscape phone is ~288 dp; a still
-        // narrower window scrolls the dock (guidelines 15.2.2) rather than shrinking the items
+        // five items of at least 48 dp (the touch target, guidelines 6); a still narrower window scrolls the dock (guidelines 15.2.2)
+        // rather than shrinking the items
         final iw = (cons.maxWidth / n).clamp(kHit, 76.0).toDouble();
         final dh = padDockH(MediaQuery.textScalerOf(context).scale(15) / 15);
         final row = SizedBox(
@@ -69,9 +81,12 @@ String? dockDimReason(EditorController ctl, EGroup g) {
 }
 
 class DockItem extends StatefulWidget {
-  const DockItem({super.key, required this.ctl, required this.group, this.holdToAdjust = true});
+  const DockItem({super.key, required this.ctl, required this.group, this.holdToAdjust = true, this.onTap});
   final EditorController ctl;
   final EGroup group;
+
+  /// Called on every touch that ends as a tap, before the category opens (the cluster wakes up on it).
+  final VoidCallback? onTap;
 
   /// False where the hold popup has no place to rise from (the fold layouts' column): a tap still opens the category.
   final bool holdToAdjust;
@@ -134,6 +149,7 @@ class _DockItemState extends State<DockItem> {
     if (wasHolding) {
       ctl.holdEnd();
     } else if (!cancelled) {
+      widget.onTap?.call();
       final why = dockDimReason(ctl, widget.group);
       ctl.openCategory(widget.group);
       // after the switch: a tab change clears the previous page's toast
@@ -143,34 +159,20 @@ class _DockItemState extends State<DockItem> {
 
   @override
   Widget build(BuildContext context) {
-    final c = context.c;
     final g = widget.group;
     final selected = ctl.wm.windowOf(g) != null;
     final pressed = ctl.hold.value?.cat == cat && cat != null;
     final on = selected || pressed;
-    final fg = on ? c.accent : c.text2;
     final label = dockLabel(g);
     final ed = ctl.edit;
     final pc = cat;
     final PadState s = pc == null ? PadState.centre : padViewOf(ed, pc, ctl.padCtx);
-    final dim = pc != null && (s.a < 0.02 || (pc == PadCat.film && ed.film == null));
-    final adjusted = pc != null && padCatAdjusted(ed, pc, ctl.padCtx);
     final local = g == EGroup.local;
     final areas = ed.local;
     final la = local && !areas.isEmpty ? (areas.byId(ctl.local.selId ?? '') ?? areas.items.last) : null;
-    final Widget glyph = local
-        ? Opacity(
-            opacity: la == null ? 0.38 : 1,
-            child: SizedBox(
-                width: 34,
-                height: 26,
-                child: CustomPaint(
-                    key: const ValueKey('glyph-local'),
-                    painter: LocalDockGlyphPainter(la == null || la.mask.isEmpty ? LocalGlyph.radial : kindOfComponent(la.mask.first).glyph, areas.length, fg,
-                        ink: c.surface, textScale: MediaQuery.textScalerOf(context).scale(11) / 11, base: DefaultTextStyle.of(context).style, strength: la == null ? null : localUiOf(la).a))))
-        : pc == null
-        ? DIcon(DI.crop, size: 24, color: fg, stroke: 1.9)
-        : Opacity(opacity: dim ? 0.38 : 1, child: SizedBox(width: 34, height: 26, child: CustomPaint(key: ValueKey('glyph-${pc.name}'), painter: GlyphPainter(s.x, s.y, s.a, pc == PadCat.film, fg))));
+    // greyed: nothing to show yet (strength 0, no stock chosen, no area); a tap still opens it and says why
+    final dim = local ? areas.isEmpty : pc != null && (s.a < 0.02 || (pc == PadCat.film && ed.film == null));
+    final adjusted = pc != null && padCatAdjusted(ed, pc, ctl.padCtx);
     return Semantics(
       selected: on,
       button: true,
@@ -183,61 +185,71 @@ class _DockItemState extends State<DockItem> {
         onPointerMove: _onMove,
         onPointerUp: (e) => _onUp(e, cancelled: false),
         onPointerCancel: (e) => _onUp(e, cancelled: true),
-        child: Container(
-          margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-          decoration: BoxDecoration(color: on ? c.accentSoft : null, borderRadius: BorderRadius.circular(26)),
-          child: Column(mainAxisAlignment: MainAxisAlignment.center, mainAxisSize: MainAxisSize.min, children: [
-            glyph,
-            const SizedBox(height: 3),
-            // one line at any text size: a long word shrinks to the item rather than wrapping under it (text scale 2.0)
-            FittedBox(fit: BoxFit.scaleDown, child: Text(label, maxLines: 1, softWrap: false, style: T.cap(fg, w: on ? FontWeight.w600 : FontWeight.w400))),
-          ]),
+        child: DockItemFace(
+          icon: dockIcon(g),
+          label: label,
+          on: on,
+          dim: dim,
+          changed: adjusted,
+          count: local && !areas.isEmpty ? areas.length : null,
+          iconKey: ValueKey('glyph-${pc?.name ?? g.name}'),
+          markKey: ValueKey('dock-mark-${pc?.name ?? g.name}'),
         ),
       ),
     );
   }
 }
 
-/// Dock height: 56, taller when the label (12 / 16, guidelines 3.2) grows with the system text size (glyph 26 + gap 3 + label + margin 4).
-double padDockH(double textScale) => textScale <= 1.0 ? 56.0 : 34 + 16 * textScale;
-
-/// The dock glyph: a rounded square (a circle for film) with a dot at the pad position and a thin bar for the strength.
-class GlyphPainter extends CustomPainter {
-  const GlyphPainter(this.x, this.y, this.a, this.round, this.color);
-  final double x, y, a;
-  final bool round;
-  final Color color;
+/// What a dock item shows: the icon over the word; selected = `accentSoft` ground and `accent` (guidelines 10.2); greyed = the icon at
+/// 38 % (the word stays readable); at the icon's top right corner a 6 dp `accent` dot when the category is changed from its default, or
+/// the number of areas ([count], 局部). Static: nothing in it follows a value while it is dragged.
+class DockItemFace extends StatelessWidget {
+  const DockItemFace({super.key, required this.icon, required this.label, this.on = false, this.dim = false, this.changed = false, this.count, this.iconSize = 24, this.iconKey, this.markKey});
+  final DI icon;
+  final String label;
+  final bool on, dim, changed;
+  final int? count;
+  final double iconSize;
+  final Key? iconKey, markKey;
 
   @override
-  void paint(Canvas canvas, Size size) {
-    const g = 24.0;
-    final box = Rect.fromLTWH(1, (size.height - g) / 2, g, g);
-    final line = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.5
-      ..color = color;
-    if (round) {
-      canvas.drawCircle(box.center, g / 2 - 0.75, line);
-    } else {
-      canvas.drawRRect(RRect.fromRectAndRadius(box.deflate(0.75), const Radius.circular(7)), line);
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final fg = on ? c.accent : c.text2;
+    final k = iconSize / 24;
+    Widget? mark;
+    if (count != null) {
+      mark = Text('$count', key: markKey, maxLines: 1, textScaler: TextScaler.noScaling,
+          style: _scaled(T.mini(c.accent, w: FontWeight.w600), k).copyWith(height: 1, fontFeatures: const [FontFeature.tabularFigures()]));
+    } else if (changed) {
+      mark = Container(key: markKey, width: 6 * k, height: 6 * k, decoration: BoxDecoration(color: c.accent, shape: BoxShape.circle));
     }
-    final hair = Paint()
-      ..strokeWidth = 1
-      ..color = color.withValues(alpha: 0.25);
-    canvas.drawLine(Offset(box.center.dx, box.top + 2), Offset(box.center.dx, box.bottom - 2), hair);
-    canvas.drawLine(Offset(box.left + 2, box.center.dy), Offset(box.right - 2, box.center.dy), hair);
-    // the dot sits where the pad cursor sits
-    canvas.drawCircle(Offset(box.center.dx + x * g * 0.36, box.center.dy - y * g * 0.36), 3.5, Paint()..color = color);
-    // the strength bar grows from the bottom
-    final h = 2 + a * 22;
-    canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTRB(box.right + 3.5, box.bottom + 1.5 - h, box.right + 6, box.bottom + 1.5), const Radius.circular(1.25)), Paint()..color = color);
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+      decoration: BoxDecoration(color: on ? c.accentSoft : null, borderRadius: BorderRadius.circular(26 * k)),
+      child: Column(mainAxisAlignment: MainAxisAlignment.center, mainAxisSize: MainAxisSize.min, children: [
+        SizedBox(
+          width: iconSize,
+          height: iconSize,
+          child: Stack(clipBehavior: Clip.none, children: [
+            Opacity(opacity: dim && !on ? 0.38 : 1, child: DIcon(icon, key: iconKey, size: iconSize, color: fg)),
+            if (mark != null) Positioned(left: iconSize + k, top: -1 * k, child: mark),
+          ]),
+        ),
+        SizedBox(height: 4 * k),
+        // one line at any text size: a long word shrinks to the item rather than wrapping under it (text scale 2.0)
+        FittedBox(fit: BoxFit.scaleDown, child: Text(label, maxLines: 1, softWrap: false, style: _scaled(T.cap(fg, w: on ? FontWeight.w600 : FontWeight.w400), k))),
+      ]),
+    );
   }
-
-  @override
-  bool shouldRepaint(GlyphPainter o) => o.x != x || o.y != y || o.a != a || o.round != round || o.color != color;
 }
 
-/// The popup above the dock while a glyph is held: the pad at full size, the photo stays where it is.
+TextStyle _scaled(TextStyle s, double k) => k == 1 ? s : s.copyWith(fontSize: (s.fontSize ?? 12) * k);
+
+/// Dock height: 56, taller when the label (12 / 16, guidelines 3.2) grows with the system text size (icon 24 + gap 4 + label + margins).
+double padDockH(double textScale) => textScale <= 1.0 ? 56.0 : 34 + 16 * textScale;
+
+/// The popup above the dock while an item is held: the pad at full size, the photo stays where it is.
 class HoldPopupLayer extends StatelessWidget {
   const HoldPopupLayer({super.key, required this.ctl, required this.dockTop, required this.screenW});
   final EditorController ctl;

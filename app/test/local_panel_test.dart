@@ -95,7 +95,7 @@ void main() {
       for (final g in padDockOrderForTest) {
         expect(key('dock-$g'), findsOneWidget, reason: '$g');
       }
-      expect(padDockOrderForTest, hasLength(6));
+      expect(padDockOrderForTest, hasLength(5));
       expect(find.text('局部'), findsWidgets);
       expect(t.takeException(), isNull);
     });
@@ -507,4 +507,4 @@ void main() {
 }
 
 /// The dock order the panel shows (the six items).
-const List<EGroup> padDockOrderForTest = [EGroup.light, EGroup.color, EGroup.style, EGroup.effects, EGroup.local, EGroup.crop];
+const List<EGroup> padDockOrderForTest = [EGroup.light, EGroup.color, EGroup.style, EGroup.effects, EGroup.local];

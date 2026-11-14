@@ -9,6 +9,7 @@ import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
 import '../../widgets/icons.dart';
+import '../../model/params.dart' show EGroup;
 import 'editor_controller.dart';
 import '../../services/perf_probe.dart';
 
@@ -48,9 +49,13 @@ class EditorTopBar extends StatelessWidget {
     required this.photoId,
     required this.onBack,
     required this.onMore,
+    this.ctl,
     this.vertical = false,
     this.immersive = false,
   });
+
+  /// The editor: when set, the bar carries the crop button (裁切's entry; it is not a dock category).
+  final EditorController? ctl;
 
   /// Immersive view: the action group fades out, the back button stays and works.
   final bool immersive;
@@ -66,8 +71,9 @@ class EditorTopBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.c;
+    final ed = ctl;
     return ListenableBuilder(
-      listenable: app,
+      listenable: Listenable.merge([app, ?ed?.wm, ?ed?.edits]),
       builder: (context, _) {
         final id = photoId();
         PerfProbe.count('topbar');
@@ -87,6 +93,17 @@ class EditorTopBar extends StatelessWidget {
               ),
             ),
             if (vertical) const SizedBox(height: 8) else const Spacer(),
+            // the tool: 裁切, its own capsule beside the history and output group
+            if (ed != null)
+              IgnorePointer(
+                ignoring: immersive,
+                child: AnimatedOpacity(
+                  opacity: immersive ? 0 : 1,
+                  duration: const Duration(milliseconds: 150),
+                  child: GlassCapsule(radius: 24, child: CropButton(ctl: ed, app: app, photoId: id)),
+                ),
+              ),
+            if (ed != null) vertical ? const SizedBox(height: 8) : const SizedBox(width: 8),
             IgnorePointer(
               ignoring: immersive,
               child: AnimatedOpacity(
@@ -155,6 +172,44 @@ class EditorTopBar extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+/// The top bar's 裁切 button. Open: the item's selected look (`accentSoft` disc, `accent` icon), the same as a selected dock item.
+/// A photo whose crop, rotation, flip or straightening differs from the original: the dock's changed mark, a small `accent` dot at the
+/// icon's top right corner.
+class CropButton extends StatelessWidget {
+  const CropButton({super.key, required this.ctl, required this.app, required this.photoId});
+  final EditorController ctl;
+  final AppState app;
+  final String photoId;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final open = ctl.cropOpen;
+    final cropped = app.photoById(photoId)?.edit.groupAdjusted(EGroup.crop) ?? false;
+    return SizedBox(
+      width: kHit,
+      height: kHit,
+      child: Stack(clipBehavior: Clip.none, children: [
+        DIconButton(
+          DI.crop,
+          key: const ValueKey('toolbar-crop'),
+          label: cropped ? '裁切，已裁切' : '裁切',
+          pressed: open,
+          color: open ? c.accent : null,
+          bg: open ? c.accentSoft : null,
+          onPressed: ctl.toggleCrop,
+        ),
+        if (cropped)
+          Positioned(
+            left: 36,
+            top: 10,
+            child: IgnorePointer(child: Container(key: const ValueKey('toolbar-crop-mark'), width: 6, height: 6, decoration: BoxDecoration(color: c.accent, shape: BoxShape.circle))),
+          ),
+      ]),
     );
   }
 }

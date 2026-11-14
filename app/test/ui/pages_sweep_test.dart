@@ -159,7 +159,12 @@ Future<void> tapK(WidgetTester t, String k, {int n = 4}) async {
 }
 
 Future<void> dock(WidgetTester t, EGroup g) async {
-  // the fold layouts have no dock: the category grid of the column, the rail of the cluster
+  // 裁切 is the top bar's crop button; the fold layouts have no dock: the category row of the column, the rail of the cluster
+  if (g == EGroup.crop) {
+    await t.tap(find.byKey(const ValueKey('toolbar-crop')));
+    await settle(t, 8);
+    return;
+  }
   final d = find.byKey(ValueKey('dock-$g'));
   final f = d.evaluate().isNotEmpty ? d : (find.byKey(ValueKey('fold-cat-${g.name}')).evaluate().isNotEmpty ? find.byKey(ValueKey('fold-cat-${g.name}')) : find.byKey(ValueKey('cluster-cat-${g.name}')));
   await t.tap(f);
@@ -874,6 +879,52 @@ void main() {
       await drain(t);
     });
   }
+
+  // ---------------------------------------------------------------------------------------------------- dock review (guidelines 15.2.2)
+  // The five-category dock and the crop button in the top bar on every form factor: one category open, one changed from its default
+  // (光线), 局部 with two areas, the photo straightened (the crop button's mark), and 裁切 open; light and dark, text scale 1.3.
+  Future<void> review(WidgetTester t, Sz z, String tag, {bool dark = false, double scale = 1, String title = '外滩夕阳', ui.DisplayFeatureState posture = ui.DisplayFeatureState.postureFlat}) async {
+    win(t, z, posture: posture);
+    if (scale != 1) {
+      t.platformDispatcher.textScaleFactorTestValue = scale;
+      addTearDown(t.platformDispatcher.clearTextScaleFactorTestValue);
+    }
+    final fake = FakeLocalAi();
+    await step(t, z, 'review $tag', () async {
+      await openEd(t, z, group: EGroup.local, dark: dark, ai: fake, title: title, before: (app, id) {
+        filmSetup(app, id);
+        app.applyEdit(id, (e) => applyPadState(e, PadCat.light, const PadState(x: 0.4, y: 0.3, a: 0.7), const PadCtx(defaultTone: 60)));
+        app.applyEdit(id, (e) => e.copyWith(values: {...e.values, 'straighten': 2.0}));
+      });
+      await tapK(t, 'kind-radial');
+      await tapK(t, 'local-add');
+      await tapK(t, 'kind-linear');
+      await dock(t, EGroup.color);
+      await snap(t, z, 'dock_$tag', 'dock review $tag: 颜色 open, 光线 changed (dot), 局部 with 2 areas (count), photo straightened (dot on the crop button)', suffix: '-dock');
+      await dock(t, EGroup.crop);
+      await snap(t, z, 'dock_${tag}_crop', 'dock review $tag: 裁切 open from the top bar (crop button selected, no dock item selected)', suffix: '-dock');
+    });
+    await drain(t);
+  }
+
+  const slab = Sz('slab-393x852', 393, 852);
+  const slabL = Sz('slab-landscape-852x393', 852, 393, top: 0, bottom: 0);
+  const narrow = Sz('small-phone-360x780', 360, 780);
+  const owner = Sz('book-inner-749x827', 749, 827, fold: Fold.vertical);
+  const bench = Sz('book-inner-904x832', 904, 832, fold: Fold.vertical);
+  const flip = Sz('flip-open-412x1004', 412, 1004, fold: Fold.horizontal);
+  testWidgets('dock review slab', (t) async => review(t, slab, 'slab'));
+  testWidgets('dock review slab dark', (t) async => review(t, slab, 'slab_dark', dark: true));
+  testWidgets('dock review slab text 1.3', (t) async => review(t, slab, 'slab_text13', scale: 1.3));
+  testWidgets('dock review slab landscape', (t) async => review(t, slabL, 'slab_landscape'));
+  testWidgets('dock review 360', (t) async => review(t, narrow, 'narrow360', scale: 1.3));
+  testWidgets('dock review 749 portrait photo', (t) async => review(t, owner, 'fold749_portrait', title: '街角咖啡'));
+  testWidgets('dock review 749 portrait photo dark', (t) async => review(t, owner, 'fold749_portrait_dark', title: '街角咖啡', dark: true));
+  testWidgets('dock review 749 portrait photo text 1.3', (t) async => review(t, owner, 'fold749_portrait_text13', title: '街角咖啡', scale: 1.3));
+  testWidgets('dock review 749 landscape photo', (t) async => review(t, owner, 'fold749_landscape'));
+  testWidgets('dock review 749 landscape photo dark', (t) async => review(t, owner, 'fold749_landscape_dark', dark: true));
+  testWidgets('dock review bench', (t) async => review(t, bench, 'bench'));
+  testWidgets('dock review half-opened flip', (t) async => review(t, flip, 'flip_half', posture: ui.DisplayFeatureState.postureHalfOpened));
 
   // ---------------------------------------------------------------------------------------------------- dark, phone portrait
   testWidgets('editor dark default layer', (t) async {

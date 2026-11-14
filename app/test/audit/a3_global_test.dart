@@ -9,7 +9,7 @@ import '../support/film_fixture.dart';
 import 'audit_support.dart';
 
 Future<void> dock(WidgetTester t, EGroup g) async {
-  await t.tap(find.byKey(ValueKey('dock-$g')));
+  await t.tap(find.byKey(ValueKey(g == EGroup.crop ? 'toolbar-crop' : 'dock-$g')));
   await settle(t, 8);
 }
 

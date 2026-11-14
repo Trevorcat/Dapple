@@ -870,68 +870,6 @@ class LocalItemised extends StatelessWidget {
   }
 }
 
-// ------------------------------------------------------------------ the dock glyph
-
-/// The dock's 局部 glyph: the selected (or last) area's kind, a count badge when there are several (a 16 dp disc in the glyph's
-/// colour with the number in 11 px [ink], the same badge as the photo grid's counts; never smaller than the type scale's 11).
-class LocalDockGlyphPainter extends CustomPainter {
-  const LocalDockGlyphPainter(
-    this.glyph,
-    this.count,
-    this.color, {
-    this.ink = Fx.onPhoto,
-    this.textScale = 1,
-    this.base,
-    this.strength,
-  });
-  final LocalGlyph glyph;
-  final int count;
-  final Color color, ink;
-  final double textScale;
-
-  /// The ambient text style (font family): a bare TextPainter would not inherit it.
-  final TextStyle? base;
-
-  /// The selected area's strip (0..1), drawn as the thin bar every dock glyph has (one element = entry + state + readout, audit F42).
-  final double? strength;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    const g = 24.0;
-    final box = Rect.fromLTWH(1, (size.height - g) / 2, g, g);
-    paintLocalGlyph(canvas, box, glyph, color, stroke: 1.5);
-    final a = strength;
-    if (a != null) {
-      final h = 2 + a.clamp(0.0, 1.0) * 22;
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(Rect.fromLTRB(box.right + 3.5, box.bottom + 1.5 - h, box.right + 6, box.bottom + 1.5), const Radius.circular(1.25)),
-        Paint()..color = color,
-      );
-    }
-    if (count > 1) {
-      final tp = TextPainter(
-        text: TextSpan(
-          text: '$count',
-          style: (base ?? const TextStyle()).merge(T.mini(ink, w: FontWeight.w600)).copyWith(height: 1, fontFeatures: const [FontFeature.tabularFigures()]),
-        ),
-        textDirection: TextDirection.ltr,
-        textScaler: TextScaler.linear(textScale),
-      )..layout();
-      final d = math.max(16.0 * textScale, tp.width + 6);
-      final centre = Offset(box.left + 1, box.top + 3); // top-left: the strength bar has the right edge
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(Rect.fromCenter(center: centre, width: d, height: 16 * textScale), Radius.circular(8 * textScale)),
-        Paint()..color = color,
-      );
-      tp.paint(canvas, centre - Offset(tp.width / 2, tp.height / 2));
-    }
-  }
-
-  @override
-  bool shouldRepaint(LocalDockGlyphPainter o) =>
-      o.glyph != glyph || o.count != count || o.color != color || o.ink != ink || o.textScale != textScale || o.strength != strength;
-}
-
 // ------------------------------------------------------------------ tool strip (on the photo)
 
 /// The "where" fine controls on the photo's bottom edge: the area's parts (when several), the brush sizes and eraser, the tone band

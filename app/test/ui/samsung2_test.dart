@@ -31,7 +31,7 @@ Rect panelRect(WidgetTester t) => t.getRect(key('docked-panel'));
 Rect stageRect(WidgetTester t) => t.getRect(key('zoom-stage'));
 
 Future<void> dock(WidgetTester t, EGroup g) async {
-  await t.tap(find.byKey(ValueKey('dock-$g')));
+  await t.tap(find.byKey(ValueKey(g == EGroup.crop ? 'toolbar-crop' : 'dock-$g')));
   await settle(t, 8);
 }
 

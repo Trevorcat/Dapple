@@ -98,32 +98,24 @@ class _HistPainter extends CustomPainter {
   bool shouldRepaint(_HistPainter o) => o.hist != hist || o.fill != fill || o.grid != grid;
 }
 
-/// The six categories as the dock's own items (glyph over word, [DockItem]) in a grid of [perRow], for the column. The dock's items, so
-/// the glyphs show the state of each category and a tap behaves as on the phone; only the press-and-hold popup is left out (it has no
-/// place to rise from here: the pad is on the card).
+/// The five categories as the dock's own items (icon over word, [DockItem]) in one row, for the column: the same item as the phone's
+/// dock and the cluster's rail, a tap behaves as on the phone; only the press-and-hold popup is left out (it has no place to rise from
+/// here: the pad is on the card).
 class FoldCatGrid extends StatelessWidget {
-  const FoldCatGrid({super.key, required this.ctl, this.perRow = 3});
+  const FoldCatGrid({super.key, required this.ctl});
   final EditorController ctl;
-  final int perRow;
 
   @override
   Widget build(BuildContext context) {
     final dh = padDockH(MediaQuery.textScalerOf(context).scale(15) / 15);
     return ListenableBuilder(
       listenable: Listenable.merge([ctl.wm, ctl.app.editTick, ctl.local]),
-      builder: (context, _) {
-        final rows = <Widget>[];
-        for (var r = 0; r < padDockOrder.length; r += perRow) {
-          rows.add(SizedBox(
-            height: dh,
-            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              for (var i = r; i < math.min(r + perRow, padDockOrder.length); i++)
-                Expanded(child: KeyedSubtree(key: ValueKey('fold-cat-${padDockOrder[i].name}'), child: DockItem(ctl: ctl, group: padDockOrder[i], holdToAdjust: false))),
-            ]),
-          ));
-        }
-        return Column(mainAxisSize: MainAxisSize.min, children: rows);
-      },
+      builder: (context, _) => SizedBox(
+        height: dh,
+        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          for (final g in padDockOrder) Expanded(child: KeyedSubtree(key: ValueKey('fold-cat-${g.name}'), child: DockItem(ctl: ctl, group: g, holdToAdjust: false))),
+        ]),
+      ),
     );
   }
 }
@@ -210,7 +202,7 @@ class FoldBench extends StatelessWidget {
   }
 }
 
-/// The column beside a portrait photo: histogram and title row on top, the six categories, then the strength strip and the pad (swapping
+/// The column beside a portrait photo: histogram and title row on top, the five categories, then the strength strip and the pad (swapping
 /// with 分项 in the same place), and a way to move the column to the other side. A horizontal fold across the column splits it in two
 /// blocks with nothing in the band between.
 class FoldColumn extends StatelessWidget {
@@ -255,11 +247,12 @@ class FoldColumn extends StatelessWidget {
       ]);
     }
 
-    final cats = Padding(padding: const EdgeInsets.fromLTRB(Sp.l - 2, 0, Sp.l - 2, Sp.xs), child: FoldCatGrid(ctl: ctl));
-    final catsH = 2 * padDockH(textScale) + Sp.xs;
+    // one row of five: the column is at least wide enough for five 48 dp items inside a 4 dp inset (kColumnMin)
+    final cats = Padding(padding: const EdgeInsets.fromLTRB(Sp.xs, 0, Sp.xs, Sp.xs), child: FoldCatGrid(ctl: ctl));
+    final catsH = padDockH(textScale) + Sp.xs;
     // the handle (drag to the other side) has its own band above the histogram
     final histogram = Padding(padding: const EdgeInsets.fromLTRB(Sp.l, 16, Sp.l, Sp.xs), child: HistogramCard(ctl: ctl));
-    // The hierarchy reads top to bottom: the histogram, the six categories (level 1), then the open category's own header (title, readout,
+    // The hierarchy reads top to bottom: the histogram, the five categories (level 1), then the open category's own header (title, readout,
     // 复位, 分项, and 局部's area chips with the 光线 / 颜色 / 质地 switch, or 成像's stock chip), then the strength strip and the pad (or what
     // swaps with it). The header has its natural height: the readout keeps its own line.
     Widget header({bool hist = false}) => ListenableBuilder(

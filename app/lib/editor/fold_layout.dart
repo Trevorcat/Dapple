@@ -96,7 +96,9 @@ const double kBenchWorkShare = 0.58; // the pad half's share of the width withou
 const double kHalfBenchMinW = 600; // a half-opened window this wide gets the workbench's two halves under the fold
 const double kFoldTopGap = 6; // the photo keeps this much under the top safe area (the status bar), and still sits at the top
 const double kCreaseClear = 24; // what stays free beside a fold
-const double kColumnMin = 244, kColumnMax = 400; // the column takes what the photo leaves, between these
+// the column takes what the photo leaves, between these; at its narrowest (inner width colW - 12) it still holds the five categories in
+// one row of 48 dp items inside a 4 dp inset
+const double kColumnMin = 260, kColumnMax = 400;
 const double kBenchPhotoMin = 300; // the photo area keeps the cluster's height (ring, ball, grip) in the bench layout
 
 /// Where everything goes. The rectangles are in window coordinates.
@@ -219,12 +221,16 @@ class FoldPlan {
 }
 
 /// The one-thumb cluster of the bench layout, laid out over the photo only (the photo's rectangle, never beyond it). The ball is the
-/// centre; the rail of the six categories stands at the holding edge, the strength ring above the ball, the 分项 pill beside it and the
+/// centre; the rail of the five categories stands at the holding edge, the strength ring above the ball, the 分项 pill beside it and the
 /// grip under it that moves the whole cluster along the edge.
 class BallGeo {
-  const BallGeo({required this.ball, required this.ring, required this.grip, required this.pill, required this.rail, required this.photo, required this.side});
+  const BallGeo({required this.ball, required this.ring, required this.grip, required this.pill, required this.rail, required this.photo, required this.side, this.itemH = railItem});
 
-  static const double ballD = 76, ringD = 52, edgeGap = 136, railW = 64, railChip = 48;
+  static const double ballD = 76, ringD = 52, edgeGap = 136, railW = 64;
+
+  /// One category item of the rail (the dock's item: icon over word) at text scale 1; [BallGeo.of] takes the scaled height.
+  static const double railItem = 56;
+  static const int railCount = 5;
   static const double ringUp = 110, gripDown = 48;
   static const double gripW = 44, gripH = 30, pillW = 52, pillH = 36;
   static const double above = ringUp + ringD / 2 + 64, below = gripDown + gripH / 2 + 4 + 24 + 4; // reach above and below the ball's centre
@@ -244,6 +250,9 @@ class BallGeo {
   final Rect ball, ring, grip, pill, rail, photo;
   final Hand side;
 
+  /// Height of one rail item.
+  final double itemH;
+
   /// The ball's centre is between these heights (top, bottom of the allowed range) for [photo].
   static (double, double) range(Rect photo) {
     final lo = photo.top + above, hi = photo.bottom - below;
@@ -251,18 +260,19 @@ class BallGeo {
   }
 
   /// [t] (0..1): where along the allowed range the cluster stands.
-  factory BallGeo.of(Rect photo, Hand side, double t, {bool clearCorners = false}) {
+  factory BallGeo.of(Rect photo, Hand side, double t, {bool clearCorners = false, double itemH = railItem}) {
     final (lo, hi) = range(photo);
     final by = lo + (hi - lo) * t.clamp(0.0, 1.0);
     final right = side == Hand.right;
-    // a photo too short for six chips in one column gets the rail in two columns of three (every category stays on screen, none scrolls)
+    // a photo too short for the five items in one column gets the rail in two columns (three and two; every category stays on screen,
+    // none scrolls)
     final railMax = photo.bottom - (clearCorners ? cornerZone + 8 : 8);
     final railTop = photo.top + railTopClear;
-    final fullH = 6 * railChip + 12.0;
+    final fullH = railCount * itemH + 8.0;
     final cols = railMax - railTop >= fullH ? 1 : 2;
     final cx = right ? photo.right - edgeGap - (cols - 1) * railW : photo.left + edgeGap + (cols - 1) * railW;
     Rect box(double x, double y, double w, double h) => Rect.fromCenter(center: Offset(x, y), width: w, height: h);
-    final railH = math.min(cols == 1 ? fullH : 3 * railChip + 12.0, math.max(railChip, railMax - railTop));
+    final railH = math.min(cols == 1 ? fullH : ((railCount + 1) ~/ 2) * itemH + 8.0, math.max(itemH, railMax - railTop));
     final ry = (by - railH / 2).clamp(railTop, math.max(railTop, railMax - railH)).toDouble();
     final rw = railW * cols;
     final rx = right ? photo.right - rw - 10 : photo.left + 10;
@@ -274,6 +284,7 @@ class BallGeo {
       rail: Rect.fromLTWH(rx, ry, rw, railH),
       photo: photo,
       side: side,
+      itemH: itemH,
     );
   }
 

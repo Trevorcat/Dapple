@@ -76,6 +76,8 @@ enum DI {
   longLegs,
   smallHead,
   push,
+  texture,
+  local,
 }
 
 class DIcon extends StatelessWidget {
@@ -206,6 +208,23 @@ class _IconPainter extends CustomPainter {
           final dx = math.sqrt(81 - (y - 12) * (y - 12));
           canvas.drawLine(Offset(12 - dx, y), Offset(12 + dx, y), line);
         }
+        break;
+      case DI.texture:
+        // 质地: the pad's 颗粒 square, clean at one corner and grained toward the other (the category runs from smooth to textured)
+        rr(3.5, 3.5, 17, 17, 4.5);
+        for (final d in const [(15.6, 8.0, 0.85), (11.4, 12.2, 0.85), (16.2, 12.0, 1.15), (8.0, 15.8, 0.85), (12.6, 16.2, 1.15), (16.4, 16.4, 1.3)]) {
+          canvas.drawCircle(Offset(d.$1, d.$2), d.$3, fill);
+        }
+        break;
+      case DI.local:
+        // 局部: the photo's frame with one part of it marked (an area that is adjusted on its own)
+        final fr = RRect.fromRectAndRadius(const Rect.fromLTWH(3, 4.5, 18, 15), const Radius.circular(3.5));
+        canvas.save();
+        canvas.clipRRect(fr);
+        canvas.drawCircle(const Offset(17, 16), 6.6, soft);
+        canvas.drawCircle(const Offset(17, 16), 6.6, line);
+        canvas.restore();
+        canvas.drawRRect(fr, line);
         break;
       case DI.crop:
         canvas.drawPath(poly([6.5, 2.5, 6.5, 17.5, 21.5, 17.5]), line);

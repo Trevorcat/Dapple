@@ -1,7 +1,7 @@
 # 编辑器控制面板（盘面 + 强度，照片下方或照片一侧）
 
 版本 0.7（2026-11-14；v0.7 按负责人批准的统一规则 U1–U8 改：强度条读数、页眉、成像改名、按住对比，见 guidelines 15.1、15.2.8–15.2.10）。范围：**所有屏幕**。负责人认可的交互稿：`dapple-panel.html`（强度和方向，第七版）。原则见 `guidelines.md` 15.1（v0.6 重写）。代码：
-`app/lib/model/pad_model.dart`（配方、条目、盘面状态；纯 Dart）、`model/film_map.dart`（胶片地图的布局）、`screens/editor/pad_panel.dart`（面板、页眉、第 2 / 3 层、裁切、复杂编辑器）、`pad_widgets.dart`（盘面、强度条）、`pad_dock.dart`（坞的活字形方块、按住弹出）、`film_map_view.dart`、`itemised_view.dart`（性格图、尺子）、`pad_icons.dart`（图标）、`pad_gestures.dart`、`editor_controller.dart`、`editor_page.dart`、`editor/panel_layout.dart`（照片下方 / 一侧的几何求解，未变）。测试：`test/pad_panel_test.dart`、`test/model/pad_model_test.dart`、`test/editor/panel_layout_test.dart`。
+`app/lib/model/pad_model.dart`（配方、条目、盘面状态；纯 Dart）、`model/film_map.dart`（胶片地图的布局）、`screens/editor/pad_panel.dart`（面板、页眉、第 2 / 3 层、裁切、复杂编辑器）、`pad_widgets.dart`（盘面、强度条）、`pad_dock.dart`（坞项、按住弹出）、`film_map_view.dart`、`itemised_view.dart`（性格图、尺子）、`pad_icons.dart`（图标）、`pad_gestures.dart`、`editor_controller.dart`、`editor_page.dart`、`editor/panel_layout.dart`（照片下方 / 一侧的几何求解，未变）。测试：`test/pad_panel_test.dart`、`test/model/pad_model_test.dart`、`test/editor/panel_layout_test.dart`。
 
 ## 1. 为什么改
 
@@ -9,7 +9,7 @@
 
 | 层 | 内容 |
 |---|---|
-| 1 | 照片 + 底部坞：光线、颜色、成像、质地、局部、裁切。前四项是活字形方块：方块里的点 = 盘面位置，旁边细条 = 强度；一个元素 = 入口 + 状态 + 读数 |
+| 1 | 照片 + 底部坞：光线、颜色、成像、质地、局部（裁切在顶栏）。坞项是静态图标加文字，改动过的有一个小圆点（2026-11-15 起；原先的活字形已取消，见 `guidelines.md` 15.2.2） |
 | 2 | 点一个坞项：**一块盘面（两个方向）+ 一条竖直强度条**，没有别的，不滚动 |
 | 3 | 页眉的“分项”：该分类的全部参数画成性格图（雷达图），下面**一把尺子**；复杂编辑器（曲线、分色、分级、相纸）是附加入口 |
 
@@ -77,7 +77,7 @@
 
 ## 3. 坞和按住弹出
 
-坞：六项（光线、颜色、成像、质地、局部、裁切），胶囊高 56，每项至少 48 dp 宽（更窄的窗口横滑，不缩项）。字形：24 dp 圆角方块（胶片是圆）、十字细线、一个点（盘面位置）、右侧一根细条（强度，高 2 + 22 a dp）；强度 0 或胶片未选时整体淡到 38 %。选中 = `accentSoft` 底 + `accent`。“更多”（发布、复制 / 粘贴设置、同步、还原）移到顶栏右侧胶囊的“…”。
+坞：五项（光线、颜色、成像、质地、局部；裁切在顶栏），胶囊高 56，每项至少 48 dp 宽（更窄的窗口横滑，不缩项）。【2026-11-15 改】活字形（方块里的盘面位置点和强度细条）已取消，坞项是静态图标加文字，改动过的类别右上一个 accent 圆点，局部显示区域数；规格以 `guidelines.md` v0.12 的 15.2.2 为准。强度 0 或胶片未选时图标淡到 38 %。选中 = `accentSoft` 底 + `accent`。“更多”（发布、复制 / 粘贴设置、同步、还原）移到顶栏右侧胶囊的“…”。
 
 按住一个字形（260 ms）或直接在上面拖超过 8 dp：盘面在坞上方弹出（216 dp，圆角 24，`Fx.shadowFloat`），面板收起、照片保持全尺寸；拖动相对按下时的值（一整个量程 = 94 dp 手指位移）；松手收回，值保留，不打开面板。短按仍打开面板。整个按住是一个撤销步。
 

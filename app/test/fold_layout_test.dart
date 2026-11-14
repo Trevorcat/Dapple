@@ -258,7 +258,7 @@ void main() {
       await openFold(t, size, fold: vFold(size), title: _portraitPhoto);
       expect(find.descendant(of: k('fold-cat-light'), matching: find.byType(DockItem)), findsOneWidget);
       expect(find.descendant(of: k('fold-column'), matching: find.byType(PanelChip)), findsNothing, reason: 'no text chips for the categories');
-      for (final g in ['light', 'color', 'style', 'effects', 'local', 'crop']) {
+      for (final g in ['light', 'color', 'style', 'effects', 'local']) {
         final r = rectOf(t, 'fold-cat-$g');
         expect(r.height, greaterThanOrEqualTo(48));
         expect(r.width, greaterThanOrEqualTo(48));
@@ -314,7 +314,7 @@ void main() {
       expect(k('cluster-ball'), findsNothing, reason: 'no ball beside a portrait photo');
       expect(k('histogram'), findsOneWidget);
       expect(k('pad-light'), findsOneWidget);
-      for (final g in ['light', 'color', 'style', 'effects', 'local', 'crop']) {
+      for (final g in ['light', 'color', 'style', 'effects', 'local']) {
         expect(k('fold-cat-$g'), findsOneWidget);
       }
       final photo = rectOf(t, 'zoom-stage');
@@ -441,10 +441,21 @@ void main() {
       await openFold(t, size, fold: vFold(size), before: (app, id) {
         app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
       });
-      await t.tap(k('cluster-cat-crop'));
+      expect(find.descendant(of: k('cluster-cat-light'), matching: find.byType(DockItem)), findsOneWidget, reason: 'the rail is the dock own items');
+      expect(k('cluster-cat-crop'), findsNothing, reason: '裁切 is in the top bar');
+      await t.tap(k('toolbar-crop'));
       await settle(t, 8);
       expect(k('crop-4:5'), findsOneWidget);
       expect(k('ruler-straighten'), findsOneWidget);
+      // back leaves 裁切 for the category that was open before (the open category is home, 裁切 is a tool)
+      await t.binding.handlePopRoute();
+      await settle(t, 8);
+      expect(k('pad-light'), findsOneWidget);
+      await t.tap(k('toolbar-crop'));
+      await settle(t, 8);
+      await t.tap(k('toolbar-crop'));
+      await settle(t, 8);
+      expect(k('pad-light'), findsOneWidget, reason: 'a second press on the crop button leaves 裁切 too');
       await t.tap(k('cluster-cat-style'));
       await settle(t, 8);
       expect(k('pad-film'), findsOneWidget, reason: 'the pad is the home of 成像, as on the phone');
@@ -483,10 +494,10 @@ void main() {
       expect((above - under).abs(), lessThan(free * 0.3 + 40), reason: 'the leftover is shared, not all under the photo');
     });
 
-    test('short bench photo: the rail takes two columns so all six categories show', () {
+    test('short bench photo: the rail takes two columns so all five categories show', () {
       final g = BallGeo.of(const Rect.fromLTWH(0, 0, 890, 330), Hand.right, 0.5);
       expect(g.rail.width, greaterThan(BallGeo.railW + 1));
-      expect(g.rail.height, greaterThanOrEqualTo(3 * BallGeo.railChip));
+      expect(g.rail.height, greaterThanOrEqualTo(3 * BallGeo.railItem));
       expect(const Rect.fromLTWH(0, 0, 890, 330).contains(g.rail.topLeft) && const Rect.fromLTWH(0, 0, 890, 330).contains(g.rail.bottomRight), isTrue);
       expect(g.rail.overlaps(g.ball), isFalse);
     });

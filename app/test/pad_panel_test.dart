@@ -7,10 +7,10 @@ import 'package:dapple/model/pad_model.dart';
 import 'package:dapple/model/params.dart';
 import 'package:dapple/screens/editor/film_map_view.dart';
 import 'package:dapple/screens/editor/itemised_view.dart';
-import 'package:dapple/screens/editor/pad_dock.dart';
 import 'package:dapple/screens/editor/pad_panel.dart';
 import 'package:dapple/screens/editor/pad_widgets.dart';
 import 'package:dapple/state/app_state.dart';
+import 'package:dapple/widgets/icons.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -28,7 +28,7 @@ Future<(AppState, String)> openFilm(WidgetTester t, {Size phys = ownerPhys, doub
 }
 
 Future<void> tapDock(WidgetTester t, EGroup g) async {
-  await t.tap(find.byKey(ValueKey('dock-$g')));
+  await t.tap(find.byKey(ValueKey(g == EGroup.crop ? 'toolbar-crop' : 'dock-$g')));
   await settle(t, 8);
 }
 
@@ -49,25 +49,25 @@ void main() {
   setUp(() => debugFoldLayouts = false);
   tearDown(() => debugFoldLayouts = true);
   group('dock', () {
-    testWidgets('five items; the first four are live glyphs (dot = pad position, bar = strength), 裁切 is an icon', (t) async {
+    testWidgets('five items, each a static icon over its word; a changed category gets a dot, 裁切 is in the top bar', (t) async {
       final (app, id) = await openFilm(t);
-      for (final l in ['光线', '颜色', '成像', '质地', '裁切']) {
+      for (final l in ['光线', '颜色', '成像', '质地', '局部']) {
         expect(find.text(l), findsWidgets, reason: l);
       }
+      expect(find.byKey(ValueKey('dock-${EGroup.crop}')), findsNothing, reason: '裁切 is not a dock category');
+      expect(find.byKey(const ValueKey('toolbar-crop')), findsOneWidget);
       expect(find.byKey(const ValueKey('docked-panel')), findsNothing);
       for (final c in PadCat.values) {
         expect(find.byKey(ValueKey('glyph-${c.name}')), findsOneWidget);
+        expect(t.widget(find.byKey(ValueKey('glyph-${c.name}'))), isA<DIcon>(), reason: 'a static icon, not a live glyph');
       }
-      GlyphPainter glyph(PadCat c) => (t.widget<CustomPaint>(find.byKey(ValueKey('glyph-${c.name}'))).painter! as GlyphPainter);
-      expect(glyph(PadCat.light).x, 0);
-      expect(glyph(PadCat.light).a, 0.5);
-      app.applyEdit(id, (e) => applyPadState(e, PadCat.light, const PadState(x: 0.6, y: -0.4, a: 0.8), ctx));
+      expect(find.byKey(const ValueKey('dock-mark-color')), findsNothing);
+      expect(find.byKey(const ValueKey('dock-mark-texture')), findsNothing);
+      app.applyEdit(id, (e) => applyPadState(e, PadCat.color, const PadState(x: 0.6, y: -0.4, a: 0.8), ctx));
       await settle(t, 2);
-      expect(glyph(PadCat.light).x, 0.6);
-      expect(glyph(PadCat.light).y, -0.4);
-      expect(glyph(PadCat.light).a, 0.8);
-      expect(glyph(PadCat.color).x, 0, reason: 'the other glyphs stay');
-      // film glyph is dim without a stock
+      expect(find.byKey(const ValueKey('dock-mark-color')), findsOneWidget, reason: 'changed from the default: the dot');
+      expect(find.byKey(const ValueKey('dock-mark-texture')), findsNothing, reason: 'the others stay plain');
+      // film icon is dim without a stock
       expect(t.widget<Opacity>(find.ancestor(of: find.byKey(const ValueKey('glyph-film')), matching: find.byType(Opacity)).first).opacity, lessThan(0.6));
       await dump(t, 'v3_dock_glyphs');
     });

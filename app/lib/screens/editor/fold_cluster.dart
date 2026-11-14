@@ -1,5 +1,5 @@
 // The one-thumb cluster of the workbench layout (docs/design/foldables.md): floats over the photo only, at the holding edge, at the height
-// the thumb is at. A rail of the six categories, the ball (press and push in any direction = a relative pad drag; hold still = compare),
+// the thumb is at. A rail of the five categories (the dock's own items), the ball (press and push in any direction = a relative pad drag; hold still = compare),
 // the strength ring above it, a small 分项 pill beside it, and a grip under it that moves the whole cluster along the edge (dragged past
 // the middle of the photo it changes sides). It fades when idle. Meanings are the phone's: the ball is the pad, the ring is the strength
 // strip, the pill is 分项 (the current category's detail, not a seventh category), the rail is the dock.
@@ -17,10 +17,10 @@ import '../../theme/tokens.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart' show GlassCapsule;
 import 'film_map_view.dart' show FilmMapStore;
-import 'fold_panels.dart' show foldSelect, foldSync;
+import 'fold_panels.dart' show foldSync;
 import 'itemised_view.dart' show CatItemSource;
-import 'pad_dock.dart' show dockLabel, padDockOrder;
-import 'pad_panel.dart' show HeaderButton, PanelChip;
+import 'pad_dock.dart' show DockItem, dockLabel, padDockOrder;
+import 'pad_panel.dart' show HeaderButton;
 import 'pad_widgets.dart';
 
 enum _Drag { none, pad, film, item, crop, remote }
@@ -348,7 +348,7 @@ class _FoldClusterState extends State<FoldCluster> {
           child: Transform.translate(
             offset: Offset(_gdx, 0),
             child: Stack(clipBehavior: Clip.none, children: [
-              Positioned.fromRect(rect: g.rail, child: _Rail(ctl: ctl, onTap: _wake, cols: g.rail.width > BallGeo.railW + 1 ? 2 : 1)),
+              Positioned.fromRect(rect: g.rail, child: _Rail(ctl: ctl, onTap: _wake, itemH: g.itemH, cols: g.rail.width > BallGeo.railW + 1 ? 2 : 1)),
               Positioned.fromRect(rect: g.ring, child: Center(child: SizedBox(width: BallGeo.ringD, height: BallGeo.ringD, child: ring))),
               Positioned.fromRect(rect: g.pill, child: Center(child: pill)),
               Positioned.fromRect(
@@ -422,48 +422,45 @@ class _FoldClusterState extends State<FoldCluster> {
   }
 }
 
-/// The six categories at the holding edge: the dock's words as chips.
+/// The five categories at the holding edge: the dock's own items (icon over word, [DockItem]), in one column or in two (three and
+/// two) when the photo is short. No press-and-hold popup here: the ball beside the rail is the pad.
 class _Rail extends StatelessWidget {
-  const _Rail({required this.ctl, required this.onTap, this.cols = 1});
+  const _Rail({required this.ctl, required this.onTap, required this.itemH, this.cols = 1});
   final EditorController ctl;
   final int cols;
+  final double itemH;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
+    final per = (padDockOrder.length + cols - 1) ~/ cols;
     return ListenableBuilder(
-      listenable: Listenable.merge([ctl.wm, ctl.edits]),
-      builder: (context, _) {
-        final cur = ctl.wm.focused?.group;
-        return GlassCapsule(
-          radius: 32,
-          child: SingleChildScrollView(
-            key: const ValueKey('cluster-rail'),
-            physics: const ClampingScrollPhysics(),
-            padding: const EdgeInsets.all(4),
-            child: Row(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-              for (var col = 0; col < cols; col++)
-                Column(children: [
-                  for (var i = col * (6 ~/ cols); i < (col + 1) * (6 ~/ cols); i++)
-                    SizedBox(
-                      height: BallGeo.railChip,
-                      width: BallGeo.railW - 8,
-                      child: PanelChip(
-                        key: ValueKey('cluster-cat-${padDockOrder[i].name}'),
-                        label: dockLabel(padDockOrder[i]),
-                        selected: cur == padDockOrder[i],
-                        compact: true,
-                        onTap: () {
-                          onTap();
-                          foldSelect(ctl, padDockOrder[i]);
-                        },
-                      ),
-                    ),
-                ]),
+      listenable: Listenable.merge([ctl.wm, ctl.edits, ctl.app.editTick, ctl.local]),
+      builder: (context, _) => GlassCapsule(
+      radius: 28,
+      child: SingleChildScrollView(
+        key: const ValueKey('cluster-rail'),
+        physics: const ClampingScrollPhysics(),
+        padding: const EdgeInsets.all(4),
+        child: Row(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          for (var col = 0; col < cols; col++)
+            Column(children: [
+              for (var i = col * per; i < math.min((col + 1) * per, padDockOrder.length); i++)
+                SizedBox(
+                  height: itemH,
+                  width: BallGeo.railW - 8,
+                  child: KeyedSubtree(
+                    key: ValueKey('cluster-cat-${padDockOrder[i].name}'),
+                    child: DockItem(ctl: ctl, group: padDockOrder[i], holdToAdjust: false, onTap: () {
+                      onTap();
+                      foldSync(ctl);
+                    }),
+                  ),
+                ),
             ]),
-          ),
-        );
-      },
+        ]),
+      ),
+      ),
     );
   }
 }

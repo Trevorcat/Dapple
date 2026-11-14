@@ -324,6 +324,40 @@ class EditorController extends ChangeNotifier implements GestureSink {
     _bump();
   }
 
+  /// The category that was open when 裁切 was entered from the top bar (the fold layouts return to it).
+  EGroup? _beforeCrop;
+
+  /// True while 裁切 is open (its entry is the top bar's crop button, not a dock category).
+  bool get cropOpen => wm.focused?.group == EGroup.crop;
+
+  /// The top bar's crop button: opens 裁切, a second press leaves it. On the phone leaving closes the panel like a second tap on a dock
+  /// item; in the fold layouts, where a category is always open, it returns to the category that was open before.
+  void toggleCrop() {
+    if (cropOpen) {
+      _leaveCrop();
+      return;
+    }
+    final was = wm.focused?.group;
+    _beforeCrop = was;
+    if (controlsHome) {
+      showCategory(EGroup.crop);
+    } else {
+      openCategory(EGroup.crop);
+    }
+  }
+
+  void _leaveCrop() {
+    if (controlsHome) {
+      final back = _beforeCrop;
+      showCategory(back == null || back == EGroup.crop ? EGroup.light : back);
+    } else {
+      wm.toggle(EGroup.crop);
+      _resetLayers();
+      _bump();
+    }
+    _beforeCrop = null;
+  }
+
   /// Opens [g] without toggling (debug link, tests): layers back to the pad.
   void showCategory(EGroup g) {
     if (wm.focused?.group != g) wm.toggle(g);
@@ -853,6 +887,11 @@ class EditorController extends ChangeNotifier implements GestureSink {
       _bump();
       return true;
     }
+    // 裁切 is a tool entered from the top bar, not a category: in the fold layouts (where the open category is home) back leaves it
+    if (controlsHome && cropOpen) {
+      _leaveCrop();
+      return true;
+    }
     if (!controlsHome && wm.closeLatest()) {
       _resetLayers();
       _bump();
@@ -867,7 +906,7 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   /// Something transient is open that one back would close (the route must not pop then).
   bool get hasTransient =>
-      editingRow.value != null || local.hasCard || extra != null || itemised || _mapIsLayer || (wm.adjustMode && !controlsHome) || immersive.value;
+      editingRow.value != null || local.hasCard || extra != null || itemised || _mapIsLayer || (wm.adjustMode && !controlsHome) || (controlsHome && cropOpen) || immersive.value;
 
   /// The film map is a layer of 成像 in every layout (back closes it, choosing a stock returns to the pad).
   bool get _mapIsLayer => filmMapOpen;

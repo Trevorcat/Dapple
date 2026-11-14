@@ -49,7 +49,7 @@ Future<void> _back(WidgetTester t) async {
 bool _inEditor() => find.byType(EditorPage).evaluate().isNotEmpty;
 ZoomController _zoom(WidgetTester t) => t.widget<ZoomView>(find.byKey(const ValueKey('zoom-stage'))).controller;
 Future<void> _dock(WidgetTester t, EGroup g) async {
-  await t.tap(find.byKey(ValueKey('dock-$g')));
+  await t.tap(find.byKey(ValueKey(g == EGroup.crop ? 'toolbar-crop' : 'dock-$g')));
   await _settle(t);
 }
 

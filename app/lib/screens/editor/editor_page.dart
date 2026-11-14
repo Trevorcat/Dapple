@@ -756,7 +756,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
           builder: (context, _) {
             final pr = _photoRect();
             if (pr.isEmpty) return const SizedBox.shrink();
-            return Positioned.fill(child: FoldCluster(ctl: ctl, geo: BallGeo.of(pr, wm.side, _ballT.value, clearCorners: wm.focused?.group == EGroup.crop), onSlide: _slideCluster, onDrop: _dropCluster, hidden: _cropHandleDrag));
+            return Positioned.fill(child: FoldCluster(ctl: ctl, geo: BallGeo.of(pr, wm.side, _ballT.value, clearCorners: wm.focused?.group == EGroup.crop, itemH: padDockH(textScale)), onSlide: _slideCluster, onDrop: _dropCluster, hidden: _cropHandleDrag));
           },
         ),
       // 2 readout: counters and the original pill; for a 2D value driven by the photo, the live readout too
@@ -808,12 +808,12 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
                       animation: _t,
                       builder: (context, _) {
                         final pr = _photoRect();
-                        return Positioned(top: pr.top + 8, left: pr.left + 8, width: math.max(0.0, pr.width - 16), child: EditorTopBar(app: app, photoId: () => id, onBack: _onBackButton, onMore: _toggleMenu, immersive: imm));
+                        return Positioned(top: pr.top + 8, left: pr.left + 8, width: math.max(0.0, pr.width - 16), child: EditorTopBar(app: app, ctl: ctl, photoId: () => id, onBack: _onBackButton, onMore: _toggleMenu, immersive: imm));
                       },
                     );
                   }
                   final sideOpen = to.open && to.place == PanelPlace.side;
-                  final bar = EditorTopBar(app: app, photoId: () => id, onBack: _onBackButton, onMore: _toggleMenu, vertical: sideOpen, immersive: imm);
+                  final bar = EditorTopBar(app: app, ctl: ctl, photoId: () => id, onBack: _onBackButton, onMore: _toggleMenu, vertical: sideOpen, immersive: imm);
                   if (sideOpen) {
                     // a rail on the photo column's outer edge (the pane is on the other side): the photo keeps the full height
                     final paneLeading = to.panel.center.dx < size.width / 2;
