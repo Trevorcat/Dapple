@@ -6,6 +6,7 @@ import '../../services/tool_models.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
+import '../../widgets/float_bar.dart';
 import '../../widgets/icons.dart';
 import '../../widgets/photo_art.dart';
 import 'capture_flow.dart';
@@ -83,7 +84,8 @@ class _HomePageState extends State<HomePage> {
 
   Widget _body(BuildContext context) {
     final groups = app.groups;
-    final bottomPad = widget.wide ? 24.0 : 120.0;
+    // the floating capsule (tabs, or the selection actions) covers the bottom edge: the last row ends above it
+    final bottomPad = widget.wide && !app.selectMode ? 24.0 : floatBarClearance(context);
     return CustomScrollView(
       key: const ValueKey('home-scroll'),
       controller: _scroll,

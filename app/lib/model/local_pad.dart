@@ -4,6 +4,7 @@
 import 'dart:math' as math;
 
 import 'local_adjust.dart';
+import 'pad_model.dart' show PadCat;
 import 'portrait.dart';
 
 /// Engine strength (0..100) of the strip position [a]: 0 at the bottom, 100 from the middle up.
@@ -23,6 +24,10 @@ Map<String, double> localRecipe(LocalUi u) {
     'temp': 40 * u.cx * k,
     'saturation': 30 * u.cy * k,
     'vibrance': 15 * u.cy * k,
+    // the texture pad: 柔 - 锐 is clarity with a little texture, 朦胧 - 通透 is dehaze (all zero at the centre)
+    'clarity': 40 * u.tx * k,
+    'texture': 20 * u.tx * k,
+    'dehaze': 35 * u.ty * k,
   };
 }
 
@@ -90,13 +95,35 @@ LocalAdjustment resetLocalOps(LocalAdjustment a) => a.copyWith(ops: const {}, st
 
 bool localOpsAdjusted(LocalAdjustment a) => a.ops.isNotEmpty || a.strength != 100 || !(a.ui?.same(LocalUi.centre) ?? true);
 
-/// Header readout of the area's pads: 强度 n% · 亮 n · 暖 n (only the directions that are away from the centre).
-String localReadout(LocalUi u, {LocalAdjustment? area}) {
+/// The edge words of the 局部 texture pad (left, right, bottom, top): the global texture pad's 柔 / 锐, and dehaze on the vertical.
+const List<String> kLocalTextureWords = ['柔', '锐', '朦胧', '通透'];
+
+/// Header readout of the area's pads: 强度 n% · 亮 n · 暖 n (only the directions that are away from the centre). [pad]: the pad that is
+/// showing (the readout follows it: its two directions); null = the light and colour pads' main directions (as before the switch).
+String localReadout(LocalUi u, {LocalAdjustment? area, PadCat? pad}) {
   String dir(double v, String neg, String pos) => v == 0 ? '' : ' · ${v > 0 ? pos : neg} ${(v.abs() * 100).round()}';
   final pct = area == null ? localStripPercent(null, u.a) : localStripPercent(area, u.a);
   if (area != null && portraitOf(area) != null) return '强度 ${pct.round()}%';
-  return '强度 ${pct.round()}%${dir(u.lx, '暗', '亮')}${dir(u.cx, '冷', '暖')}';
+  final head = '强度 ${pct.round()}%';
+  switch (pad) {
+    case PadCat.light:
+      return '$head${dir(u.lx, '暗', '亮')}${dir(u.ly, '反差低', '反差高')}';
+    case PadCat.color:
+      return '$head${dir(u.cx, '冷', '暖')}${dir(u.cy, '淡', '浓')}';
+    case PadCat.texture:
+      return '$head${dir(u.tx, kLocalTextureWords[0], kLocalTextureWords[1])}${dir(u.ty, kLocalTextureWords[2], kLocalTextureWords[3])}';
+    default:
+      return '$head${dir(u.lx, '暗', '亮')}${dir(u.cx, '冷', '暖')}';
+  }
 }
+
+/// Whether the pad of [cat] is away from its centre (the dot on its segment of the switch).
+bool localPadMoved(LocalUi u, PadCat cat) => switch (cat) {
+  PadCat.light => u.lx != 0 || u.ly != 0,
+  PadCat.color => u.cx != 0 || u.cy != 0,
+  PadCat.texture => u.tx != 0 || u.ty != 0,
+  PadCat.film => false,
+};
 
 /// The strip of an area (audit U1): bottom 0, middle 100 % = the recommended amount, top = the most it gives.
 ///  an ordinary area: middle = engine strength 100, top = the pads' recipe doubled: 200 %;

@@ -10,6 +10,7 @@ import '../../models.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
+import '../../widgets/float_bar.dart';
 import '../../widgets/export_size.dart';
 import '../../widgets/icons.dart';
 import 'codec_diagnostics_page.dart';
@@ -54,7 +55,7 @@ class _SettingsPageState extends State<SettingsPage> {
     Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => CodecDiagnosticsPage(cableDiagnostics: app.isDemo ? null : app.usb.diagnostics)));
   }
 
-  Widget _phone(BuildContext context) => ListView(padding: const EdgeInsets.only(bottom: 120), children: [
+  Widget _phone(BuildContext context) => ListView(padding: EdgeInsets.only(bottom: floatBarClearance(context)), children: [
         for (var i = 0; i < _cats.length; i++) ...[SectionTitle(_cats[i]), ..._section(context, i)],
       ]);
 

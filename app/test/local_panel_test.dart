@@ -100,8 +100,9 @@ void main() {
       expect(area(r).mask, hasLength(1));
       expect(area(r).mask.first.kind, MaskKindId.radial);
       expect(key('local-chip-0'), findsOneWidget);
-      expect(key('local-pad-light'), findsOneWidget);
-      expect(key('local-pad-color'), findsOneWidget);
+      expect(key('local-pad-light'), findsOneWidget, reason: 'one full-size pad, the light one first');
+      expect(key('local-pad-color'), findsNothing);
+      expect(key('local-seg-light'), findsOneWidget);
       expect(key('kind-radial'), findsNothing, reason: 'the card closed itself');
       expect(r.lc.selId, area(r).id);
       expect(r.app.canUndo(r.id), isTrue);
@@ -181,6 +182,7 @@ void main() {
       final r = await openLocal(t);
       await addViaCard(t, 'radial');
       final before = area(r).mask.first;
+      await settle(t, 8); // the panel's height follows the new layer (animated): the photo frame settles first
       final fr = frameRect(t);
       final f = await Finger.down(t, fr.center);
       await f.drag(const Offset(40, 24));

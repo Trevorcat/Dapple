@@ -443,19 +443,22 @@ bool _deepEq(Object? a, Object? b) {
 /// The pad state of one area (docs/design/local-adjustments.md section 4): light pad (lx, ly), colour pad (cx, cy), the strength
 /// strip [a] (0..1, 0.5 = 100 %) and the item offsets of the itemised view (op key -> offset in JSON units). Kept by the app only.
 class LocalUi {
-  const LocalUi({this.lx = 0, this.ly = 0, this.cx = 0, this.cy = 0, this.a = 0.5, this.off = const {}});
-  final double lx, ly, cx, cy, a;
+  const LocalUi({this.lx = 0, this.ly = 0, this.cx = 0, this.cy = 0, this.tx = 0, this.ty = 0, this.a = 0.5, this.off = const {}});
+
+  /// The three pads' positions (light, colour, texture; each -1..1) and the strip (0..1). tx / ty are the texture pad (柔 - 锐, 朦胧 - 通透);
+  /// an edit saved before that pad existed has none (0), and its JSON stays as it was.
+  final double lx, ly, cx, cy, tx, ty, a;
   final Map<String, double> off;
 
   static const centre = LocalUi();
 
-  LocalUi copyWith({double? lx, double? ly, double? cx, double? cy, double? a, Map<String, double>? off}) =>
-      LocalUi(lx: lx ?? this.lx, ly: ly ?? this.ly, cx: cx ?? this.cx, cy: cy ?? this.cy, a: a ?? this.a, off: off ?? this.off);
+  LocalUi copyWith({double? lx, double? ly, double? cx, double? cy, double? tx, double? ty, double? a, Map<String, double>? off}) =>
+      LocalUi(lx: lx ?? this.lx, ly: ly ?? this.ly, cx: cx ?? this.cx, cy: cy ?? this.cy, tx: tx ?? this.tx, ty: ty ?? this.ty, a: a ?? this.a, off: off ?? this.off);
 
   bool same(LocalUi o) =>
-      lx == o.lx && ly == o.ly && cx == o.cx && cy == o.cy && a == o.a && off.length == o.off.length && off.entries.every((e) => o.off[e.key] == e.value);
+      lx == o.lx && ly == o.ly && cx == o.cx && cy == o.cy && tx == o.tx && ty == o.ty && a == o.a && off.length == o.off.length && off.entries.every((e) => o.off[e.key] == e.value);
 
-  Map<String, Object> toJson() => {'lx': lx, 'ly': ly, 'cx': cx, 'cy': cy, 'a': a, if (off.isNotEmpty) 'off': off};
+  Map<String, Object> toJson() => {'lx': lx, 'ly': ly, 'cx': cx, 'cy': cy, if (tx != 0) 'tx': tx, if (ty != 0) 'ty': ty, 'a': a, if (off.isNotEmpty) 'off': off};
 
   static LocalUi? fromJson(Object? j) {
     if (j is! Map) return null;
@@ -467,7 +470,7 @@ class LocalUi {
         if (k is String && v is num && v.isFinite && localOpByKey.containsKey(k)) off[k] = v.toDouble();
       });
     }
-    return LocalUi(lx: n('lx', 0, -1, 1), ly: n('ly', 0, -1, 1), cx: n('cx', 0, -1, 1), cy: n('cy', 0, -1, 1), a: n('a', 0.5, 0, 1), off: off);
+    return LocalUi(lx: n('lx', 0, -1, 1), ly: n('ly', 0, -1, 1), cx: n('cx', 0, -1, 1), cy: n('cy', 0, -1, 1), tx: n('tx', 0, -1, 1), ty: n('ty', 0, -1, 1), a: n('a', 0.5, 0, 1), off: off);
   }
 }
 

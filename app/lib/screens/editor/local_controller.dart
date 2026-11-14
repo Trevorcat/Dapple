@@ -88,6 +88,29 @@ class LocalController extends ChangeNotifier {
   /// Itemised view group: light, color, detail.
   String itemGroup = 'light';
 
+  /// The pad showing in the default layer of an ordinary area (the 光线 / 颜色 / 质地 switch); kept when another area is selected.
+  PadCat padCat = PadCat.light;
+
+  /// The width the header's lines were sized for (the editor page sets it, so the header and the panel height agree on whether the
+  /// switch shares the chips line); null = the header measures its own width.
+  double? headerInnerW;
+
+  /// Whether the switch is part of the layer now: an ordinary area's pads (not the portrait group, not 分项, not a card).
+  bool get showsPadSwitch => body == LocalBody.pads && !ctl.itemised && sel != null && !selIsPortrait;
+
+  /// The pad source of the showing pad.
+  LocalPadSource get pad => switch (padCat) {
+    PadCat.color => colorPad,
+    PadCat.texture => texturePad,
+    _ => lightPad,
+  };
+
+  void setPadCat(PadCat c) {
+    if (padCat == c) return;
+    padCat = c;
+    _changed();
+  }
+
   /// Brush tool (screen dp radii, so a zoomed-in photo gets a finer brush).
   int brushSize = 1;
   bool erase = false;
@@ -1807,6 +1830,7 @@ class LocalController extends ChangeNotifier {
 
   late final LocalPadSource lightPad = LocalPadSource(this, PadCat.light);
   late final LocalPadSource colorPad = LocalPadSource(this, PadCat.color);
+  late final LocalPadSource texturePad = LocalPadSource(this, PadCat.texture);
   late final LocalItemSource items = LocalItemSource(this);
 
   /// The itemised view of a portrait area: its recipe's ops (to the recipe's maxima), and for 肤质 the heal sensitivity.
@@ -1879,7 +1903,11 @@ class LocalPadSource extends PadSource {
   @override
   PadState get view {
     final u = _ui;
-    return cat == PadCat.light ? PadState(x: u.lx, y: u.ly, a: u.a) : PadState(x: u.cx, y: u.cy, a: u.a);
+    return switch (cat) {
+      PadCat.color => PadState(x: u.cx, y: u.cy, a: u.a),
+      PadCat.texture => PadState(x: u.tx, y: u.ty, a: u.a),
+      _ => PadState(x: u.lx, y: u.ly, a: u.a),
+    };
   }
 
   @override
@@ -1887,7 +1915,11 @@ class LocalPadSource extends PadSource {
 
   @override
   void begin() {
-    lc.ctl.gestureBegin('local-pad-${cat.name}', param: cat == PadCat.light ? 'exposure' : 'temp');
+    lc.ctl.gestureBegin('local-pad-${cat.name}', param: switch (cat) {
+      PadCat.color => 'temp',
+      PadCat.texture => 'clarity',
+      _ => 'exposure',
+    });
     lc.padDragging = true;
     lc._updateVis();
   }
@@ -1901,7 +1933,11 @@ class LocalPadSource extends PadSource {
     final before = view;
     if (before.x == px && before.y == py) return;
     if (px == 0 && py == 0) lc.ctl.haptics.fire(HapticKind.autoSnap);
-    final n = cat == PadCat.light ? u.copyWith(lx: px, ly: py) : u.copyWith(cx: px, cy: py);
+    final n = switch (cat) {
+      PadCat.color => u.copyWith(cx: px, cy: py),
+      PadCat.texture => u.copyWith(tx: px, ty: py),
+      _ => u.copyWith(lx: px, ly: py),
+    };
     lc._writeSel((a) => applyLocalUi(a, n));
   }
 
@@ -1926,7 +1962,7 @@ class LocalPadSource extends PadSource {
   void reset() => lc.resetOps();
 
   @override
-  String get readout => localReadout(_ui, area: lc.sel);
+  String get readout => localReadout(_ui, area: lc.sel, pad: cat);
 
   @override
   double percent(double a) => localStripPercent(lc.sel, a);

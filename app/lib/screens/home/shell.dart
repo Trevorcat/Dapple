@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
+import '../../widgets/float_bar.dart';
 import '../../widgets/icons.dart';
 import '../library/settings_page.dart';
 import '../library/styles_page.dart';
@@ -21,8 +22,8 @@ const _tabs = [
   ('设置', DI.settings),
 ];
 
-/// Root navigation: three destinations; bottom navigation bar (phone) or navigation rail (wide).
-/// Selection mode replaces the navigation with the selection bar (Android bottom bar).
+/// Root navigation: three destinations; a floating capsule above the bottom inset (phone; the editor dock's own surface, guidelines 15.6)
+/// or a navigation rail (wide). Selection mode replaces the tabs with the selection capsule (保存 / 合成 / 发布) in both.
 class DappleShell extends StatelessWidget {
   const DappleShell({super.key, required this.app});
   final AppState app;
@@ -36,7 +37,6 @@ class DappleShell extends StatelessWidget {
         final c = context.c;
         final wide = MediaQuery.sizeOf(context).width >= kWideBreakpoint;
         final selecting = app.selectMode && app.tab == 0;
-        final bottom = MediaQuery.paddingOf(context).bottom;
         final pages = IndexedStack(index: app.tab, children: [
           HomePage(app: app, wide: wide),
           StylesPage(app: app, wide: wide),
@@ -50,6 +50,7 @@ class DappleShell extends StatelessWidget {
         } else {
           bar = const SizedBox.shrink();
         }
+        final capsule = selecting || !wide;
         return Scaffold(
           backgroundColor: c.bg,
           body: Stack(children: [
@@ -60,7 +61,8 @@ class DappleShell extends StatelessWidget {
               ]),
             ),
             Positioned(left: 0, right: 0, bottom: 0, child: bar),
-            ToastLayer(app: app, bottom: wide ? 24 + (selecting ? 80 + bottom : 0) : (selecting ? 116 : 112)),
+            // the toast rides above the capsule when there is one
+            ToastLayer(app: app, bottom: capsule ? floatBarBase(context) + kFloatBarGap + kFloatBarH + Sp.m : 24),
           ]),
         );
       },
@@ -74,30 +76,12 @@ class _NavBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final c = context.c;
-    final bottom = MediaQuery.paddingOf(context).bottom;
-    return Container(
-      key: const ValueKey('nav-bar'),
-      color: c.navAnd,
-      height: 80 + bottom,
-      padding: EdgeInsets.fromLTRB(8, 12, 8, bottom),
-      child: Row(children: [
+    return FloatBar(
+      capsuleKey: const ValueKey('nav-bar'),
+      children: [
         for (var i = 0; i < _tabs.length; i++)
-          Expanded(
-            child: Semantics(
-              button: true,
-              selected: app.tab == i,
-              label: _tabs[i].$1,
-              excludeSemantics: true,
-              child: GestureDetector(
-                key: ValueKey('nav-$i'),
-                behavior: HitTestBehavior.opaque,
-                onTap: () => app.setTab(i),
-                child: _NavItem(label: _tabs[i].$1, icon: _tabs[i].$2, selected: app.tab == i, width: 64),
-              ),
-            ),
-          ),
-      ]),
+          FloatBarItem(key: ValueKey('nav-$i'), label: _tabs[i].$1, icon: _tabs[i].$2, selected: app.tab == i, onTap: () => app.setTab(i)),
+      ],
     );
   }
 }
@@ -201,48 +185,41 @@ class _SelectBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.c;
-    final bottom = MediaQuery.paddingOf(context).bottom;
-    final n = app.selectedIds.length;
-    final on = n > 0;
-    return Container(
-      key: const ValueKey('select-bar'),
-      color: c.navAnd,
-      height: 80 + bottom,
-      padding: EdgeInsets.fromLTRB(4, 12, 16, bottom),
-      child: Row(children: [
-        KeyedSubtree(
-            key: const ValueKey('sel-save'),
-            child: DIconButton(DI.save, label: '存相册', onPressed: on ? () => _save(context) : null)),
+    final on = app.selectedIds.isNotEmpty;
+    return FloatBar(
+      capsuleKey: const ValueKey('select-bar'),
+      children: [
+        FloatBarItem(key: const ValueKey('sel-save'), label: '存相册', icon: DI.save, width: 72, onTap: on ? () => _save(context) : null),
         // HDR / panorama need the engine's merge build (not on iOS yet): no entry rather than a tool that can only fail.
-        if (app.engine.available)
-          KeyedSubtree(
-              key: const ValueKey('sel-compose'),
-              child: DIconButton(DI.merge, label: '合成', onPressed: on ? () => _compose(context) : null)),
-        const Spacer(),
+        if (app.engine.available) FloatBarItem(key: const ValueKey('sel-compose'), label: '合成', icon: DI.merge, width: 72, onTap: on ? () => _compose(context) : null),
+        const SizedBox(width: 4),
         Semantics(
           button: true,
           enabled: on,
           label: '发布',
           excludeSemantics: true,
+          onTap: on ? () => _publish(context) : null,
           child: Opacity(
             opacity: on ? 1 : 0.4,
             child: GestureDetector(
               key: const ValueKey('sel-publish'),
+              behavior: HitTestBehavior.opaque,
               onTap: on ? () => _publish(context) : null,
               child: Container(
-                height: 56,
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                decoration: BoxDecoration(color: c.primaryContainer, borderRadius: BorderRadius.circular(16)),
+                height: kFloatBarH - 8,
+                margin: const EdgeInsets.only(right: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 18),
+                decoration: BoxDecoration(color: c.primaryContainer, borderRadius: BorderRadius.circular(kFloatBarRadius - 4)),
                 child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  DIcon(DI.publish, size: 24, color: c.onPrimaryContainer),
-                  const SizedBox(width: 8),
+                  DIcon(DI.publish, size: 22, color: c.onPrimaryContainer),
+                  const SizedBox(width: 6),
                   Text('发布', style: T.body17(c.onPrimaryContainer, w: FontWeight.w500)),
                 ]),
               ),
             ),
           ),
         ),
-      ]),
+      ],
     );
   }
 }

@@ -632,13 +632,19 @@ void main() {
       await step(t, z, '局部 empty', () async => snap(t, z, 'local_empty', '编辑 局部: empty state, the shape card (add menu)'));
       await step(t, z, 'circle', () async {
         await tapK(t, 'kind-radial');
-        await snap(t, z, 'local_circle', '编辑 局部: circle area, light pad');
+        await snap(t, z, 'local_circle', '编辑 局部: circle area, one full-size light pad with the 光线 / 颜色 / 质地 switch');
+        await tapK(t, 'local-seg-texture');
+        await snap(t, z, 'local_texture_pad', '编辑 局部: the 质地 pad (柔 / 锐, 朦胧 / 通透)');
+        await tapK(t, 'local-seg-color');
+        await snap(t, z, 'local_color_pad', '编辑 局部: the 颜色 pad');
+        await tapK(t, 'local-seg-light');
       });
       await step(t, z, 'gradient', () async {
         await tapK(t, 'local-add');
         await snap(t, z, 'local_add_menu', '编辑 局部: 加一块 (shape card with an area present)');
         await tapK(t, 'kind-linear');
         await snap(t, z, 'local_gradient', '编辑 局部: gradient area');
+        await snap(t, z, 'local_two_areas', '编辑 局部: two areas (chips line, the switch beside or under it)');
       });
       await step(t, z, 'brush', () async {
         await tapK(t, 'local-add');

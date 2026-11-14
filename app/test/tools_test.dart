@@ -12,6 +12,7 @@ import 'package:dapple/services/tool_models.dart';
 import 'package:dapple/screens/tools/live_tool_page.dart';
 import 'package:dapple/screens/tools/merge_tool_page.dart';
 import 'package:dapple/state/app_state.dart';
+import 'package:dapple/widgets/icons.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -205,28 +206,31 @@ void main() {
       expect(find.byKey(const ValueKey('tool-hdr')), findsOneWidget);
       expect(find.byKey(const ValueKey('tool-pano')), findsOneWidget);
       expect(find.byKey(const ValueKey('tool-live')), findsOneWidget);
+      // HDR 合成 and 全景拼接 have their own icons
+      DI iconOf(String k) => tester.widget<DIcon>(find.descendant(of: find.byKey(ValueKey(k)), matching: find.byType(DIcon))).icon;
+      expect(iconOf('tool-hdr'), DI.hdr);
+      expect(iconOf('tool-pano'), DI.pano);
+      expect(iconOf('tool-hdr'), isNot(iconOf('tool-pano')));
       await fixShot(tester, 'plus_menu_tools');
+      // nothing chosen yet: the picker of all photos opens at once, not an empty page
       await tester.tap(find.byKey(const ValueKey('tool-hdr')));
       await _settle(tester);
-      expect(find.text('HDR 合成'), findsOneWidget);
-      expect(find.text('至少选 2 张'), findsOneWidget);
-      expect(find.byKey(const ValueKey('tool-pick')), findsOneWidget, reason: 'the picker of all photos');
-      await fixShot(tester, 'manual_hdr_empty');
-      await tester.tap(find.byKey(const ValueKey('tool-pick')));
-      await _settle(tester);
-      expect(find.byType(BottomSheet), findsOneWidget);
+      expect(find.byType(MergeToolPage), findsOneWidget);
+      expect(find.byType(BottomSheet), findsOneWidget, reason: 'the picker is already open');
+      await fixShot(tester, 'manual_hdr_picker');
+      // leaving it with nothing chosen leaves the tool (no empty page)
       app.navigatorKey.currentState!.pop();
       await _settle(tester);
+      await tester.pump(const Duration(seconds: 1));
       expect(find.byType(BottomSheet), findsNothing);
-      app.navigatorKey.currentState!.pop();
-      await _settle(tester);
+      expect(find.byType(MergeToolPage), findsNothing, reason: 'no empty page left behind');
 
       await tester.tap(find.byKey(const ValueKey('import-button')));
       await _settle(tester);
       await tester.tap(find.byKey(const ValueKey('tool-pano')));
       await _settle(tester);
-      expect(find.text('全景合成'), findsOneWidget);
-      expect(find.byKey(const ValueKey('tool-pick')), findsOneWidget);
+      expect(find.byType(MergeToolPage), findsOneWidget);
+      expect(find.byType(BottomSheet), findsOneWidget);
       app.navigatorKey.currentState!.pop();
       await _settle(tester);
       await tester.pump(const Duration(seconds: 1));

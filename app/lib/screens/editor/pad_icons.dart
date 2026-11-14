@@ -57,6 +57,14 @@ Path _zigzag() => Path()
   ..lineTo(13.7, 6)
   ..lineTo(17.5, 13);
 
+Path _sparkle() => Path()
+  ..moveTo(10, 2.5)
+  ..quadraticBezierTo(10.8, 9.2, 17.5, 10)
+  ..quadraticBezierTo(10.8, 10.8, 10, 17.5)
+  ..quadraticBezierTo(9.2, 10.8, 2.5, 10)
+  ..quadraticBezierTo(9.2, 9.2, 10, 2.5)
+  ..close();
+
 final RRect _square = RRect.fromRectAndRadius(const Rect.fromLTWH(4, 4, 12, 12), const Radius.circular(3));
 
 const _grainDots = [Offset(7.5, 7.5), Offset(11, 8.2), Offset(8.3, 11), Offset(12.4, 11.6), Offset(10, 13.2), Offset(13, 7)];
@@ -107,6 +115,18 @@ void paintPadIcon(Canvas canvas, PadIconKind kind, Rect box, Color color, {bool 
         canvas.drawPath(_zigzag(), stroke);
       case PadIconKind.clean:
         canvas.drawRRect(_square, stroke);
+      case PadIconKind.hazy:
+        // 朦胧: three veils of fog, the lower ones shorter
+        for (final l in const [
+          [3.0, 6.5, 17.0],
+          [5.0, 10.0, 15.0],
+          [7.0, 13.5, 13.0],
+        ]) {
+          canvas.drawLine(Offset(l[0], l[1]), Offset(l[2], l[1]), stroke);
+        }
+      case PadIconKind.clear:
+        // 通透: a four-point sparkle
+        canvas.drawPath(_sparkle(), stroke);
       case PadIconKind.grain:
         canvas.drawRRect(_square, stroke);
         for (final d in _grainDots) {

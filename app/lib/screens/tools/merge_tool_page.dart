@@ -43,6 +43,14 @@ class _MergeToolPageState extends State<MergeToolPage> {
   void initState() {
     super.initState();
     _schedulePreview();
+    // opened from the "+" sheet with nothing chosen: the picker at once, not an empty page (leaving it with nothing leaves the tool)
+    if (d.sources.isEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        await _pick();
+        if (mounted && d.sources.isEmpty) Navigator.of(context).maybePop();
+      });
+    }
   }
 
   @override

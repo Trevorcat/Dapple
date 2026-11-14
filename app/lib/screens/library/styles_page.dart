@@ -11,6 +11,7 @@ import '../../services/base_swatches.dart' show SwatchSource;
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/film_canister.dart';
+import '../../widgets/float_bar.dart';
 import '../../widgets/photo_art.dart';
 import '../editor/film_map_view.dart' show FilmMapStore;
 import 'page_bar.dart';
@@ -305,7 +306,7 @@ class _StylesPageState extends State<StylesPage> {
 
   Widget _phoneBody(BuildContext context) {
     return ListView(
-      padding: const EdgeInsets.only(bottom: 120),
+      padding: EdgeInsets.only(bottom: floatBarClearance(context)),
       children: [
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: Sp.l),

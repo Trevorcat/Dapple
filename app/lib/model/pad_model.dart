@@ -47,7 +47,7 @@ extension PadCatX on PadCat {
 }
 
 /// The line icons of the pad edges (one vocabulary everywhere; drawn by pad_icons.dart).
-enum PadIconKind { moon, sun, contrastLow, contrastHigh, cold, warm, pale, rich, soft, sharp, clean, grain }
+enum PadIconKind { moon, sun, contrastLow, contrastHigh, cold, warm, pale, rich, soft, sharp, clean, grain, hazy, clear }
 
 /// What the recipes need to know about the app's settings.
 class PadCtx {

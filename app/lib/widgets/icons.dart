@@ -29,6 +29,9 @@ enum DI {
   select,
   save,
   merge,
+  // the home "+" sheet's two merge tools: HDR (a frame with a half-lit disc: exposures merged) and panorama (a wide frame with a ridge)
+  hdr,
+  pano,
   publish,
   reset,
   flip,
@@ -264,6 +267,15 @@ class _IconPainter extends CustomPainter {
       case DI.merge:
         rr(3.5, 3.5, 11, 11, 2.5);
         rr(9.5, 9.5, 11, 11, 2.5);
+        break;
+      case DI.hdr:
+        rr(3, 4.5, 18, 15, 3.5);
+        canvas.drawCircle(const Offset(12, 12), 4, line);
+        canvas.drawPath(Path()..addArc(Rect.fromCircle(center: const Offset(12, 12), radius: 4), math.pi / 2, math.pi)..close(), fill);
+        break;
+      case DI.pano:
+        rr(2.5, 7, 19, 10, 2.5);
+        canvas.drawPath(poly([6, 14, 9.5, 10.5, 12.5, 13, 14.5, 11.5, 18, 14]), line);
         break;
       case DI.publish:
         canvas.drawPath(poly([21, 3, 10, 14]), line);

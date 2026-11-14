@@ -31,7 +31,7 @@ import 'editor_controller.dart';
 import 'editor_overlays.dart';
 import 'gesture_surface.dart';
 import '../../services/local_ai.dart';
-import 'local_panel.dart' show LocalToolStrip, localToolsShown, portraitBodyNeed, toolStripH;
+import 'local_panel.dart' show LocalHeader, LocalToolStrip, localToolsShown, portraitBodyNeed, toolStripH;
 import 'local_layer.dart';
 import 'sync_dialog.dart';
 import 'zoom_view.dart';
@@ -298,9 +298,19 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
     // The panel is as tall as its category needs and never changes height within it; the placement (bottom / side) is
     // decided per category, screen, photo and hand side, never during a drag.
     final region = dockTop - 8 - regionTop;
+    // 局部's header lines under the title (the area chips, and the 光线 / 颜色 / 质地 switch where it has no room beside them): sized for the width
+    // of the panel where it stands now (the placement is decided per category and screen, above), and the header builds with the same width,
+    // so the panel height and the header agree
+    var localHeaderExtra = 0.0;
+    if (w.group == EGroup.local) {
+      final panelW = _place == PanelPlace.side ? sw - e.marginL : math.min(size.width - 2 * e.marginL, kPanelMaxW);
+      final inner = panelW - 2 * Sp.l;
+      ctl.local.headerInnerW = inner;
+      localHeaderExtra = LocalHeader.belowLinesFor(ctl.local, inner, e.textScale) * kHeaderH;
+    }
     PanelNeeds needsFor({required bool collapsed, required bool itemised, double? bodyNeed}) => panelNeeds(
         screenW: size.width, paneW: sw - e.marginL, screenH: e.size.height, region: region, photoW: size.width - e.photoPad.horizontal, aspect: aspect,
-        textScale: e.textScale, collapsed: collapsed, itemised: itemised, headerExtra: w.group == EGroup.local ? kHeaderH : 0, bodyNeed: bodyNeed);
+        textScale: e.textScale, collapsed: collapsed, itemised: itemised, headerExtra: localHeaderExtra, bodyNeed: bodyNeed);
     // heights follow the content of the layer (guidelines 15.1-7); a change between layers is animated by _retarget
     PanelNeeds needs() => needsFor(
         collapsed: w.collapsed,

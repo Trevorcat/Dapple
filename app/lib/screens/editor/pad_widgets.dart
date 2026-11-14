@@ -73,9 +73,10 @@ Widget? padFieldOverlay(PadCat cat, bool dark, double radius) {
 
 /// The static part of a pad: the dot grid, the hairline border, the four edge icons and the ring that marks automatic.
 class _FieldPainter extends CustomPainter {
-  const _FieldPainter(this.cat, this.radius);
+  const _FieldPainter(this.cat, this.radius, [this.icons]);
   final PadCat cat;
   final double radius;
+  final List<PadIconKind>? icons;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -99,7 +100,7 @@ class _FieldPainter extends CustomPainter {
     canvas.restore();
     canvas.drawRRect(rr.deflate(0.5), Paint()..style = PaintingStyle.stroke..strokeWidth = 1..color = const Color(0x14000000));
     // the four direction icons, near the middle of each edge
-    final ic = cat.edgeIcons;
+    final ic = icons ?? cat.edgeIcons;
     const s = 20.0, m = 20.0;
     final centres = [Offset(m, size.height / 2), Offset(size.width - m, size.height / 2), Offset(size.width / 2, size.height - m), Offset(size.width / 2, m)];
     for (var i = 0; i < 4; i++) {
@@ -112,7 +113,7 @@ class _FieldPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_FieldPainter o) => o.cat != cat || o.radius != radius;
+  bool shouldRepaint(_FieldPainter o) => o.cat != cat || o.radius != radius || !identical(o.icons, icons);
 }
 
 /// The moving part: the cursor, and the grey-out of the ends the engine says change nothing (film pad).
@@ -199,7 +200,7 @@ class CatPadSource extends PadSource {
 
 /// A pad of [cat]. [interactive] false = a picture of the pad (the hold popup, where the dock glyph takes the finger).
 class PadFace extends StatefulWidget {
-  const PadFace({super.key, required this.ctl, required this.cat, this.interactive = true, this.presets = false, this.radius = 18, this.source});
+  const PadFace({super.key, required this.ctl, required this.cat, this.interactive = true, this.presets = false, this.radius = 18, this.source, this.edgeIcons, this.edgeWords});
   final EditorController ctl;
   final PadCat cat;
   final bool interactive, presets;
@@ -207,6 +208,10 @@ class PadFace extends StatefulWidget {
 
   /// Where the cursor reads and writes; null = the category's own pad.
   final PadSource? source;
+
+  /// The four edges' icons and words (left, right, bottom, top) when they differ from the category's (the 局部 质地 pad: 朦胧 / 通透).
+  final List<PadIconKind>? edgeIcons;
+  final List<String>? edgeWords;
 
   @override
   State<PadFace> createState() => _PadFaceState();
@@ -284,13 +289,13 @@ class _PadFaceState extends State<PadFace> {
     final dark = context.c.dark;
     final r = widget.radius;
     final overlay = padFieldOverlay(cat, dark, r);
-    final words = cat.edgeWords;
+    final words = widget.edgeWords ?? cat.edgeWords;
     Widget face = LayoutBuilder(builder: (context, cons) {
       _size = Size(cons.maxWidth, cons.maxHeight);
       return Stack(fit: StackFit.expand, children: [
         DecoratedBox(decoration: padFieldDecoration(cat, dark, radius: r)),
         ?overlay,
-        RepaintBoundary(child: CustomPaint(painter: _FieldPainter(cat, r))),
+        RepaintBoundary(child: CustomPaint(painter: _FieldPainter(cat, r, widget.edgeIcons))),
         RepaintBoundary(
           child: ListenableBuilder(
             listenable: src.changes,

@@ -21,7 +21,7 @@ import 'itemised_view.dart';
 import 'local_controller.dart';
 import 'local_glyphs.dart';
 import 'pad_gestures.dart';
-import 'pad_panel.dart' show HeaderButton, HeaderReadout, PanelChip, PanelHeader;
+import 'pad_panel.dart' show HeaderButton, HeaderReadout, PanelChip, PanelHeader, kHeaderH;
 import 'pad_widgets.dart';
 
 // ------------------------------------------------------------------ header
@@ -57,6 +57,16 @@ class LocalHeader extends StatelessWidget {
     return (chipCount(lc) / perLine).ceil();
   }
 
+  /// Whether the 光线 / 颜色 / 质地 switch needs a line of its own at [width] (the chips take what is left of their line, 48 dp each; a
+  /// narrow phone with several areas has no room beside them).
+  static bool switchOwnLine(LocalController lc, double width, double textScale) => chipCount(lc) * kHit + PadSwitch.widthAt(textScale) > width;
+
+  /// Lines of the header's content under the title line at [width] (the chips, and the switch where it has a line of its own).
+  static int belowLinesFor(LocalController lc, double width, double textScale) {
+    final chips = chipLines(lc, width);
+    return lc.showsPadSwitch && switchOwnLine(lc, width, textScale) ? chips + 1 : chips;
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = context.c;
@@ -89,7 +99,7 @@ class LocalHeader extends StatelessWidget {
       text: () {
         final s = lc.sel;
         if (s == null) return '';
-        final r = localReadout(localUiOf(s), area: s);
+        final r = localReadout(localUiOf(s), area: s, pad: lc.padCat);
         return portraitOf(s) != null ? '人像 · $r' : r;
       },
     );
@@ -136,7 +146,24 @@ class LocalHeader extends StatelessWidget {
     }
     return LayoutBuilder(
       builder: (context, cons) {
-        final lines = collapsed ? 0 : chipLines(lc, cons.maxWidth - 2 * Sp.l);
+        final width = lc.headerInnerW ?? cons.maxWidth - 2 * Sp.l;
+        final lines = collapsed ? 0 : belowLinesFor(lc, width, textScale);
+        Widget? below;
+        if (lines > 0) {
+          // the switch: at the right end of the chips line when it fits there, else on a line of its own under the chips
+          if (!lc.showsPadSwitch) {
+            below = LocalChips(lc: lc);
+          } else if (switchOwnLine(lc, width, textScale)) {
+            below = Column(
+              children: [
+                SizedBox(height: chipLines(lc, width) * kHeaderH, child: LocalChips(lc: lc)),
+                SizedBox(height: kHeaderH, child: Center(child: PadSwitch(lc: lc, textScale: textScale))),
+              ],
+            );
+          } else {
+            below = Row(children: [Expanded(child: LocalChips(lc: lc)), PadSwitch(lc: lc, textScale: textScale)]);
+          }
+        }
         return PanelHeader(
           title: '局部',
           side: side,
@@ -145,10 +172,106 @@ class LocalHeader extends StatelessWidget {
           sub: sub,
           buttons: buttons,
           // the area chips: always on a line of their own (the same place in every layer and placement)
-          below: lines > 0 ? LocalChips(lc: lc) : null,
+          below: below,
           belowLines: lines,
         );
       },
+    );
+  }
+}
+
+/// The 光线 / 颜色 / 质地 switch of an ordinary area's pad layer: the dock's three words and icons, one pad at a time; a dot on the icon of a
+/// segment whose pad is away from its centre. The chosen half is the persistent selection (soft fill and accent border, U7), on the same track
+/// as the add / remove switch; every half is a 48 dp target.
+class PadSwitch extends StatelessWidget {
+  const PadSwitch({super.key, required this.lc, this.textScale = 1});
+  final LocalController lc;
+  final double textScale;
+
+  static const _cats = [(PadCat.light, '光线', DI.light), (PadCat.color, '颜色', DI.color), (PadCat.texture, '质地', DI.detail)];
+
+  /// Width of one half (padding, icon, gap, the word at the text scale) and of the whole switch (the track's 2 dp padding).
+  static double segW(double textScale) => math.max(kHit, 16 + 18 + 3 + 24 * textScale.clamp(1.0, 2.0));
+  static double widthAt(double textScale) => 3 * segW(textScale) + 4;
+
+  @override
+  Widget build(BuildContext context) {
+    final a = lc.sel;
+    final ui = a == null ? LocalUi.centre : localUiOf(a);
+    return LayoutBuilder(builder: (context, cons) {
+      // a pane narrower than the switch at its text size (large text in the side pane): the halves share what there is, never under 48 dp
+      final w = cons.maxWidth.isFinite ? math.min(segW(textScale), math.max(kHit, (cons.maxWidth - 4) / 3)) : segW(textScale);
+      return _build(context, ui, w);
+    });
+  }
+
+  Widget _build(BuildContext context, LocalUi ui, double w) {
+    final c = context.c;
+    Widget seg((PadCat, String, DI) s) {
+      final on = lc.padCat == s.$1, moved = localPadMoved(ui, s.$1);
+      final fg = on ? c.accent : c.text;
+      return Semantics(
+        button: true,
+        inMutuallyExclusiveGroup: true,
+        selected: on,
+        label: '${s.$2}${moved ? '，已调整' : ''}',
+        excludeSemantics: true,
+        onTap: () => lc.setPadCat(s.$1),
+        child: GestureDetector(
+          key: ValueKey('local-seg-${s.$1.name}'),
+          behavior: HitTestBehavior.opaque,
+          onTap: () => lc.setPadCat(s.$1),
+          child: HitBox(
+            minWidth: w,
+            child: Container(
+              width: w,
+              height: 32,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: on ? c.accentSoft : null,
+                borderRadius: BorderRadius.circular(Rd.cardLg),
+                border: on ? Border.all(color: c.accent, width: 1.5) : null,
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      DIcon(s.$3, size: 18, color: fg),
+                      if (moved)
+                        Positioned(
+                          right: -2,
+                          top: -2,
+                          child: Container(
+                            key: ValueKey('local-seg-dot-${s.$1.name}'),
+                            width: 6,
+                            height: 6,
+                            decoration: BoxDecoration(color: c.accent, shape: BoxShape.circle, border: Border.all(color: on ? c.accentSoft : c.bg, width: 1)),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(width: 3),
+                  Text(s.$2, maxLines: 1, softWrap: false, style: T.cap(fg, w: on ? FontWeight.w600 : FontWeight.w500)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        Container(
+          width: 3 * w + 4,
+          height: 36,
+          decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(Rd.chip)),
+        ),
+        Row(mainAxisSize: MainAxisSize.min, children: [for (final s in _cats) seg(s)]),
+      ],
     );
   }
 }
@@ -329,6 +452,9 @@ class _AreaChip extends StatelessWidget {
 
 // ------------------------------------------------------------------ body
 
+/// The edge icons of the 局部 texture pad: 柔 / 锐 as on the global one, 朦胧 / 通透 (dehaze) on the vertical.
+const List<PadIconKind> kLocalTextureIcons = [PadIconKind.soft, PadIconKind.sharp, PadIconKind.hazy, PadIconKind.clear];
+
 class LocalBodyView extends StatelessWidget {
   const LocalBodyView({super.key, required this.ctl, required this.side});
   final EditorController ctl;
@@ -356,38 +482,22 @@ class LocalBodyView extends StatelessWidget {
     }
     if (ctl.itemised) return LocalItemised(ctl: ctl);
     if (lc.selIsPortrait) return PortraitPanel(ctl: ctl);
-    final strip = StrengthStrip(ctl: ctl, cat: PadCat.light, source: lc.lightPad, label: '强度');
-    final light = PadFace(key: const ValueKey('local-pad-light'), ctl: ctl, cat: PadCat.light, source: lc.lightPad);
-    final color = PadFace(key: const ValueKey('local-pad-color'), ctl: ctl, cat: PadCat.color, source: lc.colorPad);
+    // one full-size pad (the one the switch in the header chose) beside the strip: the global categories' pad and strength idiom
+    final cat = lc.padCat;
+    final texture = cat == PadCat.texture;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        strip,
+        StrengthStrip(ctl: ctl, cat: cat, source: lc.pad, label: '强度'),
         const SizedBox(width: Sp.m),
-        // the two pads side by side or stacked, whichever keeps them closer to square (a squat pad crowds its edge icons)
         Expanded(
-          child: LayoutBuilder(
-            builder: (context, cons) {
-              double off(double a) => (math.log(a)).abs();
-              final row = off(((cons.maxWidth - 8) / 2) / cons.maxHeight), col = off(cons.maxWidth / ((cons.maxHeight - 8) / 2));
-              return col < row
-                  ? Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Expanded(child: light),
-                        const SizedBox(height: 8),
-                        Expanded(child: color),
-                      ],
-                    )
-                  : Row(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Expanded(child: light),
-                        const SizedBox(width: 8),
-                        Expanded(child: color),
-                      ],
-                    );
-            },
+          child: PadFace(
+            key: ValueKey('local-pad-${cat.name}'),
+            ctl: ctl,
+            cat: cat,
+            source: lc.pad,
+            edgeIcons: texture ? kLocalTextureIcons : null,
+            edgeWords: texture ? kLocalTextureWords : null,
           ),
         ),
       ],
