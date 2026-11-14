@@ -727,6 +727,7 @@ void main() {
 
   // ---------------------------------------------------------------------------------------------------- fold layouts (docs/design/foldables.md)
   const foldSizes = <Sz>[
+    Sz('book-inner-749x827', 749, 827, fold: Fold.vertical),
     Sz('book-inner-984x1092', 984, 1092, fold: Fold.vertical),
     Sz('book-inner-904x832', 904, 832, fold: Fold.vertical),
     Sz('wide-fold-inner-626x890', 626, 890, fold: Fold.horizontal),

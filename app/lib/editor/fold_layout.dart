@@ -81,7 +81,7 @@ const double kBenchWorkShare = 0.58; // the pad half's share of the width withou
 const double kHalfBenchMinW = 600; // a half-opened window this wide gets the workbench's two halves under the fold
 const double kFoldTopGap = 6; // the photo keeps this much under the top safe area (the status bar), and still sits at the top
 const double kCreaseClear = 24; // what stays free beside a fold
-const double kColumnMin = 272, kColumnMax = 400; // the column takes what the photo leaves, between these
+const double kColumnMin = 244, kColumnMax = 400; // the column takes what the photo leaves, between these
 const double kBenchPhotoMin = 300; // the photo area keeps the cluster's height (ring, ball, grip) in the bench layout
 
 /// Where everything goes. The rectangles are in window coordinates.
