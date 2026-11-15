@@ -1,5 +1,76 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (b) adaptive preview size from the pixel-dependent part (app only, Dart)
+
+Build: release APK of the working tree (app change only, `install -r`), Note10+ RFCMA05Q5ZX, Battery Saver ON (unchanged), 100 %, 27.9 -> 29.5 C, 60 Hz. Same method / `an_drag.py` as the section below (logs and scripts in `build/perf-20261116b/`). Files: `S6700_26mp.ARW`, `S6700b_26mp.ARW` (public A6700 sample, new folder, removed). Local runs on the fresh copy, global runs on the other.
+
+**Cause of the collapse.** `AdaptiveQuality.record(cycleMs)` compared the whole render time (tables included) with one refresh (16.7 ms) and stepped down after 2 frames over; the way back up predicted `cycleMs * pixelRatio^2 < 0.6 * budget` (10 ms), i.e. it scaled the table time with the pixels too, so a 12 ms table-heavy frame could never climb and a 7 ms 局部 frame could not either; the rung is also carried over from drag to drag (one controller per editor). Not vsync: `renderMs` is the native call only (the view's `present` is 0.4 ms).
+**What the app receives per frame**: `renderMs` (whole `dapple_session_render_frame`, tables + exec + upload), `presentMs`, `latencyMs`. It does not separate tables from GPU time (the split is only in the `frame_profile` log line). The controller therefore models the split: pixel part = ms/Mpx x Mpx of the rung (prior: the warm-up `filmMsPerMpx`, else 12), overhead = smoothed frame time - pixel part. **Field that would make this exact:** `tablesMs` (or `execMs`) in the frame event next to `renderMs`.
+**Rule.** allowance = budget - overhead, held within 0.5..1 x budget (overhead over budget: shrinking buys nothing, the pixel part may still use half a refresh); target = largest rung whose pixel part fits (display and thermal caps stay floors); down after 2 consecutive frames over budget only if the target is smaller; up after 12 frames whose target at 0.85 x allowance is larger; kept: rung fixed during a drag (a size step mid-drag is a visible jump), the move is applied at drag end straight to the target (was: one rung per drag).
+
+| drag (A6700) | before cpu ms med / tables, rung | after cpu med / p90, tables, rung | frames > 16.7 ms (before -> after) |
+|---|---|---|---|
+| exposure | 12.2 / 6.9, 360 (143 of 279) | 9.6 / 22.2, 6.3, 810 (297 of 297) | 120/279 -> 105/297 |
+| tone | 13.9 / 7.6, 360 | 11.8 / 24.3, 7.1, 810 | 124/289 -> 111/296 |
+| colour pad | 43.7 / 34.2, 360 | 52.1 / 73.3, 34.6, 640 | 117/126 -> 114/124 |
+| film exposure | 25.4 / 20.5, 360 | 22.8 / 35.0, 19.7, 640 | 132/148 -> 130/154 |
+| film colour pad | 27.0 / 22.4, 360 | 26.1 / 54.5, 21.9, 640 (3 frames 96x64) | 124/129 -> 118/126 |
+| 局部 pad (光线) | 7.4 / 0.1, 360 | 8.3 / 13.4, 0.0, 810 | 24/381 -> 24/368 |
+| 局部 area (move circle) | 0.4 / 0.0, 810..360 (121 of 241 at 360) | 7.4 / 13.2, 0.1, 810 | 7/241 -> 12/244 |
+
+Frame time vs the pixel-dependent part: tables are unchanged (6.3-7.1 / 34.6 / 19.7-21.9 vs 6.9-7.6 / 34.2 / 20.5-22.4), engine `exec` median 3.0 vs 4.1 (exposure), 3.3 vs 6.2 (tone), 12.7 vs 12.2 (colour), so the pixel part of the larger rung is small; the colour-pad median of 52 vs 44 is inside the earlier per-rep spread (41.8 / 47.0 / 56.0) with exec +0.5 ms; not isolated further. **局部 area**: 0.4 -> 7.4 ms is a real pixel-dependent cost (the old figure was mostly 360x240 frames; exec 0.3 -> 7.1 at 810), still under the 16.7 ms budget. Dropped / late frames are not logged by the app; the table counts frames whose engine `cpu_ms` is over one refresh (p90 and max did not get worse beyond noise, except max in the film runs: 452 / 409 ms spikes as in the earlier run, 339 / 1540 before).
+**局部 at 360 (finding):** not vsync and not wall-clock latency. The rung carried over from the previous drag (a table-heavy drag drops it) and could not climb: the 0.4-7 ms frames at 360 predicted 7 x 1.78 = 12.5 ms > 10 ms. Same mechanism, fixed by the same rule; a fresh drag of cheap frames now returns to the target at its end.
+Not verified: the pixel prior on other phones (it falls back to the film warm-up value, which over-states non-film pixel cost, so those phones may stay a rung lower than necessary); thermal rule only unit tested; no film-on 局部 runs this round.
+
+## 2026-11-16 after the table work
+
+Build: release APK of e26ef6b (built 00:32, `install -r`), Note10+ RFCMA05Q5ZX, taps only, same method as the 2026-11-15 sections (3 reps of a 1.3 s swipe out and back, interactive frames pooled; scripts, logs and `an_drag.py` in `build/perf-20261116a/`). State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 25.4 C at start, 29.2 C at the end, `Thermal Status 0`, no reboot. Files: the three public samples under new names (`R6700_26mp.ARW`, `R7RM4_61mp.ARW`, `RXS10_26mp.RAF`, plus a second copy of the A6700 `R6700b_26mp.ARW` so the local no-film run starts from a fresh edit state), new throw-away folder, removed afterwards. The grid order changes with edit state, so photos were identified from the log (`session_open` names).
+
+**No film is really no film:** every frame of the no-film runs logs `film=off` (965 global frames, 634 local frames) and every film run logs `film=on` (548 + 446). The no-film local run used a fresh second copy; film was selected afterwards on the same photo (circle kept). The global runs (exposure, tone, 冷暖, colour) were on one photo with film added after the no-film runs (edits kept). All frames `exec=vulkan`, no `reason=` line, no fallback.
+
+### C1 Drag frames (A6700, interactive frames, engine `cpu_ms` median / p90 / max; tables = CPU table ms in it; [per-rep medians])
+"before" = the 2026-11-15 values (bb1cf0f / 02495b4); no before exists for tone, 冷暖 and the no-film local runs.
+| drag | film | before cpu / tables | after cpu med / p90 / max | after tables | tier settled | frames > 100 ms |
+|---|---|---|---|---|---|---|
+| exposure (光线 pad x) | off | 24.6 / 12.4 | **12.2** / 23.0 / 116 [11.1 10.5 17.5] | 6.9 | 810 -> 360x240 (143 of 279), 480 43, 640 42, 810 51 | 2 of 279 |
+| tone (光线 pad y) | off | n/a | 13.9 / 25.6 / 76 | 7.6 | 360x240 (289 of 289) | 0 |
+| 冷暖 (颜色 pad x only) | off | n/a | 13.2 / 29.8 / 159 | 8.1 | 360x240 | 1 of 246 |
+| colour pad (diagonal) | off | 54.3 / 39.4 | **43.7** / 76.0 / 163 [41.8 47.0 56.0] | 34.2 | 360x240 (126 of 126) | 8 of 126 |
+| exposure | on | 32.0 / 26.0 | **25.4** / 37.9 / 339 [24.9 25.6 26.1] | 20.5 | 360x240 (148 of 148) | 4 of 148 |
+| tone | on | n/a | 27.3 / 48.8 / 397 | 21.6 | 360x240 | 2 of 120 |
+| 冷暖 | on | n/a | 26.4 / 46.4 / 558 | 20.6 | 360x240 (one 96x64) | 5 of 124 |
+| colour pad | on | 33.6 / 26.5 | **27.0** / 55.0 / 1540 [26.8 27.8 26.2] | 22.4 | 360x240 | 7 of 129 |
+| 局部 area (move circle) | off | n/a | 0.4 / 6.9 / 93 | 0.0 | 810 35, 640 42, 480 43, 360 121 | 0 of 241 |
+| 局部 pad (光线 of the circle) | off | n/a | 7.4 / 11.2 / 198 [7.5 7.4 7.2] | 0.1 | 360x240 (381 of 381) | 1 of 381 |
+| 局部 area | on | 7.1 / 12.1 / 24 (A6700 film) | 7.6 / 12.4 / 112 [7.1 7.9 8.9] | 0.1 | 360x240 (159 of 159) | 1 of 159 |
+| 局部 pad | on | 7.8 / 15.0 / 235 | 5.9 / 14.0 / 80 [7.0 5.4 6.4] | 0.1 | 360x240 (263 of 263) | 0 of 263 |
+
+The table work shows up as expected on the Note10+, but less than on the Redmi: exposure tables 12.4 -> 6.9 ms (frame 24.6 -> 12.2), colour pad 39.4 -> 34.2 ms only (frame 54 -> 44), film tables 26-27 -> 20.5-22.4 ms (frame 32-34 -> 25-27). **The tier did not recover from 360x240** in any global drag (it also settles there for no-film exposure; the first drag starts at 810 and shrinks within the drag). The local runs show a one-off no-film start at 810 and then 360, and in the film 局部 runs the tier is 360x240 for all frames (the 2026-11-15 run had 480-810 for the film 局部 pad).
+Spikes: film frames show isolated table times of 0.3 - 1.5 s (`pre` / `tone` stage inside `tables`, e.g. `tables 1518 pre 1515`, view render up to 2.2 s) at the start of a rep or after the idle pause; 18 frames over 100 ms in 521 film global frames (3.5 %), 11 in 940 no-film global. Not diagnosed (CPU frequency / background work after the idle gap are possibilities, not measured).
+
+### C2 Drag while the 61 MP export runs (A7RM4, 光线 pad, 5 reps; view latency, ms)
+Each rep: cold open, idle drag (same swipe), then export tap, drag 1.5 s later (inside the analyse / GPU-tile phase). Latency = `dapple_view` latency of frames shown in the drag window.
+| | frames | median | p90 | max |
+|---|---|---|---|---|
+| idle drag | 488 | 24.8 | 36.0 | 153 |
+| drag during the export | 376 | 31.5 | 60.2 | **358** |
+Per rep (median / p90 / max): 33.8 / 61.1 / 325, 25.9 / 56.6 / 358, 31.4 / 72.8 / 276, 34.2 / 55.5 / 328, 26.1 / 63.7 / 315. Export 8.10-8.17 s (8148 8131 8098 8127 8166; idle 61 MP export before: 6.5-6.8), peak footprint 1165-1168 MB, peak sampled VmRSS 1118-1126 MB (VmHWM 1193-1197 MB).
+**Frames over 300 ms: 4 of 5 reps, one each (325, 358, 328, 315 ms).** Each is one interactive frame with `upload` 275-346 ms inside `exec` (`cpu_ms 345.8 ... exec 333.7; upload 333.4`), about 0.3 s after the previous frame, in the GPU tile phase (the analyse finished 1 s earlier): the frame waited for a GPU turn held by an export tile. The log has no per-turn line, so the turn itself (which tile, how long) is not logged; the wait is the `upload` time. Context lines in `build/perf-20261116a/stall_context.txt`. No frame waited more than 358 ms (the earlier 740 / 1334 ms case did not reproduce). Median drag frame cost under export is about 7 ms worse than idle (view latency), p90 +24 ms.
+
+### C3 Open and zoom (1 rep each)
+| | open, tap to first engine frame (ms) | before | zoom, tap to first detail frame (ms) | before |
+|---|---|---|---|---|
+| X-S10 | 1215 | 1304 | 1069 | 926 |
+| A6700 | 1180 | 944 | 1105 (this photo had film + edits on, frame cpu 443 ms) | 911 |
+| A7RM4 | 1600 | 1574 | 933 | 1028 |
+One rep each, within the earlier run-to-run spread except the A6700 (the opened photo carried film and colour edits from the drag session, so it is not comparable; not re-measured with a clean copy).
+
+### C4 Correctness (viewed)
+`s_nofilm_color.png` (no film after the colour drags: strongly cold, saturated, looks as an extreme colour edit should, no artefacts) and `s_film_color.png` (film selected, muted film rendering of the same edit, no artefacts); `s_local_circle.png` (circle mask overlay in the expected place). Not compared pixel for pixel.
+
+### Not measured
+Which turn held the device in the 300+ ms frames (no log line); per-frame GPU ms (log shows `gpu` as a frame counter only); a clean-copy A6700 open/zoom; whether the table spikes come from the table code or from the device state.
+
 ## 2026-11-15 (night) app-side open / zoom changes
 
 Release APK with the app changes (same Note10+ RFCMA05Q5ZX, taps only, Battery Saver on, 3 cold reps per file, frame_profile prop set then reset; raw logs and scripts in `build/perf-20261115c/`). Files: `C6700_26mp.ARW`, `C7RM4_61mp.ARW`, `CXS10_26mp.RAF` (the public samples, new throw-away folder, removed).

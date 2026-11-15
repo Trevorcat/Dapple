@@ -1,15 +1,22 @@
+import 'dart:math' as math;
+
 /// Dynamic resolution for drag-time frames.
 ///
-/// The interactive path costs roughly (lattice bake) + (pixels x neighbourhood stages). On a fast phone one
-/// 1080 px frame fits in a display frame or two; on a low-end SoC it does not. This controller picks a rung of
-/// [rungs] (long edge + lattice size) from the measured frame cycle time, so the preview keeps updating at
-/// >= ~15 Hz with bounded latency instead of falling behind.
+/// A drag frame costs (size-independent overhead: bake / tables / encode / dispatch, all CPU) + (pixel part: GPU execution
+/// and readback / present, which scales with the number of pixels). Shrinking the picture only buys back the pixel part, so
+/// the controller sizes the preview from that part alone. The engine reports one number per frame (render ms, which includes
+/// the tables), so the split is modelled: pixel part = [pixelMsPerMpx] x megapixels of the rung (prior: the engine's warm-up
+/// film-frame measurement, [seedFromMeasurement]); overhead = smoothed measured frame time minus the pixel part of the rung it
+/// ran at.
 ///
 /// Policy (pure Dart, unit tested):
-///  * budget: the whole cycle (native + upload) of an interactive frame should stay under [budgetMs];
-///  * step down after [downAfter] consecutive frames over budget (fast reaction: ~2 frames);
-///  * step up only after [upAfter] frames whose *predicted* cost at the next rung (cost scales with pixels)
-///    stays under [upMargin] x budget - hysteresis, so it does not oscillate;
+///  * allowance = budget - overhead, kept within [0.5, 1] x budget: when the overhead alone is over the budget, shrinking
+///    cannot help, so the pixel part is still allowed up to half a refresh instead of collapsing to the cheapest rung;
+///  * the target is the largest rung whose pixel part fits the allowance;
+///  * step down after [downAfter] consecutive frames over budget while the target is a smaller rung (frames over budget
+///    because of the overhead do not count: the target is the rung they already run at);
+///  * step up after [upAfter] frames at which the target (with [upMargin] x allowance, hysteresis) is a larger rung;
+///  * the rung is frozen during a drag ([beginDrag]); the move the drag asked for is applied at [endDrag], straight to the target;
 ///  * a thermal bias ([thermalCap]) can forbid the top rungs before the SoC actually throttles.
 class QualityRung {
   const QualityRung(this.longEdge, this.bake);
@@ -22,7 +29,7 @@ class QualityRung {
 }
 
 class AdaptiveQuality {
-  AdaptiveQuality({this.budgetMs = 55, this.downAfter = 2, this.upAfter = 12, this.upMargin = 0.6});
+  AdaptiveQuality({this.budgetMs = 55, this.downAfter = 2, this.upAfter = 12, this.upMargin = 0.85});
 
   /// Budget for a display of [hz]: one display refresh (the drag frame should fit in a vsync), never tighter than 8.3 ms (120 Hz) and never looser than
   /// the 55 ms default. Wave 8: a mid-range Adreno 710 phone renders the 810x1080 interactive film frame in ~12 ms on the GPU, so with a 55 ms budget it
@@ -45,6 +52,10 @@ class AdaptiveQuality {
   final int downAfter, upAfter;
   final double upMargin;
 
+  /// Pixel-dependent cost of a frame, ms per megapixel (GPU execution + present). Prior 12; [seedFromMeasurement] sets it from the
+  /// engine's warm-up measurement of an interactive film frame (an upper bound for frames without film).
+  double pixelMsPerMpx = 12;
+
   int _rung = 0;
   int _over = 0, _under = 0;
   int _thermalCap = 0; // minimum rung index allowed by the thermal state
@@ -57,26 +68,49 @@ class AdaptiveQuality {
   QualityRung get rung => rungs[_rung];
   double get emaMs => _ema;
 
+  /// Megapixels of a 3:2 frame at [r].
+  static double mpx(QualityRung r) => r.longEdge * r.longEdge * 2 / 3 / 1e6;
+
+  /// Size-independent part of the smoothed frame time at the current rung, ms.
+  double get overheadMs => _ema == 0 ? 0 : math.max(0, _ema - pixelMsPerMpx * mpx(rung));
+
+  /// Time the pixel part may take: what is left of the budget after the overhead, never under half a refresh (when the overhead
+  /// alone fills the budget a smaller picture buys nothing).
+  double get allowanceMs => (budgetMs - overheadMs).clamp(budgetMs * 0.5, budgetMs).toDouble();
+
+  int get _floor => _displayCap > _thermalCap ? _displayCap : _thermalCap;
+
+  /// Index of the largest rung whose pixel part fits [margin] x the allowance (floor: display / thermal caps).
+  int targetIndex({double margin = 1.0}) {
+    var pick = rungs.length - 1;
+    for (var i = _floor; i < rungs.length; i++) {
+      if (pixelMsPerMpx * mpx(rungs[i]) <= allowanceMs * margin) {
+        pick = i;
+        break;
+      }
+    }
+    return pick < _floor ? _floor : pick;
+  }
+
   bool _seeded = false;
   bool get seeded => _seeded;
 
   /// Seeds the starting rung from the engine's warm-up measurement ([msPerMpx]: hot milliseconds per megapixel of an interactive film frame): the largest
   /// rung whose predicted cost (a 3:2 frame of that long edge) fits [fill] of the budget. The first drag then already meets the frame period instead of
-  /// stepping down through slow frames; the normal hysteresis moves it from there. Returns true when the rung changed.
+  /// stepping down through slow frames; the normal hysteresis moves it from there. Also the prior of the pixel part ([pixelMsPerMpx]).
+  /// Returns true when the rung changed.
   bool seedFromMeasurement(double msPerMpx, {double fill = 0.8}) {
     if (!(msPerMpx > 0) || !msPerMpx.isFinite) return false;
     _seeded = true;
+    pixelMsPerMpx = msPerMpx;
     var pick = rungs.length - 1;
     for (var i = 0; i < rungs.length; i++) {
-      final e = rungs[i].longEdge.toDouble();
-      final predicted = msPerMpx * (e * e * 2 / 3) / 1e6;
-      if (predicted <= budgetMs * fill) {
+      if (msPerMpx * mpx(rungs[i]) <= budgetMs * fill) {
         pick = i;
         break;
       }
     }
-    final floor = _displayCap > _thermalCap ? _displayCap : _thermalCap;
-    if (pick < floor) pick = floor;
+    if (pick < _floor) pick = _floor;
     if (pick <= _rung) return false;
     _rung = pick;
     _ema = 0;
@@ -105,24 +139,29 @@ class AdaptiveQuality {
   bool get held => _held;
 
   /// A drag starts: the rung is frozen for its whole length (a resolution step in the middle of a drag is a visible jump; frame trace on the iPhone X
-  /// showed 1 - 3 of them in every 2 s drag). The frames are still measured; the step they ask for is applied once by [endDrag].
+  /// showed 1 - 3 of them in every 2 s drag). The frames are still measured; the move they ask for is applied once by [endDrag].
   void beginDrag() {
     _held = true;
     _pendingDown = _pendingUp = false;
   }
 
-  /// The drag ended: applies at most one step that the drag's frames asked for (so the rung cannot oscillate within a drag and moves by one rung
-  /// between drags). Returns true when the rung changed.
+  /// The drag ended: moves to the target the drag's frames asked for (down or up; a pending move is dropped if the target is the current rung).
+  /// Returns true when the rung changed.
   bool endDrag() {
     _held = false;
-    final floor = _displayCap > _thermalCap ? _displayCap : _thermalCap;
     var changed = false;
-    if (_pendingDown && _rung < rungs.length - 1) {
-      _rung++;
-      changed = true;
-    } else if (_pendingUp && _rung > floor) {
-      _rung--;
-      changed = true;
+    if (_pendingDown) {
+      final t = targetIndex();
+      if (t > _rung) {
+        _rung = t;
+        changed = true;
+      }
+    } else if (_pendingUp) {
+      final t = targetIndex(margin: upMargin);
+      if (t < _rung) {
+        _rung = t;
+        changed = true;
+      }
     }
     _pendingDown = _pendingUp = false;
     _over = _under = 0;
@@ -133,13 +172,14 @@ class AdaptiveQuality {
   /// Feed the cycle time of an interactive frame rendered at the current rung. Returns true when the rung changed.
   bool record(double cycleMs) {
     _ema = _ema == 0 ? cycleMs : _ema * 0.6 + cycleMs * 0.4;
-    final floor = _displayCap > _thermalCap ? _displayCap : _thermalCap;
-    if (cycleMs > budgetMs) {
+    // a smaller picture is only asked for when it would take the pixel part under the allowance
+    if (cycleMs > budgetMs && targetIndex() > _rung) {
       _over++;
       _under = 0;
-      if (_over >= downAfter && _rung < rungs.length - 1) {
+      if (_over >= downAfter) {
         if (_held) {
           _pendingDown = true;
+          _pendingUp = false;
           return false;
         }
         _rung++;
@@ -150,23 +190,19 @@ class AdaptiveQuality {
       return false;
     }
     _over = 0;
-    if (_rung > floor) {
-      final px = rungs[_rung - 1].longEdge / rungs[_rung].longEdge;
-      final predicted = cycleMs * px * px;
-      if (predicted < budgetMs * upMargin) {
-        if (++_under >= upAfter) {
-          if (_held) {
-            _pendingUp = !_pendingDown;
-            return false;
-          }
-          _rung--;
-          _under = 0;
-          _ema = 0;
-          return true;
+    if (cycleMs <= budgetMs && targetIndex(margin: upMargin) < _rung) {
+      if (++_under >= upAfter) {
+        if (_held) {
+          _pendingUp = !_pendingDown;
+          return false;
         }
-      } else {
+        _rung--;
         _under = 0;
+        _ema = 0;
+        return true;
       }
+    } else {
+      _under = 0;
     }
     return false;
   }
