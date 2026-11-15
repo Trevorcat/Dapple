@@ -84,17 +84,24 @@ class BandSource {
   int height() const { return H_; }
   bool gpu() const { return gpu_; }
   bool fellBack() const { return fellBack_; }
-  void setShadowFloor(bool on) { shadow_ = on; }
+  void setShadowFloor(bool on) {
+    if (on != shadow_) bandOk_ = false;  // the band's rows were made with the other setting
+    shadow_ = on;
+  }
   bool shadowFloor() const { return shadow_; }
   // [x0, x1) x [y0, y1) (must lie inside the picture). Null when cancelled (cancel != null and *cancel != mine).
   const ImageF* window(int x0, int y0, int x1, int y1);
   void setCancel(const std::atomic<std::uint64_t>* cur, std::uint64_t mine) { cancelCur_ = cur, cancelMine_ = mine; }
   std::uint64_t windows() const { return windows_; }
   double demosaicMs() const { return ms_; }
+  double demosaicMpx() const { return double(px_) / 1e6; }  // demosaiced area (window pixels, halos included), for the stage log
   std::size_t peakWindowBytes() const { return peakBytes_; }
-  void release() { ImageF().data.swap(win_.data), win_ = ImageF(); }
-  // Rows [y0, y1), columns [x0, x1) out of a cached full-width band (at least kBandRows rows; demosaiced when the rect is not inside the
-  // band of the previous call): what a row of GPU tiles reads. Pointer into the band, valid until the next call; pitch = width * 3.
+  void release() { ImageF().data.swap(win_.data), win_ = ImageF(), bandOk_ = false; }
+  // Rows [y0, y1), columns [x0, x1) of the picture for a walk over tiles in rows (the GPU executor's streamed tiles): a pointer into a cached row block
+  // when the rect lies in one, else into a full-width band (at least kBandRows rows) that rolls down the picture: the rows it shares with the previous
+  // band move to its top, cached rows are copied, only the rest is demosaiced (region demosaic == the same pixels of the whole demosaic), so a picture
+  // is demosaiced about once instead of once per tile with its halo. Cached blocks above the band are dropped as the walk passes them. A walk down a
+  // column of the picture (a quarter turn) gets its own window per rect. Valid until the next call; pitch = width * 3 for a band or a block.
   static constexpr int kBandRows = 768;
   const float* rows(int x0, int y0, int x1, int y1, std::size_t& pitchFloats);
 
@@ -117,8 +124,14 @@ class BandSource {
   const std::atomic<std::uint64_t>* cancelCur_ = nullptr;
   std::uint64_t cancelMine_ = 0, windows_ = 0;
   double ms_ = 0;
+  std::uint64_t px_ = 0;
   std::size_t peakBytes_ = 0;
-  int rowsY0_ = 0;  // first row of the cached band of rows()
+  int rowsY0_ = 0;       // first picture row of win_ when it is a full-width band (bandOk_)
+  bool bandOk_ = false;  // win_ holds full-width rows [rowsY0_, rowsY0_ + win_.height), demosaiced (and floored) completely
+  int lastX0_ = -1, lastY0_ = -1, lastY1_ = -1;  // previous narrow rect of rows(): tells a walk along rows from a walk down a column
+  bool band(int b0, int b1);                     // win_ = full-width rows [b0, b1) (kept / cached / demosaiced rows); false when cancelled or failed
+  bool demosaicRows(int ya, int yb, float* dst);  // full-width rows [ya, yb) demosaiced (and floored) into dst (pitch W_ * 3)
+  const float* blockRows(int y0, int y1) const;   // rows [y0, y1) when one cached block holds them all, else null
   struct Block {
     int y0 = 0, y1 = 0;
     std::vector<float> px;  // (y1 - y0) full-width rows

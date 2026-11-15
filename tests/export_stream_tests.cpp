@@ -221,6 +221,57 @@ static void testRegion() {
     }
 }
 
+// ---- rowwalk: the GPU executor's walk over tiles (BandSource::rows) against the whole demosaic ---------------------------------------------------
+// Tiles with a halo, row by row (the rolling band: kept rows, cached rows, new rows demosaiced), with and without the analysis pass's row cache, all
+// orientations, and a walk down columns (a quarter-turn edit reads a column of the source per row of output tiles: per-rect windows). Every pixel equals
+// the whole demosaic; the area demosaiced while walking rows stays near one picture (before the rolling band each tile demosaiced its own halo window:
+// 2 - 3 pictures).
+static void testRowWalk() {
+  for (bool xt : {false, true})
+    for (int flip : {0, 3, 6})
+      for (int mode : {0, 1, 2}) {  // 0 rows, 1 rows after an analysis pass with a row cache, 2 columns
+        const int cacheRows = mode == 1 ? 300 : 0;
+        const bool cols = mode == 2;
+        auto m = makeMosaic(1501, 1203, xt, false, flip);
+        const ImageF full = demosaic::demosaicFull(*m);
+        xstream::BandSource bs(m);
+        const int W = bs.width(), H = bs.height(), tile = 256, halo = 41;
+        if (cacheRows) {  // the analysis pass: full-width bands bottom to top, the top rows kept
+          bs.setCacheBudget(std::size_t(W) * cacheRows * 12);
+          for (int y1 = H; y1 > 0; y1 -= 200) {
+            const int y0 = std::max(0, y1 - 200);
+            const ImageF* b = bs.window(0, y0, W, y1);
+            CHECK(b != nullptr);
+            if (b) bs.keep(*b, y0, y0, y1);
+          }
+        }
+        const double mp0 = bs.demosaicMpx();
+        int bad = 0, rects = 0;
+        const int nx = (W + tile - 1) / tile, ny = (H + tile - 1) / tile;
+        for (int k = 0; k < nx * ny; ++k) {
+            const int tx = (cols ? k / ny : k % nx) * tile, ty = (cols ? k % ny : k / nx) * tile;
+            const int x0 = std::max(0, tx - halo), y0 = std::max(0, ty - halo), x1 = std::min(W, tx + tile + halo), y1 = std::min(H, ty + tile + halo);
+            std::size_t pitch = 0;
+            const float* p = bs.rows(x0, y0, x1, y1, pitch);
+            ++rects;
+            if (!p) {
+              ++bad;
+              continue;
+            }
+            for (int y = y0; y < y1; ++y)
+              if (std::memcmp(p + std::size_t(y - y0) * pitch, full.row(y) + std::size_t(x0) * 3, std::size_t(x1 - x0) * 3 * sizeof(float)) != 0) {
+                ++bad;
+                break;
+              }
+          }
+        const double walked = (bs.demosaicMpx() - mp0) * 1e6 / (double(W) * H);
+        std::printf("  %s flip %d, %s: %d of %d tile windows differ from the whole demosaic; demosaiced %.2f pictures while walking\n", xt ? "X-Trans" : "Bayer  ", flip,
+                    mode == 0 ? "rows            " : mode == 1 ? "rows after cache" : "columns         ", bad, rects, walked);
+        CHECK(bad == 0);
+        if (!cols) CHECK(walked < 1.25);  // rows: about one picture (the bands overlap by the halo)
+      }
+}
+
 // ---- reductions ----------------------------------------------------------------------------------------------------------------------------
 static void testReductions() {
   for (int k = 0; k < 3; ++k) {
@@ -1100,6 +1151,7 @@ int main(int argc, char** argv) {
   int rc = 0;
   if (id == "region") testRegion();
   else if (id == "reductions") testReductions();
+  else if (id == "rowwalk") testRowWalk();
   else if (id == "encoder") testEncoder();
   else if (id == "mixbands") testMixBands();
   else if (id == "mixbands_small") testMixBandsSmall();

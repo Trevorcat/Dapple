@@ -116,7 +116,14 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
   const int ww = hf ? 2 * tile + 6 : tile + 2 * H, wh = ww, wwE = ww + 2 * E, whE = wh + 2 * E;
   // (re)allocate for this tile size / CFA
   const bool cand = d.cfa == Cfa::XTrans && d.xtMode >= 1 && !hf;
+  const auto tSetup = Clock::now();
+  struct SetupTimer {
+    GpuStats& s;
+    Clock::time_point t;
+    ~SetupTimer() { s.setupMs = std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+  };
   if (P.tile != tile || P.cfa != d.cfa || P.period != per || P.xt != (cand ? 1 : 0) || P.extra != E || P.hf != hf) {
+    SetupTimer setupTimer{S_, tSetup};
     dev.waitIdle();
     P.release();
     const std::uint64_t planeBytes = std::uint64_t(ww) * wh * 4;
@@ -421,6 +428,26 @@ class DeviceBackend final : public GpuBackend {
     if (!gpu) why = std::string("slower than the CPU node here (") + it->second.note + ")";
     return gpu;
   }
+  double cpuShare(const Desc& d) override {
+    static const bool forced = std::getenv("DAPPLE_DEMOSAIC_NODE") != nullptr;
+    if (d.half) return 0.0;
+    if (const char* e = std::getenv("DAPPLE_DEMOSAIC_SHARE")) {  // "off", or a fixed share (tests)
+      const double v = std::strcmp(e, "off") == 0 ? 0.0 : std::atof(e);
+      return std::clamp(v, 0.0, 0.9);
+    }
+    if (forced) return 0.0;
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string w2;
+    if (!ensure(w2)) return 0.0;
+    const int key = int(d.cfa) * 8 + (d.xtMode >= 1 ? 4 : 0) + (d.hot ? 2 : 0);
+    auto it = verdicts_.find(key);
+    if (it == verdicts_.end()) it = verdicts_.emplace(key, measure(d)).first;
+    const Verdict& v = it->second;
+    if (!v.full || !(v.ms[0] > 0) || !(v.ms[1] > 0)) return 0.0;
+    // the CPU node shares the cores with the GPU runner's submission and read-back threads: count it a quarter slower than its probe
+    const double g = v.ms[0], c = v.ms[1] * 1.25;
+    return std::clamp(g / (g + c), 0.0, 0.5);
+  }
   bool trim() override {
     std::lock_guard<std::mutex> lk(mu_);
     if (!gpu_ && !dev_) return false;
@@ -432,7 +459,14 @@ class DeviceBackend final : public GpuBackend {
   bool run(const Desc& d, Rect roi, float* out, std::size_t stride, std::string& why) override {
     std::lock_guard<std::mutex> lk(mu_);
     if (!ensure(why)) return false;
-    const hal::Status s = gpu_->run(d, roi, out, stride, tile_);
+    GpuStats st;
+    const hal::Status s = gpu_->run(d, roi, out, stride, tile_, &st);
+    if (s == hal::Status::Ok && std::int64_t(roi.w()) * roi.h() >= (std::int64_t(1) << 22)) {  // a whole frame or a large band: one stage line (field diagnostics)
+      char ln[220];
+      std::snprintf(ln, sizeof ln, "gpu node %dx%d: %d tiles of %d, wall %.0f ms = setup %.0f + window build %.0f + submit/wait %.0f + read-back hand-off %.0f (conversion overlapped)", roi.w(), roi.h(),
+                    st.tiles, tile_, st.totalMs, st.setupMs, st.prepMs, st.gpuMs, st.readbackMs);
+      logLine(ln);
+    }
     if (s != hal::Status::Ok) {
       why = gpu_->error();
       if (s == hal::Status::DeviceLost) failed_ = "device lost";  // no retry in this process: the CPU node takes over

@@ -90,8 +90,8 @@ std::shared_ptr<const xstream::Analyses> lazyAnalyses(DappleSession* s, xstream:
     std::lock_guard<std::mutex> ml(s->matchMtx);
     if (!s->keyProxy) s->keyProxy = a->p256;
   }
-  stageLog("export_stream analyses %dx%d: %d pass(es) %.0f ms, shadow floor %d, %d reductions, guide grids %d, %s demosaic, row cache %.0f MB (%d rows)", s->lazy->width,
-           s->lazy->height, a->passes, a->ms, a->shadow ? 1 : 0, int(a->reduced.size()), a->guide ? int(a->guide->grids.size()) : 0, bs.gpu() ? "GPU" : "CPU",
+  stageLog("export_stream analyses %dx%d: %d pass(es) %.0f ms (demosaic %.0f ms, %.1f MP), shadow floor %d, %d reductions, guide grids %d, %s demosaic, row cache %.0f MB (%d rows)", s->lazy->width,
+           s->lazy->height, a->passes, a->ms, bs.demosaicMs(), bs.demosaicMpx(), a->shadow ? 1 : 0, int(a->reduced.size()), a->guide ? int(a->guide->grids.size()) : 0, bs.gpu() ? "GPU" : "CPU",
            double(bs.cacheBytes()) / 1048576.0, bs.cachedRows());
   return a;
 }
@@ -209,8 +209,8 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
     };
     std::string err;
     const int r = s->exportEngine.exportGpu(e, nullptr, &err);
-    stageLog("export_stream GPU %dx%d -> long edge %d: %s (%llu windows, demosaic %.0f ms %s%s)", W, H, int(outLongEdge), r == 0 ? "ok" : r > 0 ? "GPU declined" : err.c_str(),
-             (unsigned long long)bs.windows(), bs.demosaicMs(), bs.gpu() ? "GPU" : "CPU", bs.fellBack() ? ", fell back" : "");
+    stageLog("export_stream GPU %dx%d -> long edge %d: %s (%llu windows, %.1f MP, demosaic %.0f ms %s%s)", W, H, int(outLongEdge), r == 0 ? "ok" : r > 0 ? "GPU declined" : err.c_str(),
+             (unsigned long long)bs.windows(), bs.demosaicMpx(), bs.demosaicMs(), bs.gpu() ? "GPU" : "CPU", bs.fellBack() ? ", fell back" : "");
     if (r == 0) return 1;
     if (r < 0 || aborted) {
       setError(aborted ? "cancelled" : (err.empty() ? "GPU export failed" : err));

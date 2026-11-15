@@ -202,6 +202,7 @@ bool BandSource::fromCache(int x0, int y0, int x1, int y1) {
     y = hit->y1;
   }
   ImageF().data.swap(win_.data);
+  bandOk_ = false;
   win_ = ImageF(x1 - x0, y1 - y0);
   parallelFor(y1 - y0, [&](int k) {
     const int y = y0 + k;
@@ -215,27 +216,90 @@ bool BandSource::fromCache(int x0, int y0, int x1, int y1) {
   return true;
 }
 
+const float* BandSource::blockRows(int y0, int y1) const {
+  for (const Block& b : cache_)
+    if (b.y0 <= y0 && y1 <= b.y1) return b.px.data() + std::size_t(y0 - b.y0) * W_ * 3;
+  return nullptr;
+}
+
+bool BandSource::demosaicRows(int ya, int yb, float* dst) {
+  if (cancelCur_ && cancelCur_->load(std::memory_order_relaxed) != cancelMine_) return false;
+  const auto t0 = Clock::now();
+  bool fb = false;
+  // the CPU node spawns its own threads (all cores by default): follow the pool's limit when one is set (dapple_perf_configure), its per-thread
+  // scratch (X-Trans: ~8 MB a thread) is part of the export's peak
+  const ThreadPool& pool = ThreadPool::instance();
+  const int threads = pool.limit() < pool.size() ? std::max(1, pool.limit()) : 0;
+  const std::size_t pitch = std::size_t(W_) * 3;
+  if (!demosaic::demosaicOrientedRegionInto(*m_, 0, ya, W_, yb, gpu_, dst, pitch, &fb, threads)) return false;
+  fellBack_ |= fb;
+  if (shadow_) shadowChromaFloorRows(dst, W_, yb - ya, pitch);
+  ++windows_;
+  px_ += std::uint64_t(W_) * std::uint64_t(yb - ya);
+  ms_ += msSince(t0);
+  return true;
+}
+
+bool BandSource::band(int b0, int b1) {
+  const std::size_t pitch = std::size_t(W_) * 3;
+  // rows the previous band shares with this one move to the top (a walk down the picture: the halo rows of the next row of tiles)
+  const std::size_t need = std::size_t(b1 - b0) * pitch;
+  int kept = 0;
+  if (need > win_.data.capacity()) {
+    ImageF().data.swap(win_.data);  // growing: the old buffer goes first (never two bands alive); its rows are demosaiced again
+  } else if (bandOk_ && win_.width == W_ && b0 >= rowsY0_ && b0 < rowsY0_ + win_.height) {
+    kept = std::min(rowsY0_ + win_.height, b1) - b0;
+    if (b0 > rowsY0_) std::memmove(win_.data.data(), win_.row(b0 - rowsY0_), std::size_t(kept) * pitch * sizeof(float));
+  }
+  bandOk_ = false;
+  // one buffer for every band of the export: the allocation (and its pages) is reused, the window is never freed and made again
+  win_.width = W_, win_.height = b1 - b0;
+  win_.data.resize(need);
+  rowsY0_ = b0;
+  bool demosaiced = false;
+  for (int y = b0 + kept; y < b1;) {
+    const Block* hit = nullptr;
+    for (const Block& b : cache_)
+      if (b.y0 <= y && y < b.y1) hit = &b;
+    if (hit) {  // cached rows (the analysis pass made them)
+      const int e = std::min(b1, hit->y1);
+      std::memcpy(win_.row(y - b0), hit->px.data() + std::size_t(y - hit->y0) * pitch, std::size_t(e - y) * pitch * sizeof(float));
+      y = e;
+      continue;
+    }
+    int e = b1;
+    for (const Block& b : cache_)
+      if (b.y0 > y && b.y0 < e) e = b.y0;
+    if (!demosaicRows(y, e, win_.row(y - b0))) return false;
+    demosaiced = true;
+    y = e;
+  }
+  if (!demosaiced && kept < b1 - b0) ++cacheHits_;
+  peakBytes_ = std::max(peakBytes_, win_.data.size() * sizeof(float));
+  bandOk_ = true;
+  return true;
+}
+
 const ImageF* BandSource::window(int x0, int y0, int x1, int y1) {
   if (!m_ || x0 < 0 || y0 < 0 || x1 > W_ || y1 > H_ || x1 <= x0 || y1 <= y0) return nullptr;
   if (cancelCur_ && cancelCur_->load(std::memory_order_relaxed) != cancelMine_) return nullptr;
+  if (x0 == 0 && x1 == W_) return band(y0, y1) ? &win_ : nullptr;  // full-width rows (the analysis pass, the CPU render's bands): the rolling band
   if (fromCache(x0, y0, x1, y1)) {
-    rowsY0_ = y0;
     peakBytes_ = std::max(peakBytes_, win_.data.size() * sizeof(float));
     return &win_;
   }
   const auto t0 = Clock::now();
   bool fb = false;
   ImageF().data.swap(win_.data);  // the previous window goes before the next one is made (never two bands alive)
-  // the CPU node spawns its own threads (all cores by default): follow the pool's limit when one is set (dapple_perf_configure), its per-thread
-  // scratch (X-Trans: ~8 MB a thread) is part of the export's peak
+  bandOk_ = false;
   const ThreadPool& pool = ThreadPool::instance();
   const int threads = pool.limit() < pool.size() ? std::max(1, pool.limit()) : 0;
   win_ = demosaic::demosaicOrientedRegionOn(*m_, x0, y0, x1, y1, gpu_, &fb, threads);
   fellBack_ |= fb;
   if (win_.width != x1 - x0 || win_.height != y1 - y0) return nullptr;
   if (shadow_) shadowChromaFloor(win_);
-  rowsY0_ = y0;  // rows() reuses a full-width window
   ++windows_;
+  px_ += std::uint64_t(x1 - x0) * std::uint64_t(y1 - y0);
   ms_ += msSince(t0);
   peakBytes_ = std::max(peakBytes_, win_.data.size() * sizeof(float));
   return &win_;
@@ -246,21 +310,37 @@ std::uint64_t BandSourceStore::next() {
   return n.fetch_add(1);
 }
 const float* BandSource::rows(int x0, int y0, int x1, int y1, std::size_t& pitchFloats) {
-  // tiles of a row of tiles share their rows: one full-width band serves them all (one demosaic call instead of one per tile). A narrow rect
-  // (a quarter turn: a row of output tiles reads a column of the source) is read as it is.
-  const bool inBand = win_.width == W_ && y0 >= rowsY0_ && y1 <= rowsY0_ + win_.height && !win_.data.empty();
-  if (!inBand && 2 * (x1 - x0) < W_) {
+  if (!m_ || x0 < 0 || y0 < 0 || x1 > W_ || y1 > H_ || x1 <= x0 || y1 <= y0) return nullptr;
+  // a walk along rows (the next tile of the same row of tiles, or the first tile of the next row): bands; a walk down a column (a quarter turn reads a
+  // column of the source per row of output tiles): a window per rect
+  const bool alongRows = 2 * (x1 - x0) >= W_ || (y0 == lastY0_ && y1 == lastY1_) || (y0 > lastY0_ && x0 < lastX0_);
+  lastX0_ = x0, lastY0_ = y0, lastY1_ = y1;
+  pitchFloats = std::size_t(W_) * 3;
+  if (bandOk_ && y0 >= rowsY0_ && y1 <= rowsY0_ + win_.height) return win_.row(y0 - rowsY0_) + std::size_t(x0) * 3;
+  if (!alongRows) {
     if (!window(x0, y0, x1, y1)) return nullptr;
     pitchFloats = std::size_t(x1 - x0) * 3;
     return win_.data.data();
   }
-  if (!inBand) {
-    const int b1 = std::min(H_, std::max(y1, y0 + kBandRows));
-    if (!window(0, y0, W_, b1)) return nullptr;
+  // the walk goes down the picture: cached blocks above it are not read again
+  for (auto it = cache_.begin(); it != cache_.end();)
+    if (it->y1 <= y0) {
+      cacheBytes_ -= it->px.size() * sizeof(float);
+      it = cache_.erase(it);
+    } else {
+      ++it;
+    }
+  if (const float* p = blockRows(y0, y1)) {
+    if (!win_.data.empty()) release();  // the analysis pass's last band is not read again: the peak stays the cache's
+    ++cacheHits_;
+    return p + std::size_t(x0) * 3;
   }
-  if (x0 < 0 || x1 > W_) return nullptr;
-  pitchFloats = std::size_t(W_) * 3;
-  return win_.data.data() + std::size_t(y0 - rowsY0_) * pitchFloats + std::size_t(x0) * 3;
+  if (2 * (x1 - x0) < W_ && fromCache(x0, y0, x1, y1)) {  // a tile across two cached blocks: a copy of the tile, not a band next to the full cache
+    pitchFloats = std::size_t(x1 - x0) * 3;
+    return win_.data.data();
+  }
+  if (!band(y0, std::min(H_, std::max(y1, y0 + kBandRows)))) return nullptr;
+  return win_.row(0) + std::size_t(x0) * 3;
 }
 
 const float* BandSourceStore::window(int x0, int y0, int w, int h, std::size_t& pitchFloats) { return src_.rows(x0, y0, x0 + w, y0 + h, pitchFloats); }

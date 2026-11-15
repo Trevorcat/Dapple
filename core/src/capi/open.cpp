@@ -94,6 +94,7 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         bool mosaicPath = false;
         if (opts.quality == DecodeQuality::Full && std::strcmp(decoder->name(), "libraw") == 0 && xstream::envMode() != xstream::Mode::Off)
           if (DappleSession* lazy = openLazySession(p, opts, long_edge, &mosaicPath)) return lazy;
+        const double decideMs = msSince(t0);  // the export decision of a FULL open (mosaic fetch, anchor, trim): 0 for a preview
         // a RAW the band path cannot read (linear / JPEG XL DNG, sRAW, an OpcodeList3 warp) decodes whole: refuse cleanly what cannot fit
         // (the LibRaw decode peaks near 30 B/px: a 48 MP linear DNG ~1.4 GB) instead of being killed by the OS (section 42.7)
         if (!mosaicPath && opts.quality == DecodeQuality::Full && std::strcmp(decoder->name(), "libraw") == 0 && xstream::envMode() == xstream::Mode::Auto) {
@@ -120,9 +121,10 @@ DappleSession* dapple_session_open(const char* path, int32_t quality, int32_t lo
         session->source = std::move(*src);
         if (mosaicPath && long_edge <= 0) session->fullRawPath = p;
         const double decodeMs = msSince(t0);
-        if (long_edge > 0) session->source.linear = resizeToLongEdge(session->source.linear, long_edge);
-        stageLog("session_open %s quality=%s decoded %dx%d in %.0f ms, long_edge %d total %.0f ms (footprint %.0f MB, available %.0f MB)", pathToUtf8(p.filename()).c_str(),
-                 opts.quality == DecodeQuality::Full ? "full" : "preview", session->source.linear.width, session->source.linear.height, decodeMs, long_edge, msSince(t0),
+        if (long_edge > 0 && std::max(session->source.linear.width, session->source.linear.height) > long_edge)  // (the mosaic preview arrives reduced already)
+          session->source.linear = resizeToLongEdge(session->source.linear, long_edge);
+        stageLog("session_open %s quality=%s decoded %dx%d in %.0f ms (export decision %.0f ms), long_edge %d total %.0f ms (footprint %.0f MB, available %.0f MB)", pathToUtf8(p.filename()).c_str(),
+                 opts.quality == DecodeQuality::Full ? "full" : "preview", session->source.linear.width, session->source.linear.height, decodeMs, decideMs, long_edge, msSince(t0),
                  double(mem::footprint()) / 1048576.0, double(mem::available()) / 1048576.0);
         session->cameraOwned = dapple::effectiveCamera(cameras(), session->source.meta);
         session->camera = &session->cameraOwned;

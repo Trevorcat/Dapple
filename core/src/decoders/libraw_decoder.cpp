@@ -16,6 +16,7 @@
 #include <limits>
 #include <optional>
 #include <cstring>
+#include <thread>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -463,10 +464,9 @@ bool shadowChromaDecide(std::vector<float>& ls) {
   return ls[k] < kEmptyP995;  // else a photograph: leave the shadows alone
 }
 
-void shadowChromaApply(ImageF& img) {
-  const int h = img.height, w = img.width;
+void shadowChromaApplyRows(float* px, int w, int h, std::size_t strideFloats) {
   parallelRows(h, [&](int y) {
-    float* p = img.row(y);
+    float* p = px + std::size_t(y) * strideFloats;
     for (int x = 0; x < w; ++x, p += 3) {
       const float l = 0.2880f * p[0] + 0.7119f * p[1] + 0.0001f * p[2];
       if (l >= kShadowFloor) continue;
@@ -475,6 +475,8 @@ void shadowChromaApply(ImageF& img) {
     }
   });
 }
+
+void shadowChromaApply(ImageF& img) { shadowChromaApplyRows(img.data.data(), img.width, img.height, std::size_t(img.width) * 3); }
 
 void suppressShadowChroma(ImageF& img) {
   if (!shadowChromaEnabled()) return;

@@ -1,5 +1,33 @@
 # Xiaomi Redmi (2312DRA50C "garnet") device results, wave 8, 2026-11-12
 
+## 2026-11-16 open and export time (pipeline-architecture.md section 53)
+
+Native binaries only (arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`): "before" built from an exported copy of e26ef6b (`build/ofx-before-arm64`, unpatched LibRaw), "after" from the working tree (`build/ofx-arm64`); `dapple_open_bench` (the same source in both: preview open 2048 + first frame 1600 px, then the app's export: `dapple_export_intent` + FULL open + `dapple_session_export_jpeg` q92, VmHWM), `DAPPLE_GPU=1`, Vulkan, verdict cache dir, another RAF opened and rendered first (pipelines built, as in the app after the first photo). Pushed to `/data/local/tmp/ofx`, removed afterwards. Phone: screen off (no key sent), thermal status 0 (28 C), no settings changed, no taskset. The clock state of this phone changes between runs (the same unpack took 155 or 620 ms; libomp reported some of cores 4 - 7 as unavailable at times: parked, inferred): before and after runs interleaved file by file, medians [min - max] of 5 (open) / 3 (export) runs. Raw logs `build/ofx/logs/{before,after}_{cp,ce,pg}*`.
+
+### Open (ms; first frame = `render_frame` 1600 px after the open)
+| step | A6700 ARW 26 MP (ARW 2.3) | A7RM4 ARW 61 MP (ARW 2.3) | X-S10 RAF 26 MP (lossless compressed) |
+|---|---|---|---|
+| **tap to first frame** | 1682 [915 - 1740] -> **535** [528 - 605] | 3341 [1554 - 3378] -> **838** [817 - 1102] | 1994 [1221 - 2164] -> **1052** [1004 - 1061] |
+| session open | 1470 -> 337 | 3134 -> 626 | 1801 -> 878 |
+| of which unpack | 619 [155 - 623] -> 102 [98 - 194] | 1429 [345 - 1449] -> 182 [177 - 359] | 1198 [726 - 1346] -> 666 [655 - 698] |
+| mosaic copy | 75 -> 20 | 168 -> 43 | 73 -> 22 |
+| block reduction (after: one binning, preview + anchor picture) | 340 -> 91 | 790 -> 199 | 196 -> 72 |
+| anchor (after: overlapped, time waited for it) | 193 -> 24 | 369 -> 55 | 146 -> 24 |
+| first frame (tables / upload) | 216 (25 / 69) -> 197 (20 / 69) | 205 -> 203 | 198 -> 176 |
+| peak RSS (MB) | 375 -> 365 | 639 -> 560 | 287 -> 311 |
+
+### Export, no film (ms)
+| step | A6700 (whole frame, CPU node) | A7RM4 (streamed: 1542 MB predicted vs 1536 ceiling) | X-S10 (whole frame, GPU node) |
+|---|---|---|---|
+| **export total** | 2710 [2572 - 2746] -> **1848** [1810 - 1959] | 11019 [10932 - 11021] -> **4853** [4694 - 5061] | 4436 [4369 - 4682] -> **3663** [3468 - 3829] |
+| FULL open | 772 -> 416 (demosaic 457 -> 352) | 149 -> 49 | 3045 -> 2356 (demosaic 2805 -> 2279: GPU rows 742 of every 1024 + CPU node, 4 threads) |
+| render / encode | 1285 / 649 -> 1112 / 285 | analysis pass 2199 -> 1424; demosaic of the render's windows 6453 -> 616 | 922 / 437 -> 1072 / 220 |
+| peak RSS (MB) | 680 -> 681 (run-to-run 679 - 681) | 638 -> 579 | 661 -> 658 |
+
+The X-S10 whole-frame render is bimodal on this phone (about 1.0 s or 2.95 s; 2 of 3 runs at 2.95 s in one series, also with `DAPPLE_DEMOSAIC_SHARE=off`): not caused by these changes; the series above had none. The encode was lower in every after-run (437 - 671 -> 188 - 310 ms); its code did not change, the cause is not isolated.
+
+Equality on the phone: CPU executor (`DAPPLE_GPU=0`), first frame and export JPEG of all three files byte-identical before / after. `dapple_demosaic_tests pair tiles threads gpu_share gpu_tiles` (Vulkan, Adreno 710) and `dapple_export_stream_tests rowwalk`: pass. Not run here: GLES, the app, the Note10+ (Adreno 640).
+
 ## 2026-11-15 baseline after the planner rewrite
 
 Native binaries only, built from a clean worktree of bb1cf0f (arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`, `dapple_stage_bench`, `dapple_drag_bench`, `dapple_gpu_tests`, `libdapple.so`), pushed to `/data/local/tmp/perf1115` and removed afterwards. Method:

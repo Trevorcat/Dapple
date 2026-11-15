@@ -24,6 +24,7 @@ struct DecodeOptions {
   std::filesystem::path referenceImage{};
   // Long edge the caller will resize to (0 = unknown). The mosaic preview serves an X-Trans file well above its own block-reduction size (the 2x-view request) from the
   // half-resolution reconstruction of the cached mosaic (docs 32.12), which is at least as sharp as LibRaw's half-size picture; smaller requests stay block-reduced.
+  // The mosaic preview returns its picture reduced to this long edge already (resizeToLongEdge: the pixels the caller's own reduction would give).
   int wantLongEdge = 0;
 };
 

@@ -17,6 +17,7 @@ struct GpuStats {
   double prepMs = 0;      // host: window build + staging copy, all tiles
   double gpuMs = 0;       // submit + wait, all tiles (upload copy + passes + output copy)
   double readbackMs = 0;  // host: conversion of the read-back tiles
+  double setupMs = 0;     // buffers and pipelines (re)created for this tile size / CFA (pipeline compilation on the first run of a process)
   int tiles = 0;
   std::uint64_t deviceBytes = 0;  // device memory allocated for the planes and the output tile
   hal::SubmitStats submit;

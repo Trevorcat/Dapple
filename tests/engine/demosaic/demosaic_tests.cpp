@@ -360,6 +360,24 @@ std::vector<std::filesystem::path> sampleFiles() {
   return v;
 }
 
+// LibRaw patch 2 (docs/legal/libraw.md): the Sony ARW 2.3 rows decoded in parallel give the samples of the unpatched serial decoder. The hash below is
+// the mosaic of the public A7R IV file (the unpatched LibRaw of e26ef6b gives the same samples: its full-resolution linear decode of this file is
+// byte-identical to the patched one, checked 2026-11-16); ctest runs it with all threads and with OMP_NUM_THREADS=1.
+int testWireArw2() {
+  const std::filesystem::path f = "build/rawsamples/Sony/ILCE-7RM4/DSC00396.ARW";
+  if (!std::filesystem::exists(f)) return 77;
+  clearMosaicCache();
+  const auto m = decodeRawMosaic(f, {});
+  CHECK(m && m->cfa == CfaKind::Bayer, "decode failed");
+  if (!m) return 1;
+  std::uint64_t h = 1469598103934665603ull;
+  for (std::uint16_t v : m->data) h = (h ^ v) * 1099511628211ull;
+  constexpr std::uint64_t kUnpatched = 0x6d6984fb5f6c69a7ull;
+  std::printf("  wire_arw2: %dx%d mosaic hash %016llx (unpatched serial decoder %016llx)\n", m->width, m->height, (unsigned long long)h, (unsigned long long)kUnpatched);
+  CHECK(h == kUnpatched, "the ARW 2.3 mosaic differs from the unpatched decoder");
+  return g_fail ? 1 : 0;
+}
+
 // Every file under build/rawsamples (the anchor tests run on all of them; files LibRaw cannot open are skipped inside the tests)
 std::vector<std::filesystem::path> allSampleFiles() {
   std::vector<std::filesystem::path> v;
@@ -914,6 +932,98 @@ void testTiles() {
   }
 }
 
+// A MosaicImage over a synthetic sensor (the decoder's output for it): the orientation and the default crop are the parameters.
+std::shared_ptr<MosaicImage> mosaicOf(const Synth& s, int flip, bool crop) {
+  auto m = std::make_shared<MosaicImage>();
+  m->width = s.w, m->height = s.h, m->cfa = s.cfa == Cfa::XTrans ? CfaKind::XTrans : CfaKind::Bayer, m->period = s.d.period;
+  m->data.assign(s.raw.begin(), s.raw.end());
+  for (int i = 0; i < s.d.period * s.d.period; ++i) m->cfaIdx[i] = s.d.cfa4[i];
+  m->blackRows = m->blackCols = 1, m->black = {512.f}, m->white = 16383.f, m->blackMin = 512.f;
+  m->wb[0] = 1.9f, m->wb[1] = 1.f, m->wb[2] = 1.6f, m->wb[3] = 1.f;
+  const float M[9] = {1.2f, -0.15f, -0.05f, -0.1f, 1.15f, -0.05f, 0.02f, -0.2f, 1.18f};
+  std::memcpy(m->camToWork, M, sizeof M);
+  m->flip = flip;
+  if (crop) m->hasCrop = true, m->cropX = 13, m->cropY = 7, m->cropW = s.w - 40, m->cropH = s.h - 29;
+  return m;
+}
+
+// The editor's open: the preview and the anchor's picture from one binning (binnedOrientedPair) against binnedOriented as it was before (2026-11-16:
+// binnedHalf(m, step), crop copy, then the orientation), every orientation, with and without a default crop, both CFAs: bit-identical.
+void testPair() {
+  auto oracle = [](const MosaicImage& m, int step) {
+    ImageF h = binnedHalf(m, step);
+    const int bs = m.cfa == CfaKind::XTrans ? 3 : 2;
+    if (m.hasCrop) {
+      const int cx = m.cropX / bs / step, cy = m.cropY / bs / step, cw = std::min(m.cropW / bs / step, h.width - cx), ch = std::min(m.cropH / bs / step, h.height - cy);
+      if (cw > 0 && ch > 0) {
+        ImageF c(cw, ch);
+        for (int y = 0; y < ch; ++y) std::memcpy(c.row(y), h.row(cy + y) + std::size_t(cx) * 3, std::size_t(cw) * 3 * sizeof(float));
+        h = std::move(c);
+      }
+    }
+    if (m.flip != 3 && m.flip != 5 && m.flip != 6) return h;
+    const int W = h.width, H = h.height;
+    ImageF o = m.flip == 3 ? ImageF(W, H) : ImageF(H, W);
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x) {
+        int dx, dy;
+        if (m.flip == 3) dx = W - 1 - x, dy = H - 1 - y;
+        else if (m.flip == 6) dx = H - 1 - y, dy = x;
+        else dx = y, dy = W - 1 - x;
+        std::memcpy(o.row(dy) + std::size_t(dx) * 3, h.row(y) + std::size_t(x) * 3, 3 * sizeof(float));
+      }
+    return o;
+  };
+  auto same = [](const ImageF& a, const ImageF& b) { return a.width == b.width && a.height == b.height && std::memcmp(a.data.data(), b.data.data(), a.data.size() * sizeof(float)) == 0; };
+  int cases = 0, bad = 0;
+  for (Cfa c : {Cfa::Bayer, Cfa::XTrans}) {
+    Synth s(611, 437, c, zoneScene(611, 437));
+    for (int flip : {0, 3, 5, 6})
+      for (bool crop : {false, true}) {
+        const auto m = mosaicOf(s, flip, crop);
+        for (int step : {1, 2, 3}) {
+          ImageF pv, an;
+          binnedOrientedPair(*m, step, &pv, &an);
+          bad += !same(pv, oracle(*m, 1)) + !same(an, oracle(*m, step)) + !same(binnedOriented(*m, step), oracle(*m, step));
+          cases += 3;
+        }
+      }
+  }
+  std::printf("  pair: %d pictures (preview + anchor from one binning, binnedOriented) against the old crop / orientation, %d differ\n", cases, bad);
+  CHECK(bad == 0, "%d pictures differ", bad);
+}
+
+
+// Timing aid (not a ctest): 24 MP synthetic frames through the CPU node, 1 thread and all threads. `dapple_demosaic_tests speed`
+void testSpeed() {
+  for (Cfa c : {Cfa::Bayer, Cfa::XTrans}) {
+    const int w = 6000, h = 4000;
+    Synth s(w, h, c, zoneScene(w, h));
+    std::vector<float> out(std::size_t(w) * h * 3);
+    for (int threads : {1, 0}) {
+      double best = 1e30;
+      for (int rep = 0; rep < (threads == 1 ? 1 : 3); ++rep) {
+        const auto t0 = std::chrono::steady_clock::now();
+        dapple::demosaic::demosaic(s.d, {0, 0, w, h}, out.data(), std::size_t(w) * 3, threads);
+        best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      }
+      std::printf("  speed %s 24 MP, %s: %.0f ms\n", c == Cfa::Bayer ? "bayer " : "xtrans", threads == 1 ? "1 thread  " : "all threads", best);
+    }
+    {  // the streamed export's pattern: 812 x 812 windows, each into a fresh buffer
+      const auto t0 = std::chrono::steady_clock::now();
+      double px = 0;
+      for (int k = 0; k < 36; ++k) {
+        const Rect r{(k % 6) * 812, (k / 6) * 600, (k % 6) * 812 + 812, (k / 6) * 600 + 812 > h ? h : (k / 6) * 600 + 812};
+        std::vector<float> win(std::size_t(r.w()) * r.h() * 3);
+        dapple::demosaic::demosaic(s.d, r, win.data(), std::size_t(r.w()) * 3, 0);
+        px += double(r.w()) * r.h();
+      }
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      std::printf("  speed %s windows 812 x 812, all threads: %.1f ns per pixel\n", c == Cfa::Bayer ? "bayer " : "xtrans", ms * 1e6 / px);
+    }
+  }
+}
+
 void testThreads() {
   for (Cfa c : {Cfa::Bayer, Cfa::XTrans}) {
     Synth s(400, 300, c, zoneScene(400, 300));
@@ -928,7 +1038,7 @@ void testCache() {
   Synth s(128, 96, Cfa::XTrans, zoneScene(128, 96));
   auto mos = std::make_shared<MosaicImage>();
   mos->width = s.w, mos->height = s.h, mos->cfa = CfaKind::XTrans, mos->period = 6;
-  mos->data = s.raw;
+  mos->data.assign(s.raw.begin(), s.raw.end());
   for (int i = 0; i < 36; ++i) mos->cfaIdx[i] = s.d.cfa4[i];
   mos->blackRows = mos->blackCols = 1, mos->black = {512.f}, mos->white = 16383.f, mos->blackMin = 512.f;
   mos->key[0] = 0x1234, mos->key[1] = 0x5678;
@@ -1152,10 +1262,70 @@ int testHalfGpu() {
   return g_fail ? 1 : 0;
 }
 #endif
+#ifdef DAPPLE_HAVE_GPU
+// The GPU node shared with the CPU node (rows dealt by absolute mosaic row, DAPPLE_DEMOSAIC_SHARE fixes the share): the whole frame, bands of the streamed
+// export (odd heights, every orientation) and a region give every row the same node, so they are bit-identical; the CPU rows equal the CPU node, the GPU rows
+// the GPU node alone; the whole frame stays within the GPU parity budget of the CPU node.
+int testGpuShare() {
+  std::string why;
+  if (!makeDevice(why)) return 77;
+  engine::gpu::setRuntimeEnabled(1);
+  demosaic::installGpuBackend();
+  int bad = 0;
+  for (Cfa c : {Cfa::Bayer, Cfa::XTrans})
+    for (int flip : {0, 6}) {
+      Synth s(901, 2300, c, zoneScene(901, 2300));  // more than two share periods of 1024 rows
+      const auto m = mosaicOf(s, flip, false);
+      int W, H;
+      orientedSize(*m, &W, &H);
+      const std::size_t pitch = std::size_t(W) * 3;
+      auto run = [&](const char* share, int band) {
+        setEnvVar("DAPPLE_DEMOSAIC_SHARE", share);
+        std::vector<float> o(pitch * H);
+        for (int y = 0; y < H; y += band) CHECK(demosaicOrientedRegionInto(*m, 0, y, W, std::min(H, y + band), true, o.data() + std::size_t(y) * pitch, pitch), "band %d failed", y);
+        return o;
+      };
+      const auto whole = run("0.35", H), bands = run("0.35", 333), gpuOnly = run("off", H);
+      std::vector<float> cpu(pitch * H);
+      CHECK(demosaicOrientedRegionInto(*m, 0, 0, W, H, false, cpu.data(), pitch), "CPU node failed");
+      const int ry0 = H / 5, ry1 = H - H / 5;
+      const ImageF reg = [&] { setEnvVar("DAPPLE_DEMOSAIC_SHARE", "0.35"); return demosaicOrientedRegionOn(*m, 37, ry0, W - 11, ry1, true); }();
+      int regionBad = reg.width == W - 48 && reg.height == ry1 - ry0 ? 0 : 1;
+      for (int y = ry0; y < ry1 && regionBad == 0; ++y)
+        regionBad += std::memcmp(reg.row(y - ry0), whole.data() + std::size_t(y) * pitch + 37 * 3, std::size_t(W - 48) * 3 * sizeof(float)) != 0;
+      // which rows are the CPU's: mosaic rows 1024 k + 672 .. 1024 (k + 1) (share 0.35 of 1024 in steps of 32 = 352 rows), mapped through the orientation
+      int cpuRowsSame = 0, gpuRowsSame = 0, nCpu = 0, nGpu = 0;
+      for (int my = 0; my < s.h; ++my) {
+        const bool onCpu = my % 1024 >= 1024 - 352;
+        (onCpu ? nCpu : nGpu) += 1;
+        bool sameCpu = true, sameGpu = true;
+        for (int mx = 0; mx < s.w; ++mx) {
+          const int ox = flip == 6 ? s.h - 1 - my : mx, oy = flip == 6 ? mx : my;  // demosaic_session orientation 6: (dx, dy) = (H - 1 - y, x)
+          const std::size_t i = std::size_t(oy) * pitch + std::size_t(ox) * 3;
+          sameCpu = sameCpu && std::memcmp(&whole[i], &cpu[i], 12) == 0;
+          sameGpu = sameGpu && std::memcmp(&whole[i], &gpuOnly[i], 12) == 0;
+        }
+        cpuRowsSame += onCpu && sameCpu, gpuRowsSame += !onCpu && sameGpu;
+      }
+      double p99 = 0, mx = 0;
+      const double mean = meanDe(whole, cpu, &p99, &mx);
+      const bool bandsSame = whole == bands;
+      std::printf("  gpu_share %s flip %d: bands %s, region %d differing rows, CPU rows %d / %d = CPU node, GPU rows %d / %d = GPU node, whole vs CPU mean dE2000 %.4f p99 %.4f\n",
+                  c == Cfa::Bayer ? "bayer " : "xtrans", flip, bandsSame ? "identical" : "DIFFER", regionBad, cpuRowsSame, nCpu, gpuRowsSame, nGpu, mean, p99);
+      bad += !bandsSame + (regionBad != 0) + (cpuRowsSame != nCpu) + (gpuRowsSame != nGpu);
+      CHECK(mean <= 0.1 && p99 <= 1.0, "shared demosaic off the CPU node");
+    }
+  setEnvVar("DAPPLE_DEMOSAIC_SHARE", "off");
+  demosaic::setGpuBackend(nullptr);
+  CHECK(bad == 0, "%d cases where the share is not a pure function of the mosaic row", bad);
+  return g_fail ? 1 : 0;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::vector<std::string> all = {"flat", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu", "half_zone", "half_tiles", "half_flatclip", "half_real", "half_gpu"};
+  const std::vector<std::string> all = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "wire_arw2", "gpu_parity", "gpu_tiles", "gpu_real", "gpu_share", "wire_gpu", "half_zone", "half_tiles", "half_flatclip", "half_real", "half_gpu"};
   std::vector<std::string> ids;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--list") {
@@ -1164,7 +1334,7 @@ int main(int argc, char** argv) {
     }
     ids.push_back(argv[i]);
   }
-  if (ids.empty()) ids = {"flat", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache"};
+  if (ids.empty()) ids = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache"};
   int rc = 0;
   for (const auto& id : ids) {
     std::printf("[%s]\n", id.c_str());
@@ -1182,6 +1352,8 @@ int main(int argc, char** argv) {
     else if (id == "half_tiles") testHalfTiles();
     else if (id == "half_flatclip") testHalfFlatClip();
     else if (id == "threads") testThreads();
+    else if (id == "pair") testPair();
+    else if (id == "speed") testSpeed();
     else if (id == "cache") testCache();
     else if (id == "wire_region_small") { const int r = testWireRegionSmall(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_preview_small") { const int r = testWirePreviewSmall(); if (r == 77 && g_fail == before) return 77; }
@@ -1193,12 +1365,14 @@ int main(int argc, char** argv) {
     else if (id == "wire_anchor") { const int r = testWireAnchor(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_cache") { const int r = testWireCache(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_cancel") { const int r = testWireCancel(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "wire_arw2") { const int r = testWireArw2(); if (r == 77 && g_fail == before) return 77; }
 #ifdef DAPPLE_HAVE_GPU
     else if (id == "gpu_parity") { const int r = testGpuParity(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "gpu_tiles") { const int r = testGpuTiles(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "gpu_real") { const int r = testGpuReal(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "half_gpu") { const int r = testHalfGpu(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_gpu") { const int r = testWireGpu(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "gpu_share") { const int r = testGpuShare(); if (r == 77 && g_fail == before) return 77; }
 #else
     else if (id.rfind("gpu_", 0) == 0) return 77;
 #endif

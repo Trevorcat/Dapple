@@ -32,6 +32,9 @@ ImageF demosaicFull(const MosaicImage& m, int threads = 0, std::string* correcti
 ImageF binnedHalf(const MosaicImage& m, int step = 1);  // step > 1: every step-th block in x and y only (statistics)
 // The same, cropped (DNG default crop) and oriented like the full picture: the picture the exposure anchor is computed from (no OpcodeList3).
 ImageF binnedOriented(const MosaicImage& m, int step = 1);
+// The editor's open: binnedOriented(m) and binnedOriented(m, anchorStep) from one binning pass (a step-k binning is every k-th block of the step-1
+// binning, so the anchor's picture is a subsample of the preview's blocks: same values), each cropped and oriented in one parallel pass. `anchor` may be null.
+void binnedOrientedPair(const MosaicImage& m, int anchorStep, ImageF* preview, ImageF* anchor);
 // X-Trans only (empty otherwise): the half-resolution reconstruction (Desc::half, docs 32.12), cropped and oriented like the full picture, from the same cached
 // mosaic: 1/2 linear size (3876 px wide for 40 MP), as sharp as a half-size decode. GPU or CPU node by the measured verdict (a separate verdict kind).
 ImageF halfOriented(const MosaicImage& m, int threads = 0, bool* usedGpu = nullptr);
@@ -41,6 +44,9 @@ ImageF halfOriented(const MosaicImage& m, int threads = 0, bool* usedGpu = nullp
 // seam between a GPU band and a CPU band). A failed GPU run of a band falls back to the CPU node and sets *fellBack.
 bool fullUsesGpu(const MosaicImage& m);
 ImageF demosaicOrientedRegionOn(const MosaicImage& m, int x0, int y0, int x1, int y1, bool gpu, bool* fellBack = nullptr, int threads = 0);
+// The same pixels written into `out` (row stride `strideFloats` floats, at least 3 * (x1 - x0)): no allocation for an upright picture (the streamed export's
+// rolling band demosaics only its new rows into its own buffer). False when the rectangle is not inside the picture.
+bool demosaicOrientedRegionInto(const MosaicImage& m, int x0, int y0, int x1, int y1, bool gpu, float* out, std::size_t strideFloats, bool* fellBack = nullptr, int threads = 0);
 
 struct CacheStats {
   std::uint64_t mosaicHits = 0, mosaicMisses = 0, fullHits = 0, fullMisses = 0, evictions = 0;

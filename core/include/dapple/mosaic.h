@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "dapple/decoder.h"
@@ -16,9 +17,30 @@
 
 namespace dapple {
 
+// An allocator that leaves new elements uninitialised: the decoder overwrites every sample, so a 61 MP mosaic is not zero-filled (one core, 122 MB of
+// page faults and writes) before the parallel copy fills it.
+template <class T>
+struct NoInitAllocator : std::allocator<T> {
+  template <class U>
+  struct rebind {
+    using other = NoInitAllocator<U>;
+  };
+  NoInitAllocator() = default;
+  template <class U>
+  NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
+  template <class U>
+  void construct(U* p) noexcept {
+    ::new (static_cast<void*>(p)) U;
+  }
+  template <class U, class... A>
+  void construct(U* p, A&&... a) {
+    ::new (static_cast<void*>(p)) U(std::forward<A>(a)...);
+  }
+};
+
 struct MosaicImage {
   int width = 0, height = 0;           // the file's active area, sensor orientation (the decode crops to cropX.. after the demosaic)
-  std::vector<std::uint16_t> data;     // width * height raw samples (after DNG OpcodeList1 / 2 where they act on the mosaic)
+  std::vector<std::uint16_t, NoInitAllocator<std::uint16_t>> data;  // width * height raw samples (after DNG OpcodeList1 / 2 where they act on the mosaic)
   CfaKind cfa = CfaKind::None;         // Bayer (2x2), XTrans (6x6) or None: no mosaic, `reason` says why, use ImageDecoder::decode
   int period = 2;                      // 2 or 6
   std::uint8_t cfaIdx[36] = {};        // colour of cell (y % period, x % period) of `data`: 0 R, 1 G, 2 B, 3 second green (Bayer)
@@ -90,6 +112,7 @@ void mosaicCacheCounters(unsigned long long* hits, unsigned long long* misses);
 inline float shadowChromaLuma(const float* p) { return 0.2880f * p[0] + 0.7119f * p[1] + 0.0001f * p[2]; }
 bool shadowChromaWanted(std::vector<float>& lumaSamples);
 void shadowChromaFloor(ImageF& img);
+void shadowChromaFloorRows(float* px, int width, int rows, std::size_t strideFloats);  // the same, on rows of a larger buffer (per pixel: any row range)
 
 // A FULL open that does not demosaic: the cached mosaic, the metadata of the full decode (exposure anchor included) and the size of the oriented,
 // cropped picture. Refuses (reason) what the band path cannot read in windows: no mosaic path, OpcodeList3 warps. materializeFull() is then the very

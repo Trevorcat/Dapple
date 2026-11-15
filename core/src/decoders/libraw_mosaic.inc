@@ -76,10 +76,38 @@ BlackNorm normalizeBlack(LibRaw& raw, bool bayerFilters) {
 }
 
 int lcmInt(int a, int b) { return a / gcdInt(a, b) * b; }
+
+// LibRaw's OpenMP team (the ARW 2.3 rows of LibRaw patch 2, the Fuji compressed strips): one thread per cpu, each bound to its own cpu, the performance
+// cores first (OMP_PLACES / OMP_PROC_BIND, read by libomp once, at the first OpenMP construct of the process; values the user set are kept). Unbound, the
+// threads of a decompression that lasts a few tens of ms stay where the scheduler started them, often on the efficiency cores of a big.LITTLE phone:
+// Redmi (4 + 4), 26 MP ARW 2.3 unpack 156 - 626 ms unbound, 68 - 70 ms bound; 26 MP Fuji compressed 1100 ms unbound, 640 ms bound. Linux / Android
+// with performance and efficiency cores only (elsewhere nothing changes). True when the team is bound: the caller then runs LibRaw's unpack on a thread
+// of its own, so that the binding of the team's primary thread never sticks to the caller's thread.
+bool bindLibRawThreads() {
+#if defined(DAPPLE_SYSPERF_LINUX) && !defined(__APPLE__)
+  static const bool bound = [] {
+    if (std::getenv("DAPPLE_LIBRAW_BIND") && std::strcmp(std::getenv("DAPPLE_LIBRAW_BIND"), "off") == 0) return false;
+    const sys::Topology& t = sys::topology();
+    if (!t.hetero()) return false;
+    std::string places;
+    for (const std::vector<int>* v : {&t.perf, &t.efficient})
+      for (int c : *v) places += "{" + std::to_string(c) + "},";
+    places.pop_back();
+    ::setenv("OMP_PLACES", places.c_str(), 0);
+    ::setenv("OMP_PROC_BIND", "close", 0);
+    ::setenv("KMP_WARNINGS", "false", 0);  // a parked core (core control on a phone) is not a place: libomp would print a warning for it
+    return true;
+  }();
+  return bound;
+#else
+  return false;
+#endif
+}
 }  // namespace
 
 Result<MosaicImage> decodeRawMosaic(const std::filesystem::path& path, const DecodeOptions& options) {
   (void)options;
+  const auto tOpen = std::chrono::steady_clock::now();
   PathDatastream stream(path);
   if (!stream.valid()) return fail("Cannot open " + pathToUtf8(path));
   auto raw = std::make_unique<LibRaw>();
@@ -112,7 +140,16 @@ Result<MosaicImage> decodeRawMosaic(const std::filesystem::path& path, const Dec
 #if defined(__APPLE__)
   dapple::sys::appleOmpInit();
 #endif
-  if (int rc = raw->unpack(); rc != LIBRAW_SUCCESS) return fail("LibRaw unpack failed: " + std::string(libraw_strerror(rc)));
+  int unpackRc = LIBRAW_SUCCESS;
+  if (bindLibRawThreads())
+    std::thread([&] {  // (see bindLibRawThreads) every cpu: libomp takes the mask of the thread that starts it as the machine (a caller may be pinned)
+      std::vector<int> all(std::size_t(sys::topology().total));
+      for (int i = 0; i < int(all.size()); ++i) all[std::size_t(i)] = i;
+      sys::setAffinity(all);
+      unpackRc = raw->unpack();
+    }).join();
+  else unpackRc = raw->unpack();
+  if (unpackRc != LIBRAW_SUCCESS) return fail("LibRaw unpack failed: " + std::string(libraw_strerror(unpackRc)));
   const auto t1 = std::chrono::steady_clock::now();
   if (!raw->imgdata.rawdata.raw_image) return none("the format delivers 3 / 4-channel data, not a 16-bit mosaic");
   if (raw->imgdata.rawdata.ioparams.fuji_width) return none("Fuji rotated sensor layout: LibRaw demosaic");
@@ -226,6 +263,7 @@ Result<MosaicImage> decodeRawMosaic(const std::filesystem::path& path, const Dec
         m.black[std::size_t(y) * m.blackCols + x] = float(bn.cb[ch] + (bn.br ? bn.pat[std::size_t((y % br) * bc + (x % bc))] : 0));
       }
   }
+  const auto tc = std::chrono::steady_clock::now();
   m.data.resize(std::size_t(m.width) * m.height);
   const std::uint16_t* src = raw->imgdata.rawdata.raw_image;
   const std::size_t pitch = std::size_t(S.raw_pitch) / sizeof(std::uint16_t);
@@ -236,8 +274,9 @@ Result<MosaicImage> decodeRawMosaic(const std::filesystem::path& path, const Dec
   {  // one-line stage log (field diagnostics): the decompress of the whole frame, once per photo and mosaic-cache entry
     const auto t2 = std::chrono::steady_clock::now();
     char ln[200];
-    std::snprintf(ln, sizeof ln, "mosaic %s %dx%d unpack %.0f ms, copy %.0f ms", pathToUtf8(path.filename()).c_str(), m.width, m.height,
-                  std::chrono::duration<double, std::milli>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t1).count());
+    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    std::snprintf(ln, sizeof ln, "mosaic %s %dx%d open %.0f ms, unpack %.0f ms, metadata %.0f ms, copy %.0f ms", pathToUtf8(path.filename()).c_str(), m.width, m.height, ms(tOpen, t0),
+                  ms(t0, t1), ms(t1, tc), ms(tc, t2));
 #if defined(__ANDROID__)
     __android_log_write(ANDROID_LOG_INFO, "dapple_demosaic", ln);
 #elif defined(__APPLE__)
@@ -305,7 +344,29 @@ void copyAnchor(ShotMetadata& dst, const ShotMetadata& a) {
   dst.exposureAnchorDngEv = a.exposureAnchorDngEv;
 }
 
-void attachMosaicAnchor(ShotMetadata& meta, const MosaicImage& m, const std::filesystem::path& path, const DecodeOptions& options, std::future<Result<Image8>>* emb) {
+// Block step of the anchor's binned picture (every 2nd block of a 4096+ px mosaic: the statistics need no more).
+int anchorBinStep(const MosaicImage& m) {
+  const char* fastEnv = std::getenv("DAPPLE_ANCHOR_FAST");
+  return (fastEnv && std::strcmp(fastEnv, "off") == 0) || std::max(m.width, m.height) < 4096 ? 1 : 2;
+}
+
+// Whether attachMosaicAnchor will compute (not read from the cache) and therefore wants the binned picture.
+bool anchorNeedsPicture(const MosaicImage& m, const std::filesystem::path& path, const DecodeOptions& options) {
+  if (!anchorEnabled()) return false;
+  if (!options.referenceImage.empty()) return true;
+  for (const char* ext : {".jpg", ".JPG", ".jpeg", ".JPEG"}) {
+    std::filesystem::path sib = path;
+    sib.replace_extension(ext);
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(sib, ec)) return true;
+  }
+  std::lock_guard<std::mutex> lk(g_anchorMu);
+  return anchorStore().count({m.key[0], m.key[1]}) == 0;
+}
+
+// `binned` (optional): binnedOriented(m, anchorBinStep(m)) when the caller made it already (the editor's open makes it with its preview).
+void attachMosaicAnchor(ShotMetadata& meta, const MosaicImage& m, const std::filesystem::path& path, const DecodeOptions& options, std::future<Result<Image8>>* emb,
+                        ImageF* binned = nullptr) {
   if (!anchorEnabled()) return;
   // cached per file only when nothing outside the file can change the answer: no explicit reference image and no sibling camera JPEG (RAW+JPEG)
   bool cacheable = options.referenceImage.empty();
@@ -327,9 +388,10 @@ void attachMosaicAnchor(ShotMetadata& meta, const MosaicImage& m, const std::fil
   SourceImage tmp;
   tmp.meta = meta;
   const auto ta0 = std::chrono::steady_clock::now();
-  const char* fastEnv = std::getenv("DAPPLE_ANCHOR_FAST");
-  const int bstep = (fastEnv && std::strcmp(fastEnv, "off") == 0) || std::max(m.width, m.height) < 4096 ? 1 : 2;
-  if (m.opcodeList3.empty()) {
+  const int bstep = anchorBinStep(m);
+  if (m.opcodeList3.empty() && binned && !binned->empty()) {
+    tmp.linear = std::move(*binned);
+  } else if (m.opcodeList3.empty()) {
     tmp.linear = demosaic::binnedOriented(m, bstep);
   } else {  // the preview the anchor is compared with is geometry-corrected: warp the binned frame like finishMosaicRgb does the full one, then crop and orient
     ImageF h = demosaic::binnedHalf(m, bstep);
@@ -363,6 +425,19 @@ void attachMosaicAnchor(ShotMetadata& meta, const MosaicImage& m, const std::fil
   if (!cacheable) return;
   std::lock_guard<std::mutex> lk(g_anchorMu);
   anchorStore()[key] = tmp.meta;
+}
+
+// The embedded preview the anchor compares with, decoded on a second thread while the mosaic is fetched: only when the file's anchor is not cached yet. A FULL
+// open after the editor's preview open has it (the future's destructor would otherwise wait for a decode nobody reads: 100 - 300 ms on a phone).
+std::future<Result<Image8>> embeddedForAnchor(const std::filesystem::path& path, const DecodeOptions& options) {
+  if (!anchorEnabled() || !options.referenceImage.empty() || std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) return {};
+  std::uint64_t k[2];
+  fileContentKey(path, k);
+  {
+    std::lock_guard<std::mutex> lk(g_anchorMu);
+    if (anchorStore().count({k[0], k[1]})) return {};
+  }
+  return std::async(std::launch::async, [path] { return extractEmbeddedPreviewForAnchor(path); });
 }
 
 void logMosaicRefusal(const std::string& reason) {  // once per reason
@@ -406,8 +481,8 @@ Result<SourceImage> decodeFullFromMosaic(const std::filesystem::path& path, cons
     if (reason) *reason = "DAPPLE_DEMOSAIC=off";
     return fail("mosaic path disabled");
   }
-  std::future<Result<Image8>> embedded;  // the embedded preview decode overlaps the decompression and the demosaic, as in decode()
-  if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::async, [&path] { return extractEmbeddedPreviewForAnchor(path); });
+  const auto tfStart = std::chrono::steady_clock::now();
+  std::future<Result<Image8>> embedded = embeddedForAnchor(path, options);  // the embedded preview decode overlaps the decompression and the demosaic
   auto mr = mosaicCache().mosaic(path, options);
   if (!mr) {
     if (embedded.valid()) embedded.wait();
@@ -423,6 +498,7 @@ Result<SourceImage> decodeFullFromMosaic(const std::filesystem::path& path, cons
   out.sceneReferred = true;
   std::string corr;
   const auto tf0 = std::chrono::steady_clock::now();
+  const double fetchMs = std::chrono::duration<double, std::milli>(tf0 - tfStart).count();
   out.linear = demosaic::demosaicFull(*m, 0, &corr);
   const auto tf1 = std::chrono::steady_clock::now();
   out.meta.dngCorrections = m->dngCorrections.empty() ? corr : (corr.empty() ? m->dngCorrections : m->dngCorrections + ", " + corr);
@@ -432,7 +508,8 @@ Result<SourceImage> decodeFullFromMosaic(const std::filesystem::path& path, cons
   {  // one-line stage log: the demosaic node (GPU or CPU) with crop / orientation, the shadow-chroma pass, the anchor (cached after the first open)
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     char ln[200];
-    std::snprintf(ln, sizeof ln, "full %s: demosaic + crop/orientation %.0f ms, shadow chroma %.0f ms, anchor %.0f ms", pathToUtf8(path.filename()).c_str(), ms(tf0, tf1), ms(tf1, tf2), ms(tf2, std::chrono::steady_clock::now()));
+    std::snprintf(ln, sizeof ln, "full %s: mosaic %.0f ms, demosaic + crop/orientation %.0f ms, shadow chroma %.0f ms, anchor %.0f ms", pathToUtf8(path.filename()).c_str(), fetchMs, ms(tf0, tf1), ms(tf1, tf2),
+                  ms(tf2, std::chrono::steady_clock::now()));
 #if defined(__ANDROID__)
     __android_log_write(ANDROID_LOG_INFO, "dapple_demosaic", ln);
 #elif defined(__APPLE__)
@@ -450,8 +527,7 @@ Result<SourceImage> decodePreviewFromMosaic(const std::filesystem::path& path, c
   const char* pe = std::getenv("DAPPLE_PREVIEW_MOSAIC");
   if (!mosaicPathEnabled() || (pe && std::strcmp(pe, "off") == 0)) return refuse("mosaic preview off");
   const auto t0 = std::chrono::steady_clock::now();
-  std::future<Result<Image8>> embedded;  // the embedded preview read for the anchor overlaps the unpack, as in the other decodes
-  if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::async, [&path] { return extractEmbeddedPreviewForAnchor(path); });
+  std::future<Result<Image8>> embedded = embeddedForAnchor(path, options);  // the embedded preview read for the anchor overlaps the unpack
   auto mr = mosaicCache().mosaic(path, options);
   if (!mr) {
     if (embedded.valid()) embedded.wait();
@@ -484,16 +560,29 @@ Result<SourceImage> decodePreviewFromMosaic(const std::filesystem::path& path, c
   SourceImage out;
   out.meta = m->meta;
   out.sceneReferred = true;
-  out.linear = useHalf ? demosaic::halfOriented(*m) : demosaic::binnedOriented(*m);
-  if (out.linear.empty()) out.linear = demosaic::binnedOriented(*m);
   out.meta.dngCorrections = m->dngCorrections;
-  suppressShadowChroma(out.linear);
+  // one binning pass gives the preview and (when the anchor is not cached yet) the anchor's picture; the anchor then runs on a second thread while this
+  // one finishes the preview (shadow floor, reduction to the requested long edge): the two never touch the same data
+  ImageF anchorPic;
+  if (useHalf) out.linear = demosaic::halfOriented(*m);
+  if (out.linear.empty()) demosaic::binnedOrientedPair(*m, anchorBinStep(*m), &out.linear, anchorNeedsPicture(*m, path, options) ? &anchorPic : nullptr);
   const auto t2 = std::chrono::steady_clock::now();
-  attachMosaicAnchor(out.meta, *m, path, options, embedded.valid() ? &embedded : nullptr);
+  double anchorMs = 0;
+  std::future<void> anchor = std::async(std::launch::async, [&] {
+    const auto ta = std::chrono::steady_clock::now();
+    attachMosaicAnchor(out.meta, *m, path, options, embedded.valid() ? &embedded : nullptr, &anchorPic);
+    anchorMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta).count();
+  });
+  suppressShadowChroma(out.linear);
+  // the caller's reduction (open.cpp: resizeToLongEdge to the session's long edge), here so that it overlaps the anchor: the same pixels
+  if (options.wantLongEdge > 0 && std::max(out.linear.width, out.linear.height) > options.wantLongEdge) out.linear = resizeToLongEdge(out.linear, options.wantLongEdge);
+  const auto t3 = std::chrono::steady_clock::now();
+  anchor.get();
   {
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    char ln[200];
-    std::snprintf(ln, sizeof ln, "preview %s: mosaic %.0f ms, %s %.0f ms, anchor %.0f ms", pathToUtf8(path.filename()).c_str(), ms(t0, t1), useHalf ? "half-resolution reconstruction" : "block reduction", ms(t1, t2), ms(t2, std::chrono::steady_clock::now()));
+    char ln[240];
+    std::snprintf(ln, sizeof ln, "preview %s: mosaic %.0f ms, %s %.0f ms, floor + reduction %.0f ms, anchor %.0f ms (overlapped, waited %.0f ms)", pathToUtf8(path.filename()).c_str(), ms(t0, t1),
+                  useHalf ? "half-resolution reconstruction" : "block reduction", ms(t1, t2), ms(t2, t3), anchorMs, ms(t3, std::chrono::steady_clock::now()));
 #if defined(__ANDROID__)
     __android_log_write(ANDROID_LOG_INFO, "dapple_demosaic", ln);
 #elif defined(__APPLE__)
@@ -584,6 +673,7 @@ Result<SourceImage> decodeRawRegion(const std::filesystem::path& path, int x0, i
 // ---- streaming export (section 42) ----------------------------------------------------------------------------------------------------------------
 bool shadowChromaWanted(std::vector<float>& lumaSamples) { return shadowChromaEnabled() && shadowChromaDecide(lumaSamples); }
 void shadowChromaFloor(ImageF& img) { shadowChromaApply(img); }
+void shadowChromaFloorRows(float* px, int width, int rows, std::size_t strideFloats) { shadowChromaApplyRows(px, width, rows, strideFloats); }
 
 Result<LazyFull> openFullLazy(const std::filesystem::path& path, const DecodeOptions& options, std::string* reason) {
   auto refuse = [&](const std::string& why) {
@@ -591,8 +681,7 @@ Result<LazyFull> openFullLazy(const std::filesystem::path& path, const DecodeOpt
     return Result<LazyFull>(fail(why));
   };
   if (!mosaicPathEnabled()) return refuse("DAPPLE_DEMOSAIC=off");
-  std::future<Result<Image8>> embedded;  // as decodeFullFromMosaic: the embedded preview for the anchor overlaps the decompression
-  if (anchorEnabled() && options.referenceImage.empty() && !std::getenv("DAPPLE_NO_ASYNC_PREVIEW")) embedded = std::async(std::launch::async, [&path] { return extractEmbeddedPreviewForAnchor(path); });
+  std::future<Result<Image8>> embedded = embeddedForAnchor(path, options);  // as decodeFullFromMosaic
   auto mr = mosaicCache().mosaic(path, options);
   if (!mr) {
     if (embedded.valid()) embedded.wait();
