@@ -4,10 +4,10 @@ import 'dart:math' as math;
 ///
 /// A drag frame costs (size-independent overhead: bake / tables / encode / dispatch, all CPU) + (pixel part: GPU execution
 /// and readback / present, which scales with the number of pixels). Shrinking the picture only buys back the pixel part, so
-/// the controller sizes the preview from that part alone. The engine reports one number per frame (render ms, which includes
-/// the tables), so the split is modelled: pixel part = [pixelMsPerMpx] x megapixels of the rung (prior: the engine's warm-up
-/// film-frame measurement, [seedFromMeasurement]); overhead = smoothed measured frame time minus the pixel part of the rung it
-/// ran at.
+/// the controller sizes the preview from that part alone. Each frame reports its split ([FrameTiming], the "timing" object of the
+/// engine's frame analysis: execMs and the megapixels rendered): [pixelMsPerMpx] is the smoothed measured pixel ms per megapixel,
+/// the overhead the smoothed measured rest of the frame. Before the first measured frame (or for a frame without timing) the
+/// pixel part is the prior ([seedFromMeasurement]: the engine's warm-up film-frame measurement) x megapixels of the rung.
 ///
 /// Policy (pure Dart, unit tested):
 ///  * allowance = budget - overhead, kept within [0.5, 1] x budget: when the overhead alone is over the budget, shrinking
@@ -26,6 +26,23 @@ class QualityRung {
   final int bake;
   @override
   String toString() => '$longEdge/$bake';
+}
+
+/// The engine's own split of one frame ("timing" in the frame's analysis JSON, core/include/dapple/dapple_c.h): host table work,
+/// the pixel execution (GPU or CPU executor, readback included), device uploads, waiting for the GPU, megapixels rendered.
+class FrameTiming {
+  const FrameTiming({required this.tablesMs, required this.execMs, this.uploadMs = 0, this.waitMs = 0, required this.mpx});
+  final double tablesMs, execMs, uploadMs, waitMs, mpx;
+
+  /// From a frame's analysis JSON; null when the engine did not report a split.
+  static FrameTiming? fromAnalysis(Map<String, dynamic>? analysis) {
+    final t = analysis?['timing'];
+    if (t is! Map) return null;
+    double v(String k) => (t[k] as num?)?.toDouble() ?? 0;
+    final mpx = v('mpx');
+    if (!(mpx > 0) || t['execMs'] is! num) return null;
+    return FrameTiming(tablesMs: v('tablesMs'), execMs: v('execMs'), uploadMs: v('uploadMs'), waitMs: v('waitMs'), mpx: mpx);
+  }
 }
 
 class AdaptiveQuality {
@@ -52,14 +69,19 @@ class AdaptiveQuality {
   final int downAfter, upAfter;
   final double upMargin;
 
-  /// Pixel-dependent cost of a frame, ms per megapixel (GPU execution + present). Prior 12; [seedFromMeasurement] sets it from the
-  /// engine's warm-up measurement of an interactive film frame (an upper bound for frames without film).
+  /// Pixel-dependent cost of a frame, ms per megapixel (GPU execution + present): measured by [record] from the frames' split. Prior
+  /// 12; [seedFromMeasurement] sets it from the engine's warm-up measurement of an interactive film frame (an upper bound for frames without film).
   double pixelMsPerMpx = 12;
 
   int _rung = 0;
   int _over = 0, _under = 0;
   int _thermalCap = 0; // minimum rung index allowed by the thermal state
   double _ema = 0;
+  double _overheadEma = 0; // smoothed measured size-independent part (frames with a split)
+  bool _measured = false;
+
+  /// True once a frame reported its split: [pixelMsPerMpx] and [overheadMs] are measured, not modelled.
+  bool get measured => _measured;
 
   /// Rung the display size allows at most (small screens never need 1080): index into [rungs].
   int _displayCap = 0;
@@ -71,8 +93,8 @@ class AdaptiveQuality {
   /// Megapixels of a 3:2 frame at [r].
   static double mpx(QualityRung r) => r.longEdge * r.longEdge * 2 / 3 / 1e6;
 
-  /// Size-independent part of the smoothed frame time at the current rung, ms.
-  double get overheadMs => _ema == 0 ? 0 : math.max(0, _ema - pixelMsPerMpx * mpx(rung));
+  /// Size-independent part of the smoothed frame time, ms: measured (frames with a split), else the smoothed frame time minus the prior's pixel part.
+  double get overheadMs => _measured ? _overheadEma : (_ema == 0 ? 0 : math.max(0, _ema - pixelMsPerMpx * mpx(rung)));
 
   /// Time the pixel part may take: what is left of the budget after the overhead, never under half a refresh (when the overhead
   /// alone fills the budget a smaller picture buys nothing).
@@ -102,7 +124,7 @@ class AdaptiveQuality {
   bool seedFromMeasurement(double msPerMpx, {double fill = 0.8}) {
     if (!(msPerMpx > 0) || !msPerMpx.isFinite) return false;
     _seeded = true;
-    pixelMsPerMpx = msPerMpx;
+    if (!_measured) pixelMsPerMpx = msPerMpx; // a measured split is better than the warm-up's estimate
     var pick = rungs.length - 1;
     for (var i = 0; i < rungs.length; i++) {
       if (msPerMpx * mpx(rungs[i]) <= budgetMs * fill) {
@@ -169,9 +191,16 @@ class AdaptiveQuality {
     return changed;
   }
 
-  /// Feed the cycle time of an interactive frame rendered at the current rung. Returns true when the rung changed.
-  bool record(double cycleMs) {
+  /// Feed the cycle time of an interactive frame rendered at the current rung, with its measured pixel part ([pixelMs] for [mpx]
+  /// megapixels; the frame's [FrameTiming]) when the engine reported one. Returns true when the rung changed.
+  bool record(double cycleMs, {double? pixelMs, double? mpx}) {
     _ema = _ema == 0 ? cycleMs : _ema * 0.6 + cycleMs * 0.4;
+    if (pixelMs != null && mpx != null && mpx > 0.005 && pixelMs >= 0) {
+      final perMpx = pixelMs / mpx, overhead = math.max(0.0, cycleMs - pixelMs);
+      pixelMsPerMpx = _measured ? pixelMsPerMpx * 0.6 + perMpx * 0.4 : perMpx;
+      _overheadEma = _measured ? _overheadEma * 0.6 + overhead * 0.4 : overhead;
+      _measured = true;
+    }
     // a smaller picture is only asked for when it would take the pixel part under the allowance
     if (cycleMs > budgetMs && targetIndex() > _rung) {
       _over++;

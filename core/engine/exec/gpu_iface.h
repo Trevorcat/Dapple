@@ -73,6 +73,8 @@ struct GpuCancel {
 
 struct GpuStats {
   double wallMs = 0, gpuMs = 0, uploadMs = 0, readbackMs = 0, recordMs = 0, submitMs = 0, waitMs = 0, trimMs = 0;
+  double turnWaitMs = 0;  // waiting for the device (another session's job in flight, section 52); not part of uploadMs
+  double prepMs = 0;      // host preparation before the device turn (a film frame's CPU tables and plan)
   int passes = 0, barriers = 0, parts = 0, tiles = 0, sweeps = 0;
   std::vector<std::pair<std::string, double>> passTimes;  // profile only
 };

@@ -37,7 +37,7 @@ Status tilePack8(CpuTile& t, const void*) {
   const ImageF& img = *t.img;
   const Rect& in = t.interior;
   const int ch = t.outChannels;
-  ThreadPool::instance().run(in.y1 - in.y0, 16, [&](int a, int b) {
+  ThreadPool::current().run(in.y1 - in.y0, 16, [&](int a, int b) {
     for (int yy = a; yy < b; ++yy) {
       const int y = in.y0 + yy;
       const float* s = img.row(y) + 3 * std::size_t(in.x0);

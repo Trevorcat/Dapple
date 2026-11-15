@@ -149,7 +149,15 @@ std::uint64_t Context::epoch() const { return d_->epoch.load(); }
 DeviceGate& Context::gate() { return d_->gate; }
 
 // ---- device turns ----
-void DeviceGate::lock(Prio p) {
+namespace {
+std::int64_t nowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+double turnLogMs() {
+  static const double v = std::getenv("DAPPLE_GPU_TURNLOG") ? std::atof(std::getenv("DAPPLE_GPU_TURNLOG")) : -1.0;
+  return v;
+}
+}  // namespace
+
+void DeviceGate::lock(Prio p, const char* what) {
   const int i = int(p);
   {
     std::unique_lock<std::mutex> lk(m_);
@@ -159,14 +167,30 @@ void DeviceGate::lock(Prio p) {
     ++serving_[i];
   }
   queue_.lock();
+  what_ = what;
+  since_ = nowNs();
 }
 void DeviceGate::unlock() {
+  const double heldMs = double(nowNs() - since_) / 1e6, logMs = turnLogMs();
+  const char* what = what_;
   queue_.unlock();
   {
     std::lock_guard<std::mutex> lk(m_);
     held_ = false;
   }
   cv_.notify_all();
+  if (logMs >= 0.0 && heldMs > logMs) {
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "dapple_engine", "gpu turn held %.1f ms by %s", heldMs, what ? what : "?");
+#else
+    std::fprintf(stderr, "dapple_engine: gpu turn held %.1f ms by %s\n", heldMs, what ? what : "?");
+#endif
+  }
+}
+void DeviceTurn::lockTimed() {
+  const std::int64_t t0 = nowNs();
+  g_.lock(p_, what_);
+  waitedMs_ += double(nowNs() - t0) / 1e6;
 }
 bool DeviceGate::interactiveWaiting() {
   std::lock_guard<std::mutex> lk(m_);

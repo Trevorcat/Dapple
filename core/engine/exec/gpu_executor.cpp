@@ -72,7 +72,12 @@ void Executor::releaseLocked() {
   tileRb_[0] = tileRb_[1] = hal::BufferH{};
 }
 
-Executor::Turn::Turn(Executor& x, const GpuRun& in) : x_(x), in_(in), t_(x.ctx_->gate(), x.prio_) { x_.turn_ = &t_; }
+Executor::Turn::Turn(Executor& x, const GpuRun& in)
+    : x_(x), in_(in),
+      t_(x.ctx_->gate(), x.prio_,
+         in.plan.mode == ExecMode::TiledExport ? "export tile" : x.prio_ == DeviceGate::Prio::Interactive ? "interactive frame" : "background frame") {
+  x_.turn_ = &t_;
+}
 
 Executor::Turn::~Turn() {
   if (t_.held() && x_.epoch_ == x_.ctx_->epoch()) {
@@ -225,7 +230,9 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
     filmnode::planOf(fres);
   }
 
+  const double prepMs = msSince(t0);
   Turn turn(*this, in);
+  const auto tTurn = Clock::now();
   if (!turnOk()) return failed(Status::Internal);
   hal::Device& d = dev();
   if (!ensureResident()) return failed(Status::Internal);
@@ -259,8 +266,11 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   std::shared_ptr<DeviceBuffer> LDsc, LPl;
   if (!ensureLocal(in, LDsc, LPl)) return failed(Status::Internal);
   // a background frame hands the device to a waiting interactive frame between its uploads and its recording; everything it binds is held
+  const double waited0 = turn.waited();
   if (!yieldTurn()) return failed(Status::Internal);
-  const double uploadMs = msSince(t0);
+  const auto tUp = Clock::now();
+  // the device copies of this frame (source, tables, buffers), without the waits for the device (they are turnWaitMs)
+  const double turnWaitMs = turn.waited(), uploadMs = std::max(0.0, std::chrono::duration<double, std::milli>(tUp - tTurn).count() - (turnWaitMs - waited0));
   if (in.cancel.cancelled()) return fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled;
 
   auto cl = d.begin();
@@ -398,9 +408,11 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
     }
   }
   st.uploadMs = uploadMs;
+  st.turnWaitMs = turnWaitMs;
+  st.prepMs = prepMs;
   st.readbackMs = copyMs;
   st.trimMs = trimMs;
-  st.recordMs = std::chrono::duration<double, std::milli>(tSub - t0).count() - uploadMs;
+  st.recordMs = std::chrono::duration<double, std::milli>(tSub - tUp).count();
   st.submitMs = std::chrono::duration<double, std::milli>(tWait - tSub).count();
   st.waitMs = std::chrono::duration<double, std::milli>(t1 - tWait).count();
   return Status::Ok;
@@ -589,24 +601,36 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   };
   auto wrect = [](const Rect& r) { return WRect{r.x0, r.y0, r.x1, r.y1}; };
 
+  // The source window of a streamed tile (the plan's, the CPU executor's), read before the tile's turn: the store may demosaic a band of the
+  // picture for it (hundreds of ms on a phone), host work that must not hold the device while an interactive frame waits.
+  struct SrcRead {
+    SrcWin win;
+    const float* base = nullptr;
+    std::size_t pitch = 0;
+  };
+  auto readSource = [&](const TileWin& tw, SrcRead& sr) -> bool {
+    const WRect fp = wrect(tw.source);
+    sr.win = SrcWin{fp.x0, fp.y0, fp.x1, fp.y1};
+    if (resident) return true;
+    if (down) sr.win = lanczosWindow(rb, fp);
+    sr.base = store_->window(sr.win.x0, sr.win.y0, sr.win.w(), sr.win.h(), sr.pitch);
+    return sr.base || fail(GpuReason::DeviceError, "source store cannot be read");
+  };
+
   // one sweep over one tile of the plan (inside the tile's turn)
-  auto runTile = [&](const Stage& st, const TileWin& tw) -> bool {
+  auto runTile = [&](const Stage& st, const TileWin& tw, const SrcRead& sr) -> bool {
     const WRect interior = wrect(tw.interior), work = wrect(tw.work);
-    // 1. the source window of a streamed export (the plan's, the CPU executor's) is uploaded first (the upload takes frame slots of its own)
+    // 1. the source window of a streamed export is uploaded first (the upload takes frame slots of its own)
     hal::ImageH acquired;
     bool haveAcq = false;
     const WRect fp = wrect(tw.source);
-    SrcWin win{fp.x0, fp.y0, fp.x1, fp.y1};
+    const SrcWin win = sr.win;
     if (!resident) {
-      if (down) win = lanczosWindow(rb, fp);
       const hal::Status as = pool.acquire(hal::Format::RGBA16F, std::uint32_t(win.w()), std::uint32_t(win.h()), &acquired);
       if (as != hal::Status::Ok) return failStatus(as, "");
       haveAcq = true;
-      std::size_t pitch = 0;
-      const float* base = store_->window(win.x0, win.y0, win.w(), win.h(), pitch);
-      if (!base || !core().uploadRgbF32(base, pitch, win.w(), win.h(), acquired, 0, 0, err)) {
+      if (!core().uploadRgbF32(sr.base, sr.pitch, win.w(), win.h(), acquired, 0, 0, err)) {
         pool.release(acquired);
-        if (!base) return fail(GpuReason::DeviceError, "source store cannot be read");
         return fail(d.state() == hal::DeviceState::Lost ? GpuReason::DeviceLost : GpuReason::DeviceError, err);
       }
     }
@@ -727,12 +751,15 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     return turnOk();
   };
   int sweeps = 0, tiles = 0;
+  turn.release();  // every job below takes its own turn (the first tile's source is read without one)
   for (const Stage& st : in.plan.stages) {
     if (st.kind == StageKind::TileSweep) {
       ++sweeps;
       for (const TileWin& t : st.tiles) {
         if (in.cancel.cancelled()) return fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled;
-        if (!take() || !runTile(st, t)) return failed(Status::Internal);
+        SrcRead sr;
+        if (!readSource(t, sr)) return in.cancel.cancelled() ? (fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled) : failed(Status::Internal);
+        if (!take() || !runTile(st, t, sr)) return failed(Status::Internal);
         turn.release();
         if (!sinkReady()) return failed(Status::Internal);
         tiles += st.output;

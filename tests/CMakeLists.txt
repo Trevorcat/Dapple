@@ -424,6 +424,9 @@ target_include_directories(dapple_match_cache_tests PRIVATE ${PROJECT_SOURCE_DIR
 target_compile_definitions(dapple_match_cache_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 add_test(NAME engine.match_cache COMMAND dapple_match_cache_tests WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(engine.match_cache PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+# the background median seeding never takes the frame pool (a drag frame after a pause waited for it; pipeline-architecture.md section 54)
+add_test(NAME engine.match_cache_seedpool COMMAND dapple_match_cache_tests seedpool WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(engine.match_cache_seedpool PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 
 # VideoFrameSession (wave 8, motion-photo): a Motion Photo clip through the node graph, docs/engine/pipeline-architecture.md section 27.
 # depth10 / e2e / verify need the desktop FFmpeg (tools/ffmpeg/build-host.sh); the others run on synthetic frames.

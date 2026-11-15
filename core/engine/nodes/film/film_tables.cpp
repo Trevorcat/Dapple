@@ -106,8 +106,8 @@ struct Caches {
   std::list<RawEntry> raws;
 };
 Caches& caches() {
-  static Caches c;
-  return c;
+  static auto* c = new Caches;  // leaked: background bakes may run while the process exits
+  return *c;
 }
 
 std::shared_ptr<fd::RawLut> rawLutFor(const dapple::film::FilmLibrary& lib, const dapple::film::FilmStock& film,
@@ -779,21 +779,23 @@ namespace {
 // values it wanted. The worker runs on the background pool (own threads, same capability-chosen cores) and keeps only the latest request.
 // The settled frame is not coarse and bakes / fetches the exact table on the frame thread exactly as before (DAPPLE_FILM_ASYNC_TABLES=0
 // restores the synchronous path, the engine tests use it).
+// Leaked like the workers that use them: a background bake (print worker, median seeding, match) may still run while the process exits, and a
+// destroyed table cache would abort it (FORTIFY: pthread_mutex_lock on a destroyed mutex, seen at the exit of the drag bench on the Redmi).
 TableLru<RawTable>& rawsLru() {
-  static TableLru<RawTable> t;
-  return t;
+  static auto* t = new TableLru<RawTable>;
+  return *t;
 }
 TableLru<CurvesTable>& curvesLru() {
-  static TableLru<CurvesTable> t;
-  return t;
+  static auto* t = new TableLru<CurvesTable>;
+  return *t;
 }
 TableLru<PrintTable>& printsExact() {
-  static TableLru<PrintTable> t;
-  return t;
+  static auto* t = new TableLru<PrintTable>;
+  return *t;
 }
 TableLru<PrintTable>& printsCoarseLru() {
-  static TableLru<PrintTable> t;
-  return t;
+  static auto* t = new TableLru<PrintTable>;
+  return *t;
 }
 struct LastPrint {
   std::mutex m;
@@ -801,8 +803,8 @@ struct LastPrint {
   std::shared_ptr<const PrintTable> t;
 };
 LastPrint& lastPrint() {
-  static LastPrint l;
-  return l;
+  static auto* l = new LastPrint;  // leaked (see rawsLru)
+  return *l;
 }
 void noteLastPrint(const Hash128& base, const std::shared_ptr<const PrintTable>& t) {
   LastPrint& l = lastPrint();
@@ -1062,8 +1064,8 @@ struct PlanCache {
   std::list<std::pair<Hash128, std::shared_ptr<const FilmPlanData>>> l;
 };
 PlanCache& planCache() {
-  static PlanCache c;
-  return c;
+  static auto* c = new PlanCache;  // leaked (see rawsLru)
+  return *c;
 }
 }  // namespace
 

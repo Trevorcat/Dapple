@@ -629,9 +629,11 @@ class EditorEngine extends ChangeNotifier {
       if (interactive) {
         // the drag frame rate is bounded by the slower of the two overlapped stages
         final renderMs = (t1 - t0) / 1000.0, uploadMs = (tUp - t1) / 1000.0;
+        // the measured pixel part: the engine's execution, or the picture's upload when that is the slower stage (it scales with the pixels too)
+        final tm = FrameTiming.fromAnalysis(an);
         if (_skipRecord) {
           _skipRecord = false; // first frame at a new size also builds the scaled source: not representative
-        } else if (quality.record(math.max(renderMs, uploadMs))) {
+        } else if (quality.record(math.max(renderMs, uploadMs), pixelMs: tm == null ? null : (uploadMs > renderMs ? uploadMs : tm.execMs), mpx: tm?.mpx)) {
           _skipRecord = true;
           PerfProbe.log('rung', {'to': quality.rung.toString(), 'ema': quality.emaMs});
         }
@@ -744,9 +746,10 @@ class EditorEngine extends ChangeNotifier {
         }
         if (interactive) {
           final ms = math.max(e.renderMs, e.presentMs);
+          final tm = FrameTiming.fromAnalysis(an); // the engine's split of this frame (pixel part: its execution, or the present when that is slower)
           if (_skipRecord) {
             _skipRecord = false;
-          } else if (quality.record(ms)) {
+          } else if (quality.record(ms, pixelMs: tm == null ? null : (e.presentMs > e.renderMs ? e.presentMs : tm.execMs), mpx: tm?.mpx)) {
             _skipRecord = true;
             PerfProbe.log('rung', {'to': quality.rung.toString(), 'ema': quality.emaMs});
           }

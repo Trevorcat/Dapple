@@ -24,6 +24,7 @@
 // so the key is only pulled kFilmKeyPull of the way, and the result is limited to the stock's own exposure latitude: the
 // window of film EVs in which the scene's shadows (p2) stay above the toe of the stock's green density curve and its
 // highlights (p99.5) stay below the shoulder. See docs/engine/pipeline-architecture.md section 18.
+#include <atomic>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -319,6 +320,7 @@ struct FilmMatchCache {
     std::string ctx;
     float fev = 0.f;
     std::vector<std::pair<float, float>> samples;
+    std::atomic<bool> superseded{false};  // a newer context was seeded: this one is never merged
   };
   std::shared_ptr<Seed> seed;
   std::string seededCtx;

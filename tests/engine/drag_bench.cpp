@@ -600,10 +600,17 @@ int main(int argc, char** argv) {
       for (const Pad& pd : pads) {
         const std::string name = std::string(pd.name) + (film ? " (film)" : "");
         if (!sub.empty() && name.find(sub) == std::string::npos) continue;
+        // DAPPLE_BENCH_REPS (1): swipes out and back, DAPPLE_BENCH_PAUSE_MS (0) idle between them (the app's drags: spikes came after the pause)
+        const int reps = std::getenv("DAPPLE_BENCH_REPS") ? std::max(1, std::atoi(std::getenv("DAPPLE_BENCH_REPS"))) : 1;
+        const int pauseMs = std::getenv("DAPPLE_BENCH_PAUSE_MS") ? std::atoi(std::getenv("DAPPLE_BENCH_PAUSE_MS")) : 0;
         std::vector<double> t;
+        int slow = 0, slowTables = 0, withTables = 0;
+        for (int rep = 0; rep < reps; ++rep) {
+        if (rep > 0 && pauseMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(pauseMs));
         dapple_set_interaction(1);  // a finger is on the pad, as in the app (background matches and seeds wait meanwhile)
         for (int i = 0; i < frames; ++i) {
-          const float x = -1.f + 2.f * float(i) / float(std::max(1, frames - 1));
+          const int k = rep % 2 ? frames - 1 - i : i;  // out and back
+          const float x = -1.f + 2.f * float(k) / float(std::max(1, frames - 1));
           char body[256];
           if (std::strcmp(pd.name, "light pad x") == 0) std::snprintf(body, sizeof body, pd.fmt, double(x), double(-40 * x), double(20 * x));
           else if (std::strcmp(pd.name, "colour pad") == 0) std::snprintf(body, sizeof body, pd.fmt, double(30 * x), double(55 * x), double(25 * x));
@@ -621,14 +628,26 @@ int main(int argc, char** argv) {
           char* an = nullptr;
           const auto t0 = Clk::now();
           if (dapple_session_render_frame(s, json, nullptr, &rq, &img, &an) != DAPPLE_OK) return std::fprintf(stderr, "frame: %s\n", dapple_last_error()), 1;
-          t.push_back(std::chrono::duration<double, std::milli>(Clk::now() - t0).count());
-          if (an) dapple_free_string(an);
+          const double ms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+          t.push_back(ms);
+          double tables = -1;  // the frame's measured table time when the analysis reports it ("timing":{"tablesMs":...})
+          if (an) {
+            if (const char* p = std::strstr(an, "\"tablesMs\":")) tables = std::atof(p + 11), ++withTables;
+            dapple_free_string(an);
+          }
+          if (t.size() > 1 && ms > 100.0) {  // the process's first frame is a cold start, not a drag frame
+            ++slow;
+            slowTables += tables > 100.0;
+            std::printf("    slow frame rep %d #%d: %.1f ms (tables %.1f)\n", rep, i, ms, tables);
+          }
           dapple_free_image(&img);
         }
         dapple_set_interaction(0);
+        }
         std::vector<double> r(t.begin() + 1, t.end());
         std::sort(r.begin(), r.end());
-        std::printf("  %-22s first %7.1f  median %7.1f  max %7.1f  min %7.1f\n", name.c_str(), t[0], r[r.size() / 2], r.back(), r.front());
+        std::printf("  %-22s first %7.1f  median %7.1f  max %7.1f  min %7.1f  | %zu frames, over 100 ms %d (tables over 100 ms %d of %d reported)\n", name.c_str(), t[0],
+                    r[r.size() / 2], r.back(), r.front(), t.size(), slow, slowTables, withTables);
         std::fflush(stdout);
       }
     dapple_session_close(s);

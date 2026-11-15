@@ -195,6 +195,7 @@ class Executor final : public IGpuExecutor {
     ~Turn();
     void release() { t_.release(); }
     void acquire() { t_.acquire(); }
+    double waited() const { return t_.waitedMs(); }  // ms this frame waited for the device in all
 
    private:
     Executor& x_;

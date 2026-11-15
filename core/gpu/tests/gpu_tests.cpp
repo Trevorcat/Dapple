@@ -698,14 +698,15 @@ void testFilmInteractive(Env& env, int longEdge) {
       if (!px) break;
       std::free(px);
       if (i == 0 && c.keepGrain == false && std::string(c.name) == "still frame")
-        std::printf("  first film frame of the session: wall %.1f ms (upload %.1f = tables + plan + display, record %.1f incl. pipeline creation, wait %.1f)\n", wl, st.uploadMs, st.recordMs, st.waitMs);
+        std::printf("  first film frame of the session: wall %.1f ms (prep %.1f = tables + plan, upload %.1f incl. display, record %.1f incl. pipeline creation, wait %.1f)\n", wl,
+                    st.prepMs, st.uploadMs, st.recordMs, st.waitMs);
       if (i == 3 && std::getenv("DAPPLE_GPU_PASSLOG")) {  // the passes of the last frame (this case), in execution order
         std::printf("    passes of %s:", c.name);
         for (const auto& pl : engine::gpu::lastPassLog()) std::printf(" %s", pl.name.c_str());
         std::printf("\n");
       }
       if (i >= 2) {
-        wall.push_back(wl), gpu.push_back(st.gpuMs), up.push_back(st.uploadMs), rec.push_back(st.recordMs), sub.push_back(st.submitMs);
+        wall.push_back(wl), gpu.push_back(st.gpuMs), up.push_back(st.prepMs + st.uploadMs), rec.push_back(st.recordMs), sub.push_back(st.submitMs);
         wt.push_back(st.waitMs), cp.push_back(st.readbackMs), rb.push_back(rbMs);
         passes = st.passes;
       }

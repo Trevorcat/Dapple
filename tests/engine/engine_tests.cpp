@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -886,8 +887,8 @@ SeqResult runSequence(const std::vector<SeqFrame>& seq, int srcW = 1600, int src
     r.kinds += bakeCounters().latticeEvaluated.load() > ev0 ? 'B' : (bakeCounters().latticeReused.load() > re0 ? 'R' : 'H');
     std::uint64_t h = 1469598103934665603ull;
     for (std::size_t i = 0; i < std::size_t(im.width) * im.height * 4; ++i) h = (h ^ im.rgba[i]) * 1099511628211ull;
-    if (an)
-      for (const char* c = an; *c; ++c) h = (h ^ std::uint8_t(*c)) * 1099511628211ull;
+    if (an)  // the analysis without the frame's measured "timing" (wall times, not content)
+      for (const char *c = an, *end = std::strstr(an, ",\"timing\""); *c && c != end; ++c) h = (h ^ std::uint8_t(*c)) * 1099511628211ull;
     r.hashes.push_back(std::to_string(h));
     dapple_free_image(&im);
     dapple_free_string(an);

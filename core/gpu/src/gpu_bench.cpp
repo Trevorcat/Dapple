@@ -249,7 +249,7 @@ int gpuBench(const std::vector<std::string>& args) {
         GpuStats st;
         g = rig.render(v.spatialParams ? prmSp : prm, r, cs.src, fo, latticeN, gw, gh, &st, err);
         if (!g) break;
-        wall.push_back(st.wallMs - st.uploadMs);
+        wall.push_back(st.wallMs - st.prepMs - st.turnWaitMs - st.uploadMs);
         gpuT.push_back(st.gpuMs);
         rb.push_back(st.readbackMs);
         recT.push_back(st.recordMs);
@@ -304,7 +304,7 @@ int gpuBench(const std::vector<std::string>& args) {
         std::free(o);
         for (int i = 0; i < repeat && o; ++i) {
           o = rig.render(prmSp, r, cs.src, fo, latticeN, gw, gh, &st, err, 1600);
-          wall.push_back(st.wallMs - st.uploadMs);
+          wall.push_back(st.wallMs - st.prepMs - st.turnWaitMs - st.uploadMs);
           std::free(o);
         }
         std::printf("  --- preview 1600 px from the resident full source (Lanczos-3 on the GPU) ---\n      first frame (incl. resize pass): %.1f ms; later frames: %.2f ms (%dx%d)\n", firstMs, median(wall), gw, gh);

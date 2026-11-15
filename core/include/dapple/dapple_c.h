@@ -318,7 +318,10 @@ typedef struct DappleFrameRequest {
 } DappleFrameRequest;
 
 /* Fills *out (release with dapple_free_image). *analysis_json (may be NULL) receives a string to
- * release with dapple_free_string when DAPPLE_FRAME_ANALYSIS is set, else NULL. */
+ * release with dapple_free_string when DAPPLE_FRAME_ANALYSIS is set, else NULL. Besides the tonal analysis it carries the
+ * frame's own split, "timing": {"tablesMs", "execMs", "uploadMs", "waitMs", "mpx"} (ms; tables = host table work, size-independent;
+ * exec = the pixel execution on the GPU or CPU executor incl. readback; upload = device copies; wait = waiting for the GPU while another
+ * session's job held it; mpx = megapixels rendered). Readers must ignore keys they do not know. */
 DAPPLE_API int32_t dapple_session_render_frame(DappleSession* session, const char* params_json, const char* lut_path,
                                                const DappleFrameRequest* request, DappleImage* out,
                                                char** analysis_json);

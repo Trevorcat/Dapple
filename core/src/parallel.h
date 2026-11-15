@@ -48,6 +48,9 @@ class ThreadPool {
     static thread_local ThreadPool* p = nullptr;
     return p;
   }
+  // The pool a parallel job of this thread goes to: a background worker's own pool, else the frame pool. Every job takes it from here, so a
+  // background worker never queues a frame behind its jobs (the frame pool runs one job at a time).
+  static ThreadPool& current() { return tlUse() ? *tlUse() : instance(); }
 
   // Calls fn(begin, end) over disjoint ranges covering [0, n), in chunks of `chunk` items.
   void run(int n, int chunk, const std::function<void(int, int)>& fn) {
@@ -278,7 +281,7 @@ class CancelScope {
 // Runs fn(i) for every i in [0, n) across all hardware threads.
 template <class Fn>
 void parallelFor(int n, Fn&& fn, int chunk = 1) {
-  (ThreadPool::tlUse() ? *ThreadPool::tlUse() : ThreadPool::instance()).run(n, chunk, [&](int a, int b) {
+  ThreadPool::current().run(n, chunk, [&](int a, int b) {
     for (int i = a; i < b; ++i) fn(i);
   });
 }

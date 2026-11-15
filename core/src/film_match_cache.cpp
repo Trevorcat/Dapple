@@ -183,18 +183,23 @@ FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& c
     auto seed = std::make_shared<FilmMatchCache::Seed>();
     seed->ctx = ctx;
     seed->fev = fe.filmEv;
+    if (cache.seed) cache.seed->superseded.store(true);  // only the newest context is ever merged: an older seed stops at its next median
     cache.seed = seed;
     const EditParams fp0 = fp;
     const std::shared_ptr<const SourceImage> px = cache.proxyOwner;
     const std::shared_ptr<const Lut3D> lo = cache.lutOwner;
     const CameraProfile* cam = &camera;
     const float fev = fe.filmEv, pev0 = fe.printEv;
+    // The renders run on the background pool like every other background film worker: on the frame pool (ThreadPool::instance(), one job at a time)
+    // each of their parallel jobs queued a drag frame's own jobs behind it; a drag after a pause met the seeds of every match of the previous drag.
     std::thread([seed, fp0, px, lo, cam, fev, pev0] {
+      ThreadPool::tlUse() = &ThreadPool::background();
       ftrace::Busy busy(ftrace::S().bgMatch);
       sys::utilityQos();
       try {
         for (float d : {0.f, -1.f, 1.f, -2.f, 2.f, -3.f, 3.f}) {
           sys::yieldToInteraction();
+          if (seed->superseded.load()) break;
           EditParams f = fp0;
           f.filmKeyEv = fev;
           f.filmPrintEv = pev0 + d;

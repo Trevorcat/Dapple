@@ -1,5 +1,25 @@
 # Xiaomi Redmi (2312DRA50C "garnet") device results, wave 8, 2026-11-12
 
+## 2026-11-16 (b) drag under export, film drag spikes, frame split (pipeline-architecture.md section 54)
+
+Native binaries only (arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`), `DAPPLE_GPU=1`, GPU probe as the app (`DAPPLE_BENCH_PROBE`), Vulkan (Adreno 710). "before" = HEAD d3b977b (`build/stall-before-arm64`, built before any engine edit, with the new bench modes), "after" = the working tree. Public samples: A7R IV `DSC00396.ARW` (61 MP), A6700 `DSC00002.ARW`. 27.6 - 28.9 C at the starts.
+
+**Drag during the 61 MP export** (`dapple_open_bench <raw> dragexport out.jpg 3`: editor session PREVIEW 2048, interactive 360 px light-pad frames with the analysis every 4 ms; per rep 150 idle frames, then the app's export (`dapple_export_intent` + FULL session + `dapple_session_export_jpeg`, streamed GPU tiles) on a thread with drag frames until it ends; wall ms of the C API call):
+| | frames under export | median | p95 | max | > 100 ms | export ms |
+|---|---|---|---|---|---|---|
+| before | 1641 (3 reps) | 6.8 - 7.4 | 27.0 - 30.0 | **138.2** | 17 (4 / 7 / 6), every ~0.6 s in the tile phase | 10399 / 9082 / 9560 |
+| after | 1758 (3 reps) | 6.6 - 7.4 | 22.9 - 23.9 | **37.9** | 0 | 8712 / 8635 / 8824 |
+After, with `DAPPLE_GPU_TURNLOG=40`: no export-tile turn over 40 ms (one background whole frame 308 ms and one interactive 91 ms, both the session's first frames before the drag). `dapple_gpu_engine_tests concurrency` on the phone: interactive frame alone 6.9 ms, tile 4.7 ms; under a tiled export max 15.8 ms; under a streamed export with 120 ms band reads max 16.9 ms; stress 0 differing results.
+
+**Film drag spikes** (`DAPPLE_BENCH_REPS=10 DAPPLE_BENCH_PAUSE_MS=1500 dapple_drag_bench DSC00002.ARW dapple.dfp 360 50 'pads (film)'`: kodak_portra_400, interaction flag set per swipe as the app does, 10 swipes out and back per pad with a 1.5 s pause, 5 pads = 2500 frames; frames over 100 ms wall):
+| | exposure | light pad x | tone | wb | colour pad | all | max |
+|---|---|---|---|---|---|---|---|
+| before | 6 | 22 | 11 | 3 | 1 | **43 / 2500 (1.7 %)** | 865 ms |
+| after | 0 | 0 | 0 | 0 | 0 | **0 / 2500** (two runs) | 42.6 ms |
+Where the time went (instrumented build, removed): the engine's frame (lock, match, tables, GPU) took 10 - 20 ms; the rest was the wait for the frame pool's submit lock in the frame's last parallel job (`applyFrameHistogram`): 100 - 2300 ms, on the first 1 - 6 frames after each pause, behind the median seeding renders.
+Exit of the drag bench: after the seeding fix the bench aborted at exit in 2 of 2 short runs (`FORTIFY: pthread_mutex_lock called on a destroyed mutex`, two background threads, addresses 64 bytes apart = the film table caches); with the caches leaked 0 of 3 (and 0 in the 2500-frame run).
+Not verified here: the Note10+ (Adreno 640) and the app; the frame split fields were read by the bench (2500 of 2500 frames reported `timing`), the app's controller only in unit tests.
+
 ## 2026-11-16 open and export time (pipeline-architecture.md section 53)
 
 Native binaries only (arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`): "before" built from an exported copy of e26ef6b (`build/ofx-before-arm64`, unpatched LibRaw), "after" from the working tree (`build/ofx-arm64`); `dapple_open_bench` (the same source in both: preview open 2048 + first frame 1600 px, then the app's export: `dapple_export_intent` + FULL open + `dapple_session_export_jpeg` q92, VmHWM), `DAPPLE_GPU=1`, Vulkan, verdict cache dir, another RAF opened and rendered first (pipelines built, as in the app after the first photo). Pushed to `/data/local/tmp/ofx`, removed afterwards. Phone: screen off (no key sent), thermal status 0 (28 C), no settings changed, no taskset. The clock state of this phone changes between runs (the same unpack took 155 or 620 ms; libomp reported some of cores 4 - 7 as unavailable at times: parked, inferred): before and after runs interleaved file by file, medians [min - max] of 5 (open) / 3 (export) runs. Raw logs `build/ofx/logs/{before,after}_{cp,ce,pg}*`.

@@ -97,10 +97,12 @@ class Core {
 // one keep-warm unit, a trim, a rebuild. Interactive waiters are served first (FIFO among them), then background waiters (FIFO): a drag frame
 // waits for the job in flight, never for a whole background frame. The holder also holds queueMutex(), the lock the presenter takes alone
 // for its own use of the VkQueue (the lease). Lock order: Executor::runMtx_ -> gate -> queueMutex -> leaves (retire, cache, sources).
+// A turn holds only device work: host work that takes as long as a job (a band demosaic of a streamed export, an encoder) runs outside it.
+// DAPPLE_GPU_TURNLOG=<ms>: every turn held longer than that is logged with what held it (`what`).
 class DeviceGate {
  public:
   enum class Prio : int { Background = 0, Interactive = 1 };
-  void lock(Prio p);
+  void lock(Prio p, const char* what = nullptr);
   void unlock();
   bool interactiveWaiting();
   std::mutex& queueMutex() { return queue_; }
@@ -111,13 +113,16 @@ class DeviceGate {
   bool held_ = false;
   std::uint64_t next_[2] = {0, 0}, serving_[2] = {0, 0};  // tickets per priority
   std::mutex queue_;
+  const char* what_ = nullptr;   // the holder (log)
+  std::int64_t since_ = 0;       // steady clock ns of the holder's lock (log)
 };
 
 // RAII turn. yield(): a background holder hands the device to a waiting interactive turn and takes it back (true when it did; device state
 // the holder did not keep alive may have changed meanwhile, the epoch included). release() / acquire(): give the turn up for a while.
+// waitedMs(): the time this turn waited for the gate in all, so a frame's stage times do not count the wait as their own.
 class DeviceTurn {
  public:
-  DeviceTurn(DeviceGate& g, DeviceGate::Prio p) : g_(g), p_(p) { g_.lock(p_); }
+  DeviceTurn(DeviceGate& g, DeviceGate::Prio p, const char* what = nullptr) : g_(g), p_(p), what_(what) { lockTimed(); }
   ~DeviceTurn() {
     if (held_) g_.unlock();
   }
@@ -126,21 +131,25 @@ class DeviceTurn {
   bool yield() {
     if (!held_ || p_ == DeviceGate::Prio::Interactive || !g_.interactiveWaiting()) return false;
     g_.unlock();
-    g_.lock(p_);
+    lockTimed();
     return true;
   }
   void release() {
     if (held_) g_.unlock(), held_ = false;
   }
   void acquire() {
-    if (!held_) g_.lock(p_), held_ = true;
+    if (!held_) lockTimed(), held_ = true;
   }
   bool held() const { return held_; }
+  double waitedMs() const { return waitedMs_; }
 
  private:
+  void lockTimed();
   DeviceGate& g_;
   DeviceGate::Prio p_;
+  const char* what_;
   bool held_ = true;
+  double waitedMs_ = 0;
 };
 
 struct ContextOptions {

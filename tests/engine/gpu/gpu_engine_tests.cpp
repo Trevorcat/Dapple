@@ -28,9 +28,9 @@
 #include "engine/nodes/gpu_nodes.h"
 #include "parity.h"
 
+#include "../../test_tmp.h"  // every platform (the Android build of this binary failed without it)
 #if defined(_WIN32)
 #include <stdlib.h>
-#include "../../test_tmp.h"
 static void setEnv(const char* k, const char* v) { _putenv_s(k, v); }
 static void unsetEnv(const char* k) { _putenv((std::string(k) + "=").c_str()); }
 #else
@@ -684,6 +684,58 @@ int testConcurrency() {
     // the one waited for, plus 3 ms of scheduling noise. Before section 52 the frame waited for the rest of the whole export.
     const double bound = 2.0 * aloneMs + 3.0 * tileMs + 3.0;
     CHECK(p95 <= bound, "p95 latency %.2f ms above about one tile (bound %.2f ms; export %.1f ms)", p95, bound, exportMs);
+  }
+
+  // ---- phase 1b: the app's streamed export (capi/stream.cpp): its source store demosaics a band of the picture when the walk reaches a new row
+  // of tiles (BandSource::rows, ~100-140 ms on the Redmi for a 61 MP picture). That host work must not hold the device: before the fix the
+  // read ran inside the tile's turn and a drag frame waited for it (Note10+: one 275-346 ms `upload` per export). Here a store over the same
+  // pixels sleeps 120 ms per new row of tiles; the worst interactive frame stays within the phase-1 bound.
+  {
+    struct BandLikeStore final : engine::SourceStore {
+      engine::SourceStore& in;
+      int lastY = -1;
+      explicit BandLikeStore(engine::SourceStore& s) : in(s) {}
+      int width() const override { return in.width(); }
+      int height() const override { return in.height(); }
+      bool sceneReferred() const override { return in.sceneReferred(); }
+      std::uint64_t identity() const override { return in.identity() ^ 0x5a5a5a5a00000000ull; }
+      const float* window(int x0, int y0, int w, int h, std::size_t& pitch) override {
+        if (y0 != lastY) std::this_thread::sleep_for(std::chrono::milliseconds(120));  // "demosaics the next band"
+        lastY = y0;
+        return in.window(x0, y0, w, h, pitch);
+      }
+    } slow(rigS.store);
+    rigS.exportStore = &slow;
+    std::atomic<bool> stop{false}, exporting{false};
+    std::atomic<int> exportBad{0}, exportsDone{0};
+    std::thread ex([&] {
+      while (!stop.load()) {
+        exporting.store(true);
+        exportBad += !same(exportTiled(rigS, rs, true, nullptr), refS);
+        ++exportsDone;
+      }
+    });
+    while (!exporting.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::vector<double> lat;
+    int bad = 0;
+    const auto t0 = Clk::now();
+    while ((lat.size() < 80 || exportsDone.load() < 1) && ms(t0, Clk::now()) < 120000) {
+      const auto t = Clk::now();
+      const Out o = frame(rigI, pi, ri, small, true);
+      lat.push_back(ms(t, Clk::now()));
+      bad += !same(o, refI);
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    }
+    stop.store(true);
+    ex.join();
+    rigS.exportStore = nullptr;
+    std::sort(lat.begin(), lat.end());
+    const double mx = lat.back(), p95 = lat[std::size_t(double(lat.size() - 1) * 0.95)];
+    std::printf("  LATENCY interactive under a streamed export with band reads: median %.2f ms, p95 %.2f ms, max %.2f ms over %zu frames (%d exports)\n",
+                lat[lat.size() / 2], p95, mx, lat.size(), exportsDone.load());
+    CHECK(bad == 0 && exportBad.load() == 0, "phase 1b: %d interactive and %d export results differ", bad, exportBad.load());
+    const double bound = 2.0 * aloneMs + 3.0 * tileMs + 3.0 + 20.0;  // the phase-1 bound + 20 ms of scheduling noise for a single worst frame
+    CHECK(mx <= bound, "worst interactive frame %.2f ms under a streamed export: it waited for the export's source read (bound %.2f ms, band read 120 ms)", mx, bound);
   }
 
   // ---- phase 2: 4 threads, 4 sessions, results compared with the references ----

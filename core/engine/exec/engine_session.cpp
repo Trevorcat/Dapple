@@ -185,8 +185,9 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
                         exec.c_str(), onGpu ? "" : " reason=", onGpu ? "" : reason.c_str(), (unsigned long long)g, (unsigned long long)cp);
   // where the CPU side of the frame went (ms): match = film exposure solve, renderer = point::resolve, graph, tables, exec = plan + executor incl. GPU wait
   if (n > 0 && n < int(sizeof line))
-    std::snprintf(line + n, sizeof line - std::size_t(n), " | cpu_ms %.1f (match %.1f point %.1f graph %.1f tables %.1f exec %.1f; upload %.1f gpu %.1f) max %.1f", c.totalMs, c.matchMs,
-                  c.rendererMs, c.graphMs, c.tablesMs, c.execMs, out.gpu.uploadMs, out.gpu.gpuMs, std::max(maxMs, c.totalMs));
+    std::snprintf(line + n, sizeof line - std::size_t(n), " | cpu_ms %.1f (match %.1f point %.1f graph %.1f tables %.1f exec %.1f; prep %.1f turn %.1f upload %.1f gpu %.1f) max %.1f",
+                  c.totalMs, c.matchMs, c.rendererMs, c.graphMs, c.tablesMs, c.execMs, out.gpu.prepMs, out.gpu.turnWaitMs, out.gpu.uploadMs, out.gpu.gpuMs,
+                  std::max(maxMs, c.totalMs));
   if (const std::size_t len = std::strlen(line); len + 96 < sizeof line)  // inside `tables`: the table nodes baked this frame and the bake assembly
     std::snprintf(line + len, sizeof line - len, " | tables_ms lat %.1f pre %.1f tone %.1f ov %.1f an %.1f asm %.1f", c.latticeMs, c.preMs, c.toneMs, c.overflowMs,
                   c.analysisMs, c.assembleMs);

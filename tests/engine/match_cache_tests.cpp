@@ -2,15 +2,22 @@
 //   * with exact = true it returns what matchFilmExposure returns,
 //   * a print drag with exact = false (interpolated medians) stays close to the exact solve, and the settled (exact) frame equals it,
 //   * the lean key ignores print warmth / tint only when no median of the print is evaluated.
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 
 #include "../deterministic.h"
 #include "dapple/camera.h"
 #include "dapple/film.h"
 #include "dapple/film_match.h"
 #include "engine/nodes/point/point.h"
+#include "parallel.h"
 
 using namespace dapple;
 
@@ -40,7 +47,69 @@ static SourceImage proxy(int w, int h) {
   return s;
 }
 
-int main() {
+// `seedpool`: the background median seeding (film_match_cache.cpp) renders its proxies without the frame pool. Before the fix the seed thread rendered on
+// ThreadPool::instance(), the pool every frame's parallel job queues on (one job at a time), so a drag frame after a pause waited for seed renders
+// (Redmi: 0.1 - 2.5 s on the first frames of a film drag; Note10+: 3.5 % of film drag frames with 0.3 - 1.5 s of `pre` / `tone` table time). Here a
+// frame-pool job is held for 2 s while the match runs on the background pool, as the session's match worker does; the seed must deliver samples meanwhile.
+static int seedPool(const CameraProfile& cam, const SourceImage& src) {
+  EditParams p;
+  p.filmStock = "kodak_portra_400";  // a negative with its paper: the print medians are seeded
+  p.exposure = 0.3f;
+  FilmMatchCache cache;
+  cache.proxyOwner = std::make_shared<SourceImage>(src);
+  std::atomic<bool> holding{false}, release{false};
+  std::thread holder([&] {  // a long job on the frame pool (stands for the frames' own jobs; the pool runs one job at a time)
+    ThreadPool::instance().run(2, 1, [&](int, int) {
+      holding.store(true);
+      while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    });
+  });
+  while (!holding.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const auto t0 = std::chrono::steady_clock::now();
+  auto ms = [&] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); };
+  std::atomic<bool> matched{false};
+  std::thread matcher([&] {  // the session's match worker: background pool
+    ThreadPool::tlUse() = &ThreadPool::background();
+    matchFilmExposureCached(p, cam, nullptr, "", src, cache, false);
+    matched.store(true);
+  });
+  std::size_t samples = 0;
+  while (ms() < 2000.0) {
+    if (matched.load() && cache.seed) {
+      std::lock_guard<std::mutex> lk(cache.seed->m);
+      samples = cache.seed->samples.size();
+    }
+    if (samples >= 7) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  const double tSeed = ms();
+  release.store(true);
+  holder.join();
+  matcher.join();
+  std::printf("  seeding while the frame pool is busy: match %s, %zu of 7 medians after %.0f ms\n", matched.load() ? "done" : "blocked", samples, tSeed);
+  CHECK(matched.load(), "the match on the background pool waited for the frame pool");
+  CHECK(samples >= 7, "the median seeding waited for the frame pool (%zu of 7 medians in 2 s)", samples);
+  if (cache.seed)  // let the detached seed finish before the process exits
+    for (int i = 0; i < 2000; ++i) {
+      {
+        std::lock_guard<std::mutex> lk(cache.seed->m);
+        if (cache.seed->samples.size() >= 7) break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  std::printf(g_fail ? "FAILED (%d)\n" : "ok\n", g_fail);
+  return g_fail ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+  const bool seedMode = argc > 1 && std::string(argv[1]) == "seedpool";
+  if (seedMode) {  // the seeding is a timing dependent path: off in deterministic mode (read once, on first use)
+#ifdef _WIN32
+    _putenv_s("DAPPLE_DETERMINISTIC", "0");
+#else
+    setenv("DAPPLE_DETERMINISTIC", "0", 1);
+#endif
+  }
   std::string err;
   // pack folder: DAPPLE_FILM_DATA (a phone: the pushed folder holding dapple.dfp), else the source tree
   const char* envData = std::getenv("DAPPLE_FILM_DATA");
@@ -49,6 +118,7 @@ int main() {
   const CameraRegistry cams = CameraRegistry::withBuiltins();
   const CameraProfile& cam = cams.resolve("", "");
   const SourceImage src = proxy(160, 107);
+  if (seedMode) return seedPool(cam, src);
   FilmMatchOptions opt;  // Meter
   EditParams base;
   base.filmStock = "kodak_portra_400";

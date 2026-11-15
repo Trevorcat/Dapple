@@ -61,6 +61,23 @@ static thread_local double tlSwatchTablesMs = 0, tlSwatchExecMs = 0;
 static thread_local int tlSwatchGpu = 0;
 static thread_local double tlSwatchMatchMs = 0;  // film match time of the swatch frames of this thread's current dapple_session_base_previews call
 
+// The frame's own split, appended to its analysis JSON as "timing" (dapple_c.h): what of the frame scales with its pixels and what does not,
+// measured instead of modelled by the app's preview-size controller. tablesMs: the host tables (lattice, tone, film) and the executor's CPU
+// preparation of them; execMs: the pixel execution (GPU or CPU executor: recording, the GPU work and its readback) without the uploads and
+// without waiting for another session's device turn; uploadMs: device copies of tables / source; waitMs: waiting for the device; mpx: pixels rendered.
+static std::string withTiming(std::string json, const dapple::engine::FrameResult& res) {
+  if (json.empty() || json.back() != '}') return json;
+  const dapple::engine::GpuStats& g = res.gpu;
+  const bool gpu = res.executor != "cpu";
+  const double tables = res.cpu.tablesMs + (gpu ? g.prepMs : 0.0), upload = gpu ? g.uploadMs : 0.0, wait = gpu ? g.turnWaitMs : 0.0;
+  const double exec = std::max(0.0, res.cpu.execMs - (gpu ? g.prepMs + g.uploadMs + g.turnWaitMs : 0.0));
+  char b[200];
+  std::snprintf(b, sizeof b, ",\"timing\":{\"tablesMs\":%.3f,\"execMs\":%.3f,\"uploadMs\":%.3f,\"waitMs\":%.3f,\"mpx\":%.4f}", tables, exec, upload, wait,
+                double(res.w) * double(res.h) / 1e6);
+  json.insert(json.size() - 1, b);
+  return json;
+}
+
 // `quiet` (base swatches): `paramsIn` replaces the JSON, the frame leaves the session's "last frame" memory (noise decision, kept LUT) alone and skips
 // noise reduction, so a background swatch never changes what the editor's next frame does.
 static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lutPath, const DappleFrameRequest& rq,
@@ -196,7 +213,7 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS)) {
     ToneAnalysis a = res.analysis;
     if (engine::point::filmActive(point.p) && res.rgba) applyFrameHistogram(a, res.rgba, res.w, res.h);
-    *analysisOut = dupString(toneJson(a));
+    *analysisOut = dupString(withTiming(toneJson(a), res));
   }
   return true;
 }

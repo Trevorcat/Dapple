@@ -23,6 +23,7 @@ class SourceStore {
   virtual std::uint64_t identity() const = 0;
   // Linear ProPhoto float RGB of the window [x0, x0 + w) x [y0, y0 + h), `pitchFloats` floats between rows. The pointer stays
   // valid until the next call on this store. Null = the window cannot be read (the executor reports a transient failure).
+  // A call may take as long as a demosaic of a band (BandSourceStore): the GPU executor never calls it inside a device turn of a tile.
   virtual const float* window(int x0, int y0, int w, int h, std::size_t& pitchFloats) = 0;
   // The CPU image when the store is memory backed (bakes of the table nodes read it); null otherwise.
   virtual const SourceImage* image() const { return nullptr; }

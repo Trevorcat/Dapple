@@ -47,6 +47,7 @@ struct Rig {
   engine::EngineSession es;
   engine::MemorySourceStore store;
   const CameraProfile& cam;
+  engine::SourceStore* exportStore = nullptr;  // exportTiled reads this store instead (a test's slow store over `store`)
 
   Rig(std::shared_ptr<engine::gpu::Context> c, const SourceImage& full, const CameraProfile& camera)
       : ctx(std::move(c)), ex(ctx->createExecutor()), store(full), cam(camera) {
@@ -94,7 +95,7 @@ struct Rig {
   bool exportTiled(const EditParams& p, engine::point::Params& r, const SourceImage& full, int outLongEdge, int latticeN, int tile, bool forceStream, float resizeSharpen,
                    std::function<void(int, int)> onSize,
                    std::function<bool(int, int, int, int, const std::uint8_t*, std::size_t)> sink, engine::GpuStats* st, std::string& err, const Lut3D* lut = nullptr) {
-    engine::EngineSession::GpuExport e{p, r, full, store, cam, lut};
+    engine::EngineSession::GpuExport e{p, r, full, exportStore ? *exportStore : store, cam, lut};
     e.outLongEdge = outLongEdge;
     e.tile = tile;
     e.latticeN = latticeN;

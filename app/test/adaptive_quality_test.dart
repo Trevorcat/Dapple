@@ -1,14 +1,20 @@
 import 'package:dapple/services/adaptive_quality.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// Frame time of the model the controller assumes: overhead + msPerMpx x megapixels of the current rung.
+/// Frame time: a size-independent overhead + msPerMpx x megapixels of the current rung.
 double frameMs(AdaptiveQuality q, double overhead, double msPerMpx) => overhead + msPerMpx * AdaptiveQuality.mpx(q.rung);
 
-/// One drag of [n] frames (held), then its end. Returns the rung long edge afterwards.
+/// Records one frame with the split the engine reports (its "timing": execMs for mpx megapixels).
+bool recordMeasured(AdaptiveQuality q, double overhead, double msPerMpx) {
+  final m = AdaptiveQuality.mpx(q.rung);
+  return q.record(overhead + msPerMpx * m, pixelMs: msPerMpx * m, mpx: m);
+}
+
+/// One drag of [n] measured frames (held), then its end. Returns the rung long edge afterwards.
 int drag(AdaptiveQuality q, double overhead, double msPerMpx, {int n = 40}) {
   q.beginDrag();
   for (var i = 0; i < n; i++) {
-    q.record(frameMs(q, overhead, msPerMpx));
+    recordMeasured(q, overhead, msPerMpx);
   }
   q.endDrag();
   return q.rung.longEdge;
@@ -114,24 +120,59 @@ void splitTests() {
     // overhead jitters between 6 and 9 ms frame by frame; the rung stays
     q.beginDrag();
     for (var i = 0; i < 60; i++) {
-      q.record(i.isEven ? 6 + 8.7 : 9 + 8.7);
+      recordMeasured(q, i.isEven ? 6 : 9, 20);
     }
     expect(q.endDrag(), isFalse);
     expect(q.rung.longEdge, 810);
     // overhead 2 ms: the allowance is 14.7 ms but 1080 needs 15.6 ms: stays
     drag(q, 2, 20);
     expect(q.rung.longEdge, 810);
-    // a cheaper pixel part (12 ms / Mpx: 9.3 ms for 1080) fits with the margin: goes up
-    q.pixelMsPerMpx = 12;
+    // a cheaper pixel part (12 ms / Mpx: 9.3 ms for 1080) is measured over a drag and fits with the margin: goes up
+    drag(q, 2, 12);
+    expect(q.pixelMsPerMpx, closeTo(12, 0.1));
     drag(q, 2, 12);
     expect(q.rung.longEdge, 1080);
   });
 
   test('outside a drag the rung moves one step at a time, only after the confirmation count', () {
     final q = AdaptiveQuality(budgetMs: 8.33)..pixelMsPerMpx = 20;
-    expect(q.record(frameMs(q, 1, 20)), isFalse);
-    expect(q.record(frameMs(q, 1, 20)), isTrue); // second consecutive frame over budget
+    expect(recordMeasured(q, 1, 20), isFalse);
+    expect(recordMeasured(q, 1, 20), isTrue); // second consecutive frame over budget
     expect(q.rung.longEdge, 810);
+  });
+
+  test('the measured split replaces the prior', () {
+    // the warm-up prior says 500 ms / Mpx (seeded to 360); the frames report 20 ms / Mpx and 3 ms of tables: the next drag ends at 810
+    final q = AdaptiveQuality(budgetMs: 16.67)..seedFromMeasurement(500);
+    expect(q.rung.longEdge, 360);
+    expect(q.measured, isFalse);
+    expect(drag(q, 3, 20), 810);
+    expect(q.measured, isTrue);
+    expect(q.pixelMsPerMpx, closeTo(20, 0.01));
+    expect(q.overheadMs, closeTo(3, 0.01));
+    // table-heavy frames (34 ms of tables) measured as such: the overhead is not mistaken for pixels, the picture stays large
+    final heavy = AdaptiveQuality(budgetMs: 16.67)..pixelMsPerMpx = 200; // a wrong prior that would shrink the picture
+    for (var d = 0; d < 4; d++) {
+      drag(heavy, 34, 20);
+    }
+    expect(heavy.rung.longEdge, greaterThanOrEqualTo(640));
+    // a frame without a split (an engine that does not report one) keeps the last measurement
+    heavy.record(60);
+    expect(heavy.pixelMsPerMpx, closeTo(20, 0.01));
+  });
+
+  test('the split is read from the frame analysis', () {
+    final t = FrameTiming.fromAnalysis({
+      'p50': 0.4,
+      'timing': {'tablesMs': 12.5, 'execMs': 3.25, 'uploadMs': 0.5, 'waitMs': 0, 'mpx': 0.0864},
+    });
+    expect(t, isNotNull);
+    expect(t!.tablesMs, 12.5);
+    expect(t.execMs, 3.25);
+    expect(t.mpx, 0.0864);
+    expect(FrameTiming.fromAnalysis({'p50': 0.4}), isNull);
+    expect(FrameTiming.fromAnalysis(null), isNull);
+    expect(FrameTiming.fromAnalysis({'timing': {'execMs': 1, 'mpx': 0}}), isNull);
   });
 }
 

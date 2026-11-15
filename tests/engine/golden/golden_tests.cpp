@@ -780,7 +780,11 @@ void runScenario(const Scenario& sc, std::uint32_t seed, std::vector<GoldenHash>
       h.i32(im.height);
       h.bytes(im.rgba, std::size_t(im.width) * im.height * 4);
       Fnv a;
-      if (an) a.bytes(an, std::strlen(an));
+      if (an) {  // the analysis content; the frame's measured "timing" (wall times, appended last) is not part of it
+        const char* t = std::strstr(an, ",\"timing\"");
+        a.bytes(an, t ? std::size_t(t - an) : std::strlen(an));
+        if (t) a.bytes("}", 1);  // the JSON as it was without the timing object (the hashes recorded before it existed)
+      }
       r.hash = hex(h.h) + (an ? ":" + hex(a.h) : "");
       if (const char* dd = std::getenv("DAPPLE_GOLDEN_DUMP")) {  // raw RGBA8 of every frame (name with '/' -> '_'), for `dapple_golden diff`
         std::string fn = r.name;
