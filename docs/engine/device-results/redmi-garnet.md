@@ -1,5 +1,29 @@
 # Xiaomi Redmi (2312DRA50C "garnet") device results, wave 8, 2026-11-12
 
+## 2026-11-16 (55) X-Trans on one node, first drag frame, bounded cache (native binaries, pipeline-architecture.md section 55)
+
+Native binaries only, under `/data/local/tmp/xtp` (removed afterwards): `before` = HEAD b95e771, `after` = this change, arm64 release builds in `build/xtp-before-arm64` / `build/xtp-after-arm64`. Battery Saver off (`low_power` 0, unchanged), no reboot, no app. Files: public samples `Fujifilm-X-S10-lossless-compressed.RAF` (26 MP), X-T50 `DSCF0118.RAF` (40 MP), A6700 `DSC00002.ARW` (drags), pack `build/film/dapple_new.dfp`.
+
+### X-Trans export (`dapple_open_bench <raw> export`, editor session first, then the full open + export; ms)
+| | X-S10 before | X-S10 after | X-T50 before | X-T50 after |
+|---|---|---|---|---|
+| default (verdict cached) | 3500 (open 2181 + render/encode 1283), CPU/GPU row split | **2885** (open 1422, render/encode 1432; the same CPU node as the 2430 below) | 4951 (3094 + 1813) | **4061 - 4135** (2139 - 2145 + 1877 - 1945) |
+| CPU node forced | 4251 (2660 + 1561) | 2430 (1423 + 973) | 5663 (4126 + 1494) | 3690 (2141 + 1504) |
+| GPU node forced | 4211 (2862 + 1315) | 6135 (2862 + 3152) / 4962 | 5891 (4201 + 1646) | 6072 (4375 + 1662) |
+| first default export of a fresh cache (probe measured) | | 5324 | | |
+
+Demosaic alone (`dapple_demosaic_eval --no-ref --gpu 512 --no-readback`, all cores, ms): X-S10 CPU 2651 -> **1369** (1347 - 1451), GPU 2304 - 2323 -> 2408 - 2424 (the GPU of this phone is bimodal: single runs of 2.2 - 3.6 s for the same binary); X-T50 CPU 4038 -> **2065**. Verdict (fresh probe, after): frame GPU 300 vs CPU 185 ms: CPU. The encode spread on this phone (render + encode 973 - 3152 ms for the same file) is not new (section (b) below).
+Pixels: CPU-node export JPEG md5 before = after (`e87946e0...`, `9e076c4f...`), default after = CPU before, two default runs identical. `dapple_demosaic_tests gpu_parity gpu_tiles tiles threads` (Vulkan, Adreno 710): X-Trans GPU vs CPU fp32 max abs 5.4e-07, RGBA16F mean dE2000 0.016, tiles 0 differing values.
+
+### First frame of a drag, table time over a session (as on the Note10+)
+| | before | after |
+|---|---|---|
+| 60 drags, 0.3 s pauses: first frame median / max, other frames median | 57.3 / 67.8, 48.1 | **44.6 / 53.2, 46.2** |
+| same 1200 frames: table ms median per 12 drags | 13.1 12.8 13.3 13.8 14.1 | **11.9 12.3 12.0 12.5 12.3** |
+
+### Not measured
+The app (no install); GLES; the X-Trans stage lines (logcat not read); thermal state not logged (no change in the run-to-run spread).
+
 ## 2026-11-16 (b) drag under export, film drag spikes, frame split (pipeline-architecture.md section 54)
 
 Native binaries only (arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`), `DAPPLE_GPU=1`, GPU probe as the app (`DAPPLE_BENCH_PROBE`), Vulkan (Adreno 710). "before" = HEAD d3b977b (`build/stall-before-arm64`, built before any engine edit, with the new bench modes), "after" = the working tree. Public samples: A7R IV `DSC00396.ARW` (61 MP), A6700 `DSC00002.ARW`. 27.6 - 28.9 C at the starts.

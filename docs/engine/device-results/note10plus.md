@@ -1,5 +1,31 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (55) X-Trans on one node, first drag frame, bounded cache (native binaries, pipeline-architecture.md section 55)
+
+Native binaries only, under `/data/local/tmp/xtp` (removed afterwards): `before` = HEAD b95e771, `after` = this change, arm64 release builds in `build/xtp-before-arm64` / `build/xtp-after-arm64`. Battery Saver ON (`low_power` 1, unchanged), no reboot, no app. Files: public samples `Fujifilm-X-S10-lossless-compressed.RAF` (26 MP), X-T50 `DSCF0118.RAF` (40 MP), A6700 `DSC00002.ARW` (drags), pack `build/film/dapple_new.dfp`.
+
+### X-Trans export (`dapple_open_bench <raw> export`, editor session first, then the full open + export; ms)
+| | X-S10 before | X-S10 after | X-T50 before | X-T50 after |
+|---|---|---|---|---|
+| default (verdict cached) | 3492 (open 2723 + render/encode 737), CPU/GPU row split | **2596 - 2600** (open 1853, render/encode 709 - 716), CPU node | 5350 (3885 + 1424) | **4147 - 4180** (2780 + 1319 - 1361) |
+| CPU node forced | 4312 (3572 + 708) | 2600 (1854 + 716) | 6848 (5493 + 1316) | 4161 (2800 + 1321) |
+| GPU node forced | 4483 (3739 + 712) | 4101 (3345 + 721) | 6636 (5427 + 1169) | 6196 (4823 + 1329) |
+| first default export of a fresh cache (probe measured) | | 5329 (once per device + format + app version) | | |
+
+Demosaic alone (`dapple_demosaic_eval --no-ref --gpu 512 --no-readback`, all cores, ms): X-S10 CPU 3570 -> **1843** (1750 - 1816 in other runs), GPU 2957 -> 2600 (tap-list variant 2257, not kept: 1.5x slower on the Adreno 710); X-T50 CPU 5428 -> **2714**, GPU 4549 -> 3449. GPU passes before (X-S10, `DAPPLE_GPU_PROFILE`): scale 36, green 74, chroma 1531, derivatives 609, selection 504; workgroups of 64 / 128 and tiles of 256 - 2048 did not help. Verdict (fresh probe, after): frame GPU 326 vs CPU 213 ms, region 81 vs 67: CPU. Before, the probe gave GPU 372 vs CPU 509 and a 37.5 % CPU row share here; the app's cached probe had given 12.5 % (896-row GPU nodes).
+Pixels: CPU-node export JPEG md5 before = after for both files (`90d219b2...`, `10721bde...`), default after = CPU before, two default runs identical. `dapple_demosaic_tests gpu_parity gpu_tiles tiles threads` (Vulkan): X-Trans GPU vs CPU fp32 max abs 5.4e-07, RGBA16F mean dE2000 0.016 p99 0.061, tiles 0 differing values.
+
+### First frame of a drag, table time over a session (`dapple_drag_bench a6700 pack 810 20 'pads exposure (film)'`, GPU, `DAPPLE_BENCH_SETTLE_EDGE=1080`: settled frame after each drag, pause, touch hint 80 ms + 60 ms, every drag on new values; new bench with the before / after library)
+| | before | after |
+|---|---|---|
+| 10 drags, 2 s pauses: first frame median / max, other frames median | 50.0 / 77.5, 48.0 (first-frame tables 17 - 32 ms) | **35.7 / 48.4, 36.2** (tables 10 - 24) |
+| 60 drags, 0.3 s pauses: first frame median / max, other frames median | 48.7 / 65.5, 37.2 | **37.7 / 49.5, 35.3** |
+| same 1200 frames: table ms median per 12 drags | 14.7 14.9 16.3 16.6 16.9 | **13.8 14.6 14.6 13.7 13.8** |
+The app's 105 - 158 ms first frames were not reproduced natively (no `uploadMs` spike: 0.6 - 1.8 ms here, 7 - 69 ms in the app log).
+
+### Not measured
+The app (no install); GLES; the X-Trans stage lines (logcat not read); thermal state not logged (no change in the run-to-run spread).
+
 ## 2026-11-16 (b95e771) stalls, spikes, rungs, export profile
 
 Build: release APK of HEAD b95e771 (built 03:38, `install -r`), Note10+ RFCMA05Q5ZX, taps only, scripts / logs / analysis in `build/perf-20261116d/` (`xdrag.sh`, `fdrag.sh`, `rdrag.sh`, `exp1.sh`, `an*.py`; the timing split is read from the `frame_profile` line: tablesMs = tables + prep, uploadMs = upload, waitMs = turn, execMs = exec - prep - upload - turn). State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 29.8 - 30.1 C, `Thermal Status 0`, no reboot, `debug.dapple.frame_profile` set to 1 and reset to empty. **CPU: all 8 cores online (`0-7`).** `scaling_max_freq` is readable only for cores 4-7: **2016000 kHz on all four, while `cpuinfo_max_freq` is 2419200 (4-6) / 2841600 (core 7)**, i.e. 83 % / 71 % of the hardware maximum (cause not tested; Battery Saver is the likely one, not proven). Cores 0-3: `scaling_max` not readable, `cpuinfo_max` 1785600, current 1.56-1.79 GHz. Current frequency during the exports: A7RM4 CPU phase (2 s in) cores 0-3 at 1.79 GHz, core 4 at 1.40-1.61 GHz, core 7 at 2.02 GHz (the cap); during the X-S10 GPU phase cores 4-6 sat at 710 MHz. Files: the three public samples as `T1116d_6700.ARW`, `T1116d_7rm4.ARW`, `T1116d_xs10.RAF`, scanned in with `MEDIA_SCANNER_SCAN_FILE` broadcasts (no media query).

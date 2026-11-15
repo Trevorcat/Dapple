@@ -59,9 +59,13 @@ class ResultCache {
   };
   struct Limits {
     std::size_t hostBytes = 0, deviceBytes = 0;  // 0 = unlimited
+    std::size_t entries = 0;                     // most entries kept (0 = unlimited): the small per-frame entries (an assembled bake, a tone table,
+                                                 // an analysis) are kilobytes each, so the byte budgets alone let them pile up by the thousand in a long
+                                                 // session, and every lookup that walks the entries (findBest, eviction) grew with them
   };
   // Host budget from the memory configuration: 1/32 of the device's memory (dapple_memory_configure totalBytes, else the physical memory),
-  // 96 MB .. 384 MB, halved on a low-RAM device. Device budget: unlimited until a GPU executor sets it.
+  // 96 MB .. 384 MB, halved on a low-RAM device. Device budget: unlimited until a GPU executor sets it. Entries: kDefaultEntries.
+  static constexpr std::size_t kDefaultEntries = 512;
   static Limits defaultLimits();
 
   explicit ResultCache(Limits l = defaultLimits()) : limits_(l) {}
@@ -87,6 +91,7 @@ class ResultCache {
   void clear();
 
   std::vector<Entry> entries(CacheSlot s) const;   // copies, oldest use first
+  std::vector<Hash128> refs(CacheSlot s) const;    // the `ref` of every entry of slot s (no copies of payloads)
   Stats stats(CacheSlot s) const;
   std::size_t hostBytes() const;
   std::size_t deviceBytes() const;

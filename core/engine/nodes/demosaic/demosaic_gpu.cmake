@@ -12,7 +12,7 @@ set(DAPPLE_DEMOSAIC_GPU_SHADERS
   "dm_fo16|demosaic_xfast.comp|MODE=2,OUT_FMT=rgba16f,OUT16=1|BBI"
   "dm_x0|demosaic_xtrans.comp|MODE=0|BBB"
   "dm_x1|demosaic_xtrans.comp|MODE=1|BBBB"
-  "dm_x2|demosaic_xtrans.comp|MODE=2|BBBB"
+  "dm_x2|demosaic_xtrans.comp|MODE=2|BBBBB"
   "dm_x5_32|demosaic_xtrans.comp|MODE=5,OUT_FMT=rgba32f|BBBBI"
   "dm_x5_16|demosaic_xtrans.comp|MODE=5,OUT_FMT=rgba16f,OUT16=1|BBBBI"
   "dm_h32|demosaic_half.comp|OUT_FMT=rgba32f|BBI"

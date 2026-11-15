@@ -11,6 +11,7 @@
 #include "../../core/src/capi/session.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
@@ -18,10 +19,12 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <thread>
 
 #include "edit_params_fields.h"
 #include "engine/exec/engine_session.h"
 #include "engine/graph/graph.h"
+#include "parallel.h"
 
 namespace {
 
@@ -1123,6 +1126,95 @@ void testOverhead() {
 
 }  // namespace
 
+// ---- a long editing session: table time and cache size stay bounded ---------------------------------------------------------------
+// The app's alternating pad drags (exposure with film, then the colour pad, ...) for 1200 interactive frames on one session. Every frame of a drag has new
+// values, so every frame puts its own small entries (an assembled bake, a tone table, the tonal analysis): with byte budgets alone those piled up by the
+// thousand and the frame's table stage walked them (the lattice retention scanned every lattice against every bake), so the same drag's table time grew
+// through a session (a phone: 12.5 -> 30 - 35 ms, assembly 0.3 -> 16 ms). Asserted: the cache stays within its entry cap, the assembly stays small, the
+// late frames' table time is the early frames'.
+void testLongSession() {
+  const SourceImage src = makeScene(480, 320, true, 5);
+  SourceImage proxy;
+  proxy.sceneReferred = true;
+  proxy.linear = resizeToLongEdge(src.linear, 256);
+  EngineSession es;
+  const bool film = g_lib != nullptr;
+  auto frame = [&](const EditParams& p, FrameResult& res) {
+    engine::point::Params r = engine::point::resolve(p, camA(), nullptr);
+    engine::point::setToneProxy(r, &proxy);
+    FrameJob job{p, r, src, &proxy, camA(), nullptr, {}, {}, {}};
+    job.request.bakeSize = 57;
+    job.request.wantAnalysis = true;
+    job.request.fastAnalysis = true;
+    job.fastOptions.spatial = SpatialQuality::Interactive;
+    const bool ok = es.renderFrame(job, res);
+    CHECK(ok);
+    std::free(res.rgba);
+    res.rgba = nullptr;
+  };
+  const int drags = 60, perDrag = 20;
+  std::vector<double> tables, assemble;
+  std::size_t maxEntries = 0, maxBakes = 0;
+  for (int dg = 0; dg < drags; ++dg) {
+    for (int f = 0; f < perDrag; ++f) {
+      EditParams p = edit0();
+      p.toneStrength = 60.f;
+      if (film) p.filmStock = "kodak_portra_400", p.filmStrength = 100.f;
+      const float x = -1.f + 2.f * float(f) / float(perDrag - 1) + 0.0173f * float(dg);  // a new value every frame of the session
+      if (dg % 2 == 0) p.exposure = x;
+      else p.temperature = 30.f * x, p.vibrance = 55.f * x, p.saturation = 25.f * x;
+      FrameResult res;
+      frame(p, res);
+      tables.push_back(res.cpu.tablesMs);
+      assemble.push_back(res.cpu.assembleMs);
+      maxEntries = std::max(maxEntries, es.cache().size());
+      maxBakes = std::max(maxBakes, es.cache().refs(kBakeSlot).size());
+    }
+  }
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  };
+  const std::size_t n = tables.size(), w = 200;
+  const double early = median(std::vector<double>(tables.begin() + 40, tables.begin() + 40 + w)), late = median(std::vector<double>(tables.end() - w, tables.end()));
+  const double asmLate = median(std::vector<double>(assemble.end() - w, assemble.end()));
+  std::printf("  %zu frames (film %s): cache entries max %zu (cap %zu), bakes max %zu, table ms median early %.2f late %.2f, assembly late %.3f ms\n", n, film ? "on" : "off",
+              maxEntries, ResultCache::kDefaultEntries, maxBakes, early, late, asmLate);
+  CHECK(maxEntries <= ResultCache::kDefaultEntries);
+  CHECK(late <= early * 1.5 + 1.0);
+  CHECK(asmLate < 0.15);  // desktop: 0.012 ms after, 0.40 ms (and growing with the session) before
+}
+
+// ---- touch-down: the pool's workers are running when the first frame of a drag comes ----------------------------------------------
+// dapple_session_touch_hint (pointer-down, before the first movement) heats the frame pool: its workers spin on their cores for the burst, so the first
+// frame's jobs are joined by running workers. Before, the hint only warmed the GPU; the frame's WarmScope woke the workers when that frame had already
+// started (a phone: the first frame's table stage 35 - 61 ms against 11 - 15 for the rest of the drag). Asserted with the pool's count of jobs a worker
+// joined from sleep: none after the hint, some after the same pause without it (the control that the count sees a cold pool).
+void testTouchHeat() {
+  ThreadPool& pool = ThreadPool::instance();
+  if (pool.size() < 2) {
+    std::printf("  one thread: nothing to heat\n");
+    return;
+  }
+  std::atomic<int> sink{0};
+  auto job = [&] { pool.run(pool.size() * 4, 1, [&](int a, int b) { sink.fetch_add(b - a); }); };
+  job();
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));  // the workers sleep
+  const std::uint64_t c0 = pool.coldStarts();
+  job();
+  const std::uint64_t cold = pool.coldStarts() - c0;
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  pool.heat(200);  // what dapple_session_touch_hint(session, burst > 0) does for the CPU (frame.cpp)
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));  // touch-down to the first movement
+  const std::uint64_t c1 = pool.coldStarts();
+  job();
+  const std::uint64_t heated = pool.coldStarts() - c1;
+  std::printf("  workers joining from sleep: %llu after a 300 ms pause, %llu after the same pause with the touch heat (%d threads)\n", (unsigned long long)cold,
+              (unsigned long long)heated, pool.size());
+  CHECK(cold > 0);
+  CHECK(heated == 0);
+}
+
 int main(int argc, char** argv) {
   struct T {
     const char* id;
@@ -1130,7 +1222,7 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"hash", testHash},           {"registry", testRegistry},     {"validate", testValidate},
                      {"snapshots", testSnapshots}, {"keys", testKeys},             {"conformance", testConformance}, {"conformance_small", testConformanceSmall},
-                     {"cache", testCache},         {"reuse", testReuse}, {"reuse_small", testReuseSmall}, {"tables", testTables},           {"overhead", testOverhead}};
+                     {"cache", testCache},         {"reuse", testReuse}, {"reuse_small", testReuseSmall}, {"tables", testTables},           {"overhead", testOverhead}, {"long_session", testLongSession}, {"touch_heat", testTouchHeat}};
   if (argc >= 2 && std::string(argv[1]) == "--list") {
     for (const T& t : tests) std::printf("%s\n", t.id);
     return 0;

@@ -10,7 +10,7 @@ ResultCache::Limits ResultCache::defaultLimits() {
   const std::size_t total = mem::deviceTotal();
   std::size_t host = std::clamp<std::size_t>(total / 32, std::size_t(96) << 20, std::size_t(384) << 20);
   if (mem::deviceClass().lowRam.load(std::memory_order_relaxed)) host /= 2;
-  return Limits{host, 0};
+  return Limits{host, 0, kDefaultEntries};
 }
 
 void ResultCache::setLimits(Limits l) {
@@ -108,15 +108,17 @@ void ResultCache::put(Entry e) {
 }
 
 void ResultCache::evictLocked(const Key* keep, std::vector<std::shared_ptr<void>>& out) {
-  auto over = [&](bool device) {
-    return device ? (limits_.deviceBytes && device_ > limits_.deviceBytes) : (limits_.hostBytes && host_ > limits_.hostBytes);
+  // kind 0: host bytes, 1: device bytes, 2: entry count (any entry is a victim)
+  auto over = [&](int kind) {
+    return kind == 1 ? (limits_.deviceBytes && device_ > limits_.deviceBytes)
+                     : (kind == 0 ? (limits_.hostBytes && host_ > limits_.hostBytes) : (limits_.entries && items_.size() > limits_.entries));
   };
-  for (bool device : {false, true}) {
-    while (over(device)) {
+  for (int kind : {0, 1, 2}) {
+    while (over(kind)) {
       auto victim = items_.end();
       for (auto it = items_.begin(); it != items_.end(); ++it) {
         if (keep && it->first == *keep) continue;
-        if ((device ? it->second.e.deviceBytes : it->second.e.hostBytes) == 0) continue;
+        if (kind < 2 && (kind == 1 ? it->second.e.deviceBytes : it->second.e.hostBytes) == 0) continue;
         if (victim == items_.end() || it->second.prio < victim->second.prio ||
             (it->second.prio == victim->second.prio && it->second.used < victim->second.used))
           victim = it;
@@ -174,6 +176,14 @@ std::vector<ResultCache::Entry> ResultCache::entries(CacheSlot s) const {
   std::vector<Entry> out;
   out.reserve(v.size());
   for (auto& p : v) out.push_back(std::move(p.second));
+  return out;
+}
+
+std::vector<Hash128> ResultCache::refs(CacheSlot s) const {
+  std::vector<Hash128> out;
+  std::lock_guard<std::mutex> lk(m_);
+  for (const auto& [k, it] : items_)
+    if (k.slot == s) out.push_back(it.e.ref);
   return out;
 }
 

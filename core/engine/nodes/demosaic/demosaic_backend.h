@@ -17,9 +17,6 @@ class GpuBackend {
   // Whether the GPU is the faster node for this work on this device (measured once per device, see demosaic_gpu.cpp; separately for a whole frame and for a
   // region). The decoder runs the CPU node when this says no: the slower node is never used. Default: yes.
   virtual bool prefer(const Desc& d, Rect roi, std::string& why) { (void)d, (void)roi, (void)why; return true; }
-  // Share of a large rectangle (a whole frame, a band of the streamed export) the CPU node takes at the same time as the GPU (its bottom rows), so that
-  // both finish together: from this device's measured frame probe (GPU ms against CPU ms). 0 = the GPU alone (the default, a forced node, no measurement).
-  virtual double cpuShare(const Desc& d) { (void)d; return 0.0; }
   // Demosaic `roi` into out (interleaved float RGB). False = failed / unavailable: the caller falls back to the CPU node.
   virtual bool run(const Desc& d, Rect roi, float* out, std::size_t strideFloats, std::string& why) = 0;
   // Memory (pipeline-architecture.md 42.9): gives the backend's device and its tile buffers back (created again on the next run). Waits for a run in

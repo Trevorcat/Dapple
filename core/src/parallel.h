@@ -180,6 +180,8 @@ class ThreadPool {
         // While a WarmScope is open the spin lasts up to kWarmSpinUs (the next job of the scope starts on a running worker); past the normal
         // spin the worker yields its cpu at every check, so a thread that is ready to run there (the frame thread, a driver thread) is not
         // kept waiting by a spinning worker when the cpus are oversubscribed.
+        // Inside a heat window (heat(), the touch-down hint) the spin lasts to the window's end: the cores run, so their clocks are up when the first
+        // frame of the drag arrives.
         const auto spin0 = std::chrono::steady_clock::now();
         const auto spinEnd = spin0 + std::chrono::microseconds(spinUs_), warmEnd = spin0 + std::chrono::microseconds(kWarmSpinUs);
         int k = 0;
@@ -187,16 +189,18 @@ class ThreadPool {
           if ((++k & 63) == 0) {
             const auto now = std::chrono::steady_clock::now();
             if (now > spinEnd) {
-              if (warm_.load(std::memory_order_relaxed) <= 0 || now > warmEnd) break;
+              if ((warm_.load(std::memory_order_relaxed) <= 0 || now > warmEnd) && now.time_since_epoch().count() > heatUntil_.load(std::memory_order_relaxed)) break;
               std::this_thread::yield();
             }
           }
           sys::cpuRelax();
         }
+        const bool hot = gen_.load(std::memory_order_acquire) != seen;  // the job found this worker spinning (else it sleeps and is woken)
         std::unique_lock<std::mutex> lock(mtx_);
         cvWork_.wait(lock, [&] { return generation_ != seen || warmGen_ != warmSeen; });
         warmSeen = warmGen_;
         if (generation_ == seen) continue;  // woken by a WarmScope: spin until its job comes (or the scope closes)
+        if (!hot) coldStarts_.fetch_add(1, std::memory_order_relaxed);
         seen = generation_;
         mine = idx < active_;
       }
@@ -223,6 +227,8 @@ class ThreadPool {
   std::atomic<int> pendingA_{0};      // mirror of pending_ for the caller's spin
   int spinUs_ = 60;  // bounded spin before blocking (one pass gap is typically 5-50 us); env DAPPLE_SPIN_US
   std::atomic<int> warm_{0};  // open WarmScopes: the workers keep spinning between jobs
+  std::atomic<std::int64_t> heatUntil_{0};  // steady_clock ticks: the end of the heat window (heat())
+  std::atomic<std::uint64_t> coldStarts_{0};  // jobs a worker joined from sleep (woken through the condition variable), not from its spin
   static constexpr int kWarmSpinUs = 2000;  // longest idle spin inside a WarmScope (a table stage's serial gaps are shorter)
   unsigned warmGen_ = 0;      // bumped (under mtx_) when a WarmScope opens: wakes sleeping workers into the spin
   int active_ = 0;
@@ -254,6 +260,22 @@ class ThreadPool {
     }
     cvWork_.notify_all();
   }
+  // Touch-down (dapple_session_touch_hint): the sleeping workers are woken and spin on their cores for `ms`, so that the first frame of a drag finds the
+  // cores at speed and the workers running. A frame's WarmScope only wakes them when the frame starts: after a pause the cores sit at their lowest clock
+  // and that frame's table stage ran 2 - 4x slower than the rest of the drag (a phone: 35 - 61 ms against 11 - 15 ms). The workers yield at every check
+  // (the frame thread and driver threads are not kept waiting) and take a job at once when one comes.
+  void heat(int ms) {
+    if (threads_ <= 0 || ms <= 0) return;
+    const std::int64_t until = (std::chrono::steady_clock::now() + std::chrono::milliseconds(ms)).time_since_epoch().count();
+    if (until <= heatUntil_.load(std::memory_order_relaxed)) return;
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      heatUntil_.store(until, std::memory_order_relaxed);
+      ++warmGen_;
+    }
+    cvWork_.notify_all();
+  }
+  std::uint64_t coldStarts() const { return coldStarts_.load(std::memory_order_relaxed); }
   // Total threads (caller included) a job may use; 0 / out of range = all.
   void setLimit(int n) { limit_.store(n <= 0 ? threads_ + 1 : std::min(n, threads_ + 1)); }
   int size() const { return threads_ + 1; }

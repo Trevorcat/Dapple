@@ -1,7 +1,8 @@
 #version 450
 // X-Trans demosaic, candidate directions + homogeneity selection (demosaic_cpu.cpp xtransTileCand mirrors this statement by statement).
 //   MODE 0: green candidate of each of the 4 directions (H, V, D1, D2): nearest greens along the direction + directional Laplacian.
-//   MODE 1: red / blue colour differences per direction: guide-weighted mean of the unclipped samples within one pixel of the line along the direction.
+//   MODE 1: red / blue colour differences per direction: guide-weighted mean of the unclipped samples within one pixel of the line along the direction
+//           (the CPU node's taps as masks per phase / direction / colour, with its base weights and patch offsets from the host).
 //   MODE 2: derivative map of every candidate in a cube-root colour space (+ a penalty for candidates that interpolated across a clipped green).
 //           The candidate colours (matrix + cube root) of a 16 x 16 tile and its ring of 1 are evaluated ONCE into shared memory, then the derivatives are
 //           taken from there (the direct form evaluated every candidate 5 times and the 60 pow() per pixel dominated the frame on a phone GPU).
@@ -21,15 +22,16 @@ layout(binding = 1, std430) readonly buffer Sb { float S[]; };
 #endif
 #if MODE == 0
 layout(binding = 2, std430) writeonly buffer Gb { vec4 G4[]; };
-layout(binding = 3, std430) readonly buffer Tb { uint tabm[]; };  // host table (demosaic_gpu.cpp): chroma tap masks at 4136, green neighbour entries at 4712
+layout(binding = 3, std430) readonly buffer Tb { uint tabm[]; };  // host table (demosaic_gpu.cpp): green neighbour entries at 4712
 #elif MODE == 1
 layout(binding = 2, std430) readonly buffer Gb { vec4 G4[]; };
 layout(binding = 3, std430) writeonly buffer Db { vec4 Dv[]; };
-layout(binding = 4, std430) readonly buffer Tb { uint tabm[]; };  // the shared table of the host: tap masks per phase / direction / colour at 4136 (demosaic_gpu.cpp)
+layout(binding = 4, std430) readonly buffer Tb { uint tabm[]; };  // the host table (demosaic_gpu.cpp): tap masks, base weights per (direction, bit), offsets per bit (kTapMask, kTapW, kTapOff)
 #elif MODE == 2
 layout(binding = 2, std430) readonly buffer Gb { vec4 G4[]; };
 layout(binding = 3, std430) readonly buffer Db { vec4 Dv[]; };
 layout(binding = 4, std430) writeonly buffer Hb { vec4 D4[]; };
+layout(binding = 5, std430) readonly buffer Tb { uint tabm[]; };  // the host table: green neighbour entries at 4712 (the nearest greens along each direction)
 #elif MODE == 5
 layout(binding = 2, std430) readonly buffer Gb { vec4 G4[]; };
 layout(binding = 3, std430) readonly buffer Db { vec4 Dv[]; };
@@ -44,13 +46,6 @@ const float kClipSim = 4.0;
 ivec2 dv(int dir) { return dir == 0 ? ivec2(1, 0) : (dir == 1 ? ivec2(0, 1) : (dir == 2 ? ivec2(1, 1) : ivec2(1, -1))); }
 float dlen(int dir) { return dir >= 2 ? 1.41421356 : 1.0; }
 float comp(vec4 v, int d) { return d == 0 ? v.x : (d == 1 ? v.y : (d == 2 ? v.z : v.w)); }
-
-int nearestGreen(int i, int j, int dir, int sg) {
-  const ivec2 e = dv(dir);
-  for (int q = 1; q <= 3; ++q)
-    if (colAt(i + sg * q * e.x, j + sg * q * e.y, 6) == 1) return q;
-  return 0;
-}
 
 #if MODE == 0
 const int T = 16, PW = T + 6, NP = PW * PW;  // tile and a patch with a ring of 3 (the greens look 3 samples along a direction)
@@ -78,13 +73,14 @@ float greenCand(int pc, uint e, int dir) {
 
 #if MODE == 1
 const int T = 16, PW = T + 6, NP = PW * PW;  // the differences look 3 samples around: patch with a ring of 3
+const int kTapMask = 4136, kTapW = 8888, kTapOff = kTapW + 196;  // demosaic_gpu.cpp: tap masks, base weights per (direction, bit), patch offset per bit
 shared float shS[NP];
 shared vec4 shG[NP];
 shared uint shM[576];  // tap masks: ((phase * 4 + direction) * 2 + colour(R, B)) * 2 + word; bit b = (v + 3) * 7 + (u + 3) of the 7 x 7 neighbourhood
+shared float shW[196];  // base weight 1 / (r^2 (1 + perp^2)) per (direction, bit): the CPU node's value
+shared int shO[49];     // patch offset per bit
 vec2 chromaDiff(int pc, int ph, int c, int dir) {
-  const ivec2 e = dv(dir);
   const float g = comp(shG[pc], dir);
-  const float ln = dlen(dir);
   float dr = 0.0, db = 0.0;
   for (int t = 0; t < 2; ++t) {
     const int ct = t * 2;
@@ -96,16 +92,13 @@ vec2 chromaDiff(int pc, int ph, int c, int dir) {
       const int mi = ((ph * 4 + dir) * 2 + t) * 2;
       for (int part = 0; part < 2; ++part) {
         uint m = shM[mi + part];
-        while (m != 0u) {  // ascending bit order = the row-major order of the plain 7 x 7 loop
+        while (m != 0u) {  // ascending bit order = the row-major order of the CPU node's tap list
           const int b = findLSB(m) + part * 32;
           m &= m - 1u;
-          const int uu = b % 7 - 3, v = b / 7 - 3;
-          const int r2 = uu * uu + v * v;
-          const float perp = abs(float(uu * e.y - v * e.x)) / ln;
-          const int pq = pc + v * PW + uu;
+          const int pq = pc + shO[b];
           const float gq = comp(shG[pq], dir);
           const float sq = shS[pq];
-          const float w = 1.0 / (float(r2) * (1.0 + perp * perp) * (kGuide + abs(gq - g)));
+          const float w = shW[dir * 49 + b] / (kGuide + abs(gq - g));
           if (sq >= kClip) { numC += w * (sq - gq); denC += w; }
           else { num += w * (sq - gq); den += w; }
         }
@@ -178,7 +171,9 @@ void main() {
     shS[n] = ok ? S[j * ww + i] : 0.0;
     shG[n] = ok ? G4[j * ww + i] : vec4(0.0);
   }
-  for (int n = tid; n < 576; n += NT) shM[n] = tabm[4136 + n];
+  for (int n = tid; n < 576; n += NT) shM[n] = tabm[kTapMask + n];
+  for (int n = tid; n < 196; n += NT) shW[n] = uintBitsToFloat(tabm[kTapW + n]);
+  for (int n = tid; n < 49; n += NT) shO[n] = int(tabm[kTapOff + n]);
   barrier();
   for (int n = tid; n < T * T; n += NT) {
     const int i = o.x + n % T, j = o.y + n / T;
@@ -230,6 +225,7 @@ void main() {
     if (i < 7 || j < 7 || i >= ww - 7 || j >= wh - 7) { D4[k] = vec4(0.0); continue; }
     const int pc = (py + 1) * P1 + px + 1;
     const int c = colAt(i, j, 6);
+    const int ph = ((j + u.org.y + 12) % 6) * 6 + ((i + u.org.x + 12) % 6);
     vec4 dres = vec4(0.0);
     [[unroll]] for (int dir = 0; dir < 4; ++dir) {
       const int b = dir * 3 * N1;
@@ -240,10 +236,11 @@ void main() {
         const vec3 df = c0 - vec3(shc[b + pn], shc[b + N1 + pn], shc[b + 2 * N1 + pn]);
         sum += dot(df, df);
       }
-      if (c != 1) {
+      if (c != 1) {  // the nearest greens along the direction from the host table (MODE 0's entries)
         const ivec2 e = dv(dir);
         const int st = e.y * ww + e.x;
-        const int km = nearestGreen(i, j, dir, -1), kp = nearestGreen(i, j, dir, 1);
+        const uint ge = tabm[4712 + ph * 4 + dir];
+        const int km = int(ge & 3u), kp = int((ge >> 2) & 3u);
         if (S[k - km * st] >= kClip || S[k + kp * st] >= kClip) sum += kClipPen;
       }
       if (dir == 0) dres.x = sum; else if (dir == 1) dres.y = sum; else if (dir == 2) dres.z = sum; else dres.w = sum;

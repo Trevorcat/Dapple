@@ -1263,69 +1263,12 @@ int testHalfGpu() {
 }
 #endif
 #ifdef DAPPLE_HAVE_GPU
-// The GPU node shared with the CPU node (rows dealt by absolute mosaic row, DAPPLE_DEMOSAIC_SHARE fixes the share): the whole frame, bands of the streamed
-// export (odd heights, every orientation) and a region give every row the same node, so they are bit-identical; the CPU rows equal the CPU node, the GPU rows
-// the GPU node alone; the whole frame stays within the GPU parity budget of the CPU node.
-int testGpuShare() {
-  std::string why;
-  if (!makeDevice(why)) return 77;
-  engine::gpu::setRuntimeEnabled(1);
-  demosaic::installGpuBackend();
-  int bad = 0;
-  for (Cfa c : {Cfa::Bayer, Cfa::XTrans})
-    for (int flip : {0, 6}) {
-      Synth s(901, 2300, c, zoneScene(901, 2300));  // more than two share periods of 1024 rows
-      const auto m = mosaicOf(s, flip, false);
-      int W, H;
-      orientedSize(*m, &W, &H);
-      const std::size_t pitch = std::size_t(W) * 3;
-      auto run = [&](const char* share, int band) {
-        setEnvVar("DAPPLE_DEMOSAIC_SHARE", share);
-        std::vector<float> o(pitch * H);
-        for (int y = 0; y < H; y += band) CHECK(demosaicOrientedRegionInto(*m, 0, y, W, std::min(H, y + band), true, o.data() + std::size_t(y) * pitch, pitch), "band %d failed", y);
-        return o;
-      };
-      const auto whole = run("0.35", H), bands = run("0.35", 333), gpuOnly = run("off", H);
-      std::vector<float> cpu(pitch * H);
-      CHECK(demosaicOrientedRegionInto(*m, 0, 0, W, H, false, cpu.data(), pitch), "CPU node failed");
-      const int ry0 = H / 5, ry1 = H - H / 5;
-      const ImageF reg = [&] { setEnvVar("DAPPLE_DEMOSAIC_SHARE", "0.35"); return demosaicOrientedRegionOn(*m, 37, ry0, W - 11, ry1, true); }();
-      int regionBad = reg.width == W - 48 && reg.height == ry1 - ry0 ? 0 : 1;
-      for (int y = ry0; y < ry1 && regionBad == 0; ++y)
-        regionBad += std::memcmp(reg.row(y - ry0), whole.data() + std::size_t(y) * pitch + 37 * 3, std::size_t(W - 48) * 3 * sizeof(float)) != 0;
-      // which rows are the CPU's: mosaic rows 1024 k + 672 .. 1024 (k + 1) (share 0.35 of 1024 in steps of 32 = 352 rows), mapped through the orientation
-      int cpuRowsSame = 0, gpuRowsSame = 0, nCpu = 0, nGpu = 0;
-      for (int my = 0; my < s.h; ++my) {
-        const bool onCpu = my % 1024 >= 1024 - 352;
-        (onCpu ? nCpu : nGpu) += 1;
-        bool sameCpu = true, sameGpu = true;
-        for (int mx = 0; mx < s.w; ++mx) {
-          const int ox = flip == 6 ? s.h - 1 - my : mx, oy = flip == 6 ? mx : my;  // demosaic_session orientation 6: (dx, dy) = (H - 1 - y, x)
-          const std::size_t i = std::size_t(oy) * pitch + std::size_t(ox) * 3;
-          sameCpu = sameCpu && std::memcmp(&whole[i], &cpu[i], 12) == 0;
-          sameGpu = sameGpu && std::memcmp(&whole[i], &gpuOnly[i], 12) == 0;
-        }
-        cpuRowsSame += onCpu && sameCpu, gpuRowsSame += !onCpu && sameGpu;
-      }
-      double p99 = 0, mx = 0;
-      const double mean = meanDe(whole, cpu, &p99, &mx);
-      const bool bandsSame = whole == bands;
-      std::printf("  gpu_share %s flip %d: bands %s, region %d differing rows, CPU rows %d / %d = CPU node, GPU rows %d / %d = GPU node, whole vs CPU mean dE2000 %.4f p99 %.4f\n",
-                  c == Cfa::Bayer ? "bayer " : "xtrans", flip, bandsSame ? "identical" : "DIFFER", regionBad, cpuRowsSame, nCpu, gpuRowsSame, nGpu, mean, p99);
-      bad += !bandsSame + (regionBad != 0) + (cpuRowsSame != nCpu) + (gpuRowsSame != nGpu);
-      CHECK(mean <= 0.1 && p99 <= 1.0, "shared demosaic off the CPU node");
-    }
-  setEnvVar("DAPPLE_DEMOSAIC_SHARE", "off");
-  demosaic::setGpuBackend(nullptr);
-  CHECK(bad == 0, "%d cases where the share is not a pure function of the mosaic row", bad);
-  return g_fail ? 1 : 0;
-}
 #endif
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::vector<std::string> all = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "wire_arw2", "gpu_parity", "gpu_tiles", "gpu_real", "gpu_share", "wire_gpu", "half_zone", "half_tiles", "half_flatclip", "half_real", "half_gpu"};
+  const std::vector<std::string> all = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "wire_arw2", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu", "half_zone", "half_tiles", "half_flatclip", "half_real", "half_gpu"};
   std::vector<std::string> ids;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--list") {
@@ -1372,7 +1315,6 @@ int main(int argc, char** argv) {
     else if (id == "gpu_real") { const int r = testGpuReal(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "half_gpu") { const int r = testHalfGpu(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_gpu") { const int r = testWireGpu(); if (r == 77 && g_fail == before) return 77; }
-    else if (id == "gpu_share") { const int r = testGpuShare(); if (r == 77 && g_fail == before) return 77; }
 #else
     else if (id.rfind("gpu_", 0) == 0) return 77;
 #endif

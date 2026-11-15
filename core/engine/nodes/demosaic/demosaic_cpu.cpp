@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -247,51 +248,28 @@ constexpr int kXtMed = 1;        // 3 x 3 median of the final colour differences
 constexpr float kClipPen = 0.3f; // derivative penalty of a candidate that interpolated across a clipped green
 
 // cube root of a non-negative float, 2 Newton steps from a bit-trick start (relative error ~1e-6); the GPU kernel uses pow(x, 1/3)
+// (branch-free: the Newton steps run for every value and x <= 0 selects 0 at the end, so a loop over it vectorises; the same values as the early return)
 inline float fastCbrt(float x) {
-  if (x <= 0.f) return 0.f;
-  std::uint32_t i;
-  std::memcpy(&i, &x, 4);
-  i = i / 3 + 0x2a514067u;
-  float y;
-  std::memcpy(&y, &i, 4);
+  const std::uint32_t i = std::bit_cast<std::uint32_t>(x) / 3 + 0x2a514067u;
+  float y = std::bit_cast<float>(i);
   y = y - (y * y * y - x) / (3.f * y * y);
   y = y - (y * y * y - x) / (3.f * y * y);
-  return y;
+  return x <= 0.f ? 0.f : y;
 }
 
-struct XtTaps {  // per phase, direction and colour (red / blue): the samples within one pixel of the line along the direction, and the own-colour samples for the Laplacian
-  struct Tap { std::int8_t u, v; float gw; };
-  Tap t[36][4][2][12];
-  std::int8_t n[36][4][2];
-  struct Lap { std::int8_t q; };
-  std::int8_t lap[36][4][6];
-  std::int8_t nlap[36][4];
-  XtTaps(const Desc& d) {
-    static const int dx[4] = {1, 0, 1, 1}, dy[4] = {0, 1, 1, -1};
-    static const float len[4] = {1.f, 1.f, 1.41421356f, 1.41421356f};
-    for (int ph = 0; ph < 36; ++ph)
-      for (int dir = 0; dir < 4; ++dir) {
-        for (int c = 0; c < 2; ++c) {
-          int cnt = 0;
-          for (int v = -3; v <= 3; ++v)
-            for (int u = -3; u <= 3; ++u) {
-              const int r2 = u * u + v * v;
-              if (r2 == 0 || r2 > 10) continue;
-              const float perp = std::fabs(float(u * dy[dir] - v * dx[dir])) / len[dir];
-              if (perp > 1.01f) continue;
-              if (d.cfa3[pmod(ph / 6 + v, 6) * 6 + pmod(ph % 6 + u, 6)] != c * 2) continue;
-              if (cnt < 12) t[ph][dir][c][cnt++] = {std::int8_t(u), std::int8_t(v), 1.f / (float(r2) * (1.f + perp * perp))};
-            }
-          n[ph][dir][c] = std::int8_t(cnt);
-        }
-        int nl = 0;
-        const int col = d.cfa3[ph];
-        for (int q = -3; q <= 3; ++q)
-          if (q && d.cfa3[pmod(ph / 6 + q * dy[dir], 6) * 6 + pmod(ph % 6 + q * dx[dir], 6)] == col) lap[ph][dir][nl++] = std::int8_t(q);
-        nlap[ph][dir] = std::int8_t(nl);
-      }
-  }
-};
+// exact median of nine by a sorting network (19 compare-exchanges; demosaic_xtrans.comp med9 is the same network). It returns the value std::nth_element
+// would put in the middle, at a fraction of the cost (nth_element was 40 % of the X-Trans CPU time).
+inline float median9(float a0, float a1, float a2, float a3, float a4, float a5, float a6, float a7, float a8) {
+  auto s = [](float& x, float& y) {
+    const float t = std::min(x, y);
+    y = std::max(x, y);
+    x = t;
+  };
+  s(a1, a2), s(a4, a5), s(a7, a8), s(a0, a1), s(a3, a4), s(a6, a7), s(a1, a2), s(a4, a5), s(a7, a8);
+  s(a0, a3), s(a5, a8), s(a4, a7), s(a3, a6), s(a1, a4), s(a2, a5), s(a4, a7), s(a4, a2), s(a6, a4), s(a4, a2);
+  return a4;
+}
+
 
 void xtransTileCand(const Desc& d, const float* S, Rect roi, float* out, std::size_t stride) {
   static const int dx[4] = {1, 0, 1, 1}, dy[4] = {0, 1, 1, -1};
@@ -302,8 +280,13 @@ void xtransTileCand(const Desc& d, const float* S, Rect roi, float* out, std::si
   const int ox = pmod(roi.x0 - H, 6), oy = pmod(roi.y0 - H, 6);
   auto phase = [&](int i, int j) { return ((j + oy) % 6) * 6 + ((i + ox) % 6); };
   const std::size_t N = std::size_t(ww) * wh;
-  thread_local std::vector<float> G4, DD, D4, CC, SG, SRB;
-  G4.assign(4 * N, 0.f), DD.assign(8 * N, 0.f), D4.assign(4 * N, 0.f), CC.assign(12 * N, 0.f);
+  // per-thread planes, not cleared: every stage reads only what the stage before it wrote (the rings shrink stage by stage)
+  thread_local std::vector<float> G4, DD, D4, CC, SG, SR, SB, THR, MR, MB;
+  thread_local std::vector<std::uint8_t> HM;
+  auto atLeast = [](auto& v, std::size_t n) {
+    if (v.size() < n) v.resize(n);
+  };
+  atLeast(G4, 4 * N), atLeast(DD, 8 * N), atLeast(D4, 4 * N), atLeast(CC, 36 * std::size_t(ww)), atLeast(THR, N);
   // 1. directional green
   for (int j = 3; j < wh - 3; ++j)
     for (int i = 3; i < ww - 3; ++i) {
@@ -330,36 +313,84 @@ void xtransTileCand(const Desc& d, const float* S, Rect roi, float* out, std::si
       }
     }
   // 2. directional colour differences (red, blue): [8 k + 4 t + dir]
-  for (int j = 6; j < wh - 6; ++j)
-    for (int i = 6; i < ww - 6; ++i) {
-      const std::size_t k = std::size_t(j) * ww + i;
-      const int ph = phase(i, j), c = d.cfa3[ph];
-      for (int dir = 0; dir < 4; ++dir) {
-        const float g = G4[4 * k + dir];
-        for (int t = 0; t < 2; ++t) {
-          float res;
-          if (c == t * 2) {
-            res = S[k] - g;
-          } else {
-            float num = 0.f, den = 0.f, numC = 0.f, denC = 0.f;  // unclipped / clipped samples
-            const int nt = TP.n[ph][dir][t];
-            for (int a = 0; a < nt; ++a) {
-              const XtTaps::Tap& tp = TP.t[ph][dir][t][a];
-              const std::size_t q = k + std::ptrdiff_t(tp.v) * ww + tp.u;
-              const float gq = G4[4 * q + dir];
-              const float w = tp.gw / (kGuide + std::fabs(gq - g));
-              if (S[q] >= kClip) numC += w * (S[q] - gq), denC += w;
-              else num += w * (S[q] - gq), den += w;
-            }
-            // colour differences from unclipped samples only; clipped ones count only inside a clipped region (similar green), see 32.3
-            res = den > 0.f ? num / den : (denC >= kClipSim ? numC / denC : 0.f);
+  // One pixel: the reference statement order. Pixels i, i + 6, i + 12, i + 18 of a row share the phase, so they share the tap lists: chromaQuad runs them as
+  // the four lanes of a vector, every lane doing exactly the statements of the scalar form in the same order (the per-lane results are bit-identical).
+  auto chromaOne = [&](int i, int j) {
+    const std::size_t k = std::size_t(j) * ww + i;
+    const int ph = phase(i, j), c = d.cfa3[ph];
+    for (int dir = 0; dir < 4; ++dir) {
+      const float g = G4[4 * k + dir];
+      for (int t = 0; t < 2; ++t) {
+        float res;
+        if (c == t * 2) {
+          res = S[k] - g;
+        } else {
+          float num = 0.f, den = 0.f, numC = 0.f, denC = 0.f;  // unclipped / clipped samples
+          const int nt = TP.n[ph][dir][t];
+          for (int a = 0; a < nt; ++a) {
+            const XtTaps::Tap& tp = TP.t[ph][dir][t][a];
+            const std::size_t q = k + std::ptrdiff_t(tp.v) * ww + tp.u;
+            const float gq = G4[4 * q + dir];
+            const float w = tp.gw / (kGuide + std::fabs(gq - g));
+            if (S[q] >= kClip) numC += w * (S[q] - gq), denC += w;
+            else num += w * (S[q] - gq), den += w;
           }
-          DD[8 * k + 4 * t + dir] = res;
+          // colour differences from unclipped samples only; clipped ones count only inside a clipped region (similar green), see 32.3
+          res = den > 0.f ? num / den : (denC >= kClipSim ? numC / denC : 0.f);
         }
+        DD[8 * k + 4 * t + dir] = res;
       }
     }
-  // candidate colours in the cube-root space: CC[12 k + 3 dir + channel]
-  for (int j = 6; j < wh - 6; ++j)
+  };
+#if defined(__clang__)
+  auto chromaQuad = [&](int i, int j) {  // lanes: pixels i + 6 l, l = 0..3
+    typedef float F4 __attribute__((ext_vector_type(4)));
+    typedef int I4 __attribute__((ext_vector_type(4)));
+    const std::size_t k0 = std::size_t(j) * ww + i;
+    const int ph = phase(i, j), c = d.cfa3[ph];
+    auto at = [&](const float* base, std::size_t k, int step) { return F4{base[k], base[k + std::size_t(step)], base[k + 2 * std::size_t(step)], base[k + 3 * std::size_t(step)]}; };
+    for (int dir = 0; dir < 4; ++dir) {
+      const F4 g = at(G4.data() + dir, 4 * k0, 24);
+      for (int t = 0; t < 2; ++t) {
+        F4 res;
+        if (c == t * 2) {
+          res = at(S, k0, 6) - g;
+        } else {
+          F4 num = 0.f, den = 0.f, numC = 0.f, denC = 0.f;
+          const int nt = TP.n[ph][dir][t];
+          for (int a = 0; a < nt; ++a) {
+            const XtTaps::Tap& tp = TP.t[ph][dir][t][a];
+            const std::size_t q = k0 + std::ptrdiff_t(tp.v) * ww + tp.u;
+            const F4 gq = at(G4.data() + dir, 4 * q, 24), sq = at(S, q, 6);
+            const F4 w = tp.gw / (kGuide + __builtin_elementwise_abs(gq - g));
+            const F4 n2 = num + w * (sq - gq), d2 = den + w, n2C = numC + w * (sq - gq), d2C = denC + w;  // both branches of the scalar form, then the lane's one
+            const I4 clip = sq >= kClip;  // all ones where clipped
+            auto pick = [](I4 m, F4 a2, F4 b2) {  // a2 where m, else b2 (bitwise: no arithmetic on the values)
+              const I4 r = (m & __builtin_bit_cast(I4, a2)) | (~m & __builtin_bit_cast(I4, b2));
+              return __builtin_bit_cast(F4, r);
+            };
+            num = pick(clip, num, n2), den = pick(clip, den, d2), numC = pick(clip, n2C, numC), denC = pick(clip, d2C, denC);
+          }
+          for (int l = 0; l < 4; ++l) res[l] = den[l] > 0.f ? num[l] / den[l] : (denC[l] >= kClipSim ? numC[l] / denC[l] : 0.f);
+        }
+        for (int l = 0; l < 4; ++l) DD[8 * (k0 + 6 * std::size_t(l)) + 4 * t + dir] = res[l];
+      }
+    }
+  };
+#endif
+  for (int j = 6; j < wh - 6; ++j) {
+    int i = 6;
+#if defined(__clang__)
+    for (; i + 24 <= ww - 6; i += 24)
+      for (int r = 0; r < 6; ++r) chromaQuad(i + r, j);
+#endif
+    for (; i < ww - 6; ++i) chromaOne(i, j);
+  }
+  // candidate colours in the cube-root space, then 3. the derivative maps, row by row: the colours live in a ring of three rows (CC[12 (row % 3) ww + 12 i +
+  // 3 dir + channel]), the derivatives of row j - 1 follow the colours of row j (a whole-window colour plane was 12 floats per pixel through memory)
+  auto ccRow = [&](int j) { return CC.data() + 12 * std::size_t(j % 3) * ww; };
+  for (int j = 6; j < wh - 6; ++j) {
+    float* cr = ccRow(j);
     for (int i = 6; i < ww - 6; ++i) {
       const std::size_t k = std::size_t(j) * ww + i;
       const int c = d.cfa3[phase(i, j)];
@@ -367,20 +398,24 @@ void xtransTileCand(const Desc& d, const float* S, Rect roi, float* out, std::si
         const float g = G4[4 * k + dir];
         float rgb[3] = {c == 0 ? S[k] : g + DD[8 * k + dir], g, c == 2 ? S[k] : g + DD[8 * k + 4 + dir]};
         for (int q = 0; q < 3; ++q) rgb[q] = clamp01(rgb[q]);
-        for (int r = 0; r < 3; ++r) CC[12 * k + 3 * dir + r] = fastCbrt(d.m[r * 3] * rgb[0] + d.m[r * 3 + 1] * rgb[1] + d.m[r * 3 + 2] * rgb[2]);
+        for (int r = 0; r < 3; ++r) cr[12 * i + 3 * dir + r] = d.m[r * 3] * rgb[0] + d.m[r * 3 + 1] * rgb[1] + d.m[r * 3 + 2] * rgb[2];
       }
     }
-  // 3. derivative maps
-  for (int j = 7; j < wh - 7; ++j)
+    float* row = cr + 12 * 6;  // the cube roots over the row as one contiguous run: that loop vectorises, same arithmetic per value
+    const int n = 12 * (ww - 12);
+    for (int a = 0; a < n; ++a) row[a] = fastCbrt(row[a]);
+    const int jd = j - 1;  // derivative row: its colour rows jd - 1 .. jd + 1 are in the ring now
+    if (jd < 7 || jd >= wh - 7) continue;
+    const float *cu = ccRow(jd - 1), *cm = ccRow(jd), *cd = ccRow(jd + 1);
     for (int i = 7; i < ww - 7; ++i) {
-      const std::size_t k = std::size_t(j) * ww + i;
-      const int ph = phase(i, j);
+      const std::size_t k = std::size_t(jd) * ww + i;
+      const int ph = phase(i, jd);
       for (int dir = 0; dir < 4; ++dir) {
-        const float* c0 = &CC[12 * k + 3 * dir];
+        const float* c0 = cm + 12 * i + 3 * dir;
         float sum = 0.f;
-        const std::ptrdiff_t off[4] = {-1, 1, -std::ptrdiff_t(ww), std::ptrdiff_t(ww)};
-        for (int n = 0; n < 4; ++n) {
-          const float* cn = &CC[12 * std::size_t(std::ptrdiff_t(k) + off[n]) + 3 * dir];
+        const float* nb[4] = {c0 - 12, c0 + 12, cu + 12 * i + 3 * dir, cd + 12 * i + 3 * dir};  // left, right, up, down
+        for (int n2 = 0; n2 < 4; ++n2) {
+          const float* cn = nb[n2];
           sum += sq(c0[0] - cn[0]) + sq(c0[1] - cn[1]) + sq(c0[2] - cn[2]);
         }
         if (d.cfa3[ph] != 1) {  // a candidate that interpolated across a clipped green is a poor one
@@ -390,22 +425,38 @@ void xtransTileCand(const Desc& d, const float* S, Rect roi, float* out, std::si
         }
         D4[4 * k + dir] = sum;
       }
+      // the homogeneity threshold of this pixel, once (the selection below reads it for 9 pixels)
+      const float m = std::min(std::min(D4[4 * k], D4[4 * k + 1]), std::min(D4[4 * k + 2], D4[4 * k + 3]));
+      THR[k] = m * kThrF + kThrA;
     }
+  }
   // 4. homogeneity selection on the ROI + 1 ring: the mean of the best candidates as green and two colour differences
+  //    (per row: the homogeneity counts in one plain loop, which vectorises, then the selection)
   const int cw = rw + 2, ch = rh + 2;
-  SG.resize(std::size_t(cw) * ch), SRB.resize(2 * SG.size());
-  for (int y = -1; y <= rh; ++y)
+  atLeast(SG, std::size_t(cw) * ch), atLeast(SR, std::size_t(cw) * ch), atLeast(SB, std::size_t(cw) * ch), atLeast(HM, 4 * std::size_t(cw));
+  for (int y = -1; y <= rh; ++y) {
+    const int j = y + H;
+    {
+      const float* __restrict dq = D4.data();
+      const float* __restrict tq = THR.data();
+      std::uint8_t* __restrict hmr = HM.data();
+      for (int x = -1; x <= rw; ++x) {
+        const std::size_t k = std::size_t(j) * ww + x + H;
+        int h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+        for (int v = -1; v <= 1; ++v)
+          for (int u = -1; u <= 1; ++u) {
+            const std::size_t q = k + std::ptrdiff_t(v) * ww + u;
+            const float thr = tq[q];
+            h0 += dq[4 * q] <= thr, h1 += dq[4 * q + 1] <= thr, h2 += dq[4 * q + 2] <= thr, h3 += dq[4 * q + 3] <= thr;
+          }
+        std::uint8_t* hx = hmr + 4 * std::size_t(x + 1);
+        hx[0] = std::uint8_t(h0), hx[1] = std::uint8_t(h1), hx[2] = std::uint8_t(h2), hx[3] = std::uint8_t(h3);
+      }
+    }
     for (int x = -1; x <= rw; ++x) {
-      const int i = x + H, j = y + H;
+      const int i = x + H;
       const std::size_t k = std::size_t(j) * ww + i;
-      int hm[4] = {0, 0, 0, 0};
-      for (int v = -1; v <= 1; ++v)
-        for (int u = -1; u <= 1; ++u) {
-          const std::size_t q = k + std::ptrdiff_t(v) * ww + u;
-          const float m = std::min(std::min(D4[4 * q], D4[4 * q + 1]), std::min(D4[4 * q + 2], D4[4 * q + 3]));
-          const float thr = m * kThrF + kThrA;
-          for (int dir = 0; dir < 4; ++dir) hm[dir] += D4[4 * q + dir] <= thr;
-        }
+      const std::uint8_t* hm = HM.data() + 4 * std::size_t(x + 1);
       const int hmax = std::max(std::max(hm[0], hm[1]), std::max(hm[2], hm[3]));
       float g = 0.f, r = 0.f, b2 = 0.f;
       int cnt = 0;
@@ -421,24 +472,33 @@ void xtransTileCand(const Desc& d, const float* S, Rect roi, float* out, std::si
       g /= float(cnt), r /= float(cnt), b2 /= float(cnt);
       const std::size_t o2 = std::size_t(y + 1) * cw + x + 1;
       SG[o2] = g;
-      SRB[2 * o2] = clamp01(r) - clamp01(g);
-      SRB[2 * o2 + 1] = clamp01(b2) - clamp01(g);
+      SR[o2] = clamp01(r) - clamp01(g);
+      SB[o2] = clamp01(b2) - clamp01(g);
     }
+  }
   // 5. 3 x 3 median of the two colour differences (the isolated colour speckle of an estimate at a one-pixel feature is an outlier, an edge is not), matrix, output
-  auto med9 = [&](std::size_t o2, int ch2) {
-    float a[9];
-    int n = 0;
-    for (int v = -1; v <= 1; ++v)
-      for (int u = -1; u <= 1; ++u) a[n++] = SRB[2 * (std::ptrdiff_t(o2) + v * cw + u) + ch2];
-    std::nth_element(a, a + 4, a + 9);
-    return a[4];
+  //    (the medians of a row in plain loops over planar differences: they vectorise)
+  atLeast(MR, std::size_t(rw)), atLeast(MB, std::size_t(rw));
+  auto medRow = [&](const float* __restrict p, float* __restrict m) {  // p: the plane at (row y + 1, column 1) of the ring layout
+    const std::ptrdiff_t r = cw;
+    for (int x = 0; x < rw; ++x) {
+      const float* q = p + x;
+      m[x] = median9(q[-r - 1], q[-r], q[-r + 1], q[-1], q[0], q[1], q[r - 1], q[r], q[r + 1]);
+    }
   };
   for (int y = 0; y < rh; ++y) {
     float* o = out + std::size_t(y) * stride;
+    const std::size_t o0 = std::size_t(y + 1) * cw + 1;
+    if (kXtMed) {
+      medRow(SR.data() + o0, MR.data());
+      medRow(SB.data() + o0, MB.data());
+    } else {
+      std::memcpy(MR.data(), SR.data() + o0, std::size_t(rw) * 4);
+      std::memcpy(MB.data(), SB.data() + o0, std::size_t(rw) * 4);
+    }
     for (int x = 0; x < rw; ++x) {
-      const std::size_t o2 = std::size_t(y + 1) * cw + x + 1;
-      const float g = clamp01(SG[o2]);
-      float rgb[3] = {g + (kXtMed ? med9(o2, 0) : SRB[2 * o2]), g, g + (kXtMed ? med9(o2, 1) : SRB[2 * o2 + 1])};
+      const float g = clamp01(SG[o0 + x]);
+      float rgb[3] = {g + MR[x], g, g + MB[x]};
       for (int q = 0; q < 3; ++q) rgb[q] = clamp01(rgb[q]);
       float* px = o + 3 * x;
       for (int r = 0; r < 3; ++r) {
@@ -450,6 +510,32 @@ void xtransTileCand(const Desc& d, const float* S, Rect roi, float* out, std::si
 }
 
 }  // namespace
+
+XtTaps::XtTaps(const Desc& d) {
+  static const int dx[4] = {1, 0, 1, 1}, dy[4] = {0, 1, 1, -1};
+  static const float len[4] = {1.f, 1.f, 1.41421356f, 1.41421356f};
+  for (int ph = 0; ph < 36; ++ph)
+    for (int dir = 0; dir < 4; ++dir) {
+      for (int c = 0; c < 2; ++c) {
+        int cnt = 0;
+        for (int v = -3; v <= 3; ++v)
+          for (int u = -3; u <= 3; ++u) {
+            const int r2 = u * u + v * v;
+            if (r2 == 0 || r2 > 10) continue;
+            const float perp = std::fabs(float(u * dy[dir] - v * dx[dir])) / len[dir];
+            if (perp > 1.01f) continue;
+            if (d.cfa3[pmod(ph / 6 + v, 6) * 6 + pmod(ph % 6 + u, 6)] != c * 2) continue;
+            if (cnt < 12) t[ph][dir][c][cnt++] = {std::int8_t(u), std::int8_t(v), 1.f / (float(r2) * (1.f + perp * perp))};
+          }
+        n[ph][dir][c] = std::int8_t(cnt);
+      }
+      int nl = 0;
+      const int col = d.cfa3[ph];
+      for (int q = -3; q <= 3; ++q)
+        if (q && d.cfa3[pmod(ph / 6 + q * dy[dir], 6) * 6 + pmod(ph % 6 + q * dx[dir], 6)] == col) lap[ph][dir][nl++] = std::int8_t(q);
+      nlap[ph][dir] = std::int8_t(nl);
+    }
+}
 
 int mapCoord(int i, int n, Cfa c) {
   if (i >= 0 && i < n) return i;

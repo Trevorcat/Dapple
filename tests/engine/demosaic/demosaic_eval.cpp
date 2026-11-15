@@ -335,6 +335,12 @@ int main(int argc, char** argv) {
   t = Clock::now();
   ImageF ours = demosaic::demosaicFull(m, threads);
   const double tDemo = msSince(t);
+  {  // FNV-1a of the CPU node's output bits: the same file must give the same hash after a speed change (bit-identical CPU path)
+    std::uint64_t h = 1469598103934665603ull;
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(ours.data.data());
+    for (std::size_t i = 0, n = ours.data.size() * sizeof(float); i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    std::printf("  CPU output hash %016llx\n", (unsigned long long)h);
+  }
   ImageF base;
   double tBil = 0;
   if (bil) {

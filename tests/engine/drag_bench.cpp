@@ -603,14 +603,24 @@ int main(int argc, char** argv) {
         // DAPPLE_BENCH_REPS (1): swipes out and back, DAPPLE_BENCH_PAUSE_MS (0) idle between them (the app's drags: spikes came after the pause)
         const int reps = std::getenv("DAPPLE_BENCH_REPS") ? std::max(1, std::atoi(std::getenv("DAPPLE_BENCH_REPS"))) : 1;
         const int pauseMs = std::getenv("DAPPLE_BENCH_PAUSE_MS") ? std::atoi(std::getenv("DAPPLE_BENCH_PAUSE_MS")) : 0;
+        // DAPPLE_BENCH_SETTLE_EDGE (0): the app's settled frame after each drag (not interactive, this long edge, with the analysis), the prepare hint after the
+        // first drag, and the touch hint + 60 ms before each later drag; prints the first frame of every drag with its split against the rest of that drag
+        const int settleEdge = std::getenv("DAPPLE_BENCH_SETTLE_EDGE") ? std::atoi(std::getenv("DAPPLE_BENCH_SETTLE_EDGE")) : 0;
+        std::vector<double> firsts, rests;
+        std::vector<std::pair<int, double>> repTables;  // (drag, table ms) of the frames after the first: the session's trend
+        std::string lastJson;
         std::vector<double> t;
         int slow = 0, slowTables = 0, withTables = 0;
         for (int rep = 0; rep < reps; ++rep) {
         if (rep > 0 && pauseMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(pauseMs));
+        if (rep > 0 && settleEdge > 0) {  // the app's touch-down: the keep-warm hint, then the first movement
+          dapple_session_touch_hint(s, 80);
+          std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        }
         dapple_set_interaction(1);  // a finger is on the pad, as in the app (background matches and seeds wait meanwhile)
         for (int i = 0; i < frames; ++i) {
           const int k = rep % 2 ? frames - 1 - i : i;  // out and back
-          const float x = -1.f + 2.f * float(k) / float(std::max(1, frames - 1));
+          const float x = -1.f + 2.f * float(k) / float(std::max(1, frames - 1)) + (settleEdge > 0 ? 0.0137f * float(rep) : 0.f);  // with settled frames: every drag starts on new values, as a finger does
           char body[256];
           if (std::strcmp(pd.name, "light pad x") == 0) std::snprintf(body, sizeof body, pd.fmt, double(x), double(-40 * x), double(20 * x));
           else if (std::strcmp(pd.name, "colour pad") == 0) std::snprintf(body, sizeof body, pd.fmt, double(30 * x), double(55 * x), double(25 * x));
@@ -618,6 +628,7 @@ int main(int argc, char** argv) {
           else std::snprintf(body, sizeof body, pd.fmt, double(40 * x));
           char json[512];
           std::snprintf(json, sizeof json, "{%s\"toneStrength\":60,%s}", film ? "\"film\":\"kodak_portra_400\"," : "", body);
+          lastJson = json;
           DappleFrameRequest rq{};
           rq.size = sizeof rq;
           rq.long_edge = le;
@@ -635,6 +646,19 @@ int main(int argc, char** argv) {
             if (const char* p = std::strstr(an, "\"tablesMs\":")) tables = std::atof(p + 11), ++withTables;
             dapple_free_string(an);
           }
+          if (settleEdge > 0) {
+            auto num = [&](const char* k) {
+              const char* p2 = an ? std::strstr(an, k) : nullptr;
+              return p2 ? std::atof(p2 + std::strlen(k)) : -1.0;
+            };
+            if (i == 0) {
+              firsts.push_back(ms);
+              std::printf("    rep %2d first frame %6.1f ms (tables %.1f exec %.1f upload %.1f)\n", rep, ms, tables, num("\"execMs\":"), num("\"uploadMs\":"));
+            } else {
+              rests.push_back(ms);
+              repTables.push_back({rep, tables});
+            }
+          }
           if (t.size() > 1 && ms > 100.0) {  // the process's first frame is a cold start, not a drag frame
             ++slow;
             slowTables += tables > 100.0;
@@ -643,6 +667,36 @@ int main(int argc, char** argv) {
           dapple_free_image(&img);
         }
         dapple_set_interaction(0);
+        if (settleEdge > 0) {  // the settled frame of the app after the finger lifts
+          DappleFrameRequest rq{};
+          rq.size = sizeof rq;
+          rq.long_edge = settleEdge;
+          rq.flags = DAPPLE_FRAME_ANALYSIS;  // bake size 0: the engine's own for a settled frame, as the app asks
+          DappleImage img{};
+          char* an = nullptr;
+          if (dapple_session_render_frame(s, lastJson.c_str(), nullptr, &rq, &img, &an) == DAPPLE_OK) dapple_free_image(&img);
+          if (an) dapple_free_string(an);
+          if (rep == 0) dapple_session_touch_hint(s, -1);
+        }
+        }
+        if (settleEdge > 0 && reps >= 10) {  // table ms median per block of drags (a long session must not grow it)
+          std::printf("  %-22s table ms median per %d drags:", name.c_str(), reps / 5);
+          for (int b = 0; b < 5; ++b) {
+            std::vector<double> v;
+            for (const auto& [r, tm] : repTables)
+              if (r / (reps / 5) == b && tm >= 0) v.push_back(tm);
+            if (v.empty()) continue;
+            std::sort(v.begin(), v.end());
+            std::printf(" %.1f", v[v.size() / 2]);
+          }
+          std::printf("%c", 10);
+        }
+        if (settleEdge > 0 && firsts.size() > 1 && !rests.empty()) {
+          std::vector<double> f2(firsts.begin() + 1, firsts.end()), r2 = rests;
+          std::sort(f2.begin(), f2.end());
+          std::sort(r2.begin(), r2.end());
+          std::printf("  %-22s first frame of drags 2..%zu: median %.1f max %.1f | other frames median %.1f p90 %.1f\n", name.c_str(), firsts.size(), f2[f2.size() / 2], f2.back(),
+                      r2[r2.size() / 2], r2[r2.size() * 9 / 10]);
         }
         std::vector<double> r(t.begin() + 1, t.end());
         std::sort(r.begin(), r.end());

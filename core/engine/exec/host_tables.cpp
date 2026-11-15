@@ -2,6 +2,7 @@
 // CpuImpl::bake, cached in the session's ResultCache under their effective keys, assembled into the frame's BakedLut (kBakeSlot). Also the
 // Resize node's bake (the session source at a smaller long edge).
 #include <algorithm>
+#include <unordered_set>
 
 #include "engine/exec/engine_session_internal.h"
 #include "engine/nodes/resize/resize.h"
@@ -198,14 +199,11 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
     nb->colourKey = latN->family.hex();
     nb->latticeKey = latticeKey.hex();
     put(kBakeSlot, ak, tk.tone, latticeN, nb, nb->tone.size() * 4 + nb->toneMove.size() * 4 + sizeof(BakedLut), t0, latticeKey);
-    // a lattice lives exactly as long as a retained bake refers to it
-    const std::vector<ResultCache::Entry> live = cache_.entries(kBakeSlot);
-    cache_.eraseIf([&](const ResultCache::Entry& le) {
-      if (le.slot != slotOf(NodeType::ColourLattice)) return false;
-      for (const auto& a : live)
-        if (a.ref == le.key) return false;
-      return true;
-    });
+    // a lattice lives exactly as long as a retained bake refers to it (one pass over the entries with a set of the bakes' lattices: the nested scan of
+    // every lattice against every bake grew with the session)
+    std::unordered_set<Hash128, Hash128Hash> live;
+    for (const Hash128& r : cache_.refs(kBakeSlot)) live.insert(r);
+    cache_.eraseIf([&](const ResultCache::Entry& le) { return le.slot == slotOf(NodeType::ColourLattice) && !live.count(le.key); });
     bl = nb;
     out.cpu.assembleMs = session::msSince(t0);
   }

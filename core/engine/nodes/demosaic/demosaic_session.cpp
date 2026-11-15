@@ -1,12 +1,7 @@
 #include "engine/nodes/demosaic/demosaic_session.h"
 
-#if defined(__ANDROID__)
-#include <malloc.h>
-#endif
-
 #include <algorithm>
 #include <cstring>
-#include <thread>
 #include <vector>
 
 #include "engine/nodes/demosaic/demosaic_backend.h"
@@ -18,46 +13,12 @@ namespace dapple::demosaic {
 namespace {
 GpuBackend* g_backend = nullptr;
 
-// The GPU on `roi` (the GPU is chosen for it), shared with the CPU node: on a phone the GPU node is only 1.5 - 3x the speed of the CPU node (X-Trans), and
-// the cores would otherwise wait for it. The rows are dealt by their absolute mosaic row: of every kShareRows rows the last `share` part goes to the CPU
-// node, the rest to the GPU, both running at the same time (share = the backend's measured split, so that both finish together). A whole frame, a band of
-// the streamed export and a region therefore give every row to the same node: the same pixels whichever way the picture is cut. Both nodes run the same
-// arithmetic (the GPU's output rounds to fp16: the parity budget of 32.6). False when a GPU part failed (the caller runs the CPU node over everything).
-constexpr int kShareRows = 1024;
-bool runGpuShared(GpuBackend* b, const Desc& d, Rect roi, float* out, std::size_t stride, int threads) {
-  std::string why;
-  const int cpuLen = int(b->cpuShare(d) * (kShareRows / 32) + 0.5) * 32;  // steps of 32 rows: a probe a few % off moves no row (the app caches the probe per device)
-  if (cpuLen < 32) return b->run(d, roi, out, stride, why);
-  std::vector<Rect> gpuParts, cpuParts;
-  for (int p0 = roi.y0 / kShareRows * kShareRows; p0 < roi.y1; p0 += kShareRows) {
-    const int split = p0 + kShareRows - cpuLen;
-    const int ga = std::max(roi.y0, p0), gb = std::min(roi.y1, split), ca = std::max(roi.y0, split), cb = std::min(roi.y1, p0 + kShareRows);
-    if (gb > ga) gpuParts.push_back({roi.x0, ga, roi.x1, gb});
-    if (cb > ca) cpuParts.push_back({roi.x0, ca, roi.x1, cb});
-  }
-  auto at = [&](const Rect& r) { return out + std::size_t(r.y0 - roi.y0) * stride; };
-  const int hw = int(std::max(2u, std::thread::hardware_concurrency()));
-  // two cores stay with the GPU runner (submission, read-back conversion); at most 4 threads: the CPU part is the smaller one and finishes first anyway,
-  // and each X-Trans thread holds ~8 MB of scratch (Redmi, X-S10 export: 6 threads 2319 ms and +12 MB peak over the GPU alone, 4 threads 2258 ms)
-  const int cpuThreads = std::max(1, std::min(4, (threads > 0 ? std::min(threads, hw) : hw) - (gpuParts.empty() ? 0 : 2)));
-  std::thread cpu([&] {
-    for (const Rect& r : cpuParts) demosaic(d, r, at(r), stride, cpuThreads);
-  });
-  bool ok = true;
-  for (const Rect& r : gpuParts) ok = ok && b->run(d, r, at(r), stride, why);
-  cpu.join();
-#if defined(__ANDROID__) && defined(M_PURGE)
-  if (!cpuParts.empty()) mallopt(M_PURGE, 0);  // the CPU part's per-thread scratch stays in the allocator's thread caches otherwise (the export's peak)
-#endif
-  return ok;
-}
-
 // GPU when a backend is installed and usable, else the CPU node. `usedGpu` (optional) says which one ran.
 void runNode(const Desc& d, Rect roi, float* out, std::size_t stride, int threads, bool* usedGpu = nullptr) {
   if (usedGpu) *usedGpu = false;
   if (GpuBackend* b = g_backend) {
     std::string why;
-    if (b->available(why) && b->prefer(d, roi, why) && runGpuShared(b, d, roi, out, stride, threads)) {
+    if (b->available(why) && b->prefer(d, roi, why) && b->run(d, roi, out, stride, why)) {
       if (usedGpu) *usedGpu = true;
       return;
     }
@@ -137,7 +98,10 @@ ImageF demosaicOrientedRegionOn(const MosaicImage& m, int x0, int y0, int x1, in
   ImageF tmp(r.w(), r.h());
   bool done = false;
   if (gpu) {
-    if (GpuBackend* b = g_backend) done = runGpuShared(b, d, r, tmp.data.data(), std::size_t(r.w()) * 3, threads);
+    if (GpuBackend* b = g_backend) {
+      std::string why;
+      done = b->run(d, r, tmp.data.data(), std::size_t(r.w()) * 3, why);
+    }
     if (!done && fellBack) *fellBack = true;
   }
   if (!done) demosaic(d, r, tmp.data.data(), std::size_t(r.w()) * 3, threads);
@@ -157,7 +121,10 @@ bool demosaicOrientedRegionInto(const MosaicImage& m, int x0, int y0, int x1, in
   const Desc d = makeDesc(m);
   bool done = false;
   if (gpu) {
-    if (GpuBackend* b = g_backend) done = runGpuShared(b, d, r, out, strideFloats, threads);
+    if (GpuBackend* b = g_backend) {
+      std::string why;
+      done = b->run(d, r, out, strideFloats, why);
+    }
     if (!done && fellBack) *fellBack = true;
   }
   if (!done) demosaic(d, r, out, strideFloats, threads);

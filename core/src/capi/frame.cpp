@@ -259,7 +259,8 @@ int32_t dapple_session_render(DappleSession* session, const char* params_json, c
 // background thread (the same frames a drag renders, results dropped) so the GPU clock that fell during the pause is up when the first real frame arrives;
 // the burst ends at `burst_ms` or as soon as a real frame is requested. It runs only while a finger is down (one burst per call, never two at once).
 // Round 10: the default is the GPU keep-warm pump (gpu_runtime.h keepWarm): GPU-only units of ~1.5 ms (at most two ahead of a frame, none submitted while
-// a real frame is pending, more queued behind each frame of the drag), so a finger that moves at once is not held behind a burst frame. DAPPLE_HINT_MODE=frames selects the frame burst below
+// a real frame is pending, more queued behind each frame of the drag), so a finger that moves at once is not held behind a burst frame. Section 55: a burst also heats the frame pool
+// (ThreadPool::heat: the workers spin for the burst), so the first frame of the drag finds the cores at speed. DAPPLE_HINT_MODE=frames selects the frame burst below
 // (measurement only), =off disables the hint.
 static int32_t touchHintImpl(DappleSession* session, int32_t burst_ms);
 int32_t dapple_session_touch_hint(DappleSession* session, int32_t burst_ms) {
@@ -269,6 +270,8 @@ static int32_t touchHintImpl(DappleSession* session, int32_t burst_ms) {
   if (!session || burst_ms == 0) return DAPPLE_OK;
   const char* hintMode = std::getenv("DAPPLE_HINT_MODE");
   if (hintMode && std::strcmp(hintMode, "off") == 0) return DAPPLE_OK;
+  // the CPU side of the keep-warm: the pool's workers spin for the burst (the cores' clocks fell during the pause; the first frame's table stage needs them)
+  if (burst_ms > 0) dapple::ThreadPool::instance().heat(burst_ms);
   if (!(hintMode && std::strcmp(hintMode, "frames") == 0)) {
 #ifdef DAPPLE_HAVE_GPU
     dapple::engine::gpu::keepWarm(burst_ms);  // no-op when frames do not run on the GPU

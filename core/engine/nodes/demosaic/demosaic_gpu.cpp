@@ -40,7 +40,10 @@ static_assert(sizeof(U) == 144, "std140 layout of the demosaic uniform block");
 
 inline int pmod(int a, int n) { return ((a % n) + n) % n; }
 constexpr int kHalfTab = 40 + 4096 + 576 + 144;     // first float of the half-resolution tables in the table buffer (demosaic_half.comp: HT)
-constexpr int kTabFloats = kHalfTab + 1728 * 2 + 576;
+constexpr int kTapMask = 40 + 4096;                  // X-Trans colour-difference tap masks: 576 (demosaic_xtrans.comp MODE 1)
+constexpr int kTapW = kHalfTab + 1728 * 2 + 576;     // their base weights per (direction, mask bit): 196
+constexpr int kTapOff = kTapW + 196;                 // the patch offset of each mask bit: 49
+constexpr int kTabFloats = kTapOff + 49;
 
 [[maybe_unused]] float halfToFloat(std::uint16_t h) {  // not used where __fp16 converts in hardware (aarch64)
   const std::uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
@@ -69,14 +72,14 @@ struct GpuDemosaic::Impl {
   bool half = false;
   int lx = 16, ly = 16, rwg = 256;
   int tile = 0, period = 0;
-  hal::BufferH staging, mosaic, tab, S, G, D, Hh, readback, readback2;  // two read-back buffers: the host converts tile n while the device renders tile n + 1
+  hal::BufferH staging, mosaic, tab, tabDev, S, G, D, Hh, readback, readback2;  // two read-back buffers: the host converts tile n while the device renders tile n + 1
   hal::ImageH out;
   hal::PipelineH pScale, pG, pC, pH, pO;
   Cfa cfa = Cfa::Bayer;
   int xt = 1, extra = 0;
   bool hf = false;  // half-resolution path (Desc::half): window = 2 x tile + 6, two passes (scale, reconstruction)
   void release() {
-    for (hal::BufferH* b : {&staging, &mosaic, &tab, &S, &G, &D, &Hh, &readback, &readback2})
+    for (hal::BufferH* b : {&staging, &mosaic, &tab, &tabDev, &S, &G, &D, &Hh, &readback, &readback2})
       if (*b) dev->destroy(*b);
     if (out) dev->destroy(out);
     tile = 0;
@@ -132,6 +135,9 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
     Status s = mk(winBytes, hal::MemKind::Upload, true, &P.staging);
     if (s == Status::Ok) s = mk(winBytes, hal::MemKind::DeviceLocal, true, &P.mosaic);
     if (s == Status::Ok) s = mk(std::uint64_t(kTabFloats) * 4, hal::MemKind::Upload, true, &P.tab);
+    // the kernels read the table from device memory: the X-Trans tap lists are read per tap, and host-visible memory made that pass 30 x slower on an
+    // Adreno 710 (copied once per run, below)
+    if (s == Status::Ok) s = mk(std::uint64_t(kTabFloats) * 4, hal::MemKind::DeviceLocal, true, &P.tabDev);
     if (s == Status::Ok) s = mk(planeBytes, hal::MemKind::DeviceLocal, true, &P.S);
     if (s == Status::Ok) s = mk(hf ? 256 : (cand ? planeBytes * 4 : planeBytes), hal::MemKind::DeviceLocal, true, &P.G);  // candidates: 4 greens per pixel (the half path has none)
     const std::uint64_t dBytes = cand ? planeBytes * 8 : std::uint64_t(tile + 2) * (tile + 2) * 8;
@@ -146,7 +152,7 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
       P.release();
       return s;
     }
-    S_.deviceBytes = planeBytes + (hf ? 256 : (cand ? planeBytes * 4 : planeBytes)) + winBytes + std::uint64_t(tile) * tile * hal::bytesPerTexel(of) + (d.cfa == Cfa::XTrans && !hf ? dBytes : 0) + (cand ? planeBytes * 4 : 0);
+    S_.deviceBytes = std::uint64_t(kTabFloats) * 4 + planeBytes + (hf ? 256 : (cand ? planeBytes * 4 : planeBytes)) + winBytes + std::uint64_t(tile) * tile * hal::bytesPerTexel(of) + (d.cfa == Cfa::XTrans && !hf ? dBytes : 0) + (cand ? planeBytes * 4 : 0);
     auto pipe = [&](const char* name, hal::PipelineH* ph, bool wantPeriod) {
       hal::PipelineDesc pd;
       pd.shader = name;
@@ -216,25 +222,25 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
           ge[ph * 4 + dir] = e;
         }
     }
-    if (cand) {  // tap masks of the colour differences: [phase][direction][R, B] x 2 words, bit (v + 3) * 7 + (u + 3) of the 7 x 7 neighbourhood (see demosaic_xtrans.comp MODE 1)
-      std::uint32_t* mk4 = reinterpret_cast<std::uint32_t*>(t) + 40 + 4096;
+    if (cand) {  // the colour-difference taps (demosaic_xtrans.comp MODE 1), from the CPU node's lists (XtTaps): per (phase, direction, colour) a mask of the
+                 // 7 x 7 neighbourhood, bit (v + 3) * 7 + (u + 3) (ascending bits = the lists' row-major order); per (direction, bit) the base weight; per bit
+                 // the patch offset (patch row of 22)
+      const XtTaps tp(d);
+      std::uint32_t* mk4 = reinterpret_cast<std::uint32_t*>(t) + kTapMask;
+      float* gw = t + kTapW;
+      std::int32_t* off = reinterpret_cast<std::int32_t*>(t) + kTapOff;
       std::memset(mk4, 0, 576 * 4);
+      std::memset(gw, 0, 196 * 4);
+      for (int b = 0; b < 49; ++b) off[b] = (b / 7 - 3) * 22 + (b % 7 - 3);
       for (int ph = 0; ph < 36; ++ph)
-        for (int dir = 0; dir < 4; ++dir) {
-          const int ex = dir == 0 ? 1 : (dir == 1 ? 0 : 1), ey = dir == 0 ? 0 : (dir == 1 ? 1 : (dir == 2 ? 1 : -1));
-          const float ln = dir >= 2 ? 1.41421356f : 1.0f;
+        for (int dir = 0; dir < 4; ++dir)
           for (int tt = 0; tt < 2; ++tt)
-            for (int v = -3; v <= 3; ++v)
-              for (int uu = -3; uu <= 3; ++uu) {
-                const int r2 = uu * uu + v * v;
-                if (r2 == 0 || r2 > 10) continue;
-                const float perp = std::abs(float(uu * ey - v * ex)) / ln;
-                if (perp > 1.01f) continue;
-                if (d.cfa3[pmod(ph / 6 + v, 6) * 6 + pmod(ph % 6 + uu, 6)] != tt * 2) continue;
-                const int b = (v + 3) * 7 + (uu + 3);
-                mk4[((ph * 4 + dir) * 2 + tt) * 2 + (b >> 5)] |= 1u << (b & 31);
-              }
-        }
+            for (int a = 0; a < tp.n[ph][dir][tt]; ++a) {
+              const XtTaps::Tap& e = tp.t[ph][dir][tt][a];
+              const int b = (e.v + 3) * 7 + (e.u + 3);
+              mk4[((ph * 4 + dir) * 2 + tt) * 2 + (b >> 5)] |= 1u << (b & 31);
+              gw[dir * 49 + b] = e.gw;  // a function of (u, v, direction) only
+            }
     }
     if (hf) {  // the half-resolution tables (demosaic_half.comp): weights, fallback, support
       const HalfTables& T = halfTables(d);
@@ -310,19 +316,20 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
         cl->timestamp(nm);
       };
       cl->timestamp("start");
+      if (S_.tiles == 0) cl->copyBufferToBuffer(P.tab, P.tabDev, std::uint64_t(kTabFloats) * 4, 0);  // this run's table (written above), once
       cl->copyBufferToBuffer(P.staging, P.mosaic, winBytes, 0);
       cl->barrier(hal::kAll);
-      disp("scale", P.pScale, {P.mosaic, P.tab, P.S}, nullptr, cw, ch);
+      disp("scale", P.pScale, {P.mosaic, P.tabDev, P.S}, nullptr, cw, ch);
       if (hf) {
-        disp("half", P.pO, {P.S, P.tab}, &P.out, rw, rh);
-      } else if (cand) disp("green", P.pG, {P.S, P.G, P.tab}, nullptr, cw, ch, true);
+        disp("half", P.pO, {P.S, P.tabDev}, &P.out, rw, rh);
+      } else if (cand) disp("green", P.pG, {P.S, P.G, P.tabDev}, nullptr, cw, ch, true);
       else disp("green", P.pG, {P.S, P.G}, nullptr, cw, ch);
       if (hf) {
       } else if (bay) {
         disp("out", P.pO, {P.S, P.G}, &P.out, rw, rh);
       } else if (cand) {
-        disp("chroma", P.pC, {P.S, P.G, P.D, P.tab}, nullptr, cw, ch, true);
-        disp("deriv", P.pH, {P.S, P.G, P.D, P.Hh}, nullptr, cw, ch, true);
+        disp("chroma", P.pC, {P.S, P.G, P.D, P.tabDev}, nullptr, cw, ch, true);
+        disp("deriv", P.pH, {P.S, P.G, P.D, P.Hh, P.tabDev}, nullptr, cw, ch, true);
         disp("select+out", P.pO, {P.S, P.G, P.D, P.Hh}, &P.out, rw, rh, true);
       } else {
         disp("chroma", P.pC, {P.S, P.G, P.D}, nullptr, rw + 2, rh + 2);
@@ -409,7 +416,8 @@ class DeviceBackend final : public GpuBackend {
   // The verdict (docs/engine/pipeline-architecture.md 32.11): GPU node or CPU node, for a whole frame and for a region, by measurement on this device. Probes of
   // 2048 x 1536 (frame) and 1024 x 576 (region) synthetic samples with the file's pattern / matrices, GPU with the read-back the decoder does, CPU on every
   // core; the faster one wins, a tie goes to the CPU (no device work, no read-back). Measured on the first use in the process, cached on disk next to the
-  // other verdicts (build fingerprint + app version + API + device key + pattern); DAPPLE_DEMOSAIC_NODE=gpu|cpu forces one.
+  // other verdicts (build fingerprint + app version + API + device key + pattern); DAPPLE_DEMOSAIC_NODE=gpu|cpu forces one. A rectangle runs on ONE node
+  // (no CPU / GPU row split): with the cached verdict a file exports the same pixels every time on a device.
   bool prefer(const Desc& d, Rect roi, std::string& why) override {
     static const int forced = [] {
       const char* e = std::getenv("DAPPLE_DEMOSAIC_NODE");
@@ -427,26 +435,6 @@ class DeviceBackend final : public GpuBackend {
     const bool gpu = region ? it->second.region : it->second.full;
     if (!gpu) why = std::string("slower than the CPU node here (") + it->second.note + ")";
     return gpu;
-  }
-  double cpuShare(const Desc& d) override {
-    static const bool forced = std::getenv("DAPPLE_DEMOSAIC_NODE") != nullptr;
-    if (d.half) return 0.0;
-    if (const char* e = std::getenv("DAPPLE_DEMOSAIC_SHARE")) {  // "off", or a fixed share (tests)
-      const double v = std::strcmp(e, "off") == 0 ? 0.0 : std::atof(e);
-      return std::clamp(v, 0.0, 0.9);
-    }
-    if (forced) return 0.0;
-    std::lock_guard<std::mutex> lk(mu_);
-    std::string w2;
-    if (!ensure(w2)) return 0.0;
-    const int key = int(d.cfa) * 8 + (d.xtMode >= 1 ? 4 : 0) + (d.hot ? 2 : 0);
-    auto it = verdicts_.find(key);
-    if (it == verdicts_.end()) it = verdicts_.emplace(key, measure(d)).first;
-    const Verdict& v = it->second;
-    if (!v.full || !(v.ms[0] > 0) || !(v.ms[1] > 0)) return 0.0;
-    // the CPU node shares the cores with the GPU runner's submission and read-back threads: count it a quarter slower than its probe
-    const double g = v.ms[0], c = v.ms[1] * 1.25;
-    return std::clamp(g / (g + c), 0.0, 0.5);
   }
   bool trim() override {
     std::lock_guard<std::mutex> lk(mu_);
@@ -501,7 +489,7 @@ class DeviceBackend final : public GpuBackend {
     engine::gpu::cacheConfig(&dir, &app, &fp);
     char key[200];
     const bool hf = d.half && d.cfa == Cfa::XTrans;
-    std::snprintf(key, sizeof key, "%s|%s|%s|%s|%d|%d|%d|%d%s", fp.c_str(), app.c_str(), hal::apiName(dev_->caps().api), dev_->caps().key().c_str(), int(d.cfa), d.xtMode, d.hot ? 1 : 0, 1, hf ? "|half1" : "");
+    std::snprintf(key, sizeof key, "%s|%s|%s|%s|%d|%d|%d|%d%s", fp.c_str(), app.c_str(), hal::apiName(dev_->caps().api), dev_->caps().key().c_str(), int(d.cfa), d.xtMode, d.hot ? 1 : 0, 2, hf ? "|half1" : "");
     if (!dir.empty()) {
       char nm[96];
       std::snprintf(nm, sizeof nm, "demosaic_verdict_%016llx.txt", (unsigned long long)std::hash<std::string>{}(key));
@@ -545,7 +533,7 @@ class DeviceBackend final : public GpuBackend {
           if (gpu_->run(p, all, out.data(), std::size_t(all.w()) * 3, tile_) != hal::Status::Ok) { g = 1e30; break; }
           g = std::min(g, ms(t0));
         }
-      for (int rep = 0; rep < (k == 0 ? 1 : 2); ++rep) {
+      for (int rep = 0; rep < 2; ++rep) {  // the best of two: the first run also pays the first touch of the per-thread planes
         const auto t0 = Ck::now();
         demosaic(p, all, out.data(), std::size_t(all.w()) * 3, 0);
         c = std::min(c, ms(t0));

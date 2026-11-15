@@ -68,6 +68,18 @@ const HalfTables& halfTables(const Desc& d);
 void demosaicHalf(const Desc& d, Rect roi, float* out, std::size_t strideFloats, int threads = 0);  // CPU node of the half-resolution path (demosaic() calls it when d.half)
 constexpr float kHalfClip = 0.995f;  // scaled value from which a sample counts as clipped (clip fallback of the half-resolution path)
 
+// The colour-difference taps of the X-Trans candidate path (xtMode >= 1), per phase, direction (H, V, D1, D2) and colour (red, blue): the samples of that
+// colour within one pixel of the line along the direction (r^2 <= 10), row-major, with the base weight 1 / (r^2 (1 + perp^2)); and the own-colour samples
+// along the direction for the Laplacian. The CPU node and the GPU kernel (demosaic_gpu.cpp builds its table from this) use the same lists.
+struct XtTaps {
+  struct Tap { std::int8_t u, v; float gw; };
+  Tap t[36][4][2][12];
+  std::int8_t n[36][4][2];
+  std::int8_t lap[36][4][6];
+  std::int8_t nlap[36][4];
+  explicit XtTaps(const Desc& d);
+};
+
 constexpr int kHaloBayer = 4, kHaloXTrans = 6, kHaloXTransCand = 9;
 inline int halo(Cfa c) { return c == Cfa::Bayer ? kHaloBayer : kHaloXTrans; }
 constexpr int kHotMargin = 3;
