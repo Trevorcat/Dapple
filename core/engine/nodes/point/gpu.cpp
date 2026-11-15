@@ -86,4 +86,94 @@ bool recordPoint(GpuRecorder& r, const PointNode& n, H D) {
   return true;
 }
 
+// ---- GpuImpls (engine/nodes/node_list.inc) ---------------------------------------------------------------------------------------------
+namespace {
+
+PointNode pointNode(const GpuJob& j, const Epilogue& ep) {
+  PointNode pn{j.frame, j.src, j.lut, j.W, j.Hh, j.ox, j.oy, ep};
+  pn.ldesc = j.ldesc;
+  pn.lplanes = j.lplanes;
+  return pn;
+}
+
+// the point recipe: one pass for [Resize | Geometry] + Gain + Hdr + LocalLinear + ToneColour(Exact) + Vignette (+ the epilogue)
+H groupPoint(GpuRecorder& r, const GroupCall& c) {
+  PointNode pn = pointNode(c.job, c.ep);
+  pn.aux0 = c.job.aux0;
+  pn.aux1 = c.job.aux1;
+  pn.vig = &c.job.blocks->vignette;
+  return recordPoint(r, pn, c.D) ? c.D : -1;
+}
+
+// the film finish: the film plane -> display stages (curves, look LUT) -> blend with the normal branch (when a Blend is in the group: Gain +
+// ToneColour through the lattice, no vignette, the same local adjustments) -> vignette -> clamp -> D (or the epilogue + RGBA8 when last)
+H groupDisplay(GpuRecorder& r, const GroupCall& c) {
+  const GpuJob& j = c.job;
+  const point::Blocks& P = *j.frame;
+  if (j.film < 0) return r.err = "display stages without a film plane", -1;
+  if (j.disp.curves < 0 || j.disp.lut < 0) return r.err = "film display resources missing", -1;
+  bool blend = false;
+  for (NodeType t : c.nodes) blend |= t == NodeType::Blend;
+  H M = -1;
+  if (blend) {
+    if (j.lut.n < 2) return r.err = "film blend without a colour lattice", -1;
+    M = r.tr(kF16, j.W, j.Hh);
+    if (!recordPoint(r, pointNode(j, Epilogue{}), M)) return -1;
+  }
+  if (j.filmClamped && !blend && !c.ep.last && j.filmOx == 0 && j.filmOy == 0) return j.film;  // film_fin would only clamp: film_pd did it
+  struct U {
+    std::int32_t a[4];
+    float geoB[4], geoC[4], e[4];
+    std::int32_t f[4];
+    float g[4], dmin[4], dmax[4];
+  } u{};
+  u.a[0] = j.W;
+  u.a[1] = j.Hh;
+  u.a[2] = j.ox;
+  u.a[3] = j.oy;
+  u.geoB[0] = P.geo.ox0;
+  u.geoB[1] = P.geo.oy0;
+  u.geoB[2] = P.geo.stepX;
+  u.geoB[3] = P.geo.stepY;
+  u.geoC[0] = P.geo.fullW;
+  u.geoC[1] = P.geo.fullH;
+  u.geoC[2] = j.blocks->vignette.amount;
+  u.e[0] = c.ep.amp;
+  u.e[1] = c.ep.period;
+  const DisplayBind& d = j.disp;
+  const bool dispOn = d.curveMask != 0 || d.lutN > 0;
+  u.f[0] = j.filmOx;
+  u.f[1] = j.filmOy;
+  u.f[2] = dispOn ? int(d.curveMask) : 0;
+  u.f[3] = dispOn ? d.lutN : 0;
+  u.g[0] = j.strength;
+  u.g[1] = dispOn ? d.lutMix : 0.f;
+  u.g[2] = dispOn ? float(d.curveSamples) : 0.f;
+  for (int k = 0; k < 3; ++k) {
+    u.dmin[k] = d.domMin[k];
+    u.dmax[k] = d.domMax[k];
+  }
+  const hal::PipelineH p = r.pl("film_fin", {{10, c.ep.last ? 1 : 0}, {11, c.ep.last && c.ep.grain ? 1 : 0}, {12, blend ? 1 : 0}, {13, dispOn ? 1 : 0}});
+  if (!p) return -1;
+  r.g.dispatch("film_fin", p,
+               {GpuGraph::R(j.film), GpuGraph::W(c.D), c.ep.last ? GpuGraph::W(c.ep.out8) : GpuGraph::R(r.dummy(kU8)), GpuGraph::R(blend ? M : r.dummy(kF16)),
+                GpuGraph::R(d.curves), GpuGraph::R(d.lut)},
+               r.gx(j.W), r.gy(j.Hh), &u, sizeof u);
+  return c.D;
+}
+
+const char* const kPoint[] = {"point", "point_local"};
+const char* const kDisplay[] = {"film_fin", "point"};
+const GpuImpl kPointImpl{kPoint, groupPoint, nullptr, nullptr, false, 1};
+const GpuImpl kToneColourImpl{kPoint, groupPoint, nullptr, nullptr, false, 1, false, false, true};
+const GpuImpl kDisplayImpl{kDisplay, groupDisplay, nullptr, nullptr, false, 2};
+const GpuImpl kEpilogueImpl{{}, nullptr, nullptr, nullptr, false, 0, true};
+
+}  // namespace
+
+const GpuImpl* pointGpu() { return &kPointImpl; }
+const GpuImpl* toneColourGpu() { return &kToneColourImpl; }
+const GpuImpl* displayGpu() { return &kDisplayImpl; }
+const GpuImpl* epilogueGpu() { return &kEpilogueImpl; }
+
 }  // namespace dapple::engine::gpu

@@ -62,4 +62,14 @@ bool recordConvert(GpuRecorder& r, hal::BufferH staging, H dst, int w, int h, in
   return true;
 }
 
+// ---- GpuImpl (engine/nodes/node_list.inc): a head node; the resized source is recorded by the executor (recordResize) and the head's
+// pass is the point recipe ---------------------------------------------------------------------------------------------------------------
+namespace {
+const char* const kResize[] = {"resize", "convert", "point"};
+}  // namespace
+const GpuImpl* resizeGpu() {
+  static const GpuImpl impl{kResize, pointGpu()->group, nullptr, nullptr, false, 1};
+  return &impl;
+}
+
 }  // namespace dapple::engine::gpu

@@ -193,7 +193,10 @@ void testRegistry() {
     if (!used.bits.test(k) && P.info(ParamKey(k)).name != "ctx.activeParam") unused += P.info(ParamKey(k)).name + " ";
   std::printf("  %zu ParamKeys (%zu sliders), %d node types; keys no node declares: %s\n", P.size(), paramFields().size(),
               kNodeTypeCount, unused.empty() ? "(none)" : unused.c_str());
-  CHECK(unused.empty() || unused == "lutPath ");  // lutPath is covered by ctx.lutIdentity (the loaded LUT)
+  // Keys no node declares itself, each covered elsewhere: lutPath by ctx.lutIdentity (the loaded LUT); film_shoot / film_print / film_latitude
+  // by ctx.filmKeyEv / ctx.filmPrintEv (the C layer's film match resolves them); ctx.wantAnalysis / ctx.exact / ctx.wantOverflow select the
+  // wiring (which nodes exist), not what a node computes. (The deleted AssembledBake super-node declared every key.)
+  CHECK(unused == "film_shoot film_print film_latitude lutPath ctx.wantAnalysis ctx.exact ctx.wantOverflow ");
   // ParamSet hashing: equal inputs -> equal hashes, a change moves exactly that key
   const ParamSet a = ParamSet::make(inputs(edit0(), false, false));
   const ParamSet b = ParamSet::make(inputs(edit0(), false, false));
@@ -213,10 +216,14 @@ void testRegistry() {
 
 void testValidate() {
   const NodeRegistry& N = NodeRegistry::instance();
+  auto displayChain = [](Graph& g, NodeId src) {  // Source -> Resize -> Gain -> ToneColourExact: a display-referred image
+    const NodeId r = g.add(NodeType::Resize, {Edge{src}});
+    return g.add(NodeType::ToneColourExact, {Edge{g.add(NodeType::Gain, {Edge{r}})}});
+  };
   {
     Graph g;
     const NodeId s = g.add(NodeType::Source);
-    const NodeId r = g.add(NodeType::AssembledBake, {Edge{s}});
+    const NodeId r = g.add(NodeType::Pack8, {Edge{displayChain(g, s)}});
     g.markOutput(r, OutputRole::Frame);
     CHECK(g.validate(N).ok);
   }
@@ -224,24 +231,41 @@ void testValidate() {
     Graph g;
     const NodeId s = g.add(NodeType::Source);
     g.add(NodeType::ColourLattice);
-    const NodeId r = g.add(NodeType::AssembledBake, {Edge{s}});
+    const NodeId r = g.add(NodeType::Pack8, {Edge{displayChain(g, s)}});
     g.markOutput(r, OutputRole::Frame);
     const auto v = g.validate(N);
     CHECK(!v.ok && v.error.find("dead node") != std::string::npos);
   }
   {  // wrong input count
     Graph g;
-    const NodeId r = g.add(NodeType::AssembledBake);
+    const NodeId r = g.add(NodeType::Pack8);
     g.markOutput(r, OutputRole::Frame);
     CHECK(!g.validate(N).ok);
   }
   {  // domain: a Table where an Image is required
     Graph g;
     const NodeId l = g.add(NodeType::ColourLattice);
-    const NodeId r = g.add(NodeType::AssembledBake, {Edge{l}});
+    const NodeId r = g.add(NodeType::Pack8, {Edge{l}});
     g.markOutput(r, OutputRole::Frame);
     const auto v = g.validate(N);
     CHECK(!v.ok && v.error.find("domain") != std::string::npos);
+  }
+  {  // colour space: scene-linear pixels where display-encoded ones are required (Gain straight into the 8-bit pack)
+    Graph g;
+    const NodeId s = g.add(NodeType::Source);
+    const NodeId gain = g.add(NodeType::Gain, {Edge{g.add(NodeType::Resize, {Edge{s}})}});
+    const NodeId r = g.add(NodeType::Pack8, {Edge{gain}});
+    g.markOutput(r, OutputRole::Frame);
+    const auto v = g.validate(N);
+    CHECK(!v.ok && v.error.find("colour space") != std::string::npos);
+  }
+  {  // a pass-through node carries its input's space: Vignette after Gain is still scene-linear and the pack refuses it
+    Graph g;
+    const NodeId s = g.add(NodeType::Source);
+    const NodeId gain = g.add(NodeType::Gain, {Edge{g.add(NodeType::Resize, {Edge{s}})}});
+    const NodeId v0 = g.add(NodeType::Vignette, {Edge{gain}});
+    g.markOutput(g.add(NodeType::Pack8, {Edge{v0}}), OutputRole::Frame);
+    CHECK(!g.validate(N).ok);
   }
   {  // cycle / order
     Graph g;
@@ -261,11 +285,12 @@ void testValidate() {
   EditParams e2 = edit0();
   e2.exposure = 1.2f;
   const ParamSet b = ParamSet::make(inputs(e2, true, true, true));
-  CHECK(GraphBuilder::build(a).structureHash() == GraphBuilder::build(b).structureHash());
+  const FrameView none;
+  CHECK(GraphBuilder::build(a, none).structureHash() == GraphBuilder::build(b, none).structureHash());
   EditParams e3 = edit0();
   e3.toneStrength = 50.f;
   const ParamSet c = ParamSet::make(inputs(e3, true, true, true));
-  CHECK(GraphBuilder::build(a).structureHash() != GraphBuilder::build(c).structureHash());
+  CHECK(GraphBuilder::build(a, none).structureHash() != GraphBuilder::build(c, none).structureHash());
 }
 
 // ---- graph snapshots --------------------------------------------------------------------------------------------------------
@@ -367,14 +392,14 @@ std::string snapshotText(bool haveFilm) {
     const ParamSet ps = ParamSet::make(s.in);
     const point::Blocks plan = planFor(ps);
     const FrameBlocks fb = blocksFor(ps, plan);
-    for (GraphDetail d : {GraphDetail::Tables, GraphDetail::Full}) {
-      Graph g = GraphBuilder::build(ps, d, &plan, &fb);
+    {
+      Graph g = GraphBuilder::build(ps, FrameView{&plan, &fb});
       const auto v = g.validate();
       if (!v.ok) {
-        std::printf("  scenario %s (%s) invalid: %s\n", s.name.c_str(), d == GraphDetail::Full ? "full" : "tables", v.error.c_str());
+        std::printf("  scenario %s invalid: %s\n", s.name.c_str(), v.error.c_str());
         ++g_failures;
       }
-      out += "== " + s.name + (d == GraphDetail::Full ? " [full]\n" : " [tables]\n") + g.dump(false);
+      out += "== " + s.name + "\n" + g.dump(false);
     }
   }
   return out;
@@ -461,15 +486,15 @@ void testKeys() {
     const ParamSet base = ParamSet::make(s.in);
     const point::Blocks plan = planFor(base);
     const FrameBlocks fb = blocksFor(base, plan);
-    for (GraphDetail d : {GraphDetail::Tables, GraphDetail::Full}) {
-      Graph g0 = GraphBuilder::build(base, d, &plan, &fb);
+    {
+      Graph g0 = GraphBuilder::build(base, FrameView{&plan, &fb});
       g0.computeKeys(base);
       for (std::size_t k = 0; k < P.size(); ++k)
         for (int variant = 0; variant < 2; ++variant) {
           ParamInputs in2 = s.in;
           if (!P.perturb(ParamKey(k), in2, variant)) continue;
           const ParamSet ps2 = ParamSet::make(in2);
-          Graph g1 = GraphBuilder::build(ps2, d, &plan, &fb);
+          Graph g1 = GraphBuilder::build(ps2, FrameView{&plan, &fb});
           g1.computeKeys(ps2);
           if (ps2.hash(ParamKey(k)) == base.hash(ParamKey(k))) continue;  // value did not actually change
           ParamMask moved;  // the key itself and every derived key that moved with it (film flags, quality)
@@ -542,7 +567,7 @@ TableRun runTables(const ParamInputs& in0, const NodeRegistry& reg, const Source
   in.ctx.lutIdentity = lut ? std::uintptr_t(lut->contentId()) : 0;
   in.ctx.cameraId = cam.id;
   const ParamSet ps = ParamSet::make(in);
-  Graph g = GraphBuilder::build(ps, GraphDetail::Tables);
+  Graph g = GraphBuilder::build(ps, FrameView{});  // the table nodes do not depend on the frame's blocks
   g.computeKeys(ps, reg);
   const int n = std::clamp(ps.frame().bakeSize, 17, 65);
   const TableKeys tk = effectiveTableKeys(g, ps, n);
@@ -734,38 +759,64 @@ void testConformance() { conformanceImpl({}); }
 // controls: in the default run
 void testConformanceSmall() { conformanceImpl({"tone_move_exact", "modern_fast"}); }
 
-// ---- ResultCache ---------------------------------------------------------------------------------------------------------------
+// ---- ResultCache: byte budget, LRU weighted by cost, slots, device bytes -------------------------------------------------------------
 void testCache() {
-  ResultCache c;
-  c.setLimit(NodeType::ToneTable, 2);
-  auto put = [&](NodeType t, std::uint64_t key, std::uint64_t fam, int order) {
+  ResultCache c(ResultCache::Limits{3000, 2000});
+  auto put = [&](CacheSlot slot, std::uint64_t key, std::uint64_t fam, int order, std::size_t host, std::size_t device = 0, double costMs = 0) {
     ResultCache::Entry e;
+    e.slot = slot;
     e.key = {key, 1};
     e.family = {fam, 2};
     e.order = order;
     e.payload = std::make_shared<int>(int(key));
-    e.bytes = 4;
-    c.put(t, std::move(e));
+    e.hostBytes = host;
+    e.deviceBytes = device;
+    e.costMs = costMs;
+    c.put(std::move(e));
   };
-  put(NodeType::ToneTable, 1, 1, 0);
-  put(NodeType::ToneTable, 2, 2, 0);
-  put(NodeType::ToneTable, 3, 3, 0);  // evicts 1 (FIFO)
-  CHECK(!c.find(NodeType::ToneTable, {1, 1}));
-  CHECK(c.find(NodeType::ToneTable, {2, 1}));
-  CHECK(c.find(NodeType::ToneTable, {3, 1}));
-  put(NodeType::ColourLattice, 10, 7, 41);
-  put(NodeType::ColourLattice, 11, 7, 57);
-  put(NodeType::ColourLattice, 12, 8, 65);
+  const CacheSlot tone = slotOf(NodeType::ToneTable), lat = slotOf(NodeType::ColourLattice);
+  put(tone, 1, 1, 0, 1000);
+  put(tone, 2, 2, 0, 1000);
+  CHECK(c.find(tone, {1, 1}));       // 1 is now the most recently used
+  put(tone, 3, 3, 0, 1000);           // 3000 bytes: at the budget
+  put(tone, 4, 4, 0, 1000);           // over it: the least recently used (2) goes
+  CHECK(!c.contains(tone, {2, 1}));
+  CHECK(c.contains(tone, {1, 1}) && c.contains(tone, {3, 1}) && c.contains(tone, {4, 1}));
+  CHECK(c.hostBytes() == 3000);
+  CHECK(c.stats(tone).evictions == 1);
+  // cost weighs against recency: an expensive entry outlives cheaper, more recent ones
+  c.clear();
+  put(tone, 10, 10, 0, 1000, 0, 500.0);  // 500 ms to make
+  put(tone, 11, 11, 0, 1000);
+  put(tone, 12, 12, 0, 1000);
+  put(tone, 13, 13, 0, 1000);
+  CHECK(c.contains(tone, {10, 1}) && !c.contains(tone, {11, 1}));
+  // device bytes have their own budget; host entries are not evicted for them
+  c.clear();
+  put(slotOf(NodeType::Dehaze, true), 20, 20, 0, 0, 1500);
+  put(tone, 21, 21, 0, 1000);
+  put(slotOf(NodeType::Detail, true), 22, 22, 0, 0, 1500);  // over the device budget: the older device entry goes
+  CHECK(!c.contains(slotOf(NodeType::Dehaze, true), {20, 1}) && c.contains(slotOf(NodeType::Detail, true), {22, 1}) && c.contains(tone, {21, 1}));
+  CHECK(c.deviceBytes() == 1500 && c.hostBytes() == 1000);
+  // an entry larger than the budget stays (never the one being inserted), alone
+  put(tone, 30, 30, 0, 5000);
+  CHECK(c.contains(tone, {30, 1}) && !c.contains(tone, {21, 1}));
+  // family lookups (a finer lattice serves a coarser request), payloads outlive eviction
+  c.setLimits(ResultCache::Limits{0, 0});
+  put(lat, 40, 7, 41, 10);
+  put(lat, 41, 7, 57, 10);
+  put(lat, 42, 8, 65, 10);
   const Hash128 fam7{7, 2};
-  auto* e = c.findBest(NodeType::ColourLattice, fam7, 41);
-  CHECK(e && e->order == 57);                                      // the finest at least as fine as asked
-  CHECK(c.findBest(NodeType::ColourLattice, fam7, 49)->order == 57);
-  CHECK(!c.findBest(NodeType::ColourLattice, fam7, 58));           // none fine enough
-  CHECK(!c.findBest(NodeType::ColourLattice, {9, 2}, 17));         // other family
-  c.eraseIf(NodeType::ColourLattice, [](const ResultCache::Entry& x) { return x.family.a == 7; });
-  CHECK(c.entries(NodeType::ColourLattice).size() == 1);
-  CHECK(c.stats(NodeType::ToneTable).evictions == 1);
-  std::printf("  cache ok\n");
+  const ResultCache::Hit h = c.findBest(lat, fam7, 41);
+  CHECK(h && h.order == 57);  // the finest at least as fine as asked
+  CHECK(c.findBest(lat, fam7, 49).order == 57);
+  CHECK(!c.findBest(lat, fam7, 58));        // none fine enough
+  CHECK(!c.findBest(lat, {9, 2}, 17));      // other family
+  CHECK(c.containsFamily(lat, fam7));
+  c.eraseIf([&](const ResultCache::Entry& x) { return x.slot == lat && x.family.a == 7; });
+  CHECK(c.entries(lat).size() == 1);
+  CHECK(h.as<int>() && *h.as<int>() == 41);  // the hit still holds its payload
+  std::printf("  cache ok (byte budget, cost-weighted LRU, device budget, families)\n");
 }
 
 // ---- lattice reuse on the edit-bench drag sequences (gate of step a3) --------------------------------------------------------------------
@@ -864,9 +915,12 @@ void reuseImpl(bool smallRun) {
     if (seq[i].label.substr(seq[i].label.find('/') + 1) == "0") continue;
     const char k = a.kinds[i];
     if (name.find("clarity") != std::string::npos || name.find("unchanged") != std::string::npos || name.find("exact") != std::string::npos) CHECK(k == 'H');
-    else if (name.find("exposure") != std::string::npos) CHECK(k == 'R');
+    // the first exposure drag rebuilds the tone table; a later one over the same values finds those bakes still cached (byte budget, not three slots)
+    else if (name.find("i1080_exposure") != std::string::npos) CHECK(k == 'R');
+    else if (name.find("exposure") != std::string::npos) CHECK(k == 'R' || k == 'H');
     else if (name.find("saturation") != std::string::npos) CHECK(k == 'B');
-    if (k != (name.find("clarity") != std::string::npos || name.find("unchanged") != std::string::npos || name.find("exact") != std::string::npos ? 'H' : name.find("exposure") != std::string::npos ? 'R' : 'B'))
+    const bool hitOk = k == 'H' && name.find("exposure") != std::string::npos;
+    if (!hitOk && k != (name.find("clarity") != std::string::npos || name.find("unchanged") != std::string::npos || name.find("exact") != std::string::npos ? 'H' : name.find("exposure") != std::string::npos ? 'R' : 'B'))
       std::printf("  frame %s: kind %c\n", seq[i].label.c_str(), k);
   }
   {  // per frame-type medians (ms), 1600x1067 synthetic source; informational, the gate-P numbers come from edit-bench on a RAW
@@ -898,23 +952,28 @@ void testOverhead() {
     le.key = {std::uint64_t(i + 1), 9};
     le.family = {std::uint64_t(i + 1), 8};
     le.order = 57;
-    cache.put(NodeType::ColourLattice, le);
-    cache.put(NodeType::AssembledBake, le);
+    le.slot = slotOf(NodeType::ColourLattice);
+    cache.put(le);
+    le.slot = kBakeSlot;
+    cache.put(le);
   }
   volatile std::uint64_t sink = 0;
-  auto frame = [&](GraphDetail detail) {
+  const ParamSet psv = ParamSet::make(in);
+  const point::Blocks plan = planFor(psv);
+  const FrameBlocks fb = blocksFor(psv, plan);
+  auto frame = [&](bool withBlocks) {
     const ParamSet ps = ParamSet::make(in);
-    Graph g = GraphBuilder::build(ps, detail);
+    Graph g = GraphBuilder::build(ps, withBlocks ? FrameView{&plan, &fb} : FrameView{});
     const ValidationResult v = g.validate();
     g.computeKeys(ps);
     const TableKeys tk = effectiveTableKeys(g, ps, 57);
     const NodeInstance* lat = g.find(NodeType::ColourLattice);
-    cache.findBest(NodeType::ColourLattice, lat->family, 57);
-    cache.find(NodeType::AssembledBake, tk.tone);
-    cache.find(NodeType::Analysis, tk.analysis);
+    cache.findBest(slotOf(NodeType::ColourLattice), lat->family, 57);
+    cache.find(kBakeSlot, tk.tone);
+    cache.find(slotOf(NodeType::Analysis), tk.analysis);
     sink = sink + (v.ok ? 1 : 0) + tk.tone.a;
   };
-  auto measure = [&](GraphDetail d) {
+  auto measure = [&](bool d) {
     double best = 1e9;
     for (int round = 0; round < 7; ++round) {
       const int N = 4000;
@@ -924,8 +983,8 @@ void testOverhead() {
     }
     return best;
   };
-  const double legacyUs = measure(GraphDetail::Tables);
-  const double fullUs = measure(GraphDetail::Full);
+  const double legacyUs = measure(false);  // the frame graph without blocks (no optional node wired)
+  const double fullUs = measure(true);     // with the frame's blocks (every optional node of this edit wired)
   // the old keys
   SourceImage proxy = makeScene(64, 43, true);
   engine::point::Params r = engine::point::resolve(e, camA(), nullptr);
@@ -950,8 +1009,8 @@ void testOverhead() {
   };
   const double makeUs = stage([&] { sink = sink + ParamSet::make(in).hash(0).a; });
   const ParamSet ps0 = ParamSet::make(in);
-  const double buildUs = stage([&] { sink = sink + GraphBuilder::build(ps0, GraphDetail::Tables).nodes().size(); });
-  Graph g0 = GraphBuilder::build(ps0, GraphDetail::Tables);
+  const double buildUs = stage([&] { sink = sink + GraphBuilder::build(ps0, FrameView{&plan, &fb}).nodes().size(); });
+  Graph g0 = GraphBuilder::build(ps0, FrameView{&plan, &fb});
   const double valUs = stage([&] { sink = sink + g0.validate().ok; });
   const double keyUs = stage([&] { g0.computeKeys(ps0); sink = sink + g0.nodes().back().key.a; });
   const double budgetUs = 200.0 * 0.14;  // 0.2 ms on the low-end profile, host runs ~1/0.14 faster (risk 8)

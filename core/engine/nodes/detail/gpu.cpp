@@ -79,4 +79,20 @@ bool recordDetail(GpuRecorder& r, const DetailNode& n, H D) {
   return true;
 }
 
+// ---- GpuImpl (engine/nodes/node_list.inc) ----------------------------------------------------------------------------------------------
+namespace {
+H node(GpuRecorder& r, const NodeCall& c) {
+  const GpuJob& j = c.job;
+  const engine::detail::Block& b = *static_cast<const engine::detail::Block*>(c.block);
+  if (b.solve() && c.solved < 0) return r.err = "clarity solve missing from the plan", -1;
+  return recordDetail(r, DetailNode{&b, j.W, j.Hh, j.ox, j.oy, j.gridW, j.gridH, b.solve() ? c.solved : -1, c.ep}, c.D) ? c.D : -1;
+}
+H solve(GpuRecorder& r, const void* block, H grid, int gw, int gh) {
+  return recordClarityAnalysis(r, static_cast<const engine::detail::Block*>(block)->guidedRadius, grid, gw, gh);
+}
+const char* const kDetail[] = {"down", "gf_ab", "sep_c", "sep_c_s", "sep_d2y", "sep_d2y_s", "sep_y", "sep_y_s", "sep_y_v", "bx_d2y", "bx_y", "bx_y_v", "detail"};
+const GpuImpl kImpl{kDetail, nullptr, node, solve, true};  // the guided-filter coefficients (RGBA32F)
+}  // namespace
+const GpuImpl* detailGpu() { return &kImpl; }
+
 }  // namespace dapple::engine::gpu

@@ -18,5 +18,6 @@ struct Block {
 Block resolve(const EditParams& p, const FrameFacts& f);
 const NodeBehaviour& behaviour();
 const CpuImpl& cpu();
+NodeDesc desc();  // registered in engine/nodes/node_list.inc
 
 }  // namespace dapple::engine::vignette

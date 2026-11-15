@@ -6,8 +6,8 @@
 //        IGpuExecutor::run(GpuRun)     <- Vulkan, or GLES 3.1 when no Vulkan device passed its self-test
 //        CpuExecutor::run              <- the last resort, and the reference
 //
-// Selection and the failure semantics of docs/engine/pipeline-architecture.md 5.9 live in the session (engine_session.cpp);
-// the executor only reports what happened (Status + GpuFailure). The provider is installed by the GPU library
+// Selection and the failure semantics of docs/engine/pipeline-architecture.md 5.9 live in the session (exec/gpu_dispatch.cpp);
+// the executor only reports what happened: Status, the failure class (GpuFailure) and its typed cause (GpuReason). The provider is installed by the GPU library
 // (gpu::installProvider(), called by the C API in a build with DAPPLE_GPU and by the GPU tests).
 #include <atomic>
 #include <cstdint>
@@ -35,6 +35,35 @@ class ResultCache;
 //   DeviceLost   the device is gone: rebuild once (re-upload from SourceStore + tables), second loss -> next API / CPU
 enum class GpuFailure : std::uint8_t { None, Unsupported, Transient, DeviceLost };
 
+// Why a run failed (typed end to end: the executor sets it, the session counts and reports it; GpuOut::error only adds detail).
+enum class GpuReason : std::uint8_t {
+  None,
+  Cancelled,
+  Injected,           // test seam (injectFailure)
+  // the CPU takes the frame, the GPU stays in use
+  PlanUnsupported,    // Plan::unsupported
+  NodeWithoutGpu,     // a node of the plan has no GpuImpl
+  FrameUnsupported,   // the point blocks say the GPU cannot render this frame (point::Blocks::why)
+  FrameTooLarge,      // frame / film frame outside the device limits or memory
+  SourceTooLarge,     // no resident copy of the source fits
+  LatticeUnusable,    // the bake has no colour lattice / tone table of the backend's shape
+  LookLutTooLarge,    // look LUT beyond the 3D image limit
+  FilmUnavailable,    // film library / stock / paper / tables not available
+  FilmEffect,         // an effect the GPU film does not port (the recorder flagged it)
+  FilmEnlargerTiled,  // tiled export of a film with the enlarger diffusion filter (a whole-frame blur)
+  FilmTiledLocal,     // tiled film export with local detail ops
+  FilmNotResident,    // film export without a resident source
+  NoSink,             // tiled export without a tile sink
+  SinkAborted,        // the tile sink returned false
+  // transient: the CPU takes the frame, the device copies are released
+  OutOfMemory,
+  DeviceError,        // a failed submission / wait / allocation (hal::Status)
+  Recording,          // a record function failed
+  // the device is gone
+  DeviceLost,
+};
+const char* gpuReasonName(GpuReason r);
+
 // Latest-wins cancellation (5.8), same contract as CancelToken (cpu_executor.h): polled between tiles and sweeps.
 struct GpuCancel {
   const std::atomic<std::uint64_t>* current = nullptr;
@@ -60,6 +89,7 @@ struct GpuTarget {
 struct GpuRun {
   const Plan& plan;
   const Graph& graph;
+  ResultCache& cache;           // the session's cache: the executor keeps its device copies (tables, solves, buffers) in its device slots
   const point::Blocks& frame;   // the point family's blocks (geometry, warp, gain, HDR, film glue) for the source size the plan was made for
   const FrameBlocks& blocks;    // resolved blocks of the families that resolve their own parameters (engine/nodes/frame_blocks.h)
   SourceStore& store;           // full-resolution source; the Resize node scales it to frame.geo.srcW x frame.geo.srcH
@@ -75,7 +105,8 @@ struct GpuOut {
   std::uint8_t* rgba = nullptr;  // malloc()ed, caller free()s (readback target, Whole mode)
   int w = 0, h = 0;
   GpuFailure failure = GpuFailure::None;
-  std::string error;
+  GpuReason reason = GpuReason::None;
+  std::string error;            // detail for logs / FrameResult::why
   GpuStats stats;
 };
 
@@ -89,11 +120,9 @@ class IGpuExecutor {
   virtual Status run(const GpuRun& run, GpuOut& out) = 0;
   // Test seam: the next `count` runs fail with this classification before touching the device.
   virtual void injectFailure(GpuFailure f, int count) = 0;
-  // Releases the device copies (resident source, lattices) of this session.
+  // Releases the device copies of this session that the executor holds itself (resident source, film tables, display); the session drops
+  // the device slots of its cache.
   virtual void release() = 0;
-  // The frame-global solves (Dehaze / Detail node keys) this executor keeps on the device: pass it to Planner::plan so that a frame whose solve is
-  // still there is planned without the accumulation sweep and the solve. Null: the executor keeps none.
-  virtual const ResultCache* solveCache() const { return nullptr; }
 };
 
 // Process-wide device selection (Vulkan -> GLES 3.1 -> CPU), created by the GPU library.

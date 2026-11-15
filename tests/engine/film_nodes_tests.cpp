@@ -154,7 +154,7 @@ ef::FilmResolved resolvedFor(const EditParams& e, int w, int h, int quality, boo
   in.ctx.fullLongEdge = fullLongEdge;
   in.ctx.frameIndex = frameIndex;
   const ParamSet ps = ParamSet::make(in);
-  FrameGeom g;
+  ef::FrameGeom g;
   g.w = w;
   g.h = h;
   ef::FilmResolved r;
@@ -396,7 +396,7 @@ struct PlaneBuf {
 Fingerprints runNodes(const ParamInputs& in, int W, int H, const ImageF& src) {
   Fingerprints F;
   const ParamSet ps = ParamSet::make(in);
-  FrameGeom g;
+  ef::FrameGeom g;
   g.w = W;
   g.h = H;
   ef::FilmResolved r;
@@ -543,7 +543,7 @@ int conformance(const NodeRegistry& reg, bool verbose, int quality, bool keepGra
   if (keepGrain) base.frame.activeParam = "film_grain";
   // the graph of this frame (FullFilm)
   ParamSet ps0 = ParamSet::make(base);
-  Graph g = GraphBuilder::build(ps0, GraphDetail::FullFilm);
+  Graph g = GraphBuilder::build(ps0, FrameView{});
   g.computeKeys(ps0, reg);
   const Fingerprints f0 = runNodes(base, W, H, src);
   const NodeType nodes[] = {NodeType::FilmTableRaw,     NodeType::FilmTableCurves, NodeType::FilmTablePrintScan, NodeType::FilmExposure,
@@ -636,7 +636,7 @@ void testGraph() {
   e.filmStock = "kodak_portra_400";
   ParamInputs in = inputsFor(e, 640, 427, 2, library().get());
   const ParamSet ps = ParamSet::make(in);
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm);
+  Graph g = GraphBuilder::build(ps, FrameView{});
   const ValidationResult v = g.validate();
   CHECK(v.ok);
   if (!v.ok) std::printf("  invalid: %s\n", v.error.c_str());
@@ -648,7 +648,8 @@ void testGraph() {
                      NodeType::FilmPrintExposure, NodeType::FilmEnlargerBlur, NodeType::FilmPrintScan, NodeType::FilmGlare,
                      NodeType::FilmScan}) {
     CHECK(g.find(t) != nullptr);
-    CHECK(N.desc(t).cpuImpl);
+    CHECK(N.desc(t).cpu == &ef::cpuImpl(t));  // the descriptor registers the family's implementation
+    CHECK(N.desc(t).output == Domain::Table || N.desc(t).fusion == Fusion::Film);
     CHECK(ef::isFilmNode(t));
     const bool table = N.desc(t).output == Domain::Table;
     CHECK(table ? (ef::cpuImpl(t).bake != nullptr) : (ef::cpuImpl(t).run != nullptr));
@@ -657,7 +658,7 @@ void testGraph() {
   EditParams e2 = e;
   e2.filmWarmth = 30.f;
   const ParamSet ps2 = ParamSet::make(inputsFor(e2, 640, 427, 2, library().get()));
-  Graph g2 = GraphBuilder::build(ps2, GraphDetail::FullFilm);
+  Graph g2 = GraphBuilder::build(ps2, FrameView{});
   g2.computeKeys(ps2);
   std::string moved;
   for (const NodeInstance& n : g.nodes()) {
@@ -673,7 +674,7 @@ void testGraph() {
   EditParams e3 = e;
   e3.filmGrain = 40.f;
   const ParamSet ps3 = ParamSet::make(inputsFor(e3, 640, 427, 2, library().get()));
-  Graph g3 = GraphBuilder::build(ps3, GraphDetail::FullFilm);
+  Graph g3 = GraphBuilder::build(ps3, FrameView{});
   g3.computeKeys(ps3);
   moved.clear();
   for (const NodeInstance& n : g.nodes())
@@ -686,7 +687,7 @@ void testGraph() {
   EditParams e4 = e;
   e4.filmHalation = 40.f;
   const ParamSet ps4 = ParamSet::make(inputsFor(e4, 640, 427, 2, library().get()));
-  Graph g4 = GraphBuilder::build(ps4, GraphDetail::FullFilm);
+  Graph g4 = GraphBuilder::build(ps4, FrameView{});
   g4.computeKeys(ps4);
   moved.clear();
   for (const NodeInstance& n : g.nodes())

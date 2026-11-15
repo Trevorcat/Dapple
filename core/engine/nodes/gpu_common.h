@@ -1,17 +1,19 @@
 #pragma once
-// Shared pieces of the GPU node implementations (step b2): the recorder the node `record` functions append to, resolved
-// parameter blocks of the point family (point::Blocks) and the other families, and the separable filter helpers (box / weight table /
-// minimum, with an O(1)-per-pixel running-sum box for larger radii).
+// Shared pieces of the GPU node implementations: the recorder the record functions append to, what a job binds (GpuJob: the frame's blocks,
+// source, tables, side planes, film plane), the calls a node / a fused group is recorded with (NodeCall / GroupCall), and the separable filter
+// helpers (box / weight table / minimum, with an O(1)-per-pixel running-sum box for larger radii).
 //
-// Each main node has one record function; they are registered in nodes/gpu_nodes.cpp (gpuImplFor) next to the shader names
-// they use, and called in order by the frame builder (exec/gpu_frame.cpp) until the Planner hands out stages.
+// Each family's gpu.cpp defines its GpuImpl (declared at the end of this header) and the list engine/nodes/node_list.inc registers it; the GPU
+// executor calls them through gpuImplFor(type) in the plan's order.
 #include <array>
 #include <cstdint>
 #include <string>
+#include <span>
 
 #include "engine/nodes/point/blocks.h"
 #include "engine/exec/gpu_scheduler.h"
 #include "engine/hal/hal.h"
+#include "engine/graph/node.h"
 #include "engine/nodes/frame_blocks.h"
 #include "engine/nodes/resize/resize.h"
 
@@ -30,15 +32,8 @@ constexpr Format kU8 = Format::RGBA8;
 
 inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 
-// Radii of the spatial stages, shared by the builder and the tile halo computation.
 // Workgroup shape of the 2D kernels on a device: 16 x (inv/16), inv = min(256, maxComputeWorkGroupInvocations) as a power of two.
 void workgroupShape(const hal::DeviceCaps& c, int& lx, int& ly, int& rwg);
-
-// Halo of the window stages of a GPU tile (the radii come from the node blocks), multiple of 4.
-struct SpatialRadii {
-  int halo = 0;  // pixels around a tile needed by the local stages, multiple of 4
-};
-SpatialRadii spatialRadii(const FrameBlocks& b);
 
 // The image the point pass samples, and where it sits in the (resized) source space.
 struct SourceBind {
@@ -60,13 +55,14 @@ struct LutBind {
   int n = 0, n2 = 0, toneN = 0, toneBase = 0;
   float max1 = 1.5f, max2 = 8.f;
 };
-// Whole-picture analysis shared by all tiles of an export (dehaze airlight / dark channel, clarity base), on a 1/4 grid.
-struct GlobalRes {
-  H color = -1;  // RGBA32F low-res colour (dehaze analysis input)
-  H dc = -1;     // R32F dark channel (dehaze)
-  H yy = -1;     // RGBA32F (Y, Y^2) (clarity analysis input)
-  H ab = -1;     // RGBA32F guided filter coefficients (clarity)
-  int lw = 0, lh = 0;
+// The display stages after a film on the device: curves ([4][n] buffer) and the look LUT (RGBA32F n^3); identity when both are off.
+struct DisplayBind {
+  H curves = -1, lut = -1;
+  int lutN = 0;          // 0: no look LUT
+  unsigned curveMask = 0;
+  int curveSamples = 0;
+  float lutMix = 0.f;
+  float domMin[3] = {0, 0, 0}, domMax[3] = {1, 1, 1};
 };
 
 // Where a node's pass ends: every kernel that can end the pipeline adds the grain and writes the final RGBA8 instead of the
@@ -89,6 +85,9 @@ struct GpuRecorder {
   int W = 0, H_ = 0;          // size of the working images of this job
   int allocW = 0, allocH = 0; // allocation size of the working images (a tiled export uses one size for all tiles)
   int boxScanMin = -1;        // radius from which the running-sum box is used (-1: DAPPLE_GPU_BOX_SCAN_MIN or 12; 0: never)
+  // A record function sets this with `err` when the frame asks for something this backend does not port (the CPU renders the frame, the
+  // GPU stays in use: GpuReason::FilmEffect); otherwise a failed record is a transient failure.
+  bool unsupported = false;
 
   // Workgroup shape of the 2D kernels (spec constants 16 / 17) and of the reduction (spec constant 18). 16 x 16 and 256 where the
   // device allows 256 invocations; GLES 3.1 only guarantees 128 (16 x 8, reduce 128), docs/engine/gles-shader-patches.md.
@@ -117,10 +116,40 @@ struct GpuRecorder {
   H d8_ = -1, d16_ = -1, d32_ = -1, dR_ = -1, wbuf_ = -1;
 };
 
-// ---- node record functions (one per node, nodes/<node>/gpu.cpp) --------------------------------------------------------
-struct PointInputs {
-  H src, tone, lat, lat2, D, out8;
+// ---- what a job binds (a whole frame, or one tile of one sweep) ------------------------------------------------------------------
+struct GpuJob {
+  const point::Blocks* frame = nullptr;  // geometry, warp, gain, HDR, film glue, display
+  const FrameBlocks* blocks = nullptr;   // the families' resolved blocks
+  SourceBind src;
+  LutBind lut;
+  int W = 0, Hh = 0, ox = 0, oy = 0;     // working image size and its origin in the picture
+  int gridW = 0, gridH = 0;              // the 1/4 grid of the frame-global solves
+  // local adjustments (docs section 40): descriptor + plane store SSBOs, the side planes the head writes (-1: none)
+  H ldesc = -1, lplanes = -1, aux0 = -1, aux1 = -1;
+  // a film frame: the film plane, the frame coordinates of its pixel (0, 0), the display stages, the strength of the blend
+  H film = -1;
+  int filmOx = 0, filmOy = 0;
+  bool filmClamped = false;              // the film plane is already clamped to 0..1
+  DisplayBind disp;
+  float strength = 1.f;
 };
+// A fused group (GpuImpl::group): its node types in order, the epilogue of its pass, the working image. Returns the new working image.
+struct GroupCall {
+  const GpuJob& job;
+  std::span<const NodeType> nodes;
+  Epilogue ep;
+  H D;
+};
+// A single node (GpuImpl::node): its resolved block, the epilogue, the working image, its solve (GpuImpl::solve result, or -1).
+struct NodeCall {
+  const GpuJob& job;
+  const void* block;
+  Epilogue ep;
+  H D;
+  H solved;
+};
+
+// ---- node record functions (nodes/<family>/gpu.cpp) --------------------------------------------------------------------------
 struct PointNode {
   const point::Blocks* frame;  // geometry, warp, gain, HDR
   SourceBind src;
@@ -187,10 +216,17 @@ bool recordConvert(GpuRecorder& r, hal::BufferH staging, H dst, int w, int h, in
 }  // namespace dapple::engine::gpu
 
 namespace dapple::engine::gpu {
-// Ports of a node as graph handles (docs 4.2: the executor owns the images). Point: out[0] = D. In-place spatial nodes:
-// in[0] = D. Analysis nodes: in[0] = low-resolution input, out[0] = result.
-struct GpuPorts {
-  H in[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-  H out[4] = {-1, -1, -1, -1};
-};
+// The families' GPU implementations (registered by engine/nodes/node_list.inc; null = none).
+const GpuImpl* noGpu();
+const GpuImpl* pointGpu();         // nodes/point/gpu.cpp: the point recipe (Resize / Geometry + Gain + Hdr + LocalLinear + ToneColour + Vignette)
+const GpuImpl* toneColourGpu();    // the same recipe; reads the colour lattice
+const GpuImpl* displayGpu();       // DisplayStages + Blend after a film: the film finish (curves, look LUT, blend with the normal branch)
+const GpuImpl* epilogueGpu();      // Grain, Pack8: the epilogue slot of the last pass
+const GpuImpl* nrLumaGpu();        // nodes/nr/gpu.cpp
+const GpuImpl* nrChromaGpu();
+const GpuImpl* dehazeGpu();        // nodes/dehaze/gpu.cpp
+const GpuImpl* detailGpu();        // nodes/detail/gpu.cpp
+const GpuImpl* localDetailGpu();   // nodes/local/gpu.cpp
+const GpuImpl* resizeGpu();        // nodes/resize/gpu.cpp (the source resize is recorded by the executor: recordResize)
+const GpuImpl* filmGpu();          // nodes/film/film_gpu.cpp: the film stage records the film nodes as a whole
 }  // namespace dapple::engine::gpu

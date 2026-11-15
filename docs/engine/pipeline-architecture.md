@@ -3192,3 +3192,34 @@ on both executors (the GPU computed `x0 * (gw - 1) / PW`, one rounding apart; wh
 Left for stage C: the planner still takes halos / footprints from `PlanRequest`, and the GPU executor keeps its own source footprint
 (`gpu_executor.cpp footprint`, edges instead of pixel centres, one pixel wider than `point::sourceWindow`); making both read
 `geometryBehaviour().inputRect` is the planner generalisation.
+
+## 51. Stage C: a generic planner, one graph per frame, a byte-budget cache (engine, 2026-11-15)
+
+**Final structure** (core/engine/README.md has the file map and what adding a node costs).
+- **Registration.** `nodes/node_list.inc` has one line per node: `DAPPLE_NODE(Type, family::desc, gpuImpl)`. `NodeType`, the registry and the
+  GPU table are generated from it. A node's `NodeDesc` (in its family directory) declares its ports, mask, colour spaces, precision,
+  footprint class, fusion group, behaviour + block accessor, solve, work planes, wiring slot and its CPU implementation + slot binding; its
+  `GpuImpl` (family gpu.cpp) records a fused group (`group`, highest rank wins), a window node (`node`) or a solve. `AssembledBake`, the
+  `FilmSim` super-node, `GraphDetail` (Tables / Full / FullFilm), `nodes/main/cpu_nodes.cpp` (`cpuImpl` / `bindResolved` switches),
+  `Planner::windowHalo`, `PlanRequest`'s slider amounts, `headNodeOk` / `windowNodeOk`, the GPU `Walk::sweep` switch, `spatialRadii` and the
+  GPU's own source `footprint` are deleted.
+- **Builder.** Spells out the skeleton (source, Resize, tables, normal / film branch, blend, sink); every optional node is wired into its slot
+  by its own `wanted` (default: its block is not the identity). HDR is wired from the edit (`point::hdrWanted`) and elided at plan time when
+  the bound block is inactive (it needs the tone table).
+- **Planner.** Derives everything from the declarations: elision, HostTable / FilmFrame / head / window groups, solves and their
+  accumulation sweeps, sweep halos (sum of the nodes' halos + 8 px slack on the 1/4 grid), precision, tile size (memory budget: 12 B/px + the
+  widest work planes + the head's side planes; the executor's image limit), and the tiles with their source windows (`TileWin`, through the
+  head's Resample `inputRect`s up to a grid-scaling node). The CPU and the GPU executor run the same tiles and source windows: the GPU's
+  source footprint is now `point::sourceWindow` (pixel centres), the node halos are the larger of what the CPU and the GPU kernels read
+  (NR luma 2r+1, NR chroma (2lr+3)f, detail +1), so both executors' tiles are exact.
+- **Session.** One graph per frame: `renderFrame` / `exportGpu` resolve the frame's draft blocks (before the bake, at the size of the executor
+  tried first), build and key the graph, evaluate its table nodes (host_tables.cpp), plan it for the executor (GPU: solves looked up in the
+  device slots); a GPU frame that falls back re-plans the same graph with the CPU frame's blocks (rebuilt only if they wire differently).
+  Failures are typed end to end (`GpuReason`; `GpuRecorder::unsupported` replaces the "film GPU:" text prefix). Files: engine_session.cpp
+  (frame policy), host_tables.cpp, gpu_dispatch.cpp; GPU executor: gpu_executor.cpp, gpu_walk.cpp, gpu_device_copies.cpp, gpu_core.cpp.
+- **Cache.** `ResultCache` holds host and device entries of a session with their bytes and build cost, one budget per session (host from the
+  memory configuration, device = half the device pool budget, the pool trimmed to what the cache leaves), GreedyDual-Size eviction, its own
+  mutex, payloads returned by value. Device copies are released through `gpu::Core::retire` (destroyed once the first fenced submission
+  after the release has completed; no `waitIdle` in any resource destructor).
+- **Not changed:** the context mutex is still held for a whole GPU frame (the frame slots' readback buffers are reused by the next `begin()`;
+  narrowing it needs per-executor slot ownership); `GpuPool::trim` still waits for the device before freeing pool images.

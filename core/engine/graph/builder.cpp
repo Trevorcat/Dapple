@@ -1,24 +1,26 @@
-// GraphBuilder: EditParams + FrameRequest + SessionCtx -> Graph (docs/engine/pipeline-architecture.md 4.5, 4.6).
+// GraphBuilder: ParamSet + the frame's resolved blocks -> Graph (docs/engine/pipeline-architecture.md 4.5, 4.6, section 50).
 // A pure function; nothing is executed here.
+//
+// The builder spells out the frame's skeleton: source, Resize, the table nodes, the normal branch (Gain -> ToneColour, or ToneColourExact for
+// the exact variant), the film branch (its tables and image nodes), DisplayStages + Blend, the 8-bit pack. Every other node is optional and
+// placed by its own declaration (NodeDesc::wire / order / wanted): the builder walks the registry and wires a node into its slot when its
+// family wants it for this frame (by default: when its resolved block is not the identity). Adding such a node touches nothing here.
+#include <algorithm>
+
 #include "engine/graph/graph.h"
-#include "engine/nodes/frame_blocks.h"
 
 namespace dapple::engine {
 
 namespace {
-
-bool grainFamily(const std::string& key) { return key == "grain" || key == "film_grain"; }
 
 struct Tables {
   NodeId lattice = 0, overflow = 0, pre = 0, tone = 0, analysis = 0;
   bool hasOverflow = false, hasPre = false, hasAnalysis = false;
 };
 
-// Table nodes shared by both detail levels. Wiring decisions (4.4 "conditional dependencies by wiring"):
-//  - ToneTable gets the ToneAnalysisPre edge only when the tonal-class move is on (toneStrength > 0), so an exposure
-//    drag leaves its key alone;
-//  - ToneAnalysisPre exists when the move needs it, or when the analysis of an interactive frame is read through the
-//    lattice (fast path).
+// Table nodes. Wiring decisions (4.4 "conditional dependencies by wiring"):
+//  - ToneTable gets the ToneAnalysisPre edge only when the tonal-class move is on (toneStrength > 0), so an exposure drag leaves its key alone;
+//  - ToneAnalysisPre exists when the move needs it, or when the analysis of an interactive frame is read through the lattice (fast path).
 Tables buildTables(Graph& g, const ParamSet& ps) {
   const EditParams& e = ps.edit();
   const FrameRequest& f = ps.frame();
@@ -43,11 +45,8 @@ Tables buildTables(Graph& g, const ParamSet& ps) {
   return t;
 }
 
-// The film branch. FullFilm (8.1): three table nodes (each with its own minimal mask), then the film image nodes. Spatial
-// nodes whose resolved parameters make them identities are elided at plan time (NodeBehaviour::isIdentity), so the
-// structure hash does not depend on parameter values. Full: the FilmSim super-node.
-NodeId addFilm(Graph& g, NodeId cur, GraphDetail detail) {
-  if (detail != GraphDetail::FullFilm) return g.add(NodeType::FilmSim, {Edge{cur}});
+// The film branch (8.1): three table nodes (each with its own minimal mask), then the film image nodes.
+NodeId addFilm(Graph& g, NodeId cur) {
   const NodeId tRaw = g.add(NodeType::FilmTableRaw);
   const NodeId tCur = g.add(NodeType::FilmTableCurves);
   const NodeId tPrint = g.add(NodeType::FilmTablePrintScan);
@@ -63,99 +62,69 @@ NodeId addFilm(Graph& g, NodeId cur, GraphDetail detail) {
   return g.add(NodeType::FilmScan, {Edge{fl}});
 }
 
+// The optional nodes of a wire slot, in their declared order.
+std::vector<NodeType> slotNodes(Wire w) {
+  const NodeRegistry& reg = NodeRegistry::instance();
+  std::vector<NodeType> v;
+  for (int t = 0; t < kNodeTypeCount; ++t)
+    if (reg.desc(NodeType(t)).wire == w) v.push_back(NodeType(t));
+  std::stable_sort(v.begin(), v.end(), [&](NodeType a, NodeType b) { return reg.desc(a).order < reg.desc(b).order; });
+  return v;
+}
+
 }  // namespace
 
-Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const point::Blocks* point, const FrameBlocks* blocks) {
+Graph GraphBuilder::build(const ParamSet& ps, const FrameView& view) {
+  static const std::vector<NodeType> kSlots[4] = {{}, slotNodes(Wire::Source), slotNodes(Wire::Scene), slotNodes(Wire::Display)};
+  const NodeRegistry& reg = NodeRegistry::instance();
+  const BuildCtx ctx{ps, view};
   Graph g;
+  auto chain = [&](Wire w, NodeId cur) {
+    for (NodeType t : kSlots[int(w)]) {
+      const NodeDesc& d = reg.desc(t);
+      const void* blk = reg.block(t, view);
+      const bool want = d.wanted ? d.wanted(ctx) : (blk && !(d.behaviour && d.behaviour->isIdentity && d.behaviour->isIdentity(blk)));
+      if (want) cur = g.add(t, {Edge{cur}});
+    }
+    return cur;
+  };
+
   const FrameRequest& f = ps.frame();
   const ParamInputs& in = ps.inputs();
-  const NodeId src = g.add(NodeType::Source);
-
-  if (detail == GraphDetail::Tables) {
-    if (f.exact) {
-      const NodeId r = g.add(NodeType::AssembledBake, {Edge{src}});
-      g.markOutput(r, OutputRole::Frame);
-      if (f.wantAnalysis) g.markOutput(g.add(NodeType::Analysis), OutputRole::Analysis);
-      return g;
-    }
-    const Tables t = buildTables(g, ps);
-    NodeId r;
-    if (t.hasOverflow) r = g.add(NodeType::AssembledBake, {Edge{src}, Edge{t.tone}, Edge{t.lattice}, Edge{t.overflow}});
-    else r = g.add(NodeType::AssembledBake, {Edge{src}, Edge{t.tone}, Edge{t.lattice}});
-    g.markOutput(r, OutputRole::Frame);
-    if (t.hasAnalysis) g.markOutput(t.analysis, OutputRole::Analysis);
-    return g;
-  }
-
-  // ---- Full: every stage of the frame as its own node ---------------------------------------------------------------
-  const point::Blocks fallback;
-  const point::Blocks& fp = point ? *point : fallback;
-  const FrameBlocks noBlocks;
-  const FrameBlocks& fb = blocks ? *blocks : noBlocks;
   const EditParams& e = ps.edit();
-  NodeId cur = g.add(NodeType::Resize, {Edge{src}});
-  if (!point::geometryBehaviour().isIdentity(&fp)) cur = g.add(NodeType::Geometry, {Edge{cur}});
+  const NodeId src = g.add(NodeType::Source);
+  NodeId cur = chain(Wire::Source, g.add(NodeType::Resize, {Edge{src}}));
 
+  const float strength = e.filmStrength / 100.f;
+  const bool useFilm = in.filmActive && strength > 0.f;  // 4.6: strength 0 = main branch only
+  const bool needMain = !useFilm || strength < 1.f;
+  Tables t;
+  if (!f.exact) t = buildTables(g, ps);  // the exact variant evaluates tone and colour per pixel (ToneColourExact), no table nodes
+  NodeId mainOut = 0;
+  if (needMain) {
+    const NodeId scene = chain(Wire::Scene, g.add(NodeType::Gain, {Edge{cur}}));
+    if (f.exact) mainOut = g.add(NodeType::ToneColourExact, {Edge{scene}});
+    else if (t.hasOverflow) mainOut = g.add(NodeType::ToneColour, {Edge{scene}, Edge{t.tone}, Edge{t.lattice}, Edge{t.overflow}});
+    else mainOut = g.add(NodeType::ToneColour, {Edge{scene}, Edge{t.tone}, Edge{t.lattice}});
+  }
+  if (useFilm) {
+    const NodeId disp = g.add(NodeType::DisplayStages, {Edge{addFilm(g, cur)}});
+    cur = needMain ? g.add(NodeType::Blend, {Edge{mainOut}, Edge{disp}}) : disp;
+  } else {
+    cur = mainOut;
+  }
   if (f.exact) {
-    // the reference variant: per-pixel PointOp::apply instead of the lattice; the film branch is the same as below
-    const float strength = e.filmStrength / 100.f;
-    const bool useFilm = in.filmActive && strength > 0.f;
-    const bool needMain = !useFilm || strength < 1.f;
-    NodeId mainOut = 0;
-    if (needMain) {
-      NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
-      if (!point::hdrBehaviour().isIdentity(&fp)) gain = g.add(NodeType::Hdr, {Edge{gain}});
-      if (fb.local.active()) gain = g.add(NodeType::LocalLinear, {Edge{gain}});
-      mainOut = g.add(NodeType::ToneColourExact, {Edge{gain}});
-    }
-    if (useFilm) {
-      const NodeId film = addFilm(g, cur, detail);
-      const NodeId disp = g.add(NodeType::DisplayStages, {Edge{film}});
-      cur = needMain ? g.add(NodeType::Blend, {Edge{mainOut}, Edge{disp}}) : disp;
-    } else {
-      cur = mainOut;
-    }
     if (f.wantAnalysis) g.markOutput(g.add(NodeType::Analysis), OutputRole::Analysis);
   } else {
-    const Tables t = buildTables(g, ps);
-    const float strength = e.filmStrength / 100.f;
-    NodeId mainOut = 0;
-    const bool useFilm = in.filmActive && strength > 0.f;  // 4.6: strength 0 = main branch only
-    const bool needMain = !useFilm || strength < 1.f;
-    if (needMain) {
-      NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
-      if (!point::hdrBehaviour().isIdentity(&fp)) gain = g.add(NodeType::Hdr, {Edge{gain}});
-      if (fb.local.active()) gain = g.add(NodeType::LocalLinear, {Edge{gain}});
-      if (t.hasOverflow) mainOut = g.add(NodeType::ToneColour, {Edge{gain}, Edge{t.tone}, Edge{t.lattice}, Edge{t.overflow}});
-      else mainOut = g.add(NodeType::ToneColour, {Edge{gain}, Edge{t.tone}, Edge{t.lattice}});
-    }
-    if (useFilm) {
-      const NodeId film = addFilm(g, cur, detail);
-      const NodeId disp = g.add(NodeType::DisplayStages, {Edge{film}});
-      cur = needMain ? g.add(NodeType::Blend, {Edge{mainOut}, Edge{disp}}) : disp;
-    } else {
-      cur = mainOut;
-    }
-    // unused tables of a pruned main branch still have to be consumed by something to keep the graph free of dead
-    // nodes: they are demanded as table outputs (the executor skips them when nothing needs them).
+    // the tables of a pruned main branch are demanded as table outputs (no dead nodes; the session skips what nothing reads)
     if (!needMain) {
       g.markOutput(t.lattice, OutputRole::Table);
       g.markOutput(t.tone, OutputRole::Table);
+      if (t.hasOverflow) g.markOutput(t.overflow, OutputRole::Table);
     }
     if (t.hasAnalysis) g.markOutput(t.analysis, OutputRole::Analysis);
-    if (t.hasOverflow && !needMain) g.markOutput(t.overflow, OutputRole::Table);
   }
-
-  if (!vignette::behaviour().isIdentity(&fb.vignette)) cur = g.add(NodeType::Vignette, {Edge{cur}});
-  if (!nr::lumaBehaviour().isIdentity(&fb.nrLuma)) cur = g.add(NodeType::NRLuma, {Edge{cur}});
-  if (!nr::chromaBehaviour().isIdentity(&fb.nrChroma)) cur = g.add(NodeType::NRChroma, {Edge{cur}});
-  if (!dehaze::behaviour().isIdentity(&fb.dehaze)) cur = g.add(NodeType::Dehaze, {Edge{cur}});
-  if (!detail::behaviour().isIdentity(&fb.detail)) cur = g.add(NodeType::Detail, {Edge{cur}});
-  if (!localadj::detailBehaviour().isIdentity(&fb.local)) cur = g.add(NodeType::LocalDetail, {Edge{cur}});
-  // 4.6 / section 14 (Q8): grain is dropped at the interactive tier unless a grain-family slider is being dragged
-  const bool keepGrain = f.interactive && grainFamily(f.activeParam) && e.grain > 0.f;
-  if (!grain::behaviour().isIdentity(&fb.grain) || keepGrain) cur = g.add(NodeType::Grain, {Edge{cur}});
-  cur = g.add(NodeType::Pack8, {Edge{cur}});
+  cur = g.add(NodeType::Pack8, {Edge{chain(Wire::Display, cur)}});
   g.markOutput(cur, OutputRole::Frame);
   return g;
 }

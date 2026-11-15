@@ -1,5 +1,5 @@
 #pragma once
-// Engine graph IR: basic types (docs/engine/pipeline-architecture.md section 4.1). Stage a1.
+// Engine graph IR: basic types (docs/engine/pipeline-architecture.md section 4.1).
 #include <bitset>
 #include <cstdint>
 #include <cstring>
@@ -94,50 +94,28 @@ struct ParamMask {
   bool has(ParamKey k) const { return bits.test(k); }
 };
 
-enum class Domain : std::uint8_t { Image, Table, Npu /*reserved*/ };
-enum class Footprint : std::uint8_t { Point, Window, Resample, Global, Source, Sink, Composite /*Window+Global*/, Super /*one node standing for several stages*/ };
+enum class Domain : std::uint8_t { Image, Table };
+// Footprint class of a node: what part of its input one output pixel reads (the planner derives groups, halos and source windows from it).
+//   Point     the same pixel                      Window    a neighbourhood (NodeBehaviour::halo)
+//   Resample  a mapped neighbourhood (inputRect)  Global    the whole input (tables, frame-global solves of a window node: NodeDesc::solve)
+//   Source    no input (the picture)              Sink      the 8-bit output
+enum class Footprint : std::uint8_t { Point, Window, Resample, Global, Source, Sink };
 
-// Closed set of node types of stage (a). Order is part of the structure hash: append only.
+// Colour space of an image port (docs/engine/pipeline-architecture.md 4.1). Graph::validate checks that every image input carries the
+// space its consumer declares.
+//   Source   camera / source linear RGB (the picture, resampled or not)    Scene    scene-linear working RGB (after the gain)
+//   Display  display-encoded RGB (after the tone / colour stage or the film)  Film     film planes (exposure, density, print)
+//   Any      a node that passes its input space through (declared on inputs only)
+enum class Space : std::uint8_t { Any, Source, Scene, Display, Film };
+// Precision of the image a node writes. The planner gives every sweep the widest precision of its nodes (Stage::precision), the GPU
+// executor allocates the sweep's working image in it and the memory estimate counts it.
+enum class Precision : std::uint8_t { F16, F32 };
+
+// The node types (generated from engine/nodes/node_list.inc; the order enters the structure hash and the node keys: append only).
 enum class NodeType : std::uint16_t {
-  Source,
-  Resize,
-  Geometry,
-  Gain,
-  ColourLattice,
-  LatticeOverflow,
-  ToneAnalysisPre,
-  ToneTable,
-  ToneColour,
-  ToneColourExact,
-  Vignette,
-  NRLuma,
-  NRChroma,
-  Dehaze,
-  Detail,
-  Grain,
-  Pack8,
-  Analysis,
-  FilmSim,
-  DisplayStages,
-  Blend,
-  AssembledBake,
-  // film decomposition (docs/engine/pipeline-architecture.md 8.1): three tables, then the image nodes
-  FilmTableRaw,
-  FilmTableCurves,
-  FilmTablePrintScan,
-  FilmExposure,
-  FilmBlurExposure,
-  FilmDirField,
-  FilmDevelop,
-  FilmGrain,
-  FilmPrintScan,
-  FilmGlare,
-  FilmScan,
-  FilmPrintExposure,   // enlarger diffusion path: film density -> linear paper exposure (frame-sized planes)
-  FilmEnlargerBlur,    // enlarger diffusion path: Gaussian mixtures of the paper exposure
-  Hdr,                 // single-image HDR: smooth gain field from the bilateral base layer, after Gain, before the tone stage (core/src/hdr_field.h)
-  LocalLinear,         // local adjustments, stage L: masks + scene-linear ops after Gain / Hdr, before the tone stage (docs section 40)
-  LocalDetail,         // local adjustments, stage W: clarity / texture / sharpen / noise / dehaze by mask, after Detail (docs section 40)
+#define DAPPLE_NODE(type, desc, gpu) type,
+#include "engine/nodes/node_list.inc"
+#undef DAPPLE_NODE
   Count
 };
 constexpr int kNodeTypeCount = int(NodeType::Count);

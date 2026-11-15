@@ -29,5 +29,6 @@ Status bake(const void* ctx, std::span<const void* const> inputs, void** payload
 void freePayload(void* p);
 
 const NodeBehaviour& behaviour();
+NodeDesc desc();  // registered in engine/nodes/node_list.inc
 
 }  // namespace dapple::engine::resize

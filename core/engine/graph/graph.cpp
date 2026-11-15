@@ -14,6 +14,25 @@ NodeId Graph::add(NodeType t, std::initializer_list<Edge> inputs) {
   return nodes_.back().id;
 }
 
+NodeId Graph::add(NodeType t, const std::vector<Edge>& inputs) {
+  NodeInstance n;
+  n.type = t;
+  n.id = NodeId(nodes_.size());
+  n.in = inputs;
+  nodes_.push_back(std::move(n));
+  return nodes_.back().id;
+}
+
+// The colour space node `id` writes (an Any output carries the space of its first image input).
+static Space outSpaceOf(const std::vector<NodeInstance>& nodes, NodeId id, const NodeRegistry& reg) {
+  for (;;) {
+    const NodeInstance& n = nodes[id];
+    const NodeDesc& d = reg.desc(n.type);
+    if (d.outSpace != Space::Any || n.in.empty()) return d.outSpace;
+    id = n.in[0].from;
+  }
+}
+
 const NodeInstance* Graph::find(NodeType t) const {
   for (const NodeInstance& n : nodes_)
     if (n.type == t) return &n;
@@ -37,6 +56,12 @@ ValidationResult Graph::validate(const NodeRegistry& reg) const {
       const Domain want = d.inputDomain[std::min<std::size_t>(i, 3)];
       if (pd.output != want)
         return fail(where + ": input " + std::to_string(i) + " is " + pd.name + " (wrong domain)");
+      if (want == Domain::Image && i < 4 && d.inSpace[i] != Space::Any && e.from < n.id) {
+        const Space got = outSpaceOf(nodes_, e.from, reg);
+        if (got != d.inSpace[i])
+          return fail(where + ": input " + std::to_string(i) + " is " + pd.name + " in colour space " + std::to_string(int(got)) + ", expected " +
+                      std::to_string(int(d.inSpace[i])));
+      }
       ++consumers[e.from];
     }
     for (std::size_t k = 0; k < kMaxKeys; ++k)
@@ -93,7 +118,7 @@ void Graph::computeKeysHoldingSolves(const ParamSet& ps, const NodeRegistry& reg
   Graph ref = *this;
   ref.computeKeys(ps0, reg);
   for (std::size_t i = 0; i < nodes_.size(); ++i)
-    if (nodes_[i].type == NodeType::Dehaze || nodes_[i].type == NodeType::Detail) {
+    if (reg.desc(nodes_[i].type).solve) {  // a node with a frame-global solve
       nodes_[i].key = ref.nodes_[i].key;
       nodes_[i].family = ref.nodes_[i].family;
     }

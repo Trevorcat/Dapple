@@ -158,7 +158,7 @@ struct Mix {
     for (const LevelComp& c : comps) {
       if (c.r > kMaxTaps) {
         ok = false;
-        r.err = "film GPU: mixture component too wide for the tap table";
+        r.unsupported = true, r.err = "film GPU: mixture component too wide for the tap table";
         return dst;
       }
       MixU f{};
@@ -308,7 +308,7 @@ struct Mix3 {
   float* tapTable(int n, std::int32_t& off) {
     if (!r.taps.mapped || std::uint64_t(r.tapNext + n) * 16 > r.taps.bytes) {
       ok = false;
-      r.err = "film GPU: tap table buffer full";
+      r.unsupported = true, r.err = "film GPU: tap table buffer full";
       return nullptr;
     }
     if (tapsH < 0) tapsH = r.g.externalBuf(r.taps);
@@ -367,7 +367,7 @@ struct Mix3 {
           const Comp3& cp = comps[c][j0 + jj];
           if (cp.r > kMaxTaps) {
             ok = false;
-            r.err = "film GPU: mixture component too wide for the tap table";
+            r.unsupported = true, r.err = "film GPU: mixture component too wide for the tap table";
             return src;
           }
           R = std::max(R, cp.r);
@@ -511,7 +511,7 @@ struct Mix3 {
 // Separable FIR on a 3-channel image (half taps, unit sum), reflect boundary.
 H fir4(gpu::GpuRecorder& r, H in, int w, int h, const Taps& t) {
   if (t.r > kMaxTaps) {
-    r.err = "film GPU: blur kernel too wide";
+    r.unsupported = true, r.err = "film GPU: blur kernel too wide";
     return -1;
   }
   const hal::PipelineH ph = r.pl("film_f4h", {}), pv = r.pl("film_f4v", {});
@@ -535,9 +535,9 @@ struct BoostU {
   float c[4];
 };
 H recordBoost(gpu::GpuRecorder& r, H E, int w, int h, const fd::SpatialPlan& pl) {
-  if (!r.gBuf || !r.partBuf) return r.err = "film GPU: no reduction buffers for the highlight boost", -1;
+  if (!r.gBuf || !r.partBuf) return r.unsupported = true, r.err = "film GPU: no reduction buffers for the highlight boost", -1;
   const int groups = gpu::cdiv(w * h, r.rwg * 16);  // 16 samples per thread
-  if (std::uint64_t(groups) * 4 > 256u * 1024u) return r.err = "film GPU: frame too large for the boost reduction", -1;
+  if (std::uint64_t(groups) * 4 > 256u * 1024u) return r.unsupported = true, r.err = "film GPU: frame too large for the boost reduction", -1;
   const H gH = r.g.externalBuf(r.gBuf), partH = r.g.externalBuf(r.partBuf);
   BoostU u{};
   u.s[0] = w;
@@ -636,8 +636,7 @@ bool updateGpuPrintLut(gpu::Core& core, const FilmTablesHandle& tb, GpuFilmTable
   if (out.split || pr.split || !out.lut.impl) return err = "print LUT update not applicable", false;
   hal::Device& dev = core.dev();
   if (out.lutN != pr.lutN) {  // the exact 33^3 table of the settled frame <-> the coarse 17^3 of a drag: only the LUT image is re-created
-    dev.waitIdle();
-    dev.destroy(out.lut);
+    core.retire(out.lut);
     out.lut = {};
     if (dev.createImage({hal::Format::RGBA32F, std::uint32_t(pr.lutN), std::uint32_t(pr.lutN), std::uint32_t(pr.lutN)}, &out.lut) != hal::Status::Ok) return err = dev.lastError(), false;
     out.lutN = pr.lutN;
@@ -711,16 +710,15 @@ bool finishGpuPrintLutUpdate(gpu::Core& core, GpuFilmTables& out) {
 }
 
 void releaseGpuTables(gpu::Core& core, GpuFilmTables& t) {
-  hal::Device& dev = core.dev();
-  dev.waitIdle();
-  if (t.lutNextActive) dev.destroy(t.lutNext);
-  dev.destroy(t.raw);
-  dev.destroy(t.lut);
-  dev.destroy(t.curves);
-  dev.destroy(t.decode);
-  dev.destroy(t.lut1);
-  dev.destroy(t.lut3);
-  dev.destroy(t.paper);
+  // frames in flight may still read them: destroyed once the work submitted before has completed (Core::retire)
+  if (t.lutNextActive) core.retire(t.lutNext);
+  core.retire(t.raw);
+  core.retire(t.lut);
+  core.retire(t.curves);
+  core.retire(t.decode);
+  core.retire(t.lut1);
+  core.retire(t.lut3);
+  core.retire(t.paper);
   t = GpuFilmTables{};
 }
 
@@ -750,8 +748,7 @@ bool uploadGpuPlan(gpu::Core& core, const FilmResolved& res, GpuFilmPlanRes& out
 }
 
 void releaseGpuPlan(gpu::Core& core, GpuFilmPlanRes& t) {
-  core.dev().waitIdle();
-  core.dev().destroy(t.grainTab);
+  core.retire(t.grainTab);
   t = GpuFilmPlanRes{};
 }
 
@@ -842,7 +839,7 @@ bool dyePass(gpu::GpuRecorder& r, H in, int ow, int oh, bool horizontal, int tri
   int rmax = 0;
   for (int c = 0; c < 3; ++c) rmax = std::max(rmax, taps[c]->r);
   const int stride = rmax / 4 + 1;
-  if (!r.taps.mapped || std::uint64_t(r.tapNext + 3 * stride) * 16 > r.taps.bytes) return r.err = "film GPU: tap table buffer full", false;
+  if (!r.taps.mapped || std::uint64_t(r.tapNext + 3 * stride) * 16 > r.taps.bytes) return r.unsupported = true, r.err = "film GPU: tap table buffer full", false;
   DyeU u{};
   u.dim[0] = ow;
   u.dim[1] = oh;
@@ -926,11 +923,11 @@ bool recordFilmPre(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTa
   out = FilmPre{};
   const auto pd = planOf(res);
   if (!pd->error.empty()) {
-    r.err = "film GPU: unsupported effect";
+    r.unsupported = true, r.err = "film GPU: unsupported effect";
     return false;
   }
   if (pd->split && !tb.split) {
-    r.err = "film GPU: the enlarger diffusion tables are not uploaded";
+    r.unsupported = true, r.err = "film GPU: the enlarger diffusion tables are not uploaded";
     return false;
   }
   const fd::SpatialPlan& pl = pd->plan;
@@ -1012,7 +1009,7 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
   if (pl.grain.active) {
     const fd::GrainPlan& gp = pl.grain;
     if (!pres.grainTab) {
-      r.err = "film GPU: grain tables not available";
+      r.unsupported = true, r.err = "film GPU: grain tables not available";
       return none;
     }
     const int Hg = pd->grain.r, layers = gp.ch[0].layers;
@@ -1025,7 +1022,7 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
           dyeR = std::max(dyeR, pd->dye[ch][l].r);
         }
     if (std::max(dyeR, pd->micro.r) > kDyeTaps || Hg > kMaxTaps) {
-      r.err = "film GPU: blur kernel too wide";
+      r.unsupported = true, r.err = "film GPU: blur kernel too wide";
       return none;
     }
     GrainU gb{};
@@ -1114,7 +1111,7 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
   const bool split = pd->split;
   if (split) {
     if (!tb.split || w != fw || h != fh) {
-      r.err = "film GPU: the enlarger diffusion filter runs on whole frames";
+      r.unsupported = true, r.err = "film GPU: the enlarger diffusion filter runs on whole frames";
       return none;
     }
     Mix3 mix3{r};
@@ -1147,7 +1144,7 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
   if (pl.glare && (res.quality != 1 || keepGlare)) {
     rgl = pd->rgl;
     if (rgl > kMaxTaps) {
-      r.err = "film GPU: glare blur too wide";
+      r.unsupported = true, r.err = "film GPU: glare blur too wide";
       return none;
     }
     PostU gu = pu;
@@ -1206,7 +1203,7 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
   const H out = r.g.transient(hal::Format::RGBA16F, std::uint32_t(w), std::uint32_t(h));
   if (us) {  // unsharp: horizontal blur, then (vertical blur + unsharp + encode) in one pass
     const Taps& t = pd->unsharp;
-    if (t.r > kMaxTaps) return r.err = "film GPU: blur kernel too wide", none;
+    if (t.r > kMaxTaps) return r.unsupported = true, r.err = "film GPU: blur kernel too wide", none;
     const hal::PipelineH ph = r.pl("film_f4h", {}), pe = r.pl("film_f4ve", {});
     if (!ph || !pe) return none;
     PostU eu = pu;
@@ -1280,3 +1277,12 @@ bool gpuMixtureForTest(gpu::Core& core, const float* plane, int w, int h, const 
 }
 
 }  // namespace dapple::engine::filmnode
+
+namespace dapple::engine::gpu {
+// The film nodes' GpuImpl (engine/nodes/node_list.inc): the FilmFrame stage records them as a whole (filmnode::recordFilmFrame, or
+// recordFilmPre + recordFilmWindow per tile of a tiled export).
+const GpuImpl* filmGpu() {
+  static const GpuImpl impl{{}, nullptr, nullptr, nullptr, false, 0, false, true};
+  return &impl;
+}
+}  // namespace dapple::engine::gpu

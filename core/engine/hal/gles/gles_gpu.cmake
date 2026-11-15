@@ -1,7 +1,7 @@
 # GLES 3.1 backend inside the full tree build (include when -DDAPPLE_GLES=ON, after the tests directory):
 #   * dapple_gles_check                  smoke / self-test tool (needs no Vulkan, no core)
 #   * ctest gles_selftest_angle_vulkan / gles_selftest_angle_swiftshader   (skipped cleanly: exit 77 when ANGLE or a device is absent)
-#   * ctest gles_gpu_parity_angle_* / gles_engine_<t>_angle_*   the production GPU executor (Plan -> gpuImplFor(...).recordPorts) and its
+#   * ctest gles_gpu_parity_angle_* / gles_engine_<t>_angle_*   the production GPU executor (Plan -> the nodes' GpuImpls) and its
 #     tests with the GLES device forced (DAPPLE_GPU_API=gles): dapple_gpu links dapple_hal_gles and hal/select.cpp picks it.
 #     Needs -DDAPPLE_GPU=ON.
 if(NOT TARGET dapple_hal_gles)

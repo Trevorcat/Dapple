@@ -76,12 +76,31 @@ struct FilmResolved {
 };
 static_assert(sizeof(FilmResolved) <= 256);
 
+// The frame a film resolve is made for (output size, radii scale; region unused).
+struct FrameGeom {
+  int w = 0, h = 0;
+  float scale = 1.f;
+};
 // Fills a FilmResolved from the ParamSet (the resolve function of every film node).
 void resolveFilm(const ParamSet& ps, const FrameGeom& geom, FilmResolved& out);
 
 const CpuImpl& cpuImpl(NodeType t);                 // run / bake of a film node type
 const NodeBehaviour& behaviour(NodeType t);         // resolve / isIdentity / halo of a film node type
 bool isFilmNode(NodeType t);
+// descriptors, registered in engine/nodes/node_list.inc
+NodeDesc tableRawDesc();
+NodeDesc tableCurvesDesc();
+NodeDesc tablePrintScanDesc();
+NodeDesc exposureDesc();
+NodeDesc blurExposureDesc();
+NodeDesc dirFieldDesc();
+NodeDesc developDesc();
+NodeDesc grainDesc();
+NodeDesc printExposureDesc();
+NodeDesc enlargerBlurDesc();
+NodeDesc printScanDesc();
+NodeDesc glareDesc();
+NodeDesc scanDesc();
 
 // ---- halos and rects the planner (or a test driver) needs ----------------------------------------------------------------------
 struct FilmHalos {

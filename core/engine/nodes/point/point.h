@@ -36,6 +36,11 @@
 #include "engine/nodes/point/blocks.h"
 #include "engine/nodes/point/frame_options.h"
 
+namespace dapple::engine {
+struct NodeDesc;
+struct BuildCtx;
+}  // namespace dapple::engine
+
 namespace dapple {
 
 // The baked point stages of one parameter set (the HostTable payloads the executors read).
@@ -191,6 +196,24 @@ void hdrBind(const Params& r, const SourceImage& source, Hdr& out, const std::ve
 // HDR block is inactive). Neither has a halo.
 const NodeBehaviour& geometryBehaviour();
 const NodeBehaviour& hdrBehaviour();
+// The Hdr node is wired when the edit asks for HDR on a scene-referred source without a film (whether it runs is the bound block's).
+bool hdrWanted(const BuildCtx& c);
+
+// ---- the family's nodes (nodes.cpp), registered in engine/nodes/node_list.inc ---------------------------------------------------------
+NodeDesc sourceDesc();
+NodeDesc geometryDesc();
+NodeDesc gainDesc();
+NodeDesc hdrDesc();
+NodeDesc toneColourDesc();
+NodeDesc toneColourExactDesc();
+NodeDesc displayDesc();
+NodeDesc blendDesc();
+NodeDesc pack8Desc();
+NodeDesc latticeDesc();
+NodeDesc overflowDesc();
+NodeDesc tonePreDesc();
+NodeDesc toneTableDesc();
+NodeDesc analysisDesc();
 // The source pixels ([x0, x1) x [y0, y1), clamped to the source) the head reads for output rect `out`: the corner pixel centres through the
 // geometry, plus the resampling support (and the reshaping field's reach).
 Rect sourceWindow(const Blocks& b, const Rect& out);

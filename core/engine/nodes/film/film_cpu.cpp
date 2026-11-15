@@ -11,6 +11,7 @@
 #include <mutex>
 #include <vector>
 
+#include "engine/graph/param_groups.h"
 #include "engine/nodes/film/film_node_internal.h"
 #include "parallel.h"
 
@@ -648,8 +649,6 @@ Status runScan(const CpuCtx&, const void* res, std::span<const ImageView> in, st
 // ---- registration -----------------------------------------------------------------------------------------------------------------------------
 namespace {
 
-void resolveAny(const ParamSet& ps, const FrameGeom& g, void* out) { resolveFilm(ps, g, *static_cast<FilmResolved*>(out)); }
-
 bool identityOf(NodeType t, const void* res) {
   const FilmResolved& r = R(res);
   if (!r.stock) return false;
@@ -685,7 +684,6 @@ Halo haloFn(const void* res) { return haloOf(T, res); }
 NodeBehaviour behaviourFor(NodeType t) {
   NodeBehaviour b;
   b.resolvedBytes = sizeof(FilmResolved);
-  b.resolve = resolveAny;
   switch (t) {
     case NodeType::FilmBlurExposure: b.isIdentity = identityFn<NodeType::FilmBlurExposure>; break;
     case NodeType::FilmPrintExposure: b.isIdentity = identityFn<NodeType::FilmPrintExposure>; break;
@@ -752,6 +750,89 @@ const NodeBehaviour& behaviour(NodeType t) {
   if (t == NodeType::FilmPrintExposure) return table[11];
   if (t == NodeType::FilmEnlargerBlur) return table[12];
   return table[int(t) - int(NodeType::FilmTableRaw)];
+}
+
+// ---- descriptors (engine/nodes/node_list.inc): three tables, each with its own minimal mask, then the image nodes of the film stage --------
+namespace {
+NodeDesc tableDesc(NodeType t, const char* name, ParamMask m) {
+  NodeDesc d = nodeDesc(name, Domain::Table, Footprint::Global, 0, 0, std::move(m));
+  d.cpu = &cpuImpl(t);
+  return d;
+}
+// an image node of the film stage: fused into the FilmFrame stage (runFilmFrame composes the run() functions)
+NodeDesc imageDesc(NodeType t, const char* name, Footprint fp, int minIn, int maxIn, ParamMask m) {
+  NodeDesc d = nodeDesc(name, Domain::Image, fp, minIn, maxIn, std::move(m));
+  d.fusion = Fusion::Film;
+  d.precision = Precision::F32;
+  d.behaviour = &behaviour(t);
+  d.cpu = &cpuImpl(t);
+  return d;
+}
+ParamMask pitch(std::initializer_list<std::string_view> more = {}) {
+  ParamMask m = ParamGroups::get().filmPitch;
+  m.add(keys(more));
+  return m;
+}
+}  // namespace
+
+NodeDesc tableRawDesc() {  // raw-exposure LUT 192^2 (reflect-padded)
+  return tableDesc(NodeType::FilmTableRaw, "FilmTableRaw", keys({"filmStock", "film_wb", "temp", "tint", "ctx.filmScene", "ctx.filmLib"}));
+}
+NodeDesc tableCurvesDesc() {  // density + pre-coupler curves, DIR matrix: the film side only (not the print paper)
+  return tableDesc(NodeType::FilmTableCurves, "FilmTableCurves", keys({"filmStock", "ctx.filmLib"}));
+}
+NodeDesc tablePrintScanDesc() {  // 33^3 film density -> display sRGB LUT, glare white, sRGB decode: dragging print warmth / tint re-bakes only this
+  return tableDesc(NodeType::FilmTablePrintScan, "FilmTablePrintScan",
+                   keys({"filmStock", "filmPaper", "film_warmth", "film_tint", "ctx.filmPrintEv", "film_black", "ctx.filmLib"}));
+}
+NodeDesc exposureDesc() {  // gain (white balance x exposure x film exposure) folded into the input matrix; local adjustments' stage L (40.7)
+  ParamMask m = ParamGroups::get().wb;
+  m.add(keys({"exposure", "film_exp", "ctx.filmKeyEv", "ctx.camera", "ctx.source", "ctx.filmLib", "local", "ctx.quality"}));
+  NodeDesc d = imageDesc(NodeType::FilmExposure, "FilmExposure", Footprint::Point, 2, 2, m);
+  d.inputDomain[1] = Domain::Table;  // FilmTableRaw
+  d.inSpace[0] = Space::Source;
+  d.outSpace = Space::Film;
+  return d;
+}
+NodeDesc blurExposureDesc() {  // camera diffusion / lens blur + scatter + halation (+ highlight boost)
+  return imageDesc(NodeType::FilmBlurExposure, "FilmBlurExposure", Footprint::Window, 1, 1, pitch({"film_halation"}));
+}
+NodeDesc dirFieldDesc() {  // inhibitor field q from E2, diffused; preview mode drops the diffusion
+  NodeDesc d = imageDesc(NodeType::FilmDirField, "FilmDirField", Footprint::Window, 2, 2, pitch({"ctx.quality"}));
+  d.inputDomain[1] = Domain::Table;  // FilmTableCurves
+  return d;
+}
+NodeDesc developDesc() {  // log10, curves, DIR correction -> density
+  NodeDesc d = imageDesc(NodeType::FilmDevelop, "FilmDevelop", Footprint::Point, 3, 3, ParamMask{});
+  d.inputDomain[2] = Domain::Table;  // FilmTableCurves
+  return d;
+}
+NodeDesc grainDesc() {  // stateless hash noise + dye-cloud / grain blur
+  return imageDesc(NodeType::FilmGrain, "FilmGrain", Footprint::Window, 1, 1,
+                   pitch({"film_grain", "ctx.quality", "ctx.keepGrain", "ctx.frameIndex", "ctx.fullLongEdge"}));
+}
+NodeDesc printExposureDesc() {  // enlarger diffusion path: density -> linear paper exposure (identity without the filter)
+  NodeDesc d = imageDesc(NodeType::FilmPrintExposure, "FilmPrintExposure", Footprint::Point, 2, 2, pitch());
+  d.inputDomain[1] = Domain::Table;  // FilmTablePrintScan
+  return d;
+}
+NodeDesc enlargerBlurDesc() {  // enlarger diffusion filter: Gaussian mixtures of the linear paper exposure
+  return imageDesc(NodeType::FilmEnlargerBlur, "FilmEnlargerBlur", Footprint::Window, 1, 1, pitch());
+}
+NodeDesc printScanDesc() {  // tetrahedral 3-D LUT (print + scan)
+  NodeDesc d = imageDesc(NodeType::FilmPrintScan, "FilmPrintScan", Footprint::Point, 2, 2, ParamMask{});
+  d.inputDomain[1] = Domain::Table;
+  return d;
+}
+NodeDesc glareDesc() {  // decode to linear + blurred log-normal hash field
+  NodeDesc d = imageDesc(NodeType::FilmGlare, "FilmGlare", Footprint::Point, 2, 2, pitch({"filmPaper", "ctx.quality", "ctx.frameIndex"}));
+  d.inputDomain[1] = Domain::Table;
+  return d;
+}
+NodeDesc scanDesc() {  // scanner blur + unsharp mask in linear light, sRGB encode
+  NodeDesc d = imageDesc(NodeType::FilmScan, "FilmScan", Footprint::Window, 1, 1, pitch({"filmPaper", "ctx.quality"}));
+  d.outSpace = Space::Display;
+  return d;
 }
 
 }  // namespace dapple::engine::filmnode

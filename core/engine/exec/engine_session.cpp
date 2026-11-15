@@ -1,7 +1,13 @@
+// EngineSession: the frame policy (docs/engine/pipeline-architecture.md section 3, 5.9, section 50). One graph per frame: built from the
+// frame's draft blocks (the families' blocks resolved before the bake, at the size of the executor tried first), its table nodes evaluated
+// (host_tables.cpp), then planned and run on the GPU executor where it supports the plan (gpu_dispatch.cpp), else on the CPU executor. Nodes
+// whose bound blocks turn out to be the identity (HDR once the tone table is known) are elided by the planner.
 #include "engine/exec/engine_session.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,32 +20,21 @@
 #endif
 
 #include "engine/exec/cpu_executor.h"
-#include "engine/nodes/resize/resize.h"
+#include "engine/exec/engine_session_internal.h"
 #include "local_eval.h"
 #include "warp_field.h"
-#include "engine/plan/plan.h"
 
 namespace dapple::engine::filmnode {
 void filmAsyncTableStats(unsigned long long*, unsigned long long*, unsigned long long*);
 }
 namespace dapple::engine {
 
-namespace {
+namespace session {
 
-std::atomic<std::uint64_t> g_nextId{1};
-
-struct Totals {
-  std::atomic<std::uint64_t> gpuFrames{0}, gpuFallbacks{0}, gpuTransients{0}, gpuLost{0}, gpuDemotions{0};
-  std::atomic<std::uint64_t> frames{0}, fullHits{0}, latticeReuse{0}, latticeBake{0};
-  std::atomic<std::uint64_t> planned{0}, planUs{0}, execUs{0}, sweeps{0}, tiles{0}, solveHits{0}, cancelled{0}, fallbacks{0};
-};
 Totals& totals() {
   static Totals t;
   return t;
 }
-
-using Clock = std::chrono::steady_clock;
-double msSince(Clock::time_point t0) { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
 
 Hash128 combine(const Hash128& a, const Hash128& b) {
   Hasher h;
@@ -55,134 +50,14 @@ Hash128 withOrder(const Hash128& family, int order) {
   return h.finish();
 }
 
-template <class T>
-std::shared_ptr<T> as(const std::shared_ptr<void>& p) {
-  return std::static_pointer_cast<T>(p);
+void gpuLog(const char* what, const std::string& why) {
+#if defined(__ANDROID__)
+  __android_log_print(ANDROID_LOG_WARN, "dapple-gpu", "%s: %s", what, why.c_str());
+#else
+  std::fprintf(stderr, "dapple-gpu: %s: %s\n", what, why.c_str());
+#endif
 }
 
-}  // namespace
-
-namespace {
-std::atomic<GpuProvider*> g_provider{nullptr};
-}
-void installGpuProvider(GpuProvider* p) { g_provider.store(p); }
-GpuProvider* gpuProvider() { return g_provider.load(); }
-
-GpuCounters gpuCounters() {
-  const Totals& t = totals();
-  return {t.gpuFrames.load(), t.gpuFallbacks.load(), t.gpuTransients.load(), t.gpuLost.load(), t.gpuDemotions.load()};
-}
-
-// ---- table node evaluators: thin wrappers over the point family's bake pieces (point::bake*) -------------------------------------------------
-
-std::shared_ptr<void> bakeNode(NodeType type, const void* resolved, std::span<const void* const> inputs) {
-  const CpuImpl* impl = cpuImpl(type);
-  if (!impl || !impl->bake) return nullptr;
-  void* p = nullptr;
-  if (impl->bake(resolved, inputs, &p) != Status::Ok || !p) return nullptr;
-  void (*fr)(void*) = impl->freePayload;
-  return std::shared_ptr<void>(p, [fr](void* q) {
-    if (fr) fr(q);
-  });
-}
-
-std::shared_ptr<std::vector<float>> evalColourLattice(const TableEnv& env, int n) {
-  const TableBakeCtx c{&env, n, false, 0.f};
-  return as<std::vector<float>>(bakeNode(NodeType::ColourLattice, &c));
-}
-
-engine::point::TonePre evalToneAnalysisPre(const TableEnv& env, std::vector<float>* lattice, int n, bool fast) {
-  const TableBakeCtx c{&env, n, fast, 0.f};
-  const void* in[1] = {lattice};
-  const auto p = as<engine::point::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &c, in));
-  return p ? *p : engine::point::TonePre{};
-}
-
-ToneTableOut evalToneTable(const TableEnv& env, const engine::point::TonePre* pre) {
-  const TableBakeCtx c{&env, 0, false, 0.f};
-  const void* in[1] = {pre};
-  const auto p = as<ToneTableOut>(bakeNode(NodeType::ToneTable, &c, in));
-  return p ? *p : ToneTableOut{};
-}
-
-std::vector<float> evalLatticeOverflow(const TableEnv& env, int n, float maxV) {
-  const TableBakeCtx c{&env, n, false, maxV};
-  const auto p = as<std::vector<float>>(bakeNode(NodeType::LatticeOverflow, &c));
-  return p ? *p : std::vector<float>{};
-}
-
-ToneAnalysis evalAnalysis(const TableEnv& env, const engine::point::TonePre* pre) {
-  const TableBakeCtx c{&env, 0, false, 0.f};
-  const void* in[1] = {pre};
-  const auto p = as<ToneAnalysis>(bakeNode(NodeType::Analysis, &c, in));
-  return p ? *p : ToneAnalysis{};
-}
-
-TableKeys effectiveTableKeys(const Graph& g, const ParamSet& ps, int nLattice) {
-  TableKeys k;
-  const NodeInstance* latN = g.find(NodeType::ColourLattice);
-  const NodeInstance* ttN = g.find(NodeType::ToneTable);
-  const NodeInstance* preN = g.find(NodeType::ToneAnalysisPre);
-  const NodeInstance* anN = g.find(NodeType::Analysis);
-  const NodeInstance* ovN = g.find(NodeType::LatticeOverflow);
-  if (latN) k.lattice = withOrder(latN->family, nLattice);
-  if (preN) {
-    k.hasPre = true;
-    k.pre = combine(preN->key, k.lattice);
-  }
-  k.tone = ttN ? ttN->key : Hash128{};
-  if (ttN && ps.edit().toneStrength > 0.f && preN) k.tone = combine(ttN->key, k.pre);
-  if (anN) {
-    k.hasAnalysis = true;
-    k.analysis = combine(anN->key, combine(k.tone, k.lattice));
-  }
-  if (ovN) {
-    k.hasOverflow = true;
-    k.overflow = ovN->key;
-  }
-  return k;
-}
-
-// ---- session ------------------------------------------------------------------------------------------------------------
-
-EngineSession::EngineSession() : id_(g_nextId.fetch_add(1)) {
-  cache_.setLimit(NodeType::Dehaze, 2);  // frame-global solves (1/4 grids: 15 MB each at 60 MP)
-  cache_.setLimit(NodeType::Detail, 2);
-  cache_.setLimit(NodeType::Resize, 4);  // scaled copies of the source (resizedSource)
-}
-
-namespace {
-
-// Local adjustments (docs section 40): the LocalDetail halo and the amount planes of a frame.
-void localRequest(PlanRequest& rq, const localadj::Block& b) {
-  if (!b.detail) return;
-  rq.localHalo = b.halo;
-  rq.localAux = b.auxPlanes;
-}
-
-// What the planner needs besides the graph: frame size, neighbourhood amounts after quality / region / film.
-PlanRequest makeRequest(const point::CpuFrame& fk, const FrameBlocks& fb, ExecMode mode, int tile, std::size_t budget, int channels) {
-  PlanRequest rq;
-  rq.frameW = fk.width();
-  rq.frameH = fk.height();
-  rq.mode = mode;
-  rq.tile = tile;
-  rq.memBudget = budget;
-  rq.nrLuma = fb.nrLuma.amount;
-  rq.nrColor = fb.nrChroma.amount;
-  rq.dehaze = fb.dehaze.amount;
-  rq.clarity = fb.detail.clarity;
-  rq.texture = fb.detail.texture;
-  rq.sharpen = fb.detail.sharpen;
-  rq.sharpRadius = fb.detail.sharpRadius;
-  rq.grain = fb.grain.amount;
-  rq.scale = fk.spatialScale();
-  rq.vignette = fb.vignette.active();
-  rq.useGeo = fk.useGeo();
-  rq.outChannels = channels;
-  localRequest(rq, fb.local);
-  return rq;
-}
 
 void addStats(EngineStats& st, const ExecStats& es) {
   st.sweeps += std::uint64_t(es.sweeps);
@@ -192,38 +67,38 @@ void addStats(EngineStats& st, const ExecStats& es) {
   st.streamed += es.streamed ? 1 : 0;
 }
 
-// Plan request from a resolved frame (the GPU path has no point::CpuFrame: the executor reads the point blocks).
-PlanRequest requestFromFrame(const point::Blocks& fp, const FrameBlocks& fb, ExecMode mode, int tile, std::size_t budget, bool filmTiles = false) {
+PlanRequest request(int w, int h, ExecMode mode, int tile, std::size_t budget, const FrameView& view) {
   PlanRequest rq;
-  rq.filmTiles = filmTiles;
-  rq.frameW = fp.geo.outW;
-  rq.frameH = fp.geo.outH;
+  rq.frameW = w;
+  rq.frameH = h;
   rq.mode = mode;
   rq.tile = tile;
   rq.memBudget = budget;
-  rq.nrLuma = fb.nrLuma.amount;
-  rq.nrColor = fb.nrChroma.amount;
-  rq.dehaze = fb.dehaze.amount;
-  rq.clarity = fb.detail.clarity;
-  rq.texture = fb.detail.texture;
-  rq.sharpen = fb.detail.sharpen;
-  rq.sharpRadius = fb.detail.sharpRadius;
-  rq.grain = fb.grain.amount;
-  rq.scale = fp.spatialScale;
-  rq.vignette = fb.vignette.active();
-  rq.useGeo = fp.geo.useGeo;
-  rq.outChannels = 4;
-  localRequest(rq, fb.local);
+  rq.view = view;
   return rq;
 }
 
-void gpuLog(const char* what, const std::string& why) {
-#if defined(__ANDROID__)
-  __android_log_print(ANDROID_LOG_WARN, "dapple-gpu", "%s: %s", what, why.c_str());
-#else
-  std::fprintf(stderr, "dapple-gpu: %s: %s\n", what, why.c_str());
-#endif
+void keyGraph(Graph& g, const ParamSet& ps, bool holdSolves) {
+  if (holdSolves) g.computeKeysHoldingSolves(ps);
+  else g.computeKeys(ps);
 }
+
+void notePlanned(EngineStats& st, double ms) {
+  st.planMs += ms;
+  totals().planUs.fetch_add(std::uint64_t(ms * 1000.0), std::memory_order_relaxed);
+  ++st.planned;
+  totals().planned.fetch_add(1, std::memory_order_relaxed);
+}
+
+}  // namespace session
+
+using session::Clock;
+using session::msSince;
+using session::totals;
+
+namespace {
+
+std::atomic<std::uint64_t> g_nextId{1};
 
 // ---- per-frame executor accounting + throttled log (executorStatsJson, docs/engine/pipeline-architecture.md 24) --------------------------------
 struct ExecLog {
@@ -357,9 +232,35 @@ std::string executorStatsJson() {
   return j + "}}";
 }
 
-int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out) {
-  if (gpuUsable(job)) {  // Vulkan -> GLES 3.1 -> CPU (5.9)
-    const int g = renderGpu(job, ps, bake, out);
+EngineSession::EngineSession() : id_(g_nextId.fetch_add(1)) {}
+
+// The frame's blocks before the bake, at the size of the executor tried first: the GPU renders the store resized to the size of `src` (or
+// srcLongEdge) with the export's output sharpening after a downscale; the CPU renders `src`. HDR is not bound yet (it needs the tone table).
+EngineSession::FrameDraft EngineSession::draftFrame(const FrameJob& job, bool gpu) const {
+  FrameDraft d;
+  d.gpu = gpu;
+  int rw = job.src.linear.width, rh = job.src.linear.height;
+  if (gpu && job.srcLongEdge > 0) {
+    const int W = job.store->width(), H = job.store->height(), longEdge = std::max(W, H);
+    if (longEdge > job.srcLongEdge) {
+      const double scale = double(job.srcLongEdge) / longEdge;  // image.cpp resizeToLongEdge
+      rw = std::max(1, int(std::lround(W * scale)));
+      rh = std::max(1, int(std::lround(H * scale)));
+    } else {
+      rw = W;
+      rh = H;
+    }
+  }
+  d.point = engine::point::resolveFrame(job.point, rw, rh, job.src.sceneReferred, job.fastOptions, &job.src);
+  d.local = localadj::bind(job.point.p, job.src, job.fastOptions.spatial == SpatialQuality::Interactive);
+  if (gpu && job.resizeSharpen > 0.f && (rw < job.store->width() || rh < job.store->height())) d.point.resizeSharpen = job.resizeSharpen;  // adds the Detail node
+  d.blocks = resolveFrameBlocks(job.point.p, point::facts(d.point, job.fastOptions, job.src.sceneReferred), {d.local.get(), d.point.warp.field.get()});
+  return d;
+}
+
+int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut& bake, const FrameDraft& draft, FrameResult& out) {
+  if (draft.gpu) {  // Vulkan -> GLES 3.1 -> CPU (5.9)
+    const int g = renderGpu(job, ps, bake, draft, out);
     if (g != 1) return g;
   } else {
     GpuProvider* pv = gpuProvider();
@@ -371,24 +272,17 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     return 1;
   }
   const auto t0 = Clock::now();
-  const point::Blocks& fp = fk.blocks();
   const FrameBlocks fb = fk.frameBlocks();
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
-  const ValidationResult v = g.validate();
-  if (!v.ok) {
-    out.error = "engine graph: " + v.error;
-    return -1;
+  const FrameView view{&fk.blocks(), &fb};
+  if (draft.gpu) {  // the graph was wired for the GPU's blocks: the CPU's may wire differently (rare: then its own graph)
+    Graph cg = GraphBuilder::build(ps, view);
+    if (cg.structureHash() != graph_.structureHash()) {
+      session::keyGraph(cg, ps, job.holdSolves);
+      graph_ = std::move(cg);
+    }
   }
-  if (job.holdSolves) g.computeKeysHoldingSolves(ps);
-  else g.computeKeys(ps);
-  const Plan plan = Planner::plan(g, makeRequest(fk, fb, ExecMode::Whole, 0, 0, 4), &cache_);
-  {
-    const double ms = msSince(t0);
-    stats_.planMs += ms;
-    totals().planUs.fetch_add(std::uint64_t(ms * 1000.0), std::memory_order_relaxed);
-  }
-  ++stats_.planned;
-  totals().planned.fetch_add(1, std::memory_order_relaxed);
+  const Plan plan = Planner::plan(graph_, session::request(fk.width(), fk.height(), ExecMode::Whole, 0, 0, view), &cache_);
+  session::notePlanned(stats_, msSince(t0));
   if (plan.unsupported) {
     frameWhy_ += std::string(frameWhy_.empty() ? "" : "; ") + "cpu plan unsupported: " + std::string(plan.why ? plan.why : "?");
     return 1;
@@ -399,7 +293,7 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     out.error = "out of memory";
     return -1;
   }
-  ExecEnv env{fk, g, cache_, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, rgba, job.outFloat ? 3 : 4, job.outFloat};
+  ExecEnv env{fk, graph_, cache_, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, rgba, job.outFloat ? 3 : 4, job.outFloat};
   ExecStats es;
   const auto t1 = Clock::now();
   const Status s = CpuExecutor::run(plan, env, &es);
@@ -408,7 +302,7 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     stats_.execMs += ms;
     totals().execUs.fetch_add(std::uint64_t(ms * 1000.0), std::memory_order_relaxed);
   }
-  addStats(stats_, es);
+  session::addStats(stats_, es);
   totals().sweeps.fetch_add(std::uint64_t(es.sweeps), std::memory_order_relaxed);
   totals().tiles.fetch_add(std::uint64_t(es.tiles), std::memory_order_relaxed);
   totals().solveHits.fetch_add(std::uint64_t(es.solveHits), std::memory_order_relaxed);
@@ -434,89 +328,6 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     return -1;
   }
   return 1;  // Unsupported (film stage failed ...): the caller reports an explicit error, there is no second point
-}
-
-int EngineSession::renderExactGpu(const EditParams& params, const engine::point::Params& point, const SourceImage& src, const ExactOptions& opt, Image8& out,
-                                  std::string* err) {
-  GpuProvider* pv = gpuProvider();
-  if (!gpuOverride_ && !(pv && pv->enabled())) return 1;
-  IGpuExecutor* x = gpuExecutor();
-  if (!x) return 1;
-  const int W = src.linear.width, H = src.linear.height;
-  if (W < 1 || H < 1) return 1;
-  FastOptions fo;
-  fo.spatial = SpatialQuality::Full;
-  point::Blocks fp = engine::point::resolveFrame(point, W, H, src.sceneReferred, fo, &src);
-  if (!fp.supported) return 1;
-  const std::shared_ptr<const local::Frame> lf = localadj::bind(point.p, src, false);
-  ParamInputs in;
-  in.edit = params;
-  in.frame.exact = true;
-  in.ctx.sourceId = id_;
-  in.ctx.sceneReferred = src.sceneReferred;
-  in.ctx.hasProxy = opt.hasProxy;
-  const std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
-  in.ctx.filmLib = lib.get();
-  in.ctx.srcW = W;
-  in.ctx.srcH = H;
-  const ParamSet ps = ParamSet::make(std::move(in));
-  const FrameBlocks fb = resolveFrameBlocks(params, point::facts(fp, fo, src.sceneReferred), {lf.get(), fp.warp.field.get()});
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);  // the exact variant: ToneColourExact, no table nodes
-  if (const ValidationResult v = g.validate(); !v.ok) {
-    if (err) *err = "engine graph: " + v.error;
-    return -1;
-  }
-  g.computeKeys(ps);
-  // The GPU evaluates the exact colour stage through the finest lattice (65^3 + the overflow lattice) baked with the exact analysis; the CPU
-  // executor remains the per-pixel reference (docs/engine/pipeline-architecture.md 21).
-  const std::shared_ptr<const BakedLut> bake = engine::point::bake(point, src, 65, nullptr, false);
-  if (!bake) return 1;
-  engine::point::hdrBind(point, src, fp.hdr, &bake->tone);
-  const bool tiled = opt.mode == ExecMode::TiledExport;
-  const int tile = opt.tile > 0 ? opt.tile : (x->caps().unifiedMemory ? 1024 : 2048);
-  const Plan plan = Planner::plan(g, requestFromFrame(fp, fb, tiled ? ExecMode::TiledExport : ExecMode::Whole, tiled ? tile : 0, std::size_t(1) << 30, true), nullptr);
-  MemorySourceStore store(src);
-  GpuRun run{plan, g, fp, fb, store, *bake, nullptr, &point, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
-  out.width = fp.geo.outW;
-  out.height = fp.geo.outH;
-  out.data.assign(std::size_t(out.width) * out.height * 3, 0);
-  if (tiled) {
-    run.target.sink = [&](int x0, int y0, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
-      for (int j = 0; j < th; ++j) {
-        const std::uint8_t* s = rgba + std::size_t(j) * stride;
-        std::uint8_t* d = out.data.data() + (std::size_t(y0 + j) * std::size_t(out.width) + std::size_t(x0)) * 3;
-        for (int i = 0; i < tw; ++i) {
-          d[3 * i] = s[4 * i];
-          d[3 * i + 1] = s[4 * i + 1];
-          d[3 * i + 2] = s[4 * i + 2];
-        }
-      }
-      return true;
-    };
-  }
-  GpuOut go;
-  const int r = runOnGpu(run, go);
-  if (r == 0) {
-    if (!tiled) {
-      if (!go.rgba || go.w != out.width || go.h != out.height) {
-        std::free(go.rgba);
-        return 1;
-      }
-      for (std::size_t i = 0, n = std::size_t(out.width) * out.height; i < n; ++i) {
-        out.data[3 * i] = go.rgba[4 * i];
-        out.data[3 * i + 1] = go.rgba[4 * i + 1];
-        out.data[3 * i + 2] = go.rgba[4 * i + 2];
-      }
-      std::free(go.rgba);
-    }
-    return 0;
-  }
-  if (r == -2) {
-    if (err) *err = "cancelled";
-    return -1;
-  }
-  if (r < 0 && err) *err = go.error;
-  return r;
 }
 
 bool EngineSession::renderExact(const EditParams& params, const engine::point::Params& point, const SourceImage& src,
@@ -547,7 +358,7 @@ bool EngineSession::renderExact(const EditParams& params, const engine::point::P
   const ParamSet ps = ParamSet::make(std::move(in));
   const point::Blocks& fp = fk.blocks();
   const FrameBlocks fb = fk.frameBlocks();
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
+  Graph g = GraphBuilder::build(ps, FrameView{&fp, &fb});
   const ValidationResult v = g.validate();
   if (!v.ok) {
     if (err) *err = "engine graph: " + v.error;
@@ -557,14 +368,13 @@ bool EngineSession::renderExact(const EditParams& params, const engine::point::P
   const auto t0 = Clock::now();
   ResultCache local;
   ResultCache& cache = opt.sessionCache ? cache_ : local;
-  PlanRequest prq = makeRequest(fk, fb, opt.mode, opt.tile, opt.memBudget, 3);
+  PlanRequest prq = session::request(fk.width(), fk.height(), opt.mode, opt.tile, opt.memBudget, FrameView{&fp, &fb});
   // a streamed film frame keeps its tiles: the film plane arrives in bands (section 42.6); env DAPPLE_FILM_TILES=1: the whole-frame film export in
   // tiles too (comparisons at the same tile size)
   prq.filmTiles = streaming || (std::getenv("DAPPLE_FILM_TILES") && std::getenv("DAPPLE_FILM_TILES")[0] == '1');
   Plan plan = Planner::plan(g, prq, &cache);
   if (streaming && opt.tile > 0 && !std::getenv("DAPPLE_EXPORT_STREAM_TILE")) {  // a wide halo (local clarity / dehaze: ~400 px at 60 MP) costs (T + 2h)^2 / T^2 per tile: wider tiles then
-    int h = 0;
-    for (const Stage& st : plan.stages) h = std::max({h, st.halo.x, st.halo.y});
+    const int h = plan.maxHalo();
     const int want = std::min(1024, (2 * h + 63) / 64 * 64);
     if (want > opt.tile && plan.grid.nx * plan.grid.ny > 1) {
       prq.tile = want;
@@ -616,11 +426,12 @@ bool EngineSession::renderExact(const EditParams& params, const engine::point::P
     env.filmBegin = [&] { return fk.filmStreamBegin(&filmWhy); };
     env.filmRows = [&](int y0, int y1, ImageF& o) { return fk.filmStreamRows(y0, y1, o); };
     env.filmAux = [&](int x0, int y0, int x1, int y1, const local::AuxTarget& a) { return fk.filmStreamAux(x0, y0, x1, y1, a); };
-    env.prepare = [&](int x0, int y0, int x1, int y1) {
-      int sx0, sy0, sx1, sy1;
-      fk.sourceRect(x0, y0, x1, y1, sx0, sy0, sx1, sy1);
+    env.prepare = [&](const TileWin& tw) {
+      // the plan's source window of the tile (the same the GPU executor streams)
+      int sx0 = tw.source.x0, sy0 = tw.source.y0, sx1 = tw.source.x1, sy1 = tw.source.y1;
       if (haveWin && sx0 >= winX0 && sy0 >= winY0 && sx1 <= winX1 && sy1 <= winY1) return true;
       // the source of the whole band row when that is not much more than the band (no or quarter-turn geometry), else of this tile alone
+      const int y0 = tw.work.y0, y1 = tw.work.y1;
       int bx0, by0, bx1, by1;
       fk.sourceRect(0, y0, W, y1, bx0, by0, bx1, by1);
       if (double(bx1 - bx0) * double(by1 - by0) <= 2.5 * double(W) * double(y1 - y0)) sx0 = bx0, sy0 = by0, sx1 = bx1, sy1 = by1;
@@ -649,7 +460,7 @@ bool EngineSession::renderExact(const EditParams& params, const engine::point::P
     fk.setSourceWindow(nullptr, 0, 0);
     fk.setSourceProvider(nullptr);
   }
-  addStats(stats_, es);
+  session::addStats(stats_, es);
   if (statsOut) *statsOut = es;
   if (s == Status::Unsupported) {
     ++stats_.fallbacks;
@@ -666,159 +477,6 @@ bool EngineSession::renderExact(const EditParams& params, const engine::point::P
     return false;
   }
   return true;
-}
-
-std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, const ParamSet& ps, int n, FrameResult& out) {
-  const Graph& g = graph_;
-  const NodeInstance* latN = g.find(NodeType::ColourLattice);
-  const NodeInstance* preN = g.find(NodeType::ToneAnalysisPre);
-  const NodeInstance* anN = g.find(NodeType::Analysis);
-  const NodeInstance* ovN = g.find(NodeType::LatticeOverflow);
-  const int nReq = std::clamp(n, 17, 65);
-  const TableEnv env{job.point, job.src};
-  const bool move = job.params.toneStrength > 0.f;
-
-  // the finest cached lattice of this colour stage that is at least as fine as asked for
-  std::shared_ptr<std::vector<float>> lattice;
-  int latticeN = 0;
-  Hash128 latticeKey;
-  if (ResultCache::Entry* e = cache_.findBest(NodeType::ColourLattice, latN->family, nReq)) {
-    lattice = as<std::vector<float>>(e->payload);
-    latticeN = e->order;
-    latticeKey = e->key;
-  }
-
-  TableKeys tk;  // keys under the lattice actually used (see effectiveTableKeys)
-  auto deriveKeys = [&] { tk = effectiveTableKeys(g, ps, latticeN); };
-  if (lattice) deriveKeys();
-
-  engine::point::TonePre pre;
-  bool preReady = false;
-  auto ensurePre = [&]() -> engine::point::TonePre& {
-    if (preReady) return pre;
-    if (ResultCache::Entry* e = cache_.find(NodeType::ToneAnalysisPre, tk.pre)) {
-      pre = *as<engine::point::TonePre>(e->payload);
-    } else {
-      const TableBakeCtx bc{&env, latticeN, job.request.fastAnalysis, 0.f};
-      const void* in[1] = {lattice.get()};
-      const auto made = as<engine::point::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &bc, in));
-      pre = made ? *made : engine::point::TonePre{};
-      ResultCache::Entry ne;
-      ne.key = ne.family = tk.pre;
-      ne.payload = std::make_shared<engine::point::TonePre>(pre);
-      ne.bytes = sizeof(engine::point::TonePre) + pre.toneMove.size() * 4;
-      cache_.put(NodeType::ToneAnalysisPre, std::move(ne));
-      ++stats_.preBuilds;
-    }
-    preReady = true;
-    return pre;
-  };
-
-  std::shared_ptr<const BakedLut> bl;
-  if (lattice) {
-    if (ResultCache::Entry* e = cache_.find(NodeType::AssembledBake, combine(tk.tone, tk.lattice))) {
-      bl = as<BakedLut>(e->payload);
-      out.bake = FrameResult::Bake::FullHit;
-    }
-  }
-  if (!bl) {
-    if (lattice) {
-      out.bake = FrameResult::Bake::LatticeReuse;
-      bakeCounters().latticeReused.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      out.bake = FrameResult::Bake::LatticeBake;
-      bakeCounters().latticeEvaluated.fetch_add(1, std::memory_order_relaxed);
-      const TableBakeCtx bc{&env, nReq, false, 0.f};
-      lattice = as<std::vector<float>>(bakeNode(NodeType::ColourLattice, &bc));
-      if (!lattice) {
-        out.error = "colour lattice";
-        return nullptr;
-      }
-      latticeN = nReq;
-      latticeKey = withOrder(latN->family, nReq);
-      ResultCache::Entry ne;
-      ne.key = latticeKey;
-      ne.family = latN->family;
-      ne.order = nReq;
-      ne.payload = lattice;
-      ne.bytes = lattice->size() * sizeof(float);
-      cache_.put(NodeType::ColourLattice, std::move(ne));
-      deriveKeys();
-    }
-    ToneTableOut tt;
-    if (ResultCache::Entry* e = cache_.find(NodeType::ToneTable, tk.tone)) {
-      tt = *as<ToneTableOut>(e->payload);
-    } else {
-      const engine::point::TonePre* p = (move && preN) ? &ensurePre() : nullptr;
-      const TableBakeCtx bc{&env, latticeN, false, 0.f};
-      const void* in[1] = {p};
-      const auto made = as<ToneTableOut>(bakeNode(NodeType::ToneTable, &bc, in));
-      tt = made ? *made : ToneTableOut{};
-      ResultCache::Entry ne;
-      ne.key = ne.family = tk.tone;
-      ne.payload = std::make_shared<ToneTableOut>(tt);
-      ne.bytes = (tt.tone.size() + tt.toneMove.size()) * 4;
-      cache_.put(NodeType::ToneTable, std::move(ne));
-      ++stats_.toneTableBuilds;
-    }
-    auto nb = std::make_shared<BakedLut>();
-    nb->n = latticeN;
-    nb->rgb = *lattice;
-    nb->tone = std::move(tt.tone);
-    nb->toneMove = std::move(tt.toneMove);
-    const Hash128 ak = combine(tk.tone, tk.lattice);
-    nb->key = ak.hex() + "#" + std::to_string(latticeN);
-    nb->colourKey = latN->family.hex();
-    ResultCache::Entry ae;
-    ae.key = ak;
-    ae.family = tk.tone;
-    ae.order = latticeN;
-    ae.ref = latticeKey;
-    ae.payload = nb;
-    ae.bytes = nb->rgb.size() * 4 + nb->tone.size() * 4;
-    cache_.put(NodeType::AssembledBake, std::move(ae));
-    // a lattice lives exactly as long as a retained bake refers to it (the old bakes[3] kept it inside each bake)
-    const auto& live = cache_.entries(NodeType::AssembledBake);
-    cache_.eraseIf(NodeType::ColourLattice, [&](const ResultCache::Entry& le) {
-      for (const auto& a : live)
-        if (a.ref == le.key) return false;
-      return true;
-    });
-    bl = nb;
-  }
-
-  if (ovN) {  // overflow lattice for a GPU executor: cached by its own key, not part of the CPU frame
-    if (!cache_.find(NodeType::LatticeOverflow, tk.overflow)) {
-      ResultCache::Entry ne;
-      ne.key = ne.family = tk.overflow;
-      const TableBakeCtx bc{&env, 33, false, 8.f};
-      auto v = as<std::vector<float>>(bakeNode(NodeType::LatticeOverflow, &bc));
-      if (!v) v = std::make_shared<std::vector<float>>();
-      ne.bytes = v->size() * 4;
-      ne.payload = v;
-      cache_.put(NodeType::LatticeOverflow, std::move(ne));
-    }
-  }
-
-  if (anN) {
-    if (ResultCache::Entry* e = cache_.find(NodeType::Analysis, tk.analysis)) {
-      out.analysis = *as<ToneAnalysis>(e->payload);
-    } else {
-      const engine::point::TonePre* p = preN ? &ensurePre() : nullptr;
-      const TableBakeCtx bc{&env, latticeN, false, 0.f};
-      const void* in[1] = {p};
-      const auto made = as<ToneAnalysis>(bakeNode(NodeType::Analysis, &bc, in));
-      out.analysis = made ? *made : ToneAnalysis{};
-      ResultCache::Entry ne;
-      ne.key = ne.family = tk.analysis;
-      ne.payload = std::make_shared<ToneAnalysis>(out.analysis);
-      ne.bytes = out.analysis.histogram.size() * 4 + 128;
-      cache_.put(NodeType::Analysis, std::move(ne));
-      ++stats_.analysisBuilds;
-    }
-    out.hasAnalysis = true;
-  }
-  return bl;
 }
 
 bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
@@ -849,13 +507,15 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   in.ctx.gainFn = &gainOf;
   in.ctx.gainUser = &gainCtx;
   const ParamSet ps = ParamSet::make(std::move(in));
-  graph_ = GraphBuilder::build(ps, GraphDetail::Tables);
+  // the one graph of the frame: its table nodes are evaluated first, then it is planned against the bound blocks of the executor
+  const FrameDraft draft = draftFrame(job, gpuFrame);
+  graph_ = GraphBuilder::build(ps, draft.view());
   const ValidationResult v = graph_.validate();
   if (!v.ok) {
     out.error = "engine graph: " + v.error;
     return false;
   }
-  graph_.computeKeys(ps);
+  session::keyGraph(graph_, ps, job.holdSolves);
   stats_.graphMs += msSince(t0);
 
   const int n = job.request.bakeSize;
@@ -868,34 +528,25 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
     return false;
   }
 
-  // ---- the frame: GPU executor where it supports the plan, else the CpuExecutor on the same plan ---------------------------
-  int w = 0, h = 0;
-  std::uint8_t* rgba = nullptr;
+  // ---- the frame: GPU executor where it supports the plan, else the CpuExecutor on the same graph ---------------------------------
   const auto tExec = Clock::now();
-  const int r = renderFull(job, ps, *bake, out);
+  const int r = renderFull(job, ps, *bake, draft, out);
   out.cpu.execMs = msSince(tExec);
   out.cpu.matchMs = job.matchMs;
   out.cpu.rendererMs = job.rendererMs;
   out.cpu.totalMs = msSince(t0) + job.matchMs + job.rendererMs;
   if (r < 0) return false;
-  if (r == 0) {
-    rgba = out.rgba;
-    w = out.w;
-    h = out.h;
-  } else {
-    // r == 1: neither executor took the plan. There is no second point behind it: that is an explicit error (also for a film whose stock /
-    // paper is not in the library or whose table bake failed; highlight boost and the enlarger diffusion filter are film nodes).
+  if (r != 0) {
+    // neither executor took the plan. There is no second point behind it: that is an explicit error (also for a film whose stock / paper is not
+    // in the library or whose table bake failed; highlight boost and the enlarger diffusion filter are film nodes).
     out.error = "engine: plan not supported by any executor" + (frameWhy_.empty() ? std::string() : " (" + frameWhy_ + ")") +
                 (engine::point::filmActive(job.point.p) ? " [film: unknown stock / paper or failed table bake]" : "");
     return false;
   }
-  if (!rgba && !out.external && !out.floatOut) {
+  if (!out.rgba && !out.external && !out.floatOut) {
     out.error = "out of memory";
     return false;
   }
-  out.rgba = rgba;
-  out.w = w;
-  out.h = h;
   if (out.executor.empty()) out.executor = "cpu";
   out.why = frameWhy_;
   noteFrame(job, out);
@@ -908,302 +559,6 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
     case FrameResult::Bake::LatticeBake: ++stats_.latticeBake; totals().latticeBake.fetch_add(1, std::memory_order_relaxed); break;
   }
   return true;
-}
-
-// ---- GPU executor selection (docs/engine/pipeline-architecture.md 5.9) --------------------------------------------------------------
-//   Unsupported  this plan cannot run on the GPU -> this frame on the CPU executor, the GPU stays in use (counted)
-//   Transient    OOM / timeout / failed submission -> release the device copies and retry once; else this frame on the CPU
-//   DeviceLost   -> the provider rebuilds the device once (executors re-create their copies from SourceStore + tables);
-//                   a failed rebuild or a second loss gives the API up and the next one (Vulkan -> GLES 3.1 -> CPU) takes over
-// The provider owns the device(s); the session owns one executor (device copies of this photo) per device generation.
-
-void EngineSession::useGpuExecutor(IGpuExecutor* x, bool force) {
-  gpuOverride_ = x;
-  gpuForce_ = force && x;
-  if (x) gpuOwned_.reset();
-}
-
-void EngineSession::injectGpuFailure(GpuFailure f, int count) {
-  if (IGpuExecutor* x = gpuExecutor()) x->injectFailure(f, count);
-}
-
-bool EngineSession::gpuUsable(const FrameJob& job) const {
-  if (!job.store || job.outFloat) return false;
-  if (gpuOverride_) return true;
-  GpuProvider* p = gpuProvider();
-  return p && p->enabled();
-}
-
-IGpuExecutor* EngineSession::gpuExecutor() {
-  if (gpuOverride_) return gpuOverride_;
-  GpuProvider* p = gpuProvider();
-  if (!p || !p->enabled()) return nullptr;
-  if (gpuOwned_ && gpuGen_ == p->generation()) return gpuOwned_.get();
-  gpuOwned_.reset();
-  std::string why;
-  gpuOwned_ = p->createExecutor(why);
-  gpuGen_ = p->generation();  // creating the first context bumps it
-  if (!gpuOwned_) {
-    if (why != gpuWhy_) {
-      gpuWhy_ = why;
-      gpuLog("GPU unavailable, using the CPU", why);
-    }
-    return nullptr;
-  }
-  return gpuOwned_.get();
-}
-
-// 0 = `go` holds the result, 1 = the CPU takes it, -1 = failed (forced executor), -2 = cancelled
-int EngineSession::runOnGpu(const GpuRun& run, GpuOut& go) {
-  GpuProvider* pv = gpuProvider();
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    IGpuExecutor* x = gpuExecutor();
-    if (!x) {
-      frameWhy_ = gpuWhy_.empty() ? "no GPU executor" : gpuWhy_;
-      return 1;
-    }
-    go = GpuOut{};
-    const Status s = x->run(run, go);
-    if (s == Status::Ok) {
-      ++stats_.gpuFrames;
-      totals().gpuFrames.fetch_add(1, std::memory_order_relaxed);
-      gpuLastApi_ = x->api();
-      return 0;
-    }
-    std::free(go.rgba);
-    go.rgba = nullptr;
-    if (s == Status::Cancelled) return -2;
-    if (gpuForce_) {
-      gpuLog("forced executor failed", std::string("status ") + std::to_string(int(s)) + ", failure " + std::to_string(int(go.failure)) + ": " + go.error);
-      return -1;
-    }
-    switch (go.failure) {
-      case GpuFailure::Transient:
-        ++stats_.gpuTransients;
-        totals().gpuTransients.fetch_add(1, std::memory_order_relaxed);
-        gpuLog("frame failed", go.error);
-        x->release();  // drop the device copies (pools, resident source): they are rebuilt from the SourceStore
-        frameWhy_ = "transient GPU failure: " + go.error;
-        if (attempt == 0) continue;
-        return 1;
-      case GpuFailure::DeviceLost: {
-        ++stats_.gpuLost;
-        totals().gpuLost.fetch_add(1, std::memory_order_relaxed);
-        gpuLog("device lost", go.error);
-        frameWhy_ = "device lost: " + go.error;
-        if (pv && !gpuOverride_) {
-          std::string why;
-          if (pv->recover(why)) {
-            gpuLog("device rebuilt", "");
-          } else {
-            totals().gpuDemotions.fetch_add(1, std::memory_order_relaxed);
-            gpuLog(pv->enabled() ? "device rebuild failed, next backend" : "device rebuild failed, CPU for the rest of the session", why);
-          }
-          gpuOwned_.reset();
-        }
-        return 1;
-      }
-      default:
-        ++stats_.gpuUnsupported;
-        if (go.error.find("enlarger diffusion") != std::string::npos) ++stats_.gpuEnlargerTiled;
-        totals().gpuFallbacks.fetch_add(1, std::memory_order_relaxed);
-        frameWhy_ = go.error.empty() ? "unsupported (no reason given)" : go.error;
-        return 1;
-    }
-  }
-  return 1;
-}
-
-int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out) {
-  const auto t0 = Clock::now();
-  int rw = job.src.linear.width, rh = job.src.linear.height;  // the frame is rendered at the size of the CPU copy unless asked otherwise
-  if (job.srcLongEdge > 0) {
-    const int W = job.store->width(), H = job.store->height(), longEdge = std::max(W, H);
-    if (longEdge > job.srcLongEdge) {
-      const double scale = double(job.srcLongEdge) / longEdge;  // image.cpp resizeToLongEdge
-      rw = std::max(1, int(std::lround(W * scale)));
-      rh = std::max(1, int(std::lround(H * scale)));
-    } else {
-      rw = W;
-      rh = H;
-    }
-  }
-  point::Blocks fp = engine::point::resolveFrame(job.point, rw, rh, job.src.sceneReferred, job.fastOptions, &job.src);
-  engine::point::hdrBind(job.point, job.src, fp.hdr, &bake.tone);  // single-image HDR: the field comes from the CPU source (a pure function of source + white balance)
-  const std::shared_ptr<const local::Frame> lf = localadj::bind(job.point.p, job.src, job.fastOptions.spatial == SpatialQuality::Interactive);
-  if (job.resizeSharpen > 0.f && (rw < job.store->width() || rh < job.store->height())) fp.resizeSharpen = job.resizeSharpen;  // adds the Detail node
-  if (!fp.supported) {
-    ++stats_.gpuUnsupported;
-    totals().gpuFallbacks.fetch_add(1, std::memory_order_relaxed);
-    frameWhy_ = "unsupported on the GPU: " + fp.why;
-    if (gpuForce_) return out.error = frameWhy_, -1;
-    return 1;
-  }
-  const FrameBlocks fb = resolveFrameBlocks(job.point.p, point::facts(fp, job.fastOptions, job.src.sceneReferred), {lf.get(), fp.warp.field.get()});
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
-  const ValidationResult v = g.validate();
-  if (!v.ok) {
-    out.error = "engine graph: " + v.error;
-    return -1;
-  }
-  if (job.holdSolves) g.computeKeysHoldingSolves(ps);
-  else g.computeKeys(ps);
-  // the GPU plan is made against the executor's own cache of device solves (the session cache holds CPU payloads): a frame whose dehaze / clarity
-  // solve is still on the device skips the accumulation sweep and the solve
-  IGpuExecutor* gx = gpuExecutor();
-  const Plan plan = Planner::plan(g, requestFromFrame(fp, fb, ExecMode::Whole, 0, 0), gx ? gx->solveCache() : nullptr);
-  {
-    const double ms = msSince(t0);
-    stats_.planMs += ms;
-    totals().planUs.fetch_add(std::uint64_t(ms * 1000.0), std::memory_order_relaxed);
-  }
-  ++stats_.planned;
-  totals().planned.fetch_add(1, std::memory_order_relaxed);
-  const std::vector<float>* over = overflowFor(ps, bake.n);
-  GpuRun run{plan, g, fp, fb, *job.store, bake, over, &job.point, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
-  run.target.external = job.gpuTarget;
-  GpuOut go;
-  const auto t1 = Clock::now();
-  const int r = runOnGpu(run, go);
-  if (r == 0) {
-    const double ms = msSince(t1);
-    stats_.execMs += ms;
-    totals().execUs.fetch_add(std::uint64_t(ms * 1000.0), std::memory_order_relaxed);
-    out.rgba = go.rgba;
-    out.w = go.w;
-    out.h = go.h;
-    out.external = job.gpuTarget != nullptr && go.rgba == nullptr;
-    out.gpu = go.stats;
-    out.executor = gpuLastApi_ == hal::Api::Gles31 ? "gles31" : gpuLastApi_ == hal::Api::Metal ? "metal" : "vulkan";
-    return 0;
-  }
-  if (r == -2) {
-    ++stats_.cancelled;
-    totals().cancelled.fetch_add(1, std::memory_order_relaxed);
-    out.error = "cancelled";
-    return -1;
-  }
-  if (r < 0) out.error = go.error.empty() ? "GPU frame failed" : go.error;
-  return r;
-}
-
-// LatticeOverflow payload of the frame (cached by runHostTables when the request asked for it), or null.
-const std::vector<float>* EngineSession::overflowFor(const ParamSet& ps, int n) const {
-  const TableKeys tk = effectiveTableKeys(graph_, ps, n);
-  if (!tk.hasOverflow) return nullptr;
-  const ResultCache::Entry* e = cache_.peek(NodeType::LatticeOverflow, tk.overflow);
-  return e ? static_cast<const std::vector<float>*>(e->payload.get()) : nullptr;
-}
-
-int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
-  auto bail = [&](int rc, const std::string& m) {
-    if (err) *err = m;
-    return rc;
-  };
-  GpuProvider* pv = gpuProvider();
-  if (!gpuOverride_ && !(pv && pv->enabled())) return 1;
-  IGpuExecutor* x = gpuExecutor();
-  if (!x) return 1;
-  const int W = e.image.linear.width, H = e.image.linear.height;
-  ParamInputs in;
-  in.edit = e.params;
-  in.frame.bakeSize = e.latticeN;
-  in.frame.fastAnalysis = false;
-  in.frame.noise = true;
-  in.frame.wantOverflow = true;
-  in.frame.longEdge = e.outLongEdge;
-  in.ctx.sourceId = id_;
-  in.ctx.sceneReferred = e.image.sceneReferred;
-  in.ctx.hasProxy = false;
-  in.ctx.cameraId = e.camera.id;
-  in.ctx.lutIdentity = e.lut ? std::uintptr_t(e.lut->contentId()) : 0;
-  const std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
-  in.ctx.filmLib = lib.get();
-  in.ctx.srcW = W;
-  in.ctx.srcH = H;
-  FrameJob fj{e.params, e.point, e.image, nullptr, e.camera, e.lut, {}, {}, {}};
-  fj.request = in.frame;
-  fj.fastOptions.spatial = SpatialQuality::Full;
-  const ParamSet ps = ParamSet::make(std::move(in));
-  graph_ = GraphBuilder::build(ps, GraphDetail::Tables);
-  if (const ValidationResult v = graph_.validate(); !v.ok) return bail(-1, "engine graph: " + v.error);
-  graph_.computeKeys(ps);
-  FrameResult fr;
-  const std::shared_ptr<const BakedLut> bake = runHostTables(fj, ps, e.latticeN, fr);
-  if (!bake) return bail(-1, "tables");
-
-  int rw = W, rh = H;  // image.cpp resizeToLongEdge
-  const int srcLong = std::max(W, H);
-  const bool down = e.outLongEdge > 0 && srcLong > e.outLongEdge;
-  if (down) {
-    const double scale = double(e.outLongEdge) / srcLong;
-    rw = std::max(1, int(std::lround(W * scale)));
-    rh = std::max(1, int(std::lround(H * scale)));
-  }
-  point::Blocks fp = engine::point::resolveFrame(e.point, rw, rh, e.image.sceneReferred, fj.fastOptions, &e.image);
-  engine::point::hdrBind(e.point, e.image, fp.hdr, &bake->tone);
-  if (!fp.supported) return bail(1, "unsupported on the GPU: " + fp.why);
-  const std::shared_ptr<const local::Frame> lf = localadj::bind(e.point.p, e.image, false);
-  fp.resizeSharpen = down ? e.resizeSharpen : 0.f;
-  const FrameBlocks fb = resolveFrameBlocks(e.point.p, point::facts(fp, fj.fastOptions, e.image.sceneReferred), {lf.get(), fp.warp.field.get()});
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
-  if (const ValidationResult v = g.validate(); !v.ok) return bail(-1, "engine graph: " + v.error);
-  g.computeKeys(ps);
-  // mobile / unified memory: tile 1024 keeps the export pool near 320 MB (pixel-architecture.md 16 rule 8)
-  const int tile = e.tile > 0 ? e.tile : (x->caps().unifiedMemory ? 1024 : 2048);
-  const Plan plan = Planner::plan(g, requestFromFrame(fp, fb, ExecMode::TiledExport, tile, std::size_t(1) << 30, true), nullptr);
-  if (e.onSize) e.onSize(fp.geo.outW, fp.geo.outH);
-  GpuRun run{plan, g, fp, fb, e.store, *bake, overflowFor(ps, bake->n), &e.point,
-             GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, e.target, e.forceStream};
-  GpuOut go;
-  const int r = runOnGpu(run, go);
-  if (r == 0) {
-    if (stats) *stats = go.stats;
-    return 0;
-  }
-  if (r == -2) return bail(-1, "cancelled");
-  return bail(r, go.error);
-}
-
-// ---- the Resize node (CpuImpl::bake): the session source at a smaller long edge, cached ------------------------------------------------
-
-std::shared_ptr<const SourceImage> EngineSession::resizedSource(const SourceImage& full, int longEdge, bool cacheLarge) {
-  const int own = std::max(full.linear.width, full.linear.height);
-  if (longEdge <= 0 || longEdge >= own) return nullptr;
-  Hasher h;
-  h.u64(id_);
-  h.i32(longEdge);
-  h.i32(full.linear.width);
-  h.i32(full.linear.height);
-  const Hash128 key = h.finish();
-  std::lock_guard<std::mutex> lock(resizeMtx_);
-  if (const ResultCache::Entry* e = cache_.peek(NodeType::Resize, key)) {  // LRU: a hit moves the entry to the back
-    ResultCache::Entry moved = *e;
-    std::shared_ptr<const SourceImage> hit = as<const SourceImage>(moved.payload);
-    cache_.eraseIf(NodeType::Resize, [&](const ResultCache::Entry& x) { return x.key == key; });
-    cache_.put(NodeType::Resize, std::move(moved));
-    return hit;
-  }
-  const resize::BakeCtx ctx{&full, longEdge};
-  std::shared_ptr<void> made = bakeNode(NodeType::Resize, &ctx);
-  if (!made) return nullptr;
-  auto img = as<const SourceImage>(made);
-  if (!cacheLarge && img->linear.data.size() * sizeof(float) > (64u << 20)) return img;
-  ResultCache::Entry ne;
-  ne.key = ne.family = key;
-  ne.order = longEdge;
-  ne.payload = made;
-  ne.bytes = img->linear.data.size() * sizeof(float);
-  cache_.put(NodeType::Resize, std::move(ne));
-  // at most ~160 MB of scaled copies (the newest always stays), as the C layer's scaledSource did
-  std::size_t total = 0;
-  for (const auto& e : cache_.entries(NodeType::Resize)) total += e.bytes;
-  while (cache_.entries(NodeType::Resize).size() > 1 && total > (160u << 20)) {
-    const Hash128 oldest = cache_.entries(NodeType::Resize).front().key;
-    total -= cache_.entries(NodeType::Resize).front().bytes;
-    cache_.eraseIf(NodeType::Resize, [&](const ResultCache::Entry& x) { return x.key == oldest; });
-  }
-  return img;
 }
 
 bool renderImage8(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, Image8& out,
@@ -1228,7 +583,7 @@ bool renderImageF(const EditParams& params, const CameraProfile& camera, const L
 }
 
 std::string infoJson() {
-  const Totals& t = totals();
+  const session::Totals& t = totals();
   const BakeCounters& c = bakeCounters();
   std::string j = "{\"engine\":\"full\",\"frames\":" + std::to_string(t.frames.load());
   j += ",\"fullHits\":" + std::to_string(t.fullHits.load());

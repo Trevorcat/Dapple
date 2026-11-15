@@ -101,7 +101,7 @@ class CpuFrame final : public local::PixelSource {
 };
 
 // ---- the family's CPU nodes (block fragments over the frame's binding, nodes/point/cpu.cpp) ------------------------------------------
-// Resolved slot of Source / Resize / Geometry / Gain / Hdr / ToneColour(Exact) / the fused head / Blend / FilmSim: the frame's binding.
+// Resolved slot of Resize / Geometry / Gain / Hdr / ToneColour(Exact) / the fused head / Blend: the frame's binding.
 struct FrameSlot {
   const CpuFrame* frame;
 };
@@ -113,15 +113,15 @@ struct DisplayCpu {
   const int* row0;  // streaming export: frame row of the film band's first row (null: the whole frame)
 };
 void copyBlock(const void* r, float* px, int n, const PixelPos& pos);  // the head of a chain without resampling: the source row as it is
-const CpuImpl& sourceCpu();
-const CpuImpl& geometryCpu();
+const CpuImpl& geometryCpu();    // fuses [Geometry] + Gain + [Hdr] + ToneColour into one fragment (baked variant)
 const CpuImpl& gainCpu();
 const CpuImpl& hdrCpu();
 const CpuImpl& toneColourCpu();  // ToneColour (lattice + overflow) and ToneColourExact
-const CpuImpl& fusedHeadCpu();   // CPU fusion recipe: [Resize | Geometry] + Gain + [Hdr] + ToneColour in one pass (baked variant)
+// The CPU fusion recipe of a head chain led by a resampling node (CpuImpl::fuse of Geometry and Resize): [Resize | Geometry] + Gain + [Hdr]
+// + ToneColour as one block fragment, baked variant only.
+const CpuImpl* fuseHead(const FrameEnv& env, std::span<const NodeType> chain, std::size_t* consumed);
 const CpuImpl& displayCpu();
 const CpuImpl& blendCpu();
-const CpuImpl& filmSimCpu();     // nodes/film/film_glue.cpp: the film render of the whole frame (runFilm)
 
 // A recycled float frame (the renderer's ScratchImage): a fresh 20 MB buffer costs ~5 ms of page faults.
 class ScratchFrame {

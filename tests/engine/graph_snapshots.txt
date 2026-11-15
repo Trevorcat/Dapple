@@ -1,9 +1,4 @@
-== default_final [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 AssembledBake <- n0 n2 n1 [frame]
-== default_final [full]
+== default_final
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -13,13 +8,7 @@ n5 ToneColour <- n4 n3 n2
 n6 NRChroma <- n5
 n7 Detail <- n6
 n8 Pack8 <- n7 [frame]
-== final_analysis [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 Analysis [analysis]
-n4 AssembledBake <- n0 n2 n1 [frame]
-== final_analysis [full]
+== final_analysis
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -30,12 +19,7 @@ n6 ToneColour <- n5 n3 n2
 n7 NRChroma <- n6
 n8 Detail <- n7
 n9 Pack8 <- n8 [frame]
-== interactive [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 AssembledBake <- n0 n2 n1 [frame]
-== interactive [full]
+== interactive
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -45,14 +29,7 @@ n5 ToneColour <- n4 n3 n2
 n6 NRChroma <- n5
 n7 Detail <- n6
 n8 Pack8 <- n7 [frame]
-== interactive_analysis_fast [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneAnalysisPre <- n1~
-n3 ToneTable
-n4 Analysis <- n2~ [analysis]
-n5 AssembledBake <- n0 n3 n1 [frame]
-== interactive_analysis_fast [full]
+== interactive_analysis_fast
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -64,14 +41,7 @@ n7 ToneColour <- n6 n4 n2
 n8 NRChroma <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== tone_move_interactive [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneAnalysisPre <- n1~
-n3 ToneTable <- n2
-n4 Analysis <- n2~ [analysis]
-n5 AssembledBake <- n0 n3 n1 [frame]
-== tone_move_interactive [full]
+== tone_move_interactive
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -83,14 +53,7 @@ n7 ToneColour <- n6 n4 n2
 n8 NRChroma <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== tone_move_final [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneAnalysisPre <- n1~
-n3 ToneTable <- n2
-n4 Analysis <- n2~ [analysis]
-n5 AssembledBake <- n0 n3 n1 [frame]
-== tone_move_final [full]
+== tone_move_final
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -102,11 +65,7 @@ n7 ToneColour <- n6 n4 n2
 n8 NRChroma <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== exact [tables]
-n0 Source
-n1 AssembledBake <- n0 [frame]
-n2 Analysis [analysis]
-== exact [full]
+== exact
 n0 Source
 n1 Resize <- n0
 n2 Gain <- n1
@@ -115,13 +74,7 @@ n4 Analysis [analysis]
 n5 NRChroma <- n3
 n6 Detail <- n5
 n7 Pack8 <- n6 [frame]
-== overflow_gpu [tables]
-n0 Source
-n1 ColourLattice
-n2 LatticeOverflow <- n1~
-n3 ToneTable
-n4 AssembledBake <- n0 n3 n1 n2 [frame]
-== overflow_gpu [full]
+== overflow_gpu
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -132,12 +85,7 @@ n6 ToneColour <- n5 n4 n2 n3
 n7 NRChroma <- n6
 n8 Detail <- n7
 n9 Pack8 <- n8 [frame]
-== geometry_vignette [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 AssembledBake <- n0 n2 n1 [frame]
-== geometry_vignette [full]
+== geometry_vignette
 n0 Source
 n1 Resize <- n0
 n2 Geometry <- n1
@@ -149,12 +97,7 @@ n7 Vignette <- n6
 n8 NRChroma <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== region [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 AssembledBake <- n0 n2 n1 [frame]
-== region [full]
+== region
 n0 Source
 n1 Resize <- n0
 n2 Geometry <- n1
@@ -165,12 +108,7 @@ n6 ToneColour <- n5 n4 n3
 n7 NRChroma <- n6
 n8 Detail <- n7
 n9 Pack8 <- n8 [frame]
-== detail_all_final [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 AssembledBake <- n0 n2 n1 [frame]
-== detail_all_final [full]
+== detail_all_final
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -183,12 +121,7 @@ n8 Dehaze <- n7
 n9 Detail <- n8
 n10 Grain <- n9
 n11 Pack8 <- n10 [frame]
-== detail_all_interactive [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 AssembledBake <- n0 n2 n1 [frame]
-== detail_all_interactive [full]
+== detail_all_interactive
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -200,12 +133,7 @@ n7 NRChroma <- n6
 n8 Dehaze <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== detail_interactive_no_noise [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 AssembledBake <- n0 n2 n1 [frame]
-== detail_interactive_no_noise [full]
+== detail_interactive_no_noise
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -215,12 +143,7 @@ n5 ToneColour <- n4 n3 n2
 n6 Dehaze <- n5
 n7 Detail <- n6
 n8 Pack8 <- n7 [frame]
-== grain_dragged_interactive [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 AssembledBake <- n0 n2 n1 [frame]
-== grain_dragged_interactive [full]
+== grain_dragged_interactive
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -233,12 +156,7 @@ n8 Dehaze <- n7
 n9 Detail <- n8
 n10 Grain <- n9
 n11 Pack8 <- n10 [frame]
-== jpeg_source [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 AssembledBake <- n0 n2 n1 [frame]
-== jpeg_source [full]
+== jpeg_source
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -246,30 +164,30 @@ n3 ToneTable
 n4 Gain <- n1
 n5 ToneColour <- n4 n3 n2
 n6 Pack8 <- n5 [frame]
-== film_strength_100 [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 Analysis [analysis]
-n4 AssembledBake <- n0 n2 n1 [frame]
-== film_strength_100 [full]
+== film_strength_100
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice [table]
 n3 ToneTable [table]
 n4 Analysis [analysis]
-n5 FilmSim <- n1
-n6 DisplayStages <- n5
-n7 NRChroma <- n6
-n8 Detail <- n7
-n9 Pack8 <- n8 [frame]
-== film_strength_50 [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 Analysis [analysis]
-n4 AssembledBake <- n0 n2 n1 [frame]
-== film_strength_50 [full]
+n5 FilmTableRaw
+n6 FilmTableCurves
+n7 FilmTablePrintScan
+n8 FilmExposure <- n1 n5
+n9 FilmBlurExposure <- n8
+n10 FilmDirField <- n9 n6
+n11 FilmDevelop <- n9 n10 n6
+n12 FilmGrain <- n11
+n13 FilmPrintExposure <- n12 n7
+n14 FilmEnlargerBlur <- n13
+n15 FilmPrintScan <- n14 n7
+n16 FilmGlare <- n15 n7
+n17 FilmScan <- n16
+n18 DisplayStages <- n17
+n19 NRChroma <- n18
+n20 Detail <- n19
+n21 Pack8 <- n20 [frame]
+== film_strength_50
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice
@@ -277,19 +195,25 @@ n3 ToneTable
 n4 Analysis [analysis]
 n5 Gain <- n1
 n6 ToneColour <- n5 n3 n2
-n7 FilmSim <- n1
-n8 DisplayStages <- n7
-n9 Blend <- n6 n8
-n10 NRChroma <- n9
-n11 Detail <- n10
-n12 Pack8 <- n11 [frame]
-== film_strength_0 [tables]
-n0 Source
-n1 ColourLattice
-n2 ToneTable
-n3 Analysis [analysis]
-n4 AssembledBake <- n0 n2 n1 [frame]
-== film_strength_0 [full]
+n7 FilmTableRaw
+n8 FilmTableCurves
+n9 FilmTablePrintScan
+n10 FilmExposure <- n1 n7
+n11 FilmBlurExposure <- n10
+n12 FilmDirField <- n11 n8
+n13 FilmDevelop <- n11 n12 n8
+n14 FilmGrain <- n13
+n15 FilmPrintExposure <- n14 n9
+n16 FilmEnlargerBlur <- n15
+n17 FilmPrintScan <- n16 n9
+n18 FilmGlare <- n17 n9
+n19 FilmScan <- n18
+n20 DisplayStages <- n19
+n21 Blend <- n6 n20
+n22 NRChroma <- n21
+n23 Detail <- n22
+n24 Pack8 <- n23 [frame]
+== film_strength_0
 n0 Source
 n1 Resize <- n0
 n2 ColourLattice

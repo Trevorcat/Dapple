@@ -37,5 +37,6 @@ Halo halo(const Block& b);
 
 const NodeBehaviour& behaviour();
 const CpuImpl& cpu();
+NodeDesc desc();  // registered in engine/nodes/node_list.inc
 
 }  // namespace dapple::engine::detail

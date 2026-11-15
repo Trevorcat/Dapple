@@ -39,5 +39,7 @@ const NodeBehaviour& lumaBehaviour();
 const NodeBehaviour& chromaBehaviour();
 const CpuImpl& lumaCpu();
 const CpuImpl& chromaCpu();
+NodeDesc lumaDesc();    // registered in engine/nodes/node_list.inc
+NodeDesc chromaDesc();
 
 }  // namespace dapple::engine::nr

@@ -1,3 +1,5 @@
+// The GPU implementation table: generated from the registration list (engine/nodes/node_list.inc); each family defines its GpuImpl in its
+// own gpu.cpp.
 #include "engine/nodes/gpu_nodes.h"
 
 #include "engine/nodes/gpu_common.h"
@@ -5,60 +7,21 @@
 namespace dapple::engine::gpu {
 
 namespace {
-
-bool recPoint(GpuRecorder& r, const void* res, const GpuPorts& p) { return recordPoint(r, *static_cast<const PointNode*>(res), p.out[0]); }
-bool recNrLuma(GpuRecorder& r, const void* res, const GpuPorts& p) { return recordNrLuma(r, *static_cast<const NrLumaNode*>(res), p.in[0]); }
-bool recNrChroma(GpuRecorder& r, const void* res, const GpuPorts& p) { return recordNrChroma(r, *static_cast<const NrChromaNode*>(res), p.in[0]); }
-bool recDehaze(GpuRecorder& r, const void* res, const GpuPorts& p) { return recordDehazeApply(r, *static_cast<const DehazeNode*>(res), p.in[0]); }
-bool recDetail(GpuRecorder& r, const void* res, const GpuPorts& p) { return recordDetail(r, *static_cast<const DetailNode*>(res), p.in[0]); }
-bool recLocalDetail(GpuRecorder& r, const void* res, const GpuPorts& p) { return recordLocalDetail(r, *static_cast<const LocalDetailNode*>(res), p.in[0]) >= 0; }
-
-const char* const kPoint[] = {"point"};
-const char* const kNrL[] = {"nr_luma", "sep_d2y", "sep_d2y_s", "sep_y", "sep_y", "sep_y_s", "sep_y_v", "bx_d2y", "bx_y", "bx_y_v"};
-const char* const kNrC[] = {"down", "nr_chroma", "sep_c", "sep_c_s"};
-const char* const kDz[] = {"sep_c2y", "sep_c2y_s", "sep_y", "sep_y_s", "sep_y_v", "bx_y", "bx_y_v", "reduce", "dehaze_apply"};
-const char* const kDetail[] = {"down", "gf_ab", "sep_c", "sep_c_s", "sep_d2y", "sep_d2y_s", "sep_y", "sep_y_s", "sep_y_v", "bx_d2y", "bx_y", "bx_y_v", "detail"};
-const char* const kResize[] = {"resize", "convert"};
-const char* const kPointLocal[] = {"point_local"};
-const char* const kLocalDetail[] = {"down", "gf_ab", "sep_c", "sep_c_s", "sep_d2y", "sep_d2y_s", "sep_y", "sep_y_s", "sep_y_v", "bx_d2y", "bx_y", "bx_y_v", "local_detail",
-                                    "local_heal", "local_rt_down", "local_retouch"};
 const char* const kAll[] = {"point",     "sep_d2y",  "sep_d2y_v", "sep_d2y_s", "sep_c2y", "sep_c2y_v", "sep_c2y_s", "sep_c",  "sep_c_s",
                             "sep_y",     "sep_y_v",  "sep_y_s",   "down",      "nr_luma", "nr_chroma", "dehaze_apply", "reduce", "gf_ab",
                             "detail",    "resize",   "convert",   "bx_d2y",    "bx_y",    "bx_y_v", "point_local", "local_detail", "local_film_in",
                             "local_heal", "local_rt_down", "local_retouch"};
-
-const GpuImpl kPointImpl = {nullptr, kPoint, recPoint, "point", false};
-const GpuImpl kNrLImpl = {nullptr, kNrL, recNrLuma, nullptr, false};
-const GpuImpl kNrCImpl = {nullptr, kNrC, recNrChroma, nullptr, false};
-const GpuImpl kDzImpl = {nullptr, kDz, recDehaze, nullptr, false};
-const GpuImpl kDetailImpl = {nullptr, kDetail, recDetail, nullptr, false};
-const GpuImpl kPointLocalImpl = {nullptr, kPointLocal, recPoint, "point", false};
-const GpuImpl kLocalDetailImpl = {nullptr, kLocalDetail, recLocalDetail, nullptr, false};
-const GpuImpl kResizeImpl = {nullptr, kResize, nullptr, nullptr, false};  // recordResize needs a source window: called by the executor
-const GpuImpl kEpilogueImpl = {nullptr, {}, nullptr, "epilogue", true};
-
 }  // namespace
 
+const GpuImpl* noGpu() { return nullptr; }
+
 const GpuImpl* gpuImplFor(NodeType t) {
-  switch (t) {
-    // the point recipe: one pass for Geometry + Gain + ToneColour (+ the Exact variant) + Vignette
-    case NodeType::Geometry:
-    case NodeType::Gain:
-    case NodeType::Hdr:
-    case NodeType::ToneColour:
-    case NodeType::ToneColourExact:  // the exact variant runs on the same lattice kernel (a denser bake), see docs/engine/pipeline-architecture.md 21
-    case NodeType::Vignette: return &kPointImpl;
-    case NodeType::NRLuma: return &kNrLImpl;
-    case NodeType::NRChroma: return &kNrCImpl;
-    case NodeType::Dehaze: return &kDzImpl;
-    case NodeType::Detail: return &kDetailImpl;
-    case NodeType::LocalLinear: return &kPointLocalImpl;  // part of the point recipe (point_local)
-    case NodeType::LocalDetail: return &kLocalDetailImpl;
-    case NodeType::Resize: return &kResizeImpl;
-    case NodeType::Grain:
-    case NodeType::Pack8: return &kEpilogueImpl;
-    default: return nullptr;  // tables are baked on the CPU and uploaded; Source is the resident image; film nodes: b4
-  }
+  static const GpuImpl* const table[kNodeTypeCount] = {
+#define DAPPLE_NODE(type, desc, gpu) gpu(),
+#include "engine/nodes/node_list.inc"
+#undef DAPPLE_NODE
+  };
+  return std::size_t(t) < std::size_t(kNodeTypeCount) ? table[std::size_t(t)] : nullptr;
 }
 
 std::span<const char* const> allShaderNames() { return kAll; }

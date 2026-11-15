@@ -39,6 +39,8 @@ struct LinearCpu {
 };
 const NodeBehaviour& linearBehaviour();
 const NodeBehaviour& detailBehaviour();
+NodeDesc linearDesc();  // registered in engine/nodes/node_list.inc
+NodeDesc detailDesc();
 const CpuImpl& linearCpu();  // resolved slot: LinearCpu
 const CpuImpl& detailCpu();  // resolved slot: Block
 

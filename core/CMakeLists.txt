@@ -57,16 +57,19 @@ add_library(dapple_core STATIC
   engine/graph/registry.cpp
   engine/graph/builder.cpp
   engine/exec/engine_session.cpp
+  engine/exec/host_tables.cpp
+  engine/exec/gpu_dispatch.cpp
+  engine/exec/result_cache.cpp
   engine/nodes/film/film_tables.cpp
   engine/nodes/film/film_cpu.cpp
   engine/nodes/film/film_frame.cpp
   engine/exec/cpu_executor.cpp
   engine/plan/planner.cpp
-  engine/nodes/main/cpu_nodes.cpp
   engine/nodes/frame_blocks.cpp
   engine/nodes/point/resolve.cpp
   engine/nodes/point/bake.cpp
   engine/nodes/point/cpu.cpp
+  engine/nodes/point/nodes.cpp
   engine/nodes/film/film_glue.cpp
   engine/nodes/vignette/vignette.cpp
   engine/nodes/nr/nr.cpp

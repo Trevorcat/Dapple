@@ -1,0 +1,46 @@
+// The node registration list: one line per node type (docs/engine/pipeline-architecture.md section 50).
+//
+//   DAPPLE_NODE(Type, desc, gpu)
+//     Type  the NodeType enumerator (graph/types.h is generated from this list; the order enters the structure hash and the node
+//           keys: append new nodes at the end)
+//     desc  `NodeDesc desc()` of the node's family (core library): name, ports, parameter mask, colour spaces, footprint class,
+//           fusion group, behaviour, block accessor, CPU implementation + binding, where the builder wires it
+//     gpu   `const GpuImpl* gpu()` in namespace dapple::engine::gpu (GPU library, declared in nodes/gpu_common.h), or noGpu
+//
+// The builder, the planner and both executors read only these declarations: adding a node is its family directory + one line here.
+DAPPLE_NODE(Source, point::sourceDesc, noGpu)
+DAPPLE_NODE(Resize, resize::desc, resizeGpu)
+DAPPLE_NODE(Geometry, point::geometryDesc, pointGpu)
+DAPPLE_NODE(Gain, point::gainDesc, pointGpu)
+DAPPLE_NODE(ColourLattice, point::latticeDesc, noGpu)
+DAPPLE_NODE(LatticeOverflow, point::overflowDesc, noGpu)
+DAPPLE_NODE(ToneAnalysisPre, point::tonePreDesc, noGpu)
+DAPPLE_NODE(ToneTable, point::toneTableDesc, noGpu)
+DAPPLE_NODE(ToneColour, point::toneColourDesc, toneColourGpu)
+DAPPLE_NODE(ToneColourExact, point::toneColourExactDesc, toneColourGpu)
+DAPPLE_NODE(Vignette, vignette::desc, pointGpu)
+DAPPLE_NODE(NRLuma, nr::lumaDesc, nrLumaGpu)
+DAPPLE_NODE(NRChroma, nr::chromaDesc, nrChromaGpu)
+DAPPLE_NODE(Dehaze, dehaze::desc, dehazeGpu)
+DAPPLE_NODE(Detail, detail::desc, detailGpu)
+DAPPLE_NODE(Grain, grain::desc, epilogueGpu)
+DAPPLE_NODE(Pack8, point::pack8Desc, epilogueGpu)
+DAPPLE_NODE(Analysis, point::analysisDesc, noGpu)
+DAPPLE_NODE(DisplayStages, point::displayDesc, displayGpu)
+DAPPLE_NODE(Blend, point::blendDesc, displayGpu)
+DAPPLE_NODE(FilmTableRaw, filmnode::tableRawDesc, noGpu)
+DAPPLE_NODE(FilmTableCurves, filmnode::tableCurvesDesc, noGpu)
+DAPPLE_NODE(FilmTablePrintScan, filmnode::tablePrintScanDesc, noGpu)
+DAPPLE_NODE(FilmExposure, filmnode::exposureDesc, filmGpu)
+DAPPLE_NODE(FilmBlurExposure, filmnode::blurExposureDesc, filmGpu)
+DAPPLE_NODE(FilmDirField, filmnode::dirFieldDesc, filmGpu)
+DAPPLE_NODE(FilmDevelop, filmnode::developDesc, filmGpu)
+DAPPLE_NODE(FilmGrain, filmnode::grainDesc, filmGpu)
+DAPPLE_NODE(FilmPrintScan, filmnode::printScanDesc, filmGpu)
+DAPPLE_NODE(FilmGlare, filmnode::glareDesc, filmGpu)
+DAPPLE_NODE(FilmScan, filmnode::scanDesc, filmGpu)
+DAPPLE_NODE(FilmPrintExposure, filmnode::printExposureDesc, filmGpu)
+DAPPLE_NODE(FilmEnlargerBlur, filmnode::enlargerBlurDesc, filmGpu)
+DAPPLE_NODE(Hdr, point::hdrDesc, pointGpu)
+DAPPLE_NODE(LocalLinear, localadj::linearDesc, pointGpu)
+DAPPLE_NODE(LocalDetail, localadj::detailDesc, localDetailGpu)

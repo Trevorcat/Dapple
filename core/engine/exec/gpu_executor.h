@@ -1,16 +1,18 @@
 #pragma once
-// GpuExecutor: runs a Plan (plan/plan.h) on a HAL device (docs/engine/pipeline-architecture.md 5.1 - 5.9, step b3).
+// GpuExecutor: runs a Plan (plan/plan.h) on a HAL device (docs/engine/pipeline-architecture.md 5.1 - 5.9, section 50).
 //
-//   gpu::Core      device + transient pool + per-frame-slot host buffers (one per device generation)
-//   gpu::Context   process-wide: backend selection (Vulkan -> GLES 3.1), start-up self-test, device rebuild, epoch
-//   gpu::Executor  per EngineSession (IGpuExecutor): consumes the Plan's stages, keeps the device copies of the source
-//                  (fed by a SourceStore) and of the tables (on a ResultCache), records through gpuImplFor(...).recordPorts
+//   gpu::Core      device + transient pool + per-frame-slot host buffers + deferred destruction (one per device generation; gpu_core.cpp)
+//   gpu::Context   process-wide: backend selection (Vulkan -> GLES 3.1), start-up self-test, device rebuild, epoch (gpu_context.cpp)
+//   gpu::Executor  per EngineSession (IGpuExecutor): runs the Plan's stages over the plan's tiles (gpu_executor.cpp), keeps the device copies
+//                  of the source, tables, solves and buffers in the session's ResultCache (gpu_device_copies.cpp), records a job (a frame or
+//                  a tile) through the nodes' GpuImpls (gpu_walk.cpp)
 //
 // Which executor runs a frame, and what a failure means, is decided by EngineSession (exec/engine_session.cpp, 5.9).
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "engine/exec/gpu_iface.h"
 #include "engine/exec/gpu_runtime.h"
@@ -56,6 +58,16 @@ class Core {
   // Uploads packed float RGB rows of `rgb` (row pitch `pitchFloats`) into `dst` at (dx, dy) through the convert pass.
   bool uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h, const hal::ImageH& dst, int dx, int dy, std::string& err);
 
+  // Deferred destruction (no waitIdle): a device resource released while work already submitted may still read it (a cache eviction, a
+  // session closing) is destroyed once the first fenced submission after its release has completed. retire(): any thread. submitted():
+  // every fenced submission (executors, under the context mutex). collect(): destroys what is safe (under the context mutex; `all` after the
+  // device went idle); returns the bytes freed.
+  void retire(hal::ImageH h);
+  void retire(hal::BufferH h);
+  void submitted(hal::FenceH f);
+  std::size_t collect(bool all = false);
+  std::size_t retiredCount();
+
  private:
   Core() = default;
   bool init(std::string& err);
@@ -63,6 +75,14 @@ class Core {
   hal::Device* dev_ = nullptr;
   std::unique_ptr<GpuPool> pool_;
   SlotRes slots_[hal::Device::kSlots];
+  struct Retired {
+    hal::ImageH image;
+    hal::BufferH buffer;
+    hal::FenceH after;
+    bool fenced = false;
+  };
+  std::mutex retireMtx_;
+  std::vector<Retired> retired_;
 };
 
 struct ContextOptions {

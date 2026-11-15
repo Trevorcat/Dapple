@@ -256,7 +256,7 @@ void testTilesSmall() { tilesImpl(true); }
 
 // ---- plan ----------------------------------------------------------------------------------------------------------------------
 Graph graphFor(const EditParams& p, const SourceImage& src, bool exact, engine::point::CpuFrame** fkOut, std::unique_ptr<engine::point::CpuFrame>& hold,
-               std::unique_ptr<engine::point::Params>& rh, PlanRequest& rq) {
+               std::unique_ptr<engine::point::Params>& rh, PlanRequest& rq, std::unique_ptr<FrameBlocks>& fbh) {
   rh = std::make_unique<engine::point::Params>(engine::point::resolve(p, cam(), nullptr));
   FastOptions fo;
   hold = std::make_unique<engine::point::CpuFrame>(*rh, src, nullptr, fo);
@@ -266,15 +266,14 @@ Graph graphFor(const EditParams& p, const SourceImage& src, bool exact, engine::
   in.ctx.srcW = src.linear.width;
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
-  const point::Blocks fp = hold->blocks();
-  const FrameBlocks fb = hold->frameBlocks();
-  Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp, &fb);
+  fbh = std::make_unique<FrameBlocks>(hold->frameBlocks());
+  const FrameView view{&hold->blocks(), fbh.get()};
+  Graph g = GraphBuilder::build(ps, view);
   g.computeKeys(ps);
   rq = PlanRequest{};
   rq.frameW = hold->width();
   rq.frameH = hold->height();
-  rq.nrLuma = fb.nrLuma.amount, rq.nrColor = fb.nrChroma.amount, rq.dehaze = fb.dehaze.amount, rq.clarity = fb.detail.clarity, rq.texture = fb.detail.texture;
-  rq.sharpen = fb.detail.sharpen, rq.sharpRadius = fb.detail.sharpRadius, rq.grain = fb.grain.amount, rq.scale = hold->spatialScale();
+  rq.view = view;
   if (fkOut) *fkOut = hold.get();
   return g;
 }
@@ -283,19 +282,23 @@ void testPlan() {
   const SourceImage src = makeScene(640, 480);
   std::unique_ptr<engine::point::CpuFrame> fk;
   std::unique_ptr<engine::point::Params> rh;
+  std::unique_ptr<FrameBlocks> fbh;
   PlanRequest rq;
+  const NodeRegistry& reg = NodeRegistry::instance();
 
   EditParams plain = withBase();
-  Graph g = graphFor(plain, src, true, nullptr, fk, rh, rq);
+  Graph g = graphFor(plain, src, true, nullptr, fk, rh, rq, fbh);
   Plan p = Planner::plan(g, rq, nullptr);
   CHECK(!p.unsupported);
   CHECK(p.sweeps() == 1);
-  CHECK(p.stages.back().packInChain);  // nothing between the chain and the 8-bit pack
-  CHECK(p.stages.back().groups.size() == 1);
+  CHECK(p.stages.back().groups.size() == 1);  // nothing between the head chain and the 8-bit sink
+  CHECK(reg.desc(g.nodes()[p.sink].type).footprint == Footprint::Sink);
+  CHECK(p.stages.back().tiles.size() == 1 && p.stages.back().halo.x == 0);
+  for (NodeId id : p.stages.back().groups[0].nodes) CHECK(reg.desc(g.nodes()[id].type).fusion == Fusion::Head);
   std::printf("  plain: %d sweep(s), head nodes %zu\n", p.sweeps(), p.stages.back().groups[0].nodes.size());
 
   EditParams all = cases().back().p;
-  g = graphFor(all, src, true, nullptr, fk, rh, rq);
+  g = graphFor(all, src, true, nullptr, fk, rh, rq, fbh);
   p = Planner::plan(g, rq, nullptr);
   // dehaze (airlight) and clarity (guided filter) are frame-global: grid sweep, solve, grid sweep, solve, final sweep
   CHECK(p.sweeps() == 3);
@@ -304,6 +307,23 @@ void testPlan() {
   CHECK(solves == 2);
   CHECK(p.stages.back().output);
   CHECK(p.stages.back().groups.size() == 1 + 5);  // head + NRLuma, NRChroma, Dehaze, Detail, Grain
+  {  // the sweep halo is derived from the window nodes' declared halos (NodeBehaviour::halo over their blocks) + slack, on the 1/4 grid
+    int sum = 0;
+    for (std::size_t i = 1; i < p.stages.back().groups.size(); ++i) {
+      const NodeInstance& n = g.nodes()[p.stages.back().groups[i].nodes[0]];
+      const NodeDesc& d = reg.desc(n.type);
+      const Halo h = d.behaviour->halo(reg.block(n.type, rq.view));
+      CHECK(h.x == p.stages.back().groups[i].halo.x);
+      sum += h.x;
+    }
+    CHECK(p.stages.back().halo.x == (sum + 8 + 3) / 4 * 4);
+    // every solve stage names a node that declares one; its accumulation sweep names it too
+    for (std::size_t i = 0; i + 1 < p.stages.size(); ++i)
+      if (p.stages[i + 1].kind == StageKind::GlobalSolve) {
+        CHECK(p.stages[i].accum != Accum::None && p.stages[i].solveNode == p.stages[i + 1].solveNode);
+        CHECK(reg.desc(g.nodes()[p.stages[i + 1].solveNode].type).solve != nullptr);
+      }
+  }
   std::printf("  all stages: %d sweeps, %d solves, final halo %d px, peak %.1f MB (Whole)\n", p.sweeps(), solves,
               p.stages.back().halo.x, double(p.peakCpuBytes) / 1048576.0);
 
@@ -312,8 +332,9 @@ void testPlan() {
   for (const NodeInstance& n : g.nodes())
     if (n.type == NodeType::Dehaze || n.type == NodeType::Detail) {
       ResultCache::Entry e;
+      e.slot = slotOf(n.type);
       e.key = e.family = n.key;
-      cache.put(n.type, std::move(e));
+      cache.put(std::move(e));
     }
   p = Planner::plan(g, rq, &cache);
   CHECK(p.sweeps() == 1);
@@ -324,10 +345,18 @@ void testPlan() {
   rq.frameH = 6336;  // 60 MP
   rq.mode = ExecMode::TiledExport;
   rq.memBudget = 500u << 20;
-  rq.scale = 9504.f / 2048.f;
   p = Planner::plan(g, rq, nullptr);
   CHECK(p.grid.tile >= 256 && p.grid.tile % 4 == 0);
   CHECK(p.peakCpuBytes <= (std::size_t(500) << 20) + (std::size_t(100) << 20));  // + the 1/4 grids
+  {  // the tiles cover the frame; each work rect is its interior grown by the sweep halo (clipped), each source window is the geometry's input rect
+    long covered = 0;
+    for (const TileWin& t : p.stages.back().tiles) {
+      covered += long(t.interior.x1 - t.interior.x0) * (t.interior.y1 - t.interior.y0);
+      CHECK(t.work.x0 == std::max(0, t.interior.x0 - p.stages.back().halo.x) && t.work.x1 == std::min(rq.frameW, t.interior.x1 + p.stages.back().halo.x));
+    }
+    CHECK(covered == long(rq.frameW) * rq.frameH);
+    CHECK(int(p.stages.back().tiles.size()) == p.grid.nx * p.grid.ny);
+  }
   std::printf("  60 MP export under 500 MB: tile %d, %dx%d tiles, halo %d px, peak %.0f MB\n", p.grid.tile, p.grid.nx, p.grid.ny,
               p.stages.back().halo.x, double(p.peakCpuBytes) / 1048576.0);
 }
@@ -387,7 +416,7 @@ void testAnalysis() {
     if (variant == 0) in2.edit.crop = "1:1";
     else in2.edit.vignette = -60.f;
     const ParamSet p1 = ParamSet::make(in), p2 = ParamSet::make(in2);
-    Graph g1 = GraphBuilder::build(p1), g2 = GraphBuilder::build(p2);
+    Graph g1 = GraphBuilder::build(p1, FrameView{}), g2 = GraphBuilder::build(p2, FrameView{});
     g1.computeKeys(p1);
     g2.computeKeys(p2);
     CHECK(g1.find(NodeType::Analysis)->key != g2.find(NodeType::Analysis)->key);
@@ -434,15 +463,13 @@ void testBench() {
     for (int i = 0; i < 31; ++i) {
       auto t0 = Clock::now();
       engine::point::CpuFrame fk(r, src, bake.get(), fo);
-      const point::Blocks fp = fk.blocks();
       const FrameBlocks fb = fk.frameBlocks();
-      Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp, &fb);
+      const FrameView view{&fk.blocks(), &fb};
+      Graph g = GraphBuilder::build(ps, view);
       g.computeKeys(ps);
       PlanRequest rq;
       rq.frameW = fk.width(), rq.frameH = fk.height();
-      rq.nrLuma = fb.nrLuma.amount, rq.nrColor = fb.nrChroma.amount, rq.dehaze = fb.dehaze.amount;
-      rq.clarity = fb.detail.clarity, rq.texture = fb.detail.texture, rq.sharpen = fb.detail.sharpen;
-      rq.sharpRadius = fb.detail.sharpRadius, rq.grain = fb.grain.amount, rq.scale = fk.spatialScale();
+      rq.view = view;
       const Plan plan = Planner::plan(g, rq, &es.cache());
       if (i > 0) ts.push_back(msSince(t0));
       const int w = fk.width(), h = fk.height();

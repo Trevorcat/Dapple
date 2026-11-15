@@ -5,6 +5,7 @@
 
 #include "dapple/decoder.h"
 #include "engine/exec/cpu_executor.h"
+#include "engine/graph/param_groups.h"
 
 namespace dapple::engine::resize {
 
@@ -38,10 +39,30 @@ namespace {
 bool identity(const void* r) { return !static_cast<const Block*>(r)->active(); }
 Halo noHalo(const void*) { return {}; }
 Rect inputRect(const void* r, const Rect& out) { return sourceWindow(*static_cast<const Block*>(r), out); }
-const NodeBehaviour kBehaviour{sizeof(Block), nullptr, identity, noHalo, inputRect};
+const NodeBehaviour kBehaviour{sizeof(Block), identity, noHalo, inputRect};
+bool bindFrame(const FrameEnv& env, Resolved& out) {
+  if (!env.fk) return false;
+  new (out.bytes) point::FrameSlot{env.fk};
+  return true;
+}
+// leading a head chain: the frame's source row as it is (the frame binds the resized source); fuses like Geometry
+const CpuImpl kCpu{nullptr, point::copyBlock, nullptr, bake, freePayload, nullptr, point::fuseHead};
 static_assert(sizeof(Block) <= kMaxResolvedBytes, "resolved block too large");
 }  // namespace
 
 const NodeBehaviour& behaviour() { return kBehaviour; }
+
+// The resized source is a picture of its own (the frame's source grid): source windows of the plan are in the grid after this node.
+NodeDesc desc() {
+  NodeDesc d = nodeDesc("Resize", Domain::Image, Footprint::Resample, 1, 1, keys({"ctx.outLongEdge", "ctx.region", "ctx.srcSize"}));
+  d.inSpace[0] = Space::Source;
+  d.outSpace = Space::Source;
+  d.rescales = true;
+  d.fusion = Fusion::Head;
+  d.behaviour = &kBehaviour;
+  d.cpu = &kCpu;
+  d.bind = bindFrame;
+  return d;
+}
 
 }  // namespace dapple::engine::resize

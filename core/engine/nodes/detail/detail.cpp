@@ -5,6 +5,7 @@
 
 #include "dapple/modern.h"
 #include "engine/exec/cpu_executor.h"
+#include "engine/graph/param_groups.h"
 #include "spatial.h"
 
 namespace dapple::engine::detail {
@@ -52,8 +53,9 @@ Block resolve(const EditParams& p, const FrameFacts& f) {
 
 Halo halo(const Block& b) {
   int h = 0;
-  if (b.texture != 0.f) h = std::max(h, 2 * b.textureRadius);
-  if (b.sharpAmount > 0.f) h = std::max(h, b.sharpBox > 0 ? 3 * b.sharpBox : b.sharpGauss);
+  // what the CPU passes read plus one pixel: the GPU kernels' reach (both executors run the plan's windows)
+  if (b.texture != 0.f) h = std::max(h, 2 * b.textureRadius + 1);
+  if (b.sharpAmount > 0.f) h = std::max(h, b.sharpBox > 0 ? 3 * b.sharpBox + 1 : b.sharpGauss + 1);
   return {h, h};
 }
 
@@ -61,19 +63,52 @@ namespace {
 Status tile(CpuTile& t, const void* r) {
   const auto& b = *static_cast<const Block*>(r);
   if (!b.active()) return Status::Ok;
-  if (b.solve() && !t.guided) return Status::Internal;
-  stageDetail(*t.img, *t.scratch, b, t.guided, t.ox, t.oy, t.frameW, t.frameH);
+  if (b.solve() && !t.solved) return Status::Internal;
+  stageDetail(*t.img, *t.scratch, b, static_cast<const GuidedSolve*>(t.solved), t.ox, t.oy, t.frameW, t.frameH);
   return Status::Ok;
 }
 bool identity(const void* r) { return !static_cast<const Block*>(r)->active(); }
 Halo haloFn(const void* r) { return halo(*static_cast<const Block*>(r)); }
 
-const CpuImpl kCpu{nullptr, nullptr, tile, nullptr};
-const NodeBehaviour kBehaviour{sizeof(Block), nullptr, identity, haloFn, nullptr};
+// the guided-filter coefficients of the clarity base from the whole frame's 1/4 (Y, Y^2) grid
+std::shared_ptr<void> solve(const std::vector<float>& grid, int gw, int gh, const void* r, std::size_t* bytes) {
+  const auto& b = *static_cast<const Block*>(r);
+  auto gs = std::make_shared<GuidedSolve>();
+  guidedSolveGrid(grid, gw, gh, b.guidedRadius, kGuidedEps, *gs);
+  *bytes = (gs->a.size() + gs->b.size()) * 4;
+  return gs;
+}
+Accum accumOf(const void* r) { return static_cast<const Block*>(r)->solve() ? Accum::LumaGrid : Accum::None; }
+const void* blockOf(const FrameView& v) { return v.blocks ? &v.blocks->detail : nullptr; }
+bool bind(const FrameEnv& e, Resolved& out) {
+  if (!e.blocks) return false;
+  new (out.bytes) Block(e.blocks->detail);
+  return true;
+}
+int planes(const void*) { return 7; }
+
+const CpuImpl kCpu{nullptr, nullptr, tile, nullptr, nullptr, solve};
+const NodeBehaviour kBehaviour{sizeof(Block), identity, haloFn, nullptr};
 static_assert(sizeof(Block) <= kMaxResolvedBytes, "resolved block too large");
 }  // namespace
 
 const NodeBehaviour& behaviour() { return kBehaviour; }
 const CpuImpl& cpu() { return kCpu; }
+
+NodeDesc desc() {
+  ParamMask m = ParamGroups::get().spatial;
+  m.add(keys({"clarity", "texture", "sharpen", "sharpRadius", "modern"}));
+  NodeDesc d = nodeDesc("Detail", Domain::Image, Footprint::Window, 1, 1, m);  // guided base (frame-global solve) + detail passes
+  d.inSpace[0] = Space::Display;
+  d.wire = Wire::Display;
+  d.order = 50;
+  d.behaviour = &kBehaviour;
+  d.block = blockOf;
+  d.solve = accumOf;
+  d.workPlanes = planes;
+  d.cpu = &kCpu;
+  d.bind = bind;
+  return d;
+}
 
 }  // namespace dapple::engine::detail

@@ -7,6 +7,7 @@
 #include <cstdlib>
 
 #include "dapple/film_match.h"
+#include "engine/graph/graph.h"
 #include "engine/nodes/film/film_nodes.h"
 #include "engine/nodes/point/kernels.h"
 #include "hdr_field.h"
@@ -637,9 +638,16 @@ bool hdrIdentity(const void* r) { return !blocksOf(r).hdr.active(); }
 Halo noHalo(const void*) { return {}; }
 Rect geometryInput(const void* r, const Rect& out) { return sourceWindow(blocksOf(r), out); }
 // resolvedBytes 0: the blocks are not copied into a node slot (the CPU nodes bind the frame's CpuFrame, the GPU records from GpuRun::frame)
-const NodeBehaviour kGeometry{0, nullptr, geometryIdentity, noHalo, geometryInput};
-const NodeBehaviour kHdr{0, nullptr, hdrIdentity, noHalo, nullptr};
+const NodeBehaviour kGeometry{0, geometryIdentity, noHalo, geometryInput};
+const NodeBehaviour kHdr{0, hdrIdentity, noHalo, nullptr};
 }  // namespace
+
+bool hdrWanted(const BuildCtx& c) {
+  const EditParams& p = c.ps.edit();
+  if (!(effectiveHdr(p) > 0.f) || !c.ps.ctx().sceneReferred) return false;
+  const FilmRun fr = resolveFilm(p);
+  return !(fr.stock && fr.strength > 0.f);  // the film branch takes the source before this stage
+}
 
 const NodeBehaviour& geometryBehaviour() { return kGeometry; }
 const NodeBehaviour& hdrBehaviour() { return kHdr; }

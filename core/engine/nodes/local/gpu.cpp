@@ -252,4 +252,17 @@ bool recordLocalFilmIn(GpuRecorder& r, const LocalFilmInNode& n, H out) {
   return true;
 }
 
+// ---- GpuImpl (engine/nodes/node_list.inc) ----------------------------------------------------------------------------------------------
+namespace {
+H node(GpuRecorder& r, const NodeCall& c) {
+  const GpuJob& j = c.job;
+  if (j.aux0 < 0) return r.err = "LocalDetail without the amounts of the point pass", -1;
+  return recordLocalDetail(r, LocalDetailNode{static_cast<const localadj::Block*>(c.block), j.W, j.Hh, j.ox, j.oy, j.aux0, j.aux1, c.ep}, c.D);
+}
+const char* const kLocalDetail[] = {"down", "gf_ab", "sep_c", "sep_c_s", "sep_d2y", "sep_d2y_s", "sep_y", "sep_y_s", "sep_y_v", "bx_d2y", "bx_y", "bx_y_v",
+                                    "local_detail", "local_heal", "local_rt_down", "local_retouch"};
+const GpuImpl kImpl{kLocalDetail, nullptr, node};
+}  // namespace
+const GpuImpl* localDetailGpu() { return &kImpl; }
+
 }  // namespace dapple::engine::gpu

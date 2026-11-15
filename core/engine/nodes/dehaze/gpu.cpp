@@ -62,4 +62,18 @@ bool recordDehazeApply(GpuRecorder& r, const DehazeNode& n, H D) {
   return true;
 }
 
+// ---- GpuImpl (engine/nodes/node_list.inc) ----------------------------------------------------------------------------------------------
+namespace {
+H node(GpuRecorder& r, const NodeCall& c) {
+  const GpuJob& j = c.job;
+  const dehaze::Block& b = *static_cast<const dehaze::Block*>(c.block);
+  if (b.solve() && c.solved < 0) return r.err = "dehaze solve missing from the plan", -1;
+  return recordDehazeApply(r, DehazeNode{&b, j.W, j.Hh, j.ox, j.oy, j.gridW, j.gridH, b.solve() ? c.solved : -1, c.ep}, c.D) ? c.D : -1;
+}
+H solve(GpuRecorder& r, const void* block, H grid, int gw, int gh) { return recordDehazeAnalysis(r, *static_cast<const dehaze::Block*>(block), grid, gw, gh); }
+const char* const kDz[] = {"sep_c2y", "sep_c2y_s", "sep_y", "sep_y_s", "sep_y_v", "bx_y", "bx_y_v", "reduce", "dehaze_apply"};
+const GpuImpl kImpl{kDz, nullptr, node, solve, false};  // the dark channel (R32F)
+}  // namespace
+const GpuImpl* dehazeGpu() { return &kImpl; }
+
 }  // namespace dapple::engine::gpu

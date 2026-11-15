@@ -220,7 +220,7 @@ Graph fullGraph(const EditParams& p, const SourceImage& src) {
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
   const FrameBlocks fb = fk.frameBlocks();
-  return GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
+  return GraphBuilder::build(ps, FrameView{&fp, &fb});
 }
 
 bool cpuFrame(EngineSession& es, const EditParams& p, const SourceImage& src, bool interactive, FrameResult& res) {

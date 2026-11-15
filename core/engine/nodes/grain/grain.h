@@ -21,5 +21,6 @@ Block grainFor(float amount, float scale);
 
 const NodeBehaviour& behaviour();
 const CpuImpl& cpu();
+NodeDesc desc();  // registered in engine/nodes/node_list.inc
 
 }  // namespace dapple::engine::grain

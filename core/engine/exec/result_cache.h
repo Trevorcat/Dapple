@@ -1,116 +1,121 @@
 #pragma once
-// ResultCache: content-addressed cache of node outputs (docs/engine/pipeline-architecture.md 5.7), per EngineSession.
+// ResultCache: content-addressed cache of node results (docs/engine/pipeline-architecture.md 5.7), one per EngineSession.
 //
-// Stage (a3) keeps the retention semantics of the `bakes[3]` slots it replaces (FIFO, a small fixed number of entries
-// per node type) so that reuse decisions are the same as before; the cost/bytes-aware eviction of 5.7 comes with the
-// later steps. An entry has an `order` (the lattice size): a lookup by family returns the largest entry whose order is
-// at least the requested one, which is how a finer lattice serves a request for a coarser one.
-#include <algorithm>
+// Entries live in slots: a node type's host payloads (slotOf(type)), its device copies (slotOf(type, true): the GPU executor's tables,
+// solves, buffers, kept in the session's cache), and named slots for results that are not one node's (kBakeSlot: an assembled colour
+// bake). Every entry carries what it costs to keep (host and device bytes) and what it cost to make (ms).
+//
+// Budget: one per session, host and device bytes (Limits). The host limit follows the memory configuration (dapple_memory_configure /
+// the physical memory: defaultLimits()); the device limit is set by the GPU executor from its device's pool budget, which the session's
+// device entries share with the pool's free images (the executor trims the pool to what the cache leaves). Eviction is LRU weighted by
+// cost (GreedyDual-Size: an entry's priority is the inflation clock at its last use plus its build cost per MB; the lowest goes first and
+// sets the clock), never the entry being inserted.
+//
+// Locking: every member function takes the cache's own mutex; results are returned by value (payloads as shared_ptr), so nothing points
+// into the cache after a call returns. Payloads evicted by a call are released after the mutex is dropped (a device payload's deleter
+// queues its handles for deferred destruction).
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "engine/graph/types.h"
 
 namespace dapple::engine {
 
+using CacheSlot = std::uint16_t;
+constexpr CacheSlot kDeviceSlot = 0x8000;
+constexpr CacheSlot slotOf(NodeType t, bool device = false) { return CacheSlot(CacheSlot(t) | (device ? kDeviceSlot : 0)); }
+constexpr CacheSlot kBakeSlot = 0x4001;             // assembled colour bake (lattice + tone table) of a frame
+constexpr CacheSlot kDeviceBufferSlot = 0xC002;     // GPU: read-only SSBOs by content key (HDR field, reshaping field, local descriptors)
+constexpr CacheSlot kDevicePlaneSlot = 0xC003;      // GPU: the local adjustments' plane store
+constexpr bool isDeviceSlot(CacheSlot s) { return (s & kDeviceSlot) != 0; }
+
 class ResultCache {
  public:
   struct Entry {
+    CacheSlot slot = 0;
     Hash128 key, family;
     int order = 0;
     std::shared_ptr<void> payload;
-    std::size_t bytes = 0;
+    std::size_t hostBytes = 0, deviceBytes = 0;
     double costMs = 0;
-    Hash128 ref;  // an entry this one is built from (assembled bake inputs -> their lattice)
+    Hash128 ref;  // an entry this one is built from (assembled bake -> its lattice)
+  };
+  struct Hit {
+    std::shared_ptr<void> payload;
+    Hash128 key;
+    int order = 0;
+    explicit operator bool() const { return payload != nullptr; }
+    template <class T>
+    std::shared_ptr<T> as() const { return std::static_pointer_cast<T>(payload); }
   };
   struct Stats {
     std::uint64_t hits = 0, misses = 0, puts = 0, evictions = 0;
   };
+  struct Limits {
+    std::size_t hostBytes = 0, deviceBytes = 0;  // 0 = unlimited
+  };
+  // Host budget from the memory configuration: 1/32 of the device's memory (dapple_memory_configure totalBytes, else the physical memory),
+  // 96 MB .. 384 MB, halved on a low-RAM device. Device budget: unlimited until a GPU executor sets it.
+  static Limits defaultLimits();
 
-  ResultCache() {
-    for (auto& l : limit_) l = 8;
-    limit_[std::size_t(NodeType::ColourLattice)] = 3;
-    limit_[std::size_t(NodeType::AssembledBake)] = 3;  // assembled bakes (lattice + tone table + analysis), the newest three
-    limit_[std::size_t(NodeType::LatticeOverflow)] = 2;
-  }
+  explicit ResultCache(Limits l = defaultLimits()) : limits_(l) {}
+  ResultCache(const ResultCache&) = delete;
+  ResultCache& operator=(const ResultCache&) = delete;
 
-  void setLimit(NodeType t, std::size_t n) { limit_[std::size_t(t)] = n; }
+  void setLimits(Limits l);
+  void setDeviceLimit(std::size_t bytes);
+  Limits limits() const;
 
-  Entry* find(NodeType t, const Hash128& key) {
-    for (Entry& e : slot(t))
-      if (e.key == key) {
-        ++stats_[std::size_t(t)].hits;
-        return &e;
-      }
-    ++stats_[std::size_t(t)].misses;
-    return nullptr;
-  }
+  // Lookup that counts a hit / miss and marks the entry used.
+  Hit find(CacheSlot s, const Hash128& key);
+  // The entry of `family` with the largest order >= minOrder (counts, marks used).
+  Hit findBest(CacheSlot s, const Hash128& family, int minOrder);
+  // Lookups without touching statistics or recency (the planner decides on cache state before the executor uses it).
+  bool contains(CacheSlot s, const Hash128& key) const;
+  bool containsFamily(CacheSlot s, const Hash128& family) const;
 
-  // find() that also marks the entry most recently used (it moves to the back; put() evicts from the front): LRU instead of FIFO.
-  Entry* findLru(NodeType t, const Hash128& key) {
-    auto& v = slot(t);
-    for (std::size_t i = 0; i < v.size(); ++i)
-      if (v[i].key == key) {
-        ++stats_[std::size_t(t)].hits;
-        if (i + 1 != v.size()) std::rotate(v.begin() + std::ptrdiff_t(i), v.begin() + std::ptrdiff_t(i) + 1, v.end());
-        return &v.back();
-      }
-    ++stats_[std::size_t(t)].misses;
-    return nullptr;
-  }
+  // Inserts (replacing an entry of the same slot and key), then evicts down to the limits.
+  void put(Entry e);
+  void erase(CacheSlot s, const Hash128& key);
+  void eraseIf(const std::function<bool(const Entry&)>& pred);
+  void clear();
 
-  // Lookup without touching the statistics (the planner decides on cache state before the executor uses it).
-  const Entry* peek(NodeType t, const Hash128& key) const {
-    for (const Entry& e : entries_[std::size_t(t)])
-      if (e.key == key) return &e;
-    return nullptr;
-  }
-
-  // The entry of `family` with the largest order >= minOrder (earliest inserted among equals).
-  Entry* findBest(NodeType t, const Hash128& family, int minOrder) {
-    Entry* best = nullptr;
-    for (Entry& e : slot(t))
-      if (e.family == family && e.order >= minOrder && (!best || e.order > best->order)) best = &e;
-    ++(best ? stats_[std::size_t(t)].hits : stats_[std::size_t(t)].misses);
-    return best;
-  }
-
-  Entry& put(NodeType t, Entry e) {
-    auto& v = slot(t);
-    v.push_back(std::move(e));
-    ++stats_[std::size_t(t)].puts;
-    while (v.size() > limit_[std::size_t(t)]) {
-      v.erase(v.begin());
-      ++stats_[std::size_t(t)].evictions;
-    }
-    return v.back();
-  }
-
-  template <class Pred>
-  void eraseIf(NodeType t, Pred&& p) {
-    auto& v = slot(t);
-    const auto before = v.size();
-    v.erase(std::remove_if(v.begin(), v.end(), p), v.end());
-    stats_[std::size_t(t)].evictions += before - v.size();
-  }
-
-  const std::vector<Entry>& entries(NodeType t) const { return entries_[std::size_t(t)]; }
-  const Stats& stats(NodeType t) const { return stats_[std::size_t(t)]; }
-  std::size_t bytes() const {
-    std::size_t b = 0;
-    for (const auto& v : entries_)
-      for (const Entry& e : v) b += e.bytes;
-    return b;
-  }
-  void clear() {
-    for (auto& v : entries_) v.clear();
-  }
+  std::vector<Entry> entries(CacheSlot s) const;   // copies, oldest use first
+  Stats stats(CacheSlot s) const;
+  std::size_t hostBytes() const;
+  std::size_t deviceBytes() const;
+  std::size_t size() const;
 
  private:
-  std::vector<Entry>& slot(NodeType t) { return entries_[std::size_t(t)]; }
-  std::vector<Entry> entries_[kNodeTypeCount];
-  std::size_t limit_[kNodeTypeCount];
-  Stats stats_[kNodeTypeCount];
+  struct Key {
+    CacheSlot slot;
+    Hash128 key;
+    bool operator==(const Key& o) const { return slot == o.slot && key == o.key; }
+  };
+  struct KeyHash {
+    std::size_t operator()(const Key& k) const { return Hash128Hash()(k.key) ^ (std::size_t(k.slot) * 0x9E3779B97F4A7C15ull); }
+  };
+  struct Item {
+    Entry e;
+    double prio = 0;
+    std::uint64_t used = 0;
+  };
+  void touch(Item& it);
+  // Evicts down to the limits (never `keep`); evicted payloads are appended to `out` (released by the caller after unlocking).
+  void evictLocked(const Key* keep, std::vector<std::shared_ptr<void>>& out);
+
+  mutable std::mutex m_;
+  Limits limits_;
+  std::unordered_map<Key, Item, KeyHash> items_;
+  std::unordered_map<CacheSlot, Stats> stats_;
+  std::size_t host_ = 0, device_ = 0;
+  double clock_ = 0;
+  std::uint64_t tick_ = 0;
 };
 
 }  // namespace dapple::engine

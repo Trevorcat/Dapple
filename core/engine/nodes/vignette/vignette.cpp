@@ -1,6 +1,7 @@
 #include "engine/nodes/vignette/vignette_kernel.h"
 
 #include "engine/exec/cpu_executor.h"
+#include "engine/graph/param_groups.h"
 
 namespace dapple::engine::vignette {
 
@@ -24,13 +25,34 @@ void block(const void* r, float* px, int n, const PixelPos& pos) {
 bool identity(const void* r) { return !static_cast<const Block*>(r)->active(); }
 Halo noHalo(const void*) { return {}; }
 
+const void* blockOf(const FrameView& v) { return v.blocks ? &v.blocks->vignette : nullptr; }
+bool bind(const FrameEnv& e, Resolved& out) {
+  if (!e.blocks) return false;
+  new (out.bytes) Block(e.blocks->vignette);
+  return true;
+}
 const CpuImpl kCpu{nullptr, block, nullptr, nullptr};
-const NodeBehaviour kBehaviour{sizeof(Block), nullptr, identity, noHalo, nullptr};
+const NodeBehaviour kBehaviour{sizeof(Block), identity, noHalo, nullptr};
 static_assert(sizeof(Block) <= kMaxResolvedBytes, "resolved block too large");
 
 }  // namespace
 
 const NodeBehaviour& behaviour() { return kBehaviour; }
 const CpuImpl& cpu() { return kCpu; }
+
+NodeDesc desc() {
+  ParamMask m = ParamGroups::get().frame;
+  m.add(keys({"vignette", "ctx.outSpace"}));
+  NodeDesc d = nodeDesc("Vignette", Domain::Image, Footprint::Point, 1, 1, m);
+  d.inSpace[0] = Space::Display;
+  d.fusion = Fusion::Head;
+  d.wire = Wire::Display;
+  d.order = 10;
+  d.behaviour = &kBehaviour;
+  d.block = blockOf;
+  d.cpu = &kCpu;
+  d.bind = bind;
+  return d;
+}
 
 }  // namespace dapple::engine::vignette

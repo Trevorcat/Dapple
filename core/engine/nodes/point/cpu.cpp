@@ -189,6 +189,8 @@ ImageF& ScratchFrame::get(int w, int h) { return impl_->s.get(w, h); }
 // ================================================================================================
 // The family's CPU nodes: block fragments over the frame's binding (resolved slot: FrameSlot; DisplayStages: DisplayCpu)
 // ================================================================================================
+const CpuImpl* fuseHead(const FrameEnv& env, std::span<const NodeType> c, std::size_t* consumed);
+
 namespace {
 
 // ---- point block fragments ---------------------------------------------------------------------------------------------
@@ -217,8 +219,7 @@ void blkDisplay(const void* r, float* px, int n, const PixelPos& pos) {
 }
 void blkBlend(const void* r, float* px, int n, const PixelPos&) { static_cast<const FrameSlot*>(r)->frame->blend(px, t_side, n); }
 
-const CpuImpl kSource{nullptr, copyBlockImpl, nullptr, nullptr};
-const CpuImpl kGeometry{nullptr, blkGeometry, nullptr, nullptr};
+const CpuImpl kGeometry{nullptr, blkGeometry, nullptr, nullptr, nullptr, nullptr, fuseHead};
 const CpuImpl kFusedHead{nullptr, blkFusedHead, nullptr, nullptr};
 const CpuImpl kGain{nullptr, blkGain, nullptr, nullptr};
 const CpuImpl kHdr{nullptr, blkHdr, nullptr, nullptr};
@@ -231,9 +232,17 @@ static_assert(sizeof(FrameSlot) <= kMaxResolvedBytes, "resolved block too large"
 }  // namespace
 
 void copyBlock(const void* r, float* px, int n, const PixelPos& pos) { copyBlockImpl(r, px, n, pos); }
-const CpuImpl& sourceCpu() { return kSource; }
+// The CPU fusion recipe of a head chain led by a resampling node: [Resize | Geometry] + Gain + [Hdr] + ToneColour as one block fragment
+// (headGainTone: the same operations in the same order), baked variant only.
+const CpuImpl* fuseHead(const FrameEnv& env, std::span<const NodeType> c, std::size_t* consumed) {
+  *consumed = 0;
+  if (!env.fk || !env.fk->canFuseHead() || c.size() < 3 || c[1] != NodeType::Gain) return nullptr;
+  const std::size_t nf = c.size() >= 4 && c[2] == NodeType::Hdr ? 4 : 3;
+  if (c.size() < nf || c[nf - 1] != NodeType::ToneColour) return nullptr;
+  *consumed = nf;
+  return &kFusedHead;
+}
 const CpuImpl& geometryCpu() { return kGeometry; }
-const CpuImpl& fusedHeadCpu() { return kFusedHead; }
 const CpuImpl& gainCpu() { return kGain; }
 const CpuImpl& hdrCpu() { return kHdr; }
 const CpuImpl& toneColourCpu() { return kToneColour; }

@@ -121,7 +121,8 @@ if(DAPPLE_GLES)
   dapple_add_gles_backend()
 endif()
 add_library(dapple_gpu STATIC
-  ${_E}/hal/hal.cpp ${_E}/hal/select.cpp ${_E}/hal/vk/vk_device.cpp ${_E}/exec/gpu_scheduler.cpp ${_E}/exec/gpu_executor.cpp ${_E}/exec/gpu_context.cpp
+  ${_E}/hal/hal.cpp ${_E}/hal/select.cpp ${_E}/hal/vk/vk_device.cpp ${_E}/exec/gpu_scheduler.cpp ${_E}/exec/gpu_core.cpp ${_E}/exec/gpu_executor.cpp
+  ${_E}/exec/gpu_device_copies.cpp ${_E}/exec/gpu_walk.cpp ${_E}/exec/gpu_context.cpp
   ${_E}/nodes/gpu_common.cpp ${_E}/nodes/point/gpu.cpp ${_E}/nodes/nr/gpu.cpp ${_E}/nodes/dehaze/gpu.cpp ${_E}/nodes/detail/gpu.cpp ${_E}/nodes/local/gpu.cpp
   ${_E}/nodes/resize/gpu.cpp ${_E}/nodes/gpu_nodes.cpp ${DAPPLE_FILM_GPU_SOURCES} ${DAPPLE_DEMOSAIC_GPU_SOURCES}
   src/parity.cpp src/gpu_bench.cpp ${_spv_headers})

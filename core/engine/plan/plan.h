@@ -1,21 +1,21 @@
 #pragma once
-// Plan: the Planner's output, the only thing an executor runs (docs/engine/pipeline-architecture.md 5.1).
-//
-// Plan structure for the main pipeline (non-film and film):
+// Plan: the Planner's output, the only thing an executor runs (docs/engine/pipeline-architecture.md 5.1, section 50).
 //
 //   stages = [ HostTable?  FilmFrame?  TileSweep  (GlobalSolve  TileSweep)*  ]
 //
-//   HostTable   the table nodes of the frame (ColourLattice ... Analysis). Cache decisions are in Plan::cache; the evaluation
-//               itself is EngineSession's (it owns the renderer inputs the evaluators need).
-//   FilmFrame   FilmSim as a whole-frame node (film engineer's nodes replace it); Whole mode only.
-//   TileSweep   one pass over the tiles of the frame. groups[0] is the PointChain head (point nodes fused into 256-px block
-//               fragments: Resize/Geometry, Gain, ToneColour, DisplayStages, Blend, Vignette + the implicit clamp), the
-//               following groups are Window/Point groups that run on the tile (interior + stage halo) in order. A sweep lists
-//               its groups CUMULATIVELY (the prefix of the window chain it covers): a multi-tile run recomputes the chain per
-//               sweep, a single-tile run keeps the image and skips the groups it already ran.
-//   GlobalSolve a frame-global solve (dehaze airlight / transmission, guided-filter coefficients) from the 1/4 grid the
-//               previous sweep accumulated (Stage::accum). A solve whose result is in the ResultCache is not planned: the sweep
-//               that would have produced its grid disappears.
+//   HostTable   the Table-domain nodes of the frame, with their cache decisions (Plan::cache); the session evaluates them.
+//   FilmFrame   the Film-fusion nodes, run as one whole-frame stage before the sweeps.
+//   TileSweep   one pass over the plan's tiles. groups[0] is the Head group (Head-fusion nodes: CPU block fragments, GPU one recipe pass),
+//               then one Window group per neighbourhood / per-tile node, in chain order. A sweep lists its groups CUMULATIVELY (the prefix
+//               of the window chain it covers): a multi-tile run recomputes the chain per sweep, a single-tile run keeps the image and skips
+//               the groups it already ran. Its tiles carry the interior, the work rect (interior + the sweep's halo) and the source window
+//               the head reads for the work rect; both executors run exactly these windows.
+//   GlobalSolve a node's frame-global solve (NodeDesc::solve) from the 1/4 grid the previous sweep accumulated (Stage::accum). A solve in
+//               the cache is not planned: the sweep that would have produced its grid disappears.
+//
+// Everything is derived from the node declarations: footprint class, fusion group, behaviour (identity, halo, inputRect), solve, work
+// planes, precision. The planner has no list of node types.
+#include <algorithm>
 #include <cstddef>
 #include <vector>
 
@@ -27,29 +27,35 @@ namespace dapple::engine {
 
 enum class ExecMode : std::uint8_t { Whole, TiledExport };
 enum class StageKind : std::uint8_t { HostTable, FilmFrame, TileSweep, GlobalSolve };
-enum class GroupKind : std::uint8_t { PointChain, Window, Table, Film };
-enum class Accum : std::uint8_t { None, DehazeGrid, LumaGrid };  // what a TileSweep leaves behind for the GlobalSolve after it
+enum class GroupKind : std::uint8_t { Head, Window, Table, Film };
 
 struct Group {
-  GroupKind kind = GroupKind::PointChain;
+  GroupKind kind = GroupKind::Head;
   std::vector<NodeId> nodes;       // graph nodes in execution order
-  Halo inHalo;                     // pixels of input needed beyond the output window, accumulated over the group
+  Halo halo;                       // Window: the node's neighbourhood
+};
+
+// One tile of a sweep: rects in frame pixels; `source` in the grid the head's input lives in (after a grid-scaling Resample such as Resize).
+struct TileWin {
+  Rect interior, work, source;
 };
 
 struct Stage {
   StageKind kind = StageKind::TileSweep;
   std::vector<Group> groups;
-  Halo halo;                       // TileSweep: total halo of the window groups it covers (rounded up to the grid alignment)
+  Halo halo;                       // TileSweep: total halo of the window groups it covers (+ slack, rounded up to the grid alignment)
   Accum accum = Accum::None;       // TileSweep: grid accumulated from the interior of every tile at the end of the sweep
-  NodeId solveNode = 0;            // GlobalSolve: the Dehaze / Detail node whose solve this is (also its cache key owner)
-  bool output = false;             // TileSweep: the last one, packs the 8-bit result (Pack8 epilogue)
-  bool packInChain = false;        // TileSweep with output and no window group: the chain writes the 8-bit pixels directly
+  NodeId solveNode = 0;            // GlobalSolve: the node whose solve this is (also its cache key owner); TileSweep with accum: the node
+                                   // whose grid it accumulates
+  bool output = false;             // TileSweep: the last one, writes the output through the sink
+  Precision precision = Precision::F16;  // TileSweep: the working image (widest precision of its nodes)
+  std::vector<TileWin> tiles;      // TileSweep: the windows both executors run, row-major
 };
 
 struct TileGrid {
   int frameW = 0, frameH = 0;
   int tile = 0;                    // interior size (multiple of align); == max(frameW, frameH) rounded up in Whole mode
-  int align = 4;                   // 1/4 grids of dehaze / guided filter / chroma require tile origins on multiples of 4
+  int align = 4;                   // 1/4 grids of the solves require tile origins on multiples of 4
   int nx = 1, ny = 1;
 };
 
@@ -61,7 +67,7 @@ struct CacheOp {
   bool hit = false;                // Lookup: the result is in the cache now (the producer is pruned from the plan)
 };
 
-struct Alloc {                     // logical image / grid -> bytes and lifetime in stage indices (aliasing by the executor's pool)
+struct Alloc {                     // logical image / grid -> bytes and lifetime in stage indices
   const char* what = "";
   std::size_t bytes = 0;
   int firstStage = 0, lastStage = 0;
@@ -75,30 +81,40 @@ struct Plan {
   std::vector<Alloc> allocs;
   std::vector<CacheOp> cache;
   std::size_t peakCpuBytes = 0;
-  bool hasFilm = false;            // FilmFrame stage present (the film plane is a whole float frame)
-  bool unsupported = false;        // an executor cannot run this plan (reason in `why`)
+  NodeId sink = 0;                 // the node that writes the output (Footprint::Sink)
+  bool hasFilm = false;            // FilmFrame stage present
+  bool needAux = false;            // a node reads the side planes the head writes (NodeDesc::readsAux)
+  bool unsupported = false;        // no executor can run this plan (reason in `why`)
   const char* why = "";
-  // convenience for diagnostics / tests
   int sweeps() const {
     int n = 0;
     for (const Stage& s : stages) n += s.kind == StageKind::TileSweep;
     return n;
   }
+  int maxHalo() const {
+    int h = 0;
+    for (const Stage& s : stages) h = std::max({h, s.halo.x, s.halo.y});
+    return h;
+  }
+  // The nodes of every group of every stage.
+  template <class F>
+  void forEachNode(F&& f) const {
+    for (const Stage& s : stages)
+      for (const Group& g : s.groups)
+        for (NodeId id : g.nodes) f(id);
+  }
 };
 
-// What the planner needs to know about the frame besides the graph (all resolved by point::CpuFrame / the C layer).
+// What the planner needs besides the graph.
 struct PlanRequest {
   int frameW = 0, frameH = 0;
   ExecMode mode = ExecMode::Whole;
   std::size_t memBudget = 512u << 20;   // TiledExport: bytes the executor may add on top of the source and the output
   int tile = 0;                         // TiledExport: 0 = chosen from memBudget
-  // resolved neighbourhood parameters (SpatialParams after quality / region / film), scale = radii scale
-  float nrLuma = 0, nrColor = 0, dehaze = 0, clarity = 0, texture = 0, sharpen = 0, sharpRadius = 1, grain = 0, scale = 1;
-  bool vignette = false, useGeo = false;
-  int outChannels = 4;                  // 4 = RGBA8 (alpha 255), 3 = RGB8
-  bool filmTiles = false;
-  int localHalo = 0;                    // LocalDetail: its neighbourhood in frame pixels (local::detailRadii), multiple of 4
-  int localAux = 0;                     // LocalDetail: float planes of per-pixel amounts the point chain writes (tile memory)               // a film frame may keep ExecMode::TiledExport (the GPU executor runs the film in windows with a halo); the CPU executor needs false
+  int maxSide = 0;                      // largest image side the executor can allocate (GPU image limit): tile + 2 halo fits; 0 = no limit
+  FrameView view;                       // the frame's resolved blocks: identity, halos, solves, source windows
+  bool filmTiles = false;               // a film frame may keep ExecMode::TiledExport (else it runs whole)
+  bool device = false;                  // the solves are looked up among the executor's device copies (ResultCache device slots)
 };
 
 // What an executor did (tests, edit-bench, EngineStats).
@@ -111,10 +127,8 @@ class ResultCache;
 
 class Planner {
  public:
-  // Graph must have keys (Graph::computeKeys). `cache` is only read (peek), never modified.
+  // Graph must have keys (Graph::computeKeys). `cache` is only peeked, never modified.
   static Plan plan(const Graph& g, const PlanRequest& rq, const ResultCache* cache);
-  // Neighbourhood of the window nodes in pixels of the frame grid (declared halo of NodeBehaviour::halo for the CPU nodes).
-  static Halo windowHalo(NodeType t, const PlanRequest& rq);
 };
 
 }  // namespace dapple::engine

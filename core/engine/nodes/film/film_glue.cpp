@@ -334,16 +334,4 @@ bool CpuFrame::filmStreamAux(int x0, int y0, int x1, int y1, const local::AuxTar
   return true;
 }
 
-// ---- FilmSim: the film render of the whole frame as one node (super-node of the CPU executor) ------------------------------------------
-namespace {
-Status tileFilmSim(CpuTile& t, const void* r) {
-  // FilmSim as a whole-frame node: the film render of the frame into t.img (super-node until the film nodes land)
-  const auto* p = static_cast<const FrameSlot*>(r);
-  return const_cast<CpuFrame*>(p->frame)->runFilm(*t.img) ? Status::Ok : Status::Unsupported;
-}
-const CpuImpl kFilm{nullptr, nullptr, tileFilmSim, nullptr};
-}  // namespace
-
-const CpuImpl& filmSimCpu() { return kFilm; }
-
 }  // namespace dapple::engine::point

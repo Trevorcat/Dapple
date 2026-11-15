@@ -1,15 +1,17 @@
-// CpuExecutor: runs a Plan (docs/engine/pipeline-architecture.md 5.2-5.5, 5.8).
+// CpuExecutor: runs a Plan (docs/engine/pipeline-architecture.md 5.2-5.5, 5.8, section 50).
 //
-//  - the PointChain head runs as 256-pixel block fragments (CpuImpl::block), rows spread over the ThreadPool;
-//  - window nodes run on a tile (an ImageF window = interior + the sweep's halo) through CpuImpl::tile;
-//  - frame-global parts (dehaze airlight / transmission, guided-filter coefficients) are solved once from the 1/4 grid the
-//    previous sweep accumulated and are looked up at absolute coordinates by the sweeps after it, so a tile result does not
-//    depend on the tile decomposition (tile invariance, 5.5);
+//  - the head group runs as 256-pixel block fragments (CpuImpl::block, fused where the lead node's CpuImpl::fuse says so), rows spread
+//    over the ThreadPool;
+//  - window groups run on a tile (an ImageF window = the plan's work rect) through CpuImpl::tile;
+//  - a GlobalSolve runs the node's CpuImpl::solve on the 1/4 grid the previous sweep accumulated; the sweeps after it hand the payload to
+//    the node's tile (CpuTile::solved), looked up at absolute coordinates, so a tile result does not depend on the tile decomposition (5.5);
 //  - a single-tile plan (Whole) keeps the image between sweeps, a multi-tile plan recomputes the chain per sweep;
 //  - cancellation is polled between tiles and groups and by the ThreadPool chunk loop (CancelScope).
+// No node type is named here: every node is reached through its NodeDesc (cpu, bind).
 #include "engine/exec/cpu_executor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include "parallel.h"
@@ -21,108 +23,100 @@ namespace {
 struct Step {
   const CpuImpl* impl = nullptr;
   Resolved r;
-  NodeType type = NodeType::Source;
+  NodeId node = 0;
+  Accum accum = Accum::None;
+  std::shared_ptr<void> solved;
 };
-
-template <class T>
-std::shared_ptr<T> as(const std::shared_ptr<void>& p) {
-  return std::static_pointer_cast<T>(p);
-}
 
 struct Run {
   const Plan& plan;
   ExecEnv& env;
   ExecStats* stats;
+  const NodeRegistry& reg = NodeRegistry::instance();
   point::CpuFrame& fk;
   int W, H;
-  point::ScratchFrame frameBuf;        // Whole mode: the one float frame the window nodes work on
-  ImageF filmPlane;             // FilmSim output (reused as the float frame when windows follow)
+  point::ScratchFrame frameBuf;   // Whole mode: the one float frame the window nodes work on
   point::ScratchFrame filmScratch;
-  ImageF* film = nullptr;
-  ImageF tileBuf, cropBuf;      // tiled mode
-  SpatialScratch scratch;       // luminance plane etc., kept between window nodes like applySpatial
-  std::vector<Step> head, wins; // wins: every window node of the final sweep, in chain order
-  std::vector<NodeType> winTypes;
-  FrameBlocks blocks;           // resolved when a chain is bound (after the film stage: the exact variant's facts change there)
-  std::shared_ptr<DehazeSolve> dehaze;
-  std::shared_ptr<GuidedSolve> guided;
-  std::vector<float> gridLow;   // accumulated 1/4 grid of the sweep in flight
+  ImageF* film = nullptr;         // the film stage's output plane
+  ImageF tileBuf, cropBuf;        // tiled mode
+  SpatialScratch scratch;         // luminance plane etc., kept between window nodes
+  std::vector<Step> head, wins;   // wins: every window node of the final sweep, in chain order
+  FrameBlocks blocks;             // resolved when a chain is bound (after the film stage: the exact variant's facts change there)
+  std::vector<float> gridLow;     // accumulated 1/4 grid of the sweep in flight
   int gridW = 0, gridH = 0;
   bool single = true;
-  ImageF* img = nullptr;        // persistent frame (single-tile plans)
+  ImageF* img = nullptr;          // persistent frame (single-tile plans)
   bool imgValid = false;
-  std::size_t done = 0;         // window nodes already applied to the persistent frame
-  // local adjustments (docs section 40): the amount planes LocalLinear writes for the work window and LocalDetail reads
+  std::size_t done = 0;           // window nodes already applied to the persistent frame
+  // the side planes the head writes for the work window and a window node reads (Plan::needAux; local adjustments, section 40)
   local::AuxTarget aux;
   std::vector<float> auxBuf;
   int auxPlanes = 0;
-  int outRow0 = 0;              // streaming export: frame row of env.out's first row (the band in flight)
-  std::vector<float> filmAux;   // a tiled film frame: the stage-W amounts of the whole frame (runFilm's), copied into each work window
+  int outRow0 = 0;                // streaming export: frame row of env.out's first row (the band in flight)
+  std::vector<float> filmAux;     // a tiled film frame: the side planes of the whole frame (the film input pass's), copied per work window
   local::AuxTarget filmAuxAt;
-  ImageF filmBand;              // streaming export of a film frame: rows [filmY0, filmY1) of the film plane
+  ImageF filmBand;                // streaming export of a film frame: rows [filmY0, filmY1) of the film plane
   int filmY0 = 0, filmY1 = 0;
   bool filmStream = false;
 
-  Run(const Plan& p, ExecEnv& e, ExecStats* s)
-      : plan(p), env(e), stats(s), fk(e.fk), W(e.fk.width()), H(e.fk.height()) {}
+  Run(const Plan& p, ExecEnv& e, ExecStats* s) : plan(p), env(e), stats(s), fk(e.fk), W(e.fk.width()), H(e.fk.height()) {}
 
   bool cancelled() const { return env.cancel.cancelled(); }
+  const NodeDesc& desc(NodeId id) const { return reg.desc(env.graph.nodes()[id].type); }
 
-  // ---- binding ------------------------------------------------------------------------------------------------------------
-  // sizes the amount planes for a work window (no-op when the frame has no LocalDetail)
-  void auxWindow(int x0, int y0, int w, int h) {
+  void auxWindow(const Rect& r) {
     if (auxPlanes == 0) return;
-    aux.ox = x0, aux.oy = y0, aux.w = w, aux.h = h;
-    aux.plane = std::size_t(w) * h;
+    aux.ox = r.x0, aux.oy = r.y0, aux.w = r.x1 - r.x0, aux.h = r.y1 - r.y0;
+    aux.plane = std::size_t(aux.w) * aux.h;
     if (auxBuf.size() < aux.plane * std::size_t(auxPlanes)) auxBuf.resize(aux.plane * std::size_t(auxPlanes));
     aux.data = auxBuf.data();
   }
 
-  bool bind(const Stage& sweep) {
-    blocks = fk.frameBlocks();
+  FrameEnv frameEnv(std::span<const NodeType> chain) {
     FrameEnv fe;
     fe.fk = &fk;
     fe.blocks = &blocks;
     fe.film = film;
     fe.filmRow0 = filmStream ? &filmY0 : nullptr;
     fe.aux = auxPlanes ? &aux : nullptr;
-    for (NodeId id : sweep.groups[0].nodes)
-      if (env.graph.nodes()[id].type == NodeType::Blend) fe.blendFollows = true;
+    fe.chain = chain;
+    return fe;
+  }
+
+  // ---- binding ------------------------------------------------------------------------------------------------------------
+  bool bindHead(const Stage& sweep) {
+    blocks = fk.frameBlocks();
+    std::vector<NodeType> chain;
+    for (NodeId id : sweep.groups[0].nodes) chain.push_back(env.graph.nodes()[id].type);
+    const FrameEnv fe = frameEnv(chain);
     head.clear();
-    for (NodeId id : sweep.groups[0].nodes) {
+    for (std::size_t i = 0; i < chain.size();) {
+      const NodeDesc& d = reg.desc(chain[i]);
       Step s;
-      s.type = env.graph.nodes()[id].type;
-      s.impl = cpuImpl(s.type);
-      if (!s.impl || !s.impl->block || !bindResolved(s.type, fe, s.r)) return false;
+      s.node = sweep.groups[0].nodes[i];
+      s.impl = d.cpu;
+      if (!s.impl || !s.impl->block || !d.bind || !d.bind(fe, s.r)) return false;
+      std::size_t consumed = 1;
+      if (s.impl->fuse)
+        if (const CpuImpl* f = s.impl->fuse(fe, std::span<const NodeType>(chain).subspan(i), &consumed); f && consumed > 1) s.impl = f;
+      consumed = std::max<std::size_t>(consumed, 1);
       head.push_back(s);
-    }
-    // fusion recipe: the three leading fragments become one pass over the block (same operations, same order)
-    // (an Hdr node after the Gain is part of the fused pass: headGainTone applies the HDR gain between the two)
-    const std::size_t nf = head.size() >= 4 && head[2].type == NodeType::Hdr ? 4 : 3;
-    if (head.size() >= nf && fk.canFuseHead() && (head[0].type == NodeType::Resize || head[0].type == NodeType::Geometry ||
-                                                  head[0].type == NodeType::Source) &&
-        head[1].type == NodeType::Gain && head[nf - 1].type == NodeType::ToneColour) {
-      Step f = head[0];
-      f.impl = cpuFusedHead();
-      f.type = NodeType::ToneColour;
-      head.erase(head.begin(), head.begin() + long(nf));
-      head.insert(head.begin(), f);
+      i += consumed;
     }
     return true;
   }
   bool bindWindows(const Stage& last) {
     blocks = fk.frameBlocks();
-    FrameEnv fe;
-    fe.fk = &fk;
-    fe.blocks = &blocks;
-    fe.film = film;
+    const FrameEnv fe = frameEnv({});
     wins.clear();
     for (std::size_t g = 1; g < last.groups.size(); ++g)
       for (NodeId id : last.groups[g].nodes) {
+        const NodeDesc& d = desc(id);
         Step s;
-        s.type = env.graph.nodes()[id].type;
-        s.impl = cpuImpl(s.type);
-        if (!s.impl || !s.impl->tile || !bindResolved(s.type, fe, s.r)) return false;
+        s.node = id;
+        s.impl = d.cpu;
+        if (!s.impl || !s.impl->tile || !d.bind || !d.bind(fe, s.r)) return false;
+        if (d.solve) s.accum = d.solve(s.r.bytes);
         wins.push_back(s);
       }
     return true;
@@ -146,10 +140,9 @@ struct Run {
             if (drow) {  // clamp into the frame
               float* d = drow + 3 * std::size_t(x);
               for (int i = 0; i < n * 3; ++i) d[i] = std::clamp(px[i], 0.f, 1.f);
-            } else {  // clamp + 8-bit encode (Pack8 epilogue)
+            } else {  // clamp + 8-bit encode (the sink, fused into the chain when no window node follows)
               for (int i = 0; i < n; ++i) {
-                const float r = std::clamp(px[3 * i], 0.f, 1.f), g = std::clamp(px[3 * i + 1], 0.f, 1.f),
-                            b = std::clamp(px[3 * i + 2], 0.f, 1.f);
+                const float r = std::clamp(px[3 * i], 0.f, 1.f), g = std::clamp(px[3 * i + 1], 0.f, 1.f), b = std::clamp(px[3 * i + 2], 0.f, 1.f);
                 o[ch * (x + i)] = std::uint8_t(r * 255.f + 0.5f);
                 o[ch * (x + i) + 1] = std::uint8_t(g * 255.f + 0.5f);
                 o[ch * (x + i) + 2] = std::uint8_t(b * 255.f + 0.5f);
@@ -170,22 +163,36 @@ struct Run {
     t.oy = oy;
     t.frameW = W;
     t.frameH = H;
-    t.dehaze = dehaze.get();
-    t.guided = guided.get();
     t.aux = auxPlanes ? &aux : nullptr;
     for (std::size_t i = from; i < to; ++i) {
       if (cancelled()) return Status::Cancelled;
+      t.solved = wins[i].solved.get();
       const Status st = wins[i].impl->tile(t, wins[i].r.bytes);
       if (st != Status::Ok) return st;
     }
     return cancelled() ? Status::Cancelled : Status::Ok;
   }
 
+  Status sink(ImageF& im, int ox, int oy, const Rect& interior) {
+    CpuTile t;
+    t.img = &im;
+    t.ox = ox;
+    t.oy = oy;
+    t.frameW = W;
+    t.frameH = H;
+    t.interior = interior;
+    t.out8 = env.out;
+    t.outChannels = env.outChannels;
+    t.outRow0 = outRow0;
+    const CpuImpl* pack = desc(plan.sink).cpu;
+    return pack && pack->tile ? pack->tile(t, nullptr) : Status::Unsupported;
+  }
+
   // ---- accumulate the 1/4 grid a global solve needs, from the interior of a tile -----------------------------------------------
   void accumulate(Accum kind, const ImageF& im, const Rect& in, int ox, int oy, bool whole, SpatialScratch& sc) {
     const int iw = in.x1 - in.x0, ih = in.y1 - in.y0;
     const ImageF* src = &im;
-    if (!whole && kind == Accum::DehazeGrid) {  // the interior alone (its origin is on the 1/4 grid: the frame's blocks)
+    if (!whole && kind == Accum::ColourGrid) {  // the interior alone (its origin is on the 1/4 grid: the frame's blocks)
       if (cropBuf.data.size() < std::size_t(iw) * ih * 3) cropBuf.data.resize(std::size_t(iw) * ih * 3);
       cropBuf.width = iw;
       cropBuf.height = ih;
@@ -195,12 +202,9 @@ struct Run {
     }
     std::vector<float> low;
     int lw = 0, lh = 0;
-    const int ch = kind == Accum::DehazeGrid ? 3 : 1;
-    if (kind == Accum::DehazeGrid) {
-      dehazeLowGrid(*src, low, lw, lh);
-    } else {
-      lumaGrid(im, sc, in.x0, in.y0, in.x1, in.y1, low, lw, lh);
-    }
+    const int ch = kind == Accum::ColourGrid ? 3 : 1;
+    if (kind == Accum::ColourGrid) dehazeLowGrid(*src, low, lw, lh);
+    else lumaGrid(im, sc, in.x0, in.y0, in.x1, in.y1, low, lw, lh);
     if (whole) {
       gridLow = std::move(low);
       gridW = lw;
@@ -214,39 +218,36 @@ struct Run {
     }
     const int gx = (ox + in.x0) / 4, gy = (oy + in.y0) / 4;
     for (int y = 0; y < lh; ++y)
-      std::memcpy(gridLow.data() + (std::size_t(gy + y) * gridW + gx) * ch, low.data() + std::size_t(y) * lw * ch,
-                  std::size_t(lw) * ch * sizeof(float));
+      std::memcpy(gridLow.data() + (std::size_t(gy + y) * gridW + gx) * ch, low.data() + std::size_t(y) * lw * ch, std::size_t(lw) * ch * sizeof(float));
   }
 
   // ---- streaming export hooks (section 42) ------------------------------------------------------------------------------------------
-  bool prepare(int x0, int y0, int x1, int y1) {
-    if (!filmAux.empty() && auxPlanes && aux.data) {  // the window's part of the whole-frame amounts
+  bool prepare(const TileWin& tw) {
+    const Rect& r = tw.work;
+    if (!filmAux.empty() && auxPlanes && aux.data) {  // the window's part of the whole-frame side planes
       for (int k = 0; k < auxPlanes; ++k)
-        for (int y = y0; y < y1; ++y)
-          std::memcpy(aux.data + std::size_t(k) * aux.plane + std::size_t(y - aux.oy) * aux.w + std::size_t(x0 - aux.ox),
-                      filmAux.data() + std::size_t(k) * filmAuxAt.plane + std::size_t(y) * filmAuxAt.w + std::size_t(x0), std::size_t(x1 - x0) * sizeof(float));
+        for (int y = r.y0; y < r.y1; ++y)
+          std::memcpy(aux.data + std::size_t(k) * aux.plane + std::size_t(y - aux.oy) * aux.w + std::size_t(r.x0 - aux.ox),
+                      filmAux.data() + std::size_t(k) * filmAuxAt.plane + std::size_t(y) * filmAuxAt.w + std::size_t(r.x0),
+                      std::size_t(r.x1 - r.x0) * sizeof(float));
     }
-    if (filmStream) {  // the film rows of the rect, the stage-W amounts of its window; the source only when the normal branch is read
-      if (filmBand.height == 0 || y0 < filmY0 || y1 > filmY1) {
-        if (!env.filmRows || !env.filmRows(y0, y1, filmBand)) return false;
-        filmY0 = y0, filmY1 = y1;
+    if (filmStream) {  // the film rows of the rect, the side planes of its window; the source only when the normal branch is read
+      if (filmBand.height == 0 || r.y0 < filmY0 || r.y1 > filmY1) {
+        if (!env.filmRows || !env.filmRows(r.y0, r.y1, filmBand)) return false;
+        filmY0 = r.y0, filmY1 = r.y1;
       }
-      if (auxPlanes && aux.data && env.filmAux && !env.filmAux(x0, y0, x1, y1, aux)) return false;
+      if (auxPlanes && aux.data && env.filmAux && !env.filmAux(r.x0, r.y0, r.x1, r.y1, aux)) return false;
       if (!fk.needNormal()) return true;
     }
-    return !env.prepare || env.prepare(x0, y0, x1, y1);
-  }
-  void bandBegin(int y0) {
-    if (env.bandDone) outRow0 = y0;
+    return !env.prepare || env.prepare(tw);
   }
   bool bandEnd(const Stage& st, int y0, int y1) { return !(st.output && env.bandDone) || env.bandDone(y0, y1); }
 
   // ---- one TileSweep ----------------------------------------------------------------------------------------------------------
   Status sweep(const Stage& st) {
     if (stats) ++stats->sweeps;
-    if (!bind(st)) return Status::Unsupported;
+    if (!bindHead(st)) return Status::Unsupported;
     const std::size_t nWin = st.groups.size() - 1;
-    const int T = plan.grid.tile;
     gridW = gridH = 0;
 
     if (nWin == 0 && st.output && env.outF) {  // float frame straight from the chain (Whole plans)
@@ -255,27 +256,13 @@ struct Run {
       if (stats) ++stats->tiles;
       return cancelled() ? Status::Cancelled : Status::Ok;
     }
-    if (nWin == 0 && st.output) {  // no neighbourhood stage: the chain packs the 8-bit pixels itself
-      for (int ty = 0; ty < H; ty += T) {
-        bandBegin(ty);
-        for (int tx = 0; tx < W; tx += T) {
-          if (cancelled()) return Status::Cancelled;
-          if (!prepare(tx, ty, std::min(W, tx + T), std::min(H, ty + T))) return Status::Cancelled;
-          runHead(tx, ty, std::min(T, W - tx), std::min(T, H - ty), nullptr);
-          if (stats) ++stats->tiles;
-        }
-        if (cancelled()) return Status::Cancelled;
-        if (!bandEnd(st, ty, std::min(H, ty + T))) return Status::Cancelled;
-      }
-      return cancelled() ? Status::Cancelled : Status::Ok;
-    }
-
-    if (single) {
+    if (single && !(nWin == 0 && st.output)) {  // one tile: the image stays between sweeps
       if (!imgValid) {
+        const TileWin& tw = st.tiles.front();
         img = film ? film : &frameBuf.get(W, H);
-        auxWindow(0, 0, W, H);
-        if (!prepare(0, 0, W, H)) return Status::Cancelled;
-        if (st.groups[0].nodes.empty() == false) runHead(0, 0, W, H, img);
+        auxWindow(tw.work);
+        if (!prepare(tw)) return Status::Cancelled;
+        if (!st.groups[0].nodes.empty()) runHead(0, 0, W, H, img);
         if (cancelled()) return Status::Cancelled;
         scratch.yValid = false;
         imgValid = true;
@@ -292,90 +279,71 @@ struct Run {
         return cancelled() ? Status::Cancelled : Status::Ok;
       }
       if (st.output) {
-        CpuTile t;
-        t.img = img;
-        t.ox = t.oy = 0;
-        t.frameW = W;
-        t.frameH = H;
-        t.interior = all;
-        t.out8 = env.out;
-        t.outChannels = env.outChannels;
-        const CpuImpl* pack = cpuImpl(NodeType::Pack8);
-        s = pack->tile(t, nullptr);
-        if (s != Status::Ok) return s;
+        if ((s = sink(*img, 0, 0, all)) != Status::Ok) return s;
         if (!bandEnd(st, 0, H)) return Status::Cancelled;
       }
       return cancelled() ? Status::Cancelled : Status::Ok;
     }
 
-    // multi-tile: the chain is recomputed per sweep (5.4)
-    for (int ty = 0; ty < H; ty += T) {
-      bandBegin(ty);
-      for (int tx = 0; tx < W; tx += T) {
-        if (cancelled()) return Status::Cancelled;
-        const Rect in{tx, ty, std::min(tx + T, W), std::min(ty + T, H)};
-        const int x0 = std::max(0, in.x0 - st.halo.x), y0 = std::max(0, in.y0 - st.halo.y);
-        const int x1 = std::min(W, in.x1 + st.halo.x), y1 = std::min(H, in.y1 + st.halo.y);
-        const int rw = x1 - x0, rh = y1 - y0;
+    // the plan's tiles, row by row (a band = one row of tiles); the chain is recomputed per sweep (5.4)
+    int bandY0 = -1, bandY1 = 0;
+    for (const TileWin& tw : st.tiles) {
+      if (tw.interior.y0 != bandY0) {
+        if (bandY0 >= 0 && !bandEnd(st, bandY0, bandY1)) return Status::Cancelled;
+        bandY0 = tw.interior.y0, bandY1 = tw.interior.y1;
+        if (env.bandDone) outRow0 = bandY0;
+      }
+      if (cancelled()) return Status::Cancelled;
+      const Rect& w = tw.work;
+      const int rw = w.x1 - w.x0, rh = w.y1 - w.y0;
+      auxWindow(w);
+      if (!prepare(tw)) return Status::Cancelled;
+      if (nWin == 0 && st.output) {  // no window node: the chain packs the 8-bit pixels itself
+        runHead(w.x0, w.y0, rw, rh, nullptr);
+      } else {
         if (tileBuf.data.size() < std::size_t(rw) * rh * 3) tileBuf.data.resize(std::size_t(rw) * rh * 3);
         tileBuf.width = rw;
         tileBuf.height = rh;
-        auxWindow(x0, y0, rw, rh);
-        if (!prepare(x0, y0, x1, y1)) return Status::Cancelled;
-        runHead(x0, y0, rw, rh, &tileBuf);
+        runHead(w.x0, w.y0, rw, rh, &tileBuf);
         if (cancelled()) return Status::Cancelled;
         scratch.yValid = false;
-        Status s = runWindows(tileBuf, x0, y0, 0, nWin, scratch);
+        Status s = runWindows(tileBuf, w.x0, w.y0, 0, nWin, scratch);
         if (s != Status::Ok) return s;
-        const Rect local{in.x0 - x0, in.y0 - y0, in.x1 - x0, in.y1 - y0};
-        if (st.accum != Accum::None) accumulate(st.accum, tileBuf, local, x0, y0, false, scratch);
-        if (st.output) {
-          CpuTile t;
-          t.img = &tileBuf;
-          t.ox = x0;
-          t.oy = y0;
-          t.frameW = W;
-          t.frameH = H;
-          t.interior = local;
-          t.out8 = env.out;
-          t.outChannels = env.outChannels;
-          t.outRow0 = outRow0;
-          s = cpuImpl(NodeType::Pack8)->tile(t, nullptr);
-          if (s != Status::Ok) return s;
-        }
-        if (stats) ++stats->tiles;
+        const Rect in{tw.interior.x0 - w.x0, tw.interior.y0 - w.y0, tw.interior.x1 - w.x0, tw.interior.y1 - w.y0};
+        if (st.accum != Accum::None) accumulate(st.accum, tileBuf, in, w.x0, w.y0, false, scratch);
+        if (st.output && (s = sink(tileBuf, w.x0, w.y0, in)) != Status::Ok) return s;
       }
-      if (cancelled()) return Status::Cancelled;
-      if (!bandEnd(st, ty, std::min(H, ty + T))) return Status::Cancelled;
+      if (stats) ++stats->tiles;
     }
-    return cancelled() ? Status::Cancelled : Status::Ok;
+    if (cancelled()) return Status::Cancelled;
+    if (bandY0 >= 0 && !bandEnd(st, bandY0, bandY1)) return Status::Cancelled;
+    return Status::Ok;
+  }
+
+  Step* windowOf(NodeId id) {
+    for (Step& s : wins)
+      if (s.node == id) return &s;
+    return nullptr;
   }
 
   // ---- a GlobalSolve --------------------------------------------------------------------------------------------------------
   Status solve(const Stage& st) {
-    const NodeInstance& n = env.graph.nodes()[st.solveNode];
     if (cancelled()) return Status::Cancelled;
-    if (n.type == NodeType::Dehaze) {
-      auto sv = std::make_shared<DehazeSolve>();
-      dehazeSolveGrid(gridLow, gridW, gridH, blocks.dehaze.minRadius, blocks.dehaze.boxRadius, blocks.dehaze.omega, *sv);
-      if (cancelled()) return Status::Cancelled;
-      dehaze = sv;
-      ResultCache::Entry e;
-      e.key = e.family = n.key;
-      e.payload = sv;
-      e.bytes = sv->t.size() * 4;
-      env.cache.put(NodeType::Dehaze, std::move(e));
-    } else {
-      auto gs = std::make_shared<GuidedSolve>();
-      guidedSolveGrid(gridLow, gridW, gridH, blocks.detail.guidedRadius, detail::kGuidedEps, *gs);
-      if (cancelled()) return Status::Cancelled;
-      guided = gs;
-      ResultCache::Entry e;
-      e.key = e.family = n.key;
-      e.payload = gs;
-      e.bytes = (gs->a.size() + gs->b.size()) * 4;
-      env.cache.put(NodeType::Detail, std::move(e));
-    }
+    Step* w = windowOf(st.solveNode);
+    if (!w || !w->impl->solve) return Status::Unsupported;
+    std::size_t bytes = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    w->solved = w->impl->solve(gridLow, gridW, gridH, w->r.bytes, &bytes);
+    if (!w->solved) return Status::Internal;
+    if (cancelled()) return Status::Cancelled;
+    const NodeInstance& n = env.graph.nodes()[st.solveNode];
+    ResultCache::Entry e;
+    e.slot = slotOf(n.type);
+    e.key = e.family = n.key;
+    e.payload = w->solved;
+    e.hostBytes = bytes;
+    e.costMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    env.cache.put(std::move(e));
     if (stats) ++stats->solveBuilds;
     gridLow.clear();
     gridLow.shrink_to_fit();
@@ -384,25 +352,16 @@ struct Run {
 
   // Solves the plan did not schedule because they are in the cache.
   Status loadCachedSolves() {
-    bool dehazeStage = false, guidedStage = false;
-    for (const Stage& s : plan.stages)
-      if (s.kind == StageKind::GlobalSolve) {
-        const NodeType t = env.graph.nodes()[s.solveNode].type;
-        (t == NodeType::Dehaze ? dehazeStage : guidedStage) = true;
-      }
-    for (const NodeInstance& n : env.graph.nodes()) {
-      if (n.type == NodeType::Dehaze && blocks.dehaze.solve() && !dehazeStage) {
-        ResultCache::Entry* e = env.cache.find(NodeType::Dehaze, n.key);
-        if (!e) return Status::Internal;
-        dehaze = as<DehazeSolve>(e->payload);
-        if (stats) ++stats->solveHits;
-      }
-      if (n.type == NodeType::Detail && blocks.detail.solve() && !guidedStage) {
-        ResultCache::Entry* e = env.cache.find(NodeType::Detail, n.key);
-        if (!e) return Status::Internal;
-        guided = as<GuidedSolve>(e->payload);
-        if (stats) ++stats->solveHits;
-      }
+    for (Step& s : wins) {
+      if (s.accum == Accum::None) continue;
+      bool planned = false;
+      for (const Stage& st : plan.stages) planned |= st.kind == StageKind::GlobalSolve && st.solveNode == s.node;
+      if (planned) continue;
+      const NodeInstance& n = env.graph.nodes()[s.node];
+      const ResultCache::Hit h = env.cache.find(slotOf(n.type), n.key);
+      if (!h) return Status::Internal;
+      s.solved = h.payload;
+      if (stats) ++stats->solveHits;
     }
     return Status::Ok;
   }
@@ -416,16 +375,15 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
   CancelScope scope(env.cancel.current, env.cancel.mine);
   Run r(plan, env, stats);
   r.single = plan.grid.nx == 1 && plan.grid.ny == 1;
-  if (const FrameBound b = env.fk.frameBound(); b.local && env.graph.find(NodeType::LocalDetail)) r.auxPlanes = local::auxLayout(*b.local, r.aux);
+  if (const FrameBound b = env.fk.frameBound(); b.local && plan.needAux) r.auxPlanes = local::auxLayout(*b.local, r.aux);
   if (env.cancel.cancelled()) return Status::Cancelled;
 
-  // the last TileSweep lists every window node
-  const Stage* lastSweep = nullptr;
+  const Stage* lastSweep = nullptr;  // the last TileSweep lists every window node
   for (const Stage& s : plan.stages)
     if (s.kind == StageKind::TileSweep) lastSweep = &s;
   if (!lastSweep) return Status::Unsupported;
 
-  // film: a whole-frame node before the sweeps (the streaming path finishes the frame by itself)
+  // the film stage: whole-frame before the sweeps (the streaming path finishes the frame by itself)
   for (const Stage& s : plan.stages) {
     if (s.kind != StageKind::FilmFrame) continue;
     if (env.prepare) {  // streaming export: the film in bands (section 42.6), rows rendered as the sweeps need them
@@ -436,17 +394,16 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
       if (env.cancel.cancelled()) return Status::Cancelled;
       continue;
     }
-    if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF &&
-        !env.fk.frameBlocks().anyWindow() && !env.fk.frameBound().local) {
+    if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF && !env.fk.frameBlocks().anyWindow() && !env.fk.frameBound().local) {
       if (env.fk.streamFilm(env.out)) {
         if (stats) stats->streamed = true;
         return Status::Ok;
       }
     }
     r.film = &r.filmScratch.get(r.W, r.H);
-    r.auxWindow(0, 0, r.W, r.H);  // local adjustments: the film input pass writes the stage-W amounts of the whole frame
+    r.auxWindow(Rect{0, 0, r.W, r.H});  // local adjustments: the film input pass writes the side planes of the whole frame
     if (!env.fk.runFilm(*r.film, r.auxPlanes ? &r.aux : nullptr)) return Status::Unsupported;  // the frame fails with an explicit engine error
-    if (r.auxPlanes && !r.single) {  // the sweeps size the amount planes per work window: keep the whole frame's apart
+    if (r.auxPlanes && !r.single) {  // the sweeps size the side planes per work window: keep the whole frame's apart
       r.filmAuxAt = r.aux;
       r.filmAux.assign(r.auxBuf.begin(), r.auxBuf.begin() + std::ptrdiff_t(r.aux.plane * std::size_t(r.auxPlanes)));
     }

@@ -1,10 +1,10 @@
 #pragma once
 // EngineSession: per-photo engine state (docs/engine/pipeline-architecture.md section 3, stage a2/a3).
 //
-// renderFrame() builds the frame's table graph (GraphBuilder, Tables detail), computes the node keys, evaluates the table
-// nodes through the ResultCache and keeps the assembled bake (lattice + tone table + analysis) in the AssembledBake slot, then plans the
-// Full graph of the frame and runs it on the GPU executor where it supports the plan, else on the CpuExecutor. The C layer keeps everything in
-// front of it (parsing, LUT, scaled source, proxy).
+// renderFrame() builds the frame's one graph (GraphBuilder, from the frame's draft blocks), computes the node keys, evaluates its table
+// nodes through the ResultCache (host_tables.cpp; the assembled bake in kBakeSlot), then plans the same graph and runs it on the GPU executor
+// where it supports the plan (gpu_dispatch.cpp), else on the CpuExecutor. The C layer keeps everything in front of it (parsing, LUT, scaled
+// source, proxy). The session's ResultCache also holds the GPU executor's device copies (device slots) under one budget.
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -20,6 +20,7 @@
 #include "engine/exec/result_cache.h"
 #include "engine/exec/source_store.h"
 #include "engine/graph/graph.h"
+#include "engine/nodes/frame_blocks.h"
 #include "engine/plan/plan.h"
 
 namespace dapple::engine {
@@ -159,7 +160,7 @@ class EngineSession {
   bool renderExact(const EditParams& params, const engine::point::Params& point, const SourceImage& src, const ExactOptions& opt,
                    Image8& out, std::string* err = nullptr, ExecStats* stats = nullptr);
 
-  // The graph of the last frame (diagnostics, tests).
+  // The graph of the last frame (diagnostics, tests): the one graph the frame was built, tabled, planned and executed from.
   const Graph& lastGraph() const { return graph_; }
 
   // ---- GPU executor selection (5.9) ----------------------------------------------------------------------------------------------
@@ -190,15 +191,24 @@ class EngineSession {
   int exportGpu(GpuExport& job, GpuStats* stats, std::string* err);
 
  private:
+  // The frame's blocks before the bake (the builder's wiring), at the size of the executor tried first.
+  struct FrameDraft {
+    point::Blocks point;
+    std::shared_ptr<const local::Frame> local;
+    FrameBlocks blocks;
+    bool gpu = false;
+    FrameView view() const { return FrameView{&point, &blocks}; }
+  };
+  FrameDraft draftFrame(const FrameJob& job, bool gpu) const;
   bool gpuUsable(const FrameJob& job) const;
-  // One plan on the GPU with the selection of 5.9. 0 = out filled, 1 = CPU takes the frame, -1 = cancelled.
+  // One plan on the GPU with the selection of 5.9. 0 = out filled, 1 = CPU takes the frame, -1 = failed (forced), -2 = cancelled.
   int runOnGpu(const GpuRun& run, GpuOut& out);
-  int renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out);
+  int renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& bake, const FrameDraft& draft, FrameResult& out);
   // renderExact on the GPU executor (the exact variant: ToneColourExact through a dense lattice bake): 0 = `out` holds the frame, 1 = the CPU takes it,
   // -1 = failed / cancelled (err)
   int renderExactGpu(const EditParams& params, const engine::point::Params& point, const SourceImage& src, const ExactOptions& opt, Image8& out,
                      std::string* err);
-  const std::vector<float>* overflowFor(const ParamSet& ps, int n) const;
+  std::shared_ptr<const std::vector<float>> overflowFor(const ParamSet& ps, int n);
   hal::Api gpuLastApi_ = hal::Api::Null;
   IGpuExecutor* gpuExecutor();
   std::unique_ptr<IGpuExecutor> gpuOwned_;
@@ -208,12 +218,12 @@ class EngineSession {
   std::string gpuWhy_;  // last reason for not using the GPU (diagnostics)
   std::string frameWhy_;  // reason the GPU did not render the frame being rendered (reset by renderFrame; FrameResult::why)
 
-  // The HostTable stage: evaluates the table nodes of `graph_` through their CpuImpl::bake (cached in the ResultCache under the
-  // effective node keys) and assembles the frame's BakedLut.
+  // The HostTable stage (host_tables.cpp): evaluates the table nodes of `graph_` through their CpuImpl::bake (cached in the ResultCache
+  // under the effective node keys) and assembles the frame's BakedLut.
   std::shared_ptr<const BakedLut> runHostTables(FrameJob& job, const ParamSet& ps, int n, FrameResult& out);
 
   // 0 = out.rgba is the frame, 1 = not supported here (an explicit engine error), -1 = failed / cancelled (out.error)
-  int renderFull(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out);
+  int renderFull(FrameJob& job, const ParamSet& ps, const BakedLut& bake, const FrameDraft& draft, FrameResult& out);
 
   std::uint64_t id_;
   std::atomic<std::uint64_t> latest_{1};
@@ -222,8 +232,8 @@ class EngineSession {
   Graph graph_;
 
  public:
-  // The Resize node: the session source resampled to `longEdge` (CpuImpl::bake of Resize, cached; at most 4 copies / ~160 MB,
-  // least recently used first out). Null when the source is not larger than `longEdge` (the caller reads `full` itself).
+  // The Resize node: the session source resampled to `longEdge` (CpuImpl::bake of Resize, cached in the session's ResultCache under its
+  // host budget, least recently used by cost first out). Null when the source is not larger than `longEdge` (the caller reads `full` itself).
   // The returned image stays valid while the caller holds it, whatever the cache does.
   // cacheLarge = false (exports, previews): a copy of more than 64 MB is returned but not kept.
   std::shared_ptr<const SourceImage> resizedSource(const SourceImage& full, int longEdge, bool cacheLarge = true);

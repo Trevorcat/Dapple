@@ -65,4 +65,22 @@ bool recordNrChroma(GpuRecorder& r, const NrChromaNode& n, H D) {
   return true;
 }
 
+// ---- GpuImpl (engine/nodes/node_list.inc) ----------------------------------------------------------------------------------------------
+namespace {
+H nodeLuma(GpuRecorder& r, const NodeCall& c) {
+  const GpuJob& j = c.job;
+  return recordNrLuma(r, NrLumaNode{static_cast<const nr::LumaBlock*>(c.block), j.W, j.Hh, j.ox, j.oy, c.ep}, c.D) ? c.D : -1;
+}
+H nodeChroma(GpuRecorder& r, const NodeCall& c) {
+  const GpuJob& j = c.job;
+  return recordNrChroma(r, NrChromaNode{static_cast<const nr::ChromaBlock*>(c.block), j.W, j.Hh, j.ox, j.oy, c.ep}, c.D) ? c.D : -1;
+}
+const char* const kNrL[] = {"nr_luma", "sep_d2y", "sep_d2y_s", "sep_y", "sep_y", "sep_y_s", "sep_y_v", "bx_d2y", "bx_y", "bx_y_v"};
+const char* const kNrC[] = {"down", "nr_chroma", "sep_c", "sep_c_s"};
+const GpuImpl kLuma{kNrL, nullptr, nodeLuma};
+const GpuImpl kChroma{kNrC, nullptr, nodeChroma};
+}  // namespace
+const GpuImpl* nrLumaGpu() { return &kLuma; }
+const GpuImpl* nrChromaGpu() { return &kChroma; }
+
 }  // namespace dapple::engine::gpu
