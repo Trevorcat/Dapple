@@ -10,6 +10,7 @@ import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import 'dapple_bindings.dart';
 import 'memory_bindings.dart';
+import '../model/wire_json.dart';
 import '../services/perf_probe.dart';
 
 class DappleException implements Exception {
@@ -332,7 +333,7 @@ class DappleSession {
   /// Tonal analysis ({"histogram":[64],"p5","p50","p95","nearest","key","range",...}) of the photo as
   /// rendered with [params] (null = untouched). Returns null when the library predates the symbol.
   Future<Map<String, dynamic>?> analyze([Map<String, dynamic>? params]) {
-    final pj = params == null ? null : jsonEncode(params);
+    final pj = params == null ? null : encodeWire(params);
     return _serial(() => _analyzeIso(_address, pj));
   }
 
@@ -355,7 +356,7 @@ class DappleSession {
   /// The film pads' labels and effective ranges for this photo with [params] (dapple_session_film_pad_json); null when the
   /// library predates the symbol. Parse with `FilmPadRanges.parse`.
   Future<String?> filmPadJson(Map<String, dynamic> params) {
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     return _serial(() => _filmPadIso(_address, pj));
   }
 
@@ -374,7 +375,7 @@ class DappleSession {
 
   /// The nine style previews (order of [looksCatalog]) rendered on top of [params]. Null if unsupported.
   Future<List<RenderedImage>?> lookPreviews(Map<String, dynamic> params, {int longEdge = 256}) {
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     return _serial(() => _previewsIso(_address, pj, longEdge, null));
   }
 
@@ -384,7 +385,7 @@ class DappleSession {
   /// The nine tonal-class previews, order: low-short, low-mid, low-long, mid-short ... high-long.
   /// [strength] < 0 means max(60, toneStrength of params) (engine rule). Null if unsupported.
   Future<List<RenderedImage>?> tonePreviews(Map<String, dynamic> params, {int longEdge = 200, double strength = -1}) {
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     return _serial(() => _previewsIso(_address, pj, longEdge, strength));
   }
 
@@ -536,7 +537,7 @@ class DappleSession {
   /// back as null. Throws when the engine predates the call. Not serialised with the session's other calls: the engine takes its own lock one frame at a time.
   Future<List<RenderedImage?>> baseSwatches(Map<String, dynamic> params, List<String?> ids, {int longEdge = 96}) async {
     if (_closed || _closing) return List<RenderedImage?>.filled(ids.length, null);
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     final a = _address;
     _swatchCalls++;
     _swatchIdle ??= Completer<void>();
@@ -601,7 +602,7 @@ class DappleSession {
   static bool get hasAnalyze => DappleBindings.instanceOrNull?.sessionAnalyzeJson != null;
 
   Future<RenderedImage> render(Map<String, dynamic> params, {String? lutPath, int longEdge = 0}) {
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     return _serial(() => _renderIso(_address, pj, lutPath, longEdge));
   }
 
@@ -644,7 +645,7 @@ class DappleSession {
       bool background = false,
       bool exact = false,
       String? activeParam}) {
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     final flags = (interactive ? dappleFrameInteractive : 0) | (analysis ? dappleFrameAnalysis : 0) | (exact ? dappleFrameExact : 0) | (background ? dappleFrameBackground : 0);
     return _serial(() => _frame(pj, lutPath, longEdge, flags, bakeSize, region, regionLongEdge, activeParam));
   }
@@ -710,7 +711,7 @@ class DappleSession {
 
   Future<void> exportJpeg(Map<String, dynamic> params,
       {String? lutPath, int longEdge = 0, int quality = 92, required String outPath}) {
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     return _serial(() => _exportIso(_address, pj, lutPath, longEdge, quality, outPath));
   }
 
@@ -753,7 +754,7 @@ class DappleSession {
       bool hdr = false,
       String? exportJson,
       required String outPath}) {
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     return Isolate.run(() {
       final b = _b();
       final cp = srcPath.toNativeUtf8();
@@ -834,7 +835,7 @@ class DappleSession {
   /// Highlight headroom of the edit in stops above SDR white (0 = nothing worth an HDR export, or a film look): the publish page shows its
   /// "HDR 照片" option only when this is above 0. Opens a preview-quality session of [srcPath] (cheap, one-shot).
   static Future<double> hdrHeadroom(String srcPath, Map<String, dynamic> params) {
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     return Isolate.run(() {
       final b = _b();
       final f = b.sessionHdrHeadroom;
@@ -862,7 +863,7 @@ class DappleSession {
   /// Share (0..1) of the picture, after the edit, whose colour lies outside sRGB (`dapple_session_wide_gamut_fraction`): the publish page offers the
   /// "广色域 P3" export only when this is not negligible. 0 for a library without the call. Preview-quality session, one-shot.
   static Future<double> wideGamutFraction(String srcPath, Map<String, dynamic> params) {
-    final pj = jsonEncode(params);
+    final pj = encodeWire(params);
     return Isolate.run(() {
       final b = _b();
       final f = b.sessionWideGamutFraction;

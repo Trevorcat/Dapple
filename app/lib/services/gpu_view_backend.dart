@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import '../model/wire_json.dart';
 import '../native/dapple_bindings.dart';
 
 /// Switch for the zero-copy display (kill switch for diagnostics: `--dart-define=DAPPLE_GPU_VIEW=0`).
@@ -134,7 +135,7 @@ class GpuViewBackend with WidgetsBindingObserver {
   /// [activeParam]: key of the slider being dragged (grain stays on in interactive frames while a grain-family slider moves).
   int submit(Map<String, dynamic> params, {required int longEdge, required int flags, int bakeSize = 0, String? activeParam}) {
     if (_disposed || _view == ffi.nullptr) return 0;
-    final pj = jsonEncode(params).toNativeUtf8();
+    final pj = encodeWire(params).toNativeUtf8();
     final rq = calloc<DappleFrameRequestStruct>();
     final ap = (activeParam == null || activeParam.isEmpty) ? ffi.nullptr : activeParam.toNativeUtf8();
     try {

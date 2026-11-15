@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 
@@ -34,6 +35,10 @@ class SessionCache {
   /// Tests: pretend the engine is there and open sessions through [testOpener] instead of the FFI.
   @visibleForTesting
   bool? testAvailable;
+  @visibleForTesting
+  Future<DappleSession?> Function(Photo ph)? testDetailOpener;
+  @visibleForTesting
+  Future<({int w, int h})?> Function(Photo ph)? testFullSize;
   @visibleForTesting
   Future<DappleSession?> Function(Photo ph)? testOpener;
 
@@ -172,8 +177,19 @@ class SessionCache {
     return _detail = _openDetail(ph);
   }
 
+  /// Opens [ph]'s detail session ahead of the first zoom when the picture is too large for the 1:1 region path to serve a zoomed-in view
+  /// ([regionMaxPx]); [stillWanted] is asked once the picture's size is known and before the decode starts (it cannot be interrupted after).
+  /// A no-op when it is open or opening, or when the picture is small enough.
+  Future<void> prefetchDetail(Photo ph, bool Function() stillWanted) async {
+    if (!available || ph.demo != null || _detailId == ph.id) return;
+    final fs = await fullSize(ph);
+    if (fs == null || math.max(fs.w, fs.h) <= regionMaxPx || !stillWanted() || _detailId == ph.id) return;
+    await detail(ph);
+  }
+
   Future<DappleSession?> _openDetail(Photo ph) async {
     try {
+      if (testDetailOpener != null) return await testDetailOpener!(ph);
       final src = await _resolve(ph);
       if (src == null) throw '没有源文件';
       return await DappleSession.open(src.path, full: false, longEdge: detailLongEdge, background: true);
@@ -198,6 +214,7 @@ class SessionCache {
 
   /// Full-resolution size of the oriented picture (from the session info), cached.
   Future<({int w, int h})?> fullSize(Photo ph) async {
+    if (testFullSize != null) return testFullSize!(ph);
     final c = _fullSize[ph.id];
     if (c != null) return c;
     final s = await get(ph);

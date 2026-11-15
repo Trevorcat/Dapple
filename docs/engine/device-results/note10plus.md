@@ -1,5 +1,58 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-15 (night) app-side open / zoom changes
+
+Release APK with the app changes (same Note10+ RFCMA05Q5ZX, taps only, Battery Saver on, 3 cold reps per file, frame_profile prop set then reset; raw logs and scripts in `build/perf-20261115c/`). Files: `C6700_26mp.ARW`, `C7RM4_61mp.ARW`, `CXS10_26mp.RAF` (the public samples, new throw-away folder, removed).
+* Open, ms since the tap, first engine frame (before -> after, median [reps]): X-S10 1400 -> 1304 [1304 1260 1330]; A6700 993 -> 944 [959 940 944]; A7RM4 1612 -> 1574 [1552 1604 1574]. The session open now starts 12-37 ms after the tap (was about 130 ms: the open waited for the placeholder and the page build; a quick `input tap` also never reaches the 40 ms finger-down warm-up).
+* The "sharp" frame at +0.68 s is not a settle: it is the before/after picture (`{'original': true}`, 1600 px) that `_kick` renders 600 ms after the first frame once idle. The first frame is already the full 1600 px tier, nothing sharper is computed. Unchanged (it is needed for compare); the second-frame times above are 1973 / 2234 / 1622.
+* Zoom (double tap 8.5 s after the open) to the first detail frame, ms: X-S10 926 [943 884 926], A7RM4 1028 [1009 1059 1028], A6700 911 [952 911 902]; before 2.0-2.4 s. The half-resolution zoom session is opened in the background 2.5 s after the first frame (device > 5 GB, MemAvailable >= 3 GB, picture > 3200 px, nothing in flight).
+* Memory, five opens in a row (grid, open, back): VmRSS after each open 696 / 797 / 684 / 682 / 800 MB (before: 801 at open 1), VmHWM 1005 MB (before 931): +74 MB for the detail session. Grid after: 277 MB.
+* Params JSON per frame: 10 us for a plain edit (desktop), 2.5 ms with two 3000-point brush strokes; with the cached stroke text 0.05 ms.
+
+## 2026-11-15 (late) after the binding fix and GPU turns
+
+Build: release APK of 02495b4 (built 22:57, `install -r`), same Note10+ (RFCMA05Q5ZX), same method and scripts as the baseline below (copies and logs in `build/perf-20261115b/`: `drag_*`, `zoom_a*`, `export_*`, `rss_*`, `dx.sh` / `idle.sh`, `an_drag.py`). State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 25.4 C at start, 29.4 C at the end, `Thermal Status 0`, 60 Hz. Library: the same three public samples under new names (`Q6700_26mp.ARW`, `Q7RM4_61mp.ARW`, `QXS10_26mp.RAF`, a new throw-away folder). Film N160, plus a 局部 circle with a 光线 pad edit, on the A6700 file (fresh edit state). Drags: 3 reps (1.3 s out, 1.3 s back), pooled interactive frames; per-rep medians in brackets. Exports: 3 reps A6700, 2 reps each X-S10 and A7RM4 (device-time limit; asked for 3).
+
+**Pipelines: `local_film_in` and `film_src` now create.** No `VkResult` / `-13` / `reason=` / `exec=cpu` line anywhere in the logcat of the whole session (1162 drag frames, all `exec=vulkan`, no crash, ANR or fatal line; tombstones directory not readable without root, so not checked).
+
+### B1 Before / after (A6700, film on, interactive frames, engine `cpu_ms` median / p90 / max)
+| class | before (bb1cf0f) | after (02495b4) | tier settled | exec |
+|---|---|---|---|---|
+| 局部 pad drag (光线 pad of the circle) | **175.9 / 354.5 / 462**, 36 of 37 on CPU | **7.8 / 15.0 / 235** [9.9 7.5 8.0]; view latency 20 ms med | 480x321 (168 of 296), 640 49, 810 45, 360 34 | vulkan 296 / 296 |
+| 局部 circle move (area) | 1.7 / 3.3 / 102 (vulkan; this path never hit the missing pipeline) | 7.1 / 12.1 / 24 [5.7 6.5 7.3]; view latency 24 ms | 360x240 (125 of 125) | vulkan |
+| film exposure-type pad (成像) | 1.3 / 9.1 / 166 | 1.2 / 11.7 / 598 [1.2 1.2 1.3] | 480 176, 640 133, 360 70 | vulkan |
+| colour pad | 34.0 / 42.4 / 220 (film on) | 33.6 / 47.0 / 170 [34.1 33.5 31.9] | 360 (103 of 153) | vulkan; tables 26.5 ms of it |
+| exposure (光线 pad) | 32.7 / 44.3 / 225 | 32.0 / 44.4 / 97 [32.3 30.7 32.3] | 360x240 (150 of 150) | vulkan; tables 26.0 ms |
+
+The film frames with the local edit are now about 22 times cheaper (176 to 8 ms), the tier rises from 360x240 to 480-810. Colour and exposure are unchanged: the cost is still the CPU table bake on the frame thread (26 ms of 32-34).
+
+### B2 Zoom, export
+| | before | after |
+|---|---|---|
+| film + local, first detail frame (tap to frame, 3 reps) | 2.2 s, **CPU 797 ms** | 2.03 / 2.00 / 2.04 s; frame 1340x1443 `exec=vulkan`, cpu_ms 596 / 609 / 618 (match ~195, exec 384-400 incl. upload 70-72) |
+| export A6700 film + local (3 reps) | stream CPU, 10.8 / 11.2 s, RSS 1069 | **still stream CPU**: 13.6 / 13.6 / 13.6 s tap to done (stream CPU 11.8-11.9 s, analyse 0.74-0.82, encode 0.89), peak RSS 1096 / 1096 / 1102 MB (HWM 1101-1103); no GPU reason logged |
+| export X-S10 (2 reps, no film) | 6.3 / 6.9 s, 931 MB | 6.9 / 6.9 s (render 0.79, encode+write 0.37-0.39), RSS 927 / 939 (HWM 934-946) |
+| export A7RM4 61 MP (2 reps, no film) | 6.7 / 6.7 s, 879 MB | 6.8 / 6.8 s (GPU stream, 203 windows, CPU demosaic 3.0-3.1 s), RSS 850 / 887 (HWM 885-890) |
+
+The film export stays on the CPU stream by construction, not because of a failure: `core/src/capi/stream.cpp` only enters the GPU stream when `!film`. It is 2.2-2.6 s slower than the baseline (same photo, but film N160 instead of N400C and a different local edit; cause not measured). Film + local export is the largest remaining GPU gap.
+
+### B3 Dragging during background work (A7RM4 61 MP, 光线 pad, 3 reps each, engine `cpu_ms`)
+Editing is not blocked while the same photo exports (the bar shows "saving", the pad stays live), so the drag started 1.5 s after the export tap and ran 2.9 s inside the export (analyse and GPU tile phase).
+| | frames | engine median / p90 / max | view latency median / p90 / max | export total |
+|---|---|---|---|---|
+| idle drag | 202 | 21.2 / 36.2 / 118 [20.6 23.0 21.4] | 36 / 51 / 158 ms | n/a |
+| drag during the export | 181 | 21.0 / 40.2 / 292 [21.1 21.6 20.5] | 36.5 / 70 / 326 ms; present p90 12.8 ms (idle 0.6) | 8.15-8.22 s (idle export 6.47-6.49), CPU demosaic 4.5 s (idle 3.0), peak footprint 1246-1264 MB (idle 865-869) |
+
+Median drag frame cost is unchanged by the export; the tail is worse (p90 +11 ms latency, one 175 and one 292 ms frame in 2 of 3 reps) and the export is about 1.7 s slower. In an earlier single try, started in the first second of the export, the frames after the drag waited 740 ms and 1334 ms (`upload` time inside `exec`, one frame each): the GPU turn was taken by the export at that moment; not reproduced in the 3 timed reps, so it is one observation. Not measured: dragging while thumbnails develop after an import, dragging while a region render is in flight (the zoom runs on a half-resolution session here, there is no region render to overlap).
+
+### B4 Correctness (viewed)
+Screenshots `s_film.png` (film N160, 光线 tab), `s_local.png` (film + 局部 circle with its mask overlay) and the pulled export `ex_6700_film_local.jpg` (6240x4168, film N160 + circle, downscaled view plus a 800x600 crop at 100 %, `ex_6700_small.png`, `ex_6700_crop.png`): no black or garbled tiles, no seams, colours as a film look (warm greens, blue sky), the circle edit smooth, grain visible at 100 %. Full-size pixels were not compared with the CPU render.
+
+### B5 Cleanup
+Removed from the phone by exact name: `/sdcard/Pictures/DappleTest1115b/{Q6700_26mp.ARW,Q7RM4_61mp.ARW,QXS10_26mp.RAF}` (folder removed) and the 11 exports the app wrote to `/sdcard/Pictures/Dapple/` (`Q6700_26mp_dapple.jpg`, `... (1)`, `... (2)`; `Q7RM4_61mp_dapple.jpg`, `... (1)` to `... (5)`; `QXS10_26mp_dapple.jpg`, `... (1)`); the older files in that folder untouched; MediaStore refreshed per file. `debug.dapple.frame_profile` reset to empty. The app's library still lists the three test photos (no delete action, `pm clear` forbidden). Other phones not touched. Screenshots only show Dapple's own screens.
+
+---
+
 ## 2026-11-15 baseline after the planner rewrite
 
 Build: release APK of HEAD bb1cf0f (`app/build/app/outputs/flutter-apk/app-release.apk`, installed with `install -r`), Note10+ SM-N9760, Android 12, Vulkan on Adreno 640 (`gpu probe: api=vulkan ... self-test cached, probe total 9-13 ms`). Method (taps only, the release APK has no debug hooks):

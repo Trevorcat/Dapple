@@ -832,7 +832,7 @@ class EditorEngine extends ChangeNotifier {
   bool _prefetching = false;
 
   void _schedulePrefetch() {
-    if (_neighbors.isEmpty || !live) return;
+    if (!live) return;
     _prefetchTimer?.cancel();
     final g = _gen;
     _prefetchTimer = Timer(prefetchIdle, () async {
@@ -841,15 +841,44 @@ class EditorEngine extends ChangeNotifier {
         _schedulePrefetch();
         return;
       }
-      final want = _lowRam ? _neighbors.take(1).toList() : _neighbors;
-      if (want.every((n) => app.sessions.has(n.id))) return;
       _prefetching = true;
       try {
-        await app.sessions.prefetch(want, () => g == _gen && _drag == 0);
+        // 1. the half-resolution zoom session of this photo, so the first pinch-zoom finds it open (it was decoded from the RAW at the first zoom: 2.0-2.4 s
+        //    of the base picture stretched over the screen on a 26-61 MP photo); only where memory allows and nothing is in the way: the decode cannot be
+        //    interrupted once started, so the gate is checked before it and a finger down afterwards just leaves it open for the zoom.
+        final ph = photo;
+        if (ph != null && detailPrefetchAllowed()) await app.sessions.prefetchDetail(ph, () => g == _gen && !_interactiveNow && !_dirty);
+        // 2. the neighbours
+        final want = _lowRam ? _neighbors.take(1).toList() : _neighbors;
+        if (g == _gen && want.isNotEmpty && !want.every((n) => app.sessions.has(n.id))) {
+          await app.sessions.prefetch(want, () => g == _gen && _drag == 0);
+        }
       } finally {
         _prefetching = false;
       }
     });
+  }
+
+  /// Whether the device has memory for the zoom session next to the open photo and its neighbours: more than 5 GB in total and at least
+  /// [detailPrefetchMinAvailKb] available now (the session is 134 MB resident and decodes through about 600 MB). Off where /proc/meminfo
+  /// cannot be read (not Android); tests set [meminfoForTest].
+  static const int detailPrefetchMinAvailKb = 3 * 1024 * 1024;
+  @visibleForTesting
+  static String? Function()? meminfoForTest;
+  static bool detailPrefetchAllowed() {
+    try {
+      final t = meminfoForTest?.call() ?? File('/proc/meminfo').readAsStringSync();
+      return detailPrefetchFits(t);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @visibleForTesting
+  static bool detailPrefetchFits(String meminfo) {
+    final total = RegExp(r'MemTotal:\s+(\d+)').firstMatch(meminfo), avail = RegExp(r'MemAvailable:\s+(\d+)').firstMatch(meminfo);
+    if (total == null || avail == null) return false;
+    return int.parse(total.group(1)!) > 5 * 1024 * 1024 && int.parse(avail.group(1)!) >= detailPrefetchMinAvailKb;
   }
 
   static final bool _lowRam = () {

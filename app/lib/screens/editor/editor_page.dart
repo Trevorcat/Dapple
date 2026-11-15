@@ -45,6 +45,10 @@ import '../../services/perf_probe.dart';
 /// Opens the viewer / editor on [photoId] (full-screen route; the global navigation is hidden).
 void openEditor(BuildContext context, AppState app, String photoId, {EGroup? initialGroup, String? initialRow, bool initialCollapsed = false, String? initialHold, (double, double, double)? initialZoom}) {
   OpenTiming.tap();
+  // The RAW decode starts with the tap, not with the first build of the editor page (a frame or more later, and then after the placeholder's head
+  // start): the editor claims the same session. A no-op when the finger-down warm-up already opened it, or without the engine.
+  final tapped = app.photoById(photoId);
+  if (tapped != null) unawaited(app.sessions.get(tapped));
   Navigator.of(context).push(MaterialPageRoute<void>(
       builder: (_) => EditorPage(app: app, photoId: photoId, initialGroup: initialGroup, initialRow: initialRow, initialCollapsed: initialCollapsed, initialHold: initialHold, initialZoom: initialZoom)));
 }

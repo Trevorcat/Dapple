@@ -16,6 +16,7 @@ import 'package:flutter/widgets.dart';
 import '../../editor/haptics.dart';
 import '../../editor/mask_geometry.dart';
 import '../../model/local_adjust.dart';
+import '../../model/wire_json.dart';
 import '../../model/local_kinds.dart';
 import '../../model/local_pad.dart';
 import '../../model/pad_model.dart';
@@ -1254,7 +1255,7 @@ class LocalController extends ChangeNotifier {
       }
       return;
     }
-    final pj = jsonEncode(ctl.app.wireParams(p));
+    final pj = encodeWire(ctl.app.wireParams(p));
     var miss = await ai.missing(p, pj);
     if (miss.isNotEmpty && repair) {
       repairing = true;
@@ -1367,7 +1368,7 @@ class LocalController extends ChangeNotifier {
     try {
       final s = await ctl.app.sessions.get(p);
       if (s == null) return null;
-      return await LocalNative.sample(s.address, jsonEncode(ctl.app.wireParams(p)), uv.dx, uv.dy);
+      return await LocalNative.sample(s.address, encodeWire(ctl.app.wireParams(p)), uv.dx, uv.dy);
     } catch (_) {
       return null;
     }
@@ -1912,7 +1913,7 @@ class LocalController extends ChangeNotifier {
     try {
       final s = await ctl.app.sessions.get(p);
       if (s == null) return;
-      final pj = jsonEncode(ctl.app.wireParams(p));
+      final pj = encodeWire(ctl.app.wireParams(p));
       final px = await LocalNative.overlay(s.address, pj, idx, overlayPx);
       if (px == null) return;
       final c = Completer<ui.Image>();

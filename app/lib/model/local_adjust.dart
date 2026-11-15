@@ -11,6 +11,8 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'wire_json.dart';
+
 /// Engine limits (local_adjust.h).
 const int kMaxLocalAdjustments = 16;
 const int kMaxMaskComponents = 8;
@@ -158,12 +160,26 @@ class BrushStroke {
     );
   }
 
-  Map<String, Object> toJson() => {
+  /// The points as the engine's JSON array text. A stroke never changes once it is in an edit, so it is written once: a drag of another
+  /// control of the same edit re-sends the strokes with every frame ([RawJson], [encodeWire]); a 3000 point stroke cost 0.6 ms per frame to rebuild.
+  late final String ptsText = _writePts();
+
+  String _writePts() {
+    final b = StringBuffer('[');
+    for (var i = 0; i < pts.length; i++) {
+      if (i > 0) b.write(',');
+      b.write(jnum(pts[i]));
+    }
+    return (b..write(']')).toString();
+  }
+
+  /// [rawPts]: the points as [RawJson] (for [encodeWire]) instead of a list of numbers.
+  Map<String, Object> toJson({bool rawPts = false}) => {
         'size': jnum(size),
         'hardness': jnum(hardness),
         'flow': jnum(flow),
         if (erase) 'erase': true,
-        'pts': [for (final v in pts) jnum(v)],
+        'pts': rawPts ? RawJson(ptsText) : [for (final v in pts) jnum(v)],
       };
 
   bool same(BrushStroke o) {
@@ -360,7 +376,7 @@ class MaskComponent {
   };
 
   /// The engine's writer (local_adjust.cpp writeComponent): kind, op, invert when set, then the kind's own fields.
-  Map<String, Object?> toJson() {
+  Map<String, Object?> toJson({bool rawPts = false}) {
     if (kind == MaskKindId.unknown) return Map<String, Object?>.from(raw ?? const {});
     final o = <String, Object?>{
       'kind': switch (kind) {
@@ -390,7 +406,7 @@ class MaskComponent {
       case MaskKindId.color:
         o.addAll({'hue': jnum(hue), 'range': jnum(range), 'feather': jnum(hueFeather), 'satMin': jnum(satMin)});
       case MaskKindId.brush:
-        o['strokes'] = [for (final s in strokes) s.toJson()];
+        o['strokes'] = [for (final s in strokes) s.toJson(rawPts: rawPts)];
       case MaskKindId.raster:
         o['ref'] = ref;
         o['refine'] = jnum(refine);
@@ -656,13 +672,13 @@ class LocalAdjustment {
   static const _itemKeys = {'id', 'name', 'on', 'invert', 'strength', 'mask', 'adjust', 'retouch', 'ui'};
 
   /// Engine key order: id, name (when set), on (when off), invert (when set), strength, mask, adjust (non-zero, registry order).
-  Map<String, Object?> toJson({bool withUi = false}) => {
+  Map<String, Object?> toJson({bool withUi = false, bool rawPts = false}) => {
         'id': id,
         if (name.isNotEmpty) 'name': name,
         if (!on) 'on': false,
         if (invert) 'invert': true,
         'strength': jnum(strength),
-        'mask': [for (final c in mask) c.toJson()],
+        'mask': [for (final c in mask) c.toJson(rawPts: rawPts)],
         'adjust': {
           for (final s in localOpSpecs)
             if ((ops[s.key] ?? 0) != 0) s.key: jnum(ops[s.key]!),
@@ -753,11 +769,11 @@ class LocalList {
     return LocalList(out);
   }
 
-  /// What the engine reads (no "ui"); null when the list is empty (the key is then left out).
+  /// What the engine reads (no "ui"); null when the list is empty (the key is then left out). Brush points are [RawJson]: write it with [encodeWire].
   /// "v": 2 when an item uses portrait retouch (as the engine writes it), else 1.
   int get version => items.any((a) => a.usesRetouch) ? 2 : 1;
 
-  Map<String, Object?>? toEngineJson() => items.isEmpty ? null : {'v': version, 'items': [for (final a in items) a.toJson()]};
+  Map<String, Object?>? toEngineJson() => items.isEmpty ? null : {'v': version, 'items': [for (final a in items) a.toJson(rawPts: true)]};
 
   /// What the app persists (with each item's pad state).
   Map<String, Object?>? toAppJson() => items.isEmpty ? null : {'v': version, 'items': [for (final a in items) a.toJson(withUi: true)]};
