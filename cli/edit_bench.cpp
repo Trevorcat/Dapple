@@ -21,6 +21,7 @@
 #include "dapple/edit_params.h"
 #include "dapple/renderer.h"
 #include "dapple/tone.h"
+#include "engine/exec/engine_session.h"
 #include "colour_metrics.h"
 #include "spatial.h"
 
@@ -29,6 +30,40 @@ using namespace dapple;
 
 namespace dapple::benchtool {
 namespace {
+
+// A frame of the engine's baked variant (lattice `n`, fast analysis as the interactive frames take it) as float, through `es` (its result cache is
+// what lets a later frame reuse the lattice of an earlier one). `proxy` is the tone proxy of the session.
+ImageF bakedFrameF(engine::EngineSession& es, const EditParams& p, const CameraProfile& cam, const SourceImage& proxy, const SourceImage& src, int n,
+                   bool fastAnalysis) {
+  Renderer r(p, cam, nullptr);
+  r.setToneProxy(&proxy);
+  engine::FrameJob job{p, r, src, &proxy, cam, nullptr, {}, {}, {}};
+  job.request.bakeSize = n;
+  job.request.fastAnalysis = fastAnalysis;
+  job.request.noise = false;
+  job.request.interactive = fastAnalysis;
+  job.fastOptions.spatial = SpatialQuality::Off;
+  job.fastOptions.noise = false;
+  ImageF out;
+  job.outFloat = &out;
+  engine::FrameResult res;
+  if (!es.renderFrame(job, res)) std::fprintf(stderr, "edit-bench: engine frame failed: %s\n", res.error.c_str());
+  return out;
+}
+ImageF exactF(const EditParams& p, const CameraProfile& cam, const SourceImage& proxy, const SourceImage& src) {
+  Renderer r(p, cam, nullptr);
+  r.setToneProxy(&proxy);
+  engine::EngineSession es;
+  engine::EngineSession::ExactOptions o;
+  o.spatial = false;
+  o.hasProxy = true;
+  ImageF out;
+  o.outFloat = &out;
+  Image8 unused;
+  std::string err;
+  if (!es.renderExact(p, r, src, o, unused, &err)) std::fprintf(stderr, "edit-bench: engine exact render failed: %s\n", err.c_str());
+  return out;
+}
 
 using Clock = std::chrono::steady_clock;
 double msSince(Clock::time_point t0) { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
@@ -64,7 +99,7 @@ int editBench(const std::vector<std::string>& args) {
   std::string path;
   int repeat = 8;
   int onlyScenario = 0;  // --scenario N: run just scenario N (1 or 2)
-  bool quick = false;    // --quick: skip the legacy per-stage tables and the accuracy section (calibration runs)
+  bool quick = false;    // --quick: skip the per-stage tables and the accuracy section (calibration runs)
   for (std::size_t i = 0; i < args.size(); ++i) {
     if (args[i] == "--repeat" && i + 1 < args.size()) repeat = std::atoi(args[++i].c_str());
     else if (args[i] == "--scenario" && i + 1 < args.size()) onlyScenario = std::atoi(args[++i].c_str());
@@ -129,7 +164,7 @@ int editBench(const std::vector<std::string>& args) {
     ++scenNo;
     if (onlyScenario && scenNo != onlyScenario) continue;
     std::printf("\n================ %s ================\n", sc.name);
-    // --- stage breakdown on the core API (what one legacy frame executes) ---
+    // --- stage breakdown on the core API (what one exact frame executes) ---
     std::vector<Row> rows;
     SourceImage scaled;
     scaled.sceneReferred = src->sceneReferred;
@@ -142,8 +177,8 @@ int editBench(const std::vector<std::string>& args) {
     noSpatial.nrColor = 0;
     ImageF pointOut;
     rows.push_back({"2 pointwise (tone/colour/curves), incl. toneMove analysis", timeMs(repeat, [&] {
-                      Renderer r(noSpatial, cam, nullptr);
-                      pointOut = r.renderFloat(scaled, false);
+                      std::string err;
+                      engine::renderImageF(noSpatial, cam, nullptr, scaled, false, pointOut, &err);
                     })});
     rows.push_back({"  2a toneMove analysis only (resize 256 + proxy render)",
                     timeMs(repeat, [&] { (void)analyzeTone(scaled, cam, sc.params); })});
@@ -163,29 +198,30 @@ int editBench(const std::vector<std::string>& args) {
     spatialOnly("3e spatial: texture", [&](SpatialParams& s) { s.texture = 0.3f; });
     spatialOnly("3f spatial: dehaze", [&](SpatialParams& s) { s.dehaze = 0.25f; });
     spatialOnly("3g spatial: grain", [&](SpatialParams& s) { s.grain = 0.2f; });
-    rows.push_back({"4 Renderer::render total (point+spatial+u8)", timeMs(repeat, [&] {
-                      Renderer r(sc.params, cam, nullptr);
-                      (void)r.render(scaled);
+    rows.push_back({"4 engine exact render total (point+spatial+u8)", timeMs(repeat, [&] {
+                      Image8 o8;
+                      std::string err;
+                      engine::renderImage8(sc.params, cam, nullptr, scaled, o8, &err);
                     })});
-    printRows("per-stage, core API, 1600 long edge (legacy)", rows);
+    printRows("per-stage, core API, 1600 long edge (exact)", rows);
     }
 
     // --- end to end through the C API, as the app calls it ---
     const std::string pj = toJson(sc.params);
     std::vector<Row> e2e;
     if (!quick) {
-    e2e.push_back({"legacy: dapple_session_render(1600)", timeMs(repeat, [&] {
+    e2e.push_back({"exact: dapple_session_render(1600)", timeMs(repeat, [&] {
                      DappleImage im{};
                      dapple_session_render(sess, pj.c_str(), nullptr, 1600, &im);
                      dapple_free_image(&im);
                    })});
-    e2e.push_back({"legacy: dapple_session_analyze_params_json", timeMs(repeat, [&] {
+    e2e.push_back({"exact: dapple_session_analyze_params_json", timeMs(repeat, [&] {
                      char* j = dapple_session_analyze_params_json(sess, pj.c_str());
                      dapple_free_string(j);
                    })});
-    const double legacyFrame = e2e[0].ms + e2e[1].ms;
-    e2e.push_back({"legacy frame = render + analyze", legacyFrame});
-    printRows("C API end to end (legacy)", e2e);
+    const double exactFrame = e2e[0].ms + e2e[1].ms;
+    e2e.push_back({"exact frame = render + analyze", exactFrame});
+    printRows("C API end to end (exact)", e2e);
     }
 
     // ---- new path: baked lattice + one call per frame ----
@@ -245,46 +281,16 @@ int editBench(const std::vector<std::string>& args) {
       st.push_back({"bake 41^3 (incl. analysis)", timeMs(repeat, [&] { lut = rr.bake(s1600, 41); })});
       st.push_back({"bake 49^3", timeMs(repeat, [&] { lut = rr.bake(s1600, 49); })});
       st.push_back({"bake 65^3", timeMs(repeat, [&] { lut = rr.bake(s1600, 65); })});
-      lut = rr.bake(s1600, 49);
-      FastOptions fo;
-      fo.spatial = SpatialQuality::Off;
-      st.push_back({"lattice pass 1067x1600 -> RGBA8 (no spatial)", timeMs(repeat, [&] {
-                      int w, h;
-                      std::free(rr.renderBakedRgba(s1600, *lut, fo, w, h));
-                    })});
-      fo.spatial = SpatialQuality::Full;
-      st.push_back({"lattice pass + all spatial, 1600", timeMs(repeat, [&] {
-                      int w, h;
-                      std::free(rr.renderBakedRgba(s1600, *lut, fo, w, h));
-                    })});
-      SourceImage s1080;
-      s1080.sceneReferred = src->sceneReferred;
-      s1080.linear = resizeToLongEdge(src->linear, 1080);
-      fo.spatial = SpatialQuality::Interactive;
-      fo.noise = false;
-      st.push_back({"lattice pass + interactive spatial, 1080", timeMs(repeat, [&] {
-                      int w, h;
-                      std::free(rr.renderBakedRgba(s1080, *lut, fo, w, h));
-                    })});
-      fo.spatial = SpatialQuality::Off;
-      st.push_back({"lattice pass only, 1080", timeMs(repeat, [&] {
-                      int w, h;
-                      std::free(rr.renderBakedRgba(s1080, *lut, fo, w, h));
-                    })});
-      printRows("new path stages (core API)", st);
+      printRows("table stages (core API)", st);
 
       // accuracy: baked vs direct, point-wise stages only, over all pixels of the 1600 render
       EditParams ns = sc.params;
       ns.clarity = ns.texture = ns.dehaze = ns.grain = 0;
       ns.sharpen = ns.nrLuma = ns.nrColor = 0;
-      Renderer rd(ns, cam, nullptr);
-      rd.setToneProxy(&proxy);
-      const ImageF ref = rd.renderFloat(s1600, false);
+      const ImageF ref = exactF(ns, cam, proxy, s1600);
       for (int n : quick ? std::vector<int>{} : std::vector<int>{17, 25, 29, 33, 37, 41, 49, 65}) {
-        auto l = rd.bake(s1600, n);
-        FastOptions o2;
-        o2.spatial = SpatialQuality::Off;
-        const ImageF got = rd.renderBakedFloat(s1600, *l, o2);
+        engine::EngineSession es;
+        const ImageF got = bakedFrameF(es, ns, cam, proxy, s1600, n, false);
         std::vector<double> de;
         de.reserve(ref.data.size() / 3 / 3 + 1);
         for (std::size_t i = 0; i < ref.data.size() / 3; i += 3) {
@@ -327,35 +333,29 @@ int editBench(const std::vector<std::string>& args) {
       EditParams ns = sc.params;
       ns.clarity = ns.texture = ns.dehaze = ns.grain = 0;
       ns.sharpen = ns.nrLuma = ns.nrColor = 0;
-      FastOptions off;
-      off.spatial = SpatialQuality::Off;
-      Renderer r0(ns, cam, nullptr);
-      r0.setToneProxy(&proxy);
-      const auto base = r0.bake(s1600, 65);
       for (float ev : {0.35f, -0.6f}) {
         EditParams q = ns;
         q.exposure += ev;
-        Renderer r(q, cam, nullptr);
-        r.setToneProxy(&proxy);
-        const ImageF ref = r.renderFloat(s1600, false);
-        const auto fast = r.bake(s1600, 41, base.get(), true);
-        const auto exactAn = r.bake(s1600, 41, base.get(), false);
-        std::printf("  %-34s exposure %+.2f EV, reused 65^3: fast analysis %.4f  exact analysis %.4f\n", sc.name, ev,
-                    meanDe(r.renderBakedFloat(s1600, *fast, off), ref), meanDe(r.renderBakedFloat(s1600, *exactAn, off), ref));
+        const ImageF ref = exactF(q, cam, proxy, s1600);
+        double de[2];
+        for (int fastAn = 1; fastAn >= 0; --fastAn) {
+          engine::EngineSession es;  // the final frame's 65^3 lattice is cached; the drag frame reuses it, only the tone table is rebuilt
+          bakedFrameF(es, ns, cam, proxy, s1600, 65, false);
+          de[fastAn] = meanDe(bakedFrameF(es, q, cam, proxy, s1600, 41, fastAn != 0), ref);
+        }
+        std::printf("  %-34s exposure %+.2f EV, reused 65^3: fast analysis %.4f  exact analysis %.4f\n", sc.name, ev, de[1], de[0]);
       }
       EditParams q = ns;
       q.saturation += 12.f;
-      Renderer r(q, cam, nullptr);
-      r.setToneProxy(&proxy);
-      const ImageF ref = r.renderFloat(s1600, false);
+      const ImageF ref = exactF(q, cam, proxy, s1600);
       for (int n : {41, 49, 57, 65}) {
-        const auto l = r.bake(s1600, n, nullptr, true);  // as a drag frame: fresh lattice, fast analysis
-        std::printf("  %-34s saturation +12, bake %d^3: %.4f\n", sc.name, n, meanDe(r.renderBakedFloat(s1600, *l, off), ref));
+        engine::EngineSession es;  // as a drag frame: fresh lattice, fast analysis
+        std::printf("  %-34s saturation +12, bake %d^3: %.4f\n", sc.name, n, meanDe(bakedFrameF(es, q, cam, proxy, s1600, n, true), ref));
       }
     }
   }
   {
-    char* info = dapple_engine_info_json();  // frame engine / bake counters (DAPPLE_ENGINE), for comparing runs
+    char* info = dapple_engine_info_json();  // frame engine / bake counters, for comparing runs
     if (info) std::printf("\nengine info: %s\n", info);
     dapple_free_string(info);
   }

@@ -438,13 +438,6 @@ void testIdentity() {
     CHECK(std::memcmp(r0.rgba, r1.rgba, std::size_t(r0.w) * r0.h * 4) != 0);
     std::free(r1.rgba);
   }
-  // the old Renderer (DAPPLE_ENGINE=off oracle) ignores them
-  {
-    EditParams p = base;
-    p.local = richEdit();
-    const Image8 a = Renderer(base, cam(), nullptr).render(src), b = Renderer(p, cam(), nullptr).render(src);
-    CHECK(a.data == b.data);
-  }
   std::free(r0.rgba);
 }
 

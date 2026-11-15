@@ -2,7 +2,6 @@
 // Docs: pipeline-architecture.md section 37.
 //   dapple_modern_tests <id>   ids: identity off json ends fog midgrey hue skin monotonic tiles [parity bench with -DDAPPLE_GPU=ON; exit 77: no GPU]
 //     identity   strength 0 is the standard rendering byte for byte; film stock ids still reach the film code
-//     off        DAPPLE_ENGINE=off ignores the family (the old Renderer renders the standard picture)
 //     json       selector / strength round trip, unknown id harmless, film and modern exclusive by construction
 //     ends       a high-range scene reaches display black and white (percentiles of the output luminance)
 //     fog        a low-contrast scene is stretched by at most the stated rule (guard holds)
@@ -291,22 +290,6 @@ void testIdentity() {
   // a modern id is no film stock: the film code path stays off
   Renderer r(withBase("modern_vivid"), cam(), nullptr);
   CHECK(!r.filmActive());
-}
-
-void testOff() {
-#ifdef _WIN32
-  _putenv_s("DAPPLE_ENGINE", "off");
-#else
-  setenv("DAPPLE_ENGINE", "off", 1);
-#endif
-  const SourceImage src = makeScene(320, 224);
-  EditParams a;
-  const Image8 ref = Renderer(a, cam(), nullptr).render(src);
-  for (const char* id : kIds) {
-    const Image8 got = Renderer(withBase(id), cam(), nullptr).render(src);
-    CHECK(got.data == ref.data);
-    std::printf("  DAPPLE_ENGINE=off, %s: %s\n", id, got.data == ref.data ? "ignored (identical to standard)" : "APPLIED");
-  }
 }
 
 void testJson() {
@@ -810,7 +793,7 @@ int main(int argc, char** argv) {
     const char* name;
     void (*fn)();
   };
-  const T tests[] = {{"identity", testIdentity}, {"off", testOff},         {"json", testJson},   {"ends", testEnds},       {"fog", testFog},
+  const T tests[] = {{"identity", testIdentity}, {"json", testJson},   {"ends", testEnds},       {"fog", testFog},
                      {"highkey", testHighKey}, {"lowkey", testLowKey}, {"gap", testGap}, {"midgrey", testMidGrey},   {"hue", testHue},         {"skin", testSkin},   {"monotonic", testMonotonic}, {"tiles", testTiles},
                      {"cpubench", testCpuBench},
 #ifdef DAPPLE_MODERN_GPU
@@ -820,7 +803,7 @@ int main(int argc, char** argv) {
   bool ran = false;
   for (const T& t : tests)
     if (id.empty() || id == t.name) {
-      if (id.empty() && (std::string(t.name) == "cpubench" || std::string(t.name) == "off")) continue;
+      if (id.empty() && (std::string(t.name) == "cpubench")) continue;
       std::printf("[%s]\n", t.name);
       t.fn();
       ran = true;

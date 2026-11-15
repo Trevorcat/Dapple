@@ -248,7 +248,7 @@ const CpuImpl* cpuImpl(NodeType t) {
     case NodeType::ToneTable: return &kToneTable;
     case NodeType::Analysis: return &kAnalysis;
     case NodeType::LatticeOverflow: return &kOverflow;
-    default: return nullptr;  // LegacyRender has no plan
+    default: return nullptr;  // AssembledBake has no plan
   }
 }
 

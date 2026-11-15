@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "../deterministic.h"
+#include "../render_f.h"
 #include "colour_metrics.h"
 #include "dapple/camera.h"
 #include "dapple/decoder.h"
@@ -86,7 +87,7 @@ SourceImage makeScene(int w, int h, bool wide = true) {
   return s;
 }
 
-Image8 renderRef(const EditParams& p, const SourceImage& src) { return Renderer(p, cam(), nullptr).render(src); }
+Image8 renderRef(const EditParams& p, const SourceImage& src) { return render8(p, cam(), nullptr, src); }
 
 bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src, ExecMode mode, int tile, Image8& out, ExecStats* st = nullptr) {
   const Renderer r(p, cam(), nullptr);
@@ -120,12 +121,9 @@ void testIdentity() {
   Image8 ref = renderRef(p, src), got;
   CHECK(exactRender(es, p, src, ExecMode::Whole, 0, got));
   CHECK(ref.data == got.data);
-  std::printf("  hdr 0: engine exact == Renderer::render: %s\n", ref.data == got.data ? "byte-identical" : "DIFFERENT");
+  std::printf("  hdr 0: session exact == one-shot exact render: %s\n", ref.data == got.data ? "byte-identical" : "DIFFERENT");
   EditParams q = p;
   q.hdr = 100.f;
-  const Image8 oldPath = renderRef(q, src);
-  CHECK(oldPath.data == ref.data);
-  std::printf("  hdr 100 through the old Renderer (DAPPLE_ENGINE=off path): %s\n", oldPath.data == ref.data ? "ignored (identical)" : "CHANGED");
   Image8 on;
   CHECK(exactRender(es, q, src, ExecMode::Whole, 0, on));
   CHECK(on.data != ref.data);

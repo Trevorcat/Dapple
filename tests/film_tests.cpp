@@ -1823,11 +1823,10 @@ void testDevelopFilmIntegration() {
   dangling.filmStock = "kodak_portra_400";  // no library installed: ignored
   const ImageF refOff = renderF(off, cam, nullptr, src);
   CHECK(sameBits(refOff, renderF(dangling, cam, nullptr, src)));
-  const auto bakeOff = Renderer(off, cam, nullptr).bake(src, 33);
+  const auto bakeOff = Renderer(off, cam, nullptr).bake(src, 33);  // only for the lattice size comparison below
   FastOptions fo;
-  const ImageF bakedOff = Renderer(off, cam, nullptr).renderBakedFloat(src, *bakeOff, fo);
-  const auto bakeDangling = Renderer(dangling, cam, nullptr).bake(src, 33);
-  CHECK(sameBits(bakedOff, Renderer(dangling, cam, nullptr).renderBakedFloat(src, *bakeDangling, fo)));
+  const ImageF bakedOff = renderFrameF(off, cam, nullptr, src, 33, fo);
+  CHECK(sameBits(bakedOff, renderFrameF(dangling, cam, nullptr, src, 33, fo)));
   CHECK(!Renderer(dangling, cam, nullptr).filmActive());
 
   film::setLibrary(lib);
@@ -1860,18 +1859,16 @@ void testDevelopFilmIntegration() {
   const ImageF plain = renderF(plainP, cam, nullptr, src);
   CHECK(meanAbsDiff(f1, plain) > 0.02);
   const auto bk = Renderer(fp, cam, nullptr).bake(src, 33);
-  const ImageF b1 = Renderer(fp, cam, nullptr).renderBakedFloat(src, *bk, fo);
-  const ImageF b2 = Renderer(fp, cam, nullptr).renderBakedFloat(src, *bk, fo);
+  const ImageF b1 = renderFrameF(fp, cam, nullptr, src, 33, fo);
+  const ImageF b2 = renderFrameF(fp, cam, nullptr, src, 33, fo);
   CHECK(sameBits(b1, b2));
   CHECK(meanAbsDiff(f1, b1) < 1e-6);  // both paths run the same simulator on the same input
   // the streaming 8-bit path (no float frame) equals the float path quantised: plain, with curves + vignette, zoomed
   {
     auto sameAs8 = [&](const EditParams& ep, const FastOptions& o) {
-      const Renderer r(ep, cam, nullptr);
-      const auto bl = r.bake(src, 33);
       int w = 0, h = 0;
-      std::uint8_t* px = r.renderBakedRgba(src, *bl, o, w, h);
-      const ImageF fl = r.renderBakedFloat(src, *bl, o);
+      std::uint8_t* px = renderFrame8(ep, cam, nullptr, src, 33, o, w, h);
+      const ImageF fl = renderFrameF(ep, cam, nullptr, src, 33, o);
       bool ok = px && w == fl.width && h == fl.height;
       for (int i = 0; ok && i < w * h; ++i)
         for (int c = 0; c < 3; ++c) {
@@ -1907,8 +1904,8 @@ void testDevelopFilmIntegration() {
     FastOptions o2;
     o2.spatial = q;
     EditParams withGrain = fp;
-    const ImageF g1 = Renderer(withGrain, cam, nullptr).renderBakedFloat(src, *bk, o2);
-    const ImageF g2 = Renderer(withGrain, cam, nullptr).renderBakedFloat(src, *bk, o2);
+    const ImageF g1 = renderFrameF(withGrain, cam, nullptr, src, 33, o2);
+    const ImageF g2 = renderFrameF(withGrain, cam, nullptr, src, 33, o2);
     CHECK(sameBits(g1, g2));
   }
   // the lattice of a full-strength film is not baked (only the blend partner needs it)
@@ -1935,10 +1932,11 @@ void testDevelopFilmIntegration() {
     EditParams ex = fp;
     ex.filmExposure = 1.5f;
     ex.filmWarmth = 25.f;
-    const auto bkEx = Renderer(ex, cam, nullptr).bake(src, 33);
-    CHECK(sameBits(Renderer(ex, cam, nullptr).renderBakedFloat(src, *bk, fo),
-                   Renderer(ex, cam, nullptr).renderBakedFloat(src, *bkEx, fo)));
-    CHECK(!sameBits(Renderer(ex, cam, nullptr).renderBakedFloat(src, *bk, fo), b1));  // and it does move the picture
+    engine::EngineSession warm;  // one session: the second frame reuses the lattice of the first
+    (void)renderFrameF(fp, cam, nullptr, src, 33, fo, &warm);
+    const ImageF reused = renderFrameF(ex, cam, nullptr, src, 33, fo, &warm);
+    CHECK(sameBits(reused, renderFrameF(ex, cam, nullptr, src, 33, fo)));
+    CHECK(!sameBits(reused, b1));  // and it does move the picture
     // tonal class: that of the develop render, never of the film look; the histogram follows the film (and its exposure)
     ToneAnalysis t0 = analyzeTone(src, cam, fp), t1 = analyzeTone(src, cam, ex), tOff = analyzeTone(src, cam, off);
     CHECK(t0.nearest == t1.nearest && t0.nearest == tOff.nearest && t0.histogram == tOff.histogram);
@@ -1977,8 +1975,7 @@ void testDevelopFilmIntegration() {
     CHECK(d0 > 0.005 && d1 > 0.005);
     const double full = meanAbsDiff(plain, f1);
     CHECK(d0 + d1 < full * 1.2);  // roughly on the segment between the two
-    const auto bh = Renderer(half, cam, nullptr).bake(src, 33);
-    CHECK(meanAbsDiff(h, Renderer(half, cam, nullptr).renderBakedFloat(src, *bh, fo)) < 0.01);
+    CHECK(meanAbsDiff(h, renderFrameF(half, cam, nullptr, src, 33, fo)) < 0.01);
   }
 
   // ---- knobs ----
@@ -2063,11 +2060,9 @@ void testDevelopFilmIntegration() {
       EditParams p = fp;
       p.filmGrain = 0.f;
       p.filmHalation = halation;
-      Renderer r(p, cam, nullptr);
-      const auto b = r.bake(disc, 33);
       FastOptions o;
       o.region.outLongEdge = longEdge;
-      return r.renderBakedFloat(disc, *b, o);
+      return renderFrameF(p, cam, nullptr, disc, 33, o);
     };
     auto profile = [&](const ImageF& with, const ImageF& without) {
       // second moment of the red excess along the centre row, in image widths
@@ -2115,9 +2110,7 @@ void testDevelopFilmIntegration() {
     const float gain = std::exp2(cam.baselineExposureEv);
     FastOptions o;
     o.spatial = SpatialQuality::Off;
-    Renderer r(p, cam, nullptr);
-    const auto b = r.bake(patches, 33);
-    const ImageF got = r.renderBakedFloat(patches, *b, o);
+    const ImageF got = renderFrameF(p, cam, nullptr, patches, 33, o);
     double sum = 0, worst = 0;
     for (int i = 0; i < N; ++i) {
       const double in[3] = {patches.linear.data[3 * i] * gain, patches.linear.data[3 * i + 1] * gain,

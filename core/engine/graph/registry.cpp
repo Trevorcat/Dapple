@@ -277,9 +277,9 @@ NodeRegistry::NodeRegistry() {
     (void)d;
   }
 
-  // ---- the stage (a) super-node ------------------------------------------------------------------------------------------
+  // ---- the assembled bake: the frame's tables as one cached unit (EngineSession::runHostTables) ------------------------------------------------------------------------------------------
   {
-    NodeDesc& d = def(NodeType::LegacyRender, "LegacyRender", Domain::Image, Footprint::Super, 1, 4, ALL);
+    NodeDesc& d = def(NodeType::AssembledBake, "AssembledBake", Domain::Image, Footprint::Super, 1, 4, ALL);
     d.inputDomain[0] = Domain::Image;
     d.inputDomain[1] = d.inputDomain[2] = d.inputDomain[3] = Domain::Table;
     d.usesGeometry = true;

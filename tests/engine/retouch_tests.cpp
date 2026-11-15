@@ -955,14 +955,6 @@ void testIdentity() {
   for (LocalAdjustment& a : pz.local) a.strength = 0.f;
   CHECK(exactRender(es, pz, src, ExecMode::Whole, 0, z));
   CHECK(maxDiff(base, z) == 0);
-  // the old Renderer (DAPPLE_ENGINE=off) never reads the local list
-  EditParams pr;
-  pr.local = retouchEdit();
-  {
-    const Renderer r0(p0, cam(), nullptr), r1(pr, cam(), nullptr);
-    Image8 o0 = r0.render(src), o1 = r1.render(src);
-    CHECK(o0.data == o1.data);
-  }
   // a legacy edit keeps the identity channel layout (bit-identical frames: the golden corpus checks the pixels)
   EditParams pl;
   LocalAdjustment a = rasterAdj("l", "rt_skin");
@@ -974,6 +966,7 @@ void testIdentity() {
   local::AuxTarget t;
   if (f) CHECK(local::auxLayout(*f, t) == 2 && t.slot[1] == 0 && t.slot[4] == 1);
   // with a retouch op the used ops are packed
+  EditParams pr;
   pr.local = retouchEdit();
   const std::shared_ptr<const local::Frame> g = local::bind(pr.local, src, false);
   CHECK(g && g->retouchW && g->legacyW);

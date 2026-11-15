@@ -29,6 +29,7 @@
 #include "dapple/encode.h"
 #include "dapple/edit_params.h"
 #include "dapple/renderer.h"
+#include "render_f.h"
 #include "dapple/ultrahdr.h"
 #include "exif_writer.h"
 
@@ -334,7 +335,7 @@ static void testChroma() {
   CHECK(minLin < -0.05f);                                // and the P3 file carries values past sRGB
 }
 
-// ---- the pipeline itself, without codec or 8-bit grid: Renderer::renderFloat in both output spaces on the chart (float, 0..1 encoded) --------------
+// ---- the pipeline itself, without codec or 8-bit grid: the engine exact render in both output spaces on the chart (float, 0..1 encoded) --------------
 static SourceImage chartSource(float maxChroma) {
   const Image8 c = makeChart(maxChroma);
   SourceImage src;
@@ -354,7 +355,7 @@ static ImageF renderDirect(const SourceImage& src, const std::string& json, int 
   auto e = fromJson(json);
   EditParams p = e ? *e : EditParams{};
   p.outputSpace = space;
-  return Renderer(p, reg.resolve("", ""), nullptr).renderFloat(src, true);
+  return renderF(p, reg.resolve("", ""), nullptr, src, true);
 }
 static void linOf(const ImageF& im, std::size_t i, bool p3, float out[3]) {
   const float v[3] = {srgbDecode(std::clamp(im.data[3 * i], 0.f, 1.f)), srgbDecode(std::clamp(im.data[3 * i + 1], 0.f, 1.f)),
@@ -719,8 +720,7 @@ static void testPx() {
   for (int sp = 0; sp < 2; ++sp) {
     EditParams e;
     e.outputSpace = sp;
-    Renderer r(e, cam, nullptr);
-    const Image8 o = r.render(src);
+    const Image8 o = render8(e, cam, nullptr, src);
     std::printf("  space %d: px0 %d %d %d  px1 %d %d %d\n", sp, o.data[0], o.data[1], o.data[2], o.data[3], o.data[4], o.data[5]);
   }
   std::printf("  want sRGB codes %d %d %d\n", int(srgbEncode(l[0][0]) * 255 + 0.5f), int(srgbEncode(l[0][1]) * 255 + 0.5f), int(srgbEncode(l[0][2]) * 255 + 0.5f));
@@ -750,7 +750,7 @@ static void testRawDirect() {
       EditParams p0 = e ? *e : EditParams{};
       EditParams p1 = p0;
       p1.outputSpace = 1;
-      const ImageF sr = Renderer(p0, cam, nullptr).renderFloat(*dec, spatial), p3 = Renderer(p1, cam, nullptr).renderFloat(*dec, spatial);
+      const ImageF sr = renderF(p0, cam, nullptr, *dec, spatial), p3 = renderF(p1, cam, nullptr, *dec, spatial);
       const std::size_t n = std::size_t(sr.width) * sr.height;
       Stats st;
       std::size_t out = 0;

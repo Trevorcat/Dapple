@@ -30,7 +30,7 @@ class ResultCache {
   ResultCache() {
     for (auto& l : limit_) l = 8;
     limit_[std::size_t(NodeType::ColourLattice)] = 3;
-    limit_[std::size_t(NodeType::LegacyRender)] = 3;  // assembled bake inputs: the old bakes[3]
+    limit_[std::size_t(NodeType::AssembledBake)] = 3;  // assembled bakes (lattice + tone table + analysis), the newest three
     limit_[std::size_t(NodeType::LatticeOverflow)] = 2;
   }
 

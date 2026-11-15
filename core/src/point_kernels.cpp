@@ -1,3 +1,5 @@
+// Point kernels: the per-pixel pieces of the develop pipeline that the engine runs (PointOp, makePointOp, the curves, LutSampler, the gains, the lattice
+// and tone-table bakes, the frame plan, FrameKernels = the engine block fragments). No frame is rendered here; core/engine plans and executes frames.
 #include "dapple/renderer.h"
 #include "hdr_field.h"
 
@@ -266,8 +268,6 @@ void Renderer::inputGain(const EditParams& params, const CameraProfile& camera, 
 Renderer::Renderer(const EditParams& params, const CameraProfile& camera, const Lut3D* lut)
     : p_(params), camera_(camera), lut_(lut) {
   p_.clamp();
-  // DAPPLE_ENGINE=off (the golden oracle) ignores the modern rendering family, as it ignores `hdr` (section 37)
-  if (isModernId(p_.filmStock) && engine::mode() == engine::Mode::Off) p_.filmStock.clear();
   whiteBalanceGain(p_, wbGain_);
   // Film frames are authored for sRGB output (their LUTs, grain, paper mapping): they never render in P3; the C layer converts the finished sRGB frame.
   if (p_.outputSpace == 1 && filmActive()) p_.outputSpace = 0;
@@ -1091,7 +1091,7 @@ film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, Spatial
 // ProPhoto; when the frame is a resampling of it (geometry / region) `fetch(y, row)` produces row y (w * 3 floats,
 // >= 0), otherwise `src` is passed on as it is. `gain` = white balance x exposure, folded into the input matrix.
 // `pitch` = size of an output pixel in source pixels (spatial effects are defined in film-frame micrometres).
-// The arguments of the film nodes for a w x h frame of a srcW x srcH source (runFilmStage, and the streamed film of FrameKernels).
+// The arguments of the film nodes for a w x h frame of a srcW x srcH source (the film nodes of FrameKernels, whole frame and streamed).
 engine::filmnode::FilmFrameArgs filmNodeArgs(const EditParams& p, const FilmRun& run, const float gain[3], int srcW, int srcH, int w, int h, float pitch,
                                              SpatialQuality q, const FastOptions* fo) {
   const float formatScale = pitch * float(std::max(w, h)) / float(std::max(srcW, srcH));
@@ -1185,87 +1185,8 @@ void Renderer::sceneGain(const SourceImage& source, float gain[3]) const {
   for (int c = 0; c < 3; ++c) gain[c] = wbGain_[c] * expo;
 }
 
-ImageF Renderer::renderFloat(const SourceImage& source, bool spatial) const {
-  const ImageF& in = source.linear;
-  Geometry geo;
-  geo.setup(p_, in.width, in.height);
-  ImageF out(geo.outW, geo.outH);
-  const PointOp op = makePointOp(source, nullptr);
-  const float vig = p_.vignette / 100.f;
-  const float cx = out.width * 0.5f, cy = out.height * 0.5f;
-
-  // film simulation: replaces tone + colour + look (the result lands in `out`, finished in place below)
-  const FilmRun fr = resolveFilm(p_);
-  bool filmOk = false;
-  if (fr.stock) {
-    const float gain[3] = {op.wb[0] * op.exposureGain, op.wb[1] * op.exposureGain, op.wb[2] * op.exposureGain};
-    filmOk = runFilmStage(
-        p_, fr, gain, in, geo.active, out.width, out.height, 1.f,
-        spatial ? SpatialQuality::Full : SpatialQuality::Off,
-        [&](int y, float* row) {
-          for (int x = 0; x < out.width; ++x) {
-            float v[3], sx, sy;
-            geo.map(x, y, sx, sy);
-            if (geo.exact) {
-              const float* px = in.row(std::clamp(int(std::floor(sy)), 0, in.height - 1)) +
-                                3 * std::clamp(int(std::floor(sx)), 0, in.width - 1);
-              v[0] = px[0], v[1] = px[1], v[2] = px[2];
-            } else {
-              sampleCubic(in, sx, sy, v);
-            }
-            row[3 * x] = v[0];
-            row[3 * x + 1] = v[1];
-            row[3 * x + 2] = v[2];
-          }
-        },
-        out);
-  }
-  const bool needNormal = !filmOk || fr.strength < 1.f;
-
-  parallelRows(out.height, [&](int y) {
-    const float* srcRow = geo.active ? nullptr : in.row(y);
-    float* dst = out.row(y);
-    for (int x = 0; x < out.width; ++x) {
-      float e3[3];
-      if (needNormal) {
-        float v[3];
-        if (!geo.active) {
-          for (int c = 0; c < 3; ++c) v[c] = srcRow[3 * x + c];
-        } else {
-          float sx, sy;
-          geo.map(x, y, sx, sy);
-          if (geo.exact) {
-            const float* px = in.row(std::clamp(int(std::floor(sy)), 0, in.height - 1)) +
-                              3 * std::clamp(int(std::floor(sx)), 0, in.width - 1);
-            v[0] = px[0], v[1] = px[1], v[2] = px[2];
-          } else {
-            sampleCubic(in, sx, sy, v);
-          }
-        }
-        for (int c = 0; c < 3; ++c) v[c] = std::max(0.f, v[c] * op.wb[c] * op.exposureGain);
-        op.apply(v, e3);
-      }
-      if (filmOk) {
-        float ef[3] = {dst[3 * x], dst[3 * x + 1], dst[3 * x + 2]};
-        displayStages(ef);
-        for (int c = 0; c < 3; ++c) e3[c] = needNormal ? e3[c] + fr.strength * (ef[c] - e3[c]) : ef[c];
-      }
-      if (vig != 0) applyVignette(e3, (x - cx) / cx, (y - cy) / cy, vig, p_.outputSpace == 1);
-      for (int c = 0; c < 3; ++c) dst[3 * x + c] = std::clamp(e3[c], 0.f, 1.f);
-    }
-  });
-
-  if (spatial) {
-    // a film at full strength brings its own grain: the look's grain would double it
-    EditParams pe = p_;
-    if (filmOk && fr.strength >= 1.f) pe.look = "std";
-    applySpatial(out, makeSpatial(p_, source.sceneReferred, filmOk && fr.strength >= 1.f ? makeStyle(pe) : op.style));
-  }
-  return out;
-}
-
 // ================================================================================================
-// Baked path
+// Lattice bakes, keys and the frame plan
 // ================================================================================================
 namespace {
 
@@ -1545,9 +1466,7 @@ std::shared_ptr<const BakedLut> Renderer::bake(const SourceImage& source, int n,
     t.n = n;
     t.rgb = std::move(lut->rgb);
     fillToneTable(t.tone, op0);
-    FastOptions fo;
-    fo.spatial = SpatialQuality::Off;
-    pre.analysis = analyzeToneImage(r0.renderBakedFloat(*toneProxy_, t, fo));
+    pre.analysis = analyzeToneImage(r0.proxyThroughLattice(*toneProxy_, t));
     lut->rgb = std::move(t.rgb);
     if (p_.toneStrength > 0.f) {
       const auto pts = toneTargetCurve(pre.analysis, p_.toneTarget, p_.toneStrength / 100.f, toneReach_);
@@ -1614,9 +1533,7 @@ Renderer::TonePre Renderer::bakeTonePre(const SourceImage& source, std::vector<f
     t.n = n;
     t.rgb = std::move(*rgb);
     fillToneTable(t.tone, op0);
-    FastOptions fo;
-    fo.spatial = SpatialQuality::Off;
-    pre.analysis = analyzeToneImage(r0.renderBakedFloat(*toneProxy_, t, fo));
+    pre.analysis = analyzeToneImage(r0.proxyThroughLattice(*toneProxy_, t));
     *rgb = std::move(t.rgb);
     if (p_.toneStrength > 0.f) {
       const auto pts = toneTargetCurve(pre.analysis, p_.toneTarget, p_.toneStrength / 100.f, toneReach_);
@@ -1655,222 +1572,61 @@ void Renderer::fastSize(const SourceImage& source, const RenderRegion& region, i
   h = d.h;
 }
 
-std::uint8_t* Renderer::renderBakedImpl(const SourceImage& source, const BakedLut& lut, const FastOptions& opt, int& w,
-                                        int& h, ImageF* outFloat) const {
+// The 256 px tone proxy through a lattice (fast tonal analysis of drag frames, bakeTonePre / bake): the point-wise stages of the baked variant
+// (geometry, gain, lattice with the exact-colour overflow, vignette, clamp), no film, no neighbourhood stages, float. This is the only per-pixel
+// loop of the kernel class; frames are rendered by the engine (core/engine).
+ImageF Renderer::proxyThroughLattice(const SourceImage& source, const BakedLut& lut) const {
   const ImageF& in = source.linear;
-  if (in.empty() || lut.n < 2) return nullptr;
+  ImageF out;
+  if (in.empty() || lut.n < 2) return out;
   Geometry geo;
   geo.setup(p_, in.width, in.height);
-  const RenderRegion& R = opt.region;
-  const bool region = R.active();
+  const RenderRegion R;
   const FastDims d = fastDims(geo, R);
-  w = d.w;
-  h = d.h;
-
-  // film simulation (replaces tone + colour + look; the lattice is then only the blend partner)
-  const FilmRun fr = resolveFilm(p_);
-
-  // neighbourhood stages
-  EditParams pStyle = p_;
-  if (fr.stock && fr.strength >= 1.f) pStyle.look = "std";  // a film at full strength brings its own grain
-  const StyleMix style = makeStyle(pStyle);
-  SpatialParams sp = makeSpatial(p_, source.sceneReferred, style);
-  if (opt.spatial == SpatialQuality::Off) {
-    sp = SpatialParams{};
-  } else if (opt.spatial == SpatialQuality::Interactive) {
-    if (!opt.keepGrain) sp.grain = 0.f;  // kept while a grain slider is dragged (14 Q8)
-    if (!opt.noise) sp.nrLuma = sp.nrColor = 0.f;
-  }
-  if (region) sp.scale = std::max(float(w) / (d.fx1 - d.fx0), float(h) / (d.fy1 - d.fy0)) / 2048.f;
-  const bool needFloat = sp.any() || outFloat != nullptr || fr.stock != nullptr;
-
-  std::uint8_t* rgba = nullptr;
-  if (!outFloat) {
-    rgba = static_cast<std::uint8_t*>(std::malloc(std::size_t(w) * h * 4));
-    if (!rgba) return nullptr;
-  }
-  const float expo0 = std::exp2(p_.exposure + (source.sceneReferred ? camera_.baselineExposureEv : 0.f));
-  const float gain0[3] = {wbGain_[0] * expo0, wbGain_[1] * expo0, wbGain_[2] * expo0};
-
-  // the source pixel (x, y) of the output, cubic-resampled through the geometry (>= 0, no gain)
-  auto fetchPixel = [&](int x, int y, float v[3]) {
-    const float fx = d.ox0 + (float(x) + 0.5f) * d.stepX, fy = d.oy0 + (float(y) + 0.5f) * d.stepY;
-    float sx, sy;
-    geo.mapF(fx, fy, sx, sy);
-    if (geo.exact && !region) {
-      const float* px = in.row(std::clamp(int(std::floor(sy)), 0, in.height - 1)) +
-                        3 * std::clamp(int(std::floor(sx)), 0, in.width - 1);
-      v[0] = px[0], v[1] = px[1], v[2] = px[2];
-    } else {
-      sampleCubic(in, sx, sy, v);
-    }
-  };
-  // Streaming film path (full-strength film, 8-bit target, no neighbourhood stage, no resampling): the film chain
-  // runs in row bands through a thread-local tile and the display stages + 8-bit encode consume the hot tile. The
-  // 312 MB (26 MP) float frame, its page faults and two more passes over it never exist.
-  // (scale-aware / kept grain exists in the node chain only: those frames take the float path below)
-  if (fr.stock && fr.strength >= 1.f && rgba && !sp.any() && !opt.keepGrain && !(opt.fullLongEdge > 0 && opt.spatial == SpatialQuality::Full)) {
-    film::SimulatorLease lease = film::acquireSimulator(fr.lib, p_.filmStock, fr.paper);
-    std::string err;
-    const float evGain = std::exp2(p_.filmExposure + p_.filmKeyEv);
-    const float gainEv[3] = {gain0[0] * evGain, gain0[1] * evGain, gain0[2] * evGain};
-    if (lease && lease->setParams(makeFilmParams(p_, fr, opt.spatial, region ? std::max(d.stepX, d.stepY) : 1.f), &err)) {
-      const float vigS = p_.vignette / 100.f;
-      const bool plain = master_.identity && red_.identity && green_.identity && blue_.identity &&
-                         !(lut_ && p_.lutAmount > 0);
-      const float cx = d.fullW * 0.5f, cy = d.fullH * 0.5f;
-      auto sink = [&](int y, float* t, int W) {
-        std::uint8_t* o = rgba + std::size_t(y) * W * 4;
-        if (!plain || vigS != 0) {
-          for (int x = 0; x < W; ++x) {
-            float e3[3] = {t[3 * x], t[3 * x + 1], t[3 * x + 2]};
-            if (!plain) displayStages(e3);
-            if (vigS != 0) {
-              const float px = d.ox0 + (float(x) + 0.5f) * d.stepX - 0.5f,
-                          py = d.oy0 + (float(y) + 0.5f) * d.stepY - 0.5f;
-              applyVignette(e3, (px - cx) / cx, (py - cy) / cy, vigS);
-            }
-            t[3 * x] = e3[0], t[3 * x + 1] = e3[1], t[3 * x + 2] = e3[2];
-          }
-        }
-        for (int i = 0; i < W; ++i) {  // clamp + encode (vectorises: fixed trip count, no branches)
-          const float r = std::min(std::max(t[3 * i], 0.f), 1.f), g = std::min(std::max(t[3 * i + 1], 0.f), 1.f),
-                      b = std::min(std::max(t[3 * i + 2], 0.f), 1.f);
-          o[4 * i] = std::uint8_t(r * 255.f + 0.5f);
-          o[4 * i + 1] = std::uint8_t(g * 255.f + 0.5f);
-          o[4 * i + 2] = std::uint8_t(b * 255.f + 0.5f);
-          o[4 * i + 3] = 255;
-        }
-      };
-      auto tramp = [](void* u, int y, float* t, int W) { (*static_cast<decltype(sink)*>(u))(y, t, W); };
-      // resampled frames (zoom / geometry / preview from a larger source) fetch their rows straight into the band
-      auto fetchRow = [&](int y, float* row) {
-        for (int x = 0; x < w; ++x) fetchPixel(x, y, row + 3 * x);
-      };
-      auto fetchTramp = [](void* u, int y, float* row) { (*static_cast<decltype(fetchRow)*>(u))(y, row); };
-      const bool resampled = geo.active || region;
-      if (lease->renderRows(in, w, h, gainEv, resampled ? fetchTramp : nullptr, &fetchRow, tramp, &sink)) return rgba;
-    }
-  }
-
-  ScratchImage localScratch;
-  ImageF* F = outFloat ? outFloat : (needFloat ? &localScratch.get(w, h) : nullptr);
-  if (outFloat) *F = ImageF(w, h);
-
-  const LutSampler sample(lut);
-  // Tone-mapped colours above the lattice's range (bright, strongly saturated pixels) take the exact
-  // colour path; the operator is only built when such a pixel shows up.
-  std::once_flag opOnce;
-  std::optional<PointOp> overflowOp;
+  const int w = d.w, h = d.h;
+  out = ImageF(w, h);
   const float expo = std::exp2(p_.exposure + (source.sceneReferred ? camera_.baselineExposureEv : 0.f));
   const float gain[3] = {wbGain_[0] * expo, wbGain_[1] * expo, wbGain_[2] * expo};
   const float vig = p_.vignette / 100.f;
-  const bool useGeo = geo.active || region;
-  const bool direct8 = !F;
-
-  bool filmOk = false;
-  if (fr.stock) {
-    SpatialQuality q = opt.spatial;
-    filmOk = runFilmStage(
-        p_, fr, gain, in, useGeo, w, h, region ? std::max(d.stepX, d.stepY) : 1.f, q,
-        [&](int y, float* row) {
-          for (int x = 0; x < w; ++x) fetchPixel(x, y, row + 3 * x);
-        },
-        *F, &opt);
-  }
-  const bool needNormal = !filmOk || fr.strength < 1.f;
-
+  const bool useGeo = geo.active;
+  const LutSampler sample(lut);
+  // Tone-mapped colours above the lattice's range take the exact colour path; the operator is only built when such a pixel shows up.
+  std::once_flag opOnce;
+  std::optional<PointOp> overflowOp;
   parallelRows(h, [&](int y) {
     const float* srcRow = useGeo ? nullptr : in.row(y);
-    float* dstF = F ? F->row(y) : nullptr;
-    std::uint8_t* dst8 = direct8 ? rgba + std::size_t(y) * w * 4 : nullptr;
+    float* dst = out.row(y);
     for (int x = 0; x < w; ++x) {
-      float e3[3];
-      if (needNormal) {
-        float v[3];
-        if (!useGeo) {
-          v[0] = srcRow[3 * x];
-          v[1] = srcRow[3 * x + 1];
-          v[2] = srcRow[3 * x + 2];
+      float v[3];
+      if (!useGeo) {
+        v[0] = srcRow[3 * x];
+        v[1] = srcRow[3 * x + 1];
+        v[2] = srcRow[3 * x + 2];
+      } else {
+        const float fx = d.ox0 + (float(x) + 0.5f) * d.stepX, fy = d.oy0 + (float(y) + 0.5f) * d.stepY;
+        float sx, sy;
+        geo.mapF(fx, fy, sx, sy);
+        if (geo.exact) {
+          const float* px = in.row(std::clamp(int(std::floor(sy)), 0, in.height - 1)) + 3 * std::clamp(int(std::floor(sx)), 0, in.width - 1);
+          v[0] = px[0], v[1] = px[1], v[2] = px[2];
         } else {
-          fetchPixel(x, y, v);
-        }
-        for (int c = 0; c < 3; ++c) v[c] = std::max(0.f, v[c] * gain[c]);
-        float tm[3];
-        if (!sample(v, e3, tm)) {
-          std::call_once(opOnce, [&] { overflowOp.emplace(makePointOp(source, &lut)); });
-          overflowOp->colour(tm, e3);
+          sampleCubic(in, sx, sy, v);
         }
       }
-      if (filmOk) {
-        float ef[3] = {dstF[3 * x], dstF[3 * x + 1], dstF[3 * x + 2]};
-        displayStages(ef);
-        for (int c = 0; c < 3; ++c) e3[c] = needNormal ? e3[c] + fr.strength * (ef[c] - e3[c]) : ef[c];
+      for (int c = 0; c < 3; ++c) v[c] = std::max(0.f, v[c] * gain[c]);
+      float e3[3], tm[3];
+      if (!sample(v, e3, tm)) {
+        std::call_once(opOnce, [&] { overflowOp.emplace(makePointOp(source, &lut)); });
+        overflowOp->colour(tm, e3);
       }
       if (vig != 0) {
         const float cx = d.fullW * 0.5f, cy = d.fullH * 0.5f;
         const float px = d.ox0 + (float(x) + 0.5f) * d.stepX - 0.5f, py = d.oy0 + (float(y) + 0.5f) * d.stepY - 0.5f;
         applyVignette(e3, (px - cx) / cx, (py - cy) / cy, vig, p_.outputSpace == 1);
       }
-      for (float& c : e3) c = std::clamp(c, 0.f, 1.f);
-      if (dstF) {
-        dstF[3 * x] = e3[0];
-        dstF[3 * x + 1] = e3[1];
-        dstF[3 * x + 2] = e3[2];
-      } else {
-        dst8[4 * x] = std::uint8_t(e3[0] * 255.f + 0.5f);
-        dst8[4 * x + 1] = std::uint8_t(e3[1] * 255.f + 0.5f);
-        dst8[4 * x + 2] = std::uint8_t(e3[2] * 255.f + 0.5f);
-        dst8[4 * x + 3] = 255;
-      }
+      for (int c = 0; c < 3; ++c) dst[3 * x + c] = std::clamp(e3[c], 0.f, 1.f);
     }
   });
-
-  if (F && sp.any()) applySpatial(*F, sp);
-  if (rgba && F) {
-    parallelFor(
-        h,
-        [&](int y) {
-          const float* s = F->row(y);
-          std::uint8_t* o = rgba + std::size_t(y) * w * 4;
-          for (int x = 0; x < w; ++x) {
-            o[4 * x] = std::uint8_t(s[3 * x] * 255.f + 0.5f);
-            o[4 * x + 1] = std::uint8_t(s[3 * x + 1] * 255.f + 0.5f);
-            o[4 * x + 2] = std::uint8_t(s[3 * x + 2] * 255.f + 0.5f);
-            o[4 * x + 3] = 255;
-          }
-        },
-        16);
-  }
-  return rgba;
-}
-
-std::uint8_t* Renderer::renderBakedRgba(const SourceImage& source, const BakedLut& lut, const FastOptions& opt, int& w,
-                                        int& h) const {
-  return renderBakedImpl(source, lut, opt, w, h, nullptr);
-}
-
-ImageF Renderer::renderBakedFloat(const SourceImage& source, const BakedLut& lut, const FastOptions& opt) const {
-  ImageF out;
-  int w = 0, h = 0;
-  renderBakedImpl(source, lut, opt, w, h, &out);
-  return out;
-}
-
-Image8 Renderer::render(const SourceImage& source) const {
-  const ImageF f = renderFloat(source);
-  Image8 out;
-  out.width = f.width;
-  out.height = f.height;
-  out.data.resize(f.data.size());
-  parallelFor(
-      f.height,
-      [&](int y) {
-        const float* s = f.row(y);
-        std::uint8_t* d = out.data.data() + std::size_t(y) * f.width * 3;
-        for (int i = 0; i < f.width * 3; ++i) d[i] = std::uint8_t(s[i] * 255.f + 0.5f);
-      },
-      16);
   return out;
 }
 
@@ -1929,7 +1685,7 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
   fp.sharpRadius = sp.sharpRadius;
   fp.grain = sp.grain;
   fp.spatialScale = sp.scale > 0.f ? sp.scale : float(std::max(d.w, d.h)) / 2048.f;
-  if (filmRun.stock) {  // the film stage's arguments (FrameKernels::runFilm / runFilmStage)
+  if (filmRun.stock) {  // the film stage's arguments (FrameKernels::runFilm)
     FramePlan::Film& f = fp.film;
     f.active = true;
     f.displayPlain = master_.identity && red_.identity && green_.identity && blue_.identity && !(lut_ && p_.lutAmount > 0);

@@ -16,6 +16,7 @@
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 #include "film_common.h"
 
 namespace fs = std::filesystem;
@@ -276,24 +277,29 @@ int cmdRenderBench(const std::vector<std::string>& args) {
   std::printf("%dx%d (%.1f MP) source, film %s, median of %d runs\n\n", big.linear.width, big.linear.height,
               double(big.linear.width) * big.linear.height / 1e6, film.filmStock.c_str(), runs);
 
-  auto mk = [&](const EditParams& p) {
+  // one frame of the engine (table nodes + planner + executor) into RGBA8; `es` keeps the result cache between frames
+  auto frame = [&](engine::EngineSession& es, const EditParams& p, const FastOptions& fo) {
     Renderer r(p, cam, nullptr);
     r.setToneProxy(&proxy);
-    return r;
+    engine::FrameJob job{p, r, big, &proxy, cam, nullptr, {}, {}, {}};
+    job.request.bakeSize = 33;
+    job.request.noise = fo.noise;
+    job.request.interactive = fo.spatial == SpatialQuality::Interactive;
+    job.fastOptions = fo;
+    engine::FrameResult res;
+    if (!es.renderFrame(job, res)) std::fprintf(stderr, "film-bench: engine frame failed: %s\n", res.error.c_str());
+    std::free(res.rgba);
   };
   auto timeIt = [&](const EditParams& p, SpatialQuality q, int long_edge, bool freshBake, int n) {
-    Renderer r = mk(p);
     FastOptions fo;
     fo.spatial = q;
     fo.region.outLongEdge = long_edge;
     std::vector<double> v;
-    std::shared_ptr<const BakedLut> bake;
+    engine::EngineSession warm;
     for (int i = 0; i < n + 1; ++i) {
+      engine::EngineSession cold;  // a fresh session has no tables cached: the frame bakes them
       const auto t0 = Clock::now();
-      if (freshBake || !bake) bake = mk(p).bake(big, 33);
-      int w = 0, h = 0;
-      std::uint8_t* px = r.renderBakedRgba(big, *bake, fo, w, h);
-      std::free(px);
+      frame(freshBake ? cold : warm, p, fo);
       if (i > 0) v.push_back(msSince(t0));  // first run warms workspaces / pool
     }
     return median(v);
@@ -317,8 +323,6 @@ int cmdRenderBench(const std::vector<std::string>& args) {
   }
   // slider drag: every frame changes a non-spatial film parameter (print warmth) -> re-bake of the print path
   {
-    Renderer r0 = mk(film);
-    auto bake = r0.bake(big, 33);
     FastOptions fo;
     fo.spatial = SpatialQuality::Interactive;
     fo.region.outLongEdge = 1600;
@@ -326,11 +330,9 @@ int cmdRenderBench(const std::vector<std::string>& args) {
     for (int i = 0; i < runs + 1; ++i) {
       EditParams p = film;
       p.filmWarmth = float(i) * 3.f;
+      engine::EngineSession es;
       const auto t0 = Clock::now();
-      Renderer r = mk(p);
-      auto b = r.bake(big, 33);
-      int w = 0, h = 0;
-      std::free(r.renderBakedRgba(big, *b, fo, w, h));
+      frame(es, p, fo);
       if (i > 0) v.push_back(msSince(t0));
     }
     std::printf("\n1600 px interactive frame while dragging print warmth (bake + render): %.1f ms\n", median(v));

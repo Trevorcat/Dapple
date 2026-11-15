@@ -292,9 +292,6 @@ void testIdentity() {
   }
   std::printf("  eyes 100: %zu px in the support (%zu changed), %zu changed more than 3 px outside it\n", inside, insideDiff, outsideDiff);
   CHECK(outsideDiff == 0 && insideDiff > 100);
-  // the old Renderer ignores the reshaping
-  const Renderer r0(EditParams{}, cam(), nullptr), r1(pe, cam(), nullptr);
-  CHECK(r0.render(src).data == r1.render(src).data);
 }
 
 // ---- bounded and symmetric ----------------------------------------------------------------------------------------------------------------------

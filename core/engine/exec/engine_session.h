@@ -1,10 +1,10 @@
 #pragma once
 // EngineSession: per-photo engine state (docs/engine/pipeline-architecture.md section 3, stage a2/a3).
 //
-// renderFrame() builds the frame's graph (GraphBuilder, Legacy detail), computes the node keys, evaluates the table
-// nodes through the ResultCache (a3) and then runs the LegacyRender super-node, which calls the existing
-// Renderer::renderBakedRgba (optionally through a GPU hook first). The C layer keeps everything in front of it
-// (parsing, LUT, scaled source, proxy).
+// renderFrame() builds the frame's table graph (GraphBuilder, Tables detail), computes the node keys, evaluates the table
+// nodes through the ResultCache and keeps the assembled bake (lattice + tone table + analysis) in the AssembledBake slot, then plans the
+// Full graph of the frame and runs it on the GPU executor where it supports the plan, else on the CpuExecutor. The C layer keeps everything in
+// front of it (parsing, LUT, scaled source, proxy).
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -23,14 +23,6 @@
 #include "engine/plan/plan.h"
 
 namespace dapple::engine {
-
-// DAPPLE_ENGINE: unset (default) = full: every frame and export goes through the Planner and the CpuExecutor / GpuExecutor.
-// "0" / "off" = the C layer's own path with the old Renderer (bakes[3] + renderBakedRgba): kept only as the golden oracle and
-// the A/B switch until the device sign-off (docs/engine/pipeline-architecture.md 10.7). The intermediate "legacy" / "tables"
-// modes are gone (their behaviour is the Full engine's table stage).
-enum class Mode : int { Off = 0, Full = 1 };
-Mode mode();
-void setModeOverride(int m);  // tests: -1 = back to the environment
 
 // Outputs of the table nodes (cache payloads).
 struct ToneTableOut {
@@ -147,10 +139,6 @@ GpuCounters gpuCounters();
 // dapple_engine on Android, stderr when DAPPLE_ENGINE_LOG=1 elsewhere): once per 30 frames and on every change of executor or reason.
 std::string executorStatsJson();
 
-// True when frames go through the engine: DAPPLE_ENGINE is on, or the GPU runtime flag is on (the GPU executor consumes the
-// Planner's Plan, so a GPU session always runs the Full engine).
-bool engineInUse();
-
 class EngineSession {
  public:
   EngineSession();
@@ -241,7 +229,7 @@ class EngineSession {
   // effective node keys) and assembles the frame's BakedLut.
   std::shared_ptr<const BakedLut> runHostTables(FrameJob& job, const ParamSet& ps, int n, FrameResult& out);
 
-  // 0 = out.rgba is the frame, 1 = not supported here (render with the legacy renderer), -1 = failed / cancelled (out.error)
+  // 0 = out.rgba is the frame, 1 = not supported here (an explicit engine error), -1 = failed / cancelled (out.error)
   int renderFull(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out);
 
   std::uint64_t id_;
@@ -264,7 +252,6 @@ class EngineSession {
 // One-shot reference-quality renders for callers that have no DappleSession (CLI, developer, tone analysis, swatches): a private
 // EngineSession, the exact variant of the Full graph through the Planner and the CpuExecutor (frames above 16 MP in tiles). The old
 // Renderer is only the parameter resolver here. `spatial` = false skips the neighbourhood stages. False: failed (error in `err`).
-// With DAPPLE_ENGINE=off these still work (they are the engine's own entry points, not the oracle).
 bool renderImage8(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, Image8& out,
                   std::string* err = nullptr, float toneReach = 1.f);
 bool renderImageF(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, bool spatial,

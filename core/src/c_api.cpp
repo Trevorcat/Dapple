@@ -41,7 +41,7 @@
 #include "determinism.h"
 #include "sysperf.h"
 #include "dapple/xmp_preset.h"
-#include "engine/exec/engine_session.h"  // optional frame engine (DAPPLE_ENGINE), default off
+#include "engine/exec/engine_session.h"  // the frame engine: every frame and export
 #include "frame_kernels.h"
 #include "local_eval.h"
 #include "warp_field.h"
@@ -98,12 +98,11 @@ struct DappleSession {
   // ---- interactive frame caches (see dapple_session_render_frame) ----
   std::mutex mtx;
   std::shared_ptr<dapple::SourceImage> proxy;                  // 256 px copy for the tonal analysis
-  std::vector<std::shared_ptr<const dapple::BakedLut>> bakes;  // newest last (three slots)
   std::shared_ptr<const dapple::Lut3D> lutKeep;
   dapple::EditParams lastParams;
   bool haveLast = false;
-  dapple::engine::EngineSession engine;  // used only when DAPPLE_ENGINE is set (docs/engine/pipeline-architecture.md)
-  dapple::engine::EngineSession exportEngine;  // DAPPLE_ENGINE=full: export / reference renders (serialised by exportMtx)
+  dapple::engine::EngineSession engine;  // interactive / final frames (docs/engine/pipeline-architecture.md)
+  dapple::engine::EngineSession exportEngine;  // export / reference renders (serialised by exportMtx)
   std::mutex exportMtx;
   // film exposure that keeps the photo's key (film_match.h): own 256 px proxy, results cached by filmMatchKey()
   std::mutex keyMtx;
@@ -492,7 +491,7 @@ bool fillImage(const Image8& img, DappleImage* out) {
   return true;
 }
 
-// DAPPLE_ENGINE=full: the exact (reference / export) variant through the Planner and the CpuExecutor. Frames of more than
+// The exact (reference / export) variant through the Planner and the CpuExecutor. Frames of more than
 // 16 MP are split into tiles (TiledExport, halo + frame-global sweeps) so the float frame never exists; DAPPLE_ENGINE_TILE=N
 // forces tile size N for every size, =0 never tiles.
 bool engineRenderExact(DappleSession* s, const EditParams& params, const Renderer& renderer, const SourceImage& src,
@@ -665,13 +664,9 @@ bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const cha
       setError("resize failed");
       return false;
     }
-    if (dapple::engine::mode() == dapple::engine::Mode::Full) return engineRenderExact(s, params, renderer, *scaled, out);
-    out = renderer.render(*scaled);  // Mode::Off: the golden oracle
-  } else {
-    if (dapple::engine::mode() == dapple::engine::Mode::Full) return engineRenderExact(s, params, renderer, s->source, out);
-    out = renderer.render(s->source);
+    return engineRenderExact(s, params, renderer, *scaled, out);
   }
-  return true;
+  return engineRenderExact(s, params, renderer, s->source, out);
 }
 
 // ---- streaming export (docs/engine/pipeline-architecture.md section 42) -------------------------------------------------------------------
@@ -776,7 +771,6 @@ void srgb8RowsToDisplayP3(std::uint8_t* rgb, std::size_t pixels) {
 int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPath, int32_t outLongEdge, const std::function<void(int, int)>& onSize,
                  const RowSink& sink, const std::vector<int>& extraLongEdges) {
   if (!s->lazyOpen.load() || !s->lazy) return 0;
-  if (dapple::engine::mode() != dapple::engine::Mode::Full) return 0;  // the golden oracle (DAPPLE_ENGINE=off) renders whole pictures only
   const int W = s->lazy->width, H = s->lazy->height, own = std::max(W, H);
   const bool reduced = outLongEdge > 0 && outLongEdge < own;
   s->streamFilm = Renderer(paramsIn, *s->camera, nullptr).filmActive();
@@ -1914,11 +1908,7 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   if (rq.flags & DAPPLE_FRAME_EXACT) {
     // reference pipeline (no region)
     Image8 img;
-    if (dapple::engine::mode() == dapple::engine::Mode::Full) {
-      if (!engineRenderExact(s, params, renderer, src, img)) return false;
-    } else {
-      img = renderer.render(src);
-    }
+    if (!engineRenderExact(s, params, renderer, src, img)) return false;
     if (!fillImage(img, out)) return false;
     if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS))
     {
@@ -1934,115 +1924,62 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
 #ifdef DAPPLE_HAVE_GPU
   dapple::engine::gpu::installProvider();
 #endif
-  if (dapple::engine::engineInUse()) {
-    // Frame engine: graph + table nodes + ResultCache replace the bakes[3] lookup (stage a2/a3). Same inputs, same outputs.
-    dapple::engine::FrameJob job{params, renderer, src, s->proxy.get(), *s->camera, lut.get(), {}, {}, {}};
-    job.matchMs = matchMs;
-    job.rendererMs = rendererMs;
-    job.request.longEdge = rq.long_edge;
-    job.request.interactive = interactive;
-    job.request.activeParam = rq.active_param ? rq.active_param : "";
-    job.request.wantAnalysis = analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS);
-    job.request.bakeSize = n;
-    job.request.fastAnalysis = interactive && !std::getenv("DAPPLE_EXACT_ANALYSIS");
-    job.request.noise = !quiet && (!interactive || !s->haveLast || !nearEq(s->lastParams.nrLuma, params.nrLuma) ||
-                                   !nearEq(s->lastParams.nrColor, params.nrColor));
-    job.fastOptions.spatial = interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
-    job.fastOptions.noise = job.request.noise;
-    job.fastOptions.region = region;
-    job.fastOptions.keepGrain = keepGrain;
-    // a table slider moves: a print table that is not cached is baked coarsely, the frame after the drag bakes the exact one (section 26)
-    job.fastOptions.coarseFilm = interactive && !activeParam.empty() && activeParam != "grain" && activeParam != "film_grain" && activeParam != "film_strength" &&
-                                 activeParam != "film_halation" && !std::getenv("DAPPLE_FILM_COARSE_OFF");
-    job.fastOptions.fullLongEdge = fullLongEdge;
-    if (!quiet) {
-      s->lutKeep = lut;
-      s->lastParams = params;
-      s->haveLast = true;
-    }
-#ifdef DAPPLE_HAVE_GPU
-    if (dapple::engine::gpu::runtimeEnabled()) job.store = sourceStoreOf(s);  // the GPU executor reads the full-resolution source
-#endif
-    dapple::hal::ExternalImage ext;
-    if (rq.external && rq.external->image) {  // zero readback: the presenter's image on the GPU device (honoured by the GPU executor only)
-      ext.handle = rq.external->image;
-      ext.fmt = dapple::hal::Format::RGBA8;
-      ext.w = rq.external->width;
-      ext.h = rq.external->height;
-      ext.layoutIn = rq.external->layout_in;
-      ext.layoutOut = rq.external->layout_out;
-      ext.waitSemaphore = rq.external->wait_semaphore;
-      ext.signalSemaphore = rq.external->signal_semaphore;
-      job.gpuTarget = &ext;
-    }
-    dapple::engine::FrameResult res;
-    if (!s->engine.renderFrame(job, res)) {
-      setError(res.error.empty() ? "engine failure" : res.error);
-      return false;
-    }
-    if (quiet) {
-      tlSwatchTablesMs += res.cpu.tablesMs;
-      tlSwatchExecMs += res.cpu.execMs;
-      tlSwatchGpu += res.executor != "cpu";
-    }
-    out->width = res.w;
-    out->height = res.h;
-    out->rgba = res.rgba;
-    if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS)) {
-      ToneAnalysis a = res.analysis;
-      if (renderer.filmActive() && res.rgba) applyFrameHistogram(a, res.rgba, res.w, res.h);
-      *analysisOut = dupString(toneJson(a));
-    }
-    return true;
-  }
-  const bool fastAn = interactive && !std::getenv("DAPPLE_EXACT_ANALYSIS");
-  const std::string pk = renderer.pointKey() + (fastAn ? "#f" : "#x");
-  std::shared_ptr<const BakedLut> bake;
-  for (auto& b : s->bakes)  // same parameters, at least as fine a lattice as asked for
-    if (b->n >= std::clamp(n, 17, 65) && b->key.size() > pk.size() && b->key.compare(0, pk.size(), pk) == 0 &&
-        (!bake || b->n > bake->n))
-      bake = b;
-  if (bake) {  // the finest lattice of this colour stage wins (as in the engine's table path)
-    const std::string ck0 = renderer.colourKey();
-    for (auto& b : s->bakes)
-      if (b->colourKey == ck0 && b->n >= std::clamp(n, 17, 65) && b->n > bake->n) bake = nullptr;
-  }
-  if (!bake) {
-    // A lattice with the same colour stage (only tone / white balance moved: every 光线 drag) is reused, the
-    // largest one available (the final frame's 65^3 is the most accurate): just the 1D tone table is rebuilt.
-    const std::string ck = renderer.colourKey();
-    const BakedLut* from = nullptr;
-    for (auto& b : s->bakes)
-      if (b->colourKey == ck && b->n >= std::clamp(n, 17, 65) && (!from || b->n > from->n)) from = b.get();
-    bake = renderer.bake(src, n, from, fastAn);
-    s->bakes.push_back(bake);
-    if (s->bakes.size() > 3) s->bakes.erase(s->bakes.begin());
+  // Frame engine: graph + table nodes + ResultCache.
+  dapple::engine::FrameJob job{params, renderer, src, s->proxy.get(), *s->camera, lut.get(), {}, {}, {}};
+  job.matchMs = matchMs;
+  job.rendererMs = rendererMs;
+  job.request.longEdge = rq.long_edge;
+  job.request.interactive = interactive;
+  job.request.activeParam = rq.active_param ? rq.active_param : "";
+  job.request.wantAnalysis = analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS);
+  job.request.bakeSize = n;
+  job.request.fastAnalysis = interactive && !std::getenv("DAPPLE_EXACT_ANALYSIS");
+  job.request.noise = !quiet && (!interactive || !s->haveLast || !nearEq(s->lastParams.nrLuma, params.nrLuma) ||
+                                 !nearEq(s->lastParams.nrColor, params.nrColor));
+  job.fastOptions.spatial = interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
+  job.fastOptions.noise = job.request.noise;
+  job.fastOptions.region = region;
+  job.fastOptions.keepGrain = keepGrain;
+  // a table slider moves: a print table that is not cached is baked coarsely, the frame after the drag bakes the exact one (section 26)
+  job.fastOptions.coarseFilm = interactive && !activeParam.empty() && activeParam != "grain" && activeParam != "film_grain" && activeParam != "film_strength" &&
+                               activeParam != "film_halation" && !std::getenv("DAPPLE_FILM_COARSE_OFF");
+  job.fastOptions.fullLongEdge = fullLongEdge;
+  if (!quiet) {
     s->lutKeep = lut;
+    s->lastParams = params;
+    s->haveLast = true;
   }
-
-  FastOptions fo;
-  fo.spatial = interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
-  fo.noise = !interactive || !s->haveLast || !nearEq(s->lastParams.nrLuma, params.nrLuma) ||
-             !nearEq(s->lastParams.nrColor, params.nrColor);
-  fo.region = region;
-  fo.keepGrain = keepGrain;
-  fo.fullLongEdge = fullLongEdge;
-  s->lastParams = params;
-  s->haveLast = true;
-
-  int w = 0, h = 0;
-  std::uint8_t* rgba = nullptr;
-  if (!rgba) rgba = renderer.renderBakedRgba(src, *bake, fo, w, h);
-  if (!rgba) {
-    setError("out of memory");
+#ifdef DAPPLE_HAVE_GPU
+  if (dapple::engine::gpu::runtimeEnabled()) job.store = sourceStoreOf(s);  // the GPU executor reads the full-resolution source
+#endif
+  dapple::hal::ExternalImage ext;
+  if (rq.external && rq.external->image) {  // zero readback: the presenter's image on the GPU device (honoured by the GPU executor only)
+    ext.handle = rq.external->image;
+    ext.fmt = dapple::hal::Format::RGBA8;
+    ext.w = rq.external->width;
+    ext.h = rq.external->height;
+    ext.layoutIn = rq.external->layout_in;
+    ext.layoutOut = rq.external->layout_out;
+    ext.waitSemaphore = rq.external->wait_semaphore;
+    ext.signalSemaphore = rq.external->signal_semaphore;
+    job.gpuTarget = &ext;
+  }
+  dapple::engine::FrameResult res;
+  if (!s->engine.renderFrame(job, res)) {
+    setError(res.error.empty() ? "engine failure" : res.error);
     return false;
   }
-  out->width = w;
-  out->height = h;
-  out->rgba = rgba;
+  if (quiet) {
+    tlSwatchTablesMs += res.cpu.tablesMs;
+    tlSwatchExecMs += res.cpu.execMs;
+    tlSwatchGpu += res.executor != "cpu";
+  }
+  out->width = res.w;
+  out->height = res.h;
+  out->rgba = res.rgba;
   if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS)) {
-    ToneAnalysis a = bake->analysis;  // the lattice (and its class analysis) is shared across film exposure / warmth...
-    if (renderer.filmActive()) applyFrameHistogram(a, rgba, w, h);  // ...the histogram of a film edit is that of the frame
+    ToneAnalysis a = res.analysis;
+    if (renderer.filmActive() && res.rgba) applyFrameHistogram(a, res.rgba, res.w, res.h);
     *analysisOut = dupString(toneJson(a));
   }
   return true;
@@ -2833,7 +2770,7 @@ bool writeBytesAtomic(const fs::path& path, const std::vector<std::uint8_t>& byt
 // An edit the open did not foresee (a film stock: ~55 B/px more than a plain export) on a session that holds the whole float picture: when the
 // whole-frame export would not fit, the session gives its picture back and exports in bands from the cached mosaic (same pixels).
 void demoteToStream(DappleSession* s, const EditParams& ep, bool force) {
-  if (s->lazyOpen.load() || s->fullRawPath.empty() || dapple::engine::mode() != dapple::engine::Mode::Full) return;
+  if (s->lazyOpen.load() || s->fullRawPath.empty()) return;
   if (xstream::envMode() == xstream::Mode::Off || (xstream::envMode() == xstream::Mode::On && !force)) return;
   const int W = s->source.linear.width, H = s->source.linear.height;
   const std::size_t held = std::size_t(W) * H * 12;  // the float picture is already there

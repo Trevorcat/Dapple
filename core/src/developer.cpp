@@ -56,7 +56,7 @@ Result<DevelopResult> Developer::develop(const DevelopRequest& req) const {
     result.applied.filmPrintEv = fe.printEv;
   }
   t0 = std::chrono::steady_clock::now();
-  std::string renderErr;  // graph + planner + CpuExecutor (the old Renderer::render is the golden oracle only)
+  std::string renderErr;  // graph + planner + CpuExecutor 
   if (!engine::renderImage8(result.applied, *result.camera, req.lut, *source, result.image, &renderErr))
     return fail("render failed: " + renderErr);
   result.timings.renderMs = msSince(t0);

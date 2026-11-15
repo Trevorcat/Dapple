@@ -95,7 +95,7 @@ struct ParamMask {
 };
 
 enum class Domain : std::uint8_t { Image, Table, Npu /*reserved*/ };
-enum class Footprint : std::uint8_t { Point, Window, Resample, Global, Source, Sink, Composite /*Window+Global*/, Super /*legacy super-node*/ };
+enum class Footprint : std::uint8_t { Point, Window, Resample, Global, Source, Sink, Composite /*Window+Global*/, Super /*one node standing for several stages*/ };
 
 // Closed set of node types of stage (a). Order is part of the structure hash: append only.
 enum class NodeType : std::uint16_t {
@@ -120,7 +120,7 @@ enum class NodeType : std::uint16_t {
   FilmSim,
   DisplayStages,
   Blend,
-  LegacyRender,
+  AssembledBake,
   // film decomposition (docs/engine/pipeline-architecture.md 8.1): three tables, then the image nodes
   FilmTableRaw,
   FilmTableCurves,

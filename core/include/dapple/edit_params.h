@@ -155,11 +155,10 @@ struct EditParams {
   float lutAmount = 100.f;  // 0..100
 
   // Local adjustments through masks (dapple/local_adjust.h, docs/engine/pipeline-architecture.md section 40): JSON key "local".
-  // Ignored by the old Renderer (DAPPLE_ENGINE=off).
   std::vector<LocalAdjustment> local;
 
   // Portrait reshaping (dapple/reshape.h, docs/engine/pipeline-architecture.md section 45): JSON key "reshape". A geometric warp folded
-  // into the geometry fetch. Ignored by the old Renderer (DAPPLE_ENGINE=off).
+  // into the geometry fetch.
   ReshapeParams reshape;
 
   // Brings every value into its legal range (NaN -> default, unknown crop -> "orig", rotate to a

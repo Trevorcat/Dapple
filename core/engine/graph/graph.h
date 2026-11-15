@@ -97,14 +97,14 @@ class Graph {
 enum class GraphDetail : std::uint8_t {
   Full,    // every current stage as its own node (snapshot tests, validation, later steps)
   FullFilm,  // Full, with the film simulation decomposed into its nodes (8.1) instead of the FilmSim super-node
-  Legacy,  // the stages stage (a) executes: tables as nodes, everything after them inside LegacyRender
+  Tables,  // the table nodes of a frame, then the assembled bake as one node (EngineSession keys and caches the tables from it)
 };
 
 // Builds the graph of one frame request. Pure function of the ParamSet (and, for Full detail, of `plan`, the
 // FramePlan the renderer resolves for the frame: spatial amounts after quality / region, geometry, vignette).
 class GraphBuilder {
  public:
-  static Graph build(const ParamSet& ps, GraphDetail detail = GraphDetail::Legacy, const FramePlan* plan = nullptr);
+  static Graph build(const ParamSet& ps, GraphDetail detail = GraphDetail::Tables, const FramePlan* plan = nullptr);
 };
 
 }  // namespace dapple::engine

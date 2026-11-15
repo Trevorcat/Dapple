@@ -26,7 +26,7 @@ add_library(dapple_core STATIC
   src/merge_io.cpp
   src/motion_photo.cpp
   src/pano.cpp
-  src/renderer.cpp
+  src/point_kernels.cpp
   src/sequence.cpp
   src/spatial.cpp
   src/hdr_field.cpp

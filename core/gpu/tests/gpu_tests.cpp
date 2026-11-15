@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../../../tests/deterministic.h"
+#include "../../../tests/render_f.h"
 #include "dapple/camera.h"
 #include "dapple/dapple_c.h"
 #include "dapple/encode.h"
@@ -179,7 +180,6 @@ bool runStage(Env& env, Rig& rig, const SourceImage& src, const Stage& st, Row& 
   FastOptions fo;
   fo.spatial = SpatialQuality::Full;
   if (st.opt) st.opt(fo);
-  const auto lut = r.bake(src, 41);
   int w = 0, h = 0, gw = 0, gh = 0;
   SourceImage halfSrc;
   const SourceImage* refSrc = &src;
@@ -192,7 +192,7 @@ bool runStage(Env& env, Rig& rig, const SourceImage& src, const Stage& st, Row& 
     }
     refSrc = &halfSrc;
   }
-  std::uint8_t* cpu = r.renderBakedRgba(*refSrc, *lut, fo, w, h);
+  std::uint8_t* cpu = renderFrame8(p, cam, st.lut ? &testLut() : nullptr, *refSrc, 41, fo, w, h);  // the CPU executor of the same engine
   std::string err;
   std::uint8_t* gpu = rig.render(p, r, src, fo, 41, gw, gh, nullptr, err, 0, 0.f, st.lut ? &testLut() : nullptr);
   if (!cpu || !gpu || w != gw || h != gh) {
@@ -257,13 +257,12 @@ void testHalfBudget(Env& env) {
     f = std::ldexp(std::nearbyint(m * 2048.f) / 2048.f, e);
   }
   EditParams p = baseParams();
-  Renderer r(p, env.cams.resolve("", ""), nullptr);
-  const auto lut = r.bake(src, 41);
+  const CameraProfile& hcam = env.cams.resolve("", "");
   FastOptions fo;
   fo.spatial = SpatialQuality::Off;
   int w, h;
-  std::uint8_t* a = r.renderBakedRgba(src, *lut, fo, w, h);
-  std::uint8_t* b = r.renderBakedRgba(half, *lut, fo, w, h);
+  std::uint8_t* a = renderFrame8(p, hcam, nullptr, src, 41, fo, w, h);
+  std::uint8_t* b = renderFrame8(p, hcam, nullptr, half, 41, fo, w, h);
   const DeStats s = compareRgba8(a, b, std::size_t(w) * h);
   std::printf("  mean %.4f  p99 %.3f  max %.2f  (differing %.1f%%)\n", s.mean, s.p99, s.max, s.differing * 100);
   std::free(a);
@@ -288,10 +287,9 @@ void testDownscale(Env& env) {
       rh = int(std::lround(1200 * s));
     }
     small.linear = cpuLanczos(src.linear, rw, rh);
-    const auto lut = r.bake(small, 41);
     FastOptions fo;
     int w = 0, h = 0, gw = 0, gh = 0;
-    std::uint8_t* cpu = r.renderBakedRgba(small, *lut, fo, w, h);
+    std::uint8_t* cpu = renderFrame8(p, cam, nullptr, small, 41, fo, w, h);
     Rig rig(env.be, src, cam);
     std::string err;
     std::uint8_t* gpu = rig.render(p, r, small, fo, 41, gw, gh, nullptr, err);  // tables and frame size from the CPU Lanczos copy; the GPU resizes the full source itself
@@ -525,7 +523,7 @@ void testExact(Env& env) {
     o.mode = c.tiled ? engine::ExecMode::TiledExport : engine::ExecMode::Whole;
     o.tile = c.tiled ? 256 : 0;
     const bool ok = rig.es.renderExact(p, r, src, o, gpu, &err);
-    const Image8 cpu = r.render(src);
+    const Image8 cpu = render8(p, cam, lut, src);
     CHECK(ok, "%s: %s", c.name, err.c_str());
     CHECK(rig.es.stats().gpuFrames == 1, "%s: not rendered by the GPU executor (gpuFrames %llu)", c.name, (unsigned long long)rig.es.stats().gpuFrames);
     if (!ok || gpu.data.size() != cpu.data.size()) {
@@ -898,8 +896,7 @@ void testCApiHook(Env& env) {
   const SourceImage scene = makeTestImage(1400, 933);
   EditParams base = baseParams();
   const CameraProfile& cam = env.cams.resolve("", "");
-  Renderer r0(base, cam, nullptr);
-  const Image8 jpg = r0.render(scene);
+  const Image8 jpg = render8(base, cam, nullptr, scene);
   const std::string path = std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") + "/dapple_gpu_hook_test.jpg";
   if (!writeJpeg(jpg, path)) {
     std::printf("  cannot write the test jpeg\n");

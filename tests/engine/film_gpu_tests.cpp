@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../deterministic.h"
+#include "../render_f.h"
 #include "colour_metrics.h"
 #include "dapple/film.h"
 #include "engine/exec/gpu_executor.h"
@@ -724,9 +725,8 @@ void testFrames() {
       FastOptions fo;
       fo.spatial = SpatialQuality::Full;
       if (c.opt) c.opt(fo);
-      const auto lut = r.bake(src, 41);
       int w = 0, h = 0, gw = 0, gh = 0;
-      std::uint8_t* cpu = r.renderBakedRgba(src, *lut, fo, w, h);
+      std::uint8_t* cpu = renderFrame8(p, cam, look, src, 41, fo, w, h);  // the CPU executor of the same engine
       engine::GpuStats st;
       std::uint8_t* gpu = nullptr;
       if (c.tiled) {  // the GPU side is a tiled export: tiles of 256 px, the sink assembles the RGBA frame

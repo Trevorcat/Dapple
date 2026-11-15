@@ -20,6 +20,7 @@
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
 #include "dapple/renderer.h"
+#include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
 #include "gpu_rig.h"
 #include "parity.h"
@@ -36,6 +37,22 @@ double msSince(Clock::time_point t0) { return std::chrono::duration<double, std:
 double median(std::vector<double> v) {
   std::sort(v.begin(), v.end());
   return v.empty() ? 0 : v[v.size() / 2];
+}
+
+// One frame of the baked variant on the CPU executor (a FrameJob without a SourceStore never goes to the GPU): malloc()ed RGBA8, or null.
+std::uint8_t* cpuFrame(engine::EngineSession& es, const EditParams& p, const CameraProfile& cam, const SourceImage& src, int n, const FastOptions& fo, int& w,
+                       int& h) {
+  Renderer r(p, cam, nullptr);
+  engine::FrameJob job{p, r, src, nullptr, cam, nullptr, {}, {}, {}};
+  job.request.bakeSize = n;
+  job.request.noise = fo.noise;
+  job.request.interactive = fo.spatial == SpatialQuality::Interactive;
+  job.fastOptions = fo;
+  engine::FrameResult res;
+  if (!es.renderFrame(job, res)) return nullptr;
+  w = res.w;
+  h = res.h;
+  return res.rgba;
 }
 
 void report(const char* what, const DeStats& s) {
@@ -199,20 +216,19 @@ int gpuBench(const std::vector<std::string>& args) {
       FastOptions fo;
       fo.spatial = v.q;
       fo.noise = v.noise;
-      t0 = Clock::now();
-      const auto lut = r.bake(cs.src, latticeN);
-      const double bakeMs = msSince(t0);
       int cw = 0, ch = 0;
       std::uint8_t* cpu = nullptr;
       const int cpuRep = npx > 8000000 ? 2 : std::min(repeat, 5);
       std::vector<double> cpuT;
-      for (int i = 0; i < cpuRep; ++i) {
+      engine::EngineSession cpuEs;  // the CPU executor of the same engine (no store: the frame never goes to the GPU)
+      double bakeMs = 0;
+      for (int i = 0; i < cpuRep + 1; ++i) {  // the first frame builds the tables, the next ones hit them
         std::free(cpu);
         t0 = Clock::now();
-        cpu = r.renderBakedRgba(cs.src, *lut, fo, cw, ch);
-        cpuT.push_back(msSince(t0));
+        cpu = cpuFrame(cpuEs, v.spatialParams ? prmSp : prm, cam, cs.src, latticeN, fo, cw, ch);
+        (i == 0 ? bakeMs : cpuT.emplace_back()) = msSince(t0);
       }
-      std::printf("  --- %s ---\n      CPU baked path (all cores): %.1f ms/frame (lattice bake %.1f ms)\n", v.name, median(cpuT), bakeMs);
+      std::printf("  --- %s ---\n      CPU baked path (all cores): %.1f ms/frame (first frame with the tables %.1f ms)\n", v.name, median(cpuT), bakeMs);
       // first frame: resident upload + lattice upload + pipeline creation
       int gw = 0, gh = 0;
       GpuStats st0;
@@ -313,7 +329,6 @@ int gpuBench(const std::vector<std::string>& args) {
     Rig rig(be, *src, cam);
     Renderer r(prmSp, cam, nullptr);
     FastOptions fo;
-    const auto lut = r.bake(*src, latticeN);
     for (const bool stream : {true, false}) {
       if (!stream && std::uint64_t(W) * H > 40000000ull) continue;
       std::uint64_t sum = 0;
@@ -353,7 +368,8 @@ int gpuBench(const std::vector<std::string>& args) {
     if (std::uint64_t(W) * H <= 30000000ull) {
       int cw = 0, ch = 0;
       t0 = Clock::now();
-      std::uint8_t* cpu = r.renderBakedRgba(*src, *lut, fo, cw, ch);
+      engine::EngineSession cpuEs;
+      std::uint8_t* cpu = cpuFrame(cpuEs, prmSp, cam, *src, latticeN, fo, cw, ch);
       std::printf("  CPU full-frame reference: %.0f ms\n", msSince(t0));
       std::vector<std::uint8_t> img(std::size_t(cw) * ch * 4);
       auto sink2 = [&](int x, int y, int w, int h, const std::uint8_t* rgba, std::size_t stride) {

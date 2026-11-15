@@ -216,7 +216,7 @@ void testValidate() {
   {
     Graph g;
     const NodeId s = g.add(NodeType::Source);
-    const NodeId r = g.add(NodeType::LegacyRender, {Edge{s}});
+    const NodeId r = g.add(NodeType::AssembledBake, {Edge{s}});
     g.markOutput(r, OutputRole::Frame);
     CHECK(g.validate(N).ok);
   }
@@ -224,21 +224,21 @@ void testValidate() {
     Graph g;
     const NodeId s = g.add(NodeType::Source);
     g.add(NodeType::ColourLattice);
-    const NodeId r = g.add(NodeType::LegacyRender, {Edge{s}});
+    const NodeId r = g.add(NodeType::AssembledBake, {Edge{s}});
     g.markOutput(r, OutputRole::Frame);
     const auto v = g.validate(N);
     CHECK(!v.ok && v.error.find("dead node") != std::string::npos);
   }
   {  // wrong input count
     Graph g;
-    const NodeId r = g.add(NodeType::LegacyRender);
+    const NodeId r = g.add(NodeType::AssembledBake);
     g.markOutput(r, OutputRole::Frame);
     CHECK(!g.validate(N).ok);
   }
   {  // domain: a Table where an Image is required
     Graph g;
     const NodeId l = g.add(NodeType::ColourLattice);
-    const NodeId r = g.add(NodeType::LegacyRender, {Edge{l}});
+    const NodeId r = g.add(NodeType::AssembledBake, {Edge{l}});
     g.markOutput(r, OutputRole::Frame);
     const auto v = g.validate(N);
     CHECK(!v.ok && v.error.find("domain") != std::string::npos);
@@ -359,14 +359,14 @@ std::string snapshotText(bool haveFilm) {
     if (s.film && !haveFilm) continue;
     const ParamSet ps = ParamSet::make(s.in);
     const FramePlan plan = planFor(ps);
-    for (GraphDetail d : {GraphDetail::Legacy, GraphDetail::Full}) {
+    for (GraphDetail d : {GraphDetail::Tables, GraphDetail::Full}) {
       Graph g = GraphBuilder::build(ps, d, &plan);
       const auto v = g.validate();
       if (!v.ok) {
-        std::printf("  scenario %s (%s) invalid: %s\n", s.name.c_str(), d == GraphDetail::Full ? "full" : "legacy", v.error.c_str());
+        std::printf("  scenario %s (%s) invalid: %s\n", s.name.c_str(), d == GraphDetail::Full ? "full" : "tables", v.error.c_str());
         ++g_failures;
       }
-      out += "== " + s.name + (d == GraphDetail::Full ? " [full]\n" : " [legacy]\n") + g.dump(false);
+      out += "== " + s.name + (d == GraphDetail::Full ? " [full]\n" : " [tables]\n") + g.dump(false);
     }
   }
   return out;
@@ -452,7 +452,7 @@ void testKeys() {
   for (GScenario& s : graphScenarios()) {
     const ParamSet base = ParamSet::make(s.in);
     const FramePlan plan = planFor(base);
-    for (GraphDetail d : {GraphDetail::Legacy, GraphDetail::Full}) {
+    for (GraphDetail d : {GraphDetail::Tables, GraphDetail::Full}) {
       Graph g0 = GraphBuilder::build(base, d, &plan);
       g0.computeKeys(base);
       for (std::size_t k = 0; k < P.size(); ++k)
@@ -533,7 +533,7 @@ TableRun runTables(const ParamInputs& in0, const NodeRegistry& reg, const Source
   in.ctx.lutIdentity = lut ? std::uintptr_t(lut->contentId()) : 0;
   in.ctx.cameraId = cam.id;
   const ParamSet ps = ParamSet::make(in);
-  Graph g = GraphBuilder::build(ps, GraphDetail::Legacy);
+  Graph g = GraphBuilder::build(ps, GraphDetail::Tables);
   g.computeKeys(ps, reg);
   const int n = std::clamp(ps.frame().bakeSize, 17, 65);
   const TableKeys tk = effectiveTableKeys(g, ps, n);
@@ -808,8 +808,7 @@ struct SeqResult {
   std::vector<double> ms;
 };
 
-SeqResult runSequence(int mode, const std::vector<SeqFrame>& seq, int srcW = 1600, int srcH = 1067) {
-  setModeOverride(mode);
+SeqResult runSequence(const std::vector<SeqFrame>& seq, int srcW = 1600, int srcH = 1067) {
   auto* s = new DappleSession;
   s->source = makeScene(srcW, srcH, true, 3);
   s->camera = &camA();
@@ -836,36 +835,41 @@ SeqResult runSequence(int mode, const std::vector<SeqFrame>& seq, int srcW = 160
     dapple_free_string(an);
   }
   delete s;
-  setModeOverride(-1);
   return r;
 }
 
 void reuseImpl(bool smallRun) {
   const auto seq = benchSequence(smallRun);
-  const SeqResult off = runSequence(0, seq, smallRun ? 640 : 1600, smallRun ? 427 : 1067), tables = runSequence(1, seq, smallRun ? 640 : 1600, smallRun ? 427 : 1067);  // 0 = the old Renderer path (oracle), 1 = the engine
+  const int W = smallRun ? 640 : 1600, H = smallRun ? 427 : 1067;
+  const SeqResult a = runSequence(seq, W, H), b = runSequence(seq, W, H);  // two fresh sessions
   auto count = [](const std::string& k, char c) { return int(std::count(k.begin(), k.end(), c)); };
-  std::printf("  edit-bench drag sequences (%zu frames, two scenarios): old bakes[3]: bake %d, lattice-reuse %d, full-hit %d | engine: bake %d, reuse %d, hit %d\n",
-              seq.size(), count(off.kinds, 'B'), count(off.kinds, 'R'), count(off.kinds, 'H'), count(tables.kinds, 'B'),
-              count(tables.kinds, 'R'), count(tables.kinds, 'H'));
-  CHECK(off.kinds.size() == tables.kinds.size());
-  CHECK(off.kinds == tables.kinds);  // identical reuse decisions frame by frame
-  CHECK(off.hashes == tables.hashes);  // and identical pixels + analysis
-  {  // per frame-type medians (ms), 1600x1067 synthetic source; informational, the gate-P numbers come from edit-bench on a RAW
-    std::map<std::string, std::vector<double>> g[2];
-    const SeqResult* rs[2] = {&off, &tables};
-    for (int m = 0; m < 2; ++m)
-      for (std::size_t i = 0; i < seq.size(); ++i)
-        if (i % 9 != 0) g[m][seq[i].label.substr(0, seq[i].label.find('/'))].push_back(rs[m]->ms[i]);  // skip each list's warm-up frame
-    auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
-    for (const auto& [name, v] : g[0])
-      std::printf("    %-22s off %7.2f  engine %7.2f ms\n", name.c_str(), med(v), med(g[1][name]));
+  std::printf("  edit-bench drag sequences (%zu frames, two scenarios): bake %d, lattice-reuse %d, full-hit %d\n", seq.size(), count(a.kinds, 'B'), count(a.kinds, 'R'),
+              count(a.kinds, 'H'));
+  CHECK(a.kinds.size() == seq.size());
+  CHECK(a.kinds == b.kinds);    // the reuse decisions are deterministic frame by frame
+  CHECK(a.hashes == b.hashes);  // and so are the pixels + analysis
+  // the reuse rules of a drag, after the first frame of each list: a spatial-only drag (clarity) and an unchanged final frame hit the cached bake, a tone drag
+  // (exposure) reuses the colour lattice and rebuilds the tone table only, a colour drag (saturation) bakes the lattice again, the reference render bakes nothing
+  for (std::size_t i = 0; i < seq.size(); ++i) {
+    const std::string name = seq[i].label.substr(0, seq[i].label.find('/'));
+    if (seq[i].label.substr(seq[i].label.find('/') + 1) == "0") continue;
+    const char k = a.kinds[i];
+    if (name.find("clarity") != std::string::npos || name.find("unchanged") != std::string::npos || name.find("exact") != std::string::npos) CHECK(k == 'H');
+    else if (name.find("exposure") != std::string::npos) CHECK(k == 'R');
+    else if (name.find("saturation") != std::string::npos) CHECK(k == 'B');
+    if (k != (name.find("clarity") != std::string::npos || name.find("unchanged") != std::string::npos || name.find("exact") != std::string::npos ? 'H' : name.find("exposure") != std::string::npos ? 'R' : 'B'))
+      std::printf("  frame %s: kind %c\n", seq[i].label.c_str(), k);
   }
-  if (off.kinds != tables.kinds) {
-    std::printf("  old   %s\n  new   %s\n", off.kinds.c_str(), tables.kinds.c_str());
+  {  // per frame-type medians (ms), 1600x1067 synthetic source; informational, the gate-P numbers come from edit-bench on a RAW
+    std::map<std::string, std::vector<double>> g;
+    for (std::size_t i = 0; i < seq.size(); ++i)
+      if (i % 9 != 0) g[seq[i].label.substr(0, seq[i].label.find('/'))].push_back(a.ms[i]);  // skip each list's warm-up frame
+    auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+    for (const auto& [name, v] : g) std::printf("    %-22s %7.2f ms\n", name.c_str(), med(v));
   }
 }
 void testReuse() { reuseImpl(false); }
-// the same drag sequences on a 640 px source (shorter lists): the engine reuses exactly where the old path did and renders the same pixels: in the default run
+// the same drag sequences on a 640 px source (shorter lists): the reuse rules and determinism of the engine: in the default run
 void testReuseSmall() { reuseImpl(true); }
 
 // ---- planner / graph overhead --------------------------------------------------------------------------------------------------------
@@ -886,7 +890,7 @@ void testOverhead() {
     le.family = {std::uint64_t(i + 1), 8};
     le.order = 57;
     cache.put(NodeType::ColourLattice, le);
-    cache.put(NodeType::LegacyRender, le);
+    cache.put(NodeType::AssembledBake, le);
   }
   volatile std::uint64_t sink = 0;
   auto frame = [&](GraphDetail detail) {
@@ -897,7 +901,7 @@ void testOverhead() {
     const TableKeys tk = effectiveTableKeys(g, ps, 57);
     const NodeInstance* lat = g.find(NodeType::ColourLattice);
     cache.findBest(NodeType::ColourLattice, lat->family, 57);
-    cache.find(NodeType::LegacyRender, tk.tone);
+    cache.find(NodeType::AssembledBake, tk.tone);
     cache.find(NodeType::Analysis, tk.analysis);
     sink = sink + (v.ok ? 1 : 0) + tk.tone.a;
   };
@@ -911,7 +915,7 @@ void testOverhead() {
     }
     return best;
   };
-  const double legacyUs = measure(GraphDetail::Legacy);
+  const double legacyUs = measure(GraphDetail::Tables);
   const double fullUs = measure(GraphDetail::Full);
   // the old keys
   SourceImage proxy = makeScene(64, 43, true);
@@ -937,13 +941,13 @@ void testOverhead() {
   };
   const double makeUs = stage([&] { sink = sink + ParamSet::make(in).hash(0).a; });
   const ParamSet ps0 = ParamSet::make(in);
-  const double buildUs = stage([&] { sink = sink + GraphBuilder::build(ps0, GraphDetail::Legacy).nodes().size(); });
-  Graph g0 = GraphBuilder::build(ps0, GraphDetail::Legacy);
+  const double buildUs = stage([&] { sink = sink + GraphBuilder::build(ps0, GraphDetail::Tables).nodes().size(); });
+  Graph g0 = GraphBuilder::build(ps0, GraphDetail::Tables);
   const double valUs = stage([&] { sink = sink + g0.validate().ok; });
   const double keyUs = stage([&] { g0.computeKeys(ps0); sink = sink + g0.nodes().back().key.a; });
   const double budgetUs = 200.0 * 0.14;  // 0.2 ms on the low-end profile, host runs ~1/0.14 faster (risk 8)
-  std::printf("  per-frame engine overhead (host, best of 7x4000): legacy graph %.2f us, full graph %.2f us; old pointKey+colourKey %.2f us\n"
-              "    legacy-graph stages: ParamSet::make %.2f, build %.2f, validate %.2f, keys %.2f us\n"
+  std::printf("  per-frame engine overhead (host, best of 7x4000): tables graph %.2f us, full graph %.2f us; old pointKey+colourKey %.2f us\n"
+              "    tables-graph stages: ParamSet::make %.2f, build %.2f, validate %.2f, keys %.2f us\n"
               "    budget: 200 us on the low-end profile x 0.14 = %.0f us on this host\n",
               legacyUs, fullUs, oldUs, makeUs, buildUs, valUs, keyUs, budgetUs);
   CHECK(legacyUs < budgetUs);

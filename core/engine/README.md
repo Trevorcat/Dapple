@@ -18,8 +18,9 @@ Adding a node:
 4. Update snapshots: `DAPPLE_UPDATE_SNAPSHOTS=1 dapple_engine_tests snapshots`, review the diff of tests/engine/graph_snapshots.txt.
 5. Run `dapple_engine_tests keys` (undeclared-influence check on every node/key) and, for table nodes, `conformance`
    (equal key => bit-identical output; has negative controls). A node with a wrong mask fails these.
-6. Golden corpus: `dapple_golden verify tests/engine/golden/corpus.txt off full` must stay byte-identical, and `dapple_golden selfcheck`
-   (old Renderer vs engine on this machine, any architecture) must report 0 differences.
+6. Golden corpus: `dapple_golden verify tests/engine/golden/corpus.txt full` must stay byte-identical (the 163 recorded hashes are the oracle; the old
+   renderer that produced them is deleted), and `dapple_golden selfcheck` (engine-internal: 8-bit frame vs float frame quantised, whole vs tiled
+   execution, exact vs baked variant inside the dE2000 budget, merged-DNG round trip, Resize node; any architecture) must report 0 differences.
    A table node's evaluation is its `CpuImpl::bake` (`nodes/main/cpu_nodes.cpp`; `engine::bakeNode`); `EngineSession::runHostTables` caches it.
 Edge `keyed=false` = scheduling edge only (producer key does not enter the consumer key).
 
@@ -28,7 +29,7 @@ Edge `keyed=false` = scheduling edge only (producer key does not enter the consu
 - `plan/plan.h`: `Planner::plan(graph, PlanRequest, cache) -> Plan` (fused point chain, cumulative window groups per sweep, halos, global solves, cache ops).
 - `exec/cpu_executor.h`: `CpuExecutor::run(plan, ExecEnv, ExecStats*)`; `CancelToken` is polled between tiles/groups and in the ThreadPool chunk loop.
 - `nodes/main/cpu_nodes.cpp`: `cpuImpl(NodeType)`: `block` fragments (3-float RGB, n <= 256) for point nodes, `tile` fns (additive `CpuImpl::tile`) for window nodes.
-- `DAPPLE_ENGINE=full` runs every frame and export through them; `dapple_golden verify corpus.txt full`, `dapple_exec_tests <whole|tiles|plan|cancel|analysis|bench>`.
+- Every frame and export runs through them (there is no other renderer); `dapple_golden verify corpus.txt full`, `dapple_exec_tests <whole|tiles|plan|cancel|analysis|bench>`.
 
 ## GPU executor (GPU engineer, docs/engine/pipeline-architecture.md section 19)
 

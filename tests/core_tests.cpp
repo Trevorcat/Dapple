@@ -301,8 +301,7 @@ void testRenderer() {
         float lin[3] = {color::srgbDecode(pc[0]), color::srgbDecode(pc[1]), color::srgbDecode(pc[2])};
         color::srgbToProPhoto().apply(lin, src.linear.row(y) + 3 * x);
       }
-    Renderer r(EditParams{}, cam, nullptr);
-    const ImageF out = r.renderFloat(src);
+    const ImageF out = renderF(EditParams{}, cam, nullptr, src);
     double maxErr = 0;
     for (int x = 0; x < 16; ++x)
       for (int c = 0; c < 3; ++c) maxErr = std::max(maxErr, std::fabs(double(out.row(3)[3 * x + c]) - patches[(x / 4) % 4][c]));
@@ -314,8 +313,7 @@ void testRenderer() {
     SourceImage src = greyRamp(2, false, false);
     src.linear = ImageF(1, 1);
     for (int c = 0; c < 3; ++c) src.linear.data[c] = color::srgbDecode(0.5f);
-    Renderer r(EditParams{}, cam, nullptr);
-    const Image8 o = r.render(src);
+    const Image8 o = render8(EditParams{}, cam, nullptr, src);
     CHECK(std::abs(int(o.data[0]) - 128) <= 1 && std::abs(int(o.data[1]) - 128) <= 1 && std::abs(int(o.data[2]) - 128) <= 1);
   }
 
@@ -333,8 +331,7 @@ void testRenderer() {
   for (std::size_t v = 0; v < variants.size(); ++v) {
     SourceImage src = greyRamp(512, true, true);
     for (float& f : src.linear.data) f *= 4.f;  // headroom above clip: values to 4.0
-    Renderer r(variants[v], cam, nullptr);
-    const ImageF out = r.renderFloat(src);
+    const ImageF out = renderF(variants[v], cam, nullptr, src);
     bool monotone = true;
     for (int x = 1; x < out.width; ++x) monotone &= luma(out, x) + 1e-4 >= luma(out, x - 1);
     CHECK(monotone);
@@ -1356,13 +1353,11 @@ void testBakedPath() {
 
   for (const SourceImage* src : {&scene, &disp})
     for (const auto& [name, p] : cases) {
-      Renderer r(p, cam, nullptr);
-      const ImageF ref = r.renderFloat(*src, false);
+      const ImageF ref = renderF(p, cam, nullptr, *src, false);
       for (int n : {41, 65}) {
-        const auto lut = r.bake(*src, n);
         FastOptions fo;
         fo.spatial = SpatialQuality::Off;
-        const ImageF got = r.renderBakedFloat(*src, *lut, fo);
+        const ImageF got = renderFrameF(p, cam, nullptr, *src, n, fo);
         CHECK(got.width == ref.width && got.height == ref.height);
         const DeStats d = deltaE(ref, got);
         if (d.mean >= 0.5 || (n == 65 && d.mean >= 0.3))
@@ -1379,12 +1374,10 @@ void testBakedPath() {
     p.straighten = 4.f;
     p.vignette = -50.f;
     p.look = "warm";
-    Renderer r(p, cam, nullptr);
-    const ImageF ref = r.renderFloat(scene, false);
-    const auto lut = r.bake(scene, 65);
+    const ImageF ref = renderF(p, cam, nullptr, scene, false);
     FastOptions fo;
     fo.spatial = SpatialQuality::Off;
-    const ImageF got = r.renderBakedFloat(scene, *lut, fo);
+    const ImageF got = renderFrameF(p, cam, nullptr, scene, 65, fo);
     CHECK(got.width == ref.width && got.height == ref.height);
     CHECK(deltaE(ref, got).mean < 0.5);
   }
@@ -1394,15 +1387,14 @@ void testBakedPath() {
     EditParams p;
     p.look = "warm";
     Renderer r(p, cam, nullptr);
-    const auto lut = r.bake(scene, 33);
     FastOptions fo;
     fo.spatial = SpatialQuality::Off;
-    const ImageF whole = r.renderBakedFloat(scene, *lut, fo);
+    const ImageF whole = renderFrameF(p, cam, nullptr, scene, 33, fo);
     fo.region.outLongEdge = std::max(whole.width, whole.height);
     fo.region.x1 = 1.f;
     fo.region.y1 = 1.f;
     fo.region.x0 = 1e-3f;  // forces the region path
-    const ImageF reg = r.renderBakedFloat(scene, *lut, fo);
+    const ImageF reg = renderFrameF(p, cam, nullptr, scene, 33, fo);
     CHECK(std::abs(reg.width - whole.width) <= 1 && std::abs(reg.height - whole.height) <= 1);
     FastOptions half;
     half.spatial = SpatialQuality::Off;
@@ -1410,7 +1402,7 @@ void testBakedPath() {
     int w = 0, h = 0;
     r.fastSize(scene, half.region, w, h);
     CHECK(w == whole.width / 2 && h == whole.height);
-    const ImageF left = r.renderBakedFloat(scene, *lut, half);
+    const ImageF left = renderFrameF(p, cam, nullptr, scene, 33, half);
     CHECK(left.width == w && left.height == h);
     // pixels of the left half agree with the plain render (cubic sampling at 1:1 vs exact copy)
     double md = 0;

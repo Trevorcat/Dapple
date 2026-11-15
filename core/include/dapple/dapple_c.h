@@ -168,7 +168,7 @@ DAPPLE_API void dapple_session_base_previews_cancel(DappleSession* session);
 
 /* ---- Local adjustments through masks (docs/engine/pipeline-architecture.md section 40). Additive. ----
  * The adjustments travel in the params JSON under "local" ({"v":1,"items":[...]}); every render / export call honours them
- * (DAPPLE_ENGINE=off ignores them). Mask coordinates are the photo's own normalised space (before crop / rotate / straighten / flip).
+ * Mask coordinates are the photo's own normalised space (before crop / rotate / straighten / flip).
  *
  * Raster masks (AI masks, depth): a single-channel 8-bit plane referenced by id from a "raster" component. The store is process-wide
  * (exports, other sessions and the batch previews see the same id), at most 64 planes / 96 MB (oldest dropped first); planes above 1024 px long edge are
@@ -323,7 +323,7 @@ DAPPLE_API int32_t dapple_session_render_frame(DappleSession* session, const cha
                                                const DappleFrameRequest* request, DappleImage* out,
                                                char** analysis_json);
 
-/* Latest-wins cancellation (DAPPLE_ENGINE=full): makes a render / export in flight on this session return early with
+/* Latest-wins cancellation: makes a render / export in flight on this session return early with
  * DAPPLE_ERROR and dapple_last_error() == "cancelled". Lock-free, callable from any thread; a no-op when nothing runs. */
 DAPPLE_API int32_t dapple_session_cancel(DappleSession* session);
 
@@ -359,7 +359,7 @@ DAPPLE_API int32_t dapple_set_repaint_callback(DappleRepaintFn fn, void* user);
  * Costs power only while a finger is down. No-op when no interactive frame was rendered yet. */
 DAPPLE_API int32_t dapple_session_touch_hint(DappleSession* session, int32_t burst_ms);
 
-/* Frame engine diagnostics (DAPPLE_ENGINE: default full; off = the old Renderer path, golden oracle / A/B): {"engine":"off|full","frames":N,
+/* Frame engine diagnostics: {"engine":"full","frames":N,
  * "fullHits":N,"latticeReuse":N,"latticeBake":N,...}; free with dapple_free_string. Additive. */
 DAPPLE_API char* dapple_engine_info_json(void);
 

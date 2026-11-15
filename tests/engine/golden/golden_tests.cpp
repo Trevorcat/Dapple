@@ -1,13 +1,15 @@
 // Golden corpus + hash harness for the engine migration (docs/engine/pipeline-architecture.md 10.1, step a0).
 //
-//   dapple_golden record <corpus.txt>            records the corpus from the CURRENT code (DAPPLE_ENGINE ignored: off)
-//   dapple_golden verify <corpus.txt> [mode...]  mode = off | full (default: both); every frame must hash to the recorded
-//                                                value in every mode (gate B)
-//   dapple_golden selfcheck [film.dfp]           no corpus: the old Renderer path (off) against the engine (full) on THIS machine,
-//                                                bit for bit, plus the engine's one-shot renders against Renderer::render /
-//                                                renderFloat. Runs on any architecture (x86_64, arm64 NEON, the emulator): the
-//                                                recorded corpus is arch-specific, this is not. The film pack is optional
-//                                                (path argument; without it the film scenarios are skipped).
+//   dapple_golden record <corpus.txt>            records the corpus from the CURRENT engine (the old renderer that produced the first
+//                                                recording is gone: re-record only for a deliberate, reviewed change of the pixels)
+//   dapple_golden verify <corpus.txt> [full]     every frame must hash to the recorded value (gate B); the mode word is accepted for
+//                                                the old command line and ignored (there is one renderer)
+//   dapple_golden selfcheck [film.dfp]           no corpus: engine-internal checks on THIS machine that mean something on any architecture
+//                                                (x86_64, arm64 NEON, the emulator), the recorded corpus is arch-specific, these are not:
+//                                                whole frame vs tiled execution (max code 1) (two tile sizes), 8-bit frame == the float frame quantised,
+//                                                exact variant vs baked variant inside the dE2000 budgets, merged-DNG reopen round trip
+//                                                and determinism, the Resize node. The film pack is optional (path argument; without it
+//                                                the film scenarios are skipped).
 //
 // Inputs are synthetic (deterministic integer-hash scenes, no private photos). Each scenario is a short sequence of
 // frames through dapple_session_render_frame on one session, so cache state (lattice reuse, tone tables, the
@@ -20,6 +22,7 @@
 #include "../../deterministic.h"
 #include "../../../core/src/c_api.cpp"
 #include "local_eval.h"
+#include "../../../cli/colour_metrics.h"
 
 #include <chrono>
 #include <algorithm>
@@ -818,24 +821,51 @@ void runCoreApi(std::vector<GoldenHash>& out) {
   {
     Renderer r(p, cam, nullptr);
     r.setToneProxy(&proxy);
-    const Image8 i8 = r.render(src);
+    // the exact variant through the engine (a private session per render), with the proxy as the tone reference
+    auto exact = [&](bool spatial, bool asFloat, Image8& i8, ImageF& f) {
+      engine::EngineSession es;
+      engine::EngineSession::ExactOptions o;
+      o.spatial = spatial;
+      o.hasProxy = true;
+      if (asFloat) o.outFloat = &f;
+      std::string err;
+      if (!es.renderExact(p, r, src, o, i8, &err)) std::fprintf(stderr, "golden: exact render failed: %s\n", err.c_str());
+    };
+    Image8 i8, unused8;
+    ImageF fS, fN, unusedF;
+    exact(true, false, i8, unusedF);
+    exact(true, true, unused8, fS);
+    exact(false, true, unused8, fN);
     Fnv h;
     h.i32(i8.width);
     h.i32(i8.height);
     h.bytes(i8.data.data(), i8.data.size());
     out.push_back({"core/render_rgb8", hex(h.h)});
-    out.push_back({"core/render_float", hashFloat(r.renderFloat(src))});
-    out.push_back({"core/render_float_nospatial", hashFloat(r.renderFloat(src, false))});
+    out.push_back({"core/render_float", hashFloat(fS)});
+    out.push_back({"core/render_float_nospatial", hashFloat(fN)});
     for (int n : {25, 41}) {
-      const auto lut = r.bake(src, n);
       FastOptions fo;
-      out.push_back({"core/baked_float_n" + std::to_string(n), hashFloat(r.renderBakedFloat(src, *lut, fo))});
-      int w, h2;
-      std::uint8_t* px = r.renderBakedRgba(src, *lut, fo, w, h2);
+      // the baked variant: one frame of the engine (tables + executor), float and RGBA8
+      auto frame = [&](bool asFloat, ImageF& f) {
+        engine::EngineSession es;
+        engine::FrameJob job{p, r, src, &proxy, cam, nullptr, {}, {}, {}};
+        job.request.bakeSize = n;
+        job.fastOptions = fo;
+        if (asFloat) job.outFloat = &f;
+        engine::FrameResult res;
+        if (!es.renderFrame(job, res)) std::fprintf(stderr, "golden: baked frame failed: %s\n", res.error.c_str());
+        return res;
+      };
+      ImageF bf;
+      frame(true, bf);
+      out.push_back({"core/baked_float_n" + std::to_string(n), hashFloat(bf)});
+      ImageF none;
+      engine::FrameResult fr = frame(false, none);
       Fnv hh;
-      hh.bytes(px, std::size_t(w) * h2 * 4);
-      std::free(px);
+      if (fr.rgba) hh.bytes(fr.rgba, std::size_t(fr.w) * fr.h * 4);
+      std::free(fr.rgba);
       out.push_back({"core/baked_rgba_n" + std::to_string(n), hex(hh.h)});
+      const auto lut = r.bake(src, n);
       Fnv tl;
       tl.bytes(lut->tone.data(), lut->tone.size() * 4);
       tl.bytes(lut->rgb.data(), lut->rgb.size() * 4);
@@ -874,7 +904,7 @@ std::vector<GoldenHash> runAll(bool haveFilm) {
 
 }  // namespace
 
-// ---- selfcheck: off vs full on the same machine ---------------------------------------------------------------------------------------
+// ---- selfcheck: engine-internal consistency on the same machine ----------------------------------------------------------------------
 bool sameImageF(const ImageF& a, const ImageF& b) {
   return a.width == b.width && a.height == b.height &&
          std::memcmp(a.data.data(), b.data.data(), std::size_t(a.width) * a.height * 3 * sizeof(float)) == 0;
@@ -917,19 +947,76 @@ int selfcheckOneShot(bool haveFilm) {
     cases.push_back({"film-blend", p});
   }
   for (const Case& c : cases) {
-    const Renderer r(c.p, cam, nullptr);
-    const Image8 want = r.render(src);
-    Image8 got;
     std::string err;
-    bool ok = engine::renderImage8(c.p, cam, nullptr, src, got, &err) && got.width == want.width && got.height == want.height &&
-              got.data == want.data;
-    std::printf("  one-shot Image8 %-12s %s %s\n", c.name, ok ? "identical" : "DIFFERENT", err.c_str());
+    // 1. the 8-bit frame is the float frame quantised (the engine's 8-bit target and its float target agree)
+    Image8 got;
+    ImageF gotF;
+    bool ok = engine::renderImage8(c.p, cam, nullptr, src, got, &err) && engine::renderImageF(c.p, cam, nullptr, src, true, gotF, &err) &&
+              got.width == gotF.width && got.height == gotF.height && got.data.size() == gotF.data.size();
+    for (std::size_t i = 0; ok && i < got.data.size(); ++i) ok = got.data[i] == std::uint8_t(gotF.data[i] * 255.f + 0.5f);
+    std::printf("  8-bit frame == float frame quantised  %-12s %s %s\n", c.name, ok ? "identical" : "DIFFERENT", err.c_str());
     if (!ok) ++bad;
-    for (const bool spatial : {false, true}) {
-      const ImageF wantF = r.renderFloat(src, spatial);
-      ImageF gotF;
-      ok = engine::renderImageF(c.p, cam, nullptr, src, spatial, gotF, &err) && sameImageF(gotF, wantF);
-      std::printf("  one-shot float  %-12s spatial=%d %s %s\n", c.name, spatial ? 1 : 0, ok ? "identical" : "DIFFERENT", err.c_str());
+    // 2. whole-frame execution == tiled execution, at two tile sizes that divide neither side (the planner's halo / band logic is what is under test).
+    //    The tiles sum the frame-global statistics in a different order than the whole frame, so the budget is that of exec_tests: no code off by more
+    //    than one, mean dE2000 < 0.01
+    for (const int tile : {96, 160}) {
+      Renderer r(c.p, cam, nullptr);
+      engine::EngineSession es;
+      engine::EngineSession::ExactOptions o;
+      o.mode = engine::ExecMode::TiledExport;
+      o.tile = tile;
+      Image8 tiled;
+      ok = es.renderExact(c.p, r, src, o, tiled, &err) && tiled.width == got.width && tiled.height == got.height && tiled.data.size() == got.data.size();
+      int maxCode = 0;
+      double meanDe = 0;
+      if (ok) {
+        std::size_t differing = 0;
+        for (std::size_t i = 0; i < got.data.size(); i += 3) {
+          const float a[3] = {got.data[i] / 255.f, got.data[i + 1] / 255.f, got.data[i + 2] / 255.f};
+          const float b[3] = {tiled.data[i] / 255.f, tiled.data[i + 1] / 255.f, tiled.data[i + 2] / 255.f};
+          bool d = false;
+          for (int c3 = 0; c3 < 3; ++c3) {
+            maxCode = std::max(maxCode, std::abs(int(got.data[i + c3]) - int(tiled.data[i + c3])));
+            d |= got.data[i + c3] != tiled.data[i + c3];
+          }
+          if (d) {
+            ++differing;
+            meanDe += metrics::deltaE2000(metrics::srgbToLab(a), metrics::srgbToLab(b));
+          }
+        }
+        meanDe /= double(got.data.size() / 3);
+        ok = maxCode <= 1 && meanDe < 0.01;
+      }
+      std::printf("  whole vs tiled (%3d px)  %-12s max code %d, mean dE2000 %.5f %s %s\n", tile, c.name, maxCode, meanDe, ok ? "ok" : "DIFFERENT", err.c_str());
+      if (!ok) ++bad;
+    }
+    // 3. the exact variant against the baked variant (lattice 65, no neighbourhood stages) inside the budget of core_tests: mean dE2000 < 0.3
+    {
+      EditParams np = c.p;
+      np.clarity = np.texture = np.dehaze = np.grain = 0;
+      np.sharpen = np.nrLuma = np.nrColor = 0;
+      ImageF ex, bk;
+      ok = engine::renderImageF(np, cam, nullptr, src, false, ex, &err);
+      {
+        Renderer r(np, cam, nullptr);
+        engine::EngineSession es;
+        engine::FrameJob job{np, r, src, nullptr, cam, nullptr, {}, {}, {}};
+        job.request.bakeSize = 65;
+        job.fastOptions.spatial = SpatialQuality::Off;
+        job.outFloat = &bk;
+        engine::FrameResult res;
+        ok = ok && es.renderFrame(job, res);
+        if (!res.error.empty()) err = res.error;
+      }
+      double mean = 0;
+      ok = ok && ex.width == bk.width && ex.height == bk.height && !ex.data.empty();
+      if (ok) {
+        const std::size_t px = ex.data.size() / 3;
+        for (std::size_t i = 0; i < px; ++i) mean += metrics::deltaE2000(metrics::srgbToLab(&ex.data[3 * i]), metrics::srgbToLab(&bk.data[3 * i]));
+        mean /= double(px);
+        ok = mean < 0.3;
+      }
+      std::printf("  exact vs baked 65^3  %-12s mean dE2000 %.4f %s %s\n", c.name, mean, ok ? "within budget" : "OVER BUDGET", err.c_str());
       if (!ok) ++bad;
     }
   }
@@ -947,7 +1034,7 @@ int selfcheckOneShot(bool haveFilm) {
 
 // A merged (HDR / panorama) result leaves the app as a linear DNG and is reopened by the normal session path. The merge itself needs OpenCV
 // (merge_tests covers it); this part does not: write a synthetic linear DNG exactly like dapple_session_save_linear does, reopen it with
-// dapple_session_open, and render it in off and full mode: the two must agree bit for bit, and the pixels must survive the round trip.
+// dapple_session_open, and render it in two fresh sessions: the two must agree bit for bit, and the pixels must survive the round trip.
 int selfcheckMergedDng() {
   int bad = 0;
   const SourceImage src = makeScene(480, 320, 5, true);
@@ -959,10 +1046,9 @@ int selfcheckMergedDng() {
   const std::string pj = toJson(base());
   std::string hashes[2];
   for (int m = 0; m < 2; ++m) {
-    dapple::engine::setModeOverride(m);
     DappleSession* s = dapple_session_open(path.string().c_str(), 0, 0);
     if (!s) {
-      std::printf("  merged DNG reopen failed (mode %d): %s\n", m, dapple_last_error());
+      std::printf("  merged DNG reopen failed (session %d): %s\n", m, dapple_last_error());
       ++bad;
       continue;
     }
@@ -994,7 +1080,7 @@ int selfcheckMergedDng() {
     DappleImage im{};
     const int rc = dapple_session_render_frame(s, pj.c_str(), nullptr, nullptr, &im, nullptr);
     if (rc != DAPPLE_OK || !im.rgba) {
-      std::printf("  merged DNG render failed (mode %d): %s\n", m, dapple_last_error());
+      std::printf("  merged DNG render failed (session %d): %s\n", m, dapple_last_error());
       ++bad;
     } else {
       Fnv h;
@@ -1006,36 +1092,19 @@ int selfcheckMergedDng() {
     }
     dapple_session_close(s);
   }
-  dapple::engine::setModeOverride(-1);
   std::error_code ec;
   std::filesystem::remove(path, ec);
   const bool same = !hashes[0].empty() && hashes[0] == hashes[1];
-  std::printf("  merged DNG render off %s full %s %s\n", hashes[0].c_str(), hashes[1].c_str(), same ? "identical" : "DIFFERENT");
+  std::printf("  merged DNG render, session 1 %s session 2 %s %s\n", hashes[0].c_str(), hashes[1].c_str(), same ? "identical" : "DIFFERENT");
   if (!same) ++bad;
   return bad;
 }
 
 int selfcheck(bool haveFilm) {
-  const auto runMode = [&](int m) {
-    dapple::engine::setModeOverride(m);
-    return runAll(haveFilm);
-  };
-  const auto off = runMode(0);
-  const auto full = runMode(1);
-  dapple::engine::setModeOverride(-1);
   int bad = 0;
-  if (off.size() != full.size()) {
-    std::printf("frame count off %zu vs full %zu\n", off.size(), full.size());
-    ++bad;
-  }
-  for (std::size_t i = 0; i < std::min(off.size(), full.size()); ++i)
-    if (off[i].name != full[i].name || (off[i].hash != full[i].hash && off[i].name.rfind("hdr/", 0) != 0 && off[i].name.rfind("modern/", 0) != 0 && off[i].name.rfind("local/", 0) != 0)) {  // hdr/, modern/, local/: engine-only parameters
-      std::printf("MISMATCH %s: off %s full %s\n", off[i].name.c_str(), off[i].hash.c_str(), full[i].hash.c_str());
-      ++bad;
-    }
-  std::printf("selfcheck %s: %zu frames off vs full, %d mismatches\n", platformTag().c_str(), off.size(), bad);
+  std::printf("selfcheck %s\n", platformTag().c_str());
   const int oneshot = selfcheckOneShot(haveFilm);
-  std::printf("selfcheck one-shot: %d differences\n", oneshot);
+  std::printf("selfcheck engine consistency: %d differences\n", oneshot);
   bad += oneshot;
   const int merged = selfcheckMergedDng();
   std::printf("selfcheck merged DNG: %d differences\n", merged);
@@ -1201,7 +1270,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (argc < 3) {
-    std::fputs("usage: dapple_golden record|verify <corpus.txt> [off|full ...]\n", stderr);
+    std::fputs("usage: dapple_golden record|verify <corpus.txt> [full] | selfcheck [film.dfp] | seqcheck | diff <dirA> <dirB>\n", stderr);
     return 2;
   }
   const std::string cmd = argv[1], file = argv[2];
@@ -1214,7 +1283,6 @@ int main(int argc, char** argv) {
   if (!haveFilm) std::fputs("warning: film pack not loaded, film scenarios skipped\n", stderr);
 
   if (cmd == "record") {
-    dapple::engine::setModeOverride(0);
     const auto r1 = runAll(haveFilm);
     const auto r2 = runAll(haveFilm);  // a second run in a fresh state must agree (determinism of the corpus itself)
     int bad = 0;
@@ -1225,7 +1293,7 @@ int main(int argc, char** argv) {
       }
     if (bad) return 1;
     std::ofstream f(file);
-    f << "# dapple golden corpus (docs/engine/pipeline-architecture.md 10.1). Recorded from the unchanged renderer.\n";
+    f << "# dapple golden corpus (docs/engine/pipeline-architecture.md 10.1). First recorded from the old renderer, which the engine reproduced bit for bit.\n";
     f << "# platform " << platformTag() << (haveFilm ? " film=1" : " film=0") << "\n";
     for (const GoldenHash& r : r1) f << r.name << " " << r.hash << "\n";
     std::printf("recorded %zu hashes to %s (%s)\n", r1.size(), file.c_str(), platformTag().c_str());
@@ -1253,16 +1321,11 @@ int main(int argc, char** argv) {
       std::printf("corpus recorded on '%s', this machine is '%s': skipped\n", platform.c_str(), have.c_str());
       return 77;
     }
-    std::vector<std::string> modes;
-    for (int i = 3; i < argc; ++i) modes.push_back(argv[i]);
-    if (modes.empty()) modes = {"off", "full"};
     int failures = 0;
-    for (const std::string& m : modes) {
-      dapple::engine::setModeOverride(m == "off" ? 0 : 1);
+    for (const std::string m : {"full"}) {  // the mode words of the old command line (off | full) are accepted and ignored: one renderer
       const auto r = runAll(haveFilm);
       int bad = 0;
       for (const GoldenHash& x : r) {
-        if (m == "off" && (x.name.rfind("hdr/", 0) == 0 || x.name.rfind("modern/", 0) == 0 || x.name.rfind("local/", 0) == 0)) continue;  // engine-only parameter: the old Renderer path ignores it (record: append the full-mode hashes by hand)
         const auto it = want.find(x.name);
         if (it == want.end()) {
           std::printf("[%s] NEW (not in corpus) %s %s\n", m.c_str(), x.name.c_str(), x.hash.c_str());

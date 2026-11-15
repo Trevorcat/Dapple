@@ -25,7 +25,6 @@ namespace dapple::engine {
 
 namespace {
 
-std::atomic<int> g_override{-1};
 std::atomic<std::uint64_t> g_nextId{1};
 
 struct Totals {
@@ -40,22 +39,6 @@ Totals& totals() {
 
 using Clock = std::chrono::steady_clock;
 double msSince(Clock::time_point t0) { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
-
-Mode envMode() {
-  static const Mode m = [] {
-    // Default: Full. Override to the old Renderer path (the golden oracle / A/B switch): env DAPPLE_ENGINE=off|0, or on Android
-    // the system property debug.dapple.engine (read when the env var is unset).
-    const char* e = std::getenv("DAPPLE_ENGINE");
-#if defined(__ANDROID__)
-    char propBuf[PROP_VALUE_MAX] = {0};
-    if ((!e || !*e) && __system_property_get("debug.dapple.engine", propBuf) > 0 && propBuf[0]) e = propBuf;
-#endif
-    if (!e || !*e) return Mode::Full;
-    if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return Mode::Off;
-    return Mode::Full;  // "full", "1", anything else (the retired "legacy" / "tables" modes included)
-  }();
-  return m;
-}
 
 Hash128 combine(const Hash128& a, const Hash128& b) {
   Hasher h;
@@ -88,18 +71,6 @@ GpuCounters gpuCounters() {
   const Totals& t = totals();
   return {t.gpuFrames.load(), t.gpuFallbacks.load(), t.gpuTransients.load(), t.gpuLost.load(), t.gpuDemotions.load()};
 }
-
-bool engineInUse() {
-  if (mode() != Mode::Off) return true;
-  GpuProvider* p = gpuProvider();
-  return p && p->enabled();
-}
-
-Mode mode() {
-  const int o = g_override.load(std::memory_order_relaxed);
-  return o >= 0 ? Mode(o) : envMode();
-}
-void setModeOverride(int m) { g_override.store(m, std::memory_order_relaxed); }
 
 // ---- table node evaluators: thin wrappers over the Renderer::bake pieces -------------------------------------------------
 
@@ -488,7 +459,7 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     out.error = "out of memory";
     return -1;
   }
-  return 1;  // Unsupported (film stage failed ...): the legacy renderer takes the frame
+  return 1;  // Unsupported (film stage failed ...): the caller reports an explicit error, there is no second renderer
 }
 
 int EngineSession::renderExactGpu(const EditParams& params, const Renderer& renderer, const SourceImage& src, const ExactOptions& opt, Image8& out,
@@ -769,7 +740,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
 
   std::shared_ptr<const BakedLut> bl;
   if (lattice) {
-    if (ResultCache::Entry* e = cache_.find(NodeType::LegacyRender, combine(tk.tone, tk.lattice))) {
+    if (ResultCache::Entry* e = cache_.find(NodeType::AssembledBake, combine(tk.tone, tk.lattice))) {
       bl = as<BakedLut>(e->payload);
       out.bake = FrameResult::Bake::FullHit;
     }
@@ -829,9 +800,9 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
     ae.ref = latticeKey;
     ae.payload = nb;
     ae.bytes = nb->rgb.size() * 4 + nb->tone.size() * 4;
-    cache_.put(NodeType::LegacyRender, std::move(ae));
+    cache_.put(NodeType::AssembledBake, std::move(ae));
     // a lattice lives exactly as long as a retained bake refers to it (the old bakes[3] kept it inside each bake)
-    const auto& live = cache_.entries(NodeType::LegacyRender);
+    const auto& live = cache_.entries(NodeType::AssembledBake);
     cache_.eraseIf(NodeType::ColourLattice, [&](const ResultCache::Entry& le) {
       for (const auto& a : live)
         if (a.ref == le.key) return false;
@@ -902,7 +873,7 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   in.ctx.gainFn = &gainOf;
   in.ctx.gainUser = &gainCtx;
   const ParamSet ps = ParamSet::make(std::move(in));
-  graph_ = GraphBuilder::build(ps, GraphDetail::Legacy);
+  graph_ = GraphBuilder::build(ps, GraphDetail::Tables);
   const ValidationResult v = graph_.validate();
   if (!v.ok) {
     out.error = "engine graph: " + v.error;
@@ -1177,7 +1148,7 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
   fj.request = in.frame;
   fj.fastOptions.spatial = SpatialQuality::Full;
   const ParamSet ps = ParamSet::make(std::move(in));
-  graph_ = GraphBuilder::build(ps, GraphDetail::Legacy);
+  graph_ = GraphBuilder::build(ps, GraphDetail::Tables);
   if (const ValidationResult v = graph_.validate(); !v.ok) return bail(-1, "engine graph: " + v.error);
   graph_.computeKeys(ps);
   FrameResult fr;
@@ -1281,22 +1252,17 @@ bool renderImageF(const EditParams& params, const CameraProfile& camera, const L
 std::string infoJson() {
   const Totals& t = totals();
   const BakeCounters& c = bakeCounters();
-  const Mode m = mode();
-  std::string j = "{\"engine\":\"";
-  j += m == Mode::Off ? "off" : "full";
-  j += "\",\"frames\":" + std::to_string(t.frames.load());
+  std::string j = "{\"engine\":\"full\",\"frames\":" + std::to_string(t.frames.load());
   j += ",\"fullHits\":" + std::to_string(t.fullHits.load());
   j += ",\"latticeReuse\":" + std::to_string(t.latticeReuse.load());
   j += ",\"latticeBake\":" + std::to_string(t.latticeBake.load());
-  if (m == Mode::Full) {
-    const std::uint64_t n = t.planned.load();
-    j += ",\"planned\":" + std::to_string(n);
-    j += ",\"planUsPerFrame\":" + std::to_string(n ? t.planUs.load() / n : 0);
-    j += ",\"execUsPerFrame\":" + std::to_string(n ? t.execUs.load() / n : 0);
-    j += ",\"sweeps\":" + std::to_string(t.sweeps.load()) + ",\"tiles\":" + std::to_string(t.tiles.load());
-    j += ",\"solveHits\":" + std::to_string(t.solveHits.load()) + ",\"cancelled\":" + std::to_string(t.cancelled.load());
-    j += ",\"fallbacks\":" + std::to_string(t.fallbacks.load());
-  }
+  const std::uint64_t n = t.planned.load();
+  j += ",\"planned\":" + std::to_string(n);
+  j += ",\"planUsPerFrame\":" + std::to_string(n ? t.planUs.load() / n : 0);
+  j += ",\"execUsPerFrame\":" + std::to_string(n ? t.execUs.load() / n : 0);
+  j += ",\"sweeps\":" + std::to_string(t.sweeps.load()) + ",\"tiles\":" + std::to_string(t.tiles.load());
+  j += ",\"solveHits\":" + std::to_string(t.solveHits.load()) + ",\"cancelled\":" + std::to_string(t.cancelled.load());
+  j += ",\"fallbacks\":" + std::to_string(t.fallbacks.load());
   j += ",\"bakeLatticeEvaluated\":" + std::to_string(c.latticeEvaluated.load());
   j += ",\"bakeLatticeReused\":" + std::to_string(c.latticeReused.load());
   j += ",\"bakeToneTables\":" + std::to_string(c.toneTables.load());

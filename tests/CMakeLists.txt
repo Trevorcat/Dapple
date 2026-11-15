@@ -130,13 +130,11 @@ if(MSVC)
 else()
   target_compile_options(dapple_golden PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-foreach(mode off full)
-  add_test(NAME engine.golden_${mode}
-           COMMAND dapple_golden verify ${PROJECT_SOURCE_DIR}/tests/engine/golden/corpus.txt ${mode}
-           WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-  set_tests_properties(engine.golden_${mode} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
-endforeach()
-# off (old Renderer) vs full (engine) on this machine, any architecture; also built for Android (arm64 NEON / x86_64 emulator)
+add_test(NAME engine.golden_full
+         COMMAND dapple_golden verify ${PROJECT_SOURCE_DIR}/tests/engine/golden/corpus.txt full
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(engine.golden_full PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+# engine-internal consistency on this machine, any architecture (whole vs tiled, 8-bit vs float, exact vs baked, merged DNG); also built for Android (arm64 NEON / x86_64 emulator)
 add_test(NAME engine.selfcheck COMMAND dapple_golden selfcheck WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 # cached film exposure match against the uncached one: every settled frame bit identical (pipeline-architecture.md 26.2)
 add_test(NAME engine.match_cache_seq COMMAND dapple_golden seqcheck WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -355,7 +353,7 @@ if(MSVC)
 else()
   target_compile_options(dapple_modern_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-set(_modern_ids identity off json ends fog highkey lowkey gap midgrey hue skin monotonic tiles)
+set(_modern_ids identity json ends fog highkey lowkey gap midgrey hue skin monotonic tiles)
 if(TARGET dapple_gpu)
   target_link_libraries(dapple_modern_tests PRIVATE dapple_gpu)
   target_include_directories(dapple_modern_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src)
@@ -595,7 +593,6 @@ set(_dapple_heavy
   engine.conformance
   engine.exec_tiles
   engine.golden_full
-  engine.golden_off
   engine.gpu_box
   engine.gpu_box_swiftshader
   engine.gpu_external

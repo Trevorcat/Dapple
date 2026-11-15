@@ -1,8 +1,8 @@
-== default_final [legacy]
+== default_final [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
-n3 LegacyRender <- n0 n2 n1 [frame]
+n3 AssembledBake <- n0 n2 n1 [frame]
 == default_final [full]
 n0 Source
 n1 Resize <- n0
@@ -13,12 +13,12 @@ n5 ToneColour <- n4 n3 n2
 n6 NRChroma <- n5
 n7 Detail <- n6
 n8 Pack8 <- n7 [frame]
-== final_analysis [legacy]
+== final_analysis [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
 n3 Analysis [analysis]
-n4 LegacyRender <- n0 n2 n1 [frame]
+n4 AssembledBake <- n0 n2 n1 [frame]
 == final_analysis [full]
 n0 Source
 n1 Resize <- n0
@@ -30,11 +30,11 @@ n6 ToneColour <- n5 n3 n2
 n7 NRChroma <- n6
 n8 Detail <- n7
 n9 Pack8 <- n8 [frame]
-== interactive [legacy]
+== interactive [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
-n3 LegacyRender <- n0 n2 n1 [frame]
+n3 AssembledBake <- n0 n2 n1 [frame]
 == interactive [full]
 n0 Source
 n1 Resize <- n0
@@ -45,13 +45,13 @@ n5 ToneColour <- n4 n3 n2
 n6 NRChroma <- n5
 n7 Detail <- n6
 n8 Pack8 <- n7 [frame]
-== interactive_analysis_fast [legacy]
+== interactive_analysis_fast [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneAnalysisPre <- n1~
 n3 ToneTable
 n4 Analysis <- n2~ [analysis]
-n5 LegacyRender <- n0 n3 n1 [frame]
+n5 AssembledBake <- n0 n3 n1 [frame]
 == interactive_analysis_fast [full]
 n0 Source
 n1 Resize <- n0
@@ -64,13 +64,13 @@ n7 ToneColour <- n6 n4 n2
 n8 NRChroma <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== tone_move_interactive [legacy]
+== tone_move_interactive [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneAnalysisPre <- n1~
 n3 ToneTable <- n2
 n4 Analysis <- n2~ [analysis]
-n5 LegacyRender <- n0 n3 n1 [frame]
+n5 AssembledBake <- n0 n3 n1 [frame]
 == tone_move_interactive [full]
 n0 Source
 n1 Resize <- n0
@@ -83,13 +83,13 @@ n7 ToneColour <- n6 n4 n2
 n8 NRChroma <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== tone_move_final [legacy]
+== tone_move_final [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneAnalysisPre <- n1~
 n3 ToneTable <- n2
 n4 Analysis <- n2~ [analysis]
-n5 LegacyRender <- n0 n3 n1 [frame]
+n5 AssembledBake <- n0 n3 n1 [frame]
 == tone_move_final [full]
 n0 Source
 n1 Resize <- n0
@@ -102,9 +102,9 @@ n7 ToneColour <- n6 n4 n2
 n8 NRChroma <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== exact [legacy]
+== exact [tables]
 n0 Source
-n1 LegacyRender <- n0 [frame]
+n1 AssembledBake <- n0 [frame]
 n2 Analysis [analysis]
 == exact [full]
 n0 Source
@@ -115,12 +115,12 @@ n4 Analysis [analysis]
 n5 NRChroma <- n3
 n6 Detail <- n5
 n7 Pack8 <- n6 [frame]
-== overflow_gpu [legacy]
+== overflow_gpu [tables]
 n0 Source
 n1 ColourLattice
 n2 LatticeOverflow <- n1~
 n3 ToneTable
-n4 LegacyRender <- n0 n3 n1 n2 [frame]
+n4 AssembledBake <- n0 n3 n1 n2 [frame]
 == overflow_gpu [full]
 n0 Source
 n1 Resize <- n0
@@ -132,11 +132,11 @@ n6 ToneColour <- n5 n4 n2 n3
 n7 NRChroma <- n6
 n8 Detail <- n7
 n9 Pack8 <- n8 [frame]
-== geometry_vignette [legacy]
+== geometry_vignette [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
-n3 LegacyRender <- n0 n2 n1 [frame]
+n3 AssembledBake <- n0 n2 n1 [frame]
 == geometry_vignette [full]
 n0 Source
 n1 Resize <- n0
@@ -149,11 +149,11 @@ n7 Vignette <- n6
 n8 NRChroma <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== region [legacy]
+== region [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
-n3 LegacyRender <- n0 n2 n1 [frame]
+n3 AssembledBake <- n0 n2 n1 [frame]
 == region [full]
 n0 Source
 n1 Resize <- n0
@@ -165,11 +165,11 @@ n6 ToneColour <- n5 n4 n3
 n7 NRChroma <- n6
 n8 Detail <- n7
 n9 Pack8 <- n8 [frame]
-== detail_all_final [legacy]
+== detail_all_final [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
-n3 LegacyRender <- n0 n2 n1 [frame]
+n3 AssembledBake <- n0 n2 n1 [frame]
 == detail_all_final [full]
 n0 Source
 n1 Resize <- n0
@@ -183,11 +183,11 @@ n8 Dehaze <- n7
 n9 Detail <- n8
 n10 Grain <- n9
 n11 Pack8 <- n10 [frame]
-== detail_all_interactive [legacy]
+== detail_all_interactive [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
-n3 LegacyRender <- n0 n2 n1 [frame]
+n3 AssembledBake <- n0 n2 n1 [frame]
 == detail_all_interactive [full]
 n0 Source
 n1 Resize <- n0
@@ -200,11 +200,11 @@ n7 NRChroma <- n6
 n8 Dehaze <- n7
 n9 Detail <- n8
 n10 Pack8 <- n9 [frame]
-== detail_interactive_no_noise [legacy]
+== detail_interactive_no_noise [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
-n3 LegacyRender <- n0 n2 n1 [frame]
+n3 AssembledBake <- n0 n2 n1 [frame]
 == detail_interactive_no_noise [full]
 n0 Source
 n1 Resize <- n0
@@ -215,11 +215,11 @@ n5 ToneColour <- n4 n3 n2
 n6 Dehaze <- n5
 n7 Detail <- n6
 n8 Pack8 <- n7 [frame]
-== grain_dragged_interactive [legacy]
+== grain_dragged_interactive [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
-n3 LegacyRender <- n0 n2 n1 [frame]
+n3 AssembledBake <- n0 n2 n1 [frame]
 == grain_dragged_interactive [full]
 n0 Source
 n1 Resize <- n0
@@ -233,11 +233,11 @@ n8 Dehaze <- n7
 n9 Detail <- n8
 n10 Grain <- n9
 n11 Pack8 <- n10 [frame]
-== jpeg_source [legacy]
+== jpeg_source [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
-n3 LegacyRender <- n0 n2 n1 [frame]
+n3 AssembledBake <- n0 n2 n1 [frame]
 == jpeg_source [full]
 n0 Source
 n1 Resize <- n0
@@ -246,12 +246,12 @@ n3 ToneTable
 n4 Gain <- n1
 n5 ToneColour <- n4 n3 n2
 n6 Pack8 <- n5 [frame]
-== film_strength_100 [legacy]
+== film_strength_100 [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
 n3 Analysis [analysis]
-n4 LegacyRender <- n0 n2 n1 [frame]
+n4 AssembledBake <- n0 n2 n1 [frame]
 == film_strength_100 [full]
 n0 Source
 n1 Resize <- n0
@@ -263,12 +263,12 @@ n6 DisplayStages <- n5
 n7 NRChroma <- n6
 n8 Detail <- n7
 n9 Pack8 <- n8 [frame]
-== film_strength_50 [legacy]
+== film_strength_50 [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
 n3 Analysis [analysis]
-n4 LegacyRender <- n0 n2 n1 [frame]
+n4 AssembledBake <- n0 n2 n1 [frame]
 == film_strength_50 [full]
 n0 Source
 n1 Resize <- n0
@@ -283,12 +283,12 @@ n9 Blend <- n6 n8
 n10 NRChroma <- n9
 n11 Detail <- n10
 n12 Pack8 <- n11 [frame]
-== film_strength_0 [legacy]
+== film_strength_0 [tables]
 n0 Source
 n1 ColourLattice
 n2 ToneTable
 n3 Analysis [analysis]
-n4 LegacyRender <- n0 n2 n1 [frame]
+n4 AssembledBake <- n0 n2 n1 [frame]
 == film_strength_0 [full]
 n0 Source
 n1 Resize <- n0

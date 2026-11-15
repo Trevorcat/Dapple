@@ -93,7 +93,7 @@ struct ExecEnv {
 class CpuExecutor {
  public:
   // Runs everything but the HostTable stage (the session evaluated the tables before). Ok, Cancelled, Unsupported (e.g. the
-  // film stage failed: the caller renders the frame with the legacy renderer), OutOfMemory.
+  // film stage failed: the frame fails with an explicit engine error), OutOfMemory.
   static Status run(const Plan& plan, ExecEnv& env, ExecStats* stats = nullptr);
 };
 

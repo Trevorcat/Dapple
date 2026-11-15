@@ -442,7 +442,7 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
     }
     r.film = &r.filmScratch.get(r.W, r.H);
     r.auxWindow(0, 0, r.W, r.H);  // local adjustments: the film input pass writes the stage-W amounts of the whole frame
-    if (!env.fk.runFilm(*r.film, r.auxPlanes ? &r.aux : nullptr)) return Status::Unsupported;  // the caller renders the frame with the legacy renderer
+    if (!env.fk.runFilm(*r.film, r.auxPlanes ? &r.aux : nullptr)) return Status::Unsupported;  // the frame fails with an explicit engine error
     if (r.auxPlanes && !r.single) {  // the sweeps size the amount planes per work window: keep the whole frame's apart
       r.filmAuxAt = r.aux;
       r.filmAux.assign(r.auxBuf.begin(), r.auxBuf.begin() + std::ptrdiff_t(r.aux.plane * std::size_t(r.auxPlanes)));

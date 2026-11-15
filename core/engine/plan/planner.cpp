@@ -105,9 +105,9 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
       case NodeType::LocalDetail:
       case NodeType::Grain: windows.push_back(&n); break;
       case NodeType::Pack8: nPack = &n; break;
-      case NodeType::LegacyRender:
+      case NodeType::AssembledBake:
         p.unsupported = true;
-        p.why = "LegacyRender super-node has no CPU plan (use the Full graph)";
+        p.why = "AssembledBake super-node has no CPU plan (use the Full graph)";
         return p;
       default: break;
     }

@@ -17,7 +17,9 @@
 
 namespace dapple {
 
-// CPU reference implementation of the develop pipeline:
+// The per-pixel kernels of the develop pipeline (PointOp, the curves, the lattice and tone-table bakes, the frame plan), resolved from one
+// EditParams. Frames are not rendered here: the engine (core/engine: graph, planner, CpuExecutor / GpuExecutor) runs these kernels as nodes
+// (FrameKernels). The pipeline they implement:
 //
 //   linear ProPhoto (scene) -> white balance -> exposure -> tone (log domain)
 //   -> base shoulder curve -> OKLab colour (vibrance/sat/HSL/grading)
@@ -25,8 +27,7 @@ namespace dapple {
 //   -> noise reduction -> dehaze -> clarity/texture/sharpen -> grain -> 8 bit
 //   (geometry - rotate, straighten, crop, flip - is a resampling front end of the first stage)
 //
-// The GPU implementations for Android/iOS must match this output; it is the
-// ground truth used by regression tests.
+// The GPU executor must match the CPU executor's output; the recorded golden corpus (tests/engine/golden) is the ground truth.
 // ---- interactive (baked) path ----------------------------------------------------------------------
 //
 // All point-wise stages (white balance gain and exposure are applied outside; then tone, colour, style,
@@ -91,8 +92,6 @@ class Renderer {
   // Widens the limits of the tonal-class move (EditParams::toneTarget); > 1 for previews.
   void setToneReach(float reach) { toneReach_ = reach; }
 
-  Image8 render(const SourceImage& source) const;
-
   // White balance x exposure gain of the Gain node (what the film folds into its input matrix; engine SessionCtx::gainFn).
   static void inputGain(const EditParams& params, const CameraProfile& camera, bool sceneReferred, float out[3]);
   static void whiteBalanceGain(const EditParams& clamped, float out[3]);
@@ -153,32 +152,20 @@ class Renderer {
   // The tonal analysis of the render: pre.analysis when available, else the exact one.
   ToneAnalysis bakeAnalysis(const SourceImage& source, const TonePre& pre) const;
 
-  // Read-only description of what renderBakedRgba() would do for a source of srcW x srcH (GPU backend, tests).
+  // Read-only description of what a baked frame does for a source of srcW x srcH (the planner, the GPU backend, tests).
   FramePlan framePlan(int srcW, int srcH, bool sceneReferred, const FastOptions& opt) const;
   // Second, coarser lattice over [0, maxV] (same layout as BakedLut::rgb, n^3 * 3) for tone-mapped colours that lie
   // beyond the range of BakedLut; `base` supplies the tone analysis so nothing is re-analysed. Empty when unsupported.
   std::vector<float> bakeOverflow(const SourceImage& source, const BakedLut& base, int n, float maxV) const;
 
-  // Output size of render*() for `source` (geometry / region applied).
+  // Output size of a frame of `source` (geometry / region applied).
   void fastSize(const SourceImage& source, const RenderRegion& region, int& w, int& h) const;
-
-  // Renders through a lattice from bake(). Returns a malloc()ed RGBA8 buffer (alpha 255) of
-  // fastSize() pixels; the caller free()s it. Null on failure.
-  std::uint8_t* renderBakedRgba(const SourceImage& source, const BakedLut& lut, const FastOptions& opt, int& w,
-                                int& h) const;
-  // Same, float sRGB-encoded 0..1 (tests, analysis).
-  ImageF renderBakedFloat(const SourceImage& source, const BakedLut& lut, const FastOptions& opt) const;
-
-  // Same as render() but keeps float sRGB-encoded values (0..1), for tests. The output size
-  // follows the geometry (crop / rotate / straighten). `spatial` = false skips the neighbourhood
-  // stages (noise reduction, dehaze, clarity, texture, sharpening, grain), used by the tone analysis.
-  ImageF renderFloat(const SourceImage& source, bool spatial = true) const;
 
   // Per-channel linear gain the pipeline applies to the source before tone mapping / the film (white balance x develop
   // exposure x the camera's baseline exposure), for scene statistics.
   void sceneGain(const SourceImage& source, float gain[3]) const;
   // EditParams::hdr resolved for this source (field built / cached, parameters): leaves `out` inactive when the strength is 0, the source is
-  // display-referred or a film stock is selected. Engine only: the old Renderer paths ignore the parameter.
+  // display-referred or a film stock is selected.
   // `tone`: the frame's 1D tone table (BakedLut::tone); the range the curve shows well is derived from it (null: 8 EV).
   void hdrBind(const SourceImage& source, FramePlan::Hdr& out, const std::vector<float>* tone = nullptr) const;
   // The post-gain scene luminance that a modern rendering (EditParams::filmStock = modern_*) shows as display white (1 = not modern or no
@@ -205,8 +192,8 @@ class Renderer {
   struct PointOp;
   PointOp makePointOp(const SourceImage& source, const BakedLut* reuse) const;
   void displayStages(float e3[3]) const;  // curves + LUT on an encoded display value (film path)
-  std::uint8_t* renderBakedImpl(const SourceImage& source, const BakedLut& lut, const FastOptions& opt, int& w, int& h,
-                                ImageF* outFloat) const;
+  // The 256 px tone proxy through a lattice, float (the fast tonal analysis of bakeTonePre / bake). Frames are rendered by the engine (core/engine).
+  ImageF proxyThroughLattice(const SourceImage& source, const BakedLut& lut) const;
 };
 
 }  // namespace dapple

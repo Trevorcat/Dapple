@@ -20,6 +20,7 @@
 #endif
 
 #include "../deterministic.h"
+#include "../render_f.h"
 #include "colour_metrics.h"
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"
@@ -187,17 +188,16 @@ std::vector<Case> cases() {
   return v;
 }
 
-// ---- whole: byte-identical to the reference renderer ------------------------------------------------------------------------
+// ---- whole: the session render equals the one-shot render ------------------------------------------------------------------------
 void testWhole() {
   const SourceImage src = makeScene(613, 421);
   EngineSession es;
   for (const Case& c : cases()) {
     Image8 ref, got;
-    const Renderer r(c.p, cam(), nullptr);
-    ref = r.render(src);
+    ref = render8(c.p, cam(), nullptr, src);  // the one-shot engine render (a private session); the golden corpus pins the pixels themselves
     CHECK(exactRender(es, c.p, src, ExecMode::Whole, 0, got));
     const bool same = ref.width == got.width && ref.height == got.height && ref.data == got.data;
-    std::printf("  %-18s whole vs Renderer::render: %s\n", c.name, same ? "byte-identical" : "DIFFERENT");
+    std::printf("  %-18s whole (session) vs one-shot render: %s\n", c.name, same ? "byte-identical" : "DIFFERENT");
     CHECK(same);
   }
 }
@@ -393,7 +393,7 @@ void testAnalysis() {
   }
 }
 
-// ---- bench: the pixel pipeline of the executor vs Renderer::renderBakedRgba (same BakedLut), alternating, medians ---------------
+// ---- bench: the pixel pipeline of the executor (setup + run), medians ---------------
 void testBench() {
   struct V {
     const char* name;
@@ -428,14 +428,9 @@ void testBench() {
     in.ctx.srcW = src.linear.width;
     in.ctx.srcH = src.linear.height;
     const ParamSet ps = ParamSet::make(in);
-    std::vector<double> tl, te, ts;
+    std::vector<double> te, ts;
     for (int i = 0; i < 31; ++i) {
-      int w = 0, h = 0;
       auto t0 = Clock::now();
-      std::uint8_t* legacy = r.renderBakedRgba(src, *bake, fo, w, h);
-      const double l = msSince(t0);
-      std::free(legacy);
-      t0 = Clock::now();
       FrameKernels fk(r, src, bake.get(), fo);
       const FramePlan fp = fk.framePlan();
       Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp);
@@ -447,22 +442,18 @@ void testBench() {
       rq.sharpRadius = fk.spatial().sharpRadius, rq.grain = fk.spatial().grain, rq.scale = fk.spatialScale();
       const Plan plan = Planner::plan(g, rq, &es.cache());
       if (i > 0) ts.push_back(msSince(t0));
+      const int w = fk.width(), h = fk.height();
       std::vector<std::uint8_t> out(std::size_t(w) * h * 4);
       ExecEnv env{fk, g, es.cache(), CancelToken{}, out.data(), 4};
       const Status st = CpuExecutor::run(plan, env);
       const double e = msSince(t0);
       CHECK(st == Status::Ok);
-      if (i > 0) {
-        tl.push_back(l);
-        te.push_back(e);
-      }
+      if (i > 0) te.push_back(e);
     }
     std::sort(ts.begin(), ts.end());
     std::printf("    (setup: FrameKernels + graph + keys + plan: median %.3f ms)\n", ts[ts.size() / 2]);
-    std::sort(tl.begin(), tl.end());
     std::sort(te.begin(), te.end());
-    std::printf("  %-32s legacy median %6.2f min %6.2f   executor median %6.2f min %6.2f   ratio %.3f (median)\n", v.name, tl[tl.size() / 2],
-                tl[0], te[te.size() / 2], te[0], te[te.size() / 2] / tl[tl.size() / 2]);
+    std::printf("  %-32s executor median %6.2f min %6.2f\n", v.name, te[te.size() / 2], te[0]);
   }
 }
 

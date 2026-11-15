@@ -70,23 +70,23 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
   const ParamInputs& in = ps.inputs();
   const NodeId src = g.add(NodeType::Source);
 
-  if (detail == GraphDetail::Legacy) {
+  if (detail == GraphDetail::Tables) {
     if (f.exact) {
-      const NodeId r = g.add(NodeType::LegacyRender, {Edge{src}});
+      const NodeId r = g.add(NodeType::AssembledBake, {Edge{src}});
       g.markOutput(r, OutputRole::Frame);
       if (f.wantAnalysis) g.markOutput(g.add(NodeType::Analysis), OutputRole::Analysis);
       return g;
     }
     const Tables t = buildTables(g, ps);
     NodeId r;
-    if (t.hasOverflow) r = g.add(NodeType::LegacyRender, {Edge{src}, Edge{t.tone}, Edge{t.lattice}, Edge{t.overflow}});
-    else r = g.add(NodeType::LegacyRender, {Edge{src}, Edge{t.tone}, Edge{t.lattice}});
+    if (t.hasOverflow) r = g.add(NodeType::AssembledBake, {Edge{src}, Edge{t.tone}, Edge{t.lattice}, Edge{t.overflow}});
+    else r = g.add(NodeType::AssembledBake, {Edge{src}, Edge{t.tone}, Edge{t.lattice}});
     g.markOutput(r, OutputRole::Frame);
     if (t.hasAnalysis) g.markOutput(t.analysis, OutputRole::Analysis);
     return g;
   }
 
-  // ---- Full: every stage of renderBakedImpl as its own node ---------------------------------------------------------------
+  // ---- Full: every stage of the frame as its own node ---------------------------------------------------------------
   FramePlan fallback;
   const FramePlan& fp = plan ? *plan : fallback;
   const EditParams& e = ps.edit();
