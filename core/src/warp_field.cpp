@@ -936,6 +936,12 @@ void resetCache() {
 }
 
 std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH, bool interactive) {
+  // One snapshot of the process-wide knobs for the whole build: the cache key and every later decision use only this copy.
+  struct Cfg { Mode mode; int leg; double band; } cfg;
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    cfg = {g_mode, g_leg, g_band};
+  }
   if (!r.active() || photoW < 2 || photoH < 2) return nullptr;
   const int N = interactive ? kGridInteractive : kGridExact;
   const double L = std::max(photoW, photoH);
@@ -947,9 +953,9 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
   std::uint64_t key = reshapeHash(r);
   key = (key ^ std::uint64_t(G.gw) * 0x9E3779B97F4A7C15ull) * 1099511628211ull;
   key = (key ^ std::uint64_t(G.gh) * 0xC2B2AE3D27D4EB4Full) * 1099511628211ull;
-  key = (key ^ std::uint64_t(g_mode == Mode::Layered ? 0x51ull : g_mode == Mode::Smooth ? 0x17ull : 0x93ull)) * 1099511628211ull;
-  key = (key ^ std::uint64_t(g_band * 1e6)) * 1099511628211ull;
-  key = (key ^ std::uint64_t(g_leg + 7)) * 1099511628211ull;
+  key = (key ^ std::uint64_t(cfg.mode == Mode::Layered ? 0x51ull : cfg.mode == Mode::Smooth ? 0x17ull : 0x93ull)) * 1099511628211ull;
+  key = (key ^ std::uint64_t(cfg.band * 1e6)) * 1099511628211ull;
+  key = (key ^ std::uint64_t(cfg.leg + 7)) * 1099511628211ull;
   {
     std::lock_guard<std::mutex> lk(g_mu);
     for (auto it = g_cache.begin(); it != g_cache.end(); ++it)
@@ -1010,10 +1016,10 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
     }
   }
   // Layered mode (section 48): needs the person plane to cover every body that is lengthened as well (its legs); otherwise the earlier single field.
-  bool layered = Mp && g_mode == Mode::Layered;
+  bool layered = Mp && cfg.mode == Mode::Layered;
   bool anyLong = false;
   for (const ReshapeBody& b : r.bodies) anyLong = anyLong || (b.active() && b.longLegs != 0);
-  if (anyLong && g_leg == 0) layered = false;  // W: the earlier single field with the compressed ground (A, B: a separate whole-frame stretch, composed below)
+  if (anyLong && cfg.leg == 0) layered = false;  // W: the earlier single field with the compressed ground (A, B: a separate whole-frame stretch, composed below)
   Grid S = G;  // A / B stretch (forward), applied last, i.e. outermost
   S.zero();
   bool stretch = false;
@@ -1051,7 +1057,7 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
   }
   bool band = false;
   // Mode C (section 49): the slimming operators go into their own grid Fb (the data of the structure-aware solve); everything else keeps the protection band
-  const bool modeC = g_mode == Mode::Structure;
+  const bool modeC = cfg.mode == Mode::Structure;
   Grid Fb = G;
   Fb.zero();
   Grid& Fbody = modeC ? Fb : F;
@@ -1080,7 +1086,7 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
   if (layered) out->matteUsed = true;  // layered: the background is frozen by construction, the person field needs no decay band around the matte
   std::vector<double> wprot;
   if (Mp && scale > 0 && !layered) {
-    const double delta = g_band > 0 ? g_band : std::clamp(scale, 0.006, 0.05);
+    const double delta = cfg.band > 0 ? cfg.band : std::clamp(scale, 0.006, 0.05);
     const std::vector<double> w = protection(G, M, delta);
     if (useC) wprot = w;
     for (std::size_t k = 0; k < w.size(); ++k) F.f[2 * k] *= w[k], F.f[2 * k + 1] *= w[k];
@@ -1092,8 +1098,8 @@ std::shared_ptr<const Field> bind(const ReshapeParams& r, int photoW, int photoH
   if (band)
     for (const ReshapeBody& b : r.bodies)
       if (b.active() && b.longLegs) {
-        if (g_leg >= 2) {
-          const int mode = opStretchLegs(S, bodyGeo(b, G.AX, G.AY), M.r ? &M : nullptr, b.longLegs / 100.0, g_leg == 2);
+        if (cfg.leg >= 2) {
+          const int mode = opStretchLegs(S, bodyGeo(b, G.AX, G.AY), M.r ? &M : nullptr, b.longLegs / 100.0, cfg.leg == 2);
           stretch = stretch || mode != 0;
           if (mode) local::logLine(std::string("reshape: long legs as a whole stretch, axis ") + (mode == 1 ? "along the legs (A)" : "vertical (B)"));
         } else {

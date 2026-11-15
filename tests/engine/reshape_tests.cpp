@@ -14,6 +14,8 @@
 //     parity       GPU vs CPU frame, GPU tiled export vs one tile
 //   not in ctest: bench (field build, CPU / GPU frames at 1080 interactive and 24 MP exact)
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1344,6 +1346,37 @@ void testStructureTiles() {
   warp::setMode(warp::Mode::Layered);
 }
 
+// The process-wide mode is read once per field build: a build racing with setMode/setLayered yields exactly one of the pure-mode fields.
+void testModeRace() {
+  const int W = 300, H = 400;
+  putMatte("rs_matte", W, H);
+  const EditParams p = layeredEdit(W, H);
+  auto build = [&](warp::Mode m) {
+    warp::setMode(m);
+    warp::resetCache();
+    return warp::bind(p.reshape, W, H, true);
+  };
+  const auto smooth = build(warp::Mode::Smooth);
+  const auto layered = build(warp::Mode::Layered);
+  CHECK(smooth && layered && smooth->d != layered->d);
+  if (!smooth || !layered) return;
+  std::atomic<bool> stop{false};
+  std::thread toggler([&] {
+    for (bool on = false; !stop.load(); on = !on) warp::setMode(on ? warp::Mode::Layered : warp::Mode::Smooth);
+  });
+  int bad = 0;
+  for (int i = 0; i < 40; ++i) {
+    warp::resetCache();
+    const auto f = warp::bind(p.reshape, W, H, true);
+    if (!f || !((f->layered == smooth->layered && f->d == smooth->d) || (f->layered == layered->layered && f->d == layered->d))) ++bad;
+  }
+  stop = true;
+  toggler.join();
+  std::printf("  mode race: %d of 40 builds were neither pure field\n", bad);
+  CHECK(bad == 0);
+  warp::setMode(warp::Mode::Layered);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1354,7 +1387,7 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"json", testJson},       {"identity", testIdentity}, {"bounded", testBounded},         {"protect", testProtect},
                      {"push", testPush},       {"tiles", testTiles},       {"region", testRegion},           {"interactive", testInteractive},
-                     {"mappoint", testMapPoint}, {"sharpness", testSharpness}, {"body", testBody}, {"layered", testLayered}, {"legs", testLegs}, {"structure", testStructure}, {"structure_tiles", testStructureTiles},
+                     {"mappoint", testMapPoint}, {"sharpness", testSharpness}, {"body", testBody}, {"layered", testLayered}, {"legs", testLegs}, {"structure", testStructure}, {"structure_tiles", testStructureTiles}, {"moderace", testModeRace},
 #ifdef DAPPLE_RESHAPE_GPU
                      {"parity", testParity},
 #endif

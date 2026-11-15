@@ -138,7 +138,15 @@ struct DappleSession {
     }
     dapple::aimask::cancelOwner(this);  // AI mask jobs hold a pointer to this session
     dapple::aimask::waitOwner(this);
-    for (int i = 0; i < 5000 && matchBusy.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // The film-match and touch-hint workers hold a raw pointer to this session: ask them to stop (no queued match is started, the hint burst ends at its
+    // next frame) and wait until they are gone. Every loop is finite, so the wait is unbounded on purpose: a timeout that fell through would free the
+    // session under a running worker.
+    {
+      std::lock_guard<std::mutex> lk(asyncMtx);
+      asyncHave = false;
+    }
+    frameSeq.fetch_add(1);
+    while (matchBusy.load() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   dapple::FilmMatchCache filmCache;  // image statistics + remembered medians of the match (film_match.h)
   // Where the executors read the full-resolution source from (the GPU keeps a device copy per store identity)
@@ -328,6 +336,7 @@ void queueFilmMatch(DappleSession* s, const EditParams& params, const std::strin
     s->asyncRunning = true;
   }
   s->matchBusy.fetch_add(1);
+  try {
   std::thread([s] {
     dapple::ThreadPool::tlUse() = &dapple::ThreadPool::background();
     sys::utilityQos();
@@ -365,6 +374,13 @@ void queueFilmMatch(DappleSession* s, const EditParams& params, const std::strin
     }
     s->matchBusy.fetch_sub(1);
   }).detach();
+  } catch (...) {  // no thread: undo the books, or the session destructor would wait for a worker that never ran
+    {
+      std::lock_guard<std::mutex> lock(s->asyncMtx);
+      s->asyncRunning = false;
+    }
+    s->matchBusy.fetch_sub(1);
+  }
 }
 
 // `params` with EditParams::filmKeyEv set: the EV that puts the film render's median lightness where the normal develop
@@ -915,6 +931,18 @@ auto guarded(Fn&& fn, decltype(fn()) failure) -> decltype(fn()) {
   return failure;
 }
 
+// The same for entry points that return nothing.
+template <class Fn>
+void guardedVoid(Fn&& fn) {
+  try {
+    fn();
+  } catch (const std::exception& e) {
+    setError(std::string("exception: ") + e.what());
+  } catch (...) {
+    setError("unknown exception");
+  }
+}
+
 }  // namespace
 
 // ---- merge / motion photo helpers (phase 3) ----
@@ -1007,9 +1035,13 @@ void dapple_free_string(char* s) { std::free(s); }
 // ---- optional GPU backend (core/gpu): runtime flag + status ----
 int32_t dapple_gpu_set_enabled(int32_t mode) {
 #ifdef DAPPLE_HAVE_GPU
-  dapple::engine::gpu::installProvider();
-  dapple::engine::gpu::setRuntimeEnabled(mode);
-  return dapple::engine::gpu::runtimeEnabled() ? 1 : 0;
+  return guarded(
+      [&]() -> int32_t {
+        dapple::engine::gpu::installProvider();
+        dapple::engine::gpu::setRuntimeEnabled(mode);
+        return dapple::engine::gpu::runtimeEnabled() ? 1 : 0;
+      },
+      0);
 #else
   (void)mode;
   return 0;
@@ -1017,30 +1049,36 @@ int32_t dapple_gpu_set_enabled(int32_t mode) {
 }
 
 void dapple_gpu_configure(const char* cache_dir, const char* app_version, const char* fingerprint) {
+  guardedVoid([&] {
 #ifdef DAPPLE_HAVE_GPU
-  dapple::engine::gpu::configure(cache_dir ? cache_dir : "", app_version ? app_version : "", fingerprint ? fingerprint : "");
+    dapple::engine::gpu::configure(cache_dir ? cache_dir : "", app_version ? app_version : "", fingerprint ? fingerprint : "");
 #else
-  // CPU-only build: the same cache directory still holds the film tables and the print-exposure constants (the prebake persists them there)
-  if (cache_dir && cache_dir[0])
-    dapple::engine::filmnode::setFilmTableDisk((fs::path(cache_dir) / "film_tables").string(), std::string(app_version ? app_version : "") + "|" + (fingerprint ? fingerprint : ""));
+    // CPU-only build: the same cache directory still holds the film tables and the print-exposure constants (the prebake persists them there)
+    if (cache_dir && cache_dir[0])
+      dapple::engine::filmnode::setFilmTableDisk((fs::path(cache_dir) / "film_tables").string(), std::string(app_version ? app_version : "") + "|" + (fingerprint ? fingerprint : ""));
 #endif
+  });
 }
 
 void dapple_gpu_warmup(void) {
 #ifdef DAPPLE_HAVE_GPU
-  dapple::engine::gpu::startWarmup();
+  guardedVoid([&] { dapple::engine::gpu::startWarmup(); });
 #endif
 }
 
-char* dapple_engine_stats_json(void) { return dupString(dapple::engine::executorStatsJson()); }
+char* dapple_engine_stats_json(void) { return guarded([&]() -> char* { return dupString(dapple::engine::executorStatsJson()); }, nullptr); }
 
 char* dapple_gpu_status_json(void) {
+  return guarded(
+      [&]() -> char* {
 #ifdef DAPPLE_HAVE_GPU
-  dapple::engine::gpu::installProvider();
-  return dupString(dapple::engine::gpu::statusJson());
+        dapple::engine::gpu::installProvider();
+        return dupString(dapple::engine::gpu::statusJson());
 #else
-  return dupString("{\"compiled\":false,\"enabled\":false,\"available\":false}");
+        return dupString("{\"compiled\":false,\"enabled\":false,\"available\":false}");
 #endif
+      },
+      nullptr);
 }
 
 // ---- local adjustments (docs/engine/pipeline-architecture.md section 40) ----------------------------------------------------------------
@@ -1055,8 +1093,8 @@ int32_t dapple_mask_raster_set(const char* id, int32_t w, int32_t h, const uint8
       },
       DAPPLE_ERROR);
 }
-int32_t dapple_mask_raster_remove(const char* id) { return id && local::rasterRemove(id) ? DAPPLE_OK : DAPPLE_ERROR; }
-int32_t dapple_mask_raster_has(const char* id) { return id && local::rasterHas(id) ? 1 : 0; }
+int32_t dapple_mask_raster_remove(const char* id) { return guarded([&]() -> int32_t { return id && local::rasterRemove(id) ? DAPPLE_OK : DAPPLE_ERROR; }, DAPPLE_ERROR); }
+int32_t dapple_mask_raster_has(const char* id) { return guarded([&]() -> int32_t { return id && local::rasterHas(id) ? 1 : 0; }, 0); }
 
 namespace {
 // The source of a mask query at long_edge (the session's scaled copy, kept by the Resize cache) and the edit's kernels on it (exact path:
@@ -1129,13 +1167,13 @@ int32_t dapple_session_mask_preview(DappleSession* s, const char* params_json, i
 }
 
 int32_t dapple_session_map_point(DappleSession* s, const char* params_json, int32_t long_edge, float x, float y, int32_t direction, float* u, float* v) {
-  ensureSource(s);
   return guarded(
       [&]() -> int32_t {
         if (!s || !u || !v) {
           setError("null argument");
           return DAPPLE_ERROR;
         }
+        if (!ensureSource(s)) return DAPPLE_ERROR;
         EditParams params;
         if (!parseParams(params_json, params)) return DAPPLE_ERROR;
         params.local.clear();
@@ -1192,13 +1230,13 @@ int32_t dapple_session_map_point(DappleSession* s, const char* params_json, int3
 }
 
 char* dapple_session_mask_sample_json(DappleSession* s, const char* params_json, float u, float v) {
-  ensureSource(s);
   return guarded(
       [&]() -> char* {
         if (!s) {
           setError("null session");
           return nullptr;
         }
+        if (!ensureSource(s)) return nullptr;
         EditParams params;
         if (!parseParams(params_json, params)) return nullptr;
         params.crop = "orig";
@@ -1305,13 +1343,17 @@ std::string jsonEsc(const std::string& in) {
 }  // extern "C++"
 
 int32_t dapple_ai_configure(const char* model_dir, const char* cache_dir) {
-  aimask::configure(model_dir ? model_dir : "", cache_dir ? cache_dir : "");
-  return DAPPLE_OK;
+  return guarded(
+      [&]() -> int32_t {
+        aimask::configure(model_dir ? model_dir : "", cache_dir ? cache_dir : "");
+        return DAPPLE_OK;
+      },
+      DAPPLE_ERROR);
 }
-char* dapple_ai_status_json(void) { return dupString(aimask::availabilityJson()); }
+char* dapple_ai_status_json(void) { return guarded([&]() -> char* { return dupString(aimask::availabilityJson()); }, nullptr); }
 char* dapple_session_ai_photo_id(DappleSession* s) {
   if (!s) return nullptr;
-  return dupString(aiSource(s).photoId);
+  return guarded([&]() -> char* { return dupString(aiSource(s).photoId); }, nullptr);
 }
 int32_t dapple_session_ai_start(DappleSession* s, int32_t tasks, int32_t flags, int32_t max_faces) {
   return guarded(
@@ -1329,8 +1371,8 @@ int32_t dapple_session_ai_start(DappleSession* s, int32_t tasks, int32_t flags, 
       },
       -1);
 }
-char* dapple_ai_job_json(int32_t job) { return dupString(aimask::jobJson(job)); }
-void dapple_ai_job_cancel(int32_t job) { aimask::cancelJob(job); }
+char* dapple_ai_job_json(int32_t job) { return guarded([&]() -> char* { return dupString(aimask::jobJson(job)); }, nullptr); }
+void dapple_ai_job_cancel(int32_t job) { guardedVoid([&] { aimask::cancelJob(job); }); }
 
 char* dapple_session_ai_tap_json(DappleSession* s, float u, float v, int32_t op) {
   return guarded(
@@ -1445,8 +1487,10 @@ int32_t dapple_session_ai_ensure(DappleSession* s, const char* params_json, int3
       -1);
 }
 void dapple_ai_release(int32_t all) {
-  if (all) aimask::releaseAll();
-  else aimask::releaseIdle();
+  guardedVoid([&] {
+    if (all) aimask::releaseAll();
+    else aimask::releaseIdle();
+  });
 }
 
 void dapple_free_image(DappleImage* image) {
@@ -1724,13 +1768,13 @@ char* dapple_session_info_json(DappleSession* session) {
 }
 
 char* dapple_session_auto_json(DappleSession* session, float strength) {
-  ensureSource(session);
   return guarded(
       [&]() -> char* {
         if (!session) {
           setError("null session");
           return nullptr;
         }
+        if (!ensureSource(session)) return nullptr;
         AutoOptions opt;
         opt.strength = strength;
         const AutoResult r = computeAutoAdjust(session->source, *session->camera, opt);
@@ -2008,13 +2052,13 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
 char* dapple_session_analyze_json(DappleSession* session) { return dapple_session_analyze_params_json(session, nullptr); }
 
 char* dapple_session_analyze_params_json(DappleSession* session, const char* params_json) {
-  ensureSource(session);
   return guarded(
       [&]() -> char* {
         if (!session) {
           setError("null session");
           return nullptr;
         }
+        if (!ensureSource(session)) return nullptr;
         EditParams params;
         if (!parseParams(params_json, params)) return nullptr;
         params = withFilmKey(session, params);
@@ -2048,7 +2092,11 @@ int32_t dapple_session_render(DappleSession* session, const char* params_json, c
 // Round 10: the default is the GPU keep-warm pump (gpu_runtime.h keepWarm): GPU-only units of ~1.5 ms (at most two ahead of a frame, none submitted while
 // a real frame is pending, more queued behind each frame of the drag), so a finger that moves at once is not held behind a burst frame. DAPPLE_HINT_MODE=frames selects the frame burst below
 // (measurement only), =off disables the hint.
+static int32_t touchHintImpl(DappleSession* session, int32_t burst_ms);
 int32_t dapple_session_touch_hint(DappleSession* session, int32_t burst_ms) {
+  return guarded([&]() -> int32_t { return touchHintImpl(session, burst_ms); }, DAPPLE_ERROR);
+}
+static int32_t touchHintImpl(DappleSession* session, int32_t burst_ms) {
   if (!session || burst_ms == 0) return DAPPLE_OK;
   const char* hintMode = std::getenv("DAPPLE_HINT_MODE");
   if (hintMode && std::strcmp(hintMode, "off") == 0) return DAPPLE_OK;
@@ -2079,6 +2127,7 @@ int32_t dapple_session_touch_hint(DappleSession* session, int32_t burst_ms) {
     if (sc > 0.0 && rq.long_edge > 0) rq.long_edge = std::max<std::int32_t>(rq.long_edge, std::int32_t(double(rq.long_edge) * sc));
   }
   session->matchBusy.fetch_add(1);  // the session destructor waits for the worker
+  try {
   std::thread([session, json, lut, active, rq, burst_ms, prepareOnly]() mutable {
     tlHintFrame = true;
     const std::uint64_t seq0 = session->frameSeq.load();
@@ -2092,6 +2141,11 @@ int32_t dapple_session_touch_hint(DappleSession* session, int32_t burst_ms) {
     session->hintRunning.store(false);
     session->matchBusy.fetch_sub(1);
   }).detach();
+  } catch (...) {  // no thread: undo the books (the destructor waits on matchBusy)
+    session->hintRunning.store(false);
+    session->matchBusy.fetch_sub(1);
+    throw;
+  }
   return DAPPLE_OK;
 }
 
@@ -2179,7 +2233,7 @@ int32_t dapple_session_render_frame(DappleSession* session, const char* params_j
       DAPPLE_ERROR);
 }
 
-char* dapple_engine_info_json(void) { return dupString(dapple::engine::infoJson()); }
+char* dapple_engine_info_json(void) { return guarded([&]() -> char* { return dupString(dapple::engine::infoJson()); }, nullptr); }
 
 int32_t dapple_session_cancel(DappleSession* session) {
   if (!session) return DAPPLE_ERROR;
@@ -2191,11 +2245,13 @@ int32_t dapple_session_cancel(DappleSession* session) {
 void dapple_thread_background(int32_t on) { sys::setBackground(on != 0); }
 
 void dapple_frame_trace_enable(int32_t on) {
-  dapple::ftrace::S().on.store(on != 0);
-  if (on) dapple::ftrace::clear();
+  guardedVoid([&] {
+    dapple::ftrace::S().on.store(on != 0);
+    if (on) dapple::ftrace::clear();
+  });
 }
-int32_t dapple_frame_trace_dump(const char* path) { return path && dapple::ftrace::dump(path) ? DAPPLE_OK : DAPPLE_ERROR; }
-void dapple_frame_trace_clear(void) { dapple::ftrace::clear(); }
+int32_t dapple_frame_trace_dump(const char* path) { return guarded([&]() -> int32_t { return path && dapple::ftrace::dump(path) ? DAPPLE_OK : DAPPLE_ERROR; }, DAPPLE_ERROR); }
+void dapple_frame_trace_clear(void) { guardedVoid([&] { dapple::ftrace::clear(); }); }
 
 void dapple_set_interaction(int32_t active) {
   dapple::demosaic::setInteraction(active != 0);
@@ -2203,13 +2259,19 @@ void dapple_set_interaction(int32_t active) {
 }
 
 void dapple_perf_configure(int32_t thread_limit, int32_t target_frame_ms) {
-  ThreadPool::instance().setLimit(thread_limit);
-  sys::adpf().setTarget(int64_t(std::max(0, target_frame_ms)) * 1000000);
+  guardedVoid([&] {
+    ThreadPool::instance().setLimit(thread_limit);
+    sys::adpf().setTarget(int64_t(std::max(0, target_frame_ms)) * 1000000);
+  });
 }
 
 float dapple_thermal_headroom(int32_t forecast_seconds) { return sys::adpf().headroom(forecast_seconds); }
 
+static int32_t setRepaintCallbackImpl(DappleRepaintFn fn, void* user);
 int32_t dapple_set_repaint_callback(DappleRepaintFn fn, void* user) {
+  return guarded([&]() -> int32_t { return setRepaintCallbackImpl(fn, user); }, DAPPLE_ERROR);
+}
+static int32_t setRepaintCallbackImpl(DappleRepaintFn fn, void* user) {
   static DappleRepaintFn cur = nullptr;
   static void* curUser = nullptr;
   using namespace dapple::engine::filmnode;
@@ -2223,7 +2285,9 @@ int32_t dapple_set_repaint_callback(DappleRepaintFn fn, void* user) {
   return DAPPLE_OK;
 }
 
-char* dapple_perf_info_json(void) {
+static char* perfInfoImpl();
+char* dapple_perf_info_json(void) { return guarded([&]() -> char* { return perfInfoImpl(); }, nullptr); }
+static char* perfInfoImpl() {
   const sys::Topology& t = sys::topology();
   ThreadPool& pool = ThreadPool::instance();
   std::string j = "{\"cpus\":" + std::to_string(t.total) + ",\"perf\":" + std::to_string(t.perf.size()) +
@@ -2262,13 +2326,17 @@ int32_t dapple_film_load_pack_memory(const void* data, size_t size) {
       DAPPLE_ERROR);
 }
 
-void dapple_film_set_pack_path(const char* path) { film::setLibraryPathLazy(toPath(path)); }
+void dapple_film_set_pack_path(const char* path) { guardedVoid([&] { film::setLibraryPathLazy(toPath(path)); }); }
 
-void dapple_film_prebake_start(void) { dapple::engine::filmnode::startFilmPrebake(); }
+void dapple_film_prebake_start(void) { guardedVoid([&] { dapple::engine::filmnode::startFilmPrebake(); }); }
 char* dapple_film_prebake_status(void) {
-  char b[256];
-  dapple::engine::filmnode::filmPrebakeStatus(b, int(sizeof b));
-  return dupString(b);
+  return guarded(
+      [&]() -> char* {
+        char b[256];
+        dapple::engine::filmnode::filmPrebakeStatus(b, int(sizeof b));
+        return dupString(b);
+      },
+      nullptr);
 }
 
 char* dapple_film_list_json(void) {
@@ -2341,18 +2409,18 @@ char* dapple_film_swatches_json(void) {
       nullptr);
 }
 
-char* dapple_looks_json(void) { return dupString(looksJson()); }
+char* dapple_looks_json(void) { return guarded([&]() -> char* { return dupString(looksJson()); }, nullptr); }
 
-char* dapple_params_schema_json(void) { return dupString(paramsSchemaJson()); }
+char* dapple_params_schema_json(void) { return guarded([&]() -> char* { return dupString(paramsSchemaJson()); }, nullptr); }
 
 char* dapple_session_film_pad_json(DappleSession* session, const char* params_json) {
-  ensureSource(session);
   return guarded(
       [&]() -> char* {
         if (!session) {
           setError("null session");
           return nullptr;
         }
+        if (!ensureSource(session)) return nullptr;
         EditParams params;
         if (!parseParams(params_json, params)) return nullptr;
         const std::string lutFile = params.lutPath;
@@ -2394,7 +2462,6 @@ char* dapple_session_film_pad_json(DappleSession* session, const char* params_js
 
 int32_t dapple_session_render_look_previews(DappleSession* session, const char* params_json, int32_t out_long_edge,
                                             DappleImage* out) {
-  ensureSource(session);
   return guarded(
       [&]() -> int32_t {
         if (!out) {
@@ -2406,6 +2473,7 @@ int32_t dapple_session_render_look_previews(DappleSession* session, const char* 
           setError("null session");
           return DAPPLE_ERROR;
         }
+        if (!ensureSource(session)) return DAPPLE_ERROR;
         EditParams base;
         if (!parseParams(params_json, base)) return DAPPLE_ERROR;
         base.hasPalette = false;
@@ -2426,7 +2494,6 @@ int32_t dapple_session_render_look_previews(DappleSession* session, const char* 
 
 int32_t dapple_session_render_tone_previews(DappleSession* session, const char* params_json, int32_t out_long_edge,
                                             float strength, DappleImage* out) {
-  ensureSource(session);
   return guarded(
       [&]() -> int32_t {
         if (!out) {
@@ -2438,6 +2505,7 @@ int32_t dapple_session_render_tone_previews(DappleSession* session, const char* 
           setError("null session");
           return DAPPLE_ERROR;
         }
+        if (!ensureSource(session)) return DAPPLE_ERROR;
         EditParams base;
         if (!parseParams(params_json, base)) return DAPPLE_ERROR;
         // Previews show each class at full strength with a wide reach so the nine cells are
@@ -2465,7 +2533,6 @@ int32_t dapple_session_render_tone_previews(DappleSession* session, const char* 
 // touch-hint burst runs, and it holds the session lock only for one frame at a time.
 int32_t dapple_session_base_previews(DappleSession* session, const char* params_json, const char* const* base_ids, int32_t n, int32_t long_edge,
                                      DappleImage* out) {
-  ensureSource(session);
   return guarded(
       [&]() -> int32_t {
         if (!out || n <= 0 || n > 256) {
@@ -2477,6 +2544,7 @@ int32_t dapple_session_base_previews(DappleSession* session, const char* params_
           setError("null session");
           return DAPPLE_ERROR;
         }
+        if (!ensureSource(session)) return DAPPLE_ERROR;
         EditParams base;
         if (!parseParams(params_json, base)) return DAPPLE_ERROR;
         const std::uint64_t mine = session->swatchSeq.fetch_add(1) + 1;  // a newer request or a cancel makes this one stop
@@ -3084,7 +3152,7 @@ int32_t dapple_progress_to_cell(float fraction, const char* stage, void* user) {
   return 0;
 }
 
-int32_t dapple_merge_available(void) { return mergeAvailable() ? 1 : 0; }
+int32_t dapple_merge_available(void) { return guarded([&]() -> int32_t { return mergeAvailable() ? 1 : 0; }, 0); }
 
 DappleSession* dapple_session_open_merged(const char* const* paths, int32_t count, const char* kind, const char* options_json,
                                           DappleProgressFn progress, void* user, const volatile int32_t* cancel_flag,
@@ -3143,13 +3211,13 @@ DappleSession* dapple_session_open_merged(const char* const* paths, int32_t coun
 }
 
 int32_t dapple_session_save_linear(DappleSession* session, const char* out_path, const char* format) {
-  ensureSource(session);
   return guarded(
       [&]() -> int32_t {
         if (!session) {
           setError("null session");
           return DAPPLE_ERROR;
         }
+        if (!ensureSource(session)) return DAPPLE_ERROR;
         const std::string f = format ? format : "dng";
         Result<void> r = f == "tiff" || f == "tif" ? writeLinearTiff16(session->source.linear, toPath(out_path))
                          : f == "dng"              ? writeLinearDng(session->source, toPath(out_path))
@@ -3322,7 +3390,9 @@ int32_t dapple_session_set_export_progress(DappleSession* session, DappleProgres
   return DAPPLE_OK;
 }
 
-char* dapple_memory_json(void) {
+static char* memoryJsonImpl();
+char* dapple_memory_json(void) { return guarded([&]() -> char* { return memoryJsonImpl(); }, nullptr); }
+static char* memoryJsonImpl() {
   char b[192];
   std::snprintf(b, sizeof b, "{\"footprint\":%llu,\"resident\":%llu,\"available\":%llu,\"exportBudget\":%llu,\"stream\":\"%s\"}",
                 (unsigned long long)mem::footprint(), (unsigned long long)mem::resident(), (unsigned long long)mem::available(),
@@ -3528,7 +3598,11 @@ int64_t dapple_memory_trim(int32_t level) {
 
 // Not part of the C API (not in dapple_c.h): the test suite reads the bright-rendition shift of a modern rendering (EV, see modernWhiteEv).
 extern "C" float dapple_internal_modern_white_ev(DappleSession* session, const char* params_json) {
-  EditParams params;
-  if (!session || !parseParams(params_json, params) || !ensureSource(session)) return 0.f;
-  return modernWhiteEv(session, params);
+  return guarded(
+      [&]() -> float {
+        EditParams params;
+        if (!session || !parseParams(params_json, params) || !ensureSource(session)) return 0.f;
+        return modernWhiteEv(session, params);
+      },
+      0.f);
 }
