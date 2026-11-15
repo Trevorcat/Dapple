@@ -41,7 +41,7 @@ endforeach()
 # Spectral film engine tests (profiles, film pack, grey neutrality, baked-vs-direct dE2000, hooks).
 # The C API under test is compiled into the executable (not the dapple DLL): the registry and the thread pool are
 # process singletons, so linking both libdapple_core.a and the DLL would test two separate copies.
-add_executable(dapple_film_tests film_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
+add_executable(dapple_film_tests film_tests.cpp ${DAPPLE_CAPI_SOURCES} ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
 target_link_libraries(dapple_film_tests PRIVATE dapple_core)
 target_include_directories(dapple_film_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
 target_include_directories(dapple_film_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/cli)
@@ -121,7 +121,7 @@ endif()
 # ---- engine migration (docs/engine/pipeline-architecture.md section 10, stage a) ---------------------------------------
 # Golden corpus + hash harness (step a0): hashes recorded from the unchanged renderer; every engine mode must reproduce
 # them byte for byte (gate B). The C API is compiled into the executable (process singletons, see dapple_film_tests).
-add_executable(dapple_golden engine/golden/golden_tests.cpp)
+add_executable(dapple_golden engine/golden/golden_tests.cpp ${DAPPLE_CAPI_SOURCES})
 target_link_libraries(dapple_golden PRIVATE dapple_core)
 target_include_directories(dapple_golden PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include)
 target_compile_definitions(dapple_golden PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
@@ -142,7 +142,7 @@ set_tests_properties(engine.match_cache_seq PROPERTIES TIMEOUT 600 SKIP_RETURN_C
 set_tests_properties(engine.selfcheck PROPERTIES TIMEOUT 600)
 
 # Engine graph / table nodes / cache / overhead tests (steps a1-a3). One ctest entry per id (`--list` prints them).
-add_executable(dapple_engine_tests engine/engine_tests.cpp)
+add_executable(dapple_engine_tests engine/engine_tests.cpp ${DAPPLE_CAPI_SOURCES})
 target_link_libraries(dapple_engine_tests PRIVATE dapple_core)
 target_include_directories(dapple_engine_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include)
 target_compile_definitions(dapple_engine_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
@@ -281,7 +281,7 @@ foreach(id ${_reshape_ids})
 endforeach()
 
 # Local adjustments through the C API (render / export / UI helpers / video cover path) and the evidence sheets. Compile the C API in, like uhdr_tests.
-set(_local_capi_srcs ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp ${PROJECT_SOURCE_DIR}/core/engine/video/video_c_api.cpp)
+set(_local_capi_srcs ${DAPPLE_CAPI_SOURCES} ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp ${PROJECT_SOURCE_DIR}/core/engine/video/video_c_api.cpp)
 foreach(_t dapple_local_capi_tests dapple_local_sheets)
   if(_t STREQUAL "dapple_local_capi_tests")
     add_executable(${_t} engine/local_capi_tests.cpp ${_local_capi_srcs})
@@ -449,7 +449,7 @@ include(${PROJECT_SOURCE_DIR}/tests/engine/demosaic/demosaic.cmake)
 
 # Ultra HDR (gain-map JPEG) export: container, gain-map maths, session export (docs/engine/pipeline-architecture.md section 34). Compiles the C API in,
 # like the film tests; the session test skips (exit 77) without build/rawsamples.
-add_executable(dapple_uhdr_tests uhdr_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
+add_executable(dapple_uhdr_tests uhdr_tests.cpp ${DAPPLE_CAPI_SOURCES} ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
 target_link_libraries(dapple_uhdr_tests PRIVATE dapple_core dapple_stb)
 target_include_directories(dapple_uhdr_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/cli)
 target_compile_definitions(dapple_uhdr_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
@@ -465,7 +465,7 @@ foreach(id container reconstruct rule jpeg_source session)
 endforeach()
 
 # Ultra HDR cover of an HDR Motion Photo (section 30.14): cover_uhdr C API, container, both readers' rules, validate_json. Compiles the C API in.
-add_executable(dapple_motion_cover_uhdr_tests video/motion_cover_uhdr_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp
+add_executable(dapple_motion_cover_uhdr_tests video/motion_cover_uhdr_tests.cpp ${DAPPLE_CAPI_SOURCES} ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp
                ${PROJECT_SOURCE_DIR}/core/engine/video/video_c_api.cpp)
 target_link_libraries(dapple_motion_cover_uhdr_tests PRIVATE dapple_core dapple_stb)
 target_include_directories(dapple_motion_cover_uhdr_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/cli)
@@ -480,7 +480,7 @@ add_test(NAME motion.cover_uhdr COMMAND dapple_motion_cover_uhdr_tests WORKING_D
 set_tests_properties(motion.cover_uhdr PROPERTIES TIMEOUT 300)
 
 # Export metadata: Exif / ICC segments, location stripping (JPEG, Ultra HDR, Motion Photo), strip encoder, source reader, C API export.
-add_executable(dapple_export_meta_tests export_meta_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
+add_executable(dapple_export_meta_tests export_meta_tests.cpp ${DAPPLE_CAPI_SOURCES} ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
 target_link_libraries(dapple_export_meta_tests PRIVATE dapple_core dapple_stb)
 target_include_directories(dapple_export_meta_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/cli)
 target_compile_definitions(dapple_export_meta_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
@@ -496,7 +496,7 @@ foreach(id icc exif jpeg strip uhdr motion reader session)
 endforeach()
 
 # Display P3 export (colorSpace "p3"): identity of the sRGB default, tags, chroma kept, equality inside sRGB, hue, CPU / GPU parity, Ultra HDR, evidence.
-add_executable(dapple_p3_tests p3_export_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
+add_executable(dapple_p3_tests p3_export_tests.cpp ${DAPPLE_CAPI_SOURCES} ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
 target_link_libraries(dapple_p3_tests PRIVATE dapple_core dapple_stb)
 target_include_directories(dapple_p3_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/cli)
 target_compile_definitions(dapple_p3_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
@@ -506,7 +506,7 @@ if(MSVC)
 else()
   target_compile_options(dapple_p3_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-if(TARGET dapple_gpu)  # the parity id needs the GPU export path (c_api.cpp is compiled in here, so DAPPLE_HAVE_GPU comes from this link)
+if(TARGET dapple_gpu)  # the parity id needs the GPU export path (the C API sources are compiled in here, so DAPPLE_HAVE_GPU comes from this link)
   target_link_libraries(dapple_p3_tests PRIVATE dapple_gpu)
   target_include_directories(dapple_p3_tests PRIVATE ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/core/gpu/src)
 endif()
@@ -516,7 +516,7 @@ foreach(id identity tags chroma direct direct_small inside inside_small hue pari
 endforeach()
 
 # Batch base swatches (dapple_session_base_previews): per-base frame equality, final-render tolerance, modern / unknown ids, cancellation, interaction yield.
-add_executable(dapple_base_previews_tests base_previews_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
+add_executable(dapple_base_previews_tests base_previews_tests.cpp ${DAPPLE_CAPI_SOURCES} ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
 target_link_libraries(dapple_base_previews_tests PRIVATE dapple_core dapple_stb)
 target_include_directories(dapple_base_previews_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/cli)
 target_compile_definitions(dapple_base_previews_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
@@ -550,7 +550,7 @@ target_include_directories(dapple_stock_switch_bench PRIVATE ${PROJECT_SOURCE_DI
 
 # Streaming (band) export: band-vs-whole equality over the edit matrix (CPU, GPU executor), the bounded peak on a synthetic 60 MP mosaic, the
 # per-stage memory probe (`mem` subcommand). Compiles the C API in. docs/engine/pipeline-architecture.md section 42.
-add_executable(dapple_export_stream_tests export_stream_tests.cpp ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
+add_executable(dapple_export_stream_tests export_stream_tests.cpp ${DAPPLE_CAPI_SOURCES} ${PROJECT_SOURCE_DIR}/core/src/film_swatch.cpp)
 target_link_libraries(dapple_export_stream_tests PRIVATE dapple_core dapple_stb)
 target_include_directories(dapple_export_stream_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/cli)
 target_compile_definitions(dapple_export_stream_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}" $<$<BOOL:${DAPPLE_FILM_AVX2}>:DAPPLE_FILM_HAVE_AVX2=1>)

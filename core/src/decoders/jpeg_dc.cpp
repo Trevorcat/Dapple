@@ -53,6 +53,7 @@ struct Bits {
     return int(buf >> (64 - k));
   }
   void drop(int k) {
+    if (n < k) fill();  // skipping coefficient bits that were not loaded yet (n would go negative and the next fill() shifts by 64 or more)
     buf <<= k;
     n -= k;
   }

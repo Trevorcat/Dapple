@@ -20,7 +20,8 @@
 // The C API under test is compiled into this executable (like dapple_film_tests): the registry and the thread pool are
 // process singletons.
 #include "../../deterministic.h"
-#include "../../../core/src/c_api.cpp"
+#include "../../../core/src/capi/session.h"
+#include "dapple/merge.h"
 #include "local_eval.h"
 #include "../../../cli/colour_metrics.h"
 

@@ -29,6 +29,9 @@ using dapple::engine::video::VideoFrameSession;
 thread_local std::string g_err;
 void setErr(std::string m) { g_err = std::move(m); }
 
+// UTF-8 string -> path (std::filesystem::u8path is deprecated).
+std::filesystem::path pathFromUtf8(const std::string& s) { return std::filesystem::path(std::u8string(s.begin(), s.end())); }
+
 }  // namespace
 
 struct DappleVideoEdit {
@@ -94,7 +97,7 @@ DAPPLE_API DappleVideoEdit* dapple_video_edit_open(const char* params_json, cons
   cfg.camera = cams.resolve(strOpt(opt, "cameraMake"), strOpt(opt, "cameraModel"));
   const std::string lutFile = (lut_path && lut_path[0]) ? std::string(lut_path) : params.lutPath;  // the edit's own look LUT when none is given
   if (!lutFile.empty()) {
-    auto lut = dapple::Lut3D::loadCube(std::filesystem::u8path(lutFile));
+    auto lut = dapple::Lut3D::loadCube(pathFromUtf8(lutFile));
     if (!lut) {
       setErr("lut: " + lut.error().message);
       return nullptr;
@@ -177,13 +180,13 @@ DAPPLE_API int32_t dapple_video_edit_output_kind(DappleVideoEdit* h, int32_t tag
 namespace {
 
 bool readAll(const char* path, std::vector<uint8_t>& out) {
-  std::ifstream f(std::filesystem::u8path(path ? path : ""), std::ios::binary);
+  std::ifstream f(pathFromUtf8(path ? path : ""), std::ios::binary);
   if (!f) return false;
   out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
   return !out.empty();
 }
 bool writeAllAtomic(const char* path, const std::vector<uint8_t>& b) {
-  const std::filesystem::path p = std::filesystem::u8path(path ? path : "");
+  const std::filesystem::path p = pathFromUtf8(path ? path : "");
   const std::filesystem::path tmp = p.string() + ".part";
   {
     std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -227,6 +230,7 @@ bool jpegSize(const std::vector<uint8_t>& j, int& w, int& h) {
   return false;
 }
 // Area average of a per-pixel plane into gw x gh.
+extern "C++" {
 std::vector<float> boxDown(const std::vector<float>& src, int w, int h, int gw, int gh) {
   std::vector<double> acc(size_t(gw) * gh, 0.0);
   std::vector<int> cnt(size_t(gw) * gh, 0);
@@ -242,6 +246,7 @@ std::vector<float> boxDown(const std::vector<float>& src, int w, int h, int gw, 
   for (size_t i = 0; i < out.size(); ++i) out[i] = cnt[i] ? float(acc[i] / cnt[i]) : 0.f;
   return out;
 }
+}  // extern "C++"
 
 }  // namespace
 

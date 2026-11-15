@@ -152,6 +152,9 @@ if(Threads_FOUND)
 endif()
 if(NOT MSVC)
   target_compile_options(dapple_gpu PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+  if(DAPPLE_WERROR)
+    target_compile_options(dapple_gpu PRIVATE -Werror)
+  endif()
 endif()
 
 # The C API library (libdapple.so / dapple.dll) carries the backend behind the runtime flag (default off), see

@@ -18,10 +18,10 @@ if(ANDROID)
   target_link_libraries(dapple PRIVATE android)
 endif()
 
-# Native tests (loop semantics + view lifecycle on the null presenter). c_api.cpp is compiled in, not the DLL, like film_tests.
+# Native tests (loop semantics + view lifecycle on the null presenter). the C API sources (DAPPLE_CAPI_SOURCES) are compiled in, not the DLL, like film_tests.
 if(DAPPLE_BUILD_TESTS AND NOT ANDROID)
   add_executable(dapple_present_tests ${_p}/present_tests.cpp ${_p}/render_loop.cpp ${_p}/null_presenter.cpp ${_p}/view.cpp
-                 ${PROJECT_SOURCE_DIR}/core/src/c_api.cpp)
+                 ${DAPPLE_CAPI_SOURCES})
   target_link_libraries(dapple_present_tests PRIVATE dapple_core)
   if(APPLE)
     target_sources(dapple_present_tests PRIVATE ${_p}/metal_presenter.mm)

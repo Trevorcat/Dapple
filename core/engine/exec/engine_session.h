@@ -183,8 +183,8 @@ class EngineSession {
     float resizeSharpen = 0.2f;
     int latticeN = 65;          // lattice size of the bake
     bool forceStream = false;   // tests: never keep the source resident
-    GpuTarget target;           // target.sink receives the tiles
-    std::function<void(int w, int h)> onSize;  // the output size, called before the first tile (allocate the destination here)
+    GpuTarget target{};         // target.sink receives the tiles
+    std::function<void(int w, int h)> onSize{};  // the output size, called before the first tile (allocate the destination here)
   };
   // 0 = done, 1 = the GPU cannot / did not do it (nothing written to the sink beyond what an aborted run left; the caller renders on the CPU),
   // -1 = cancelled / failed hard (err).

@@ -327,7 +327,7 @@ cmake ... -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDR
 | `core/gpu/src/gpu_bench.cpp` | `dapple gpu-bench`：全管线分 pass 计时、上传、回读、CPU vs GPU、1600 px / 26 MP / tile 60 MP |
 | `core/include/dapple/frame_plan.h`；`renderer.h/.cpp` 末尾各加一个只读访问器 | `Renderer::framePlan()`（几何、增益、暗角、空间参数，**由 CPU 参考解析**，GPU 不重复实现参数逻辑）与 `Renderer::bakeOverflow()`（第二格点） |
 
-共享文件的改动（均为追加）：`renderer.h/.cpp`（上述两个方法）、`c_api.cpp`（`#ifdef DAPPLE_HAVE_GPU` 的 3 处钩子 + 2 个 C 函数）、`dapple_c.h`（`dapple_gpu_set_enabled`、`dapple_gpu_status_json`）、`tests/CMakeLists.txt`（`if(TARGET dapple_gpu)` 块）、`app/android/app/build.gradle.kts`（`-Pdapple.gpu=true` 时加 `-DDAPPLE_GPU=ON`）。`core/gpu/CMakeLists.txt` 末尾让 `dapple` 共享库链接 `dapple_gpu`，未开 `DAPPLE_GPU` 的构建不含任何 GPU 代码。
+共享文件的改动（均为追加）：`renderer.h/.cpp`（上述两个方法）、`capi/*.cpp`（`#ifdef DAPPLE_HAVE_GPU` 的 3 处钩子 + 2 个 C 函数）、`dapple_c.h`（`dapple_gpu_set_enabled`、`dapple_gpu_status_json`）、`tests/CMakeLists.txt`（`if(TARGET dapple_gpu)` 块）、`app/android/app/build.gradle.kts`（`-Pdapple.gpu=true` 时加 `-DDAPPLE_GPU=ON`）。`core/gpu/CMakeLists.txt` 末尾让 `dapple` 共享库链接 `dapple_gpu`，未开 `DAPPLE_GPU` 的构建不含任何 GPU 代码。
 
 ### 10.2 架构
 

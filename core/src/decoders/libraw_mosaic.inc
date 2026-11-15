@@ -328,7 +328,7 @@ void attachMosaicAnchor(ShotMetadata& meta, const MosaicImage& m, const std::fil
   tmp.meta = meta;
   const auto ta0 = std::chrono::steady_clock::now();
   const char* fastEnv = std::getenv("DAPPLE_ANCHOR_FAST");
-  const int bstep = fastEnv && std::strcmp(fastEnv, "off") == 0 || std::max(m.width, m.height) < 4096 ? 1 : 2;
+  const int bstep = (fastEnv && std::strcmp(fastEnv, "off") == 0) || std::max(m.width, m.height) < 4096 ? 1 : 2;
   if (m.opcodeList3.empty()) {
     tmp.linear = demosaic::binnedOriented(m, bstep);
   } else {  // the preview the anchor is compared with is geometry-corrected: warp the binned frame like finishMosaicRgb does the full one, then crop and orient

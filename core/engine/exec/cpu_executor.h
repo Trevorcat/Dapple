@@ -76,14 +76,14 @@ struct ExecEnv {
   // `prepare` is called with the plan's window of the frame the head is about to compute (before every head run; the session hands the source
   // pixels of its source window to the point::CpuFrame) and `bandDone` with each finished band of the output sweep (rows [y0, y1) of the frame,
   // in order, the pixels in `out`). A false return aborts the run (Status::Cancelled).
-  std::function<bool(const TileWin& win)> prepare;
-  std::function<bool(int y0, int y1)> bandDone;
+  std::function<bool(const TileWin& win)> prepare{};
+  std::function<bool(int y0, int y1)> bandDone{};
   // Streaming export of a film frame (section 42.6): filmBegin replaces the whole-frame film stage (the film's pre-passes; false = render
   // the frame whole), filmRows(y0, y1, out) renders rows of the film plane before the head reads them, filmAux fills the side planes of
   // a work window (the local adjustments of a film frame come from its input pass).
-  std::function<bool()> filmBegin;
-  std::function<bool(int y0, int y1, ImageF& out)> filmRows;
-  std::function<bool(int x0, int y0, int x1, int y1, const local::AuxTarget& aux)> filmAux;
+  std::function<bool()> filmBegin{};
+  std::function<bool(int y0, int y1, ImageF& out)> filmRows{};
+  std::function<bool(int x0, int y0, int x1, int y1, const local::AuxTarget& aux)> filmAux{};
 };
 
 class CpuExecutor {

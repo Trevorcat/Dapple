@@ -448,7 +448,7 @@ Status runPrintExposure(const CpuCtx& c, const void* res, std::span<const ImageV
   const int n = rw(o);
   if (n <= 0) return Status::Ok;
   thread_local std::vector<float> rowD, rowO;
-  if (int(rowD.size()) < 3 * std::size_t(n)) rowD.resize(std::size_t(3) * n), rowO.resize(std::size_t(3) * n);
+  if (rowD.size() < std::size_t(3) * std::size_t(n)) rowD.resize(std::size_t(3) * n), rowO.resize(std::size_t(3) * n);
   for (int y = o.y0; y < o.y1; ++y) {
     interleave(planeRow(in[0], 0, y, o.x0), planeRow(in[0], 1, y, o.x0), planeRow(in[0], 2, y, o.x0), rowD.data(), n);
     ks.printRaw(view, rowD.data(), rowO.data(), n);

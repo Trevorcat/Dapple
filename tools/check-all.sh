@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# One-command verification. Usage: tools/check-all.sh [--heavy] [--quick] [--android] [--emu] [--keep-going(default)] [--fail-fast]
+# One-command verification. Usage: tools/check-all.sh [--heavy] [--quick] [--android] [--emu] [--asan] [--keep-going(default)] [--fail-fast]
 #   default : desktop core build (GPU on, SwiftShader) + the default ctest set (label heavy excluded; budget: about 25 s), golden selfcheck,
 #             flutter analyze, flutter test, host video tests
 #   --heavy   also the tests labelled heavy (full-size exports, software-GPU runs: many minutes), the OpenCV-ON build with merge_tests, JVM unit tests
 #   --quick   skip slow suites (gpu_parity_swiftshader, JVM unit tests, flutter test)
 #   --android NDK arm64-v8a + x86_64 core builds and debug APK builds
 #   --emu     on-emulator native video suite + dapple_golden selfcheck (free port; starts/stops its own emulator)
+#   --asan    separate tree build/check-asan (GPU and OpenCV off): core, cli and tests with AddressSanitizer + UBSan (clang; /fsanitize=address with MSVC), the default ctest set
+#             on it; any report fails the step (halt_on_error). Leak detection is not available on Windows. Slow: a full rebuild the first time.
 # Logs: build/check/logs/<step>.log ; summary: build/check/logs/summary.txt. Exit code non-zero if any step FAILs.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)"; R="$(cd "$HERE/.." && pwd -W)"
 source "$HERE/env.sh"
 export MSYS_NO_PATHCONV=1
-QUICK=0; ANDROID=0; EMU=0; FAILFAST=0; HEAVY=0
+QUICK=0; ANDROID=0; EMU=0; FAILFAST=0; HEAVY=0; ASAN=0
 for a in "$@"; do case "$a" in
-  --quick) QUICK=1;; --heavy) HEAVY=1;; --android) ANDROID=1;; --emu) EMU=1;; --fail-fast) FAILFAST=1;;
+  --quick) QUICK=1;; --heavy) HEAVY=1;; --android) ANDROID=1;; --emu) EMU=1;; --asan) ASAN=1;; --fail-fast) FAILFAST=1;;
   -h|--help) sed -n 2,8p "$0"; exit 0;; *) echo "unknown flag $a"; exit 2;; esac; done
 LOGS="$R/build/check/logs"; mkdir -p "$LOGS"; rm -f "$LOGS"/*.log "$LOGS/summary.txt"
 RES=(); FAILED=0; NJ="${JOBS:-$(nproc)}"
@@ -70,6 +72,18 @@ desktop_opencv() {
   ( cd "$OCV_BD" && ctest --output-on-failure -R 'merge_tests' ) || return 1
   ( cd "$R" && "$OCV_BD/bin/dapple_golden" selfcheck )
 }
+# AddressSanitizer + UndefinedBehaviorSanitizer (llvm-mingw clang): the runtime is the DLL libclang_rt.asan_dynamic-x86_64.dll in the toolchain's bin, found
+# through PATH (tools/env.sh); the tree is not linked -static (DAPPLE_ASAN). Same compiler and flags as check-desktop otherwise, GPU and OpenCV off.
+ASAN_BD="$R/build/check-asan"
+asan_check() {
+  if [ ! -f "$ASAN_BD/build.ninja" ]; then
+    cmake -S "$R" -B "$ASAN_BD" -G Ninja -DCMAKE_BUILD_TYPE=Release       -DCMAKE_C_COMPILER="$TC_BIN/clang.exe" -DCMAKE_CXX_COMPILER="$TC_BIN/clang++.exe"       -DCMAKE_MAKE_PROGRAM="$HERE/ninja/ninja.exe"       -DDAPPLE_ASAN=ON -DDAPPLE_BUILD_CLI=ON -DDAPPLE_BUILD_TESTS=ON -DDAPPLE_WITH_OPENCV=OFF -DDAPPLE_GPU=OFF || return 1
+  fi
+  cmake --build "$ASAN_BD" -j "$NJ" || return 1
+  local nj=$(( $(nproc) > 6 ? $(nproc) - 4 : 2 ))
+  ( cd "$ASAN_BD" && ASAN_OPTIONS="detect_leaks=0:abort_on_error=0" UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"       ctest --output-on-failure -j "${CTEST_JOBS:-$nj}" -LE heavy --timeout 300 )
+}
+
 flutter_analyze() { cd "$R/app" && flutter analyze --no-pub; }
 flutter_test() { cd "$R/app" && flutter test --no-pub; }
 jvm_tests() { unset MSYS_NO_PATHCONV; cd "$(cygpath -u "$R/app/android")" && ./gradlew --no-daemon -q :app:testDebugUnitTest; }
@@ -88,6 +102,8 @@ if [ $QUICK = 1 ]; then skip flutter-test "--quick"; skip jvm-unit-tests "--quic
   step flutter-test flutter_test
   if [ $HEAVY = 1 ]; then step jvm-unit-tests jvm_tests; else skip jvm-unit-tests "only with --heavy"; fi; fi
 step video-host video_host
+
+if [ $ASAN = 1 ]; then step asan-ubsan asan_check; else skip asan-ubsan "only with --asan"; fi
 
 if [ $ANDROID = 1 ]; then
   droid() { # abi

@@ -42,7 +42,7 @@ inline int pmod(int a, int n) { return ((a % n) + n) % n; }
 constexpr int kHalfTab = 40 + 4096 + 576 + 144;     // first float of the half-resolution tables in the table buffer (demosaic_half.comp: HT)
 constexpr int kTabFloats = kHalfTab + 1728 * 2 + 576;
 
-float halfToFloat(std::uint16_t h) {
+[[maybe_unused]] float halfToFloat(std::uint16_t h) {  // not used where __fp16 converts in hardware (aarch64)
   const std::uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
   std::uint32_t f;
   if (e == 0) {

@@ -166,6 +166,9 @@ if(MSVC)
   target_compile_options(dapple_core PRIVATE /W4 /utf-8)
 else()
   target_compile_options(dapple_core PRIVATE -Wall -Wextra -Wno-unused-parameter -fno-math-errno)
+  if(DAPPLE_WERROR)
+    target_compile_options(dapple_core PRIVATE -Werror)
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -175,7 +178,7 @@ endif()
 # ---------------------------------------------------------------------------
 # film_swatch.cpp (a C API function of its own) is compiled into the shared library itself: as a member of the static core nothing
 # references it, so the linker would drop it from libdapple.
-add_library(dapple SHARED src/c_api.cpp src/film_swatch.cpp engine/video/video_c_api.cpp engine/video/video_jni.cpp)
+add_library(dapple SHARED ${DAPPLE_CAPI_SOURCES} src/film_swatch.cpp engine/video/video_c_api.cpp engine/video/video_jni.cpp)
 target_include_directories(dapple PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dapple PRIVATE dapple_core)
 target_compile_definitions(dapple PRIVATE DAPPLE_VERSION_STRING="${PROJECT_VERSION}")
@@ -190,6 +193,10 @@ if(MSVC)
   target_compile_options(dapple PRIVATE /W4 /utf-8)
 else()
   target_compile_options(dapple PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  if(DAPPLE_WERROR)
+    # the presenter (core/engine/present, Android) builds Vulkan structs with the idiomatic { sType } initialiser
+    target_compile_options(dapple PRIVATE -Werror -Wno-missing-field-initializers)
+  endif()
 endif()
 if(ANDROID)
   target_link_libraries(dapple_core PUBLIC log)  # engine_session.cpp logs via __android_log_print (static consumers: tests, cli)

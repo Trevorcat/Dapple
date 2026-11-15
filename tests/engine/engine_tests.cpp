@@ -8,7 +8,7 @@
 //
 // The C API is compiled into the executable (like dapple_film_tests): process singletons.
 #include "../deterministic.h"
-#include "../../core/src/c_api.cpp"
+#include "../../core/src/capi/session.h"
 
 #include <algorithm>
 #include <chrono>

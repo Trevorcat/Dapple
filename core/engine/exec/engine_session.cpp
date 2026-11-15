@@ -426,7 +426,7 @@ bool EngineSession::renderExact(const EditParams& params, const engine::point::P
     env.filmBegin = [&] { return fk.filmStreamBegin(&filmWhy); };
     env.filmRows = [&](int y0, int y1, ImageF& o) { return fk.filmStreamRows(y0, y1, o); };
     env.filmAux = [&](int x0, int y0, int x1, int y1, const local::AuxTarget& a) { return fk.filmStreamAux(x0, y0, x1, y1, a); };
-    env.prepare = [&](const TileWin& tw) {
+    env.prepare = [&, W](const TileWin& tw) {  // W is a block local: capture it by value, the executor runs after the block
       // the plan's source window of the tile (the same the GPU executor streams)
       int sx0 = tw.source.x0, sy0 = tw.source.y0, sx1 = tw.source.x1, sy1 = tw.source.y1;
       if (haveWin && sx0 >= winX0 && sy0 >= winY0 && sx1 <= winX1 && sy1 <= winY1) return true;

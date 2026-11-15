@@ -23,8 +23,14 @@ if(NOT DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
   set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
 
+# Local gate `tools/check-all.sh --asan`: AddressSanitizer (+ UBSan with clang) for core/, cli/ and tests/; the third-party libraries configured above stay
+# plain. MSVC has no UBSan. The llvm-mingw ASan runtime is a DLL, so the sanitizer build is not linked -static.
+option(DAPPLE_ASAN "Build core, cli and tests with AddressSanitizer (+ UBSan with clang)" OFF)
+# Treat warnings of core/ as errors (clang / gcc; MSVC /W4 is not gated).
+option(DAPPLE_WERROR "Compile core/ with -Werror" ON)
+
 # Self-contained Windows binaries (llvm-mingw): no libc++.dll / libunwind.dll next to the exe.
-if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT MSVC AND NOT DAPPLE_ASAN)
   add_link_options(-static)
 endif()
 
@@ -39,6 +45,16 @@ if(DAPPLE_WITH_OPENCV)
   include(cmake/OpenCV.cmake)
 endif()
 
+if(DAPPLE_ASAN)
+  if(MSVC)
+    add_compile_options(/fsanitize=address)
+  else()
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g1)
+    add_link_options(-fsanitize=address,undefined)
+  endif()
+endif()
+
+include(core/src/capi/sources.cmake)
 add_subdirectory(core)
 include(core/video/host.cmake)  # desktop video core (only when tools/ffmpeg/build-host.sh has run)
 
