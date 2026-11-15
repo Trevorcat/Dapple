@@ -46,12 +46,16 @@ namespace dapple {
 // The baked point stages of one parameter set (the HostTable payloads the executors read).
 struct BakedLut {
   int n = 0;
-  std::vector<float> rgb;       // n^3 * 3 encoded display values, index ((b * n + g) * n + r) * 3
+  // n^3 * 3 encoded display values, index ((b * n + g) * n + r) * 3. Shared and immutable: the bakes of one colour stage (every tone,
+  // exposure and white balance change) hold the same lattice as the ColourLattice cache entry, nothing copies it.
+  std::shared_ptr<const std::vector<float>> rgb;
   std::vector<float> toneMove;  // curve of EditParams::toneTarget (empty = none), for exact fallbacks
   std::vector<float> tone;      // luminance ratio of the tone stage over log2(Y) (kernels.h, LutSampler)
   ToneAnalysis analysis;        // tonal analysis of the render with these point-wise parameters
   std::string key;              // what it was baked from (point::pointKey + n)
   std::string colourKey;        // what `rgb` alone depends on (point::colourKey): equal keys -> the lattice is reusable
+  std::string latticeKey;       // the lattice's own identity (colour stage + n): equal keys -> the same device lattice (the GPU uploads it once)
+  std::size_t latticeFloats() const { return rgb ? rgb->size() : 0; }
 };
 
 // Process-wide counters of the bake pieces (tests, edit-bench): how many lattices were evaluated vs. reused and how
@@ -142,15 +146,14 @@ std::shared_ptr<const BakedLut> bake(const Params& r, const SourceImage& source,
                                      bool fastAnalysis = false);
 // The n^3 colour lattice (n clamped 17..65; 3 floats when latticeFilmOnly). Does not depend on the tone stage.
 std::vector<float> bakeColourLattice(const Params& r, const SourceImage& source, int n);
-// Tonal analysis and tonal-class move. `fast` takes the analysis through `*rgb` (the lattice of size n; moved into a scratch BakedLut and
-// back, so it is unchanged on return); otherwise through the exact pipeline, and only when the move is on -- `has` is false when nothing
-// was analysed.
+// Tonal analysis and tonal-class move. `fast` takes the analysis through `*rgb` (the lattice of size n, only read); otherwise through the exact
+// pipeline, and only when the move is on -- `has` is false when nothing was analysed.
 struct TonePre {
   ToneAnalysis analysis;
   std::vector<float> toneMove;
   bool has = false;
 };
-TonePre bakeTonePre(const Params& r, const SourceImage& source, std::vector<float>* rgb, int n, bool fast);
+TonePre bakeTonePre(const Params& r, const SourceImage& source, const std::vector<float>* rgb, int n, bool fast);
 // Fills out.tone and out.toneMove (the 1D luminance table of the tone stage).
 void bakeToneTable(const Params& r, const SourceImage& source, const TonePre& pre, BakedLut& out);
 // The tonal analysis of the render: pre.analysis when available, else the exact one.

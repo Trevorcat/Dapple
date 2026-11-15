@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -22,6 +23,7 @@
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session_internal.h"
 #include "local_eval.h"
+#include "parallel.h"
 #include "warp_field.h"
 
 namespace dapple::engine::filmnode {
@@ -185,6 +187,9 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
   if (n > 0 && n < int(sizeof line))
     std::snprintf(line + n, sizeof line - std::size_t(n), " | cpu_ms %.1f (match %.1f point %.1f graph %.1f tables %.1f exec %.1f; upload %.1f gpu %.1f) max %.1f", c.totalMs, c.matchMs,
                   c.rendererMs, c.graphMs, c.tablesMs, c.execMs, out.gpu.uploadMs, out.gpu.gpuMs, std::max(maxMs, c.totalMs));
+  if (const std::size_t len = std::strlen(line); len + 96 < sizeof line)  // inside `tables`: the table nodes baked this frame and the bake assembly
+    std::snprintf(line + len, sizeof line - len, " | tables_ms lat %.1f pre %.1f tone %.1f ov %.1f an %.1f asm %.1f", c.latticeMs, c.preMs, c.toneMs, c.overflowMs,
+                  c.analysisMs, c.assembleMs);
   if (engine::point::filmActive(job.point.p)) {  // background print tables of the film drag (wave 8): frames that used the previous step, tables finished, requests
     unsigned long long su = 0, bk = 0, rq = 0;
     filmnode::filmAsyncTableStats(&su, &bk, &rq);
@@ -481,6 +486,10 @@ bool EngineSession::renderExact(const EditParams& params, const engine::point::P
 
 bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   const auto t0 = Clock::now();
+  // the table stage is a few short pool jobs between serial pieces (lattice, the proxy's tonal analysis, overflow): wake the workers now and
+  // keep them spinning until the tables are done, so no job waits for a worker to come out of an idle core
+  std::optional<ThreadPool::WarmScope> warm;
+  if (!sys::inBackground()) warm.emplace(ThreadPool::instance());  // background frames run on the background pool or serially
   frameWhy_.clear();
   ParamInputs in;
   in.edit = job.params;
@@ -522,6 +531,7 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
   const auto tTables = Clock::now();
   out.cpu.graphMs = msSince(t0);
   const std::shared_ptr<const BakedLut> bake = runHostTables(job, ps, n, out);
+  warm.reset();
   out.cpu.tablesMs = msSince(tTables);
   if (!bake) {
     if (out.error.empty()) out.error = "tables";

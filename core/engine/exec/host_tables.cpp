@@ -34,7 +34,7 @@ std::shared_ptr<std::vector<float>> evalColourLattice(const TableEnv& env, int n
   return as<std::vector<float>>(bakeNode(NodeType::ColourLattice, &c));
 }
 
-engine::point::TonePre evalToneAnalysisPre(const TableEnv& env, std::vector<float>* lattice, int n, bool fast) {
+engine::point::TonePre evalToneAnalysisPre(const TableEnv& env, const std::vector<float>* lattice, int n, bool fast) {
   const TableBakeCtx c{&env, n, fast, 0.f};
   const void* in[1] = {lattice};
   const auto p = as<engine::point::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &c, in));
@@ -137,6 +137,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
       const void* in[1] = {lattice.get()};
       const auto made = as<engine::point::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &bc, in));
       pre = made ? *made : engine::point::TonePre{};
+      out.cpu.preMs += session::msSince(t0);
       put(slotOf(NodeType::ToneAnalysisPre), tk.pre, tk.pre, 0, std::make_shared<engine::point::TonePre>(pre),
           sizeof(engine::point::TonePre) + pre.toneMove.size() * 4, t0);
       ++stats_.preBuilds;
@@ -166,6 +167,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
         out.error = "colour lattice";
         return nullptr;
       }
+      out.cpu.latticeMs = session::msSince(t0);
       latticeN = nReq;
       latticeKey = withOrder(latN->family, nReq);
       put(slotOf(NodeType::ColourLattice), latticeKey, latN->family, nReq, lattice, lattice->size() * sizeof(float), t0);
@@ -181,19 +183,21 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
       const void* in[1] = {p};
       const auto made = as<ToneTableOut>(bakeNode(NodeType::ToneTable, &bc, in));
       tt = made ? *made : ToneTableOut{};
+      out.cpu.toneMs = session::msSince(t0) - out.cpu.preMs;
       put(slotOf(NodeType::ToneTable), tk.tone, tk.tone, 0, std::make_shared<ToneTableOut>(tt), (tt.tone.size() + tt.toneMove.size()) * 4, t0);
       ++stats_.toneTableBuilds;
     }
     const auto t0 = Clock::now();
     auto nb = std::make_shared<BakedLut>();
     nb->n = latticeN;
-    nb->rgb = *lattice;
+    nb->rgb = lattice;  // shared with the ColourLattice entry (that entry accounts its bytes)
     nb->tone = std::move(tt.tone);
     nb->toneMove = std::move(tt.toneMove);
     const Hash128 ak = combine(tk.tone, tk.lattice);
     nb->key = ak.hex() + "#" + std::to_string(latticeN);
     nb->colourKey = latN->family.hex();
-    put(kBakeSlot, ak, tk.tone, latticeN, nb, nb->rgb.size() * 4 + nb->tone.size() * 4, t0, latticeKey);
+    nb->latticeKey = latticeKey.hex();
+    put(kBakeSlot, ak, tk.tone, latticeN, nb, nb->tone.size() * 4 + nb->toneMove.size() * 4 + sizeof(BakedLut), t0, latticeKey);
     // a lattice lives exactly as long as a retained bake refers to it
     const std::vector<ResultCache::Entry> live = cache_.entries(kBakeSlot);
     cache_.eraseIf([&](const ResultCache::Entry& le) {
@@ -203,6 +207,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
       return true;
     });
     bl = nb;
+    out.cpu.assembleMs = session::msSince(t0);
   }
 
   if (ovN && !cache_.contains(slotOf(NodeType::LatticeOverflow), tk.overflow)) {  // overflow lattice for a GPU executor: cached by its own key
@@ -210,6 +215,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
     const TableBakeCtx bc{&env, 33, false, 8.f};
     auto v = as<std::vector<float>>(bakeNode(NodeType::LatticeOverflow, &bc));
     if (!v) v = std::make_shared<std::vector<float>>();
+    out.cpu.overflowMs = session::msSince(t0);
     put(slotOf(NodeType::LatticeOverflow), tk.overflow, tk.overflow, 0, v, v->size() * 4, t0);
   }
 
@@ -223,6 +229,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
       const void* in[1] = {p};
       const auto made = as<ToneAnalysis>(bakeNode(NodeType::Analysis, &bc, in));
       out.analysis = made ? *made : ToneAnalysis{};
+      out.cpu.analysisMs = session::msSince(t0);
       put(slotOf(NodeType::Analysis), tk.analysis, tk.analysis, 0, std::make_shared<ToneAnalysis>(out.analysis), out.analysis.histogram.size() * 4 + 128, t0);
       ++stats_.analysisBuilds;
     }

@@ -161,7 +161,7 @@ class ThreadPool {
   }
 
   void loop(int idx) {
-    unsigned seen = 0;
+    unsigned seen = 0, warmSeen = 0;
     if (!std::getenv("DAPPLE_THREADS")) sys::setAffinity(sys::poolCpus(sys::topology()));
     if (!bg_) sys::setInteractivePriority();
     {
@@ -174,14 +174,26 @@ class ThreadPool {
         // A frame is a dozen passes back to back: spin briefly (bounded, spinUs_) for the next pass so the
         // workers are not put to sleep and woken (a futex round trip per pass, far slower in a VM or when the
         // core drops to a low clock), then block on the condition variable: an idle pool costs no CPU.
-        const auto spinEnd = std::chrono::steady_clock::now() + std::chrono::microseconds(spinUs_);
+        // While a WarmScope is open the spin lasts up to kWarmSpinUs (the next job of the scope starts on a running worker); past the normal
+        // spin the worker yields its cpu at every check, so a thread that is ready to run there (the frame thread, a driver thread) is not
+        // kept waiting by a spinning worker when the cpus are oversubscribed.
+        const auto spin0 = std::chrono::steady_clock::now();
+        const auto spinEnd = spin0 + std::chrono::microseconds(spinUs_), warmEnd = spin0 + std::chrono::microseconds(kWarmSpinUs);
         int k = 0;
         while (gen_.load(std::memory_order_acquire) == seen) {
-          if ((++k & 63) == 0 && std::chrono::steady_clock::now() > spinEnd) break;
+          if ((++k & 63) == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now > spinEnd) {
+              if (warm_.load(std::memory_order_relaxed) <= 0 || now > warmEnd) break;
+              std::this_thread::yield();
+            }
+          }
           sys::cpuRelax();
         }
         std::unique_lock<std::mutex> lock(mtx_);
-        cvWork_.wait(lock, [&] { return generation_ != seen; });
+        cvWork_.wait(lock, [&] { return generation_ != seen || warmGen_ != warmSeen; });
+        warmSeen = warmGen_;
+        if (generation_ == seen) continue;  // woken by a WarmScope: spin until its job comes (or the scope closes)
         seen = generation_;
         mine = idx < active_;
       }
@@ -207,12 +219,38 @@ class ThreadPool {
   std::atomic<unsigned> gen_{0};      // mirror of generation_ for the lock-free spin
   std::atomic<int> pendingA_{0};      // mirror of pending_ for the caller's spin
   int spinUs_ = 60;  // bounded spin before blocking (one pass gap is typically 5-50 us); env DAPPLE_SPIN_US
+  std::atomic<int> warm_{0};  // open WarmScopes: the workers keep spinning between jobs
+  static constexpr int kWarmSpinUs = 2000;  // longest idle spin inside a WarmScope (a table stage's serial gaps are shorter)
+  unsigned warmGen_ = 0;      // bumped (under mtx_) when a WarmScope opens: wakes sleeping workers into the spin
   int active_ = 0;
   bool bg_ = false;
   std::atomic<int> limit_{1};
   std::vector<int> tids_;
 
  public:
+  // A stretch of the calling thread with several short jobs separated by serial work (an interactive frame's table stage): the sleeping
+  // workers are woken now, while the caller still works alone, and keep spinning between jobs (up to kWarmSpinUs idle) until the scope closes. On a phone a worker
+  // woken from an idle core takes milliseconds to start and the job waits for it; a warm worker joins at once. Nests; jobs from inside a
+  // job and background threads are unaffected.
+  class WarmScope {
+   public:
+    explicit WarmScope(ThreadPool& p) : p_(p) { p_.warmBegin(); }
+    ~WarmScope() { p_.warm_.fetch_sub(1, std::memory_order_relaxed); }
+    WarmScope(const WarmScope&) = delete;
+    WarmScope& operator=(const WarmScope&) = delete;
+
+   private:
+    ThreadPool& p_;
+  };
+  void warmBegin() {
+    if (threads_ <= 0) return void(warm_.fetch_add(1, std::memory_order_relaxed));
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      warm_.fetch_add(1, std::memory_order_relaxed);
+      ++warmGen_;
+    }
+    cvWork_.notify_all();
+  }
   // Total threads (caller included) a job may use; 0 / out of range = all.
   void setLimit(int n) { limit_.store(n <= 0 ? threads_ + 1 : std::min(n, threads_ + 1)); }
   int size() const { return threads_ + 1; }

@@ -20,6 +20,7 @@
 #include "engine/nodes/frame_facts.h"
 #include "engine/nodes/point/point.h"
 #include "look_internal.h"
+#include "parallel.h"
 
 namespace dapple::engine::point {
 
@@ -590,7 +591,7 @@ struct LutSampler {
   float maxU;
   int sr, sg, sb;
 
-  explicit LutSampler(const BakedLut& l) : t(l.rgb.data()), tone(l.tone.data()), n(l.n) {
+  explicit LutSampler(const BakedLut& l) : t(l.rgb ? l.rgb->data() : nullptr), tone(l.tone.data()), n(l.n) {
     scale = float(n - 1);
     maxU = float(n - 1) - 1e-4f;
     sr = 3;
@@ -653,15 +654,20 @@ struct LutSampler {
   }
 };
 
+// Every entry is independent, so the parallel fill is bit-identical to a serial one (inline when called from inside a pool job).
 template <class Op>
 void fillToneTable(std::vector<float>& tone, const Op& op) {
   tone.resize(kToneN);
-  for (int i = 0; i < kToneN; ++i) {
-    const std::uint32_t bits = std::uint32_t(i + kToneBase) << 15;
-    float y;
-    std::memcpy(&y, &bits, 4);
-    tone[std::size_t(i)] = op.toneRatio(y);
-  }
+  float* o = tone.data();
+  parallelFor(
+      kToneN,
+      [&](int i) {
+        const std::uint32_t bits = std::uint32_t(i + kToneBase) << 15;
+        float y;
+        std::memcpy(&y, &bits, 4);
+        o[i] = op.toneRatio(y);
+      },
+      1024);
 }
 
 // EV range (around mid-grey) that a frame's tone curve shows well (the single-image HDR leaves it alone).

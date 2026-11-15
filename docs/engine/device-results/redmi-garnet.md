@@ -499,3 +499,30 @@ Paced like a 120 Hz display (`DAPPLE_BENCH_PERIOD_MS=8.33`, final defaults, 3 re
 **Not done.** A second, lower-priority queue (VK_EXT_global_priority, EGL_IMG_context_priority): not built; with units the remaining wait is at most one or two 1.5 ms units, while the dominant first-frame costs (wake-up, low clock) are not queueing, so no priority changes them. Ending the window early once the clock is up: not done (bounded by time). In-app measurement: not done; `app/` is unchanged (it already calls the hint on pointer-down with 80 ms and the prepare form once per photo). The screen was woken once with `input keyevent KEYCODE_WAKEUP` (no setting changed); results are given for both device states seen.
 
 Tests: `engine.gpu_keepwarm` (+ `_swiftshader`, `tests/engine/gpu/keep_warm_tests.cpp`): frames inside a window bit-identical to the reference, units queued behind real frames, hold window ~250 ms, nothing submitted while a real frame is pending, `DAPPLE_HINT_MODE=off`; passes on the desktop (RTX 4060 Ti, SwiftShader) and on the Redmi (Adreno 710). Desktop `build/hint-desk`: GPU / engine / exec / film / demosaic ctest (109, then 21 after the last change) passed, `dapple_golden selfcheck` OK (0 differences).
+
+# 2026-11-15 night: CPU table bake of the pad drags
+
+Native binaries only (arm64-v8a, NDK 28.2, android-29, Release, own tree `build/bake-arm64`), `/data/local/tmp/bakeperf`, removed afterwards; no props or settings changed. `dapple_drag_bench <a6700.ARW> dapple.dfp 360 24 pads` (new mode: the app's pad drags, `INTERACTIVE | ANALYSIS`, lattice 57, tone strength 60, `dapple_set_interaction(1)` during the drag as the app does, `DAPPLE_BENCH_ADPF=16`), Vulkan (`DAPPLE_GPU=1`), `DAPPLE_FRAME_PROFILE=1` (the `dapple_engine` line now carries `tables_ms lat / pre / tone / ov / an / asm`). Before = the same bench executable on the HEAD 02495b4 `libdapple.so`; medians of 22 frames (frame CPU = `cpu_ms`, the frame thread's whole frame; tables = its table stage).
+
+| drag (parameters per frame) | before frame / tables ms | after frame / tables ms | where the before table time went | after |
+|---|---|---|---|---|
+| exposure | 11.6 / 6.3 | 4.4 / 2.9 | analysis 4.9, tone 0.6, bake copy 0.9; exec 5.2 of which lattice re-upload 3.8 | analysis 2.5, tone 0.4, copy 0; exec 1.5, upload 0.5 |
+| light pad x (exposure, highlights, shadows) | 12.0 / 6.7 | 4.6 / 2.8 | analysis 5.0, tone 0.7, copy 0.9 | analysis 2.4, tone 0.4 |
+| tone (contrast) | 14.3 / 7.4 | 4.9 / 3.1 | analysis 5.6, tone 0.6, copy 1.1 | analysis 2.6, tone 0.4 |
+| white balance (temp) | 15.6 / 8.0 | 5.3 / 3.4 | analysis 6.0, tone 0.7, copy 1.2 | analysis 2.9, tone 0.4 |
+| colour pad (temp, vibrance, saturation) | 39.2 / 33.2 | 21.0 / 15.0 | lattice 57^3 22.7 (11-31 between runs), overflow 4.6, analysis 4.6 | lattice 11.0, overflow 2.3, analysis 1.4, tone 0.2; upload 4.0 |
+| exposure, film on | 19.8 / 14.8 | 12.1 / 7.4 | exact analysis render 12.9 | 6.9 |
+| light pad x, film | 24.8 / 18.0 | 13.3 / 8.2 | 15.2 | 7.8 |
+| tone, film | 21.9 / 15.7 | 14.2 / 8.8 | 14.6 | 7.4 |
+| white balance, film | 23.1 / 17.4 | 14.1 / 8.5 | 15.0 | 7.9 |
+| colour pad, film | 23.4 / 17.4 | 13.5 / 8.1 | 15.4 | 7.7 |
+
+What changed (all exact; golden corpus 163 frames unchanged): (1) the colour lattice is shared by every bake of its colour stage (`BakedLut::rgb` is a `shared_ptr` to the cached lattice, no 2.2 MB copy per tone change); (2) the GPU keeps the lattice + overflow lattice per colour stage (`DeviceLattice`, keyed by `BakedLut::latticeKey`) and uploads only the 30 KB tone table per bake (`kDeviceToneSlot`) instead of 3.6 MB + a fence wait on every tone / exposure / white-balance frame; (3) the fast tonal analysis counts its histogram in the same parallel pass that runs the proxy through the lattice (per-block integer counts, the same counts as before) instead of storing the proxy and encoding 44k pixels on one core; the exact analysis histogram is counted in four parallel blocks; the tone table is filled in parallel (entries are independent); (4) `ThreadPool::WarmScope` around a frame's table stage wakes the pool workers when the frame starts and keeps them spinning between the table jobs (at most 2 ms idle, yielding the cpu past the normal 60 us spin, so a ready thread is not kept off it): on this phone a worker woken from an idle core started milliseconds late and every short job waited for it (`DAPPLE_SPIN_US=1000` showed the same: analysis 7.2 -> 2.8 ms). Without the yield the desktop (28 threads, 27 spinning workers) lost 6 ms in film frames; with it the desktop is unchanged by the scope. Two runs each; the after column is the first run of the final build (the second: within 0.6 ms except its first case, exposure 7.4 / 5.6 warming up).
+
+Variance: the lattice bake alternated between ~11 and ~31 ms between runs of the same binary (both before and after; clock / core state, not the code). The exact analysis of film frames (a 256 px exact render through a new `EngineSession`) is 7-11 ms.
+
+Not changed, numbers for a decision (both change interactive frames; the golden corpus has interactive drag frames `drag_saturation/*`, `film/full_interactive`, `film/blend50_interactive` that would change):
+* a coarser lattice while a colour slider moves (`dapple_drag_bench <raw> dapple.dfp 480 1 coarse`, 8 colour-pad positions, interactive frames, desktop): against the 57 lattice, 33^3 mean dE2000 0.16-0.38, p99 1.5-4.1, max 4.4-6.5 on five public RAWs (A6700, R5, X-S10, Z8, Pixel 8 Pro); against the settled frame 33^3 gives mean 0.40-0.81 (57^3 today 0.32-0.62), 41^3 0.36-0.72. The lattice would cost ~2.2 ms (33^3) / ~4.1 ms (41^3) here instead of 11.
+* the fast (lattice) analysis for film frames: the film frame's tables would drop from ~10 ms to ~2 ms on exposure / white balance / tone drags.
+
+Not measured: GLES, the Note10+ (Adreno 640), the app itself.

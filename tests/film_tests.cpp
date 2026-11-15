@@ -1909,7 +1909,7 @@ void testDevelopFilmIntegration() {
     CHECK(sameBits(g1, g2));
   }
   // the lattice of a full-strength film is not baked (only the blend partner needs it)
-  CHECK(bk->rgb.size() < bakeOff->rgb.size());
+  CHECK(bk->latticeFloats() < bakeOff->latticeFloats());
   // key: film parameters that are not spatial change it, spatial ones do not
   {
     engine::point::Params a = engine::point::resolve(fp, cam, nullptr);

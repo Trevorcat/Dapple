@@ -36,7 +36,7 @@ std::shared_ptr<void> bakeNode(NodeType type, const void* resolved, std::span<co
 
 // Convenience wrappers over bakeNode (conformance tests, bench).
 std::shared_ptr<std::vector<float>> evalColourLattice(const TableEnv& env, int n);
-engine::point::TonePre evalToneAnalysisPre(const TableEnv& env, std::vector<float>* lattice, int n, bool fast);
+engine::point::TonePre evalToneAnalysisPre(const TableEnv& env, const std::vector<float>* lattice, int n, bool fast);
 ToneTableOut evalToneTable(const TableEnv& env, const engine::point::TonePre* pre);
 std::vector<float> evalLatticeOverflow(const TableEnv& env, int n, float maxV);
 ToneAnalysis evalAnalysis(const TableEnv& env, const engine::point::TonePre* pre);
@@ -96,6 +96,8 @@ struct FrameResult {
   // construction (C layer), graph = ParamSet + graph + keys, tables = host tables (lattice, tone, film), exec = plan + executor incl. GPU wait
   struct CpuSplit {
     double matchMs = 0, rendererMs = 0, graphMs = 0, tablesMs = 0, execMs = 0, totalMs = 0;
+    // inside tablesMs: the table nodes this frame baked (0 = cache hit) and the assembly of the frame's bake
+    double latticeMs = 0, preMs = 0, toneMs = 0, overflowMs = 0, analysisMs = 0, assembleMs = 0;
   } cpu;
 };
 

@@ -46,21 +46,26 @@ struct DeviceCopy {
     if (current()) ctx->core().retire(h);
   }
 };
-// colour lattice + overflow lattice + tone table of one bake (cache slot: slotOf(ColourLattice, true))
-struct DeviceTables : DeviceCopy {
+// colour lattice + overflow lattice of one colour stage (cache slot: slotOf(ColourLattice, true), keyed by BakedLut::latticeKey): uploaded
+// once per lattice, whatever the tone stage, the exposure or the white balance do
+struct DeviceLattice : DeviceCopy {
   hal::ImageH lat, lat2;
-  hal::BufferH tone;
   int n = 0, n2 = 0;
-  ~DeviceTables() {
+  ~DeviceLattice() {
     retire(lat);
     retire(lat2);
-    retire(tone);
   }
 };
-// a read-only SSBO (HDR field + reshaping field, local adjustment descriptors / plane store)
+// a read-only SSBO (HDR field + reshaping field, local adjustment descriptors / plane store, the tone table)
 struct DeviceBuffer : DeviceCopy {
   hal::BufferH buf;
   ~DeviceBuffer() { retire(buf); }
+};
+// What the point kernels bind: the lattice of the frame's colour stage + the tone table of its bake (slot kDeviceToneSlot, by bake key).
+// Cached apart, so a drag that moves only the tone table uploads 30 KB instead of the 3.6 MB of the two lattices.
+struct DeviceTables {
+  std::shared_ptr<DeviceLattice> lattice;
+  std::shared_ptr<DeviceBuffer> tone;
 };
 // the frame-global solve of a node (cache slot: slotOf(type, true))
 struct DeviceSolve : DeviceCopy {

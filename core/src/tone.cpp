@@ -7,13 +7,15 @@
 #include "color.h"
 #include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
+#include "parallel.h"
+#include "tone_hist.h"
 
 namespace dapple {
 
 using namespace color;
 
 namespace {
-constexpr int kFine = 512;  // fine histogram for percentiles
+constexpr int kFine = kToneFine;
 constexpr int kProxyEdge = 256;
 
 // The develop render of a proxy without neighbourhood stages, as float, through the engine (graph + planner + CpuExecutor, the
@@ -55,24 +57,36 @@ int toneClassIndex(const std::string& name) {
 }
 
 ToneAnalysis analyzeToneImage(const ImageF& im) {
-  ToneAnalysis a;
-  a.histogram.assign(ToneAnalysis::kBins, 0.f);
   if (im.empty()) {
+    ToneAnalysis a;
+    a.histogram.assign(ToneAnalysis::kBins, 0.f);
     a.nearest = "mid-mid";
     a.key = "mid";
     a.range = "mid";
     return a;
   }
-  std::vector<double> fine(kFine, 0.0);
+  // blocks of pixels counted in parallel (a 256 px proxy: four blocks; the 11k samples of a frame histogram: one, inline), summed after
   const std::size_t n = std::size_t(im.width) * im.height;
-  for (std::size_t i = 0; i < n; ++i) {
-    const float* p = &im.data[3 * i];
-    const float lin = 0.2126729f * srgbDecode(std::clamp(p[0], 0.f, 1.f)) +
-                      0.7151522f * srgbDecode(std::clamp(p[1], 0.f, 1.f)) +
-                      0.0721750f * srgbDecode(std::clamp(p[2], 0.f, 1.f));
-    const float e = srgbEncode(lin);
-    fine[std::min(kFine - 1, int(e * kFine))] += 1.0;
-  }
+  constexpr std::size_t kBlock = 12288;
+  const int blocks = int((n + kBlock - 1) / kBlock);
+  std::vector<ToneCounts> counts(static_cast<std::size_t>(blocks));
+  parallelFor(blocks, [&](int k) {
+    ToneCounts& c = counts[std::size_t(k)];
+    c.fill(0);
+    const std::size_t i1 = std::min(n, (std::size_t(k) + 1) * kBlock);
+    for (std::size_t i = std::size_t(k) * kBlock; i < i1; ++i) ++c[std::size_t(toneFineBin(&im.data[3 * i]))];
+  });
+  ToneCounts fine{};
+  for (const ToneCounts& c : counts)
+    for (int i = 0; i < kFine; ++i) fine[std::size_t(i)] += c[std::size_t(i)];
+  return toneAnalysisFromCounts(fine, n);
+}
+
+ToneAnalysis toneAnalysisFromCounts(const ToneCounts& counts, std::size_t n) {
+  ToneAnalysis a;
+  a.histogram.assign(ToneAnalysis::kBins, 0.f);
+  std::vector<double> fine(kFine, 0.0);
+  for (int i = 0; i < kFine; ++i) fine[std::size_t(i)] = double(counts[std::size_t(i)]);
   for (int i = 0; i < kFine; ++i) a.histogram[i * ToneAnalysis::kBins / kFine] += float(fine[i] / double(n));
   auto pct = [&](double q) {
     double acc = 0;

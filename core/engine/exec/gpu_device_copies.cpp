@@ -138,14 +138,22 @@ bool Executor::upload(hal::BufferH dst, const void* data, std::size_t bytes) {
 // ---- tables (HostTable payloads on the device) ------------------------------------------------------------------------------------
 std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
   const BakedLut& lut = in.bake;
+  if (lut.n < 2 || lut.latticeFloats() != std::size_t(lut.n) * lut.n * lut.n * 3) return fail(GpuReason::LatticeUnusable, "lattice not usable (film only bake?)"), nullptr;
+  if (lut.tone.size() != kToneN) return fail(GpuReason::LatticeUnusable, "tone table size differs from the GPU backend's"), nullptr;
+  auto t = std::make_shared<DeviceTables>();
+  // the tone table of the bake: a small SSBO, re-uploaded when the bake changes
+  Hasher tk;
+  tk.str(lut.key);
+  if (!(t->tone = ensureBuffer(in.cache, kDeviceToneSlot, tk.finish().a, lut.tone.data(), kToneN * 4))) return nullptr;
+
   Hasher hk;
-  hk.str(lut.key);
+  hk.str(lut.latticeKey.empty() ? lut.key : lut.latticeKey);  // a bake without a lattice identity (none in the engine) gets its own copy
   const Hash128 key = hk.finish();
   const CacheSlot slot = slotOf(NodeType::ColourLattice, true);
-  if (const ResultCache::Hit h = in.cache.find(slot, key)) return h.as<DeviceTables>();
-
-  if (lut.n < 2 || lut.rgb.size() != std::size_t(lut.n) * lut.n * lut.n * 3) return fail(GpuReason::LatticeUnusable, "lattice not usable (film only bake?)"), nullptr;
-  if (lut.tone.size() != kToneN) return fail(GpuReason::LatticeUnusable, "tone table size differs from the GPU backend's"), nullptr;
+  if (const ResultCache::Hit h = in.cache.find(slot, key)) {
+    t->lattice = h.as<DeviceLattice>();
+    return t;
+  }
   std::vector<float> overOwned;
   const std::vector<float>* over = in.overflow;
   if (!over) {
@@ -157,25 +165,22 @@ std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
   if (over->size() != std::size_t(kLat2N) * kLat2N * kLat2N * 3) return fail(GpuReason::LatticeUnusable, "overflow lattice unavailable"), nullptr;
 
   const auto t0 = Clock::now();
-  auto t = std::make_shared<DeviceTables>();
-  t->ctx = ctx_;
-  t->epoch = epoch_;
-  t->n = lut.n;
-  t->n2 = kLat2N;
-  hal::Status s = dev().createImage({hal::Format::RGBA32F, std::uint32_t(lut.n), std::uint32_t(lut.n), std::uint32_t(lut.n)}, &t->lat);
-  if (s == hal::Status::Ok) s = dev().createImage({hal::Format::RGBA32F, kLat2N, kLat2N, kLat2N}, &t->lat2);
-  if (s == hal::Status::Ok) s = dev().createBuffer({kToneN * 4, hal::MemKind::DeviceLocal, true}, &t->tone);
+  auto L = std::make_shared<DeviceLattice>();
+  L->ctx = ctx_;
+  L->epoch = epoch_;
+  L->n = lut.n;
+  L->n2 = kLat2N;
+  hal::Status s = dev().createImage({hal::Format::RGBA32F, std::uint32_t(lut.n), std::uint32_t(lut.n), std::uint32_t(lut.n)}, &L->lat);
+  if (s == hal::Status::Ok) s = dev().createImage({hal::Format::RGBA32F, kLat2N, kLat2N, kLat2N}, &L->lat2);
   if (s != hal::Status::Ok) return failStatus(s, ""), nullptr;
 
   const std::size_t latBytes = std::size_t(lut.n) * lut.n * lut.n * 16, lat2Bytes = std::size_t(kLat2N) * kLat2N * kLat2N * 16;
-  const std::size_t toneBytes = (kToneN * 4 + 255) / 256 * 256;
   auto cl = dev().begin();
   if (!cl) return failStatus(hal::Status::Timeout, ""), nullptr;
   std::string err;
-  if (!core().ensureStaging(cl->slot(), toneBytes + latBytes + lat2Bytes, err)) return fail(GpuReason::OutOfMemory, err), nullptr;
+  if (!core().ensureStaging(cl->slot(), latBytes + lat2Bytes, err)) return fail(GpuReason::OutOfMemory, err), nullptr;
   auto& sr = core().slot(cl->slot());
   auto* base = static_cast<std::uint8_t*>(sr.staging.mapped);
-  std::memcpy(base, lut.tone.data(), kToneN * 4);
   auto texels = [](const std::vector<float>& rgb, float* o) {
     const std::size_t n = rgb.size() / 3;
     for (std::size_t i = 0; i < n; ++i) {
@@ -185,12 +190,11 @@ std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
       o[4 * i + 3] = 1.f;
     }
   };
-  texels(lut.rgb, reinterpret_cast<float*>(base + toneBytes));
-  texels(*over, reinterpret_cast<float*>(base + toneBytes + latBytes));
+  texels(*lut.rgb, reinterpret_cast<float*>(base));
+  texels(*over, reinterpret_cast<float*>(base + latBytes));
   GpuGraph g(dev(), core().pool());
-  g.copyBufferToBuffer(sr.staging, g.externalBuf(t->tone), kToneN * 4, 0);
-  g.copyBufferToImage(sr.staging, g.external(t->lat), std::uint32_t(lut.n), std::uint32_t(lut.n), std::uint32_t(lut.n), toneBytes);
-  g.copyBufferToImage(sr.staging, g.external(t->lat2), kLat2N, kLat2N, kLat2N, toneBytes + latBytes);
+  g.copyBufferToImage(sr.staging, g.external(L->lat), std::uint32_t(lut.n), std::uint32_t(lut.n), std::uint32_t(lut.n), 0);
+  g.copyBufferToImage(sr.staging, g.external(L->lat2), kLat2N, kLat2N, kLat2N, latBytes);
   hal::FenceH f;
   s = submit(g, *cl, &f, err);
   if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
@@ -200,10 +204,11 @@ std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
   e.slot = slot;
   e.key = e.family = key;
   e.order = lut.n;
-  e.payload = t;
-  e.deviceBytes = latBytes + lat2Bytes + kToneN * 4;
+  e.payload = L;
+  e.deviceBytes = latBytes + lat2Bytes;
   e.costMs = msSince(t0);
   in.cache.put(std::move(e));
+  t->lattice = std::move(L);
   return t;
 }
 
@@ -271,11 +276,11 @@ bool Executor::ensureLocal(const GpuRun& in, std::shared_ptr<DeviceBuffer>& desc
 
 LutBind Executor::lutBind(GpuGraph& g, const DeviceTables& t) {
   LutBind b;
-  b.tone = g.externalBuf(t.tone);
-  b.lat = g.external(t.lat);
-  b.lat2 = g.external(t.lat2);
-  b.n = t.n;
-  b.n2 = t.n2;
+  b.tone = g.externalBuf(t.tone->buf);
+  b.lat = g.external(t.lattice->lat);
+  b.lat2 = g.external(t.lattice->lat2);
+  b.n = t.lattice->n;
+  b.n2 = t.lattice->n2;
   b.toneN = int(kToneN);
   b.toneBase = kToneBase;
   b.max1 = kBakeMax;

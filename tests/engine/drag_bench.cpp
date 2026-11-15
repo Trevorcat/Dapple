@@ -16,6 +16,34 @@
 #include "dapple/dapple_c.h"
 
 namespace {
+// sRGB 8-bit -> CIELAB (D65) and the CIEDE2000 difference (visualcost, coarse)
+void lab(const uint8_t* p, double* L, double* a, double* b) {
+  auto lin = [](double c) { c /= 255.0; return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4); };
+  const double r = lin(p[0]), g = lin(p[1]), bl = lin(p[2]);
+  double x = (0.4124 * r + 0.3576 * g + 0.1805 * bl) / 0.95047, y = 0.2126 * r + 0.7152 * g + 0.0722 * bl, z = (0.0193 * r + 0.1192 * g + 0.9505 * bl) / 1.08883;
+  auto f = [](double t) { return t > 216.0 / 24389.0 ? std::cbrt(t) : (24389.0 / 27.0 * t + 16.0) / 116.0; };
+  x = f(x), y = f(y), z = f(z);
+  *L = 116.0 * y - 16.0, *a = 500.0 * (x - y), *b = 200.0 * (y - z);
+}
+double de2000(double L1, double a1, double b1, double L2, double a2, double b2) {
+  const double kPi = 3.14159265358979323846, rad = kPi / 180.0;
+  const double C1 = std::hypot(a1, b1), C2 = std::hypot(a2, b2), Cb = (C1 + C2) / 2, G = 0.5 * (1 - std::sqrt(std::pow(Cb, 7) / (std::pow(Cb, 7) + std::pow(25.0, 7))));
+  const double ap1 = (1 + G) * a1, ap2 = (1 + G) * a2, Cp1 = std::hypot(ap1, b1), Cp2 = std::hypot(ap2, b2);
+  double h1 = std::atan2(b1, ap1) / rad, h2 = std::atan2(b2, ap2) / rad;
+  if (h1 < 0) h1 += 360;
+  if (h2 < 0) h2 += 360;
+  const double dL = L2 - L1, dC = Cp2 - Cp1;
+  double dh = h2 - h1;
+  if (Cp1 * Cp2 == 0) dh = 0; else if (dh > 180) dh -= 360; else if (dh < -180) dh += 360;
+  const double dH = 2 * std::sqrt(Cp1 * Cp2) * std::sin(dh * rad / 2);
+  const double Lb = (L1 + L2) / 2, Cpb = (Cp1 + Cp2) / 2;
+  double hb = h1 + h2;
+  if (Cp1 * Cp2 == 0) hb = h1 + h2; else if (std::fabs(h1 - h2) <= 180) hb /= 2; else hb = (hb + (hb < 360 ? 360 : -360)) / 2;
+  const double T = 1 - 0.17 * std::cos((hb - 30) * rad) + 0.24 * std::cos(2 * hb * rad) + 0.32 * std::cos((3 * hb + 6) * rad) - 0.20 * std::cos((4 * hb - 63) * rad);
+  const double dTh = 30 * std::exp(-std::pow((hb - 275) / 25, 2)), Rc = 2 * std::sqrt(std::pow(Cpb, 7) / (std::pow(Cpb, 7) + std::pow(25.0, 7)));
+  const double Sl = 1 + 0.015 * std::pow(Lb - 50, 2) / std::sqrt(20 + std::pow(Lb - 50, 2)), Sc = 1 + 0.045 * Cpb, Sh = 1 + 0.015 * Cpb * T, Rt = -std::sin(2 * dTh * rad) * Rc;
+  return std::sqrt(std::pow(dL / Sl, 2) + std::pow(dC / Sc, 2) + std::pow(dH / Sh, 2) + Rt * (dC / Sc) * (dH / Sh));
+}
 int settleMsEnv() { return std::getenv("DAPPLE_BENCH_SETTLE_MS") ? std::atoi(std::getenv("DAPPLE_BENCH_SETTLE_MS")) : 0; }
 struct Case {
   const char* name;
@@ -350,33 +378,6 @@ int main(int argc, char** argv) {
       rq.flags = interactive ? DAPPLE_FRAME_INTERACTIVE : 0;
       return dapple_session_render_frame(s, js, nullptr, &rq, out, nullptr) == DAPPLE_OK;
     };
-    auto lab = [](const uint8_t* p, double* L, double* a, double* b) {
-      auto lin = [](double c) { c /= 255.0; return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4); };
-      const double r = lin(p[0]), g = lin(p[1]), bl = lin(p[2]);
-      double x = (0.4124 * r + 0.3576 * g + 0.1805 * bl) / 0.95047, y = 0.2126 * r + 0.7152 * g + 0.0722 * bl, z = (0.0193 * r + 0.1192 * g + 0.9505 * bl) / 1.08883;
-      auto f = [](double t) { return t > 216.0 / 24389.0 ? std::cbrt(t) : (24389.0 / 27.0 * t + 16.0) / 116.0; };
-      x = f(x), y = f(y), z = f(z);
-      *L = 116.0 * y - 16.0, *a = 500.0 * (x - y), *b = 200.0 * (y - z);
-    };
-    auto de2000 = [](double L1, double a1, double b1, double L2, double a2, double b2) {
-      const double kPi = 3.14159265358979323846, rad = kPi / 180.0;
-      const double C1 = std::hypot(a1, b1), C2 = std::hypot(a2, b2), Cb = (C1 + C2) / 2, G = 0.5 * (1 - std::sqrt(std::pow(Cb, 7) / (std::pow(Cb, 7) + std::pow(25.0, 7))));
-      const double ap1 = (1 + G) * a1, ap2 = (1 + G) * a2, Cp1 = std::hypot(ap1, b1), Cp2 = std::hypot(ap2, b2);
-      double h1 = std::atan2(b1, ap1) / rad, h2 = std::atan2(b2, ap2) / rad;
-      if (h1 < 0) h1 += 360;
-      if (h2 < 0) h2 += 360;
-      const double dL = L2 - L1, dC = Cp2 - Cp1;
-      double dh = h2 - h1;
-      if (Cp1 * Cp2 == 0) dh = 0; else if (dh > 180) dh -= 360; else if (dh < -180) dh += 360;
-      const double dH = 2 * std::sqrt(Cp1 * Cp2) * std::sin(dh * rad / 2);
-      const double Lb = (L1 + L2) / 2, Cpb = (Cp1 + Cp2) / 2;
-      double hb = h1 + h2;
-      if (Cp1 * Cp2 == 0) hb = h1 + h2; else if (std::fabs(h1 - h2) <= 180) hb /= 2; else hb = (hb + (hb < 360 ? 360 : -360)) / 2;
-      const double T = 1 - 0.17 * std::cos((hb - 30) * rad) + 0.24 * std::cos(2 * hb * rad) + 0.32 * std::cos((3 * hb + 6) * rad) - 0.20 * std::cos((4 * hb - 63) * rad);
-      const double dTh = 30 * std::exp(-std::pow((hb - 275) / 25, 2)), Rc = 2 * std::sqrt(std::pow(Cpb, 7) / (std::pow(Cpb, 7) + std::pow(25.0, 7)));
-      const double Sl = 1 + 0.015 * std::pow(Lb - 50, 2) / std::sqrt(20 + std::pow(Lb - 50, 2)), Sc = 1 + 0.045 * Cpb, Sh = 1 + 0.015 * Cpb * T, Rt = -std::sin(2 * dTh * rad) * Rc;
-      return std::sqrt(std::pow(dL / Sl, 2) + std::pow(dC / Sc, 2) + std::pow(dH / Sh, 2) + Rt * (dC / Sc) * (dH / Sh));
-    };
     DappleImage fin{};
     if (!render(screen, false, &fin)) return 1;
     auto sharp = [](const DappleImage& im) {  // mean |gradient| of the green channel, a stand-in for the sharpness / grain content of the picture
@@ -527,6 +528,110 @@ int main(int argc, char** argv) {
       dapple_free_image(&a);
       dapple_free_image(&b);
     }
+    return 0;
+  }
+  if (filter == "coarse") {  // a smaller interactive lattice on colour-pad positions: dE2000 against the 57 lattice and against the settled frame
+    struct Pos {
+      float x, y;
+    };
+    const Pos pos[] = {{-1, -1}, {-1, 1}, {1, -1}, {1, 1}, {0, 1}, {0.5f, 0.5f}, {-0.5f, 0.8f}, {0, 0}};
+    const int sizes[] = {17, 25, 33, 41};
+    std::vector<std::vector<double>> dRef(std::size(sizes)), dFin(std::size(sizes) + 1);
+    auto frame = [&](const char* js, int bake, bool interactive, DappleImage* out) {
+      DappleFrameRequest rq{};
+      rq.size = sizeof rq;
+      rq.long_edge = le;
+      rq.flags = (interactive ? DAPPLE_FRAME_INTERACTIVE : 0) | DAPPLE_FRAME_ANALYSIS;
+      rq.bake_size = bake;
+      char* an = nullptr;
+      const bool ok = dapple_session_render_frame(s, js, nullptr, &rq, out, &an) == DAPPLE_OK;
+      if (an) dapple_free_string(an);
+      return ok;
+    };
+    auto diff = [](const DappleImage& a, const DappleImage& b, std::vector<double>& d) {
+      for (std::size_t i = 0; i < std::size_t(a.width) * a.height; ++i) {
+        double L1, a1, b1, L2, a2, b2;
+        lab(a.rgba + 4 * i, &L1, &a1, &b1);
+        lab(b.rgba + 4 * i, &L2, &a2, &b2);
+        d.push_back(de2000(L1, a1, b1, L2, a2, b2));
+      }
+    };
+    for (const Pos& p : pos) {
+      char js[256];
+      std::snprintf(js, sizeof js, "{\"toneStrength\":60,\"temp\":%.2f,\"vibrance\":%.2f,\"saturation\":%.2f}", double(30 * p.x), double(55 * p.y), double(25 * p.y));
+      // ascending sizes: a request reuses a cached finer lattice of the same colour stage, never a coarser one
+      std::vector<DappleImage> im(std::size(sizes) + 2);
+      for (std::size_t k = 0; k < std::size(sizes); ++k)
+        if (!frame(js, sizes[k], true, &im[k])) return 1;
+      if (!frame(js, 57, true, &im[std::size(sizes)]) || !frame(js, 0, false, &im[std::size(sizes) + 1])) return 1;
+      for (std::size_t k = 0; k < std::size(sizes); ++k) diff(im[std::size(sizes)], im[k], dRef[k]);
+      for (std::size_t k = 0; k <= std::size(sizes); ++k) diff(im[std::size(sizes) + 1], im[k], dFin[k]);
+      for (DappleImage& i : im) dapple_free_image(&i);
+    }
+    auto line = [](const char* what, int n, std::vector<double>& d) {
+      std::sort(d.begin(), d.end());
+      double mean = 0;
+      for (double v : d) mean += v;
+      std::printf("  %-26s %2d^3: dE2000 mean %.3f p99 %.3f max %.2f\n", what, n, mean / double(d.size()), d[d.size() * 99 / 100], d.back());
+    };
+    std::printf("== coarse lattice: %s, long edge %d, colour pad positions, interactive frames ==\n", argv[1], le);
+    for (std::size_t k = 0; k < std::size(sizes); ++k) line("vs the 57 lattice", sizes[k], dRef[k]);
+    for (std::size_t k = 0; k < std::size(sizes); ++k) line("vs the settled frame", sizes[k], dFin[k]);
+    line("vs the settled frame", 57, dFin[std::size(sizes)]);
+    dapple_session_close(s);
+    return 0;
+  }
+  if (filter.rfind("pads", 0) == 0) {  // the app's pad drags: interactive frames with the analysis, lattice 57, tone strength 60 (the app's default), film off / on;
+                                       // "pads <name>" runs the cases whose name contains <name>. Per-table times: DAPPLE_ENGINE_LOG=1 DAPPLE_FRAME_PROFILE=1
+    struct Pad {
+      const char* name;
+      const char* fmt;  // one %f: the pad coordinate -1..1
+    };
+    const Pad pads[] = {
+        {"exposure", "\"exposure\":%.4f"},
+        {"light pad x", "\"exposure\":%.4f,\"highlights\":%.4f,\"shadows\":%.4f"},
+        {"tone (contrast)", "\"contrast\":%.4f"},
+        {"wb (temp)", "\"temp\":%.4f"},
+        {"colour pad", "\"temp\":%.4f,\"vibrance\":%.4f,\"saturation\":%.4f"},
+    };
+    const std::string sub = filter.size() > 5 ? filter.substr(5) : "";
+    std::printf("== pad drags: %s, long edge %d, %d frames, bake 57, analysis on, GPU env %s ==\n", argv[1], le, frames, std::getenv("DAPPLE_GPU") ? std::getenv("DAPPLE_GPU") : "-");
+    for (int film = 0; film < 2; ++film)
+      for (const Pad& pd : pads) {
+        const std::string name = std::string(pd.name) + (film ? " (film)" : "");
+        if (!sub.empty() && name.find(sub) == std::string::npos) continue;
+        std::vector<double> t;
+        dapple_set_interaction(1);  // a finger is on the pad, as in the app (background matches and seeds wait meanwhile)
+        for (int i = 0; i < frames; ++i) {
+          const float x = -1.f + 2.f * float(i) / float(std::max(1, frames - 1));
+          char body[256];
+          if (std::strcmp(pd.name, "light pad x") == 0) std::snprintf(body, sizeof body, pd.fmt, double(x), double(-40 * x), double(20 * x));
+          else if (std::strcmp(pd.name, "colour pad") == 0) std::snprintf(body, sizeof body, pd.fmt, double(30 * x), double(55 * x), double(25 * x));
+          else if (std::strcmp(pd.name, "exposure") == 0) std::snprintf(body, sizeof body, pd.fmt, double(x));
+          else std::snprintf(body, sizeof body, pd.fmt, double(40 * x));
+          char json[512];
+          std::snprintf(json, sizeof json, "{%s\"toneStrength\":60,%s}", film ? "\"film\":\"kodak_portra_400\"," : "", body);
+          DappleFrameRequest rq{};
+          rq.size = sizeof rq;
+          rq.long_edge = le;
+          rq.flags = DAPPLE_FRAME_INTERACTIVE | DAPPLE_FRAME_ANALYSIS;
+          rq.bake_size = 57;
+          rq.active_param = "exposure";
+          DappleImage img{};
+          char* an = nullptr;
+          const auto t0 = Clk::now();
+          if (dapple_session_render_frame(s, json, nullptr, &rq, &img, &an) != DAPPLE_OK) return std::fprintf(stderr, "frame: %s\n", dapple_last_error()), 1;
+          t.push_back(std::chrono::duration<double, std::milli>(Clk::now() - t0).count());
+          if (an) dapple_free_string(an);
+          dapple_free_image(&img);
+        }
+        dapple_set_interaction(0);
+        std::vector<double> r(t.begin() + 1, t.end());
+        std::sort(r.begin(), r.end());
+        std::printf("  %-22s first %7.1f  median %7.1f  max %7.1f  min %7.1f\n", name.c_str(), t[0], r[r.size() / 2], r.back(), r.front());
+        std::fflush(stdout);
+      }
+    dapple_session_close(s);
     return 0;
   }
   const int settleMs = std::getenv("DAPPLE_BENCH_SETTLE_MS") ? std::atoi(std::getenv("DAPPLE_BENCH_SETTLE_MS")) : 0;  // lets the background calibration finish

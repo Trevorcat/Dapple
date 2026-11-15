@@ -585,10 +585,8 @@ TableRun runTables(const ParamInputs& in0, const NodeRegistry& reg, const Source
   engine::point::TonePre pre;
   const bool move = ps.edit().toneStrength > 0.f;
   if (tk.hasPre) {
-    std::vector<float> lat = *lattice;
-    pre = evalToneAnalysisPre(env, &lat, n, ps.frame().fastAnalysis);
+    pre = evalToneAnalysisPre(env, lattice.get(), n, ps.frame().fastAnalysis);
     out.nodes[NodeType::ToneAnalysisPre] = {tk.pre, flat(pre)};
-    CHECK(lat == *lattice);  // the lattice is handed back unchanged
   }
   out.nodes[NodeType::ToneTable] = {tk.tone, flat(evalToneTable(env, (move && tk.hasPre) ? &pre : nullptr))};
   if (tk.hasAnalysis) out.nodes[NodeType::Analysis] = {tk.analysis, flat(evalAnalysis(env, tk.hasPre ? &pre : nullptr))};
@@ -932,6 +930,106 @@ void reuseImpl(bool smallRun) {
   }
 }
 void testReuse() { reuseImpl(false); }
+
+// ---- which tables a pad drag re-bakes -------------------------------------------------------------------------------------------
+// The minimal-key contract of the table nodes for the parameters of the app's pads (exposure / white balance / tone / colour): the
+// colour lattice and the overflow lattice are functions of the colour stage alone, so exposure, white balance and the tone sliders keep
+// them (only the tonal analysis and the tone table follow); a colour slider re-bakes them. Then the same on real frames: the bake of
+// a tone-only change shares the cached lattice (no copy), and its pixels + analysis equal a fresh session's.
+void testTables() {
+  const NodeRegistry& reg = NodeRegistry::instance();
+  struct Change {
+    const char* name;
+    void (*apply)(EditParams&);
+    bool colour;  // the colour stage moves
+    bool tone;    // the tone table moves without the tonal-class move (the move makes it follow everything the analysis sees)
+  };
+  const Change changes[] = {
+      {"exposure", [](EditParams& q) { q.exposure += 0.5f; }, false, false},
+      {"temp", [](EditParams& q) { q.temperature += 15.f; }, false, true},
+      {"tint", [](EditParams& q) { q.tint += 10.f; }, false, true},
+      {"contrast", [](EditParams& q) { q.contrast += 20.f; }, false, true},
+      {"highlights", [](EditParams& q) { q.highlights -= 30.f; }, false, true},
+      {"vibrance", [](EditParams& q) { q.vibrance += 30.f; }, true, false},
+      {"saturation", [](EditParams& q) { q.saturation += 15.f; }, true, false},
+  };
+  for (const float strength : {60.f, 0.f}) {
+    for (const Change& c : changes) {
+      EditParams a = edit0(), b = edit0();
+      a.toneStrength = b.toneStrength = strength;
+      c.apply(b);
+      auto keysOf = [&](const EditParams& e) {
+        ParamInputs in = inputs(e, true, true, true);  // an interactive frame with the fast analysis, as in a drag
+        in.frame.wantOverflow = true;                  // a GPU frame
+        const ParamSet ps = ParamSet::make(in);
+        Graph g = GraphBuilder::build(ps, FrameView{});
+        g.computeKeys(ps, reg);
+        return effectiveTableKeys(g, ps, 57);
+      };
+      const TableKeys ka = keysOf(a), kb = keysOf(b);
+      CHECK((ka.lattice != kb.lattice) == c.colour);
+      CHECK(ka.hasOverflow && kb.hasOverflow && (ka.overflow != kb.overflow) == c.colour);
+      CHECK(ka.hasPre && ka.pre != kb.pre);  // the fast tonal analysis sees every one of them
+      CHECK((ka.tone != kb.tone) == (strength > 0.f || c.tone));
+      std::printf("  %-10s move %-3s: lattice %s, overflow %s, analysis re-baked, tone table %s\n", c.name, strength > 0.f ? "on" : "off",
+                  ka.lattice != kb.lattice ? "re-baked" : "kept", ka.overflow != kb.overflow ? "re-baked" : "kept", ka.tone != kb.tone ? "re-baked" : "kept");
+    }
+  }
+
+  // real frames: the lattice is evaluated once for a tone-only drag and shared by every bake that uses it
+  const SourceImage src = makeScene(640, 427, true, 3);
+  SourceImage proxy;
+  proxy.sceneReferred = true;
+  proxy.linear = resizeToLongEdge(src.linear, 256);
+  auto render = [&](EngineSession& es, const EditParams& p, FrameResult& res) {
+    engine::point::Params r = engine::point::resolve(p, camA(), nullptr);
+    engine::point::setToneProxy(r, &proxy);
+    FrameJob job{p, r, src, &proxy, camA(), nullptr, {}, {}, {}};
+    job.request.bakeSize = 57;
+    job.request.wantAnalysis = true;
+    job.request.fastAnalysis = true;
+    job.fastOptions.spatial = SpatialQuality::Interactive;
+    CHECK(es.renderFrame(job, res));
+  };
+  auto analysisKey = [](const ToneAnalysis& a) {
+    std::string k = a.nearest + "/" + a.key + "/" + a.range;
+    for (float v : a.histogram) k += " " + std::to_string(v);
+    return k + " " + std::to_string(a.p5) + " " + std::to_string(a.p50) + " " + std::to_string(a.p95);
+  };
+  EngineSession es;
+  EditParams p = edit0();
+  p.toneStrength = 60.f;
+  std::vector<std::pair<std::vector<std::uint8_t>, std::string>> last;
+  const auto ev0 = bakeCounters().latticeEvaluated.load();
+  for (const Change& c : changes) {
+    if (c.colour) continue;
+    c.apply(p);
+    FrameResult res;
+    render(es, p, res);
+    CHECK(res.rgba != nullptr);
+    last.push_back({std::vector<std::uint8_t>(res.rgba, res.rgba + std::size_t(res.w) * res.h * 4), analysisKey(res.analysis)});
+    std::free(res.rgba);
+  }
+  CHECK(bakeCounters().latticeEvaluated.load() == ev0 + 1);  // one lattice for exposure, white balance and tone
+  const std::vector<ResultCache::Entry> bakes = es.cache().entries(kBakeSlot);
+  CHECK(bakes.size() >= 2);
+  for (const ResultCache::Entry& b : bakes) CHECK(static_cast<const BakedLut*>(b.payload.get())->rgb == static_cast<const BakedLut*>(bakes[0].payload.get())->rgb);
+  CHECK(es.cache().entries(slotOf(NodeType::ColourLattice)).size() == 1);
+  {  // the last frame of the drag equals a fresh session's (the shared lattice carries nothing of the frames before)
+    EngineSession fresh;
+    FrameResult res;
+    render(fresh, p, res);
+    CHECK(res.rgba && std::equal(last.back().first.begin(), last.back().first.end(), res.rgba));
+    CHECK(analysisKey(res.analysis) == last.back().second);
+    std::free(res.rgba);
+  }
+  // a colour change bakes a second lattice; the first stays shared by the bakes that hold it
+  p.saturation += 15.f;
+  FrameResult res;
+  render(es, p, res);
+  std::free(res.rgba);
+  CHECK(bakeCounters().latticeEvaluated.load() == ev0 + 3);  // + the fresh session's
+}
 // the same drag sequences on a 640 px source (shorter lists): the reuse rules and determinism of the engine: in the default run
 void testReuseSmall() { reuseImpl(true); }
 
@@ -1031,7 +1129,7 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"hash", testHash},           {"registry", testRegistry},     {"validate", testValidate},
                      {"snapshots", testSnapshots}, {"keys", testKeys},             {"conformance", testConformance}, {"conformance_small", testConformanceSmall},
-                     {"cache", testCache},         {"reuse", testReuse}, {"reuse_small", testReuseSmall},           {"overhead", testOverhead}};
+                     {"cache", testCache},         {"reuse", testReuse}, {"reuse_small", testReuseSmall}, {"tables", testTables},           {"overhead", testOverhead}};
   if (argc >= 2 && std::string(argv[1]) == "--list") {
     for (const T& t : tests) std::printf("%s\n", t.id);
     return 0;

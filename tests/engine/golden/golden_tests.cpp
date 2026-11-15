@@ -869,7 +869,7 @@ void runCoreApi(std::vector<GoldenHash>& out) {
       const auto lut = engine::point::bake(r, src, n);
       Fnv tl;
       tl.bytes(lut->tone.data(), lut->tone.size() * 4);
-      tl.bytes(lut->rgb.data(), lut->rgb.size() * 4);
+      tl.bytes(lut->rgb->data(), lut->rgb->size() * 4);
       out.push_back({"core/bake_tables_n" + std::to_string(n), hex(tl.h)});
     }
     const auto fast = engine::point::bake(r, src, 33, nullptr, true);

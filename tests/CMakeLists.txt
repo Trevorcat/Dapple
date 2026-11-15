@@ -159,7 +159,7 @@ if(MSVC)
 else()
   target_compile_options(dapple_engine_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-set(DAPPLE_ENGINE_TEST_IDS hash registry validate snapshots keys conformance conformance_small cache reuse reuse_small overhead)
+set(DAPPLE_ENGINE_TEST_IDS hash registry validate snapshots keys conformance conformance_small cache reuse reuse_small tables overhead)
 foreach(id IN LISTS DAPPLE_ENGINE_TEST_IDS)
   add_test(NAME engine.${id} COMMAND dapple_engine_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(engine.${id} PROPERTIES TIMEOUT 900)
@@ -660,7 +660,7 @@ endforeach()
 
 # Timing-sensitive (present.loop_view measures a frame loop, demosaic.wire_cancel a cancel latency) or not yet safe next to other test processes (film.c_api crashes only when run in parallel:
 # shared state still to be found): run them alone so the default run does not report load as failures.
-foreach(_t present.loop_view film.c_api demosaic.wire_cancel)
+foreach(_t present.loop_view film.c_api demosaic.wire_cancel engine.gpu_concurrency engine.gpu_concurrency_swiftshader base_previews.cancel engine.overhead)
   if(TEST ${_t})
     set_tests_properties(${_t} PROPERTIES RUN_SERIAL TRUE)
   endif()

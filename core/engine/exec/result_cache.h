@@ -32,6 +32,7 @@ constexpr CacheSlot slotOf(NodeType t, bool device = false) { return CacheSlot(C
 constexpr CacheSlot kBakeSlot = 0x4001;             // assembled colour bake (lattice + tone table) of a frame
 constexpr CacheSlot kDeviceBufferSlot = 0xC002;     // GPU: read-only SSBOs by content key (HDR field, reshaping field, local descriptors)
 constexpr CacheSlot kDevicePlaneSlot = 0xC003;      // GPU: the local adjustments' plane store
+constexpr CacheSlot kDeviceToneSlot = 0xC005;       // GPU: the tone table of a bake (the lattices are slotOf(ColourLattice, true))
 constexpr bool isDeviceSlot(CacheSlot s) { return (s & kDeviceSlot) != 0; }
 
 class ResultCache {

@@ -24,6 +24,7 @@
 #include "dapple/lut.h"
 #include "engine/nodes/point/point.h"
 #include "engine/exec/gpu_executor.h"
+#include "engine/exec/result_cache.h"
 #include "engine/exec/gpu_scheduler.h"
 #include "gpu_rig.h"
 #include "parity.h"
@@ -810,6 +811,46 @@ void testFilmTiming(Env& env, bool with24mp) {
 
 // The device keeps the frame-global solves: a frame that only changes parameters downstream of the dehaze (sharpen) is planned without the
 // accumulation sweep and the solve, and renders the same pixels as a session that has to solve.
+// The device copies of the colour tables (exec/gpu_device_copies.cpp): frames that move only the tone stage (exposure, white balance, tone
+// sliders) keep the uploaded lattice + overflow lattice and upload a new tone table; a colour change uploads a new lattice. The last frame of
+// such a drag is byte-identical to a fresh session's (no stale table bound).
+void testDeviceTables(Env& env) {
+  std::printf("== device tables: one lattice upload per colour stage ==\n");
+  const SourceImage src = makeTestImage(640, 427);
+  const CameraProfile& cam = env.cams.resolve("", "");
+  FastOptions fo;
+  Rig rig(env.be, src, cam);
+  const engine::CacheSlot lat = engine::slotOf(engine::NodeType::ColourLattice, true), tone = engine::kDeviceToneSlot;
+  auto render = [&](Rig& g, const EditParams& p) {
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
+    int w = 0, h = 0;
+    std::string err;
+    std::uint8_t* px = g.render(p, r, src, fo, 41, w, h, nullptr, err);
+    CHECK(px != nullptr, "render: %s", err.c_str());
+    std::vector<std::uint8_t> v;
+    if (px) v.assign(px, px + std::size_t(w) * h * 4);
+    std::free(px);
+    return v;
+  };
+  EditParams p = baseParams();
+  p.toneStrength = 60.f;  // the tonal-class move on: every one of these drags makes a new tone table
+  render(rig, p);
+  void (*const drag[])(EditParams&) = {[](EditParams& q) { q.exposure += 0.4f; }, [](EditParams& q) { q.temperature += 12.f; },
+                                       [](EditParams& q) { q.contrast += 10.f; }};
+  std::vector<std::uint8_t> last;
+  for (auto f : drag) {
+    f(p);
+    last = render(rig, p);
+  }
+  CHECK(rig.es.cache().entries(lat).size() == 1, "tone-only frames uploaded %zu lattices", rig.es.cache().entries(lat).size());
+  CHECK(rig.es.cache().entries(tone).size() == 4, "%zu tone tables for 4 bakes", rig.es.cache().entries(tone).size());
+  Rig fresh(env.be, src, cam);
+  CHECK(render(fresh, p) == last, "the last frame of a tone drag differs from a fresh session's");
+  p.saturation += 15.f;
+  render(rig, p);
+  CHECK(rig.es.cache().entries(lat).size() == 2, "a colour change: %zu device lattices", rig.es.cache().entries(lat).size());
+}
+
 void testSolveCache(Env& env) {
   std::printf("== device solve cache: dehaze solve kept between frames ==\n");
   const SourceImage src = makeTestImage(900, 600);
@@ -1067,6 +1108,7 @@ int main(int argc, char** argv) {
     return g_fail ? 1 : 0;
   }
   testStages(env);
+  testDeviceTables(env);
   if (!quick) {
     testHalfBudget(env);
     testDownscale(env);
