@@ -4,7 +4,7 @@
 #include <chrono>
 
 #include "dapple/film_match.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 
 namespace dapple {

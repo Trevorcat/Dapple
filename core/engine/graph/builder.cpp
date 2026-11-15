@@ -65,7 +65,7 @@ NodeId addFilm(Graph& g, NodeId cur, GraphDetail detail) {
 
 }  // namespace
 
-Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePlan* plan, const FrameBlocks* blocks) {
+Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const point::Blocks* point, const FrameBlocks* blocks) {
   Graph g;
   const FrameRequest& f = ps.frame();
   const ParamInputs& in = ps.inputs();
@@ -88,13 +88,13 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
   }
 
   // ---- Full: every stage of the frame as its own node ---------------------------------------------------------------
-  FramePlan fallback;
-  const FramePlan& fp = plan ? *plan : fallback;
+  const point::Blocks fallback;
+  const point::Blocks& fp = point ? *point : fallback;
   const FrameBlocks noBlocks;
   const FrameBlocks& fb = blocks ? *blocks : noBlocks;
   const EditParams& e = ps.edit();
   NodeId cur = g.add(NodeType::Resize, {Edge{src}});
-  if (fp.useGeo) cur = g.add(NodeType::Geometry, {Edge{cur}});
+  if (!point::geometryBehaviour().isIdentity(&fp)) cur = g.add(NodeType::Geometry, {Edge{cur}});
 
   if (f.exact) {
     // the reference variant: per-pixel PointOp::apply instead of the lattice; the film branch is the same as below
@@ -104,7 +104,7 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
     NodeId mainOut = 0;
     if (needMain) {
       NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
-      if (fp.hdr.active()) gain = g.add(NodeType::Hdr, {Edge{gain}});
+      if (!point::hdrBehaviour().isIdentity(&fp)) gain = g.add(NodeType::Hdr, {Edge{gain}});
       if (fb.local.active()) gain = g.add(NodeType::LocalLinear, {Edge{gain}});
       mainOut = g.add(NodeType::ToneColourExact, {Edge{gain}});
     }
@@ -124,7 +124,7 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
     const bool needMain = !useFilm || strength < 1.f;
     if (needMain) {
       NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
-      if (fp.hdr.active()) gain = g.add(NodeType::Hdr, {Edge{gain}});
+      if (!point::hdrBehaviour().isIdentity(&fp)) gain = g.add(NodeType::Hdr, {Edge{gain}});
       if (fb.local.active()) gain = g.add(NodeType::LocalLinear, {Edge{gain}});
       if (t.hasOverflow) mainOut = g.add(NodeType::ToneColour, {Edge{gain}, Edge{t.tone}, Edge{t.lattice}, Edge{t.overflow}});
       else mainOut = g.add(NodeType::ToneColour, {Edge{gain}, Edge{t.tone}, Edge{t.lattice}});

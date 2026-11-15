@@ -149,7 +149,7 @@ class BandSourceStore final : public engine::SourceStore {
 struct Wants {
   bool tone = true;    // resizeToLongEdge(full, 256): tonal analysis, the session's proxies (film match, modern white point)
   bool hdr = false;    // resizeToLongEdge(full, 512): single-image HDR field
-  bool modern = false; // the modern rendering's end-point samples (Renderer::modernGridPixel)
+  bool modern = false; // the modern rendering's end-point samples (engine::point::modernGridPixel)
   std::vector<int> longEdges;  // further reductions resizeToLongEdge(full, n) (Ultra HDR quarter renders, a session opened at a long edge)
   std::vector<std::pair<int, int>> guideGrids;  // raster refinement guide grids (local::guideGridSizes); non-empty also captures the 64 x 64 samples
   bool guide = false;
@@ -184,10 +184,10 @@ struct GuideScope {
 };
 
 // The CPU streamed render: EngineSession::renderExact with the band hooks (TiledExport, `tile` rows per band; the source windows from `bs`;
-// onSize(w, h) before the first band; rows(y0, n, rgb) per finished band). `renderer` reads its analyses from the Analyses
-// (Renderer::setAnalysisSources) and the guide capture is installed (GuideScope); `virt` = sizeOnly(...). False: failed / cancelled (`err`;
+// onSize(w, h) before the first band; rows(y0, n, rgb) per finished band). `point` reads its analyses from the Analyses
+// (point::setAnalysisSources) and the guide capture is installed (GuideScope); `virt` = sizeOnly(...). False: failed / cancelled (`err`;
 // "engine: plan not supported ..." = this edit cannot stream: the film branch).
-bool renderBands(engine::EngineSession& es, const EditParams& params, const Renderer& renderer, const SourceImage& virt, BandSource& bs, int tile, bool hasProxy,
+bool renderBands(engine::EngineSession& es, const EditParams& params, const engine::point::Params& point, const SourceImage& virt, BandSource& bs, int tile, bool hasProxy,
                  const std::function<void(int, int)>& onSize, const std::function<bool(int, int, const std::uint8_t*)>& rows, std::string* err);
 
 }  // namespace dapple::xstream

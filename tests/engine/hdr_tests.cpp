@@ -28,7 +28,7 @@
 #include "dapple/camera.h"
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session.h"
 #include "hdr_field.h"
@@ -90,7 +90,7 @@ SourceImage makeScene(int w, int h, bool wide = true) {
 Image8 renderRef(const EditParams& p, const SourceImage& src) { return render8(p, cam(), nullptr, src); }
 
 bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src, ExecMode mode, int tile, Image8& out, ExecStats* st = nullptr) {
-  const Renderer r(p, cam(), nullptr);
+  const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   EngineSession::ExactOptions o;
   o.mode = mode;
   o.tile = tile;
@@ -143,13 +143,13 @@ void testIdentity() {
     CHECK(toJsonDiff(q2).find("\"hdr\"") != std::string::npos);
   }
   // the graph of hdr = 0 has no Hdr node
-  FramePlan fp;
-  const Renderer r0(p, cam(), nullptr);
-  r0.hdrBind(src, fp.hdr);
+  point::Blocks fp;
+  const engine::point::Params r0 = engine::point::resolve(p, cam(), nullptr);
+  engine::point::hdrBind(r0, src, fp.hdr);
   CHECK(!fp.hdr.active());
-  const Renderer r1(q, cam(), nullptr);
-  const auto lut1 = r1.bake(src, 33);
-  r1.hdrBind(src, fp.hdr, &lut1->tone);
+  const engine::point::Params r1 = engine::point::resolve(q, cam(), nullptr);
+  const auto lut1 = engine::point::bake(r1, src, 33);
+  engine::point::hdrBind(r1, src, fp.hdr, &lut1->tone);
   CHECK(fp.hdr.active());
 }
 
@@ -246,10 +246,10 @@ void testLowRange() {
     Image8 ia, ib;
     CHECK(exactRender(es, a, src, ExecMode::Whole, 0, ia));
     CHECK(exactRender(es, b, src, ExecMode::Whole, 0, ib));
-    FramePlan fp;
-    const Renderer rb0(b, cam(), nullptr);
-    const auto lut0 = rb0.bake(src, 33);
-    rb0.hdrBind(src, fp.hdr, &lut0->tone);
+    point::Blocks fp;
+    const engine::point::Params rb0 = engine::point::resolve(b, cam(), nullptr);
+    const auto lut0 = engine::point::bake(rb0, src, 33);
+    engine::point::hdrBind(rb0, src, fp.hdr, &lut0->tone);
     double mx = 0;
     const double m = meanDE(ia, ib, &mx);
     std::printf("  %.1f EV scene (shown range %.1f EV) at hdr 100: node %s, dE2000 mean %.4f max %.3f\n", fp.hdr.range, fp.hdr.shown, fp.hdr.active() ? "active" : "not in the graph", m, mx);
@@ -262,10 +262,10 @@ void testLowRange() {
     Image8 ia, ib;
     CHECK(exactRender(es, a, mid, ExecMode::Whole, 0, ia));
     CHECK(exactRender(es, b, mid, ExecMode::Whole, 0, ib));
-    FramePlan fp;
-    const Renderer rb(b, cam(), nullptr);
-    const auto lutb = rb.bake(mid, 33);
-    rb.hdrBind(mid, fp.hdr, &lutb->tone);
+    point::Blocks fp;
+    const engine::point::Params rb = engine::point::resolve(b, cam(), nullptr);
+    const auto lutb = engine::point::bake(rb, mid, 33);
+    engine::point::hdrBind(rb, mid, fp.hdr, &lutb->tone);
     const double m = meanDE(ia, ib);
     std::printf("  %.1f EV scene (shown range %.1f EV) at hdr 100: node %s, dE2000 mean %.3f\n", fp.hdr.range, fp.hdr.shown, fp.hdr.active() ? "active" : "not in the graph", m);
     CHECK(m < 3.5);
@@ -301,10 +301,10 @@ void testAnchors() {
   {
     EditParams bp;
     bp.hdr = 100.f;
-    Renderer rr(bp, cam(), nullptr);
-    const auto lut = rr.bake(src, 33);
-    FramePlan fp;
-    rr.hdrBind(src, fp.hdr, &lut->tone);
+    engine::point::Params rr = engine::point::resolve(bp, cam(), nullptr);
+    const auto lut = engine::point::bake(rr, src, 33);
+    point::Blocks fp;
+    engine::point::hdrBind(rr, src, fp.hdr, &lut->tone);
     std::printf("  with the real tone curve: R %.1f EV, shown range T %.1f EV, lift %.2f EV, pull %.2f EV\n", fp.hdr.range, fp.hdr.shown, fp.hdr.ls, fp.hdr.hp);
   }
   // end to end: the darkest 1 % of the frame comes out where it was without hdr
@@ -566,7 +566,7 @@ void parityImpl(const std::vector<std::pair<int, int>>& sizes) {
     for (const Case& c : cases) {
       EditParams p;
       c.set(p);
-      Renderer r(p, cam(), nullptr);
+      engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
       FastOptions fo;
       fo.spatial = c.interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
       fo.noise = false;
@@ -611,7 +611,7 @@ void testParitySmall() { parityImpl({{320, 224}}); }
 
 double medianGpuMs(dapple::gpu::Rig& rig, const EditParams& p, const SourceImage& src, const FastOptions& fo, int srcLong, int& w, int& h) {
   std::vector<double> v;
-  Renderer r(p, cam(), nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   for (int i = 0; i < 9; ++i) {
     std::string err;
     engine::GpuStats st;

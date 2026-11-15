@@ -1,6 +1,6 @@
 #pragma once
 // Shared pieces of the GPU node implementations (step b2): the recorder the node `record` functions append to, resolved
-// parameter blocks derived from the CPU reference's FramePlan, and the separable filter helpers (box / weight table /
+// parameter blocks of the point family (point::Blocks) and the other families, and the separable filter helpers (box / weight table /
 // minimum, with an O(1)-per-pixel running-sum box for larger radii).
 //
 // Each main node has one record function; they are registered in nodes/gpu_nodes.cpp (gpuImplFor) next to the shader names
@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <string>
 
-#include "dapple/frame_plan.h"
+#include "engine/nodes/point/blocks.h"
 #include "engine/exec/gpu_scheduler.h"
 #include "engine/hal/hal.h"
 #include "engine/nodes/frame_blocks.h"
@@ -53,7 +53,7 @@ struct WarpU {
   std::int32_t wI[4];
   float wB[4], wC[4];
 };
-void warpUniform(const FramePlan& P, const SourceBind& s, WarpU& u);
+void warpUniform(const point::Warp& w, const SourceBind& s, WarpU& u);
 struct LutBind {
   H tone = -1, lat = -1, lat2 = -1;
   H hdr = -1;  // single-image HDR field (SSBO), -1 = none
@@ -122,7 +122,7 @@ struct PointInputs {
   H src, tone, lat, lat2, D, out8;
 };
 struct PointNode {
-  const FramePlan* plan;
+  const point::Blocks* frame;  // geometry, warp, gain, HDR
   SourceBind src;
   LutBind lut;
   int W, Hh, ox, oy;  // working image size and its origin in the picture
@@ -164,7 +164,7 @@ H recordLocalDetail(GpuRecorder& r, const LocalDetailNode& n, H D);
 // The scene input of a film frame with the local adjustments applied (stage L; geometry gather included), RGBA32F `out` of n.W x n.Hh at
 // (n.ox, n.oy); writes the stage-W amounts into aux0 / aux1 when both are >= 0.
 struct LocalFilmInNode {
-  const FramePlan* plan;
+  const point::Blocks* frame;  // geometry, warp, gain
   SourceBind src;
   int W, Hh, ox, oy;
   H ldesc, lplanes, aux0, aux1;

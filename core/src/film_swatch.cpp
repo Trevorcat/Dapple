@@ -15,7 +15,7 @@
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 
 namespace {

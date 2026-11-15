@@ -24,7 +24,7 @@
 #include "colour_metrics.h"
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "dapple/tone.h"
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session.h"
@@ -116,7 +116,7 @@ Cmp compare(const Image8& a, const Image8& b) {
 
 bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src, ExecMode mode, int tile, Image8& out,
                  ExecStats* st = nullptr) {
-  const Renderer r(p, cam(), nullptr);
+  const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   EngineSession::ExactOptions o;
   o.mode = mode;
   o.tile = tile;
@@ -255,18 +255,18 @@ void testTiles() { tilesImpl(false); }
 void testTilesSmall() { tilesImpl(true); }
 
 // ---- plan ----------------------------------------------------------------------------------------------------------------------
-Graph graphFor(const EditParams& p, const SourceImage& src, bool exact, FrameKernels** fkOut, std::unique_ptr<FrameKernels>& hold,
-               std::unique_ptr<Renderer>& rh, PlanRequest& rq) {
-  rh = std::make_unique<Renderer>(p, cam(), nullptr);
+Graph graphFor(const EditParams& p, const SourceImage& src, bool exact, engine::point::CpuFrame** fkOut, std::unique_ptr<engine::point::CpuFrame>& hold,
+               std::unique_ptr<engine::point::Params>& rh, PlanRequest& rq) {
+  rh = std::make_unique<engine::point::Params>(engine::point::resolve(p, cam(), nullptr));
   FastOptions fo;
-  hold = std::make_unique<FrameKernels>(*rh, src, nullptr, fo);
+  hold = std::make_unique<engine::point::CpuFrame>(*rh, src, nullptr, fo);
   ParamInputs in;
   in.edit = p;
   in.frame.exact = exact;
   in.ctx.srcW = src.linear.width;
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
-  const FramePlan fp = hold->framePlan();
+  const point::Blocks fp = hold->blocks();
   const FrameBlocks fb = hold->frameBlocks();
   Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp, &fb);
   g.computeKeys(ps);
@@ -281,8 +281,8 @@ Graph graphFor(const EditParams& p, const SourceImage& src, bool exact, FrameKer
 
 void testPlan() {
   const SourceImage src = makeScene(640, 480);
-  std::unique_ptr<FrameKernels> fk;
-  std::unique_ptr<Renderer> rh;
+  std::unique_ptr<engine::point::CpuFrame> fk;
+  std::unique_ptr<engine::point::Params> rh;
   PlanRequest rq;
 
   EditParams plain = withBase();
@@ -341,7 +341,7 @@ void testCancel() {
   Image8 out;
   // Deterministic: the cancel lands after the request took its ticket and before the first tile (no wall-clock involved).
   {
-    const Renderer r(p, cam(), nullptr);
+    const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
     EngineSession::ExactOptions o;
     o.mode = ExecMode::TiledExport;
     o.tile = 512;
@@ -371,11 +371,13 @@ void testAnalysis() {
   c.vignette = -60.f;
   CHECK(analyzeTone(src, cam(), c).histogram != ta.histogram);  // ... and on the vignette
   // ... so the keys that identify a bake must tell them apart
-  const Renderer ra(a, cam(), nullptr), rb(b, cam(), nullptr), rc(c, cam(), nullptr);
-  CHECK(ra.pointKey() != rb.pointKey());
-  CHECK(ra.pointKey() != rc.pointKey());
-  CHECK(ra.colourKey() == rb.colourKey());  // the colour lattice does not care
-  CHECK(ra.colourKey() == rc.colourKey());
+  const engine::point::Params ra = engine::point::resolve(a, cam(), nullptr);
+  const engine::point::Params rb = engine::point::resolve(b, cam(), nullptr);
+  const engine::point::Params rc = engine::point::resolve(c, cam(), nullptr);
+  CHECK(engine::point::pointKey(ra) != engine::point::pointKey(rb));
+  CHECK(engine::point::pointKey(ra) != engine::point::pointKey(rc));
+  CHECK(engine::point::colourKey(ra) == engine::point::colourKey(rb));  // the colour lattice does not care
+  CHECK(engine::point::colourKey(ra) == engine::point::colourKey(rc));
   // and the graph: the Analysis node declares the keys
   for (int variant : {0, 1}) {
     ParamInputs in;
@@ -418,8 +420,8 @@ void testBench() {
   vs.push_back({"geometry + vignette", d, SpatialQuality::Off});
   const SourceImage src = makeScene(1600, 1067);
   for (const V& v : vs) {
-    const Renderer r(v.p, cam(), nullptr);
-    const std::shared_ptr<const BakedLut> bake = r.bake(src, 57);
+    const engine::point::Params r = engine::point::resolve(v.p, cam(), nullptr);
+    const std::shared_ptr<const BakedLut> bake = engine::point::bake(r, src, 57);
     FastOptions fo;
     fo.spatial = v.q;
     EngineSession es;
@@ -431,8 +433,8 @@ void testBench() {
     std::vector<double> te, ts;
     for (int i = 0; i < 31; ++i) {
       auto t0 = Clock::now();
-      FrameKernels fk(r, src, bake.get(), fo);
-      const FramePlan fp = fk.framePlan();
+      engine::point::CpuFrame fk(r, src, bake.get(), fo);
+      const point::Blocks fp = fk.blocks();
       const FrameBlocks fb = fk.frameBlocks();
       Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp, &fb);
       g.computeKeys(ps);
@@ -452,7 +454,7 @@ void testBench() {
       if (i > 0) te.push_back(e);
     }
     std::sort(ts.begin(), ts.end());
-    std::printf("    (setup: FrameKernels + graph + keys + plan: median %.3f ms)\n", ts[ts.size() / 2]);
+    std::printf("    (setup: engine::point::CpuFrame + graph + keys + plan: median %.3f ms)\n", ts[ts.size() / 2]);
     std::sort(te.begin(), te.end());
     std::printf("  %-32s executor median %6.2f min %6.2f\n", v.name, te[te.size() / 2], te[0]);
   }
@@ -482,7 +484,7 @@ void testExport60() {
   EditParams p = cases().back().p;
   p.rotate = 0;
   EngineSession es;
-  const Renderer r(p, cam(), nullptr);
+  const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   EngineSession::ExactOptions o;
   o.mode = ExecMode::TiledExport;
   o.memBudget = 500u << 20;

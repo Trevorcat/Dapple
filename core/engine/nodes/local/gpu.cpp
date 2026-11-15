@@ -229,21 +229,22 @@ struct FiU {
 }  // namespace
 
 bool recordLocalFilmIn(GpuRecorder& r, const LocalFilmInNode& n, H out) {
-  const FramePlan& P = *n.plan;
+  const point::Blocks& F = *n.frame;
+  const point::Geometry& P = F.geo;
   const int geo = !P.useGeo ? 0 : (P.exact ? 1 : 2);
   const bool w = n.aux0 >= 0 && n.aux1 >= 0;
-  const bool warpOn = P.warp.active() && n.src.warp >= 0;
+  const bool warpOn = F.warp.active() && n.src.warp >= 0;
   const hal::PipelineH p = r.pl("local_film_in", {{0, geo}, {3, w ? 1 : 0}, {4, warpOn ? 1 : 0}});
   if (!p) return false;
   FiU u{};
-  for (int k = 0; k < 3; ++k) u.gain[k] = P.gain[k];
+  for (int k = 0; k < 3; ++k) u.gain[k] = F.gain[k];
   u.a[0] = P.srcW, u.a[1] = P.srcH, u.a[2] = n.W, u.a[3] = n.Hh;
   u.b[0] = n.src.ox, u.b[1] = n.src.oy, u.b[2] = n.ox, u.b[3] = n.oy;
   u.geoA[0] = P.cs, u.geoA[1] = P.sn, u.geoA[2] = P.fw, u.geoA[3] = P.fh;
   u.geoB[0] = P.ox0, u.geoB[1] = P.oy0, u.geoB[2] = P.stepX, u.geoB[3] = P.stepY;
   u.geoC[0] = P.fullW, u.geoC[1] = P.fullH;
   u.c[0] = P.rot, u.c[1] = P.flip ? 1 : 0;
-  if (warpOn) warpUniform(P, n.src, u.w);
+  if (warpOn) warpUniform(F.warp, n.src, u.w);
   r.g.dispatch("local_film_in", p,
                {GpuGraph::R(n.src.img), GpuGraph::W(out), GpuGraph::R(n.ldesc), GpuGraph::R(n.lplanes), w ? GpuGraph::W(n.aux0) : GpuGraph::R(r.dummy(kF16)),
                 w ? GpuGraph::W(n.aux1) : GpuGraph::R(r.dummy(kF16)), GpuGraph::R(warpOn ? n.src.warp : n.lplanes)},

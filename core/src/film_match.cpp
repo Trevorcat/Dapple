@@ -18,7 +18,7 @@
 #include "color.h"
 #include "dapple/illuminant.h"
 #include "film_internal.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "film_match_render.h"
 
 namespace dapple {
@@ -483,7 +483,7 @@ void filmInputAdaptation(const EditParams& p, double* x, double* y, double* D) {
   EditParams c = p;
   c.clamp();
   float g[3];
-  Renderer::whiteBalanceGain(c, g);  // the gain the user's white balance applies to the white-balanced data
+  engine::point::whiteBalanceGain(c, g);  // the gain the user's white balance applies to the white-balanced data
   const fd::Vec3 w = {1.0 / g[0], 1.0 / g[1], 1.0 / g[2]};  // the colour that gain turns neutral: the light the edit declares
   const fd::Vec3 xyz = fd::mul(fd::adaptationMatrix(fd::cat16(), fd::kD50x, fd::kD50y, p.filmSceneX, p.filmSceneY), fd::mul(fd::prophotoToXyz(), w));
   const double s = xyz[0] + xyz[1] + xyz[2];
@@ -1014,9 +1014,9 @@ FilmPadInfo filmPadFor(const EditParams& p, const CameraProfile& camera, const L
   ref.sharpen = ref.nrLuma = 0.f;
   float gain[3], keyL0;
   {
-    Renderer r(ref, camera, lut);
-    r.setToneProxy(&proxy);
-    r.sceneGain(proxy, gain);
+    engine::point::Params r = engine::point::resolve(ref, camera, lut);
+    engine::point::setToneProxy(r, &proxy);
+    engine::point::sceneGain(r, proxy, gain);
     EditParams ref0 = ref;
     ref0.exposure = 0.f;
     keyL0 = medianLightness(renderMatchProxy(ref0, camera, lut, proxy));
@@ -1072,10 +1072,10 @@ FilmExposure matchFilmExposure(const EditParams& p, const CameraProfile& camera,
   float target;
   float gain[3];
   {
-    Renderer r(ref, camera, lut);
-    r.setToneProxy(&proxy);
+    engine::point::Params r = engine::point::resolve(ref, camera, lut);
+    engine::point::setToneProxy(r, &proxy);
     target = medianLightness(renderMatchProxy(ref, camera, lut, proxy));
-    r.sceneGain(proxy, gain);
+    engine::point::sceneGain(r, proxy, gain);
   }
 
   // the film alone (strength 100), spatial stages off

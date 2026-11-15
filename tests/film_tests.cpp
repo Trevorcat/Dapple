@@ -24,7 +24,7 @@
 #include "dapple/film.h"
 #include "dapple/film_match.h"
 #include "dapple/illuminant.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "render_f.h"
 #include "dapple/tone.h"
 #include "film_internal.h"
@@ -1823,21 +1823,21 @@ void testDevelopFilmIntegration() {
   dangling.filmStock = "kodak_portra_400";  // no library installed: ignored
   const ImageF refOff = renderF(off, cam, nullptr, src);
   CHECK(sameBits(refOff, renderF(dangling, cam, nullptr, src)));
-  const auto bakeOff = Renderer(off, cam, nullptr).bake(src, 33);  // only for the lattice size comparison below
+  const auto bakeOff = engine::point::bake(engine::point::resolve(off, cam, nullptr), src, 33);  // only for the lattice size comparison below
   FastOptions fo;
   const ImageF bakedOff = renderFrameF(off, cam, nullptr, src, 33, fo);
   CHECK(sameBits(bakedOff, renderFrameF(dangling, cam, nullptr, src, 33, fo)));
-  CHECK(!Renderer(dangling, cam, nullptr).filmActive());
+  CHECK(!engine::point::filmActive(dangling));
 
   film::setLibrary(lib);
-  CHECK(Renderer(filmEdit(), cam, nullptr).filmActive());
-  CHECK(!Renderer(off, cam, nullptr).filmActive());
+  CHECK(engine::point::filmActive(filmEdit()));
+  CHECK(!engine::point::filmActive(off));
   EditParams bogus = off;
   bogus.filmStock = "no_such_stock";
-  CHECK(!Renderer(bogus, cam, nullptr).filmActive());
+  CHECK(!engine::point::filmActive(bogus));
   EditParams isPaper = off;
   isPaper.filmStock = "kodak_portra_endura";  // a paper is not a camera film
-  CHECK(!Renderer(isPaper, cam, nullptr).filmActive());
+  CHECK(!engine::point::filmActive(isPaper));
   // installed library, film off or strength 0: identical to the render without any film code involved
   CHECK(sameBits(refOff, renderF(off, cam, nullptr, src)));
   EditParams zero = filmEdit();
@@ -1858,7 +1858,7 @@ void testDevelopFilmIntegration() {
   plainP.filmStock.clear();
   const ImageF plain = renderF(plainP, cam, nullptr, src);
   CHECK(meanAbsDiff(f1, plain) > 0.02);
-  const auto bk = Renderer(fp, cam, nullptr).bake(src, 33);
+  const auto bk = engine::point::bake(engine::point::resolve(fp, cam, nullptr), src, 33);
   const ImageF b1 = renderFrameF(fp, cam, nullptr, src, 33, fo);
   const ImageF b2 = renderFrameF(fp, cam, nullptr, src, 33, fo);
   CHECK(sameBits(b1, b2));
@@ -1912,7 +1912,7 @@ void testDevelopFilmIntegration() {
   CHECK(bk->rgb.size() < bakeOff->rgb.size());
   // key: film parameters that are not spatial change it, spatial ones do not
   {
-    Renderer a(fp, cam, nullptr);
+    engine::point::Params a = engine::point::resolve(fp, cam, nullptr);
     EditParams w = fp;
     w.filmWarmth = 20.f;
     EditParams g = fp;
@@ -1921,13 +1921,13 @@ void testDevelopFilmIntegration() {
     EditParams x = fp;
     x.filmExposure = 1.5f;
     x.filmTint = -30.f;
-    CHECK(a.pointKey() == Renderer(w, cam, nullptr).pointKey());  // film warmth / tint / exposure: inside the simulator
-    CHECK(a.pointKey() == Renderer(x, cam, nullptr).pointKey());
-    CHECK(a.pointKey() == Renderer(g, cam, nullptr).pointKey());
-    CHECK(a.pointKey() != Renderer(off, cam, nullptr).pointKey());
+    CHECK(engine::point::pointKey(a) == engine::point::pointKey(engine::point::resolve(w, cam, nullptr)));  // film warmth / tint / exposure: inside the simulator
+    CHECK(engine::point::pointKey(a) == engine::point::pointKey(engine::point::resolve(x, cam, nullptr)));
+    CHECK(engine::point::pointKey(a) == engine::point::pointKey(engine::point::resolve(g, cam, nullptr)));
+    CHECK(engine::point::pointKey(a) != engine::point::pointKey(engine::point::resolve(off, cam, nullptr)));
     EditParams other = fp;
     other.filmStock = "kodak_ektar_100";
-    CHECK(a.pointKey() != Renderer(other, cam, nullptr).pointKey());
+    CHECK(engine::point::pointKey(a) != engine::point::pointKey(engine::point::resolve(other, cam, nullptr)));
     // a lattice baked at one film exposure renders every other exposure exactly like a fresh bake
     EditParams ex = fp;
     ex.filmExposure = 1.5f;

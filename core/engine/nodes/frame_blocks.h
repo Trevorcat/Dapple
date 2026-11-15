@@ -14,8 +14,8 @@
 
 namespace dapple::engine {
 
-// What a frame bound from its source that a family's resolve reads (field builds, plane caches). Owned by the binder: FrameKernels on the
-// CPU (FrameKernels::frameBound), the session's GPU frame (localadj::bind + the FramePlan's reshaping field).
+// What a frame bound from its source that a family's resolve reads (field builds, plane caches). Owned by the binder: point::CpuFrame on the
+// CPU (point::CpuFrame::frameBound), the session's GPU frame (localadj::bind + the point blocks' reshaping field, point::Blocks::warp).
 struct FrameBound {
   const local::Frame* local = nullptr;  // localadj::bind
   const warp::Field* warp = nullptr;    // portrait reshaping field

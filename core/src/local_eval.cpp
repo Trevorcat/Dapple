@@ -1346,7 +1346,7 @@ void applyLinearCtx(const Frame& f, float u, float v, const float src[3], float 
       for (int k = 0; k < kLocalWindowSlots; ++k) K[k] += wa * A.win[k];
     if (!A.hasLinear) continue;
     const float* l = A.lin;
-    if (l[6] != 0.f || l[7] != 0.f) {  // white balance (Renderer::whiteBalanceGain with the weighted sliders)
+    if (l[6] != 0.f || l[7] != 0.f) {  // white balance (engine::point::whiteBalanceGain with the weighted sliders)
       float g[3] = {std::exp2(0.006f * l[6] * wa), std::exp2(-0.004f * l[7] * wa), std::exp2(-0.006f * l[6] * wa)};
       const float nrm = g[0] * kLumaPP[0] + g[1] * kLumaPP[1] + g[2] * kLumaPP[2];
       for (int c = 0; c < 3; ++c) px[c] *= g[c] / nrm;

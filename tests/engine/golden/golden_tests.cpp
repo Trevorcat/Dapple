@@ -819,8 +819,8 @@ void runCoreApi(std::vector<GoldenHash>& out) {
     return hex(h.h);
   };
   {
-    Renderer r(p, cam, nullptr);
-    r.setToneProxy(&proxy);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
+    engine::point::setToneProxy(r, &proxy);
     // the exact variant through the engine (a private session per render), with the proxy as the tone reference
     auto exact = [&](bool spatial, bool asFloat, Image8& i8, ImageF& f) {
       engine::EngineSession es;
@@ -865,13 +865,13 @@ void runCoreApi(std::vector<GoldenHash>& out) {
       if (fr.rgba) hh.bytes(fr.rgba, std::size_t(fr.w) * fr.h * 4);
       std::free(fr.rgba);
       out.push_back({"core/baked_rgba_n" + std::to_string(n), hex(hh.h)});
-      const auto lut = r.bake(src, n);
+      const auto lut = engine::point::bake(r, src, n);
       Fnv tl;
       tl.bytes(lut->tone.data(), lut->tone.size() * 4);
       tl.bytes(lut->rgb.data(), lut->rgb.size() * 4);
       out.push_back({"core/bake_tables_n" + std::to_string(n), hex(tl.h)});
     }
-    const auto fast = r.bake(src, 33, nullptr, true);
+    const auto fast = engine::point::bake(r, src, 33, nullptr, true);
     Fnv tl;
     tl.bytes(fast->tone.data(), fast->tone.size() * 4);
     tl.bytes(fast->analysis.histogram.data(), fast->analysis.histogram.size() * 4);
@@ -960,7 +960,7 @@ int selfcheckOneShot(bool haveFilm) {
     //    The tiles sum the frame-global statistics in a different order than the whole frame, so the budget is that of exec_tests: no code off by more
     //    than one, mean dE2000 < 0.01
     for (const int tile : {96, 160}) {
-      Renderer r(c.p, cam, nullptr);
+      engine::point::Params r = engine::point::resolve(c.p, cam, nullptr);
       engine::EngineSession es;
       engine::EngineSession::ExactOptions o;
       o.mode = engine::ExecMode::TiledExport;
@@ -998,7 +998,7 @@ int selfcheckOneShot(bool haveFilm) {
       ImageF ex, bk;
       ok = engine::renderImageF(np, cam, nullptr, src, false, ex, &err);
       {
-        Renderer r(np, cam, nullptr);
+        engine::point::Params r = engine::point::resolve(np, cam, nullptr);
         engine::EngineSession es;
         engine::FrameJob job{np, r, src, nullptr, cam, nullptr, {}, {}, {}};
         job.request.bakeSize = 65;

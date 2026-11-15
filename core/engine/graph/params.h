@@ -47,7 +47,7 @@ struct SessionCtx {
   int fullLongEdge = 0;         // long edge of the full-resolution render this frame is a preview of (0 = none): scale-aware grain
   std::uint32_t frameIndex = 0; // video: enters the grain / glare noise seed (0 = a still; the seed is then unchanged)
   // White balance x exposure gain of the frame (what the Gain node multiplies): the film folds it into its input matrix.
-  // Set by the C layer (Renderer); null = unit gain.
+  // Set by the C layer (point::inputGain); null = unit gain.
   void (*gainFn)(const void* user, const EditParams&, float out[3]) = nullptr;
   const void* gainUser = nullptr;
 };

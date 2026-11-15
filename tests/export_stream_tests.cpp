@@ -34,7 +34,7 @@
 #include "dapple/edit_params.h"
 #include "dapple/encode.h"
 #include "dapple/mosaic.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #include "engine/nodes/demosaic/demosaic_session.h"
 #include "export_stream.h"
@@ -243,12 +243,12 @@ static void testReductions() {
     for (int le : w.longEdges) CHECK(a.at(le) && sameImage(a.at(le)->linear, resizeToLongEdge(whole.linear, le)));
     // modern end-point samples
     int gw, gh;
-    Renderer::modernGridSize(z.width, z.height, gw, gh);
+    engine::point::modernGridSize(z.width, z.height, gw, gh);
     bool gridOk = a.grid && a.grid->linear.width == gw && a.grid->linear.height == gh;
     for (int j = 0; gridOk && j < gh; ++j)
       for (int i = 0; i < gw; ++i) {
         int x, y;
-        Renderer::modernGridPixel(z.width, z.height, i, j, x, y);
+        engine::point::modernGridPixel(z.width, z.height, i, j, x, y);
         gridOk &= std::memcmp(a.grid->linear.row(j) + 3 * i, whole.linear.row(y) + 3 * x, 3 * sizeof(float)) == 0;
       }
     CHECK(gridOk);
@@ -343,8 +343,8 @@ static Diff diff(const Image8& a, const Image8& b) {
 }
 // The streamed render of a lazy picture at the engine level (what the C layer's streamRender does on the CPU).
 static bool streamed(const LazyFull& z, const EditParams& p, const xstream::Analyses& a, int tile, Image8& out, std::string& err) {
-  Renderer r(p, cam(), nullptr);
-  r.setAnalysisSources(a.p256.get(), a.grid.get(), a.p512.get());
+  engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
+  engine::point::setAnalysisSources(r, a.p256.get(), a.grid.get(), a.p512.get());
   const xstream::GuideScope gs(a.guide.get());
   xstream::BandSource bs(z.mosaic);
   bs.setShadowFloor(a.shadow);
@@ -363,7 +363,7 @@ static bool streamed(const LazyFull& z, const EditParams& p, const xstream::Anal
       &err);
 }
 static bool wholeRender(const SourceImage& src, const EditParams& p, int tile, Image8& out, std::string& err) {
-  Renderer r(p, cam(), nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   engine::EngineSession es;
   engine::EngineSession::ExactOptions o;
   o.mode = engine::ExecMode::TiledExport;
@@ -451,8 +451,8 @@ static void testPeak() {
   std::size_t rows = 0;
   JpegStripEncoder* encp = nullptr;
   std::unique_ptr<JpegStripEncoder> enc;
-  Renderer r(p, cam(), nullptr);
-  r.setAnalysisSources(a.p256.get(), a.grid.get(), a.p512.get());
+  engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
+  engine::point::setAnalysisSources(r, a.p256.get(), a.grid.get(), a.p512.get());
   xstream::BandSource bs2(m);
   engine::EngineSession es;
   const SourceImage virt = xstream::sizeOnly(z.meta, z.width, z.height);

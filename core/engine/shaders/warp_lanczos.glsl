@@ -1,5 +1,5 @@
 // Lanczos-3 sample of the source for the reads moved by the portrait reshaping field (section 45). Twin of sampleLanczos3
-// (core/src/renderer.cpp): 6 x 6 taps, normalised weights, clamped to the picture (srcAt), >= 0. Included after srcAt.
+// (engine/nodes/point/kernels.h sampleLanczos3): 6 x 6 taps, normalised weights, clamped to the picture (srcAt), >= 0. Included after srcAt.
 float lanczos3w(float d) {
   if (abs(d) < 1e-6) return 1.0;
   if (abs(d) >= 3.0) return 0.0;

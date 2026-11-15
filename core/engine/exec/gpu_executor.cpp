@@ -162,43 +162,29 @@ using Clock = std::chrono::steady_clock;
 double msSince(Clock::time_point t0) { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
 constexpr std::uint64_t kWaitNs = 30ull * 1000 * 1000 * 1000;
 
-// must match core/src/renderer.cpp (kBakeMax, kToneOctLo/Hi); the start-up self-test notices a drift
+// must match core/engine/nodes/point/kernels.h (kBakeMax, kToneOctLo/Hi); the start-up self-test notices a drift
 constexpr float kBakeMax = 1.5f;
 constexpr int kToneBase = (127 - 24) << 8;
 constexpr std::size_t kToneN = ((6 + 24) << 8) + 2;
 constexpr int kLat2N = 33;
 constexpr float kLat2Max = 8.f;
 
-// Geometry::mapF of the CPU renderer for the footprint of a rectangle.
-void mapPlan(const FramePlan& P, float px, float py, float& sx, float& sy) {
-  float u = px - P.fullW * 0.5f;
-  const float v = py - P.fullH * 0.5f;
-  if (P.flip) u = -u;
-  const float fx = u * P.cs + v * P.sn + P.fw * 0.5f;
-  const float fy = -u * P.sn + v * P.cs + P.fh * 0.5f;
-  switch (P.rot) {
-    case 0: sx = fx; sy = fy; break;
-    case 1: sx = fy; sy = float(P.srcH) - fx; break;
-    case 2: sx = float(P.srcW) - fx; sy = float(P.srcH) - fy; break;
-    default: sx = float(P.srcW) - fy; sy = fx; break;
-  }
-}
-
 // Rectangle of the (resized) source the point pass reads for the output pixels of `work`.
-WRect footprint(const FramePlan& P, const WRect& work) {
+WRect footprint(const point::Blocks& F, const WRect& work) {
+  const point::Geometry& P = F.geo;
   if (!P.useGeo) return work;
   float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
   for (int cx = 0; cx < 2; ++cx)
     for (int cy = 0; cy < 2; ++cy) {
       const float px = P.ox0 + float(cx ? work.x1 : work.x0) * P.stepX, py = P.oy0 + float(cy ? work.y1 : work.y0) * P.stepY;
       float sx, sy;
-      mapPlan(P, px, py, sx, sy);
+      point::mapToSource(P, px, py, sx, sy);
       x0 = std::min(x0, sx);
       x1 = std::max(x1, sx);
       y0 = std::min(y0, sy);
       y1 = std::max(y1, sy);
     }
-  const int m = P.warp.active() ? 6 + P.warp.pad : (P.exact ? 2 : 4);  // a reshaping field moves reads by up to `pad` pixels
+  const int m = F.warp.active() ? 6 + F.warp.pad : (P.exact ? 2 : 4);  // a reshaping field moves reads by up to `pad` pixels
   WRect r;
   r.x0 = std::max(0, int(std::floor(x0)) - m);
   r.y0 = std::max(0, int(std::floor(y0)) - m);
@@ -446,11 +432,11 @@ class Executor final : public IGpuExecutor {
   // Local adjustments of the frame: descriptor + plane store SSBOs (both null when the frame has none; false on a device error)
   bool ensureLocal(const GpuRun& in, std::shared_ptr<DeviceHdr>& desc, std::shared_ptr<DeviceHdr>& planes);
   LutBind lutBind(GpuGraph& g, const DeviceTables& t);
-  // Film frames (section 20): arguments of the film nodes from the FramePlan, device tables of their bake
+  // Film frames (section 20): arguments of the film nodes from the point blocks (point::Film), device tables of their bake
   bool filmResolve(const GpuRun& in, filmnode::FilmResolved& r);
   std::shared_ptr<DeviceFilm> ensureFilm(const filmnode::FilmResolved& r);
   // DisplayStages after a film: curves + look LUT on the device (the identity for plain frames); a small LRU of the last displays
-  std::shared_ptr<DeviceDisplay> ensureDisplay(const FramePlan& P);
+  std::shared_ptr<DeviceDisplay> ensureDisplay(const point::Blocks& P);
 
   Status runWhole(const GpuRun& in, GpuOut& out);
   Status runTiled(const GpuRun& in, GpuOut& out);
@@ -563,8 +549,8 @@ std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
   const std::vector<float>* over = in.overflow;
   if (!over) {
     const SourceImage* img = in.store.image();
-    if (!img || !in.renderer) return fail(GpuFailure::Unsupported, "overflow lattice unavailable (no CPU source)"), nullptr;
-    overOwned = in.renderer->bakeOverflow(*img, lut, kLat2N, kLat2Max);
+    if (!img || !in.params) return fail(GpuFailure::Unsupported, "overflow lattice unavailable (no CPU source)"), nullptr;
+    overOwned = point::bakeOverflow(*in.params, *img, lut, kLat2N, kLat2Max);
     over = &overOwned;
   }
   if (over->size() != std::size_t(kLat2N) * kLat2N * kLat2N * 3) return fail(GpuFailure::Unsupported, "overflow lattice unavailable"), nullptr;
@@ -628,7 +614,7 @@ std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
 }
 
 std::shared_ptr<DeviceHdr> Executor::ensureHdr(const GpuRun& in) {
-  const FramePlan::Hdr& h = in.frame.hdr;
+  const point::Hdr& h = in.frame.hdr;
   if (!h.active()) return nullptr;
   Hasher hk;
   hk.u64(h.field->id);
@@ -669,7 +655,7 @@ std::shared_ptr<DeviceHdr> Executor::ensureHdr(const GpuRun& in) {
 
 std::shared_ptr<DeviceHdr> Executor::ensureGeoAux(const GpuRun& in, int& warpOff) {
   warpOff = 0;
-  const FramePlan& P = in.frame;
+  const point::Blocks& P = in.frame;
   if (!P.warp.active()) return ensureHdr(in);
   std::vector<float> data;
   std::uint64_t key = P.warp.field->id * 0x9E3779B97F4A7C15ull + 0x5245534841504555ull;  // "RESHAPE"
@@ -757,7 +743,7 @@ LutBind Executor::lutBind(GpuGraph& g, const DeviceTables& t) {
 }
 
 bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
-  const FramePlan::Film& f = in.frame.film;
+  const point::Film& f = in.frame.film;
   const std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
   if (!lib) return fail(GpuFailure::Unsupported, "film library not available");
   filmnode::FilmFrameArgs a;
@@ -776,8 +762,8 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
   a.grainPct = f.grainPct;
   a.halationPct = f.halationPct;
   a.formatScale = f.formatScale;
-  a.w = in.frame.outW;
-  a.h = in.frame.outH;
+  a.w = in.frame.geo.outW;
+  a.h = in.frame.geo.outH;
   a.quality = f.quality;
   a.keepGrain = f.keepGrain;
   a.coarse = f.coarse;
@@ -871,8 +857,8 @@ std::shared_ptr<DeviceFilm> Executor::ensureFilm(const filmnode::FilmResolved& r
   return film_;
 }
 
-std::shared_ptr<DeviceDisplay> Executor::ensureDisplay(const FramePlan& P) {
-  const FramePlan::Display& d = P.display;
+std::shared_ptr<DeviceDisplay> Executor::ensureDisplay(const point::Blocks& P) {
+  const point::Display& d = P.display;
   const bool hasLut = d.lut && d.lutMix > 0.f && d.lut->size() >= 2 && d.lut->table().size() == std::size_t(d.lut->size()) * d.lut->size() * d.lut->size() * 3;
   const bool curves = d.curveMask != 0 && d.curveSamples >= 2 && d.curves.size() == std::size_t(4) * d.curveSamples;
   const bool plain = P.film.displayPlain || (!curves && !hasLut);
@@ -991,7 +977,7 @@ bool Executor::validate(const GpuRun& in) {
 struct Executor::Walk {
   GpuRecorder& r;
   const GpuRun& in;
-  const FramePlan& P;
+  const point::Blocks& P;
   SpatialRadii R;
   bool whole;
   WRect interior, work;
@@ -1051,44 +1037,44 @@ struct Executor::Walk {
     H in = src.img;
     if (this->in.blocks.local.active() && ldesc >= 0 && lplanes >= 0) {  // local adjustments, stage L, on the film's scene input (docs section 40.7): gather + ops in one pass
       if (needAux && aux0 < 0) {
-        aux0 = r.tr(kF16, P.outW, P.outH);
-        aux1 = r.tr(kF16, P.outW, P.outH);
+        aux0 = r.tr(kF16, P.geo.outW, P.geo.outH);
+        aux1 = r.tr(kF16, P.geo.outW, P.geo.outH);
       }
-      const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.outW), std::uint32_t(P.outH));
-      const LocalFilmInNode ln{&P, src, P.outW, P.outH, 0, 0, ldesc, lplanes, needAux ? aux0 : -1, needAux ? aux1 : -1};
+      const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
+      const LocalFilmInNode ln{&P, src, P.geo.outW, P.geo.outH, 0, 0, ldesc, lplanes, needAux ? aux0 : -1, needAux ? aux1 : -1};
       if (!recordLocalFilmIn(r, ln, g)) return -1;
       return g;
     }
-    if (P.useGeo) {
+    if (P.geo.useGeo) {
       struct U {
         std::int32_t a[4], b[4];
         float geoA[4], geoB[4], geoC[4];
         std::int32_t c[4];
         WarpU w;
       } u{};
-      u.a[0] = P.srcW;
-      u.a[1] = P.srcH;
-      u.a[2] = P.outW;
-      u.a[3] = P.outH;
-      u.geoA[0] = P.cs;
-      u.geoA[1] = P.sn;
-      u.geoA[2] = P.fw;
-      u.geoA[3] = P.fh;
-      u.geoB[0] = P.ox0;
-      u.geoB[1] = P.oy0;
-      u.geoB[2] = P.stepX;
-      u.geoB[3] = P.stepY;
-      u.geoC[0] = P.fullW;
-      u.geoC[1] = P.fullH;
-      u.c[0] = P.rot;
-      u.c[1] = P.flip ? 1 : 0;
+      u.a[0] = P.geo.srcW;
+      u.a[1] = P.geo.srcH;
+      u.a[2] = P.geo.outW;
+      u.a[3] = P.geo.outH;
+      u.geoA[0] = P.geo.cs;
+      u.geoA[1] = P.geo.sn;
+      u.geoA[2] = P.geo.fw;
+      u.geoA[3] = P.geo.fh;
+      u.geoB[0] = P.geo.ox0;
+      u.geoB[1] = P.geo.oy0;
+      u.geoB[2] = P.geo.stepX;
+      u.geoB[3] = P.geo.stepY;
+      u.geoC[0] = P.geo.fullW;
+      u.geoC[1] = P.geo.fullH;
+      u.c[0] = P.geo.rot;
+      u.c[1] = P.geo.flip ? 1 : 0;
       const bool warpOn = P.warp.active() && src.warp >= 0;
-      if (warpOn) warpUniform(P, src, u.w);
-      const hal::PipelineH p = r.pl("film_src", {{0, P.exact ? 1 : 2}, {4, warpOn ? 1 : 0}});
+      if (warpOn) warpUniform(P.warp, src, u.w);
+      const hal::PipelineH p = r.pl("film_src", {{0, P.geo.exact ? 1 : 2}, {4, warpOn ? 1 : 0}});
       if (!p) return -1;
-      const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.outW), std::uint32_t(P.outH));
-      r.g.dispatch("film_src", p, {GpuGraph::R(src.img), GpuGraph::W(g), GpuGraph::R(warpOn ? src.warp : r.g.externalBuf(r.gBuf))}, r.gx(P.outW),
-                   r.gy(P.outH), &u, sizeof u);
+      const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
+      r.g.dispatch("film_src", p, {GpuGraph::R(src.img), GpuGraph::W(g), GpuGraph::R(warpOn ? src.warp : r.g.externalBuf(r.gBuf))}, r.gx(P.geo.outW),
+                   r.gy(P.geo.outH), &u, sizeof u);
       in = g;
     }
     return in;
@@ -1096,7 +1082,7 @@ struct Executor::Walk {
   bool filmStage() {
     const H in = filmInput();
     if (in < 0) return false;
-    filmH = filmnode::recordFilmFrame(r, *fres, *ftab, *fplan, in, P.outW, P.outH);
+    filmH = filmnode::recordFilmFrame(r, *fres, *ftab, *fplan, in, P.geo.outW, P.geo.outH);
     filmClamped = filmH >= 0 && filmnode::filmEndsClamped(*fres);
     filmOx = filmOy = 0;
     return filmH >= 0;
@@ -1105,7 +1091,7 @@ struct Executor::Walk {
   bool filmPrePass(filmnode::FilmPre& out) {
     const H in = filmInput();
     if (in < 0) return false;
-    return filmnode::recordFilmPre(r, *fres, *ftab, in, P.outW, P.outH, out);
+    return filmnode::recordFilmPre(r, *fres, *ftab, in, P.geo.outW, P.geo.outH, out);
   }
   // tiled export: the develop / grain / print / scan chain over the work rectangle grown by the film halo (clipped to the frame)
   bool filmWindowStage() {
@@ -1113,9 +1099,9 @@ struct Executor::Walk {
     filmnode::FilmWin win;
     win.x0 = std::max(0, work.x0 - halo);
     win.y0 = std::max(0, work.y0 - halo);
-    win.w = std::min(P.outW, work.x1 + halo) - win.x0;
-    win.h = std::min(P.outH, work.y1 + halo) - win.y0;
-    const filmnode::FilmImg fi = filmnode::recordFilmWindow(r, *fres, *ftab, *fplan, pre, P.outW, P.outH, win);
+    win.w = std::min(P.geo.outW, work.x1 + halo) - win.x0;
+    win.h = std::min(P.geo.outH, work.y1 + halo) - win.y0;
+    const filmnode::FilmImg fi = filmnode::recordFilmWindow(r, *fres, *ftab, *fplan, pre, P.geo.outW, P.geo.outH, win);
     if (fi.img < 0) return false;
     filmH = fi.img;
     filmOx = fi.ox;
@@ -1148,12 +1134,12 @@ struct Executor::Walk {
     u.a[1] = Hh;
     u.a[2] = ox;
     u.a[3] = oy;
-    u.geoB[0] = P.ox0;
-    u.geoB[1] = P.oy0;
-    u.geoB[2] = P.stepX;
-    u.geoB[3] = P.stepY;
-    u.geoC[0] = P.fullW;
-    u.geoC[1] = P.fullH;
+    u.geoB[0] = P.geo.ox0;
+    u.geoB[1] = P.geo.oy0;
+    u.geoB[2] = P.geo.stepX;
+    u.geoB[3] = P.geo.stepY;
+    u.geoC[0] = P.geo.fullW;
+    u.geoC[1] = P.geo.fullH;
     u.geoC[2] = in.blocks.vignette.amount;
     u.e[0] = e.amp;
     u.e[1] = e.period;
@@ -1344,14 +1330,14 @@ Status Executor::run(const GpuRun& in, GpuOut& out) {
 Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   const auto t0 = Clock::now();
   hal::Device& d = dev();
-  const FramePlan& P = in.frame;
+  const point::Blocks& P = in.frame;
   const hal::DeviceCaps& caps = d.caps();
-  const int fw = P.outW, fh = P.outH;
+  const int fw = P.geo.outW, fh = P.geo.outH;
   if (fw <= 0 || fh <= 0 || std::uint32_t(fw) > caps.maxImage2D || std::uint32_t(fh) > caps.maxImage2D)
     return fail(GpuFailure::Unsupported, "frame size outside the device limits"), Status::Unsupported;
   if (!canResident(W_, H_)) return fail(GpuFailure::Unsupported, "source too large for a resident GPU copy"), Status::Unsupported;
   if (!ensureResident()) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
-  hal::ImageH* S = resizedSource(P.srcW, P.srcH);
+  hal::ImageH* S = resizedSource(P.geo.srcW, P.geo.srcH);
   if (!S) return failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
   const bool filmFrame = in.plan.hasFilm;
   std::shared_ptr<DeviceTables> L;
@@ -1542,10 +1528,10 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   hal::Device& d = dev();
   GpuPool& pool = core().pool();
   const double gpu0 = d.gpuAccumMs();
-  const FramePlan& P = in.frame;
+  const point::Blocks& P = in.frame;
   auto bad = [&](Status s) { return failure_ == GpuFailure::Unsupported ? Status::Unsupported : s; };
   if (!in.target.sink) return fail(GpuFailure::Unsupported, "no tile sink"), Status::Unsupported;
-  const int rw = P.srcW, rh = P.srcH;
+  const int rw = P.geo.srcW, rh = P.geo.srcH;
   const resize::Block rb = resize::resolve(W_, H_, rw, rh);
   const bool down = rw < W_ || rh < H_;
   const SpatialRadii R = spatialRadii(in.blocks);
@@ -1574,7 +1560,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   std::shared_ptr<DeviceDisplay> DD;
   filmnode::FilmResolved fres;
   if (filmFrame) {  // the whole-frame part of the film (E2, q) is kept on the device while the tiles run
-    if (std::uint64_t(P.outW) * P.outH * 128 > std::uint64_t(double(d.caps().deviceLocalBytes) * 0.5))
+    if (std::uint64_t(P.geo.outW) * P.geo.outH * 128 > std::uint64_t(double(d.caps().deviceLocalBytes) * 0.5))
       return fail(GpuFailure::Unsupported, "film frame too large for the device memory"), Status::Unsupported;
     if (!filmResolve(in, fres)) return Status::Unsupported;
     DF = ensureFilm(fres);
@@ -1599,7 +1585,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     wantDz |= st.kind == StageKind::TileSweep && st.accum == Accum::DehazeGrid;
     wantClar |= st.kind == StageKind::TileSweep && st.accum == Accum::LumaGrid;
   }
-  const int glw = cdiv(P.outW, 4), glh = cdiv(P.outH, 4);
+  const int glw = cdiv(P.geo.outW, 4), glh = cdiv(P.geo.outH, 4);
   hal::ImageH gColor, gDc, gYy, gAb;
   struct Free {
     hal::Device& dev;
@@ -1641,7 +1627,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     rec.gBuf = core().gBuf;
     rec.partBuf = core().partBuf;
     Walk wp(rec, in, true);
-    wp.interior = wp.work = WRect{0, 0, P.outW, P.outH};
+    wp.interior = wp.work = WRect{0, 0, P.geo.outW, P.geo.outH};
     wp.src.img = g.external(*S);
     if (HD && P.warp.active()) wp.src.warp = g.externalBuf(HD->buf), wp.src.warpOff = warpOff;
     wp.fres = &fres;
@@ -1659,7 +1645,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     keep.any = pre.any;
     hal::Status ms = hal::Status::Ok;
     auto mkImg = [&](hal::ImageH& im) {
-      if (ms == hal::Status::Ok) ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(P.outW), std::uint32_t(P.outH), 1}, &im);
+      if (ms == hal::Status::Ok) ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH), 1}, &im);
     };
     if (pre.any) {
       mkImg(keep.e2);
@@ -1669,10 +1655,10 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     }
     if (ms != hal::Status::Ok) return failStatus(ms, ""), Status::Internal;
     if (pre.any) {
-      g.copyImage(pre.e2, g.external(keep.e2), std::uint32_t(P.outW), std::uint32_t(P.outH));
-      if (pre.q >= 0) g.copyImage(pre.q, g.external(keep.q), std::uint32_t(P.outW), std::uint32_t(P.outH));
+      g.copyImage(pre.e2, g.external(keep.e2), std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
+      if (pre.q >= 0) g.copyImage(pre.q, g.external(keep.q), std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
     } else {
-      g.copyImage(pre.disp, g.external(keep.disp), std::uint32_t(P.outW), std::uint32_t(P.outH));
+      g.copyImage(pre.disp, g.external(keep.disp), std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
     }
     hal::FenceH fence;
     ms = runGraph(d, g, *cl, &fence, perr);
@@ -1682,8 +1668,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   }
 
   std::vector<WRect> tiles;
-  for (int y = 0; y < P.outH; y += tile)
-    for (int x = 0; x < P.outW; x += tile) tiles.push_back({x, y, std::min(P.outW, x + tile), std::min(P.outH, y + tile)});
+  for (int y = 0; y < P.geo.outH; y += tile)
+    for (int x = 0; x < P.geo.outW; x += tile) tiles.push_back({x, y, std::min(P.geo.outW, x + tile), std::min(P.geo.outH, y + tile)});
 
   struct Pending {
     int slot = -1;
@@ -1720,8 +1706,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
 
   // one sweep over one tile
   auto runTile = [&](const Stage& st, const WRect& interior) -> bool {
-    const WRect work{std::max(0, interior.x0 - R.halo), std::max(0, interior.y0 - R.halo), std::min(P.outW, interior.x1 + R.halo),
-                     std::min(P.outH, interior.y1 + R.halo)};
+    const WRect work{std::max(0, interior.x0 - R.halo), std::max(0, interior.y0 - R.halo), std::min(P.geo.outW, interior.x1 + R.halo),
+                     std::min(P.geo.outH, interior.y1 + R.halo)};
     const bool readback = st.output;
     // 1. the source window of a streamed export is uploaded first (the upload takes frame slots of its own)
     hal::ImageH acquired;
@@ -1753,8 +1739,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     rec.boxScanMin = core().boxScanOk ? -1 : 0;
     rec.gBuf = core().gBuf;
     rec.partBuf = core().partBuf;
-    rec.allocW = int(pool.bucket(std::uint32_t(std::min(P.outW, tile + 2 * R.halo))));
-    rec.allocH = int(pool.bucket(std::uint32_t(std::min(P.outH, tile + 2 * R.halo))));
+    rec.allocW = int(pool.bucket(std::uint32_t(std::min(P.geo.outW, tile + 2 * R.halo))));
+    rec.allocH = int(pool.bucket(std::uint32_t(std::min(P.geo.outH, tile + 2 * R.halo))));
     Walk w(rec, in, false);
     w.interior = interior;
     w.work = work;
@@ -1877,8 +1863,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   }
   if (d.waitAll() != hal::Status::Ok) return failStatus(hal::Status::Timeout, ""), Status::Internal;
   if (pool.freeBytes() > d.poolBudget()) pool.trim(d.poolBudget());
-  out.w = P.outW;
-  out.h = P.outH;
+  out.w = P.geo.outW;
+  out.h = P.geo.outH;
   out.stats.wallMs = msSince(t0);
   out.stats.gpuMs = d.gpuAccumMs() - gpu0;
   out.stats.passes = passes;

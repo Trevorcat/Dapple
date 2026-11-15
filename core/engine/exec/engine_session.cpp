@@ -73,7 +73,7 @@ GpuCounters gpuCounters() {
   return {t.gpuFrames.load(), t.gpuFallbacks.load(), t.gpuTransients.load(), t.gpuLost.load(), t.gpuDemotions.load()};
 }
 
-// ---- table node evaluators: thin wrappers over the Renderer::bake pieces -------------------------------------------------
+// ---- table node evaluators: thin wrappers over the point family's bake pieces (point::bake*) -------------------------------------------------
 
 std::shared_ptr<void> bakeNode(NodeType type, const void* resolved, std::span<const void* const> inputs) {
   const CpuImpl* impl = cpuImpl(type);
@@ -91,14 +91,14 @@ std::shared_ptr<std::vector<float>> evalColourLattice(const TableEnv& env, int n
   return as<std::vector<float>>(bakeNode(NodeType::ColourLattice, &c));
 }
 
-Renderer::TonePre evalToneAnalysisPre(const TableEnv& env, std::vector<float>* lattice, int n, bool fast) {
+engine::point::TonePre evalToneAnalysisPre(const TableEnv& env, std::vector<float>* lattice, int n, bool fast) {
   const TableBakeCtx c{&env, n, fast, 0.f};
   const void* in[1] = {lattice};
-  const auto p = as<Renderer::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &c, in));
-  return p ? *p : Renderer::TonePre{};
+  const auto p = as<engine::point::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &c, in));
+  return p ? *p : engine::point::TonePre{};
 }
 
-ToneTableOut evalToneTable(const TableEnv& env, const Renderer::TonePre* pre) {
+ToneTableOut evalToneTable(const TableEnv& env, const engine::point::TonePre* pre) {
   const TableBakeCtx c{&env, 0, false, 0.f};
   const void* in[1] = {pre};
   const auto p = as<ToneTableOut>(bakeNode(NodeType::ToneTable, &c, in));
@@ -111,7 +111,7 @@ std::vector<float> evalLatticeOverflow(const TableEnv& env, int n, float maxV) {
   return p ? *p : std::vector<float>{};
 }
 
-ToneAnalysis evalAnalysis(const TableEnv& env, const Renderer::TonePre* pre) {
+ToneAnalysis evalAnalysis(const TableEnv& env, const engine::point::TonePre* pre) {
   const TableBakeCtx c{&env, 0, false, 0.f};
   const void* in[1] = {pre};
   const auto p = as<ToneAnalysis>(bakeNode(NodeType::Analysis, &c, in));
@@ -160,33 +160,8 @@ void localRequest(PlanRequest& rq, const localadj::Block& b) {
   rq.localAux = b.auxPlanes;
 }
 
-// What a GPU frame binds from its source (the CPU frames' FrameKernels bind their own): the region source's radii scale and the portrait
-// reshaping field into the plan, the local adjustments (localadj::bind) returned; the caller keeps them alive for the frame.
-std::shared_ptr<const local::Frame> bindSource(FramePlan& fp, const Renderer& r, const SourceImage& src, bool interactive) {
-  if (src.parent && src.parent->fullW > 0 && src.parent->fullH > 0 && fp.srcW > 0 && fp.srcH > 0)  // a region source (docs section 44): radii are fractions of the parent picture
-    fp.spatialScale *= float(std::max(src.parent->fullW, src.parent->fullH)) / float(std::max(fp.srcW, fp.srcH));
-  if (r.params().reshape.active() && fp.srcW > 0 && fp.srcH > 0 && !src.linear.empty()) {
-    // portrait reshaping (section 45): the field of the photo, mapped to the plan's source pixels (the store may be a resized copy of `src`)
-    const bool par = src.parent && src.parent->fullW > 0 && src.parent->fullH > 0;
-    const int PW = par ? src.parent->fullW : src.linear.width, PH = par ? src.parent->fullH : src.linear.height;
-    fp.warp.field = warp::bind(r.params().reshape, PW, PH, interactive);
-    if (fp.warp.field) {
-      const warp::Field& f = *fp.warp.field;
-      const float kx = float(src.linear.width) / float(fp.srcW), ky = float(src.linear.height) / float(fp.srcH);  // source px of `src` per plan px
-      fp.warp.ax = float(f.gw - 1) / float(PW) * kx;
-      fp.warp.bx = float(par ? src.parent->x0 : 0) * float(f.gw - 1) / float(PW);
-      fp.warp.ay = float(f.gh - 1) / float(PH) * ky;
-      fp.warp.by = float(par ? src.parent->y0 : 0) * float(f.gh - 1) / float(PH);
-      fp.warp.lpx = float(std::max(PW, PH)) / kx;
-      fp.warp.pad = int(std::ceil(f.maxDisp * fp.warp.lpx)) + 1;
-      fp.useGeo = true;
-    }
-  }
-  return localadj::bind(r.params(), src, interactive);
-}
-
 // What the planner needs besides the graph: frame size, neighbourhood amounts after quality / region / film.
-PlanRequest makeRequest(const FrameKernels& fk, const FrameBlocks& fb, ExecMode mode, int tile, std::size_t budget, int channels) {
+PlanRequest makeRequest(const point::CpuFrame& fk, const FrameBlocks& fb, ExecMode mode, int tile, std::size_t budget, int channels) {
   PlanRequest rq;
   rq.frameW = fk.width();
   rq.frameH = fk.height();
@@ -217,12 +192,12 @@ void addStats(EngineStats& st, const ExecStats& es) {
   st.streamed += es.streamed ? 1 : 0;
 }
 
-// Plan request from a resolved frame (the GPU path has no FrameKernels: the executor reads the FramePlan).
-PlanRequest requestFromFrame(const FramePlan& fp, const FrameBlocks& fb, ExecMode mode, int tile, std::size_t budget, bool filmTiles = false) {
+// Plan request from a resolved frame (the GPU path has no point::CpuFrame: the executor reads the point blocks).
+PlanRequest requestFromFrame(const point::Blocks& fp, const FrameBlocks& fb, ExecMode mode, int tile, std::size_t budget, bool filmTiles = false) {
   PlanRequest rq;
   rq.filmTiles = filmTiles;
-  rq.frameW = fp.outW;
-  rq.frameH = fp.outH;
+  rq.frameW = fp.geo.outW;
+  rq.frameH = fp.geo.outH;
   rq.mode = mode;
   rq.tile = tile;
   rq.memBudget = budget;
@@ -236,7 +211,7 @@ PlanRequest requestFromFrame(const FramePlan& fp, const FrameBlocks& fb, ExecMod
   rq.grain = fb.grain.amount;
   rq.scale = fp.spatialScale;
   rq.vignette = fb.vignette.active();
-  rq.useGeo = fp.useGeo;
+  rq.useGeo = fp.geo.useGeo;
   rq.outChannels = 4;
   localRequest(rq, fb.local);
   return rq;
@@ -329,13 +304,13 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
   const char* tier = q == SpatialQuality::Interactive ? "interactive" : q == SpatialQuality::Full ? "full" : "off";
   char line[512];
   const FrameResult::CpuSplit& c = out.cpu;
-  int n = std::snprintf(line, sizeof line, "frame %dx%d tier=%s film=%s exec=%s%s%s | gpu %llu cpu %llu", out.w, out.h, tier, job.renderer.filmActive() ? "on" : "off",
+  int n = std::snprintf(line, sizeof line, "frame %dx%d tier=%s film=%s exec=%s%s%s | gpu %llu cpu %llu", out.w, out.h, tier, engine::point::filmActive(job.point.p) ? "on" : "off",
                         exec.c_str(), onGpu ? "" : " reason=", onGpu ? "" : reason.c_str(), (unsigned long long)g, (unsigned long long)cp);
-  // where the CPU side of the frame went (ms): match = film exposure solve, renderer = Renderer ctor, graph, tables, exec = plan + executor incl. GPU wait
+  // where the CPU side of the frame went (ms): match = film exposure solve, renderer = point::resolve, graph, tables, exec = plan + executor incl. GPU wait
   if (n > 0 && n < int(sizeof line))
-    std::snprintf(line + n, sizeof line - std::size_t(n), " | cpu_ms %.1f (match %.1f renderer %.1f graph %.1f tables %.1f exec %.1f; upload %.1f gpu %.1f) max %.1f", c.totalMs, c.matchMs,
+    std::snprintf(line + n, sizeof line - std::size_t(n), " | cpu_ms %.1f (match %.1f point %.1f graph %.1f tables %.1f exec %.1f; upload %.1f gpu %.1f) max %.1f", c.totalMs, c.matchMs,
                   c.rendererMs, c.graphMs, c.tablesMs, c.execMs, out.gpu.uploadMs, out.gpu.gpuMs, std::max(maxMs, c.totalMs));
-  if (job.renderer.filmActive()) {  // background print tables of the film drag (wave 8): frames that used the previous step, tables finished, requests
+  if (engine::point::filmActive(job.point.p)) {  // background print tables of the film drag (wave 8): frames that used the previous step, tables finished, requests
     unsigned long long su = 0, bk = 0, rq = 0;
     filmnode::filmAsyncTableStats(&su, &bk, &rq);
     const std::size_t len = std::strlen(line);
@@ -355,7 +330,7 @@ struct GainCtx {
 };
 void gainOf(const void* user, const EditParams& e, float out[3]) {
   const auto* g = static_cast<const GainCtx*>(user);
-  Renderer::inputGain(e, *g->camera, g->sceneReferred, out);
+  engine::point::inputGain(e, *g->camera, g->sceneReferred, out);
 }
 
 }  // namespace
@@ -390,13 +365,13 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     GpuProvider* pv = gpuProvider();
     frameWhy_ = !pv ? "no GPU provider (build without the GPU executor)" : !pv->enabled() ? pv->inactiveReason() : "no source store (host frame)";
   }
-  FrameKernels fk(job.renderer, job.src, &bake, job.fastOptions);
+  point::CpuFrame fk(job.point, job.src, &bake, job.fastOptions);
   if (!fk.valid()) {
     frameWhy_ += std::string(frameWhy_.empty() ? "" : "; ") + "empty source";
     return 1;
   }
   const auto t0 = Clock::now();
-  const FramePlan fp = fk.framePlan();
+  const point::Blocks& fp = fk.blocks();
   const FrameBlocks fb = fk.frameBlocks();
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   const ValidationResult v = g.validate();
@@ -458,10 +433,10 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
     out.error = "out of memory";
     return -1;
   }
-  return 1;  // Unsupported (film stage failed ...): the caller reports an explicit error, there is no second renderer
+  return 1;  // Unsupported (film stage failed ...): the caller reports an explicit error, there is no second point
 }
 
-int EngineSession::renderExactGpu(const EditParams& params, const Renderer& renderer, const SourceImage& src, const ExactOptions& opt, Image8& out,
+int EngineSession::renderExactGpu(const EditParams& params, const engine::point::Params& point, const SourceImage& src, const ExactOptions& opt, Image8& out,
                                   std::string* err) {
   GpuProvider* pv = gpuProvider();
   if (!gpuOverride_ && !(pv && pv->enabled())) return 1;
@@ -471,9 +446,9 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   if (W < 1 || H < 1) return 1;
   FastOptions fo;
   fo.spatial = SpatialQuality::Full;
-  FramePlan fp = renderer.framePlan(W, H, src.sceneReferred, fo);
+  point::Blocks fp = engine::point::resolveFrame(point, W, H, src.sceneReferred, fo, &src);
   if (!fp.supported) return 1;
-  const std::shared_ptr<const local::Frame> lf = bindSource(fp, renderer, src, false);
+  const std::shared_ptr<const local::Frame> lf = localadj::bind(point.p, src, false);
   ParamInputs in;
   in.edit = params;
   in.frame.exact = true;
@@ -485,7 +460,7 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   in.ctx.srcW = W;
   in.ctx.srcH = H;
   const ParamSet ps = ParamSet::make(std::move(in));
-  const FrameBlocks fb = resolveFrameBlocks(params, frameFacts(fp, fo, src.sceneReferred), {lf.get(), fp.warp.field.get()});
+  const FrameBlocks fb = resolveFrameBlocks(params, point::facts(fp, fo, src.sceneReferred), {lf.get(), fp.warp.field.get()});
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);  // the exact variant: ToneColourExact, no table nodes
   if (const ValidationResult v = g.validate(); !v.ok) {
     if (err) *err = "engine graph: " + v.error;
@@ -494,16 +469,16 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   g.computeKeys(ps);
   // The GPU evaluates the exact colour stage through the finest lattice (65^3 + the overflow lattice) baked with the exact analysis; the CPU
   // executor remains the per-pixel reference (docs/engine/pipeline-architecture.md 21).
-  const std::shared_ptr<const BakedLut> bake = renderer.bake(src, 65, nullptr, false);
+  const std::shared_ptr<const BakedLut> bake = engine::point::bake(point, src, 65, nullptr, false);
   if (!bake) return 1;
-  renderer.hdrBind(src, fp.hdr, &bake->tone);
+  engine::point::hdrBind(point, src, fp.hdr, &bake->tone);
   const bool tiled = opt.mode == ExecMode::TiledExport;
   const int tile = opt.tile > 0 ? opt.tile : (x->caps().unifiedMemory ? 1024 : 2048);
   const Plan plan = Planner::plan(g, requestFromFrame(fp, fb, tiled ? ExecMode::TiledExport : ExecMode::Whole, tiled ? tile : 0, std::size_t(1) << 30, true), nullptr);
   MemorySourceStore store(src);
-  GpuRun run{plan, g, fp, fb, store, *bake, nullptr, &renderer, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
-  out.width = fp.outW;
-  out.height = fp.outH;
+  GpuRun run{plan, g, fp, fb, store, *bake, nullptr, &point, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
+  out.width = fp.geo.outW;
+  out.height = fp.geo.outH;
   out.data.assign(std::size_t(out.width) * out.height * 3, 0);
   if (tiled) {
     run.target.sink = [&](int x0, int y0, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
@@ -544,17 +519,17 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   return r;
 }
 
-bool EngineSession::renderExact(const EditParams& params, const Renderer& renderer, const SourceImage& src,
+bool EngineSession::renderExact(const EditParams& params, const engine::point::Params& point, const SourceImage& src,
                                 const ExactOptions& opt, Image8& out, std::string* err, ExecStats* statsOut) {
   const bool streaming = bool(opt.sourceWindow) && bool(opt.rows);  // section 42
   if (!opt.outFloat && opt.spatial && !opt.sessionCache && !streaming) {  // export / reference frames: the GPU executor first (exact variant on the dense lattice)
-    const int gr = renderExactGpu(params, renderer, src, opt, out, err);
+    const int gr = renderExactGpu(params, point, src, opt, out, err);
     if (gr == 0) return true;
     if (gr < 0) return false;
   }
   FastOptions fo;
   fo.spatial = opt.spatial ? SpatialQuality::Full : SpatialQuality::Off;
-  FrameKernels fk(renderer, src, nullptr, fo);
+  point::CpuFrame fk(point, src, nullptr, fo);
   if (!fk.valid()) {
     if (err) *err = "empty source";
     return false;
@@ -570,7 +545,7 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   in.ctx.srcW = src.linear.width;
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
-  const FramePlan fp = fk.framePlan();
+  const point::Blocks& fp = fk.blocks();
   const FrameBlocks fb = fk.frameBlocks();
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   const ValidationResult v = g.validate();
@@ -610,7 +585,7 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   ++stats_.planned;
   ExecEnv env{fk, g, cache, CancelToken{&latest_, latest_.load(std::memory_order_relaxed)}, nullptr, 3};
   std::vector<std::uint8_t> band;  // streaming export: the band in flight
-  int winX0 = 0, winY0 = 0, winX1 = 0, winY1 = 0;  // source rect of the window the FrameKernels hold
+  int winX0 = 0, winY0 = 0, winX1 = 0, winY1 = 0;  // source rect of the window the point::CpuFrame holds
   bool haveWin = false;
   std::string filmWhy;  // streaming export: why the film could not run in bands
   if (streaming) {
@@ -678,11 +653,11 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   if (statsOut) *statsOut = es;
   if (s == Status::Unsupported) {
     ++stats_.fallbacks;
-    // No second renderer behind the engine: a film whose stock / paper is not in the library or whose table bake failed is an explicit error
+    // No second point behind the engine: a film whose stock / paper is not in the library or whose table bake failed is an explicit error
     // like any other unsupported plan.
     if (err)
       *err = "engine: plan not supported by the CPU executor" + (std::string(plan.why ? plan.why : "").empty() ? std::string() : " (" + std::string(plan.why) + ")") +
-             (renderer.filmActive() ? (filmWhy.empty() ? " [film: unknown stock / paper or failed table bake]" : " [" + filmWhy + "]") : "");
+             (engine::point::filmActive(point.p) ? (filmWhy.empty() ? " [film: unknown stock / paper or failed table bake]" : " [" + filmWhy + "]") : "");
     return false;
   }
   if (s != Status::Ok) {
@@ -700,7 +675,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
   const NodeInstance* anN = g.find(NodeType::Analysis);
   const NodeInstance* ovN = g.find(NodeType::LatticeOverflow);
   const int nReq = std::clamp(n, 17, 65);
-  const TableEnv env{job.renderer, job.src};
+  const TableEnv env{job.point, job.src};
   const bool move = job.params.toneStrength > 0.f;
 
   // the finest cached lattice of this colour stage that is at least as fine as asked for
@@ -717,21 +692,21 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
   auto deriveKeys = [&] { tk = effectiveTableKeys(g, ps, latticeN); };
   if (lattice) deriveKeys();
 
-  Renderer::TonePre pre;
+  engine::point::TonePre pre;
   bool preReady = false;
-  auto ensurePre = [&]() -> Renderer::TonePre& {
+  auto ensurePre = [&]() -> engine::point::TonePre& {
     if (preReady) return pre;
     if (ResultCache::Entry* e = cache_.find(NodeType::ToneAnalysisPre, tk.pre)) {
-      pre = *as<Renderer::TonePre>(e->payload);
+      pre = *as<engine::point::TonePre>(e->payload);
     } else {
       const TableBakeCtx bc{&env, latticeN, job.request.fastAnalysis, 0.f};
       const void* in[1] = {lattice.get()};
-      const auto made = as<Renderer::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &bc, in));
-      pre = made ? *made : Renderer::TonePre{};
+      const auto made = as<engine::point::TonePre>(bakeNode(NodeType::ToneAnalysisPre, &bc, in));
+      pre = made ? *made : engine::point::TonePre{};
       ResultCache::Entry ne;
       ne.key = ne.family = tk.pre;
-      ne.payload = std::make_shared<Renderer::TonePre>(pre);
-      ne.bytes = sizeof(Renderer::TonePre) + pre.toneMove.size() * 4;
+      ne.payload = std::make_shared<engine::point::TonePre>(pre);
+      ne.bytes = sizeof(engine::point::TonePre) + pre.toneMove.size() * 4;
       cache_.put(NodeType::ToneAnalysisPre, std::move(ne));
       ++stats_.preBuilds;
     }
@@ -774,7 +749,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
     if (ResultCache::Entry* e = cache_.find(NodeType::ToneTable, tk.tone)) {
       tt = *as<ToneTableOut>(e->payload);
     } else {
-      const Renderer::TonePre* p = (move && preN) ? &ensurePre() : nullptr;
+      const engine::point::TonePre* p = (move && preN) ? &ensurePre() : nullptr;
       const TableBakeCtx bc{&env, latticeN, false, 0.f};
       const void* in[1] = {p};
       const auto made = as<ToneTableOut>(bakeNode(NodeType::ToneTable, &bc, in));
@@ -829,7 +804,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
     if (ResultCache::Entry* e = cache_.find(NodeType::Analysis, tk.analysis)) {
       out.analysis = *as<ToneAnalysis>(e->payload);
     } else {
-      const Renderer::TonePre* p = preN ? &ensurePre() : nullptr;
+      const engine::point::TonePre* p = preN ? &ensurePre() : nullptr;
       const TableBakeCtx bc{&env, latticeN, false, 0.f};
       const void* in[1] = {p};
       const auto made = as<ToneAnalysis>(bakeNode(NodeType::Analysis, &bc, in));
@@ -908,10 +883,10 @@ bool EngineSession::renderFrame(FrameJob& job, FrameResult& out) {
     w = out.w;
     h = out.h;
   } else {
-    // r == 1: neither executor took the plan. There is no second renderer behind it: that is an explicit error (also for a film whose stock /
+    // r == 1: neither executor took the plan. There is no second point behind it: that is an explicit error (also for a film whose stock /
     // paper is not in the library or whose table bake failed; highlight boost and the enlarger diffusion filter are film nodes).
     out.error = "engine: plan not supported by any executor" + (frameWhy_.empty() ? std::string() : " (" + frameWhy_ + ")") +
-                (job.renderer.filmActive() ? " [film: unknown stock / paper or failed table bake]" : "");
+                (engine::point::filmActive(job.point.p) ? " [film: unknown stock / paper or failed table bake]" : "");
     return false;
   }
   if (!rgba && !out.external && !out.floatOut) {
@@ -1053,9 +1028,9 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
       rh = H;
     }
   }
-  FramePlan fp = job.renderer.framePlan(rw, rh, job.src.sceneReferred, job.fastOptions);
-  job.renderer.hdrBind(job.src, fp.hdr, &bake.tone);  // single-image HDR: the field comes from the CPU source (a pure function of source + white balance)
-  const std::shared_ptr<const local::Frame> lf = bindSource(fp, job.renderer, job.src, job.fastOptions.spatial == SpatialQuality::Interactive);
+  point::Blocks fp = engine::point::resolveFrame(job.point, rw, rh, job.src.sceneReferred, job.fastOptions, &job.src);
+  engine::point::hdrBind(job.point, job.src, fp.hdr, &bake.tone);  // single-image HDR: the field comes from the CPU source (a pure function of source + white balance)
+  const std::shared_ptr<const local::Frame> lf = localadj::bind(job.point.p, job.src, job.fastOptions.spatial == SpatialQuality::Interactive);
   if (job.resizeSharpen > 0.f && (rw < job.store->width() || rh < job.store->height())) fp.resizeSharpen = job.resizeSharpen;  // adds the Detail node
   if (!fp.supported) {
     ++stats_.gpuUnsupported;
@@ -1064,7 +1039,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
     if (gpuForce_) return out.error = frameWhy_, -1;
     return 1;
   }
-  const FrameBlocks fb = resolveFrameBlocks(job.renderer.params(), frameFacts(fp, job.fastOptions, job.src.sceneReferred), {lf.get(), fp.warp.field.get()});
+  const FrameBlocks fb = resolveFrameBlocks(job.point.p, point::facts(fp, job.fastOptions, job.src.sceneReferred), {lf.get(), fp.warp.field.get()});
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   const ValidationResult v = g.validate();
   if (!v.ok) {
@@ -1085,7 +1060,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
   ++stats_.planned;
   totals().planned.fetch_add(1, std::memory_order_relaxed);
   const std::vector<float>* over = overflowFor(ps, bake.n);
-  GpuRun run{plan, g, fp, fb, *job.store, bake, over, &job.renderer, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
+  GpuRun run{plan, g, fp, fb, *job.store, bake, over, &job.point, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
   run.target.external = job.gpuTarget;
   GpuOut go;
   const auto t1 = Clock::now();
@@ -1146,7 +1121,7 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
   in.ctx.filmLib = lib.get();
   in.ctx.srcW = W;
   in.ctx.srcH = H;
-  FrameJob fj{e.params, e.renderer, e.image, nullptr, e.camera, e.lut, {}, {}, {}};
+  FrameJob fj{e.params, e.point, e.image, nullptr, e.camera, e.lut, {}, {}, {}};
   fj.request = in.frame;
   fj.fastOptions.spatial = SpatialQuality::Full;
   const ParamSet ps = ParamSet::make(std::move(in));
@@ -1165,20 +1140,20 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
     rw = std::max(1, int(std::lround(W * scale)));
     rh = std::max(1, int(std::lround(H * scale)));
   }
-  FramePlan fp = e.renderer.framePlan(rw, rh, e.image.sceneReferred, fj.fastOptions);
-  e.renderer.hdrBind(e.image, fp.hdr, &bake->tone);
+  point::Blocks fp = engine::point::resolveFrame(e.point, rw, rh, e.image.sceneReferred, fj.fastOptions, &e.image);
+  engine::point::hdrBind(e.point, e.image, fp.hdr, &bake->tone);
   if (!fp.supported) return bail(1, "unsupported on the GPU: " + fp.why);
-  const std::shared_ptr<const local::Frame> lf = bindSource(fp, e.renderer, e.image, false);
+  const std::shared_ptr<const local::Frame> lf = localadj::bind(e.point.p, e.image, false);
   fp.resizeSharpen = down ? e.resizeSharpen : 0.f;
-  const FrameBlocks fb = resolveFrameBlocks(e.renderer.params(), frameFacts(fp, fj.fastOptions, e.image.sceneReferred), {lf.get(), fp.warp.field.get()});
+  const FrameBlocks fb = resolveFrameBlocks(e.point.p, point::facts(fp, fj.fastOptions, e.image.sceneReferred), {lf.get(), fp.warp.field.get()});
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   if (const ValidationResult v = g.validate(); !v.ok) return bail(-1, "engine graph: " + v.error);
   g.computeKeys(ps);
   // mobile / unified memory: tile 1024 keeps the export pool near 320 MB (pixel-architecture.md 16 rule 8)
   const int tile = e.tile > 0 ? e.tile : (x->caps().unifiedMemory ? 1024 : 2048);
   const Plan plan = Planner::plan(g, requestFromFrame(fp, fb, ExecMode::TiledExport, tile, std::size_t(1) << 30, true), nullptr);
-  if (e.onSize) e.onSize(fp.outW, fp.outH);
-  GpuRun run{plan, g, fp, fb, e.store, *bake, overflowFor(ps, bake->n), &e.renderer,
+  if (e.onSize) e.onSize(fp.geo.outW, fp.geo.outH);
+  GpuRun run{plan, g, fp, fb, e.store, *bake, overflowFor(ps, bake->n), &e.point,
              GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, e.target, e.forceStream};
   GpuOut go;
   const int r = runOnGpu(run, go);
@@ -1233,23 +1208,23 @@ std::shared_ptr<const SourceImage> EngineSession::resizedSource(const SourceImag
 
 bool renderImage8(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, Image8& out,
                   std::string* err, float toneReach) {
-  Renderer renderer(params, camera, lut);
-  renderer.setToneReach(toneReach);
+  engine::point::Params point = engine::point::resolve(params, camera, lut);
+  point.toneReach = toneReach;
   EngineSession session;
   EngineSession::ExactOptions o;
   if (std::size_t(src.linear.width) * src.linear.height > 16000000u) o.mode = ExecMode::TiledExport;  // as the C layer's exports
-  return session.renderExact(params, renderer, src, o, out, err);
+  return session.renderExact(params, point, src, o, out, err);
 }
 
 bool renderImageF(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, bool spatial,
                   ImageF& out, std::string* err) {
-  Renderer renderer(params, camera, lut);
+  engine::point::Params point = engine::point::resolve(params, camera, lut);
   EngineSession session;
   EngineSession::ExactOptions o;
   o.spatial = spatial;
   o.outFloat = &out;
   Image8 unused;
-  return session.renderExact(params, renderer, src, o, unused, err);
+  return session.renderExact(params, point, src, o, unused, err);
 }
 
 std::string infoJson() {

@@ -20,7 +20,7 @@
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/big_core.h"
 #include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
@@ -204,7 +204,7 @@ bool pipelineSelfTest(const std::shared_ptr<Context>& ctx, std::string& report) 
   for (const Case& c : cases) {
     EditParams p;
     c.set(p);
-    Renderer r(p, cam, nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
     FastOptions fo;
     fo.spatial = SpatialQuality::Full;
     // the reference is the CpuExecutor on the same plan (a session without a source store never uses the GPU)
@@ -281,7 +281,7 @@ double warmFilm(const std::shared_ptr<Context>& ctx, std::string& note, bool* wr
     p.filmStock = stock;
     p.filmStrength = t.strength;
     if (t.active) p.filmBlack = 0.2f;
-    Renderer r(p, cam, nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
     FastOptions fo;
     fo.spatial = t.q;
     fo.keepGrain = t.grain;
@@ -518,7 +518,7 @@ void measureFilmV3(const std::shared_ptr<Context>& ctx, const char* stock, std::
     for (int rep = 0; rep < 3; ++rep) {  // rep 0 compiles the variant's pipelines
       EditParams p;
       p.filmStock = stock;
-      Renderer r(p, cam, nullptr);
+      engine::point::Params r = engine::point::resolve(p, cam, nullptr);
       FastOptions fo;
       fo.spatial = SpatialQuality::Full;
       FrameJob job{p, r, src, nullptr, cam, nullptr, {}, {}, {}};
@@ -554,7 +554,7 @@ void measureFilmV3(const std::shared_ptr<Context>& ctx, const char* stock, std::
     for (int rep = 0; rep < 14; ++rep) {  // until the last three agree within 15 %: the GPU clock has ramped (a drag runs hot)
       EditParams p;
       p.filmStock = stock;
-      Renderer r(p, cam, nullptr);
+      engine::point::Params r = engine::point::resolve(p, cam, nullptr);
       FastOptions fo;
       fo.spatial = SpatialQuality::Interactive;
       FrameJob job{p, r, isrc, nullptr, cam, nullptr, {}, {}, {}};

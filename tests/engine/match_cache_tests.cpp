@@ -10,7 +10,7 @@
 #include "dapple/camera.h"
 #include "dapple/film.h"
 #include "dapple/film_match.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 
 using namespace dapple;
 

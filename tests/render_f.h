@@ -23,10 +23,10 @@ inline ImageF renderF(const EditParams& params, const CameraProfile& camera, con
 // passes them), as float. EngineSession::renderFrame on the CPU executor; a failure aborts with the engine's message.
 inline ImageF renderFrameF(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, int n, const FastOptions& fo,
                           engine::EngineSession* shared = nullptr) {
-  Renderer renderer(params, camera, lut);
+  engine::point::Params point = engine::point::resolve(params, camera, lut);
   engine::EngineSession own;
   engine::EngineSession& session = shared ? *shared : own;  // a shared session keeps its result cache between frames (lattice reuse)
-  engine::FrameJob job{params, renderer, src, nullptr, camera, lut, {}, {}, {}};
+  engine::FrameJob job{params, point, src, nullptr, camera, lut, {}, {}, {}};
   job.request.bakeSize = n;
   job.request.fastAnalysis = false;
   job.request.noise = fo.noise;
@@ -45,9 +45,9 @@ inline ImageF renderFrameF(const EditParams& params, const CameraProfile& camera
 // The same frame as malloc()ed RGBA8 (the caller free()s it), the 8-bit result of the C layer's frame path.
 inline std::uint8_t* renderFrame8(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, int n, const FastOptions& fo,
                                   int& w, int& h) {
-  Renderer renderer(params, camera, lut);
+  engine::point::Params point = engine::point::resolve(params, camera, lut);
   engine::EngineSession session;
-  engine::FrameJob job{params, renderer, src, nullptr, camera, lut, {}, {}, {}};
+  engine::FrameJob job{params, point, src, nullptr, camera, lut, {}, {}, {}};
   job.request.bakeSize = n;
   job.request.fastAnalysis = false;
   job.request.noise = fo.noise;

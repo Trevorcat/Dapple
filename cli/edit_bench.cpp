@@ -19,7 +19,7 @@
 #include "dapple/dapple_c.h"
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "dapple/tone.h"
 #include "engine/exec/engine_session.h"
 #include "colour_metrics.h"
@@ -39,8 +39,8 @@ namespace {
 // what lets a later frame reuse the lattice of an earlier one). `proxy` is the tone proxy of the session.
 ImageF bakedFrameF(engine::EngineSession& es, const EditParams& p, const CameraProfile& cam, const SourceImage& proxy, const SourceImage& src, int n,
                    bool fastAnalysis) {
-  Renderer r(p, cam, nullptr);
-  r.setToneProxy(&proxy);
+  engine::point::Params r = engine::point::resolve(p, cam, nullptr);
+  engine::point::setToneProxy(r, &proxy);
   engine::FrameJob job{p, r, src, &proxy, cam, nullptr, {}, {}, {}};
   job.request.bakeSize = n;
   job.request.fastAnalysis = fastAnalysis;
@@ -55,8 +55,8 @@ ImageF bakedFrameF(engine::EngineSession& es, const EditParams& p, const CameraP
   return out;
 }
 ImageF exactF(const EditParams& p, const CameraProfile& cam, const SourceImage& proxy, const SourceImage& src) {
-  Renderer r(p, cam, nullptr);
-  r.setToneProxy(&proxy);
+  engine::point::Params r = engine::point::resolve(p, cam, nullptr);
+  engine::point::setToneProxy(r, &proxy);
   engine::EngineSession es;
   engine::EngineSession::ExactOptions o;
   o.spatial = false;
@@ -307,12 +307,12 @@ int editBench(const std::vector<std::string>& args) {
       SourceImage proxy;
       proxy.sceneReferred = src->sceneReferred;
       proxy.linear = resizeToLongEdge(src->linear, 256);
-      Renderer rr(sc.params, cam, nullptr);
-      rr.setToneProxy(&proxy);
+      engine::point::Params rr = engine::point::resolve(sc.params, cam, nullptr);
+      engine::point::setToneProxy(rr, &proxy);
       std::shared_ptr<const BakedLut> lut;
-      st.push_back({"bake 41^3 (incl. analysis)", timeMs(repeat, [&] { lut = rr.bake(s1600, 41); })});
-      st.push_back({"bake 49^3", timeMs(repeat, [&] { lut = rr.bake(s1600, 49); })});
-      st.push_back({"bake 65^3", timeMs(repeat, [&] { lut = rr.bake(s1600, 65); })});
+      st.push_back({"bake 41^3 (incl. analysis)", timeMs(repeat, [&] { lut = engine::point::bake(rr, s1600, 41); })});
+      st.push_back({"bake 49^3", timeMs(repeat, [&] { lut = engine::point::bake(rr, s1600, 49); })});
+      st.push_back({"bake 65^3", timeMs(repeat, [&] { lut = engine::point::bake(rr, s1600, 65); })});
       printRows("table stages (core API)", st);
 
       // accuracy: baked vs direct, point-wise stages only, over all pixels of the 1600 render

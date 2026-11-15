@@ -1,7 +1,8 @@
-// CpuImpl of the main-pipeline nodes (docs/engine/pipeline-architecture.md 4.5). Every function wraps an existing kernel:
-// the point nodes are block fragments of FrameKernels (the per-pixel loop of renderer.cpp). The families that resolve their own
-// parameters (Vignette, NR, Dehaze, Detail, Grain, local adjustments: core/engine/nodes/<family>, docs section 50) bring their CpuImpl; this table
-// lists them and bindResolved copies their block from FrameEnv::blocks. Nothing is re-implemented here.
+// The CPU implementation table of the main pipeline (docs/engine/pipeline-architecture.md 4.5) and the per-frame binding of resolved
+// blocks. Every node family brings its CpuImpl (core/engine/nodes/<family>, docs section 50): the point family (nodes/point: the head's
+// block fragments over point::CpuFrame, the table bakes), the film glue (FilmSim), Vignette, NR, Dehaze, Detail, Grain, the local
+// adjustments, Resize. This file lists them, binds their resolved slot (bindResolved: the family's block from FrameEnv::blocks, or the
+// frame's point::CpuFrame) and implements Pack8. Nothing else is implemented here.
 //
 // Block fragment contract (CpuImpl::block): `px` = n pixels of interleaved float RGB (3 floats, not float4), n <= 256,
 // processed in place; `pos` = frame coordinates of the first pixel. The head of a chain (Resize/Geometry/DisplayStages in
@@ -18,49 +19,7 @@ namespace dapple::engine {
 
 namespace {
 
-struct PtRes {
-  const FrameKernels* fk;
-};
-struct DispRes {
-  const FrameKernels* fk;
-  const ImageF* film;
-  bool replace;
-  const int* row0;  // streaming export: frame row of the film band's first row (null: the whole frame)
-};
-static_assert(sizeof(DispRes) <= kMaxResolvedBytes, "resolved block too large");
-
-// ---- point block fragments ---------------------------------------------------------------------------------------------
-void blkCopy(const void* r, float* px, int n, const PixelPos& pos) {
-  static_cast<const PtRes*>(r)->fk->copyRow(px, n, pos.x, pos.y);
-}
-void blkGeometry(const void* r, float* px, int n, const PixelPos& pos) {
-  static_cast<const PtRes*>(r)->fk->fetchRow(px, n, pos.x, pos.y);
-}
-void blkFusedHead(const void* r, float* px, int n, const PixelPos& pos) {
-  static_cast<const PtRes*>(r)->fk->headGainTone(px, n, pos.x, pos.y);
-}
-void blkGain(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->gain(px, n); }
-void blkHdr(const void* r, float* px, int n, const PixelPos& pos) {
-  static_cast<const PtRes*>(r)->fk->hdrBlock(px, n, pos.x, pos.y);
-}
-void blkToneColour(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->toneColour(px, n); }
-
-thread_local float t_side[256 * 3];  // display-staged film pixels waiting for the Blend that follows in the chain
-
-void blkDisplay(const void* r, float* px, int n, const PixelPos& pos) {
-  const auto* d = static_cast<const DispRes*>(r);
-  float* dst = d->replace ? px : t_side;
-  std::memcpy(dst, d->film->row(pos.y - (d->row0 ? *d->row0 : 0)) + 3 * std::size_t(pos.x), std::size_t(n) * 3 * sizeof(float));
-  d->fk->displayStages(dst, n);
-}
-void blkBlend(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->blend(px, t_side, n); }
-
 // ---- tile (window / whole-frame) nodes -------------------------------------------------------------------------------------
-Status tileFilmSim(CpuTile& t, const void* r) {
-  // FilmSim as a whole-frame node: the film render of the frame into t.img (super-node until the film nodes land)
-  const auto* p = static_cast<const PtRes*>(r);
-  return const_cast<FrameKernels*>(p->fk)->runFilm(*t.img) ? Status::Ok : Status::Unsupported;
-}
 // Pack8: clamp-free 8-bit encode of the interior of the tile (the chain already clamped to [0, 1])
 Status tilePack8(CpuTile& t, const void* r) {
   (void)r;
@@ -87,97 +46,40 @@ Status tilePack8(CpuTile& t, const void* r) {
   return Status::Ok;
 }
 
-// ---- table nodes: CpuImpl::bake (the HostTable stage; docs/engine/pipeline-architecture.md 10.7 item 4) ---------------------------------
-// `resolved` is the per-frame TableBakeCtx (engine_session.h), `inputs` the payloads of the node's table inputs in edge order
-// (null = edge not wired). The payload is a heap object the caller wraps in a shared_ptr with `freePayload`.
-const TableBakeCtx& tctx(const void* r) { return *static_cast<const TableBakeCtx*>(r); }
-template <class T>
-void freeAs(void* p) {
-  delete static_cast<T*>(p);
-}
-Status bakeLattice(const void* r, std::span<const void* const>, void** out) {
-  const TableBakeCtx& c = tctx(r);
-  *out = new std::vector<float>(c.env->renderer.bakeColourLattice(c.env->src, c.n));
-  return Status::Ok;
-}
-Status bakePre(const void* r, std::span<const void* const> in, void** out) {
-  const TableBakeCtx& c = tctx(r);
-  // the fast analysis reads the lattice (moved into a scratch BakedLut and back: unchanged on return)
-  auto* lattice = in.empty() ? nullptr : const_cast<std::vector<float>*>(static_cast<const std::vector<float>*>(in[0]));
-  *out = new Renderer::TonePre(c.env->renderer.bakeTonePre(c.env->src, lattice, c.n, c.fast));
-  return Status::Ok;
-}
-Status bakeToneTable(const void* r, std::span<const void* const> in, void** out) {
-  const TableBakeCtx& c = tctx(r);
-  const auto* pre = in.empty() ? nullptr : static_cast<const Renderer::TonePre*>(in[0]);
-  BakedLut tmp;
-  c.env->renderer.bakeToneTable(c.env->src, pre ? *pre : Renderer::TonePre{}, tmp);
-  *out = new ToneTableOut{std::move(tmp.tone), std::move(tmp.toneMove)};
-  return Status::Ok;
-}
-Status bakeAnalysisNode(const void* r, std::span<const void* const> in, void** out) {
-  const TableBakeCtx& c = tctx(r);
-  const auto* pre = in.empty() ? nullptr : static_cast<const Renderer::TonePre*>(in[0]);
-  *out = new ToneAnalysis(c.env->renderer.bakeAnalysis(c.env->src, pre ? *pre : Renderer::TonePre{}));
-  return Status::Ok;
-}
-Status bakeOverflow(const void* r, std::span<const void* const>, void** out) {
-  const TableBakeCtx& c = tctx(r);
-  BakedLut base;
-  base.rgb.resize(4);  // only its presence matters: the overflow lattice is a function of the colour stage alone
-  *out = new std::vector<float>(c.env->renderer.bakeOverflow(c.env->src, base, c.n, c.maxV));
-  return Status::Ok;
-}
-
-const CpuImpl kSource{nullptr, blkCopy, nullptr, nullptr};
 // Resize: the bake is the family's (nodes/resize: the whole source at a long edge); the chain's head copies rows of the frame's source
-const CpuImpl kResize{nullptr, blkCopy, nullptr, resize::bake, resize::freePayload};
-const CpuImpl kLattice{nullptr, nullptr, nullptr, bakeLattice, freeAs<std::vector<float>>};
-const CpuImpl kPre{nullptr, nullptr, nullptr, bakePre, freeAs<Renderer::TonePre>};
-const CpuImpl kToneTable{nullptr, nullptr, nullptr, bakeToneTable, freeAs<ToneTableOut>};
-const CpuImpl kAnalysis{nullptr, nullptr, nullptr, bakeAnalysisNode, freeAs<ToneAnalysis>};
-const CpuImpl kOverflow{nullptr, nullptr, nullptr, bakeOverflow, freeAs<std::vector<float>>};
-const CpuImpl kGeometry{nullptr, blkGeometry, nullptr, nullptr};
-const CpuImpl kFusedHead{nullptr, blkFusedHead, nullptr, nullptr};
-const CpuImpl kGain{nullptr, blkGain, nullptr, nullptr};
-const CpuImpl kHdr{nullptr, blkHdr, nullptr, nullptr};
-const CpuImpl kToneColour{nullptr, blkToneColour, nullptr, nullptr};
-const CpuImpl kDisplay{nullptr, blkDisplay, nullptr, nullptr};
-const CpuImpl kBlend{nullptr, blkBlend, nullptr, nullptr};
-
-const CpuImpl kFilm{nullptr, nullptr, tileFilmSim, nullptr};
+const CpuImpl kResize{nullptr, point::copyBlock, nullptr, resize::bake, resize::freePayload};
 const CpuImpl kPack8{nullptr, nullptr, tilePack8, nullptr};
 
 }  // namespace
 
-const CpuImpl* cpuFusedHead() { return &kFusedHead; }
+const CpuImpl* cpuFusedHead() { return &point::fusedHeadCpu(); }
 
 const CpuImpl* cpuImpl(NodeType t) {
   switch (t) {
-    case NodeType::Source: return &kSource;
+    case NodeType::Source: return &point::sourceCpu();
     case NodeType::Resize: return &kResize;
-    case NodeType::Geometry: return &kGeometry;
-    case NodeType::Gain: return &kGain;
-    case NodeType::Hdr: return &kHdr;
+    case NodeType::Geometry: return &point::geometryCpu();
+    case NodeType::Gain: return &point::gainCpu();
+    case NodeType::Hdr: return &point::hdrCpu();
     case NodeType::ToneColour:
-    case NodeType::ToneColourExact: return &kToneColour;
+    case NodeType::ToneColourExact: return &point::toneColourCpu();
     case NodeType::Vignette: return &vignette::cpu();
     case NodeType::LocalLinear: return &localadj::linearCpu();
     case NodeType::LocalDetail: return &localadj::detailCpu();
-    case NodeType::DisplayStages: return &kDisplay;
-    case NodeType::Blend: return &kBlend;
+    case NodeType::DisplayStages: return &point::displayCpu();
+    case NodeType::Blend: return &point::blendCpu();
     case NodeType::NRLuma: return &nr::lumaCpu();
     case NodeType::NRChroma: return &nr::chromaCpu();
     case NodeType::Dehaze: return &dehaze::cpu();
     case NodeType::Detail: return &detail::cpu();
     case NodeType::Grain: return &grain::cpu();
-    case NodeType::FilmSim: return &kFilm;
+    case NodeType::FilmSim: return &point::filmSimCpu();
     case NodeType::Pack8: return &kPack8;
-    case NodeType::ColourLattice: return &kLattice;
-    case NodeType::ToneAnalysisPre: return &kPre;
-    case NodeType::ToneTable: return &kToneTable;
-    case NodeType::Analysis: return &kAnalysis;
-    case NodeType::LatticeOverflow: return &kOverflow;
+    case NodeType::ColourLattice: return &point::latticeCpu();
+    case NodeType::ToneAnalysisPre: return &point::tonePreCpu();
+    case NodeType::ToneTable: return &point::toneTableCpu();
+    case NodeType::Analysis: return &point::analysisCpu();
+    case NodeType::LatticeOverflow: return &point::overflowCpu();
     default: return nullptr;  // AssembledBake has no plan
   }
 }
@@ -185,7 +87,7 @@ const CpuImpl* cpuImpl(NodeType t) {
 bool bindResolved(NodeType t, const FrameEnv& env, Resolved& out) {
   switch (t) {
     case NodeType::DisplayStages:
-      new (out.bytes) DispRes{env.fk, env.film, !env.blendFollows, env.filmRow0};
+      new (out.bytes) point::DisplayCpu{env.fk, env.film, !env.blendFollows, env.filmRow0};
       return true;
     case NodeType::NRLuma:
       if (!env.blocks) return false;
@@ -222,7 +124,7 @@ bool bindResolved(NodeType t, const FrameEnv& env, Resolved& out) {
       return true;
     default:
       if (!cpuImpl(t) || (!cpuImpl(t)->block && !cpuImpl(t)->tile)) return false;  // table nodes bake, they are not bound per frame
-      new (out.bytes) PtRes{env.fk};
+      new (out.bytes) point::FrameSlot{env.fk};
       return true;
   }
 }

@@ -29,7 +29,7 @@ namespace dapple::engine::filmnode {
 
 namespace {
 
-constexpr float kWarmthFilterUnits = 12.f;  // renderer.cpp: enlarger filtration at warmth / tint = +-100
+constexpr float kWarmthFilterUnits = 12.f;  // film_glue.cpp: enlarger filtration at warmth / tint = +-100
 constexpr int kCoarseLutN = 17;           // nodes per axis of the print table baked while a print-table slider moves (33 otherwise)
 
 std::uint32_t mix32(std::uint32_t h) {
@@ -41,14 +41,14 @@ std::uint32_t mix32(std::uint32_t h) {
   return h;
 }
 
-// Same construction as renderer.cpp makeFilmParams(); `quality`: 0 off, 1 interactive (preview mode), 2 full.
+// Same construction as film_glue.cpp makeFilmParams(); `quality`: 0 off, 1 interactive (preview mode), 2 full.
 dapple::film::FilmParams makeParams(const FilmResolved& r, int quality) {
   using namespace dapple::film;
   FilmParams fp;
   fp.film = r.stock->stock;
   fp.paper = r.scan ? std::string("none") : r.paper->stock;
   fp.camera.autoExposure = false;
-  dapple::applyFilmPaperMapping(fp, r.black);  // as renderer.cpp
+  dapple::applyFilmPaperMapping(fp, r.black);  // as film_glue.cpp
   fp.camera.filmFormatMm *= r.formatScale;
   fp.enlarger.yFilterShift = -r.warmth / 100.f * kWarmthFilterUnits;
   fp.enlarger.mFilterShift = -r.tint / 100.f * kWarmthFilterUnits;
@@ -59,7 +59,7 @@ dapple::film::FilmParams makeParams(const FilmResolved& r, int quality) {
     fp.filmRender.grain.particleAreaUm2 *= g * g;  // grain amplitude ~ sqrt(particle area)
   }
   const double h = std::clamp(r.halationPct / 100.f, 0.f, 2.f);
-  fp.filmRender.halation.halationAmount = h;  // as renderer.cpp
+  fp.filmRender.halation.halationAmount = h;  // as film_glue.cpp
   fp.filmRender.halation.scatterAmount = std::min(h, 1.0);
   fp.filmRender.halation.boostEv = r.fx.boostEv;
   fp.filmRender.halation.boostRange = r.fx.boostRange;
@@ -720,7 +720,7 @@ bool filmTableDiskRoundTrip(const fd::FilmTables& in, fd::FilmTables& out) {
   return deserializeTables(s.data(), s.size(), out);
 }
 
-// ---- process-wide table cache (Renderer-facing entry) ------------------------------------------------------------------------------------
+// ---- process-wide table cache (the film glue's entry) ------------------------------------------------------------------------------------
 namespace {
 template <class T>
 struct TableLru {

@@ -24,7 +24,7 @@
 #include "dapple/edit_params.h"
 #include "dapple/image.h"
 #include "dapple/lut.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 
 namespace dapple::engine::video {

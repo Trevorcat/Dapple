@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "dapple/film.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/gpu_iface.h"
 #include "engine/exec/result_cache.h"
 #include "engine/exec/source_store.h"
@@ -24,33 +24,21 @@
 
 namespace dapple::engine {
 
-// Outputs of the table nodes (cache payloads).
-struct ToneTableOut {
-  std::vector<float> tone, toneMove;
-};
-
-struct TableEnv {
-  const Renderer& renderer;
-  const SourceImage& src;
-};
-// The per-frame parameters of a table node's CpuImpl::bake (`resolved`). n = lattice size; fast / maxV as the node needs.
-struct TableBakeCtx {
-  const TableEnv* env = nullptr;
-  int n = 0;
-  bool fast = false;
-  float maxV = 0.f;
-};
+// The table nodes' payloads and bake contexts are the point family's (nodes/point/point.h).
+using point::TableBakeCtx;
+using point::TableEnv;
+using point::ToneTableOut;
 // Runs `type`'s CpuImpl::bake; null payload when the node has no bake or it failed. Payload types: ColourLattice and
-// LatticeOverflow std::vector<float>, ToneAnalysisPre Renderer::TonePre, ToneTable ToneTableOut, Analysis ToneAnalysis,
+// LatticeOverflow std::vector<float>, ToneAnalysisPre engine::point::TonePre, ToneTable ToneTableOut, Analysis ToneAnalysis,
 // Resize SourceImage.
 std::shared_ptr<void> bakeNode(NodeType type, const void* resolved, std::span<const void* const> inputs = {});
 
 // Convenience wrappers over bakeNode (conformance tests, bench).
 std::shared_ptr<std::vector<float>> evalColourLattice(const TableEnv& env, int n);
-Renderer::TonePre evalToneAnalysisPre(const TableEnv& env, std::vector<float>* lattice, int n, bool fast);
-ToneTableOut evalToneTable(const TableEnv& env, const Renderer::TonePre* pre);
+engine::point::TonePre evalToneAnalysisPre(const TableEnv& env, std::vector<float>* lattice, int n, bool fast);
+ToneTableOut evalToneTable(const TableEnv& env, const engine::point::TonePre* pre);
 std::vector<float> evalLatticeOverflow(const TableEnv& env, int n, float maxV);
-ToneAnalysis evalAnalysis(const TableEnv& env, const Renderer::TonePre* pre);
+ToneAnalysis evalAnalysis(const TableEnv& env, const engine::point::TonePre* pre);
 
 // The keys under which the executor stores the table nodes of a frame. They are the graph's node keys plus the
 // lattice that was actually used (`nLattice`: the size the lookup returned): the tonal analysis and the tone-class move
@@ -63,7 +51,7 @@ TableKeys effectiveTableKeys(const Graph& g, const ParamSet& ps, int nLattice);
 
 struct FrameJob {
   const EditParams& params;
-  Renderer& renderer;
+  engine::point::Params& point;
   const SourceImage& src;
   const SourceImage* proxy = nullptr;
   const CameraProfile& camera;
@@ -81,7 +69,7 @@ struct FrameJob {
   // presenter (hal::ExternalImage: VkImage + layouts + semaphores). On success FrameResult::rgba stays null and `external` is
   // set; when the GPU cannot take the frame the CPU result is returned in rgba as usual (the presenter uploads it).
   const hal::ExternalImage* gpuTarget = nullptr;
-  // CPU time the C layer spent before the engine call (film exposure match, Renderer construction): reported in FrameResult::cpu
+  // CPU time the C layer spent before the engine call (film exposure match, point::resolve): reported in FrameResult::cpu
   double matchMs = 0, rendererMs = 0;
   // Video frames (docs/engine/pipeline-architecture.md section 30): non-null = the clamped, display-encoded float frame goes here instead of the
   // 8-bit rgba (CPU executor, Whole plan; the GPU executor writes 8-bit, so such a frame is always a CPU frame). FrameResult::rgba stays null.
@@ -103,7 +91,7 @@ struct FrameResult {
   bool external = false; // the pixels are in FrameJob::gpuTarget, not in rgba
   bool floatOut = false; // the pixels are in FrameJob::outFloat, not in rgba
   GpuStats gpu;          // GPU runs only
-  // CPU time of this frame by stage, ms (reported by the throttled dapple_engine line): match = film exposure solve (C layer), renderer = Renderer
+  // CPU time of this frame by stage, ms (reported by the throttled dapple_engine line): match = film exposure solve (C layer), renderer = point::resolve
   // construction (C layer), graph = ParamSet + graph + keys, tables = host tables (lattice, tone, film), exec = plan + executor incl. GPU wait
   struct CpuSplit {
     double matchMs = 0, rendererMs = 0, graphMs = 0, tablesMs = 0, execMs = 0, totalMs = 0;
@@ -162,13 +150,13 @@ class EngineSession {
     // Non-null: the clamped, display-encoded float frame goes here instead of the 8-bit `out` (Whole plans; analysis, swatches).
     ImageF* outFloat = nullptr;
     // Streaming export (docs/engine/pipeline-architecture.md section 42): set = `src` carries the size and metadata only (no pixels, its analyses
-    // come from Renderer::setAnalysisSources); sourceWindow(sx0, sy0, sx1, sy1) returns the source pixels of that rect (window pixel (0, 0) =
+    // come from point::setAnalysisSources); sourceWindow(sx0, sy0, sx1, sy1) returns the source pixels of that rect (window pixel (0, 0) =
     // (sx0, sy0); valid until the next call; null aborts) and rows(y0, n, rgb) receives every finished band of the output in order (RGB8, width * 3
     // bytes per row; false aborts). TiledExport with `tile` rows per band; the GPU executor is not tried here; `out` gets the size, no pixels.
     std::function<const ImageF*(int sx0, int sy0, int sx1, int sy1)> sourceWindow;
     std::function<bool(int y0, int n, const std::uint8_t* rgb)> rows;
   };
-  bool renderExact(const EditParams& params, const Renderer& renderer, const SourceImage& src, const ExactOptions& opt,
+  bool renderExact(const EditParams& params, const engine::point::Params& point, const SourceImage& src, const ExactOptions& opt,
                    Image8& out, std::string* err = nullptr, ExecStats* stats = nullptr);
 
   // The graph of the last frame (diagnostics, tests).
@@ -184,7 +172,7 @@ class EngineSession {
   // Same pixels the app exports on the GPU path: lattice 65, Lanczos downscale to outLongEdge with a little output sharpening.
   struct GpuExport {
     const EditParams& params;
-    Renderer& renderer;
+    engine::point::Params& point;
     const SourceImage& image;   // full resolution (the tables are baked from it)
     SourceStore& store;         // the same pixels, for the executor
     const CameraProfile& camera;
@@ -208,7 +196,7 @@ class EngineSession {
   int renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& bake, FrameResult& out);
   // renderExact on the GPU executor (the exact variant: ToneColourExact through a dense lattice bake): 0 = `out` holds the frame, 1 = the CPU takes it,
   // -1 = failed / cancelled (err)
-  int renderExactGpu(const EditParams& params, const Renderer& renderer, const SourceImage& src, const ExactOptions& opt, Image8& out,
+  int renderExactGpu(const EditParams& params, const engine::point::Params& point, const SourceImage& src, const ExactOptions& opt, Image8& out,
                      std::string* err);
   const std::vector<float>* overflowFor(const ParamSet& ps, int n) const;
   hal::Api gpuLastApi_ = hal::Api::Null;
@@ -246,7 +234,7 @@ class EngineSession {
 
 // One-shot reference-quality renders for callers that have no DappleSession (CLI, developer, tone analysis, swatches): a private
 // EngineSession, the exact variant of the Full graph through the Planner and the CpuExecutor (frames above 16 MP in tiles). The old
-// Renderer is only the parameter resolver here. `spatial` = false skips the neighbourhood stages. False: failed (error in `err`).
+// `point` carries the resolved point parameters (point::resolve). `spatial` = false skips the neighbourhood stages. False: failed (error in `err`).
 bool renderImage8(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, Image8& out,
                   std::string* err = nullptr, float toneReach = 1.f);
 bool renderImageF(const EditParams& params, const CameraProfile& camera, const Lut3D* lut, const SourceImage& src, bool spatial,

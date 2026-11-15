@@ -20,7 +20,7 @@
 #include "dapple/dapple_c.h"
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 
 namespace fs = std::filesystem;

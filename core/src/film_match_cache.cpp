@@ -17,7 +17,7 @@
 #include "dapple/film_match.h"
 #include "parallel.h"
 #include "determinism.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "film_match_render.h"
 
 namespace dapple {
@@ -99,9 +99,9 @@ FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& c
   const std::string baseKey = toJson(ref) + "|" + lutId + "|" + std::to_string(p.exposure) + "|" + std::to_string(p.filmSceneX) + "," + std::to_string(p.filmSceneY);
   if (!cache.haveBase || cache.baseKey != baseKey) {
     cache.haveBase = false;
-    Renderer r(ref, camera, lut);
-    r.setToneProxy(&proxy);
-    r.sceneGain(proxy, cache.gain);
+    engine::point::Params r = engine::point::resolve(ref, camera, lut);
+    engine::point::setToneProxy(r, &proxy);
+    engine::point::sceneGain(r, proxy, cache.gain);
     EditParams ref0 = ref;
     ref0.exposure = 0.f;
     // the intended key is rendered at exposure 0: an exposure drag keeps it (one develop render of the proxy less per frame)

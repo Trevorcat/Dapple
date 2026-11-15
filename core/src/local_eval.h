@@ -130,7 +130,7 @@ struct AuxTarget {
 };
 // The planes a frame needs (only the stage-W ops some adjustment uses) and their slot map.
 int auxLayout(const Frame& f, AuxTarget& t);
-// What the frame's geometry gives the CPU kernels (the point family's source fetch: FrameKernels implements it).
+// What the frame's geometry gives the CPU kernels (the point family's source fetch: engine::point::CpuFrame implements it).
 struct PixelSource {
   virtual ~PixelSource() = default;
   virtual int width() const = 0;                                            // frame width

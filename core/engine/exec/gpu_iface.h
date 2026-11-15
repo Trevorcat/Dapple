@@ -18,8 +18,7 @@
 #include <utility>
 #include <vector>
 
-#include "dapple/frame_plan.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/source_store.h"
 #include "engine/graph/graph.h"
 #include "engine/nodes/frame_blocks.h"
@@ -61,12 +60,12 @@ struct GpuTarget {
 struct GpuRun {
   const Plan& plan;
   const Graph& graph;
-  const FramePlan& frame;       // resolved frame (geometry, gain, neighbourhood amounts) for the source size the plan was made for
+  const point::Blocks& frame;   // the point family's blocks (geometry, warp, gain, HDR, film glue) for the source size the plan was made for
   const FrameBlocks& blocks;    // resolved blocks of the families that resolve their own parameters (engine/nodes/frame_blocks.h)
-  SourceStore& store;           // full-resolution source; the Resize node scales it to frame.srcW x frame.srcH
+  SourceStore& store;           // full-resolution source; the Resize node scales it to frame.geo.srcW x frame.geo.srcH
   const BakedLut& bake;         // HostTable payloads: lattice + tone table
   const std::vector<float>* overflow = nullptr;  // LatticeOverflow payload (33^3 RGB), null = compute from the store
-  const Renderer* renderer = nullptr;            // only for the overflow lattice when `overflow` is null
+  const point::Params* params = nullptr;        // only for the overflow lattice when `overflow` is null
   GpuCancel cancel;
   GpuTarget target;
   bool forceStream = false;     // tests: never keep the source resident (streaming path of a tiled export)

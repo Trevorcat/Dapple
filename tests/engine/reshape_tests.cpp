@@ -28,11 +28,11 @@
 #include "dapple/camera.h"
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session.h"
 #include "ai_masks.h"
-#include "frame_kernels.h"
+#include "engine/nodes/point/cpu.h"
 #include "json_value.h"
 #include "local_eval.h"
 #include "warp_field.h"
@@ -147,7 +147,7 @@ ReshapeBody synthBody(int W, int H) {
 }
 
 bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src, ExecMode mode, int tile, Image8& out) {
-  const Renderer r(p, cam(), nullptr);
+  const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   EngineSession::ExactOptions o;
   o.mode = mode;
   o.tile = tile;
@@ -158,7 +158,7 @@ bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src,
   return ok;
 }
 bool cpuFrame(EngineSession& es, const EditParams& p, const SourceImage& src, bool interactive, FrameResult& res) {
-  Renderer r(p, cam(), nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   FrameJob job{p, r, src, nullptr, cam(), nullptr, {}, {}, {}};
   job.request.bakeSize = 33;
   job.request.fastAnalysis = false;
@@ -256,10 +256,10 @@ void testIdentity() {
   CHECK(exactRender(es, pz, src, ExecMode::Whole, 0, z));
   CHECK(maxDiff(base, z) == 0);
   {  // the frame plan has no field and no geometry
-    Renderer r(pz, cam(), nullptr);
+    engine::point::Params r = engine::point::resolve(pz, cam(), nullptr);
     FastOptions fo;
-    FrameKernels fk(r, src, nullptr, fo);
-    CHECK(!fk.useGeo() && !fk.framePlan().warp.active());
+    engine::point::CpuFrame fk(r, src, nullptr, fo);
+    CHECK(!fk.useGeo() && !fk.blocks().warp.active());
   }
   // eyes only: everything outside the field's support is bit-identical, inside changes
   EditParams pe = faceEdit(W, H, 0, 0, 0, 100, 0);
@@ -711,9 +711,9 @@ void testMapPoint() {
   p.reshape = r;
   ReshapeFace& fc = p.reshape.faces[0];
   fc.eyes = 100;
-  Renderer rr(p, cam(), nullptr);
+  engine::point::Params rr = engine::point::resolve(p, cam(), nullptr);
   FastOptions fo;
-  FrameKernels fk(rr, src, nullptr, fo);
+  engine::point::CpuFrame fk(rr, src, nullptr, fo);
   // the output pixel showing the eye centre maps back to the eye centre's source position
   double eu, ev;
   auto fe = warp::bind(p.reshape, W, H, false);
@@ -821,7 +821,7 @@ void parityImpl(int W, int H, int exportTile) {
   for (const Case& c : cases) {
     EditParams p;
     c.set(p);
-    Renderer r(p, cam(), nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
     FastOptions fo;
     fo.spatial = c.interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
     fo.noise = false;
@@ -843,7 +843,7 @@ void parityImpl(int W, int H, int exportTile) {
     std::free(res.rgba);
   }
   EditParams p = richEdit(W, H, true);
-  Renderer r(p, cam(), nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   std::vector<std::uint8_t> a, b;
   int ew = 0, eh = 0;
   for (int pass = 0; pass < 2; ++pass) {
@@ -933,7 +933,7 @@ void testBench() {
     warp::setLayered(std::strcmp(e.first, "body ops, earlier field") != 0);
     double gi = -1, gf = -1, ci = -1, cf = -1;
 #ifdef DAPPLE_RESHAPE_GPU
-    Renderer rd(p, cam(), nullptr);
+    engine::point::Params rd = engine::point::resolve(p, cam(), nullptr);
     for (int mode = 0; mode < 2; ++mode) {
       const SourceImage& s = mode ? big : small;
       FastOptions fo;

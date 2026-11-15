@@ -221,7 +221,7 @@ const float kTo2020[9] = {0.6274039f, 0.3292830f, 0.0433131f, 0.0690973f, 0.9195
 
 namespace {
 // The geometry of the edit (rotate 90 -> straighten with the ratio crop -> flip) applied to the working-space source, the same mapping as
-// Geometry in core/src/renderer.cpp (kept in step by the geometry test of video_session.hdr_geometry). The highlight excess of an HDR clip is
+// Geometry in core/src/point.cpp (kept in step by the geometry test of video_session.hdr_geometry). The highlight excess of an HDR clip is
 // taken from this warped float source, so a geometry edit warps the 10-bit / float HDR data itself and never touches an 8-bit or sRGB target.
 // Returns false when the edit has no geometry (the source is used as it is).
 bool warpSourceLikeGraph(const EditParams& p, const ImageF& in, ImageF& out) {
@@ -346,7 +346,7 @@ struct VideoFrameSession::Impl {
   Config cfg;
   EditParams held;  // cfg.params + the film match of the reference
   std::shared_ptr<SourceImage> proxy;
-  std::unique_ptr<Renderer> renderer;
+  std::unique_ptr<engine::point::Params> point;
   EngineSession es;
   bool ready = false;
   int refW = 0, refH = 0, outW = 0, outH = 0;
@@ -391,13 +391,13 @@ struct VideoFrameSession::Impl {
       held.filmKeyEv = ev.filmEv;
       held.filmPrintEv = ev.printEv;
     }
-    renderer = std::make_unique<Renderer>(held, cfg.camera, cfg.lut.get());
-    renderer->setToneProxy(proxy.get());
+    point = std::make_unique<engine::point::Params>(engine::point::resolve(held, cfg.camera, cfg.lut.get()));
+    engine::point::setToneProxy(*point, proxy.get());
   }
 
   bool run(const SourceImage& src, std::uint32_t frameIndex, bool wantFloat, ImageF* outF, std::vector<std::uint8_t>* rgba, FrameInfo* info,
            std::string* err) {
-    FrameJob job{held, *renderer, src, proxy.get(), cfg.camera, cfg.lut.get(), {}, {}, {}};
+    FrameJob job{held, *point, src, proxy.get(), cfg.camera, cfg.lut.get(), {}, {}, {}};
     job.holdSolves = true;
     job.request.interactive = false;
     job.request.bakeSize = cfg.bakeSize;

@@ -24,7 +24,7 @@
 #include "dapple/ingest.h"
 #include "dapple/look.h"
 #include "dapple/lut.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "render_f.h"
 #include "dapple/tone.h"
 #include "dapple/auto_adjust.h"
@@ -1386,7 +1386,7 @@ void testBakedPath() {
   {
     EditParams p;
     p.look = "warm";
-    Renderer r(p, cam, nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
     FastOptions fo;
     fo.spatial = SpatialQuality::Off;
     const ImageF whole = renderFrameF(p, cam, nullptr, scene, 33, fo);
@@ -1400,7 +1400,7 @@ void testBakedPath() {
     half.spatial = SpatialQuality::Off;
     half.region = {0.f, 0.f, 0.5f, 1.f, 0};
     int w = 0, h = 0;
-    r.fastSize(scene, half.region, w, h);
+    engine::point::fastSize(r, scene, half.region, w, h);
     CHECK(w == whole.width / 2 && h == whole.height);
     const ImageF left = renderFrameF(p, cam, nullptr, scene, 33, half);
     CHECK(left.width == w && left.height == h);

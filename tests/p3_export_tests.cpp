@@ -28,7 +28,7 @@
 #include "dapple/decoder.h"
 #include "dapple/encode.h"
 #include "dapple/edit_params.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "render_f.h"
 #include "dapple/ultrahdr.h"
 #include "exif_writer.h"

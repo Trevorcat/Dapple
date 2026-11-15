@@ -162,7 +162,7 @@ ef::FilmResolved resolvedFor(const EditParams& e, int w, int h, int quality, boo
   return r;
 }
 
-// Reference: the FilmSimulator exactly as renderer.cpp drives it (makeFilmParams + gain folded into the input matrix).
+// Reference: the FilmSimulator exactly as film_glue.cpp drives it (makeFilmParams + gain folded into the input matrix).
 film::FilmParams refParams(const ef::FilmResolved& r, int quality) {
   film::FilmParams fp;
   fp.film = r.stock->stock;
@@ -791,7 +791,7 @@ void fxImpl(const std::vector<std::string>& only) {
     double msSim = 0, msNode = 0;
     const bool simOk = simRender(r, c.quality, in, sim, &msSim);
     const bool nodeOk = nodeRender(r, in, nodes, &msNode);
-    // the Renderer-facing entry (what FrameKernels::runFilm / runFilmStage call): true = rendered by the node chain, no simulator
+    // the CPU-frame entry (what point::CpuFrame::runFilm / runFilmStage call): true = rendered by the node chain, no simulator
     ef::FilmFrameArgs a;
     a.lib = library().get();
     a.stock = r.stock->stock.c_str();

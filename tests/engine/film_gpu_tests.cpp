@@ -21,7 +21,7 @@
 #include "engine/exec/gpu_executor.h"
 #include "engine/hal/select.h"
 #include "dapple/camera.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "gpu_rig.h"
 #include "parity.h"
 #include "engine/nodes/film/film_gpu.h"
@@ -721,7 +721,7 @@ void testFrames() {
       p.contrast = 15;
       c.set(p);
       const Lut3D* look = c.lut ? &dapple::gpu::syntheticLut() : nullptr;
-      Renderer r(p, cam, look);
+      engine::point::Params r = engine::point::resolve(p, cam, look);
       FastOptions fo;
       fo.spatial = SpatialQuality::Full;
       if (c.opt) c.opt(fo);

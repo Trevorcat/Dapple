@@ -19,7 +19,7 @@
 #include "dapple/camera.h"
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
 #include "gpu_rig.h"
@@ -42,7 +42,7 @@ double median(std::vector<double> v) {
 // One frame of the baked variant on the CPU executor (a FrameJob without a SourceStore never goes to the GPU): malloc()ed RGBA8, or null.
 std::uint8_t* cpuFrame(engine::EngineSession& es, const EditParams& p, const CameraProfile& cam, const SourceImage& src, int n, const FastOptions& fo, int& w,
                        int& h) {
-  Renderer r(p, cam, nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam, nullptr);
   engine::FrameJob job{p, r, src, nullptr, cam, nullptr, {}, {}, {}};
   job.request.bakeSize = n;
   job.request.noise = fo.noise;
@@ -212,7 +212,7 @@ int gpuBench(const std::vector<std::string>& args) {
     Rig rig(be, cs.src, cam);  // the engine session of this photo: Planner -> GpuExecutor
     for (std::size_t vi = variantFrom; vi < 3; ++vi) {
       const Variant& v = variants[vi];
-      Renderer r(v.spatialParams ? prmSp : prm, cam, nullptr);
+      engine::point::Params r = engine::point::resolve(v.spatialParams ? prmSp : prm, cam, nullptr);
       FastOptions fo;
       fo.spatial = v.q;
       fo.noise = v.noise;
@@ -291,7 +291,7 @@ int gpuBench(const std::vector<std::string>& args) {
     if (&cs == &cases.back() || cs.name.rfind("full", 0) == 0) {
       // preview from the resident full-resolution source: GPU Lanczos downscale to 1600 px
       if (W > 1700) {
-        Renderer r(prmSp, cam, nullptr);
+        engine::point::Params r = engine::point::resolve(prmSp, cam, nullptr);
         FastOptions fo;
         fo.spatial = SpatialQuality::Interactive;
         fo.noise = false;
@@ -327,7 +327,7 @@ int gpuBench(const std::vector<std::string>& args) {
     const int W = src->linear.width, H = src->linear.height;
     std::printf("\n================ tiled export: %dx%d (%.1f MP), tile %d + halo ================\n", W, H, double(W) * H / 1e6, tile);
     Rig rig(be, *src, cam);
-    Renderer r(prmSp, cam, nullptr);
+    engine::point::Params r = engine::point::resolve(prmSp, cam, nullptr);
     FastOptions fo;
     for (const bool stream : {true, false}) {
       if (!stream && std::uint64_t(W) * H > 40000000ull) continue;

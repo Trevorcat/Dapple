@@ -8,9 +8,9 @@ Block resolve(const EditParams& p, const FrameFacts& f) {
   Block b;
   b.amount = p.vignette / 100.f;
   b.p3 = p.outputSpace == 1 ? 1 : 0;
-  b.ox0 = f.ox0, b.oy0 = f.oy0, b.stepX = f.stepX, b.stepY = f.stepY;
-  b.cx = f.fullW * 0.5f;
-  b.cy = f.fullH * 0.5f;
+  b.ox0 = f.geo.ox0, b.oy0 = f.geo.oy0, b.stepX = f.geo.stepX, b.stepY = f.geo.stepY;
+  b.cx = f.geo.fullW * 0.5f;
+  b.cy = f.geo.fullH * 0.5f;
   return b;
 }
 

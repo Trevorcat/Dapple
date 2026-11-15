@@ -22,7 +22,7 @@
 #include "dapple/film.h"
 #include "dapple/edit_params.h"
 #include "dapple/lut.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/gpu_executor.h"
 #include "engine/exec/gpu_scheduler.h"
 #include "gpu_rig.h"
@@ -176,7 +176,7 @@ bool runStage(Env& env, Rig& rig, const SourceImage& src, const Stage& st, Row& 
   EditParams p = baseParams();
   st.set(p);
   const CameraProfile& cam = env.cams.resolve("", "");
-  Renderer r(p, cam, st.lut ? &testLut() : nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam, st.lut ? &testLut() : nullptr);
   FastOptions fo;
   fo.spatial = SpatialQuality::Full;
   if (st.opt) st.opt(fo);
@@ -276,7 +276,7 @@ void testDownscale(Env& env) {
   p.sharpen = 30;
   p.straighten = 2.f;
   const CameraProfile& cam = env.cams.resolve("", "");
-  Renderer r(p, cam, nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam, nullptr);
   for (int longEdge : {1200, 640, 300}) {
     SourceImage small;
     small.sceneReferred = true;
@@ -323,7 +323,7 @@ void testTiling(Env& env, bool stream, int pw = 1500, int ph = 1000, std::vector
   for (const Case& c : cases) {
     EditParams p = baseParams();
     c.set(p);
-    Renderer r(p, cam, nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
     FastOptions fo;
     Rig rig(env.be, src, cam);
     std::string err;
@@ -389,7 +389,7 @@ void testFilmTiling(Env& env, int pw = 1500, int ph = 1000, std::vector<int> til
     EditParams p = baseParams();
     c.set(p);
     const Lut3D* lut = c.lut ? &testLut() : nullptr;
-    Renderer r(p, cam, lut);
+    engine::point::Params r = engine::point::resolve(p, cam, lut);
     FastOptions fo;
     Rig rig(env.be, src, cam);
     std::string err;
@@ -449,7 +449,7 @@ void testBandCurve(Env& env) {
     EditParams p = baseParams();
     p.filmStock = "kodak_portra_400";
     if (std::getenv("DAPPLE_BAND_GEO")) p.straighten = 3.f, p.rotate = 90;  // a geometry gather (film_src, RGBA32F frame-sized image) in front of the film
-    Renderer r(p, cam, nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
     FastOptions fo;
     fo.spatial = SpatialQuality::Interactive;
     Rig rig(env.be, src, cam);
@@ -490,7 +490,7 @@ void testBandCurve(Env& env) {
 // EngineSession::renderExact (the exact variant: ToneColourExact) on the GPU executor against the CPU reference renderer. The device evaluates the
 // exact colour stage through a 65^3 lattice baked with the exact analysis: the budget is the lattice's, not bit identity.
 void testExact(Env& env) {
-  std::printf("== renderExact on the GPU (ToneColourExact via the dense lattice) vs Renderer::render ==\n");
+  std::printf("== renderExact on the GPU (ToneColourExact via the dense lattice) vs the CPU exact variant ==\n");
   const SourceImage src = makeTestImage(900, 600);
   struct Case {
     const char* name;
@@ -515,7 +515,7 @@ void testExact(Env& env) {
     EditParams p = baseParams();
     c.set(p);
     const Lut3D* lut = c.lut ? &testLut() : nullptr;
-    Renderer r(p, cam, lut);
+    engine::point::Params r = engine::point::resolve(p, cam, lut);
     Rig rig(env.be, src, cam);
     Image8 gpu;
     std::string err;
@@ -577,7 +577,7 @@ void testNoFallback(Env& env) {
                 p.toneCurveGreen = {{0.f, 8.f}, {255.f, 250.f}};
               }
               const Lut3D* lut = lutOn ? &testLut() : nullptr;
-              Renderer r(p, cam, lut);
+              engine::point::Params r = engine::point::resolve(p, cam, lut);
               char name[160];
               std::snprintf(name, sizeof name, "strength %.0f lut %d curves %d tiled %d exact %d", st, lutOn, curvesOn, tiled, exact);
               std::string err;
@@ -620,7 +620,7 @@ void testNoFallback(Env& env) {
           p.filmStock = id;
           p.filmStrength = strength;
           p.straighten = 1.5f;
-          Renderer r(p, cam, nullptr);
+          engine::point::Params r = engine::point::resolve(p, cam, nullptr);
           FastOptions fo;
           fo.spatial = tier ? SpatialQuality::Full : SpatialQuality::Interactive;
           fo.noise = tier != 0;
@@ -670,7 +670,7 @@ void testFilmInteractive(Env& env, int longEdge) {
       {"film warmth drag", [](EditParams& p, int i) { p.filmWarmth = 4.f * float(i % 10); }, false},
   };
   std::printf("== film interactive frames through the session, long edge %d (source %dx%d): ms, medians of 12 ==\n", longEdge, sw, sh);
-  std::printf("  %-32s %7s %6s %7s %7s %7s %7s %7s %6s %s\n", "case", "wall", "gpu", "upload", "record", "submit", "wait", "copy", "passes", "(rebuild Renderer)");
+  std::printf("  %-32s %7s %6s %7s %7s %7s %7s %7s %6s %s\n", "case", "wall", "gpu", "upload", "record", "submit", "wait", "copy", "passes", "(rebuild params)");
   Rig rig(env.be, src, cam);
   for (const Case& c : cases) {
     std::vector<double> wall, gpu, up, rec, sub, wt, cp, rb;
@@ -680,7 +680,7 @@ void testFilmInteractive(Env& env, int longEdge) {
       p.filmStock = "kodak_portra_400";
       c.set(p, i);
       auto t0 = Clk::now();
-      Renderer r(p, cam, nullptr);
+      engine::point::Params r = engine::point::resolve(p, cam, nullptr);
       const double rbMs = ms(t0);
       FastOptions fo;
       fo.spatial = SpatialQuality::Interactive;
@@ -742,7 +742,7 @@ void testFilmTiming(Env& env, bool with24mp) {
       EditParams p = baseParams();
       c.set(p);
       const Lut3D* lut = c.lut ? &testLut() : nullptr;
-      Renderer r(p, cam, lut);
+      engine::point::Params r = engine::point::resolve(p, cam, lut);
       FastOptions fo;
       fo.spatial = SpatialQuality::Full;
       Rig rig(env.be, src, cam);
@@ -777,7 +777,7 @@ void testFilmTiming(Env& env, bool with24mp) {
     EditParams p = baseParams();
     c.set(p);
     const Lut3D* lut = c.lut ? &testLut() : nullptr;
-    Renderer r(p, cam, lut);
+    engine::point::Params r = engine::point::resolve(p, cam, lut);
     Rig rig(env.be, big, cam);
     std::string err;
     int w = 0, h = 0;
@@ -820,7 +820,7 @@ void testSolveCache(Env& env) {
     EditParams p = baseParams();
     p.dehaze = 35;
     p.sharpen = float(sharpen);
-    Renderer r(p, cam, nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
     int w = 0, h = 0;
     std::string err;
     std::uint8_t* px = rig.render(p, r, src, fo, 41, w, h, st, err);
@@ -850,7 +850,7 @@ void testSolveCache(Env& env) {
     p.dehaze = 25;
     p.clarity = 35;
     p.sharpen = 30;
-    Renderer r(p, cam, nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
     int w = 0, h = 0;
     std::string err;
     std::uint8_t* x1 = rig.render(p, r, src, fo, 41, w, h, &f1, err);
@@ -878,7 +878,7 @@ void testSteadyState(Env& env) {
   std::size_t pooled = 0;
   for (int i = 0; i < 12; ++i) {
     p.exposure = 0.1f * float(i % 5);  // parameters change every frame: new bake, new lattice, same sizes
-    Renderer r(p, cam, nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
     int w, h;
     engine::GpuStats st;
     std::uint8_t* o = rig.render(p, r, src, FastOptions{}, 41, w, h, &st, err);

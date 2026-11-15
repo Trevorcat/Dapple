@@ -28,7 +28,7 @@ layout(binding = 4) uniform sampler2D uM;                       // BLEND: the no
 layout(binding = 5, std430) readonly buffer Curves { float cv[]; };  // DISP: [4][samples]: master, red, green, blue
 layout(binding = 6) uniform sampler3D uLut;                     // DISP: look LUT (r fastest), RGBA32F
 
-// Renderer::Curve1D::operator()
+// point::Curve1D::operator() (engine/nodes/point/point.h)
 float curveAt(int c, float x) {
   if (((u.f.z >> c) & 1) == 0) return x;
   const int n = int(u.g.z);
@@ -76,7 +76,7 @@ vec3 lutApply(vec3 e) {
   }
   return w0 * c000 + wa * a + wb * b + w1 * c111;
 }
-// Renderer::displayStages
+// point::displayStages (engine/nodes/point/kernels.h)
 vec3 displayStages(vec3 e) {
   e = vec3(curveAt(0, e.x), curveAt(0, e.y), curveAt(0, e.z));
   e = vec3(curveAt(1, e.x), curveAt(2, e.y), curveAt(3, e.z));

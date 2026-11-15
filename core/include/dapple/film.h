@@ -345,7 +345,7 @@ class FilmSimulator {
 
 }  // namespace dapple::film
 
-// ---- process-wide library and simulator pool (used by the develop pipeline, see renderer.cpp) -------------
+// ---- process-wide library and simulator pool (used by the develop pipeline, see engine/nodes/film/film_glue.cpp) -------------
 
 namespace dapple::film {
 

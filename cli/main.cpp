@@ -30,7 +30,7 @@
 #include "dapple/encode.h"
 #include "dapple/ingest.h"
 #include "dapple/lut.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #include "dapple/xmp_preset.h"
 #include "eval.h"

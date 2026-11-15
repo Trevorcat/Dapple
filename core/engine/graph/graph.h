@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
-#include "dapple/frame_plan.h"
 #include "engine/graph/params.h"
 #include "engine/graph/types.h"
+#include "engine/nodes/point/point.h"
 
 namespace dapple::engine {
 
@@ -102,12 +102,12 @@ enum class GraphDetail : std::uint8_t {
   Tables,  // the table nodes of a frame, then the assembled bake as one node (EngineSession keys and caches the tables from it)
 };
 
-// Builds the graph of one frame request. Pure function of the ParamSet (and, for Full detail, of `plan`, the
-// FramePlan the point family resolves for the frame: geometry, spatial amounts after quality / region; and of `blocks`, the
+// Builds the graph of one frame request. Pure function of the ParamSet (and, for Full detail, of `point`, the point family's
+// blocks of the frame: geometry (Geometry node), HDR (Hdr node); and of `blocks`, the
 // resolved blocks of the migrated families: a node whose block is the identity is not wired).
 class GraphBuilder {
  public:
-  static Graph build(const ParamSet& ps, GraphDetail detail = GraphDetail::Tables, const FramePlan* plan = nullptr,
+  static Graph build(const ParamSet& ps, GraphDetail detail = GraphDetail::Tables, const point::Blocks* point = nullptr,
                      const FrameBlocks* blocks = nullptr);
 };
 

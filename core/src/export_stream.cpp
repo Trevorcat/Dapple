@@ -8,7 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/nodes/film/film_nodes.h"
 #include "engine/nodes/demosaic/demosaic_session.h"
 #include "mem_probe.h"
@@ -274,7 +274,7 @@ SourceImage sizeOnly(const SourceImage& meta, int W, int H) {
   return s;
 }
 
-bool renderBands(engine::EngineSession& es, const EditParams& params, const Renderer& renderer, const SourceImage& virt, BandSource& bs, int tile, bool hasProxy,
+bool renderBands(engine::EngineSession& es, const EditParams& params, const engine::point::Params& point, const SourceImage& virt, BandSource& bs, int tile, bool hasProxy,
                  const std::function<void(int, int)>& onSize, const std::function<bool(int, int, const std::uint8_t*)>& rows, std::string* err) {
   engine::EngineSession::ExactOptions o;
   o.mode = engine::ExecMode::TiledExport;
@@ -287,7 +287,7 @@ bool renderBands(engine::EngineSession& es, const EditParams& params, const Rend
     return w;
   };
   int fw = 0, fh = 0;
-  renderer.fastSize(virt, RenderRegion{}, fw, fh);  // the frame of the exact render (geometry applied)
+  engine::point::fastSize(point, virt, RenderRegion{}, fw, fh);  // the frame of the exact render (geometry applied)
   bool begun = false;
   o.rows = [&](int y0, int n, const std::uint8_t* rgb) {
     if (!begun) {
@@ -298,7 +298,7 @@ bool renderBands(engine::EngineSession& es, const EditParams& params, const Rend
   };
   Image8 sizeOut;
   std::string e;
-  const bool ok = es.renderExact(params, renderer, virt, o, sizeOut, &e);
+  const bool ok = es.renderExact(params, point, virt, o, sizeOut, &e);
   if (!ok && err) *err = srcFailed && e == "cancelled" ? "streaming export: a source window could not be read" : e;
   return ok;
 }
@@ -371,17 +371,17 @@ bool analyse(BandSource& src, const SourceImage& meta, const Wants& want, Analys
     for (int le : want.longEdges) addRz(le);
     // modern end-point samples
     int gw = 0, gh = 0;
-    Renderer::modernGridSize(W, H, gw, gh);
+    engine::point::modernGridSize(W, H, gw, gh);
     ImageF grid(gw, gh);
     std::vector<int> gridRowY(static_cast<std::size_t>(gh)), gridColX(static_cast<std::size_t>(gw));
     for (int j = 0; j < gh; ++j) {
       int x, y;
-      Renderer::modernGridPixel(W, H, 0, j, x, y);
+      engine::point::modernGridPixel(W, H, 0, j, x, y);
       gridRowY[std::size_t(j)] = y;
     }
     for (int i = 0; i < gw; ++i) {
       int x, y;
-      Renderer::modernGridPixel(W, H, i, 0, x, y);
+      engine::point::modernGridPixel(W, H, i, 0, x, y);
       gridColX[std::size_t(i)] = x;
     }
     // raster guide

@@ -29,7 +29,7 @@
 #include "dapple/film_match.h"
 #include "dapple/illuminant.h"
 #include "dapple/auto_adjust.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #include "film_internal.h"
 

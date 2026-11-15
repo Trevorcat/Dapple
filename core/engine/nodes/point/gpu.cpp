@@ -1,5 +1,5 @@
 // GPU implementation of the point recipe Geometry + Gain + ToneColour + Vignette (+ Grain/Pack8 epilogue) in one pass.
-// Shader: point.comp. Mirrors Renderer::renderBakedImpl + LutSampler (core/src/renderer.cpp).
+// Shader: point.comp. Mirrors the CPU point head (point::CpuFrame::headGainTone + LutSampler).
 #include "engine/nodes/gpu_common.h"
 #include "hdr_field.h"
 
@@ -18,17 +18,18 @@ struct PointU {
 }  // namespace
 
 bool recordPoint(GpuRecorder& r, const PointNode& n, H D) {
-  const FramePlan& P = *n.plan;
+  const point::Blocks& F = *n.frame;
+  const point::Geometry& P = F.geo;
   const int geo = !P.useGeo ? 0 : (P.exact ? 1 : 2);
-  const bool hdrOn = P.hdr.active() && n.lut.hdr >= 0;
-  const bool warpOn = P.warp.active() && n.src.warp >= 0;
+  const bool hdrOn = F.hdr.active() && n.lut.hdr >= 0;
+  const bool warpOn = F.warp.active() && n.src.warp >= 0;
   const bool localOn = n.ldesc >= 0 && n.lplanes >= 0;  // bound only when the frame has local adjustments (Executor::ensureLocal)
   const bool localW = localOn && n.aux0 >= 0 && n.aux1 >= 0;
   const hal::PipelineH p = localOn ? r.pl("point_local", {{0, geo}, {1, hdrOn ? 1 : 0}, {3, localW ? 1 : 0}, {4, warpOn ? 1 : 0}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}})
                                    : r.pl("point", {{0, geo}, {1, hdrOn ? 1 : 0}, {4, warpOn ? 1 : 0}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}});
   if (!p) return false;
   PointU u{};
-  for (int k = 0; k < 3; ++k) u.gain[k] = P.gain[k];
+  for (int k = 0; k < 3; ++k) u.gain[k] = F.gain[k];
   u.a[0] = P.srcW;
   u.a[1] = P.srcH;
   u.a[2] = n.W;
@@ -60,13 +61,13 @@ bool recordPoint(GpuRecorder& r, const PointNode& n, H D) {
   u.e[2] = n.ep.amp;
   u.e[3] = n.ep.period;
   if (hdrOn) {
-    const FramePlan::Hdr& h = P.hdr;
+    const point::Hdr& h = F.hdr;
     u.h0[0] = h.s, u.h0[1] = h.ev, u.h0[2] = h.key, u.h0[3] = h.yn;
     u.h1[0] = h.yclip, u.h1[1] = float(h.field->gw), u.h1[2] = float(h.field->gh), u.h1[3] = float(h.field->nb);
     u.h2[0] = h.field->lmin, u.h2[1] = h.field->lstep, u.h2[2] = h.lo, u.h2[3] = h.hi;
     u.h3[0] = h.ls, u.h3[1] = h.hp;
   }
-  if (warpOn) warpUniform(P, n.src, u.w);
+  if (warpOn) warpUniform(F.warp, n.src, u.w);
   // binding 7: the HDR buffer, which also carries the reshaping field after the HDR grid
   const H hb = warpOn ? n.src.warp : (hdrOn ? n.lut.hdr : n.lut.tone);
   if (localOn) {

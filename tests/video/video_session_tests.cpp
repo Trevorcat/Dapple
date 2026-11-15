@@ -268,10 +268,10 @@ static int testOracle(bool filmOk) {
       p.filmKeyEv = ev.filmEv;
       p.filmPrintEv = ev.printEv;
     }
-    Renderer renderer(p, cfg.camera, nullptr);
-    renderer.setToneProxy(&proxy);
+    engine::point::Params point = engine::point::resolve(p, cfg.camera, nullptr);
+    engine::point::setToneProxy(point, &proxy);
     EngineSession es;
-    FrameJob job{p, renderer, still, &proxy, cfg.camera, nullptr, {}, {}, {}};
+    FrameJob job{p, point, still, &proxy, cfg.camera, nullptr, {}, {}, {}};
     job.request.bakeSize = 65;
     job.request.noise = true;
     job.fastOptions.spatial = SpatialQuality::Full;
@@ -291,7 +291,7 @@ static int testOracle(bool filmOk) {
     std::string e2;
     double meanExact = -1;
     int maxExact = 0;
-    if (es2.renderExact(p, renderer, still, EngineSession::ExactOptions{}, exact, &e2)) {
+    if (es2.renderExact(p, point, still, EngineSession::ExactOptions{}, exact, &e2)) {
       std::vector<std::uint8_t> ex(std::size_t(exact.width) * exact.height * 4, 255);
       for (std::size_t i = 0, n = std::size_t(exact.width) * exact.height; i < n; ++i)
         for (int c = 0; c < 3; ++c) ex[4 * i + c] = exact.data[3 * i + c];

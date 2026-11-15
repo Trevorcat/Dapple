@@ -86,7 +86,7 @@ struct Plan {
   }
 };
 
-// What the planner needs to know about the frame besides the graph (all resolved by FrameKernels / the C layer).
+// What the planner needs to know about the frame besides the graph (all resolved by point::CpuFrame / the C layer).
 struct PlanRequest {
   int frameW = 0, frameH = 0;
   ExecMode mode = ExecMode::Whole;

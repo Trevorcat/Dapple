@@ -22,7 +22,7 @@
 #include "dapple/camera.h"
 #include "dapple/developer.h"
 #include "dapple/encode.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #include "dapple/tone.h"
 #include "eval_common.h"

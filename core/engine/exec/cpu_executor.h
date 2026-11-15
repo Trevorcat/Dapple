@@ -16,7 +16,7 @@
 #include "engine/graph/node.h"
 #include "engine/nodes/frame_blocks.h"
 #include "engine/plan/plan.h"
-#include "frame_kernels.h"
+#include "engine/nodes/point/cpu.h"
 #include "local_eval.h"
 #include "spatial.h"
 
@@ -49,7 +49,7 @@ struct CpuTile {
 
 // What a node binds its resolved block to for one frame (nodes/main/cpu_nodes.cpp).
 struct FrameEnv {
-  const FrameKernels* fk = nullptr;
+  const point::CpuFrame* fk = nullptr;
   const FrameBlocks* blocks = nullptr;  // the resolved blocks of the families that resolve their own parameters (copied into the slot)
   const ImageF* film = nullptr;   // FilmSim output plane (whole frame), null when there is no film branch
   bool blendFollows = false;      // DisplayStages feeds a Blend (else it replaces the pixel value)
@@ -69,7 +69,7 @@ bool bindResolved(NodeType t, const FrameEnv& env, Resolved& out);
 const CpuImpl* cpuFusedHead();
 
 struct ExecEnv {
-  FrameKernels& fk;
+  point::CpuFrame& fk;
   const Graph& graph;
   ResultCache& cache;
   CancelToken cancel;
@@ -80,7 +80,7 @@ struct ExecEnv {
   ImageF* outF = nullptr;
   // Streaming export (docs/engine/pipeline-architecture.md section 42), TiledExport plans: `out` holds one band of tile rows (plan.grid.tile rows),
   // `prepare` is called with the rect of the frame the head is about to compute (before every head run; it hands the source pixels of that rect to
-  // the FrameKernels) and `bandDone` with each finished band of the output sweep (rows [y0, y1) of the frame, in order, the pixels in `out`). A false
+  // the point::CpuFrame) and `bandDone` with each finished band of the output sweep (rows [y0, y1) of the frame, in order, the pixels in `out`). A false
   // return aborts the run (Status::Cancelled). Film plans are not run this way (Unsupported).
   std::function<bool(int x0, int y0, int x1, int y1)> prepare;
   std::function<bool(int y0, int y1)> bandDone;

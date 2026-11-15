@@ -5,7 +5,7 @@
 
 namespace dapple {
 
-// The nine built-in colour styles. Their recipes live in the engine (renderer.cpp); this is the
+// The nine built-in colour styles. Their recipes live in the engine (engine/nodes/point, makeStyle); this is the
 // catalogue the UI lists (ids/names/tags match docs/design/requirements.md 4.12).
 struct LookInfo {
   const char* id;        // "std" "warm" "amber" "rose" "neutral" "cool" "teal" "film" "bw"

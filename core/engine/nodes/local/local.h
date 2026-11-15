@@ -1,7 +1,7 @@
 #pragma once
 // Local adjustments node family (LocalLinear, stage L; LocalDetail, stage W; docs/engine/pipeline-architecture.md sections 40 and 50).
 // bind(): the adjustment list of the edit resolved against the source (masks, plane caches; local::bind) — owned by whoever holds the
-// frame's source (FrameKernels on the CPU, the session's GPU frame). resolve(): the per-frame block both executors read (the bound list,
+// frame's source (point::CpuFrame on the CPU, the session's GPU frame). resolve(): the per-frame block both executors read (the bound list,
 // the LocalDetail radii and amount planes, the frame pixel -> photo metric mapping of the portrait retouch). Kernels: core/src/local_eval
 // (CPU), local/gpu.cpp + shaders/local*.comp (GPU).
 #include <memory>

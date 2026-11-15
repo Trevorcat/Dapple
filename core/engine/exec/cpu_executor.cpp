@@ -33,11 +33,11 @@ struct Run {
   const Plan& plan;
   ExecEnv& env;
   ExecStats* stats;
-  FrameKernels& fk;
+  point::CpuFrame& fk;
   int W, H;
-  ScratchFrame frameBuf;        // Whole mode: the one float frame the window nodes work on
+  point::ScratchFrame frameBuf;        // Whole mode: the one float frame the window nodes work on
   ImageF filmPlane;             // FilmSim output (reused as the float frame when windows follow)
-  ScratchFrame filmScratch;
+  point::ScratchFrame filmScratch;
   ImageF* film = nullptr;
   ImageF tileBuf, cropBuf;      // tiled mode
   SpatialScratch scratch;       // luminance plane etc., kept between window nodes like applySpatial

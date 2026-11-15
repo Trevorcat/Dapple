@@ -440,7 +440,8 @@ void healSpotsOf(const LocalAdjustment& a, const Frame& f, int adj, const Source
 
 // ---- frame geometry -----------------------------------------------------------------------------------------------------------------------
 namespace {
-void framePoint(const engine::FrameFacts& P, const Frame* lf, double x, double y, double& X, double& Y) {
+void framePoint(const engine::FrameFacts& facts, const Frame* lf, double x, double y, double& X, double& Y) {
+  const engine::point::Geometry& P = facts.geo;
   const bool win = lf && lf->parentW > 0 && lf->parentH > 0;  // a region source: the metric is the parent picture's (section 44)
   const double L = win ? double(std::max(lf->parentW, lf->parentH)) : double(std::max(P.srcW, P.srcH));
   double sx, sy;

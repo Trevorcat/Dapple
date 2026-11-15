@@ -3113,8 +3113,7 @@ node resolves its own block (`NodeBehaviour::resolve`); only the film nodes did 
   `resolve…(const EditParams&, const FrameFacts&)`, its `NodeBehaviour` (isIdentity / halo computed from the block) and its `CpuImpl`;
   `gpu.cpp` records from the same block. Every derived number (radius, blend, 1/sigma^2, halo) is computed once, in the resolve.
 - `nodes/frame_facts.h` `FrameFacts`: what the frame decides that families read (output pixel -> picture mapping, radii scale, spatial
-  quality, noise flag, scene-referred). Today the point remnant produces it (`FrameKernels::frameFacts()`, `frameFacts(FramePlan, FastOptions)`);
-  after the point family it is the Geometry block.
+  quality, noise flag, scene-referred). Producer: the point family, `point::facts(Blocks, FastOptions, scene)`; it carries the Geometry block.
 - `nodes/frame_blocks.h` `FrameBlocks` + `resolveFrameBlocks(EditParams, FrameFacts)`: the blocks of the migrated families of one frame. The
   session resolves it for the graph builder (identity decides wiring), the plan request and the GPU run (`GpuRun::blocks`); the CPU executor
   resolves it again when it binds (after the film stage, because the exact variant's facts change there, `finalizeSpatial`). The executors
@@ -3159,12 +3158,37 @@ clarity, texture, sharpen, sharpRadius, grain}` are gone, `GpuRun::resizeSharpen
 Recorded corpus hashes unchanged (163 frames, no re-recording); content keys unchanged (the local list and the reshaping field already enter
 through the LocalLinear / LocalDetail / Geometry keys).
 
-**Left (steps 8-9), and why not in the same session.** `FramePlan` (frame_plan.h) still carries supported/why, sizes, geometry, gain, hdr, warp,
-lookGrain, spatialScale, resizeSharpen, film, display: all produced by `Renderer::framePlan` / `FrameKernels::framePlan` and read by the GPU
-executor and the point / film GPU nodes. `hdrBind`, the gain and the geometry need the Renderer's camera, white-balance gain and HDR proxy, and
-the fused CPU head (`headGainTone`) interleaves geometry, gain, HDR and the tone table per pixel; moving one of them alone would leave two
-mechanisms in one family, so geometry, gain, HDR, warp, tone/colour, display stages, blend and the table bakes (`TableBakeCtx` still carries the
-`Renderer`) move together as step 8. Graph (`graph.h`: the builder takes `FramePlan` for useGeo / hdr), exec (`cpu_executor.h` includes
-frame_kernels.h; `gpu_iface.h`, `engine_session.h`, `gpu_context.cpp` include renderer.h / frame_plan.h) still depend on them until then.
-Next smallest step: an `nodes/point/geometry` block (FrameFacts already holds its numbers) that the GPU point / film-input / local-film-input
-recorders read instead of `FramePlan` geometry fields.
+**Steps 8-9 (2026-11-15): the point family and the film glue; stage B is complete.** `Renderer` (renderer.h), `FramePlan`
+(frame_plan.h), `FrameKernels` (frame_kernels.h) and `core/src/point_kernels.cpp` are gone; `core/include/dapple/` holds only public API.
+The family lives in `core/engine/nodes/point/` (namespace `engine::point`):
+- `point.h`: `Params` (was `Renderer`: the clamped edit, curves, white-balance gain, camera, LUT, tone reach, analysis proxies) =
+  `point::resolve(EditParams, CameraProfile, Lut3D*)`; free functions over it: gains (`inputGain`, `whiteBalanceGain`, `sceneGain`), film glue
+  (`filmActive(EditParams)`, `latticeFilmOnly`), keys (`pointKey`, `colourKey`), the table bakes (`bake`, `bakeColourLattice`, `bakeTonePre`,
+  `bakeToneTable`, `bakeAnalysis`, `bakeOverflow`; `TonePre`, `ToneTableOut`, `TableEnv`, `TableBakeCtx`), the frame (`resolveFrame`, `hdrBind`,
+  `fastSize`), the modern rendering (`modernSdrWhite`, `modernGrid*`), the Geometry / Hdr `NodeBehaviour`s and `sourceWindow` (Geometry's
+  `inputRect`). `BakedLut` / `bakeCounters` keep their names in namespace `dapple`.
+- `blocks.h` `Blocks` (was `FramePlan`): `Geometry` (`geometry.h`, the mapping + `mapToSource` / `mapPixel`), `Warp`, `gain`, `Hdr`,
+  `lookGrain`, `spatialScale`, `resizeSharpen`, `Film` (glue), `Display`. `frame_options.h`: `SpatialQuality`, `RenderRegion`, `FastOptions`.
+- `resolve.cpp` (resolves, keys, `makePointOp`, `resolveGeometry`), `bake.cpp` (the bakes and the five table nodes' `CpuImpl`), `kernels.h`
+  (per-pixel: `PointOp`, `LutSampler` + tone-table layout, resamplers, `displayStages`; plain inline header), `cpu.h` / `cpu_impl.h` / `cpu.cpp`
+  (`CpuFrame`, was `FrameKernels`: the CPU binding of a frame; the family's CPU nodes Source / Geometry / Gain / Hdr / ToneColour(Exact) / fused
+  head / DisplayStages / Blend are block fragments over it), `scratch.h` (recycled frames), `gpu.cpp`. The film stage of a CPU frame
+  (`runFilm`, `streamFilm`, `filmStream*`, the FilmSim node, `makeFilmParams`, `runFilmStage`) is `nodes/film/film_glue.cpp`.
+- One resolve for both executors: `resolveFrame(Params, srcW, srcH, scene, FastOptions, source, exactVariant)` builds geometry, region, radii
+  scale (region source included), reshaping warp, gain, look grain, film glue and display stages; `hdrBind` adds the Hdr block. `CpuFrame`
+  calls it (it used to compute its own copy) and so do the session's GPU frames (`renderGpu`, `renderExactGpu`, `exportGpu`; `bindSource` is
+  gone, the local adjustments are `localadj::bind`). `FrameFacts` = `{geo, spatialScale, quality, noise, keepGrain, lookGrain, resizeSharpen,
+  sceneReferred}` (`point::facts`), no copied geometry fields. `GraphBuilder::build` takes `point::Blocks` and wires Geometry / Hdr through
+  their behaviours; `GpuRun::frame` is `point::Blocks`, `GpuRun::params` (was `renderer`) the overflow fallback. `nodes/main/cpu_nodes.cpp`
+  only lists the families' `CpuImpl`s, binds their slots and implements Pack8.
+- Call sites (C layer, video session, film match, tests, benches) call `point::resolve` and the free functions; no code constructs a parameter
+  resolver object any more. graph / plan / exec include no renderer.h / frame_plan.h / frame_kernels.h (they include `nodes/point/*.h`).
+Bit identity: recorded corpus hashes unchanged (163 frames, no re-recording), selfcheck 0 differences, content keys unchanged (the keys
+are the registry's ParamMask keys; `pointKey` / `colourKey` strings are byte-identical). The per-pixel code moved verbatim into one inline
+header, so every TU that runs it inlines it as `point_kernels.cpp` did (exec bench in the stage-B report). Two GPU-only arithmetic changes,
+both towards the CPU reference: (a) a GPU frame's look grain now follows the CPU rule (a film drops the look's grain only at full
+strength; `framePlan` dropped it for any film strength), (b) the reshaping field's grid offset of a region source is `x0 * ((gw - 1) / PW)`
+on both executors (the GPU computed `x0 * (gw - 1) / PW`, one rounding apart; whole-picture frames have x0 = 0).
+Left for stage C: the planner still takes halos / footprints from `PlanRequest`, and the GPU executor keeps its own source footprint
+(`gpu_executor.cpp footprint`, edges instead of pixel centres, one pixel wider than `point::sourceWindow`); making both read
+`geometryBehaviour().inputRect` is the planner generalisation.

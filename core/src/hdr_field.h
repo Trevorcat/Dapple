@@ -9,7 +9,7 @@
 //     preserving by construction (a pixel only mixes with places of similar brightness), so no halo. Everything finer than the base is
 //     DETAIL and is never compressed;
 //   * the amount is scene adaptive: R = p99 - p1 of the base EV over the frame is compared with the range T the tone curve of THIS frame
-//     shows well (the EV span around mid-grey where the curve keeps >= 60 % of its peak slope, Renderer::hdrBind). Only the excess
+//     shows well (the EV span around mid-grey where the curve keeps >= 60 % of its peak slope, point::hdrBind). Only the excess
 //     E = R - T is compressed; a scene with R <= T is not touched at all (the node is not even in the graph);
 //   * the compression is an asymmetric curve with fixed ends on the base: black (p1) and mid-grey (the scene key) do not move; between
 //     them the shadows are lifted by a bump t (1-t)^2 (zero slope change at the key, peak at a third of the way up from black) and
@@ -68,7 +68,7 @@ std::shared_ptr<const HdrField> fieldFor(const SourceImage& src, const float wb[
 // Same without the cache (tests, synthetic inputs): `lum` = exposure-free luminance proxy, pw x ph.
 std::shared_ptr<HdrField> buildField(const std::vector<float>& lum, int pw, int ph);
 
-// `targetRange` T: EV range the frame's tone curve shows well (Renderer::hdrBind derives it from the tone table).
+// `targetRange` T: EV range the frame's tone curve shows well (point::hdrBind derives it from the tone table).
 float sliceBase(const HdrField& f, float u, float v, float lc0);  // base EV (exposure-free) at source position (u, v) for a pixel of log luminance lc0
 HdrParams resolve(const HdrField& f, float strength01, float expoLog2, float iso, const float gain[3], float targetRange);
 

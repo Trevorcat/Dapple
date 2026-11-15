@@ -3,7 +3,7 @@
 //
 // One whole-photo BACKWARD field B on a regular grid of nodes over the photo's normalised space: the content shown at photo point p
 // of the warped picture comes from p + B(p) of the original. Units: long edges of the photo (isotropic). The engine folds it into the
-// geometry fetch (FrameKernels / point.comp / film_src.comp / local_film_in.comp): output pixel -> geometry -> source position s ->
+// geometry fetch (engine::point::CpuFrame / point.comp / film_src.comp / local_film_in.comp): output pixel -> geometry -> source position s ->
 // s + B(s) -> resample. Where the four grid nodes around s are exactly zero nothing changes (bit-identical to no reshaping).
 //
 // The CPU sampler below and warp.glsl are twins: keep the arithmetic identical.

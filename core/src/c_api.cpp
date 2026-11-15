@@ -33,7 +33,7 @@
 #include "dapple/film_match.h"
 #include "dapple/look.h"
 #include "dapple/lut.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "dng_thumbnail.h"
 #include "dapple/tone.h"
 #include "dapple/ultrahdr.h"
@@ -42,7 +42,7 @@
 #include "sysperf.h"
 #include "dapple/xmp_preset.h"
 #include "engine/exec/engine_session.h"  // the frame engine: every frame and export
-#include "frame_kernels.h"
+#include "engine/nodes/point/cpu.h"
 #include "local_eval.h"
 #include "warp_field.h"
 #include "ai_masks.h"
@@ -494,7 +494,7 @@ bool fillImage(const Image8& img, DappleImage* out) {
 // The exact (reference / export) variant through the Planner and the CpuExecutor. Frames of more than
 // 16 MP are split into tiles (TiledExport, halo + frame-global sweeps) so the float frame never exists; DAPPLE_ENGINE_TILE=N
 // forces tile size N for every size, =0 never tiles.
-bool engineRenderExact(DappleSession* s, const EditParams& params, const Renderer& renderer, const SourceImage& src,
+bool engineRenderExact(DappleSession* s, const EditParams& params, const engine::point::Params& point, const SourceImage& src,
                        Image8& out) {
   dapple::engine::EngineSession::ExactOptions o;
   o.hasProxy = s->proxy != nullptr;
@@ -509,7 +509,7 @@ bool engineRenderExact(DappleSession* s, const EditParams& params, const Rendere
   }
   std::lock_guard<std::mutex> lock(s->exportMtx);
   std::string err;
-  if (!s->exportEngine.renderExact(params, renderer, src, o, out, &err)) {
+  if (!s->exportEngine.renderExact(params, point, src, o, out, &err)) {
     setError(err.empty() ? "engine failure" : err);
     return false;
   }
@@ -523,9 +523,9 @@ bool engineRenderExact(DappleSession* s, const EditParams& params, const Rendere
 
 #ifdef DAPPLE_HAVE_GPU
 // Full-picture export on the GPU executor (tiled; lattice 65, Lanczos + a little sharpening when downscaled). False = the CPU renders it.
-bool gpuExport(DappleSession* s, const EditParams& params, Renderer& renderer, const Lut3D* lut, int32_t outLongEdge, Image8& out) {
+bool gpuExport(DappleSession* s, const EditParams& params, engine::point::Params& point, const Lut3D* lut, int32_t outLongEdge, Image8& out) {
   std::lock_guard<std::mutex> lock(s->exportMtx);
-  dapple::engine::EngineSession::GpuExport e{params, renderer, s->source, *sourceStoreOf(s), *s->camera, lut};
+  dapple::engine::EngineSession::GpuExport e{params, point, s->source, *sourceStoreOf(s), *s->camera, lut};
   e.outLongEdge = outLongEdge;
   int w = 0;
   e.onSize = [&](int ow, int oh) {
@@ -619,7 +619,7 @@ bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const cha
   }
   if (!ensureSource(s)) return false;
   const EditParams params = withFilmKey(s, paramsIn, lutPath);
-  if (params.outputSpace == 1 && Renderer(params, *s->camera, nullptr).filmActive()) {
+  if (params.outputSpace == 1 && engine::point::filmActive(params)) {
     // Film stocks (and their blend with the normal render) are authored for sRGB output: rendered as sRGB, then converted to Display P3 (no colour is added).
     EditParams q = paramsIn;
     q.outputSpace = 0;
@@ -633,21 +633,21 @@ bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const cha
     lut = loadLut(lutFile);
     if (!lut) return false;
   }
-  Renderer renderer(params, *s->camera, lut.get());
-  renderer.setToneReach(toneReach);
+  engine::point::Params point = engine::point::resolve(params, *s->camera, lut.get());
+  point.toneReach = toneReach;
 #ifdef DAPPLE_HAVE_GPU
   dapple::engine::gpu::installProvider();
   if (dapple::engine::gpu::runtimeEnabled() && toneReach == 1.f && (outLongEdge <= 0 || outLongEdge >= 1500)) {
     const int W = s->source.linear.width, H = s->source.linear.height;
     const bool fullSize = outLongEdge <= 0 || outLongEdge >= std::max(W, H);
-    const GpuWhole g = fullSize ? gpuWholeCheck(W, H, renderer.filmActive()) : GpuWhole{};
+    const GpuWhole g = fullSize ? gpuWholeCheck(W, H, engine::point::filmActive(point.p)) : GpuWhole{};
     if (!g.fits) {  // the driver's budget cannot hold it: no attempt (an allocation failure halfway costs seconds and memory)
       stageLog("export: the GPU has %.0f MB free for this %dx%d frame, it needs ~%.0f MB: not tried on the GPU", double(g.free) / 1048576.0, W, H,
                double(g.need) / 1048576.0);
       s->gpuOom = true;
     } else {
       s->gpuOom = false;
-      if (gpuExport(s, params, renderer, lut.get(), outLongEdge, out)) return true;
+      if (gpuExport(s, params, point, lut.get(), outLongEdge, out)) return true;
     }
     if (s->gpuOom && fullSize && tlExportCall && !s->fullRawPath.empty() && !s->lazyOpen.load() && xstream::envMode() != xstream::Mode::Off) {
       // full size, and the session can stream: the export switches to bands (the caller: retryInBands) rather than a whole-frame CPU render
@@ -664,9 +664,9 @@ bool renderSessionParams(DappleSession* s, const EditParams& paramsIn, const cha
       setError("resize failed");
       return false;
     }
-    return engineRenderExact(s, params, renderer, *scaled, out);
+    return engineRenderExact(s, params, point, *scaled, out);
   }
-  return engineRenderExact(s, params, renderer, s->source, out);
+  return engineRenderExact(s, params, point, s->source, out);
 }
 
 // ---- streaming export (docs/engine/pipeline-architecture.md section 42) -------------------------------------------------------------------
@@ -773,7 +773,7 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
   if (!s->lazyOpen.load() || !s->lazy) return 0;
   const int W = s->lazy->width, H = s->lazy->height, own = std::max(W, H);
   const bool reduced = outLongEdge > 0 && outLongEdge < own;
-  s->streamFilm = Renderer(paramsIn, *s->camera, nullptr).filmActive();
+  s->streamFilm = engine::point::filmActive(paramsIn);
   if (paramsIn.outputSpace == 1 && s->streamFilm) {
     // as renderSessionParams: a film is rendered as sRGB, then converted to Display P3 (band by band). The film match of the P3 params is
     // solved first, as renderSessionParams does (the match cache of the session remembers it: the sRGB solve that follows starts from it)
@@ -797,7 +797,7 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
         extraLongEdges);
   }
   // a film stock streams on the CPU in bands (section 42.6): the GPU executor keeps a film frame resident (it would read the whole picture)
-  const bool film = Renderer(paramsIn, *s->camera, nullptr).filmActive();
+  const bool film = engine::point::filmActive(paramsIn);
   xstream::Wants want;
   want.longEdges = extraLongEdges;
   if (reduced) want.longEdges.push_back(outLongEdge);
@@ -812,8 +812,8 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
     lut = loadLut(lutFile);
     if (!lut) return -1;
   }
-  Renderer renderer(params, *s->camera, lut.get());
-  renderer.setAnalysisSources(a->p256.get(), a->grid.get(), a->p512.get());
+  engine::point::Params point = engine::point::resolve(params, *s->camera, lut.get());
+  engine::point::setAnalysisSources(point, a->p256.get(), a->grid.get(), a->p512.get());
   const xstream::GuideScope guideScope(a->guide.get());
   const SourceImage virt = xstream::sizeOnly(s->lazy->meta, W, H);
   if (!s->bands) s->bands = std::make_shared<xstream::BandSource>(s->lazy->mosaic);
@@ -838,7 +838,7 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
     std::lock_guard<std::mutex> lock(s->exportMtx);
     bs.setCancel(s->exportEngine.cancelCell(), s->exportEngine.ticket());
     xstream::BandSourceStore store(bs);
-    dapple::engine::EngineSession::GpuExport e{params, renderer, virt, store, *s->camera, lut.get()};
+    dapple::engine::EngineSession::GpuExport e{params, point, virt, store, *s->camera, lut.get()};
     e.outLongEdge = outLongEdge;
     e.forceStream = true;
     // tiles of 512: the device pool (shared memory on phones) stays small; the GPU executor is tile-invariant (same pixels at any tile size)
@@ -882,7 +882,7 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
     const std::shared_ptr<SourceImage> R = a->at(outLongEdge);
     if (!R) return 0;
     Image8 img;
-    if (!engineRenderExact(s, params, renderer, *R, img)) return -1;
+    if (!engineRenderExact(s, params, point, *R, img)) return -1;
     sized(img.width, img.height);
     for (int y = 0; y < img.height; y += 512) {
       const int n = std::min(512, img.height - y);
@@ -900,7 +900,7 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
   std::string err;
   const auto t0 = std::chrono::steady_clock::now();
   int fw = 0, fh = 0;
-  const bool ok = xstream::renderBands(s->exportEngine, params, renderer, virt, bs, tile, s->proxy != nullptr, [&](int w, int h) { fw = w, fh = h, sized(w, h); },
+  const bool ok = xstream::renderBands(s->exportEngine, params, point, virt, bs, tile, s->proxy != nullptr, [&](int w, int h) { fw = w, fh = h, sized(w, h); },
                                        progressSink, &err);
   stageLog("export_stream CPU %dx%d: %s in %.0f ms (%d bands, %llu windows demosaiced, %llu from the row cache, demosaic %.0f ms %s, largest window %.0f MB)", fw, fh,
            ok ? "ok" : err.c_str(), msSince(t0), bandsDone, (unsigned long long)(bs.windows() - windows0), (unsigned long long)(bs.cacheHits() - hits0), bs.demosaicMs(),
@@ -1096,8 +1096,8 @@ namespace {
 struct MaskView {
   std::shared_ptr<const SourceImage> hold;
   const SourceImage* src = nullptr;
-  std::unique_ptr<Renderer> renderer;
-  std::unique_ptr<FrameKernels> fk;
+  std::unique_ptr<engine::point::Params> point;
+  std::unique_ptr<engine::point::CpuFrame> fk;
 };
 bool maskView(DappleSession* s, const EditParams& params, int longEdge, MaskView& mv) {
   if (!ensureSource(s)) return false;
@@ -1105,10 +1105,10 @@ bool maskView(DappleSession* s, const EditParams& params, int longEdge, MaskView
   mv.hold = s->engine.resizedSource(s->source, longEdge, false);
   mv.src = mv.hold ? mv.hold.get() : &s->source;
   if (mv.src->linear.empty()) return false;
-  mv.renderer = std::make_unique<Renderer>(params, *s->camera, nullptr);
+  mv.point = std::make_unique<engine::point::Params>(engine::point::resolve(params, *s->camera, nullptr));
   FastOptions fo;
   fo.spatial = SpatialQuality::Off;
-  mv.fk = std::make_unique<FrameKernels>(*mv.renderer, *mv.src, nullptr, fo);
+  mv.fk = std::make_unique<engine::point::CpuFrame>(*mv.point, *mv.src, nullptr, fo);
   return mv.fk->valid();
 }
 }  // namespace
@@ -1896,8 +1896,8 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
     s->proxy->linear = resizeToLongEdge(s->source.linear, 256);
   }
   const auto tRen0 = std::chrono::steady_clock::now();
-  Renderer renderer(params, *s->camera, lut.get());
-  renderer.setToneProxy(s->proxy.get());
+  engine::point::Params point = engine::point::resolve(params, *s->camera, lut.get());
+  engine::point::setToneProxy(point, s->proxy.get());
   const double rendererMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tRen0).count();
   // Grain (14 Q8): a drag of a grain-family slider keeps grain in interactive frames; a frame smaller than the full
   // render previews it with grain statistically matched to the downscaled full-resolution grain.
@@ -1908,7 +1908,7 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   if (rq.flags & DAPPLE_FRAME_EXACT) {
     // reference pipeline (no region)
     Image8 img;
-    if (!engineRenderExact(s, params, renderer, src, img)) return false;
+    if (!engineRenderExact(s, params, point, src, img)) return false;
     if (!fillImage(img, out)) return false;
     if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS))
     {
@@ -1925,7 +1925,7 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   dapple::engine::gpu::installProvider();
 #endif
   // Frame engine: graph + table nodes + ResultCache.
-  dapple::engine::FrameJob job{params, renderer, src, s->proxy.get(), *s->camera, lut.get(), {}, {}, {}};
+  dapple::engine::FrameJob job{params, point, src, s->proxy.get(), *s->camera, lut.get(), {}, {}, {}};
   job.matchMs = matchMs;
   job.rendererMs = rendererMs;
   job.request.longEdge = rq.long_edge;
@@ -1979,7 +1979,7 @@ static bool renderFrame(DappleSession* s, const char* paramsJson, const char* lu
   out->rgba = res.rgba;
   if (analysisOut && (rq.flags & DAPPLE_FRAME_ANALYSIS)) {
     ToneAnalysis a = res.analysis;
-    if (renderer.filmActive() && res.rgba) applyFrameHistogram(a, res.rgba, res.w, res.h);
+    if (engine::point::filmActive(point.p) && res.rgba) applyFrameHistogram(a, res.rgba, res.w, res.h);
     *analysisOut = dupString(toneJson(a));
   }
   return true;
@@ -2669,7 +2669,7 @@ int32_t exportJpegImpl(DappleSession* session, const char* params_json, const ch
 
 // ---- Ultra HDR (docs/engine/pipeline-architecture.md section 34) ----
 namespace {
-// The bright rendition of an edit: the same params with the exposure lowered by H (the Renderer clamps exposure to -5, so H is cut to what is left).
+// The bright rendition of an edit: the same params with the exposure lowered by H (point::resolve clamps exposure to -5, so H is cut to what is left).
 bool renderBright(DappleSession* s, const EditParams& params, const char* lutPath, int longEdge, float H, Image8& out) {
   EditParams p = params;
   p.exposure -= H;
@@ -2685,9 +2685,9 @@ float modernWhiteEv(DappleSession* s, const EditParams& params) {
     s->proxy->sceneReferred = s->source.sceneReferred;
     s->proxy->linear = resizeToLongEdge(s->source.linear, 256);
   }
-  Renderer r(params, *s->camera, nullptr);
-  r.setToneProxy(s->proxy.get());
-  return std::log2(std::max(1e-3f, r.modernSdrWhite(s->source)));
+  engine::point::Params r = engine::point::resolve(params, *s->camera, nullptr);
+  engine::point::setToneProxy(r, s->proxy.get());
+  return std::log2(std::max(1e-3f, engine::point::modernSdrWhite(r, s->source)));
 }
 
 struct HdrDecision {
@@ -2712,7 +2712,7 @@ bool hdrDecide(DappleSession* s, const EditParams& params, const char* lutPath, 
     bp.filmStrength = 100.f;
     bp.exposure -= modernWhiteEv(s, params);
   }
-  const float room = std::max(0.f, bp.exposure + 5.f);  // exposure is clamped to -5 by the Renderer
+  const float room = std::max(0.f, bp.exposure + 5.f);  // exposure is clamped to -5 by point::resolve
   const float probeH = std::min(dapple::uhdr::kMaxHeadroomStops, room);
   if (probeH < 0.5f) {
     d.reason = 1;
@@ -2774,7 +2774,7 @@ void demoteToStream(DappleSession* s, const EditParams& ep, bool force) {
   if (xstream::envMode() == xstream::Mode::Off || (xstream::envMode() == xstream::Mode::On && !force)) return;
   const int W = s->source.linear.width, H = s->source.linear.height;
   const std::size_t held = std::size_t(W) * H * 12;  // the float picture is already there
-  const bool film = Renderer(ep, *s->camera, nullptr).filmActive();
+  const bool film = engine::point::filmActive(ep);
   std::size_t need = xstream::predictWholePeak(W, H, film);
   bool gpuFits = true;
 #ifdef DAPPLE_HAVE_GPU
@@ -2813,7 +2813,7 @@ bool retryInBands(DappleSession* s, const EditParams& ep) {
 
 bool wholeFrameFits(DappleSession* s, const EditParams& ep) {
   if (!s->lazy) return true;
-  const std::size_t need = xstream::predictWholePeak(s->lazy->width, s->lazy->height, Renderer(ep, *s->camera, nullptr).filmActive());
+  const std::size_t need = xstream::predictWholePeak(s->lazy->width, s->lazy->height, engine::point::filmActive(ep));
   const std::size_t budget = xstream::budgetBytes();
   if (xstream::envMode() == xstream::Mode::On || need <= budget) return true;
   char b[256];
@@ -2853,7 +2853,7 @@ int streamExportJpeg(DappleSession* s, const EditParams& ep, const char* lutPath
   std::vector<int> extra;
   if (hdr) {  // the gain map's renders are at a quarter of the output's long edge: build that reduction in the same pass
     int fw = 0, fh = 0;
-    Renderer(ep, *s->camera, nullptr).fastSize(xstream::sizeOnly(s->lazy->meta, s->lazy->width, s->lazy->height), RenderRegion{}, fw, fh);
+    engine::point::fastSize(engine::point::resolve(ep, *s->camera, nullptr), xstream::sizeOnly(s->lazy->meta, s->lazy->width, s->lazy->height), RenderRegion{}, fw, fh);
     if (outLongEdge > 0 && std::max(fw, fh) > outLongEdge) {
       const double k = double(outLongEdge) / std::max(fw, fh);
       fw = int(std::lround(fw * k)), fh = int(std::lround(fh * k));
@@ -3454,7 +3454,7 @@ int32_t dapple_export_intent(const char* params_json) {
         EditParams ep;
         if (!params_json || !parseParams(params_json, ep)) return DAPPLE_ERROR;
         const CameraProfile cam;
-        tlExportFilm = Renderer(ep, cam, nullptr).filmActive() ? 1 : 0;
+        tlExportFilm = engine::point::filmActive(ep) ? 1 : 0;
         return DAPPLE_OK;
       },
       DAPPLE_ERROR);

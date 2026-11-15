@@ -15,7 +15,7 @@
 #include "dapple/developer.h"
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #include "film_common.h"
 
@@ -247,7 +247,7 @@ int cmdBench(const std::vector<std::string>& args) {
 }
 
 // dapple film-render-bench [--runs N] [--mp 26] [--film ID] [--paper ID]
-// The develop pipeline with the film simulation switched on (Renderer): full resolution and 1600 px preview, with and
+// The develop pipeline with the film simulation switched on (the engine): full resolution and 1600 px preview, with and
 // without spatial effects, one cold render and repeated renders that reuse the cached bake.
 int cmdRenderBench(const std::vector<std::string>& args) {
   const Args a = parse(args);
@@ -279,8 +279,8 @@ int cmdRenderBench(const std::vector<std::string>& args) {
 
   // one frame of the engine (table nodes + planner + executor) into RGBA8; `es` keeps the result cache between frames
   auto frame = [&](engine::EngineSession& es, const EditParams& p, const FastOptions& fo) {
-    Renderer r(p, cam, nullptr);
-    r.setToneProxy(&proxy);
+    engine::point::Params r = engine::point::resolve(p, cam, nullptr);
+    engine::point::setToneProxy(r, &proxy);
     engine::FrameJob job{p, r, big, &proxy, cam, nullptr, {}, {}, {}};
     job.request.bakeSize = 33;
     job.request.noise = fo.noise;

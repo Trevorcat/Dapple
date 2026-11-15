@@ -16,7 +16,7 @@
 #include "dapple/encode.h"
 #include "dapple/merge.h"
 #include "dapple/motion_photo.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 
 namespace fs = std::filesystem;

@@ -112,7 +112,7 @@ bool bakeFilmTables(const FilmResolved& r, FilmTablesHandle& out, std::string* e
 bool runFilmFrame(const FilmResolved& r, const FilmTablesHandle& tables, const float* in, std::size_t inStrideFloats,
                   float* out, std::size_t outStrideFloats, int tileW = 0, int tileH = 0, FilmTimingsNodes* t = nullptr);
 
-// ---- Renderer-facing entry (FrameKernels::runFilm) --------------------------------------------------------------------------------
+// ---- CPU-frame entry (point::CpuFrame::runFilm, nodes/film/film_glue.cpp) --------------------------------------------------------------------------------
 // The film of one frame from the values the C layer / renderer already have; tables come from a process-wide cache with the
 // granularity of the table nodes (raw + curves per stock, print per stock / paper / warmth / tint), so a warmth drag re-bakes
 // only the print LUT. Returns false when the node chain cannot render this frame (unknown stock / paper, allocation failure): the

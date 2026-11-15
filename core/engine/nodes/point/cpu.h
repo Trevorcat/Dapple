@@ -1,9 +1,8 @@
 #pragma once
-// FrameKernels: the per-pixel pieces of Renderer::renderBakedImpl / renderFloat, resolved once per frame and exposed as
-// block operations, for the engine's CPU nodes (core/engine/nodes/main). Internal header (core/src).
-//
-// Nothing here is a new algorithm: every method is the body of the per-pixel loop of the renderer it was taken from, so a
-// graph built from these pieces reproduces the renderer bit for bit (gate B, tests/engine/golden).
+// CpuFrame: the point family's CPU binding of one frame (docs/engine/pipeline-architecture.md section 50): the source, the frame's point
+// blocks (Geometry, Warp, Gain, Hdr: point::resolveFrame + hdrBind), the lattice sampler or the exact colour operator, the local
+// adjustments' binding. The family's CPU nodes are block fragments over it (nodes/point/cpu_nodes.cpp); the film stage's glue reads the
+// same binding (nodes/film/film_glue.cpp).
 //
 // Block convention: `px` = n pixels of interleaved float RGB (3 floats per pixel), n <= 256 in the executor.
 #include <cstdint>
@@ -11,22 +10,20 @@
 #include <memory>
 #include <string>
 
-#include "dapple/frame_plan.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/nodes/frame_blocks.h"
 #include "engine/nodes/frame_facts.h"
-#include "local_eval.h"
-#include "spatial.h"
+#include "src/local_eval.h"  // core/src (the C layer includes this header too)
 
-namespace dapple {
-class FrameKernels final : public local::PixelSource {
+namespace dapple::engine::point {
+class CpuFrame final : public local::PixelSource {
  public:
-  // lut != null: the baked path (renderBakedImpl: lattice + tone table, region + quality from `opt`);
-  // lut == null: the exact path (renderFloat: per-pixel PointOp::apply; `opt.spatial` = Off skips the neighbourhood stages).
-  FrameKernels(const Renderer& r, const SourceImage& src, const BakedLut* lut, const FastOptions& opt);
-  ~FrameKernels() override;
-  FrameKernels(const FrameKernels&) = delete;
-  FrameKernels& operator=(const FrameKernels&) = delete;
+  // lut != null: the baked variant (lattice + tone table, region + quality from `opt`);
+  // lut == null: the exact variant (per-pixel PointOp::apply; `opt.spatial` = Off skips the neighbourhood stages).
+  CpuFrame(const Params& r, const SourceImage& src, const BakedLut* lut, const FastOptions& opt);
+  ~CpuFrame() override;
+  CpuFrame(const CpuFrame&) = delete;
+  CpuFrame& operator=(const CpuFrame&) = delete;
 
   bool valid() const;
   int width() const override;
@@ -38,8 +35,8 @@ class FrameKernels final : public local::PixelSource {
   bool filmFull() const { return filmSelected() && filmStrength() >= 1.f; }
   // Radii scale of the neighbourhood stages of this frame (region, region source and, on the exact path, the film outcome applied).
   float spatialScale() const;
-  // What the GraphBuilder (Full detail) needs: geometry, spatial amounts.
-  FramePlan framePlan() const;
+  // The point family's blocks of this frame (geometry, warp, gain, HDR, look grain, radii scale; point::resolveFrame + hdrBind).
+  const engine::point::Blocks& blocks() const;
   // What the node families resolve their blocks from (engine/nodes/frame_blocks.h), with the parameters of the frame.
   engine::FrameFacts frameFacts() const;
   // What the frame bound from its source that the families' resolves read (local adjustments, reshaping field); owned by this object.
@@ -57,7 +54,7 @@ class FrameKernels final : public local::PixelSource {
   // in the same order, as the three fragments above, without the two extra passes over the block).
   bool canFuseHead() const;
   void headGainTone(float* px, int n, int x0, int y) const;  // applies the HDR gain after the gain when hdrActive()
-  bool hdrActive() const;                                 // single-image HDR is part of this frame (EditParams::hdr, FramePlan::hdr)
+  bool hdrActive() const;                                 // single-image HDR is part of this frame (EditParams::hdr, point::Blocks::hdr)
   void hdrBlock(float* px, int n, int x0, int y) const;   // Hdr node (unfused chain): the HDR gain on gained pixels
   void displayStages(float* px, int n) const;             // curves + LUT on an encoded display value (film path)
   void blend(float* main, const float* film, int n) const;  // main += strength * (film - main)
@@ -103,8 +100,28 @@ class FrameKernels final : public local::PixelSource {
   std::unique_ptr<Impl> impl_;
 };
 
-// FrameFacts of a frame resolved without a source (Renderer::framePlan, the GPU path): mapping and radii scale of `fp`, quality of `opt`.
-engine::FrameFacts frameFacts(const FramePlan& fp, const FastOptions& opt, bool sceneReferred);
+// ---- the family's CPU nodes (block fragments over the frame's binding, nodes/point/cpu.cpp) ------------------------------------------
+// Resolved slot of Source / Resize / Geometry / Gain / Hdr / ToneColour(Exact) / the fused head / Blend / FilmSim: the frame's binding.
+struct FrameSlot {
+  const CpuFrame* frame;
+};
+// Resolved slot of DisplayStages: the film plane it reads and whether a Blend follows.
+struct DisplayCpu {
+  const CpuFrame* frame;
+  const ImageF* film;
+  bool replace;     // the display-staged film replaces the pixel (no Blend follows)
+  const int* row0;  // streaming export: frame row of the film band's first row (null: the whole frame)
+};
+void copyBlock(const void* r, float* px, int n, const PixelPos& pos);  // the head of a chain without resampling: the source row as it is
+const CpuImpl& sourceCpu();
+const CpuImpl& geometryCpu();
+const CpuImpl& gainCpu();
+const CpuImpl& hdrCpu();
+const CpuImpl& toneColourCpu();  // ToneColour (lattice + overflow) and ToneColourExact
+const CpuImpl& fusedHeadCpu();   // CPU fusion recipe: [Resize | Geometry] + Gain + [Hdr] + ToneColour in one pass (baked variant)
+const CpuImpl& displayCpu();
+const CpuImpl& blendCpu();
+const CpuImpl& filmSimCpu();     // nodes/film/film_glue.cpp: the film render of the whole frame (runFilm)
 
 // A recycled float frame (the renderer's ScratchImage): a fresh 20 MB buffer costs ~5 ms of page faults.
 class ScratchFrame {
@@ -120,4 +137,4 @@ class ScratchFrame {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace dapple
+}  // namespace dapple::engine::point

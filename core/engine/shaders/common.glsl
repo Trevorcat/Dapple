@@ -1,5 +1,5 @@
 // Shared helpers of the Dapple compute kernels (docs/engine/gpu-backend.md). Everything here mirrors the CPU
-// reference in core/src/spatial.cpp / renderer.cpp; keep the arithmetic identical when changing either side.
+// reference in core/src/spatial.cpp / engine/nodes/point/kernels.h; keep the arithmetic identical when changing either side.
 const vec3 kLuma = vec3(0.2126729, 0.7151522, 0.0721750);  // sRGB luma, as spatial.cpp kR/kG/kB
 float lumaOf(vec3 c) { return dot(c, kLuma); }
 

@@ -1,6 +1,6 @@
 #version 450
 // FilmExposure input of a geometry / region frame: the Catmull-Rom (or exact index) gather of point.comp without gain, tone or
-// colour. Output RGBA32F linear ProPhoto, ungained, clamped at 0 (what FrameKernels::fetchPixel hands to the film).
+// colour. Output RGBA32F linear ProPhoto, ungained, clamped at 0 (what point::CpuFrame::Impl::fetchPixel hands to the film).
 #extension GL_GOOGLE_include_directive : enable
 layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
 layout(constant_id = 0) const int GEO = 2;  // 1 exact index mapping, 2 Catmull-Rom

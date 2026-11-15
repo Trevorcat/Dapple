@@ -22,7 +22,7 @@
 #include "color.h"
 #include "colour_metrics.h"
 #include "dapple/developer.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #include "eval.h"
 #include "eval_common.h"

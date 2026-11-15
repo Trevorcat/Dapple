@@ -30,10 +30,10 @@
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
 #include "dapple/local_adjust.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session.h"
-#include "frame_kernels.h"
+#include "engine/nodes/point/cpu.h"
 #include "local_eval.h"
 #include "local_retouch.h"
 #ifdef DAPPLE_RETOUCH_GPU
@@ -222,7 +222,7 @@ std::vector<LocalAdjustment> retouchEdit(bool legacyToo = true) {
 }
 
 bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src, ExecMode mode, int tile, Image8& out) {
-  const Renderer r(p, cam(), nullptr);
+  const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   EngineSession::ExactOptions o;
   o.mode = mode;
   o.tile = tile;
@@ -234,7 +234,7 @@ bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src,
 }
 
 bool cpuFrame(EngineSession& es, const EditParams& p, const SourceImage& src, bool interactive, FrameResult& res) {
-  Renderer r(p, cam(), nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   FrameJob job{p, r, src, nullptr, cam(), nullptr, {}, {}, {}};
   job.request.bakeSize = 33;
   job.request.fastAnalysis = false;
@@ -1264,7 +1264,7 @@ void parityImpl(const std::vector<std::pair<int, int>>& sizes, int exportTile) {
     for (const Case& c : cases) {
       EditParams p;
       c.set(p);
-      Renderer r(p, cam(), nullptr);
+      engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
       FastOptions fo;
       fo.spatial = c.interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
       fo.noise = false;
@@ -1288,7 +1288,7 @@ void parityImpl(const std::vector<std::pair<int, int>>& sizes, int exportTile) {
     }
     EditParams p;
     p.local = retouchEdit();
-    Renderer r(p, cam(), nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
     std::vector<std::uint8_t> a, b;
     int ew = 0, eh = 0;
     for (int pass = 0; pass < 2; ++pass) {
@@ -1343,7 +1343,8 @@ void regionGpuImpl(int W, int H, int x0, int y0, int x1, int y1, int margin) {
   fo.noise = false;
   std::string e1, e2;
   int gw = 0, gh = 0, rw = 0, rh = 0;
-  Renderer r1(p, cam(), nullptr), r2(p, cam(), nullptr);
+  engine::point::Params r1 = engine::point::resolve(p, cam(), nullptr);
+  engine::point::Params r2 = engine::point::resolve(p, cam(), nullptr);
   std::uint8_t* a = whole.render(p, r1, src, fo, 33, gw, gh, nullptr, e1);
   std::uint8_t* b = win.render(p, r2, ws, fo, 33, rw, rh, nullptr, e2);
   if (!a || !b || rw != x1 - x0 || rh != y1 - y0) {
@@ -1406,7 +1407,7 @@ void testBench() {
     o.set(p);
     double gi = -1, gf = -1, ci = -1, cf = -1;
 #ifdef DAPPLE_RETOUCH_GPU
-    Renderer rd(p, cam(), nullptr);
+    engine::point::Params rd = engine::point::resolve(p, cam(), nullptr);
     for (int mode = 0; mode < 2; ++mode) {
       const SourceImage& s = mode ? big : small;
       FastOptions fo;

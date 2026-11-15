@@ -339,7 +339,7 @@ std::vector<GScenario> graphScenarios() {
   return v;
 }
 
-// FramePlan for a scenario (what the renderer resolves: spatial after quality / region, geometry, vignette)
+// The point blocks of a scenario (what the renderer resolves: spatial after quality / region, geometry, vignette)
 FastOptions optsFor(const ParamSet& ps) {
   const FrameRequest& f = ps.frame();
   FastOptions fo;
@@ -351,13 +351,13 @@ FastOptions optsFor(const ParamSet& ps) {
   }
   return fo;
 }
-FramePlan planFor(const ParamSet& ps) {
-  Renderer r(ps.edit(), camA(), nullptr);
-  return r.framePlan(ps.ctx().srcW, ps.ctx().srcH, ps.ctx().sceneReferred, optsFor(ps));
+point::Blocks planFor(const ParamSet& ps) {
+  engine::point::Params r = engine::point::resolve(ps.edit(), camA(), nullptr);
+  return engine::point::resolveFrame(r, ps.ctx().srcW, ps.ctx().srcH, ps.ctx().sceneReferred, optsFor(ps));
 }
 // the resolved blocks of the migrated node families for the same frame
-FrameBlocks blocksFor(const ParamSet& ps, const FramePlan& plan) {
-  return resolveFrameBlocks(ps.edit(), frameFacts(plan, optsFor(ps), ps.ctx().sceneReferred), {nullptr, plan.warp.field.get()});
+FrameBlocks blocksFor(const ParamSet& ps, const point::Blocks& plan) {
+  return resolveFrameBlocks(ps.edit(), point::facts(plan, optsFor(ps), ps.ctx().sceneReferred), {nullptr, plan.warp.field.get()});
 }
 
 std::string snapshotText(bool haveFilm) {
@@ -365,7 +365,7 @@ std::string snapshotText(bool haveFilm) {
   for (GScenario& s : graphScenarios()) {
     if (s.film && !haveFilm) continue;
     const ParamSet ps = ParamSet::make(s.in);
-    const FramePlan plan = planFor(ps);
+    const point::Blocks plan = planFor(ps);
     const FrameBlocks fb = blocksFor(ps, plan);
     for (GraphDetail d : {GraphDetail::Tables, GraphDetail::Full}) {
       Graph g = GraphBuilder::build(ps, d, &plan, &fb);
@@ -459,7 +459,7 @@ void testKeys() {
   long checked = 0, declaredChecked = 0;
   for (GScenario& s : graphScenarios()) {
     const ParamSet base = ParamSet::make(s.in);
-    const FramePlan plan = planFor(base);
+    const point::Blocks plan = planFor(base);
     const FrameBlocks fb = blocksFor(base, plan);
     for (GraphDetail d : {GraphDetail::Tables, GraphDetail::Full}) {
       Graph g0 = GraphBuilder::build(base, d, &plan, &fb);
@@ -511,7 +511,7 @@ std::vector<float> flat(const ToneAnalysis& a) {
   for (char c : a.key + "|" + a.range + "|" + a.nearest) v.push_back(float(c));
   return v;
 }
-std::vector<float> flat(const Renderer::TonePre& p) {
+std::vector<float> flat(const engine::point::TonePre& p) {
   std::vector<float> v = flat(p.analysis);
   v.push_back(p.has ? 1.f : 0.f);
   v.push_back(float(p.toneMove.size()));
@@ -550,14 +550,14 @@ TableRun runTables(const ParamInputs& in0, const NodeRegistry& reg, const Source
   SourceImage proxy;
   proxy.sceneReferred = src.sceneReferred;
   proxy.linear = resizeToLongEdge(src.linear, 256);
-  Renderer r(ps.edit(), cam, lut);
-  r.setToneReach(ps.ctx().toneReach);
-  if (ps.ctx().hasProxy) r.setToneProxy(&proxy);
+  engine::point::Params r = engine::point::resolve(ps.edit(), cam, lut);
+  r.toneReach = ps.ctx().toneReach;
+  if (ps.ctx().hasProxy) engine::point::setToneProxy(r, &proxy);
   const TableEnv env{r, src};
   TableRun out;
   auto lattice = evalColourLattice(env, n);
   out.nodes[NodeType::ColourLattice] = {tk.lattice, *lattice};
-  Renderer::TonePre pre;
+  engine::point::TonePre pre;
   const bool move = ps.edit().toneStrength > 0.f;
   if (tk.hasPre) {
     std::vector<float> lat = *lattice;
@@ -928,13 +928,13 @@ void testOverhead() {
   const double fullUs = measure(GraphDetail::Full);
   // the old keys
   SourceImage proxy = makeScene(64, 43, true);
-  Renderer r(e, camA(), nullptr);
-  r.setToneProxy(&proxy);
+  engine::point::Params r = engine::point::resolve(e, camA(), nullptr);
+  engine::point::setToneProxy(r, &proxy);
   double oldUs = 1e9;
   for (int round = 0; round < 7; ++round) {
     const int N = 4000;
     const auto t0 = Clock::now();
-    for (int i = 0; i < N; ++i) sink = sink + r.pointKey().size() + r.colourKey().size();
+    for (int i = 0; i < N; ++i) sink = sink + engine::point::pointKey(r).size() + engine::point::colourKey(r).size();
     oldUs = std::min(oldUs, msSince(t0) * 1000.0 / N);
   }
   // stage costs

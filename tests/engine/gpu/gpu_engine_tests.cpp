@@ -17,7 +17,7 @@
 
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
 #include "engine/exec/gpu_runtime.h"
@@ -361,7 +361,7 @@ int testSelect() {
   EditParams p;
   p.exposure = 0.3f;
   p.nrLuma = 20;
-  Renderer r(p, cams.resolve("", ""), nullptr);
+  engine::point::Params r = engine::point::resolve(p, cams.resolve("", ""), nullptr);
   FastOptions fo;
   fo.spatial = SpatialQuality::Full;
   engine::MemorySourceStore store(src);
@@ -441,7 +441,7 @@ int testExternal() {
   p.clarity = 25;
   p.sharpen = 50;
   p.grain = 20;
-  Renderer r(p, cams.resolve("", ""), nullptr);
+  engine::point::Params r = engine::point::resolve(p, cams.resolve("", ""), nullptr);
   FastOptions fo;
   fo.spatial = SpatialQuality::Full;
   gpu::Rig rig(ctx, src, cams.resolve("", ""));
@@ -596,7 +596,7 @@ int probeChild(const std::string& dir) {
   engine::EngineSession es;
   std::string firstExec, firstWhy;
   {
-    Renderer r(p, cams.resolve("", ""), nullptr);
+    engine::point::Params r = engine::point::resolve(p, cams.resolve("", ""), nullptr);
     engine::FrameJob job{p, r, src, nullptr, cams.resolve("", ""), nullptr, {}, {}, {}};
     job.request.bakeSize = 33;
     job.store = &store;
@@ -614,7 +614,7 @@ int probeChild(const std::string& dir) {
   }
   std::string lastExec;
   {
-    Renderer r(p, cams.resolve("", ""), nullptr);
+    engine::point::Params r = engine::point::resolve(p, cams.resolve("", ""), nullptr);
     engine::FrameJob job{p, r, src, nullptr, cams.resolve("", ""), nullptr, {}, {}, {}};
     job.request.bakeSize = 33;
     job.store = &store;

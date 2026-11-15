@@ -5,7 +5,7 @@
 #include <stdexcept>
 
 #include "color.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 
 namespace dapple {
@@ -143,8 +143,8 @@ void applyFilmHistogram(ToneAnalysis& a, const SourceImage& source, const Camera
   EditParams p = look;
   p.toneStrength = 0.f;
   p.toneTarget.clear();
-  const Renderer r(p, camera, nullptr);
-  if (!r.filmActive()) return;
+  const engine::point::Params r = engine::point::resolve(p, camera, nullptr);
+  if (!engine::point::filmActive(r.p)) return;
   SourceImage proxy;
   proxy.sceneReferred = source.sceneReferred;
   proxy.linear = resizeToLongEdge(source.linear, kProxyEdge);

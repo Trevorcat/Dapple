@@ -26,7 +26,6 @@ add_library(dapple_core STATIC
   src/merge_io.cpp
   src/motion_photo.cpp
   src/pano.cpp
-  src/point_kernels.cpp
   src/sequence.cpp
   src/spatial.cpp
   src/hdr_field.cpp
@@ -65,6 +64,10 @@ add_library(dapple_core STATIC
   engine/plan/planner.cpp
   engine/nodes/main/cpu_nodes.cpp
   engine/nodes/frame_blocks.cpp
+  engine/nodes/point/resolve.cpp
+  engine/nodes/point/bake.cpp
+  engine/nodes/point/cpu.cpp
+  engine/nodes/film/film_glue.cpp
   engine/nodes/vignette/vignette.cpp
   engine/nodes/nr/nr.cpp
   engine/nodes/grain/grain.cpp

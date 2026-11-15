@@ -12,7 +12,7 @@
 #include "dapple/camera.h"
 #include "dapple/edit_params.h"
 #include "dapple/lut.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
 
@@ -53,8 +53,8 @@ struct Rig {
     es.useGpuExecutor(ex.get(), true);  // forced: a plan the GPU cannot run is an error here, not a CPU fallback
   }
 
-  // malloc()ed RGBA8 (alpha 255) like Renderer::renderBakedRgba, or null (err set)
-  std::uint8_t* render(const EditParams& p, Renderer& r, const SourceImage& cpuSrc, const FastOptions& fo, int latticeN, int& w, int& h,
+  // malloc()ed RGBA8 (alpha 255) like the CPU executor's 8-bit frames, or null (err set)
+  std::uint8_t* render(const EditParams& p, engine::point::Params& r, const SourceImage& cpuSrc, const FastOptions& fo, int latticeN, int& w, int& h,
                        engine::GpuStats* st, std::string& err, int srcLongEdge = 0, float resizeSharpen = 0.f, const Lut3D* lut = nullptr) {
     engine::FrameJob job{p, r, cpuSrc, nullptr, cam, lut, {}, {}, {}};
     job.request.bakeSize = latticeN;
@@ -73,7 +73,7 @@ struct Rig {
   }
 
   // Zero readback: the frame is copied into an externally owned image (hal::ExternalImage). True = the GPU did it.
-  bool renderTo(const hal::ExternalImage& ext, const EditParams& p, Renderer& r, const SourceImage& cpuSrc, const FastOptions& fo, int latticeN, int& w, int& h,
+  bool renderTo(const hal::ExternalImage& ext, const EditParams& p, engine::point::Params& r, const SourceImage& cpuSrc, const FastOptions& fo, int latticeN, int& w, int& h,
                 std::string& err) {
     engine::FrameJob job{p, r, cpuSrc, nullptr, cam, nullptr, {}, {}, {}};
     job.request.bakeSize = latticeN;
@@ -91,7 +91,7 @@ struct Rig {
   }
 
   // Tiled export of the baked pipeline (lattice 65, Lanczos + output sharpening when `outLongEdge` downscales). `onSize` allocates.
-  bool exportTiled(const EditParams& p, Renderer& r, const SourceImage& full, int outLongEdge, int latticeN, int tile, bool forceStream, float resizeSharpen,
+  bool exportTiled(const EditParams& p, engine::point::Params& r, const SourceImage& full, int outLongEdge, int latticeN, int tile, bool forceStream, float resizeSharpen,
                    std::function<void(int, int)> onSize,
                    std::function<bool(int, int, int, int, const std::uint8_t*, std::size_t)> sink, engine::GpuStats* st, std::string& err, const Lut3D* lut = nullptr) {
     engine::EngineSession::GpuExport e{p, r, full, store, cam, lut};

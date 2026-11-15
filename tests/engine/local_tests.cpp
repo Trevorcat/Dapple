@@ -29,10 +29,10 @@
 #include "dapple/edit_params.h"
 #include "dapple/film.h"
 #include "dapple/local_adjust.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session.h"
-#include "frame_kernels.h"
+#include "engine/nodes/point/cpu.h"
 #include "local_eval.h"
 #ifdef DAPPLE_LOCAL_GPU
 #include "engine/exec/gpu_executor.h"
@@ -196,7 +196,7 @@ void putEdgeRaster(const char* id, int w, int h, float edgeU, float blurPx) {
 }
 
 bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src, ExecMode mode, int tile, Image8& out, ExecStats* st = nullptr) {
-  const Renderer r(p, cam(), nullptr);
+  const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   EngineSession::ExactOptions o;
   o.mode = mode;
   o.tile = tile;
@@ -209,10 +209,10 @@ bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src,
 
 // The Full graph of an exact frame of the edit (what the executors run)
 Graph fullGraph(const EditParams& p, const SourceImage& src) {
-  const Renderer r(p, cam(), nullptr);
+  const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   FastOptions fo;
-  FrameKernels fk(r, src, nullptr, fo);
-  const FramePlan fp = fk.framePlan();
+  engine::point::CpuFrame fk(r, src, nullptr, fo);
+  const point::Blocks fp = fk.blocks();
   ParamInputs in;
   in.edit = p;
   in.frame.exact = true;
@@ -224,7 +224,7 @@ Graph fullGraph(const EditParams& p, const SourceImage& src) {
 }
 
 bool cpuFrame(EngineSession& es, const EditParams& p, const SourceImage& src, bool interactive, FrameResult& res) {
-  Renderer r(p, cam(), nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   FrameJob job{p, r, src, nullptr, cam(), nullptr, {}, {}, {}};
   job.request.bakeSize = 33;
   job.request.fastAnalysis = false;
@@ -649,9 +649,9 @@ void coordsImpl(int iw, int ih) {
     a.mask.push_back(m);
     a.ops.v[kLoExposure] = 1.f;
     p.local = {a};
-    const Renderer r(p, cam(), nullptr);
+    const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
     FastOptions fo;
-    FrameKernels fk(r, src, nullptr, fo);
+    engine::point::CpuFrame fk(r, src, nullptr, fo);
     auto f = local::bind(p.local, src, false, true);
     CHECK(f != nullptr);
     if (!f) continue;
@@ -883,7 +883,7 @@ void parityImpl(const std::vector<std::pair<int, int>>& sizes, int exportTile) {
     for (const Case& c : cases) {
       EditParams p;
       c.set(p);
-      Renderer r(p, cam(), nullptr);
+      engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
       FastOptions fo;
       fo.spatial = c.interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
       fo.noise = false;
@@ -908,7 +908,7 @@ void parityImpl(const std::vector<std::pair<int, int>>& sizes, int exportTile) {
     // a tiled GPU export against the same export in one tile
     EditParams p;
     p.local = richEdit();
-    Renderer r(p, cam(), nullptr);
+    engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
     std::vector<std::uint8_t> a, b;
     int ew = 0, eh = 0;
     for (int pass = 0; pass < 2; ++pass) {
@@ -1123,7 +1123,8 @@ void regionGpuImpl(int W, int H, int wx0, int wy0, int wx1, int wy1, int margin)
     fo.noise = false;
     std::string err1, err2;
     int gw = 0, gh = 0, rw = 0, rh = 0;
-    Renderer r1(p, cam(), nullptr), r2(p, cam(), nullptr);
+    engine::point::Params r1 = engine::point::resolve(p, cam(), nullptr);
+    engine::point::Params r2 = engine::point::resolve(p, cam(), nullptr);
     std::uint8_t* a = whole.render(p, r1, src, fo, 33, gw, gh, nullptr, err1);
     std::uint8_t* b = win.render(p, r2, ws, fo, 33, rw, rh, nullptr, err2);
     FrameResult res;
@@ -1269,7 +1270,7 @@ void testBench() {
       r.n = n;
       r.gi[0] = r.gi[1] = r.gf[0] = r.gf[1] = -1;
 #ifdef DAPPLE_LOCAL_GPU
-      Renderer rd(p, cam(), nullptr);
+      engine::point::Params rd = engine::point::resolve(p, cam(), nullptr);
       for (int mode = 0; mode < 2; ++mode) {
         const SourceImage& s = mode ? big : small;
         FastOptions fo;

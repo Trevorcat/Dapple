@@ -27,7 +27,7 @@
 #include "dapple/decoder.h"
 #include "dapple/edit_params.h"
 #include "dapple/modern.h"
-#include "dapple/renderer.h"
+#include "engine/nodes/point/point.h"
 #include "engine/exec/engine_session.h"
 #ifdef DAPPLE_MODERN_GPU
 #include "engine/exec/gpu_executor.h"
@@ -222,7 +222,7 @@ EditParams withBase(const char* id, float strength = 100.f) {
 }
 
 bool exactRender(EngineSession& es, const EditParams& p, const SourceImage& src, ExecMode mode, int tile, Image8& out, ExecStats* st = nullptr) {
-  const Renderer r(p, cam(), nullptr);
+  const engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   EngineSession::ExactOptions o;
   o.mode = mode;
   o.tile = tile;
@@ -288,8 +288,8 @@ void testIdentity() {
     std::printf("  %-13s strength 0 identical: %s, strength 100 differs: %s\n", id, got.data == ref.data ? "yes" : "NO", full.data != ref.data ? "yes" : "NO");
   }
   // a modern id is no film stock: the film code path stays off
-  Renderer r(withBase("modern_vivid"), cam(), nullptr);
-  CHECK(!r.filmActive());
+  engine::point::Params r = engine::point::resolve(withBase("modern_vivid"), cam(), nullptr);
+  CHECK(!engine::point::filmActive(r.p));
 }
 
 void testJson() {
@@ -365,7 +365,7 @@ void testFog() {
   }
 }
 
-// the 1D tone table of a bake: ratio over log2(Y) (renderer.cpp: octaves -24 .. +6, 256 buckets per octave)
+// the 1D tone table of a bake: ratio over log2(Y) (engine/nodes/point/kernels.h: octaves -24 .. +6, 256 buckets per octave)
 float tableRatio(const std::vector<float>& tone, float Y) {
   constexpr int kBase = (127 - 24) << 8, kN = ((6 + 24) << 8) + 2;
   std::uint32_t bits;
@@ -387,13 +387,13 @@ void testMidGrey() {
   std::printf("  standard 18 %% patch: %.4f\n", v0);
   // the tone model itself: the 1D table at 18 % (post-gain) against the standard table, every rendering and strength, with user edits
   {
-    const Renderer rs(EditParams{}, cam(), nullptr);
-    const auto ls = rs.bake(src, 17);
+    const engine::point::Params rs = engine::point::resolve(EditParams{}, cam(), nullptr);
+    const auto ls = engine::point::bake(rs, src, 17);
     const float std18 = 0.18f * tableRatio(ls->tone, 0.18f);
     for (const char* id : kIds)
       for (float s : {10.f, 50.f, 100.f}) {
-        const Renderer rm(withBase(id, s), cam(), nullptr);
-        const auto lm = rm.bake(src, 17);
+        const engine::point::Params rm = engine::point::resolve(withBase(id, s), cam(), nullptr);
+        const auto lm = engine::point::bake(rm, src, 17);
         const float m18 = 0.18f * tableRatio(lm->tone, 0.18f);
         CHECK(std::fabs(m18 - std18) <= 2e-4f);
         if (s == 100.f) std::printf("  tone table at 0.18: standard %.5f, %s %.5f\n", std18, id, m18);
@@ -402,8 +402,8 @@ void testMidGrey() {
     e.contrast = 30.f;
     EditParams e0;
     e0.contrast = 30.f;
-    const float a18 = 0.18f * tableRatio(Renderer(e, cam(), nullptr).bake(src, 17)->tone, 0.18f);
-    const float b18 = 0.18f * tableRatio(Renderer(e0, cam(), nullptr).bake(src, 17)->tone, 0.18f);
+    const float a18 = 0.18f * tableRatio(engine::point::bake(engine::point::resolve(e, cam(), nullptr), src, 17)->tone, 0.18f);
+    const float b18 = 0.18f * tableRatio(engine::point::bake(engine::point::resolve(e0, cam(), nullptr), src, 17)->tone, 0.18f);
     CHECK(std::fabs(a18 - b18) <= 2e-4f);
   }
   // end to end on a ten-stop scene (the single-image HDR and the local contrast of the family also act here: informational, bound 0.015)
@@ -670,7 +670,7 @@ void parityImpl(const std::vector<std::pair<int, int>>& sizes) {
     for (const Case& c : cases) {
       EditParams p;
       c.set(p);
-      Renderer r(p, cam(), nullptr);
+      engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
       FastOptions fo;
       fo.spatial = c.interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
       fo.noise = false;
@@ -705,7 +705,7 @@ void testParitySmall() { parityImpl({{320, 224}}); }
 
 double medianGpuMs(dapple::gpu::Rig& rig, const EditParams& p, const SourceImage& src, const FastOptions& fo, int& w, int& h) {
   std::vector<double> v;
-  Renderer r(p, cam(), nullptr);
+  engine::point::Params r = engine::point::resolve(p, cam(), nullptr);
   for (int i = 0; i < 9; ++i) {
     std::string err;
     engine::GpuStats st;
