@@ -14,6 +14,7 @@
 #include "engine/exec/result_cache.h"
 #include "engine/graph/graph.h"
 #include "engine/graph/node.h"
+#include "engine/nodes/frame_blocks.h"
 #include "engine/plan/plan.h"
 #include "frame_kernels.h"
 #include "local_eval.h"
@@ -49,6 +50,7 @@ struct CpuTile {
 // What a node binds its resolved block to for one frame (nodes/main/cpu_nodes.cpp).
 struct FrameEnv {
   const FrameKernels* fk = nullptr;
+  const FrameBlocks* blocks = nullptr;  // the resolved blocks of the families that resolve their own parameters (copied into the slot)
   const ImageF* film = nullptr;   // FilmSim output plane (whole frame), null when there is no film branch
   bool blendFollows = false;      // DisplayStages feeds a Blend (else it replaces the pixel value)
   const local::AuxTarget* aux = nullptr;  // LocalLinear: where the stage-W amounts of the work window go (null: none)

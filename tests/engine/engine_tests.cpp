@@ -340,9 +340,8 @@ std::vector<GScenario> graphScenarios() {
 }
 
 // FramePlan for a scenario (what the renderer resolves: spatial after quality / region, geometry, vignette)
-FramePlan planFor(const ParamSet& ps) {
+FastOptions optsFor(const ParamSet& ps) {
   const FrameRequest& f = ps.frame();
-  Renderer r(ps.edit(), camA(), nullptr);
   FastOptions fo;
   fo.spatial = f.interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
   fo.noise = f.noise;
@@ -350,7 +349,15 @@ FramePlan planFor(const ParamSet& ps) {
     fo.region.x0 = f.region[0]; fo.region.y0 = f.region[1]; fo.region.x1 = f.region[2]; fo.region.y1 = f.region[3];
     fo.region.outLongEdge = f.regionLongEdge;
   }
-  return r.framePlan(ps.ctx().srcW, ps.ctx().srcH, ps.ctx().sceneReferred, fo);
+  return fo;
+}
+FramePlan planFor(const ParamSet& ps) {
+  Renderer r(ps.edit(), camA(), nullptr);
+  return r.framePlan(ps.ctx().srcW, ps.ctx().srcH, ps.ctx().sceneReferred, optsFor(ps));
+}
+// the resolved blocks of the migrated node families for the same frame
+FrameBlocks blocksFor(const ParamSet& ps, const FramePlan& plan) {
+  return resolveFrameBlocks(ps.edit(), frameFacts(plan, optsFor(ps), ps.ctx().sceneReferred));
 }
 
 std::string snapshotText(bool haveFilm) {
@@ -359,8 +366,9 @@ std::string snapshotText(bool haveFilm) {
     if (s.film && !haveFilm) continue;
     const ParamSet ps = ParamSet::make(s.in);
     const FramePlan plan = planFor(ps);
+    const FrameBlocks fb = blocksFor(ps, plan);
     for (GraphDetail d : {GraphDetail::Tables, GraphDetail::Full}) {
-      Graph g = GraphBuilder::build(ps, d, &plan);
+      Graph g = GraphBuilder::build(ps, d, &plan, &fb);
       const auto v = g.validate();
       if (!v.ok) {
         std::printf("  scenario %s (%s) invalid: %s\n", s.name.c_str(), d == GraphDetail::Full ? "full" : "tables", v.error.c_str());
@@ -452,15 +460,16 @@ void testKeys() {
   for (GScenario& s : graphScenarios()) {
     const ParamSet base = ParamSet::make(s.in);
     const FramePlan plan = planFor(base);
+    const FrameBlocks fb = blocksFor(base, plan);
     for (GraphDetail d : {GraphDetail::Tables, GraphDetail::Full}) {
-      Graph g0 = GraphBuilder::build(base, d, &plan);
+      Graph g0 = GraphBuilder::build(base, d, &plan, &fb);
       g0.computeKeys(base);
       for (std::size_t k = 0; k < P.size(); ++k)
         for (int variant = 0; variant < 2; ++variant) {
           ParamInputs in2 = s.in;
           if (!P.perturb(ParamKey(k), in2, variant)) continue;
           const ParamSet ps2 = ParamSet::make(in2);
-          Graph g1 = GraphBuilder::build(ps2, d, &plan);
+          Graph g1 = GraphBuilder::build(ps2, d, &plan, &fb);
           g1.computeKeys(ps2);
           if (ps2.hash(ParamKey(k)) == base.hash(ParamKey(k))) continue;  // value did not actually change
           ParamMask moved;  // the key itself and every derived key that moved with it (film flags, quality)

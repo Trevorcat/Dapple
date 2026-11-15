@@ -1,6 +1,7 @@
 // CpuImpl of the main-pipeline nodes (docs/engine/pipeline-architecture.md 4.5). Every function wraps an existing kernel:
-// the point nodes are block fragments of FrameKernels (the per-pixel loop of renderer.cpp), the window nodes call the stage
-// functions of spatial.cpp. Nothing is re-implemented here.
+// the point nodes are block fragments of FrameKernels (the per-pixel loop of renderer.cpp). The families that resolve their own
+// parameters (Vignette, NR, Dehaze, Detail, Grain: core/engine/nodes/<family>, docs section 50) bring their CpuImpl; this table
+// lists them and bindResolved copies their block from FrameEnv::blocks. Nothing is re-implemented here.
 //
 // Block fragment contract (CpuImpl::block): `px` = n pixels of interleaved float RGB (3 floats, not float4), n <= 256,
 // processed in place; `pos` = frame coordinates of the first pixel. The head of a chain (Resize/Geometry/DisplayStages in
@@ -28,7 +29,6 @@ struct DispRes {
 };
 struct WinRes {
   const FrameKernels* fk;
-  SpatialParams sp;
   float scale;
 };
 struct LocalRes {
@@ -56,9 +56,6 @@ void blkLocal(const void* r, float* px, int n, const PixelPos& pos) {
   const auto* l = static_cast<const LocalRes*>(r);
   if (const local::Frame* f = l->fk->localFrame()) local::linearBlock(*f, *l->fk, px, n, pos.x, pos.y, l->aux);
 }
-void blkVignette(const void* r, float* px, int n, const PixelPos& pos) {
-  static_cast<const PtRes*>(r)->fk->vignette(px, n, pos.x, pos.y);
-}
 
 thread_local float t_side[256 * 3];  // display-staged film pixels waiting for the Blend that follows in the chain
 
@@ -71,31 +68,6 @@ void blkDisplay(const void* r, float* px, int n, const PixelPos& pos) {
 void blkBlend(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->blend(px, t_side, n); }
 
 // ---- tile (window / whole-frame) nodes -------------------------------------------------------------------------------------
-Status tileNRLuma(CpuTile& t, const void* r) {
-  const auto* w = static_cast<const WinRes*>(r);
-  if (w->sp.nrLuma > 0.f) stageNRLuma(*t.img, *t.scratch, w->sp.nrLuma, w->scale);
-  return Status::Ok;
-}
-Status tileNRChroma(CpuTile& t, const void* r) {
-  const auto* w = static_cast<const WinRes*>(r);
-  if (w->sp.nrColor > 0.f) stageNRChroma(*t.img, *t.scratch, w->sp.nrColor, w->scale);
-  return Status::Ok;
-}
-Status tileDehaze(CpuTile& t, const void* r) {
-  const auto* w = static_cast<const WinRes*>(r);
-  if (w->sp.dehaze == 0.f) return Status::Ok;
-  if (w->sp.dehaze > 0.f && !t.dehaze) return Status::Internal;  // the solve must exist before the apply
-  stageDehazeApply(*t.img, *t.scratch, w->sp.dehaze, t.ox, t.oy, t.frameW, t.frameH, t.dehaze);
-  return Status::Ok;
-}
-Status tileDetail(CpuTile& t, const void* r) {
-  const auto* w = static_cast<const WinRes*>(r);
-  const SpatialParams& p = w->sp;
-  if (!(p.clarity != 0.f || p.texture != 0.f || p.sharpen > 0.f)) return Status::Ok;
-  if (p.clarity != 0.f && !t.guided) return Status::Internal;
-  stageDetail(*t.img, *t.scratch, p, w->scale, t.guided, t.ox, t.oy, t.frameW, t.frameH);
-  return Status::Ok;
-}
 Status tileLocalDetail(CpuTile& t, const void* r) {
   const auto* w = static_cast<const WinRes*>(r);
   const local::Frame* f = w->fk->localFrame();
@@ -103,11 +75,6 @@ Status tileLocalDetail(CpuTile& t, const void* r) {
   if (!t.aux || !t.aux->data || t.aux->ox != t.ox || t.aux->oy != t.oy || t.aux->w != t.img->width || t.aux->h != t.img->height)
     return Status::Internal;  // the amounts must come from the head chain of this very window
   local::detailWindow(*f, *t.img, *t.aux, t.frameW, t.frameH, w->scale, w->fk);
-  return Status::Ok;
-}
-Status tileGrain(CpuTile& t, const void* r) {
-  const auto* w = static_cast<const WinRes*>(r);
-  if (w->sp.grain > 0.f) stageGrain(*t.img, w->sp.grain, w->scale, t.ox, t.oy);
   return Status::Ok;
 }
 Status tileFilmSim(CpuTile& t, const void* r) {
@@ -205,16 +172,11 @@ const CpuImpl kFusedHead{nullptr, blkFusedHead, nullptr, nullptr};
 const CpuImpl kGain{nullptr, blkGain, nullptr, nullptr};
 const CpuImpl kHdr{nullptr, blkHdr, nullptr, nullptr};
 const CpuImpl kToneColour{nullptr, blkToneColour, nullptr, nullptr};
-const CpuImpl kVignette{nullptr, blkVignette, nullptr, nullptr};
 const CpuImpl kLocalLinear{nullptr, blkLocal, nullptr, nullptr};
 const CpuImpl kLocalDetail{nullptr, nullptr, tileLocalDetail, nullptr};
 const CpuImpl kDisplay{nullptr, blkDisplay, nullptr, nullptr};
 const CpuImpl kBlend{nullptr, blkBlend, nullptr, nullptr};
-const CpuImpl kNRLuma{nullptr, nullptr, tileNRLuma, nullptr};
-const CpuImpl kNRChroma{nullptr, nullptr, tileNRChroma, nullptr};
-const CpuImpl kDehaze{nullptr, nullptr, tileDehaze, nullptr};
-const CpuImpl kDetail{nullptr, nullptr, tileDetail, nullptr};
-const CpuImpl kGrain{nullptr, nullptr, tileGrain, nullptr};
+
 const CpuImpl kFilm{nullptr, nullptr, tileFilmSim, nullptr};
 const CpuImpl kPack8{nullptr, nullptr, tilePack8, nullptr};
 
@@ -231,16 +193,16 @@ const CpuImpl* cpuImpl(NodeType t) {
     case NodeType::Hdr: return &kHdr;
     case NodeType::ToneColour:
     case NodeType::ToneColourExact: return &kToneColour;
-    case NodeType::Vignette: return &kVignette;
+    case NodeType::Vignette: return &vignette::cpu();
     case NodeType::LocalLinear: return &kLocalLinear;
     case NodeType::LocalDetail: return &kLocalDetail;
     case NodeType::DisplayStages: return &kDisplay;
     case NodeType::Blend: return &kBlend;
-    case NodeType::NRLuma: return &kNRLuma;
-    case NodeType::NRChroma: return &kNRChroma;
-    case NodeType::Dehaze: return &kDehaze;
-    case NodeType::Detail: return &kDetail;
-    case NodeType::Grain: return &kGrain;
+    case NodeType::NRLuma: return &nr::lumaCpu();
+    case NodeType::NRChroma: return &nr::chromaCpu();
+    case NodeType::Dehaze: return &dehaze::cpu();
+    case NodeType::Detail: return &detail::cpu();
+    case NodeType::Grain: return &grain::cpu();
     case NodeType::FilmSim: return &kFilm;
     case NodeType::Pack8: return &kPack8;
     case NodeType::ColourLattice: return &kLattice;
@@ -258,14 +220,33 @@ bool bindResolved(NodeType t, const FrameEnv& env, Resolved& out) {
       new (out.bytes) DispRes{env.fk, env.film, !env.blendFollows, env.filmRow0};
       return true;
     case NodeType::NRLuma:
+      if (!env.blocks) return false;
+      new (out.bytes) nr::LumaBlock(env.blocks->nrLuma);
+      return true;
     case NodeType::NRChroma:
-    case NodeType::Dehaze:
-    case NodeType::Detail:
-    case NodeType::LocalDetail:
+      if (!env.blocks) return false;
+      new (out.bytes) nr::ChromaBlock(env.blocks->nrChroma);
+      return true;
     case NodeType::Grain:
-      new (out.bytes) WinRes{env.fk, env.fk->spatial(), env.fk->spatialScale()};  // read after the film outcome is known
+      if (!env.blocks) return false;
+      new (out.bytes) grain::Block(env.blocks->grain);
+      return true;
+    case NodeType::Dehaze:
+      if (!env.blocks) return false;
+      new (out.bytes) dehaze::Block(env.blocks->dehaze);
+      return true;
+    case NodeType::Detail:
+      if (!env.blocks) return false;
+      new (out.bytes) detail::Block(env.blocks->detail);
+      return true;
+    case NodeType::LocalDetail:
+      new (out.bytes) WinRes{env.fk, env.fk->spatialScale()};  // read after the film outcome is known
       return true;
     case NodeType::Pack8: return true;
+    case NodeType::Vignette:
+      if (!env.blocks) return false;
+      new (out.bytes) vignette::Block(env.blocks->vignette);
+      return true;
     case NodeType::LocalLinear:
       new (out.bytes) LocalRes{env.fk, env.aux};
       return true;

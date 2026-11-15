@@ -1,5 +1,6 @@
 // GPU implementation of Dehaze: dark channel + airlight analysis on a 1/4 grid (min filter, box, four reduction passes) and
-// the apply pass. Shaders: sepconv.comp (min / box), reduce.comp, dehaze_apply.comp. Mirrors dehazeImage (core/src/spatial.cpp).
+// the apply pass. Shaders: sepconv.comp (min / box), reduce.comp, dehaze_apply.comp. Radii and strengths come from the Dehaze block
+// (dehaze.h), the numbers of the CPU stages (core/src/spatial.cpp).
 #include "engine/nodes/gpu_common.h"
 
 namespace dapple::engine::gpu {
@@ -14,8 +15,8 @@ struct DehU {
 };
 }  // namespace
 
-H recordDehazeAnalysis(GpuRecorder& r, const SpatialRadii& R, H col, int lw, int lh) {
-  const int rm = R.dehazeMin, rb = R.dehazeBox;
+H recordDehazeAnalysis(GpuRecorder& r, const dehaze::Block& b, H col, int lw, int lh) {
+  const int rm = b.minRadius, rb = b.boxRadius;
   H t = r.sep(1, col, lw, lh, 0, 2, {rm, rm, rm, rm}, kR32);
   if (t < 0) return -1;
   t = r.sep(3, t, lw, lh, 1, 2, {rm, rm, rm, rm}, kR32);
@@ -38,9 +39,9 @@ H recordDehazeAnalysis(GpuRecorder& r, const SpatialRadii& R, H col, int lw, int
 }
 
 bool recordDehazeApply(GpuRecorder& r, const DehazeNode& n, H D) {
-  const FramePlan& P = *n.plan;
+  const dehaze::Block& b = *n.b;
   const H gH = r.g.externalBuf(r.gBuf);
-  const hal::PipelineH p = r.pl("dehaze_apply", {{0, P.dehaze > 0 ? 0 : 1}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}});
+  const hal::PipelineH p = r.pl("dehaze_apply", {{0, b.solve() ? 0 : 1}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}});
   if (!p) return false;
   DehU u{};
   u.dims[0] = n.W;
@@ -50,9 +51,9 @@ bool recordDehazeApply(GpuRecorder& r, const DehazeNode& n, H D) {
   u.low[0] = n.gridW;
   u.low[1] = n.gridH;
   u.low[2] = 4;
-  u.dh[0] = 0.7f * P.dehaze;
-  u.dh[1] = 0.5f * -P.dehaze;
-  u.dh[2] = 0.88f;
+  u.dh[0] = b.omega;
+  u.dh[1] = b.veil;
+  u.dh[2] = b.veilAir;
   u.grain[0] = n.ep.amp;
   u.grain[1] = n.ep.period;
   r.g.dispatch("dehaze_apply", p,

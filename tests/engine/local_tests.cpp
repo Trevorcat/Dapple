@@ -219,7 +219,8 @@ Graph fullGraph(const EditParams& p, const SourceImage& src) {
   in.ctx.srcW = src.linear.width;
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
-  return GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);
+  const FrameBlocks fb = resolveFrameBlocks(fk.params(), fk.frameFacts());
+  return GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
 }
 
 bool cpuFrame(EngineSession& es, const EditParams& p, const SourceImage& src, bool interactive, FrameResult& res) {

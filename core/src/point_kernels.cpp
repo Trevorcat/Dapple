@@ -24,6 +24,8 @@
 #include "parallel.h"
 #include "engine/exec/engine_session.h"
 #include "engine/nodes/film/film_nodes.h"
+#include "engine/nodes/frame_blocks.h"
+#include "engine/nodes/vignette/vignette_kernel.h"
 #include "frame_kernels.h"
 #include "local_eval.h"
 #include "warp_field.h"
@@ -522,46 +524,7 @@ Grade makeGrade(const ToneZoneGrade& g) {
 }
 
 // Neighbourhood operations. For display-referred sources (camera JPEG: already sharpened and
-// denoised in camera) the defaults sharpen 40 / nrColor 25 are the no-op level.
-SpatialParams makeSpatial(const EditParams& p, bool scene, const StyleMix& style) {
-  SpatialParams sp;
-  sp.sharpen = std::max(0.f, p.sharpen - (scene ? 0.f : 40.f)) / 100.f;
-  sp.sharpRadius = p.sharpRadius / 10.f;
-  sp.nrColor = std::max(0.f, p.nrColor - (scene ? 0.f : 25.f)) / 100.f;
-  sp.nrLuma = p.nrLuma / 100.f;
-  sp.clarity = p.clarity / 100.f;
-  sp.texture = p.texture / 100.f;
-  if (const ModernKind mk = modernKind(p.filmStock); mk != ModernKind::None) {  // local contrast of the modern rendering (section 37)
-    const ModernRecipe& r = modernRecipe(mk);
-    const float k = std::clamp(p.filmStrength / 100.f, 0.f, 1.f);
-    sp.clarity = std::clamp((p.clarity + r.clarity * k) / 100.f, -1.f, 1.f);
-    sp.texture = std::clamp((p.texture + r.texture * k) / 100.f, -1.f, 1.f);
-  }
-  sp.dehaze = p.dehaze / 100.f;
-  sp.grain = std::min(100.f, p.grain + style.grain) / 100.f;
-  return sp;
-}
-
-// `p3`: e3 holds Display P3 encoded values (export colour space). The vignette is authored on sRGB-encoded values, so it runs there (P3 -> sRGB
-// primaries, extended transfer curve, the formula, back): a colour inside sRGB gets the sRGB path's value. GPU twin: point.comp (u.geoC.w).
-inline void applyVignette(float e3[3], float dx, float dy, float vig, bool p3 = false) {
-  const float f = smoothstep(0.35f, 1.05f, std::sqrt((dx * dx + dy * dy) * 0.5f));
-  if (!p3) {
-    for (int c = 0; c < 3; ++c) e3[c] = vig < 0 ? e3[c] * (1.f + vig * 0.6f * f) : e3[c] + (1.f - e3[c]) * vig * 0.6f * f;
-    return;
-  }
-  const float q[3] = {srgbDecode(e3[0]), srgbDecode(e3[1]), srgbDecode(e3[2])};
-  float s[3];
-  p3ToSrgb().apply(q, s);
-  for (int c = 0; c < 3; ++c) {
-    const float e = srgbEncodeExt(s[c]);
-    s[c] = srgbDecodeExt(vig < 0 ? e * (1.f + vig * 0.6f * f) : e + (1.f - e) * vig * 0.6f * f);
-  }
-  float o[3];
-  srgbToP3().apply(s, o);
-  for (int c = 0; c < 3; ++c) e3[c] = srgbEncode(o[c]);
-}
-
+// denoised in camera) the default sharpen 40 is the no-op level. Noise reduction resolves its own block (core/engine/nodes/nr).
 }  // namespace
 
 // Everything of the per-pixel pipeline that depends on parameters only, resolved once.
@@ -1354,6 +1317,14 @@ struct FastDims {
   float fx0 = 0.f, fy0 = 0.f, fx1 = 1.f, fy1 = 1.f;
 };
 
+// the output -> picture mapping part of the FrameFacts the node families resolve from
+engine::FrameFacts mapFacts(const FastDims& d) {
+  engine::FrameFacts f;
+  f.ox0 = d.ox0, f.oy0 = d.oy0, f.stepX = d.stepX, f.stepY = d.stepY;
+  f.fullW = d.fullW, f.fullH = d.fullH;
+  return f;
+}
+
 FastDims fastDims(const Geometry& geo, const RenderRegion& R) {
   FastDims d;
   d.fullW = float(geo.outW);
@@ -1587,7 +1558,7 @@ ImageF Renderer::proxyThroughLattice(const SourceImage& source, const BakedLut& 
   out = ImageF(w, h);
   const float expo = std::exp2(p_.exposure + (source.sceneReferred ? camera_.baselineExposureEv : 0.f));
   const float gain[3] = {wbGain_[0] * expo, wbGain_[1] * expo, wbGain_[2] * expo};
-  const float vig = p_.vignette / 100.f;
+  const engine::vignette::Block vig = engine::vignette::resolve(p_, mapFacts(d));
   const bool useGeo = geo.active;
   const LutSampler sample(lut);
   // Tone-mapped colours above the lattice's range take the exact colour path; the operator is only built when such a pixel shows up.
@@ -1619,11 +1590,7 @@ ImageF Renderer::proxyThroughLattice(const SourceImage& source, const BakedLut& 
         std::call_once(opOnce, [&] { overflowOp.emplace(makePointOp(source, &lut)); });
         overflowOp->colour(tm, e3);
       }
-      if (vig != 0) {
-        const float cx = d.fullW * 0.5f, cy = d.fullH * 0.5f;
-        const float px = d.ox0 + (float(x) + 0.5f) * d.stepX - 0.5f, py = d.oy0 + (float(y) + 0.5f) * d.stepY - 0.5f;
-        applyVignette(e3, (px - cx) / cx, (py - cy) / cy, vig, p_.outputSpace == 1);
-      }
+      if (vig.active()) engine::vignette::applyAt(vig, e3, x, y, vig.p3 == 1);
       for (int c = 0; c < 3; ++c) dst[3 * x + c] = std::clamp(e3[c], 0.f, 1.f);
     }
   });
@@ -1664,27 +1631,13 @@ FramePlan Renderer::framePlan(int srcW, int srcH, bool sceneReferred, const Fast
   fp.fullH = d.fullH;
   const float expo = std::exp2(p_.exposure + (sceneReferred ? camera_.baselineExposureEv : 0.f));
   for (int c = 0; c < 3; ++c) fp.gain[c] = wbGain_[c] * expo;
-  fp.vignette = p_.vignette / 100.f;
-  fp.outputSpace = p_.outputSpace;
   EditParams pStyle = p_;
   if (filmRun.stock) pStyle.look = "std";  // a film at full strength brings its own grain (FrameKernels::Impl)
-  SpatialParams sp = makeSpatial(p_, sceneReferred, makeStyle(pStyle));
-  if (opt.spatial == SpatialQuality::Off) {
-    sp = SpatialParams{};
-  } else if (opt.spatial == SpatialQuality::Interactive) {
-    if (!opt.keepGrain) sp.grain = 0.f;  // kept while a grain slider is dragged (14 Q8)
-    if (!opt.noise) sp.nrLuma = sp.nrColor = 0.f;
-  }
-  if (region) sp.scale = std::max(float(d.w) / (d.fx1 - d.fx0), float(d.h) / (d.fy1 - d.fy0)) / 2048.f;
-  fp.nrLuma = sp.nrLuma;
-  fp.nrColor = sp.nrColor;
-  fp.dehaze = sp.dehaze;
-  fp.clarity = sp.clarity;
-  fp.texture = sp.texture;
-  fp.sharpen = sp.sharpen;
-  fp.sharpRadius = sp.sharpRadius;
-  fp.grain = sp.grain;
-  fp.spatialScale = sp.scale > 0.f ? sp.scale : float(std::max(d.w, d.h)) / 2048.f;
+  fp.lookGrain = makeStyle(pStyle).grain;
+  float spScale = 0.f;
+  if (region) spScale = std::max(float(d.w) / (d.fx1 - d.fx0), float(d.h) / (d.fy1 - d.fy0)) / 2048.f;
+
+  fp.spatialScale = spScale > 0.f ? spScale : float(std::max(d.w, d.h)) / 2048.f;
   if (filmRun.stock) {  // the film stage's arguments (FrameKernels::runFilm)
     FramePlan::Film& f = fp.film;
     f.active = true;
@@ -1784,9 +1737,9 @@ struct FrameKernels::Impl {
   FastDims d;
   bool region = false, useGeo = false, exactMap = false;
   FilmRun fr;
-  SpatialParams sp;
+  float spScale = 0.f;          // radii scale of the neighbourhood stages when not the frame's own (region / region source), 0 = own long edge / 2048
+  float lookGrain = 0.f;        // the look's grain (slider units) the Grain block adds (none when a film at full strength brings its own)
   float gain[3] = {1.f, 1.f, 1.f};
-  float vig = 0.f;
   FramePlan::Hdr hdr;           // single-image HDR (inactive: strength 0, film, display-referred source)
   HdrParams hdrP;
   std::optional<LutSampler> sample;
@@ -1815,15 +1768,8 @@ struct FrameKernels::Impl {
       d = fastDims(geo, R);
       EditParams pStyle = r.p_;
       if (fr.stock && fr.strength >= 1.f) pStyle.look = "std";  // a film at full strength brings its own grain
-      const StyleMix style = makeStyle(pStyle);
-      sp = makeSpatial(r.p_, source.sceneReferred, style);
-      if (opt.spatial == SpatialQuality::Off) {
-        sp = SpatialParams{};
-      } else if (opt.spatial == SpatialQuality::Interactive) {
-        if (!opt.keepGrain) sp.grain = 0.f;
-        if (!opt.noise) sp.nrLuma = sp.nrColor = 0.f;
-      }
-      if (region) sp.scale = std::max(float(d.w) / (d.fx1 - d.fx0), float(d.h) / (d.fy1 - d.fy0)) / 2048.f;
+      lookGrain = makeStyle(pStyle).grain;
+      if (region) spScale = std::max(float(d.w) / (d.fx1 - d.fx0), float(d.h) / (d.fy1 - d.fy0)) / 2048.f;
       const float expo = std::exp2(r.p_.exposure + (source.sceneReferred ? r.camera_.baselineExposureEv : 0.f));
       for (int c = 0; c < 3; ++c) gain[c] = r.wbGain_[c] * expo;
       sample.emplace(*lut);
@@ -1831,14 +1777,13 @@ struct FrameKernels::Impl {
     } else {
       d = fastDims(geo, RenderRegion{});
       exactOp.emplace(r.makePointOp(source, nullptr));
-      sp = opt.spatial == SpatialQuality::Off ? SpatialParams{} : makeSpatial(r.p_, source.sceneReferred, exactOp->style);
+      lookGrain = exactOp->style.grain;
     }
     if (source.parent && source.parent->fullW > 0 && source.parent->fullH > 0 && !in.empty()) {
       // a region source (docs section 44): the neighbourhood radii are fractions of the PARENT picture (like the export's), not of the window
       const float k = float(std::max(source.parent->fullW, source.parent->fullH)) / float(std::max(in.width, in.height));
-      sp.scale = (sp.scale > 0.f ? sp.scale : float(std::max(d.w, d.h)) / 2048.f) * k;
+      spScale = (spScale > 0.f ? spScale : float(std::max(d.w, d.h)) / 2048.f) * k;
     }
-    vig = r.p_.vignette / 100.f;
     if (r.p_.reshape.active()) {
       // the field lives in the photo's normalised space: a region window samples it in its parent's coordinates (docs section 44)
       const bool par = source.parent && source.parent->fullW > 0 && source.parent->fullH > 0;
@@ -1916,13 +1861,39 @@ bool FrameKernels::exactVariant() const { return impl_->exact; }
 bool FrameKernels::useGeo() const { return impl_->useGeo; }
 bool FrameKernels::filmSelected() const { return impl_->fr.stock != nullptr; }
 float FrameKernels::filmStrength() const { return impl_->fr.strength; }
-bool FrameKernels::vignetteActive() const { return impl_->vig != 0.f; }
-const SpatialParams& FrameKernels::spatial() const { return impl_->sp; }
 float FrameKernels::spatialScale() const {
-  return impl_->sp.scale > 0.f ? impl_->sp.scale : float(std::max(impl_->d.w, impl_->d.h)) / 2048.f;
+  return impl_->spScale > 0.f ? impl_->spScale : float(std::max(impl_->d.w, impl_->d.h)) / 2048.f;
 }
 bool FrameKernels::filmOk() const { return impl_->filmOkV; }
 bool FrameKernels::needNormal() const { return !impl_->filmOkV || impl_->fr.strength < 1.f; }
+
+const EditParams& FrameKernels::params() const { return impl_->r.p_; }
+
+engine::FrameFacts FrameKernels::frameFacts() const {
+  const Impl& m = *impl_;
+  engine::FrameFacts f = mapFacts(m.d);
+  f.spatialScale = spatialScale();
+  f.quality = int(m.opt.spatial);
+  f.noise = m.opt.noise;
+  f.keepGrain = m.opt.keepGrain;
+  f.lookGrain = m.lookGrain;
+  f.sceneReferred = m.source.sceneReferred;
+  return f;
+}
+
+engine::FrameFacts frameFacts(const FramePlan& fp, const FastOptions& opt, bool sceneReferred) {
+  engine::FrameFacts f;
+  f.ox0 = fp.ox0, f.oy0 = fp.oy0, f.stepX = fp.stepX, f.stepY = fp.stepY;
+  f.fullW = fp.fullW, f.fullH = fp.fullH;
+  f.spatialScale = fp.spatialScale;
+  f.quality = int(opt.spatial);
+  f.noise = opt.noise;
+  f.keepGrain = opt.keepGrain;
+  f.lookGrain = fp.lookGrain;
+  f.resizeSharpen = fp.resizeSharpen;
+  f.sceneReferred = sceneReferred;
+  return f;
+}
 
 FramePlan FrameKernels::framePlan() const {
   const Impl& m = *impl_;
@@ -1946,17 +1917,7 @@ FramePlan FrameKernels::framePlan() const {
   fp.fullW = m.d.fullW;
   fp.fullH = m.d.fullH;
   for (int c = 0; c < 3; ++c) fp.gain[c] = m.gain[c];
-  fp.vignette = m.vig;
-  fp.outputSpace = m.r.p_.outputSpace;
   fp.hdr = m.hdr;
-  fp.nrLuma = m.sp.nrLuma;
-  fp.nrColor = m.sp.nrColor;
-  fp.dehaze = m.sp.dehaze;
-  fp.clarity = m.sp.clarity;
-  fp.texture = m.sp.texture;
-  fp.sharpen = m.sp.sharpen;
-  fp.sharpRadius = m.sp.sharpRadius;
-  fp.grain = m.sp.grain;
   fp.spatialScale = spatialScale();
   fp.local = m.local;
   fp.localDetail = m.local && m.local->anyWindow;
@@ -2103,19 +2064,10 @@ void FrameKernels::blend(float* main, const float* film, int n) const {
     for (int c = 0; c < 3; ++c) main[3 * i + c] = main[3 * i + c] + s * (film[3 * i + c] - main[3 * i + c]);
 }
 
-void FrameKernels::vignette(float* px, int n, int x0, int y) const {
-  const Impl& m = *impl_;
-  const float cx = m.d.fullW * 0.5f, cy = m.d.fullH * 0.5f;
-  const float py = m.d.oy0 + (float(y) + 0.5f) * m.d.stepY - 0.5f;
-  for (int i = 0; i < n; ++i) {
-    const float pxx = m.d.ox0 + (float(x0 + i) + 0.5f) * m.d.stepX - 0.5f;
-    applyVignette(px + 3 * i, (pxx - cx) / cx, (py - cy) / cy, m.vig, m.r.p_.outputSpace == 1);
-  }
-}
-
 bool FrameKernels::streamFilm(std::uint8_t* rgba) {
   Impl& m = *impl_;
-  if (m.exact || !(m.fr.stock && m.fr.strength >= 1.f) || !rgba || m.sp.any() || m.win) return false;
+  if (m.exact || !(m.fr.stock && m.fr.strength >= 1.f) || !rgba || m.win) return false;
+  if (engine::resolveFrameBlocks(m.r.p_, frameFacts()).anyWindow()) return false;  // a neighbourhood stage of a migrated family runs
   if (m.opt.keepGrain || (m.opt.fullLongEdge > 0 && m.opt.spatial == SpatialQuality::Full)) return false;  // scale-aware / kept grain: node chain only
   const Renderer& rr = m.r;
   const int w = m.d.w, h = m.d.h;
@@ -2126,18 +2078,14 @@ bool FrameKernels::streamFilm(std::uint8_t* rgba) {
   if (!(lease && lease->setParams(makeFilmParams(rr.p_, m.fr, m.opt.spatial, m.pitch), &err))) return false;
   const bool plain = rr.master_.identity && rr.red_.identity && rr.green_.identity && rr.blue_.identity &&
                      !(rr.lut_ && rr.p_.lutAmount > 0);
+  const engine::vignette::Block vig = engine::vignette::resolve(rr.p_, mapFacts(m.d));
   auto sink = [&](int y, float* t, int W) {
     std::uint8_t* o = rgba + std::size_t(y) * W * 4;
-    if (!plain || m.vig != 0) {
+    if (!plain || vig.active()) {
       for (int x = 0; x < W; ++x) {
         float e3[3] = {t[3 * x], t[3 * x + 1], t[3 * x + 2]};
         if (!plain) rr.displayStages(e3);
-        if (m.vig != 0) {
-          const float cx = m.d.fullW * 0.5f, cy = m.d.fullH * 0.5f;
-          const float px = m.d.ox0 + (float(x) + 0.5f) * m.d.stepX - 0.5f,
-                      py = m.d.oy0 + (float(y) + 0.5f) * m.d.stepY - 0.5f;
-          applyVignette(e3, (px - cx) / cx, (py - cy) / cy, m.vig);
-        }
+        if (vig.active()) engine::vignette::applyAt(vig, e3, x, y, false);  // the film's display values are sRGB here
         t[3 * x] = e3[0], t[3 * x + 1] = e3[1], t[3 * x + 2] = e3[2];
       }
     }
@@ -2337,7 +2285,8 @@ void FrameKernels::finalizeSpatial() {
   // renderFloat: a film at full strength brings its own grain, the look's grain would double it
   EditParams pe = m.r.p_;
   if (m.filmOkV && m.fr.strength >= 1.f) pe.look = "std";
-  m.sp = makeSpatial(m.r.p_, m.source.sceneReferred, m.filmOkV && m.fr.strength >= 1.f ? makeStyle(pe) : m.exactOp->style);
+  m.lookGrain = (m.filmOkV && m.fr.strength >= 1.f ? makeStyle(pe) : m.exactOp->style).grain;
+  m.spScale = 0.f;  // the exact variant takes its own long edge once the film ran
 }
 
 struct ScratchFrame::Impl {

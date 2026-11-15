@@ -43,6 +43,7 @@ struct Run {
   SpatialScratch scratch;       // luminance plane etc., kept between window nodes like applySpatial
   std::vector<Step> head, wins; // wins: every window node of the final sweep, in chain order
   std::vector<NodeType> winTypes;
+  FrameBlocks blocks;           // resolved when a chain is bound (after the film stage: the exact variant's facts change there)
   std::shared_ptr<DehazeSolve> dehaze;
   std::shared_ptr<GuidedSolve> guided;
   std::vector<float> gridLow;   // accumulated 1/4 grid of the sweep in flight
@@ -78,8 +79,10 @@ struct Run {
   }
 
   bool bind(const Stage& sweep) {
+    blocks = resolveFrameBlocks(fk.params(), fk.frameFacts());
     FrameEnv fe;
     fe.fk = &fk;
+    fe.blocks = &blocks;
     fe.film = film;
     fe.filmRow0 = filmStream ? &filmY0 : nullptr;
     fe.aux = auxPlanes ? &aux : nullptr;
@@ -108,8 +111,10 @@ struct Run {
     return true;
   }
   bool bindWindows(const Stage& last) {
+    blocks = resolveFrameBlocks(fk.params(), fk.frameFacts());
     FrameEnv fe;
     fe.fk = &fk;
+    fe.blocks = &blocks;
     fe.film = film;
     wins.clear();
     for (std::size_t g = 1; g < last.groups.size(); ++g)
@@ -349,12 +354,10 @@ struct Run {
   // ---- a GlobalSolve --------------------------------------------------------------------------------------------------------
   Status solve(const Stage& st) {
     const NodeInstance& n = env.graph.nodes()[st.solveNode];
-    const SpatialParams& sp = fk.spatial();
-    const float scale = fk.spatialScale();
     if (cancelled()) return Status::Cancelled;
     if (n.type == NodeType::Dehaze) {
       auto sv = std::make_shared<DehazeSolve>();
-      dehazeSolveGrid(gridLow, gridW, gridH, sp.dehaze, scale, *sv);
+      dehazeSolveGrid(gridLow, gridW, gridH, blocks.dehaze.minRadius, blocks.dehaze.boxRadius, blocks.dehaze.omega, *sv);
       if (cancelled()) return Status::Cancelled;
       dehaze = sv;
       ResultCache::Entry e;
@@ -364,7 +367,7 @@ struct Run {
       env.cache.put(NodeType::Dehaze, std::move(e));
     } else {
       auto gs = std::make_shared<GuidedSolve>();
-      guidedSolveGrid(gridLow, gridW, gridH, scale, *gs);
+      guidedSolveGrid(gridLow, gridW, gridH, blocks.detail.guidedRadius, detail::kGuidedEps, *gs);
       if (cancelled()) return Status::Cancelled;
       guided = gs;
       ResultCache::Entry e;
@@ -387,15 +390,14 @@ struct Run {
         const NodeType t = env.graph.nodes()[s.solveNode].type;
         (t == NodeType::Dehaze ? dehazeStage : guidedStage) = true;
       }
-    const SpatialParams& sp = fk.spatial();
     for (const NodeInstance& n : env.graph.nodes()) {
-      if (n.type == NodeType::Dehaze && sp.dehaze > 0.f && !dehazeStage) {
+      if (n.type == NodeType::Dehaze && blocks.dehaze.solve() && !dehazeStage) {
         ResultCache::Entry* e = env.cache.find(NodeType::Dehaze, n.key);
         if (!e) return Status::Internal;
         dehaze = as<DehazeSolve>(e->payload);
         if (stats) ++stats->solveHits;
       }
-      if (n.type == NodeType::Detail && sp.clarity != 0.f && !guidedStage) {
+      if (n.type == NodeType::Detail && blocks.detail.solve() && !guidedStage) {
         ResultCache::Entry* e = env.cache.find(NodeType::Detail, n.key);
         if (!e) return Status::Internal;
         guided = as<GuidedSolve>(e->payload);
@@ -434,7 +436,8 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
       if (env.cancel.cancelled()) return Status::Cancelled;
       continue;
     }
-    if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF && !env.fk.spatial().any() && !env.fk.localFrame()) {
+    if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF &&
+        !resolveFrameBlocks(env.fk.params(), env.fk.frameFacts()).anyWindow() && !env.fk.localFrame()) {
       if (env.fk.streamFilm(env.out)) {
         if (stats) stats->streamed = true;
         return Status::Ok;

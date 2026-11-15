@@ -24,6 +24,13 @@ Adding a node:
    A table node's evaluation is its `CpuImpl::bake` (`nodes/main/cpu_nodes.cpp`; `engine::bakeNode`); `EngineSession::runHostTables` caches it.
 Edge `keyed=false` = scheduling edge only (producer key does not enter the consumer key).
 
+Parameter resolution (docs/engine/pipeline-architecture.md section 50): a node family that resolves its own parameters lives in
+`nodes/<family>/` (`vignette`, `nr`, `dehaze`, `detail`, `grain`): a POD block, `resolve(EditParams, FrameFacts)` that derives every number
+the kernels use, its `NodeBehaviour` (identity, halo) and `CpuImpl`; its `gpu.cpp` records from the same block. `nodes/frame_blocks.h`
+`resolveFrameBlocks` builds the blocks of a frame; the builder wires a node only when its block is not the identity, the executors copy
+`&blocks.<node>` into the node's slot (CPU `bindResolved`, GPU `GpuRun::blocks`). New family = a block + resolve there, a member of
+`FrameBlocks`, nothing in `FramePlan` / `FrameKernels`.
+
 ## Planner / executor (CPU engineer, docs/engine/pipeline-architecture.md section 17)
 
 - `plan/plan.h`: `Planner::plan(graph, PlanRequest, cache) -> Plan` (fused point chain, cumulative window groups per sweep, halos, global solves, cache ops).
@@ -34,7 +41,7 @@ Edge `keyed=false` = scheduling edge only (producer key does not enter the consu
 ## GPU executor (GPU engineer, docs/engine/pipeline-architecture.md section 19)
 
 - `exec/gpu_iface.h`: `IGpuExecutor::run(GpuRun&, GpuOut&)` consumes the same `Plan` as the CPU executor; `GpuProvider` is the process-wide device selection (installed by `gpu::installProvider()`). `EngineSession::renderFull / exportGpu` pick the executor per frame (Vulkan -> GLES 3.1 -> CPU, failure semantics of 5.9).
-- A node gets a GPU implementation by registering `GpuImpl::recordPorts` in `nodes/gpu_nodes.cpp` (`gpuImplFor`), a `Walk::sweep` case in `exec/gpu_executor.cpp` that builds its resolved block, and its type in `headNodeOk` / `windowNodeOk`. A plan that contains any other node is `Unsupported` and runs on the CPU executor.
+- A node gets a GPU implementation by registering `GpuImpl::recordPorts` in `nodes/gpu_nodes.cpp` (`gpuImplFor`), a `Walk::sweep` case in `exec/gpu_executor.cpp` that hands it its block (`GpuRun::blocks`), and its type in `headNodeOk` / `windowNodeOk`. A plan that contains any other node is `Unsupported` and runs on the CPU executor.
 - Kernels declare the workgroup shape as spec constants 16 / 17 (2D) and 18 / 19 (reduce); group counts come from `GpuRecorder::gx / gy` (`docs/engine/gles-shader-patches.md`).
 - Tests: `dapple_gpu_tests`, `dapple_gpu_engine_tests` (`hal box sched select external`), `dapple_film_gpu_tests`; bench `dapple gpu-bench`.
 

@@ -13,6 +13,8 @@
 
 namespace dapple::engine {
 
+struct FrameBlocks;  // engine/nodes/frame_blocks.h: resolved blocks of the families that resolve their own parameters
+
 enum class CacheHint : std::uint8_t { Never, KeepIfCheap, Keep };
 
 struct NodeDesc {
@@ -101,10 +103,12 @@ enum class GraphDetail : std::uint8_t {
 };
 
 // Builds the graph of one frame request. Pure function of the ParamSet (and, for Full detail, of `plan`, the
-// FramePlan the renderer resolves for the frame: spatial amounts after quality / region, geometry, vignette).
+// FramePlan the point family resolves for the frame: geometry, spatial amounts after quality / region; and of `blocks`, the
+// resolved blocks of the migrated families: a node whose block is the identity is not wired).
 class GraphBuilder {
  public:
-  static Graph build(const ParamSet& ps, GraphDetail detail = GraphDetail::Tables, const FramePlan* plan = nullptr);
+  static Graph build(const ParamSet& ps, GraphDetail detail = GraphDetail::Tables, const FramePlan* plan = nullptr,
+                     const FrameBlocks* blocks = nullptr);
 };
 
 }  // namespace dapple::engine

@@ -3100,3 +3100,47 @@ Internal switch `warp::setMode(Smooth | Layered | Structure)` (S / L / C; `setLa
 **Cost (this PC, field build only; per frame the single field costs what S costs).** Analysis 11 - 15 ms once per photo at 512 px luma. Solve 40 ms on real photos (60 + up to 4 x 30 iterations, `c.txt`), 3 - 9 ms in the synthetic test; field build for a 24 MP photo (6000 x 4000; the grid is the same size for any photo): exact 87 ms (S) / 90 ms (C), interactive 22 / 21 ms (test `engine.reshape_structure`, which is labelled heavy at 1.2 s). The GPU path needs nothing new.
 
 **Tests.** `engine.reshape_structure` (a diagonal line behind the figure: S 2.23 px, C 0.31 px from straight at 2048; C fold-free at 100, max grad 0.749; half strength moves half as far; build times), `engine.reshape_structure_tiles` (tiled render = whole render, max code <= 1). Sheets: `dapple_reshape_sheets <out> --c [names]` writes `<name>_c.jpg` (rows: full frame, zoom at the silhouette, zoom at the line that bends most; columns: original | S | L | C) and `c.txt`.
+
+## 50. Stage B: each node family resolves its own parameters (engine, 2026-11-15)
+
+**Problem.** Parameter resolution lives in `Renderer` (point_kernels.cpp) and `FramePlan`; the CPU executor binds through `FrameKernels`, the GPU
+nodes carry `&FramePlan`, the graph builder takes a `FramePlan`. Numbers derived from a slider (radii, blend strengths, sigmas) were computed
+three times (spatial.cpp, gpu_common.cpp `spatialRadii`, planner `windowHalo`) with "must match" comments. Sections 3-5 already say that each
+node resolves its own block (`NodeBehaviour::resolve`); only the film nodes did (`resolveFilm` -> `FilmResolved`).
+
+**Target shape.**
+- A family lives in `core/engine/nodes/<family>/`: `<family>.h` declares its POD block(s) (<= `kMaxResolvedBytes`), a pure
+  `resolve…(const EditParams&, const FrameFacts&)`, its `NodeBehaviour` (isIdentity / halo computed from the block) and its `CpuImpl`;
+  `gpu.cpp` records from the same block. Every derived number (radius, blend, 1/sigma^2, halo) is computed once, in the resolve.
+- `nodes/frame_facts.h` `FrameFacts`: what the frame decides that families read (output pixel -> picture mapping, radii scale, spatial
+  quality, noise flag, scene-referred). Today the point remnant produces it (`FrameKernels::frameFacts()`, `frameFacts(FramePlan, FastOptions)`);
+  after the point family it is the Geometry block.
+- `nodes/frame_blocks.h` `FrameBlocks` + `resolveFrameBlocks(EditParams, FrameFacts)`: the blocks of the migrated families of one frame. The
+  session resolves it for the graph builder (identity decides wiring), the plan request and the GPU run (`GpuRun::blocks`); the CPU executor
+  resolves it again when it binds (after the film stage, because the exact variant's facts change there, `finalizeSpatial`). The executors
+  copy `&blocks.<node>` into the node's resolved slot and never read the family's EditParams fields.
+- Content keys stay the registry's ParamMask keys: a block is a pure function of the keys its node declares plus ctx keys the frame already
+  hashes, so equal keys still mean equal blocks (engine.reuse / keys / conformance unchanged).
+- End state: graph / plan / exec include neither renderer.h, frame_plan.h nor frame_kernels.h; what is left of `Renderer` becomes free
+  functions named for what they are (point resolve, tone table, colour lattice bake, display stages, HDR bind).
+
+**Order** (smallest first, each a green, bit-identical step): 1 Vignette; 2 NR (luma + chroma); 3 Grain; 4 Dehaze; 5 Detail (+ GPU resize
+sharpening); 6 LocalLinear / LocalDetail (`local::Frame` binding); 7 Resize; 8 the point family (Geometry, Gain, Hdr, warp, ToneColour,
+DisplayStages, Blend) together with the table bakes (ColourLattice, ToneAnalysisPre, ToneTable, Analysis, LatticeOverflow: `TableBakeCtx`
+still carries the `Renderer`); 9 the film glue (FilmSim / `runFilm` / `streamFilm`). After 8, `FrameFacts` comes from the Geometry block and
+`FramePlan` / `FrameKernels` disappear; then stage C makes the planner read halo / footprint / GpuImpl from the registry.
+
+**What cannot move yet, and why.**
+- The radii scale and the look's grain of the exact variant depend on the film outcome (`finalizeSpatial` resets the scale after a film ran and
+  swaps the style): Grain and Detail must be resolved after the film stage; the CPU executor already re-resolves at bind time.
+- The spatial quality comes from `FastOptions` (set by the C layer / video session), not from `ParamInputs::quality`; resolving from the
+  ParamSet alone would need the two unified first (a key change), so the quality enters through `FrameFacts`.
+- Geometry, HDR, warp and local bindings need the source (field builds, plane caches): the point family's resolve needs source metadata and
+  those caches, which is why it is last.
+- The planner still recomputes window halos from `PlanRequest` amounts (stage C); for migrated families it calls the family's resolve, so
+  the formula exists once.
+
+**Status (2026-11-15).** Steps 1-5 done: Vignette, NRLuma / NRChroma, Grain, Dehaze, Detail resolve their own blocks (`nodes/vignette`,
+`nodes/nr`, `nodes/grain`, `nodes/dehaze`, `nodes/detail`); `SpatialParams` and `FramePlan::{vignette, outputSpace, nrLuma, nrColor, dehaze,
+clarity, texture, sharpen, sharpRadius, grain}` are gone, `GpuRun::resizeSharpen` became `FrameFacts::resizeSharpen` (Detail block), the GPU
+`spatialRadii` keeps only the tile halo. Recorded corpus hashes unchanged; content keys unchanged. Next: step 6 (local).

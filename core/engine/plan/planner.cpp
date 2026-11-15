@@ -6,6 +6,8 @@
 #include <cmath>
 
 #include "engine/exec/result_cache.h"
+#include "engine/nodes/detail/detail.h"
+#include "engine/nodes/nr/nr.h"
 
 namespace dapple::engine {
 
@@ -24,31 +26,9 @@ bool isTable(NodeType t) { return NodeRegistry::instance().desc(t).output == Dom
 Halo Planner::windowHalo(NodeType t, const PlanRequest& rq) {
   const float s = rq.scale;
   switch (t) {
-    case NodeType::NRLuma: {
-      const int r = std::max(1, int(std::lround((0.8f + 1.8f * rq.nrLuma) * s)));
-      return {2 * r, 2 * r};  // boxBlur(r, 2 iterations)
-    }
-    case NodeType::NRChroma: {
-      const float rFull = (1.5f + 5.f * rq.nrColor) * s;
-      const int f = rFull >= 6.f ? 4 : 2;
-      const int rl = std::max(1, int(std::lround(rFull / float(f))));
-      const int h = (2 * rl + 2) * f;  // box on the reduced grid (2 iterations) + block + bilinear upsample
-      return {h, h};
-    }
-    case NodeType::Detail: {
-      int h = 0;
-      if (rq.texture != 0.f) h = std::max(h, 2 * std::max(1, int(std::lround(2.f * s))));
-      if (rq.sharpen > 0.f) {
-        const float sigma = std::max(0.4f, rq.sharpRadius * s * 0.5f);
-        if (sigma > 2.6f) {
-          const int r = std::max(1, int(std::lround(std::sqrt(sigma * sigma * 4.f / 3.f + 0.25f) - 0.5f)));
-          h = std::max(h, 3 * r);
-        } else {
-          h = std::max(h, std::max(1, int(std::ceil(sigma * 3.f))));
-        }
-      }
-      return {h, h};
-    }
+    case NodeType::NRLuma: return nr::lumaHalo(nr::lumaFor(rq.nrLuma, s));        // the family's own radii (stage C: NodeBehaviour::halo)
+    case NodeType::NRChroma: return nr::chromaHalo(nr::chromaFor(rq.nrColor, s));
+    case NodeType::Detail: return detail::halo(detail::detailFor(rq.clarity, rq.texture, rq.sharpen, rq.sharpRadius, 0.f, s));
     case NodeType::LocalDetail:
       return {rq.localHalo, rq.localHalo};
     default:

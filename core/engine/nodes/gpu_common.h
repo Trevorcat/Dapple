@@ -12,6 +12,7 @@
 #include "dapple/frame_plan.h"
 #include "engine/exec/gpu_scheduler.h"
 #include "engine/hal/hal.h"
+#include "engine/nodes/frame_blocks.h"
 
 namespace dapple::engine::gpu {
 
@@ -32,20 +33,11 @@ inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 // Workgroup shape of the 2D kernels on a device: 16 x (inv/16), inv = min(256, maxComputeWorkGroupInvocations) as a power of two.
 void workgroupShape(const hal::DeviceCaps& c, int& lx, int& ly, int& rwg);
 
-// Radii of the spatial stages, shared by the builder and the tile halo computation.
+// Halo of the window stages of a GPU tile (the radii come from the node blocks), multiple of 4.
 struct SpatialRadii {
-  int nrLumaR = 0;  // box radius (2 iterations)
-  int nrChromaF = 2, nrChromaRl = 0;
-  int dehazeMin = 0, dehazeBox = 0;
-  int clarityR = 0;
-  int textureR = 0;
-  float sharpSigma = 0;
-  int sharpBox = 0, sharpGauss = 0;  // box radius (3 iterations) or direct kernel half width
-  float sharpAmount = 0;
   int halo = 0;  // pixels around a tile needed by the local stages, multiple of 4
 };
-SpatialRadii spatialRadii(const FramePlan& p, float resizeSharpen);
-void grainArgs(const FramePlan& P, float& amp, float& period);
+SpatialRadii spatialRadii(const FramePlan& p, const FrameBlocks& b);
 
 // The image the point pass samples, and where it sits in the (resized) source space.
 struct SourceBind {
@@ -136,24 +128,24 @@ struct PointNode {
   Epilogue ep;
   // local adjustments (docs section 40): descriptor and plane store SSBOs (point_local when >= 0), the stage-W amount images (or -1)
   H ldesc = -1, lplanes = -1, aux0 = -1, aux1 = -1;
+  const vignette::Block* vig = nullptr;  // the Vignette block of the frame (null: no vignette, e.g. the normal branch of a film blend)
 };
 bool recordPoint(GpuRecorder& r, const PointNode& n, H D);
 
-struct NrLumaNode { const FramePlan* plan; const SpatialRadii* R; int W, Hh, ox, oy; Epilogue ep; };
+struct NrLumaNode { const nr::LumaBlock* b; int W, Hh, ox, oy; Epilogue ep; };
 bool recordNrLuma(GpuRecorder& r, const NrLumaNode& n, H D);
-struct NrChromaNode { const FramePlan* plan; const SpatialRadii* R; int W, Hh, ox, oy; Epilogue ep; };
+struct NrChromaNode { const nr::ChromaBlock* b; int W, Hh, ox, oy; Epilogue ep; };
 bool recordNrChroma(GpuRecorder& r, const NrChromaNode& n, H D);
 
 // dehaze analysis of the low-resolution colour grid: dark channel + airlight statistics (into gBuf). Returns the dark channel.
-H recordDehazeAnalysis(GpuRecorder& r, const SpatialRadii& R, H col, int lw, int lh);
-struct DehazeNode { const FramePlan* plan; int W, Hh, ox, oy, gridW, gridH; H dc; Epilogue ep; };
+H recordDehazeAnalysis(GpuRecorder& r, const dehaze::Block& b, H col, int lw, int lh);
+struct DehazeNode { const dehaze::Block* b; int W, Hh, ox, oy, gridW, gridH; H dc; Epilogue ep; };
 bool recordDehazeApply(GpuRecorder& r, const DehazeNode& n, H D);
 
 // guided filter coefficients (a, b) of the clarity base from the (Y, Y^2) grid
-H recordClarityAnalysis(GpuRecorder& r, const SpatialRadii& R, H yy, int lw, int lh);
+H recordClarityAnalysis(GpuRecorder& r, int radius, H yy, int lw, int lh);
 struct DetailNode {
-  const FramePlan* plan;
-  const SpatialRadii* R;
+  const engine::detail::Block* b;
   int W, Hh, ox, oy, gridW, gridH;
   H ab;  // clarity coefficients (or -1)
   Epilogue ep;

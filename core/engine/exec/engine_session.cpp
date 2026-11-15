@@ -187,24 +187,23 @@ void bindLocal(FramePlan& fp, const Renderer& r, const SourceImage& src, bool in
 }
 
 // What the planner needs besides the graph: frame size, neighbourhood amounts after quality / region / film.
-PlanRequest makeRequest(const FrameKernels& fk, ExecMode mode, int tile, std::size_t budget, int channels) {
+PlanRequest makeRequest(const FrameKernels& fk, const FrameBlocks& fb, ExecMode mode, int tile, std::size_t budget, int channels) {
   PlanRequest rq;
   rq.frameW = fk.width();
   rq.frameH = fk.height();
   rq.mode = mode;
   rq.tile = tile;
   rq.memBudget = budget;
-  const SpatialParams& sp = fk.spatial();
-  rq.nrLuma = sp.nrLuma;
-  rq.nrColor = sp.nrColor;
-  rq.dehaze = sp.dehaze;
-  rq.clarity = sp.clarity;
-  rq.texture = sp.texture;
-  rq.sharpen = sp.sharpen;
-  rq.sharpRadius = sp.sharpRadius;
-  rq.grain = sp.grain;
+  rq.nrLuma = fb.nrLuma.amount;
+  rq.nrColor = fb.nrChroma.amount;
+  rq.dehaze = fb.dehaze.amount;
+  rq.clarity = fb.detail.clarity;
+  rq.texture = fb.detail.texture;
+  rq.sharpen = fb.detail.sharpen;
+  rq.sharpRadius = fb.detail.sharpRadius;
+  rq.grain = fb.grain.amount;
   rq.scale = fk.spatialScale();
-  rq.vignette = fk.vignetteActive();
+  rq.vignette = fb.vignette.active();
   rq.useGeo = fk.useGeo();
   rq.outChannels = channels;
   localRequest(rq, fk.localFrame());
@@ -220,7 +219,7 @@ void addStats(EngineStats& st, const ExecStats& es) {
 }
 
 // Plan request from a resolved frame (the GPU path has no FrameKernels: the executor reads the FramePlan).
-PlanRequest requestFromFrame(const FramePlan& fp, ExecMode mode, int tile, std::size_t budget, bool filmTiles = false) {
+PlanRequest requestFromFrame(const FramePlan& fp, const FrameBlocks& fb, ExecMode mode, int tile, std::size_t budget, bool filmTiles = false) {
   PlanRequest rq;
   rq.filmTiles = filmTiles;
   rq.frameW = fp.outW;
@@ -228,16 +227,16 @@ PlanRequest requestFromFrame(const FramePlan& fp, ExecMode mode, int tile, std::
   rq.mode = mode;
   rq.tile = tile;
   rq.memBudget = budget;
-  rq.nrLuma = fp.nrLuma;
-  rq.nrColor = fp.nrColor;
-  rq.dehaze = fp.dehaze;
-  rq.clarity = fp.clarity;
-  rq.texture = fp.texture;
-  rq.sharpen = fp.sharpen;
-  rq.sharpRadius = fp.sharpRadius;
-  rq.grain = fp.grain;
+  rq.nrLuma = fb.nrLuma.amount;
+  rq.nrColor = fb.nrChroma.amount;
+  rq.dehaze = fb.dehaze.amount;
+  rq.clarity = fb.detail.clarity;
+  rq.texture = fb.detail.texture;
+  rq.sharpen = fb.detail.sharpen;
+  rq.sharpRadius = fb.detail.sharpRadius;
+  rq.grain = fb.grain.amount;
   rq.scale = fp.spatialScale;
-  rq.vignette = fp.vignette != 0.f;
+  rq.vignette = fb.vignette.active();
   rq.useGeo = fp.useGeo;
   rq.outChannels = 4;
   localRequest(rq, fp.local.get());
@@ -399,7 +398,8 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
   }
   const auto t0 = Clock::now();
   const FramePlan fp = fk.framePlan();
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);
+  const FrameBlocks fb = resolveFrameBlocks(fk.params(), fk.frameFacts());
+  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   const ValidationResult v = g.validate();
   if (!v.ok) {
     out.error = "engine graph: " + v.error;
@@ -407,7 +407,7 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
   }
   if (job.holdSolves) g.computeKeysHoldingSolves(ps);
   else g.computeKeys(ps);
-  const Plan plan = Planner::plan(g, makeRequest(fk, ExecMode::Whole, 0, 0, 4), &cache_);
+  const Plan plan = Planner::plan(g, makeRequest(fk, fb, ExecMode::Whole, 0, 0, 4), &cache_);
   {
     const double ms = msSince(t0);
     stats_.planMs += ms;
@@ -486,7 +486,8 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   in.ctx.srcW = W;
   in.ctx.srcH = H;
   const ParamSet ps = ParamSet::make(std::move(in));
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);  // the exact variant: ToneColourExact, no table nodes
+  const FrameBlocks fb = resolveFrameBlocks(params, frameFacts(fp, fo, src.sceneReferred));
+  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);  // the exact variant: ToneColourExact, no table nodes
   if (const ValidationResult v = g.validate(); !v.ok) {
     if (err) *err = "engine graph: " + v.error;
     return -1;
@@ -499,9 +500,9 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   renderer.hdrBind(src, fp.hdr, &bake->tone);
   const bool tiled = opt.mode == ExecMode::TiledExport;
   const int tile = opt.tile > 0 ? opt.tile : (x->caps().unifiedMemory ? 1024 : 2048);
-  const Plan plan = Planner::plan(g, requestFromFrame(fp, tiled ? ExecMode::TiledExport : ExecMode::Whole, tiled ? tile : 0, std::size_t(1) << 30, true), nullptr);
+  const Plan plan = Planner::plan(g, requestFromFrame(fp, fb, tiled ? ExecMode::TiledExport : ExecMode::Whole, tiled ? tile : 0, std::size_t(1) << 30, true), nullptr);
   MemorySourceStore store(src);
-  GpuRun run{plan, g, fp, store, *bake, nullptr, &renderer, 0.f, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
+  GpuRun run{plan, g, fp, fb, store, *bake, nullptr, &renderer, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
   out.width = fp.outW;
   out.height = fp.outH;
   out.data.assign(std::size_t(out.width) * out.height * 3, 0);
@@ -571,7 +572,8 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
   const FramePlan fp = fk.framePlan();
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);
+  const FrameBlocks fb = resolveFrameBlocks(fk.params(), fk.frameFacts());
+  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   const ValidationResult v = g.validate();
   if (!v.ok) {
     if (err) *err = "engine graph: " + v.error;
@@ -581,7 +583,7 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   const auto t0 = Clock::now();
   ResultCache local;
   ResultCache& cache = opt.sessionCache ? cache_ : local;
-  PlanRequest prq = makeRequest(fk, opt.mode, opt.tile, opt.memBudget, 3);
+  PlanRequest prq = makeRequest(fk, fb, opt.mode, opt.tile, opt.memBudget, 3);
   // a streamed film frame keeps its tiles: the film plane arrives in bands (section 42.6); env DAPPLE_FILM_TILES=1: the whole-frame film export in
   // tiles too (comparisons at the same tile size)
   prq.filmTiles = streaming || (std::getenv("DAPPLE_FILM_TILES") && std::getenv("DAPPLE_FILM_TILES")[0] == '1');
@@ -1063,7 +1065,8 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
     if (gpuForce_) return out.error = frameWhy_, -1;
     return 1;
   }
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);
+  const FrameBlocks fb = resolveFrameBlocks(job.renderer.params(), frameFacts(fp, job.fastOptions, job.src.sceneReferred));
+  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   const ValidationResult v = g.validate();
   if (!v.ok) {
     out.error = "engine graph: " + v.error;
@@ -1074,7 +1077,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
   // the GPU plan is made against the executor's own cache of device solves (the session cache holds CPU payloads): a frame whose dehaze / clarity
   // solve is still on the device skips the accumulation sweep and the solve
   IGpuExecutor* gx = gpuExecutor();
-  const Plan plan = Planner::plan(g, requestFromFrame(fp, ExecMode::Whole, 0, 0), gx ? gx->solveCache() : nullptr);
+  const Plan plan = Planner::plan(g, requestFromFrame(fp, fb, ExecMode::Whole, 0, 0), gx ? gx->solveCache() : nullptr);
   {
     const double ms = msSince(t0);
     stats_.planMs += ms;
@@ -1083,7 +1086,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
   ++stats_.planned;
   totals().planned.fetch_add(1, std::memory_order_relaxed);
   const std::vector<float>* over = overflowFor(ps, bake.n);
-  GpuRun run{plan, g, fp, *job.store, bake, over, &job.renderer, job.resizeSharpen, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
+  GpuRun run{plan, g, fp, fb, *job.store, bake, over, &job.renderer, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
   run.target.external = job.gpuTarget;
   GpuOut go;
   const auto t1 = Clock::now();
@@ -1168,14 +1171,15 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
   if (!fp.supported) return bail(1, "unsupported on the GPU: " + fp.why);
   bindLocal(fp, e.renderer, e.image, false);
   fp.resizeSharpen = down ? e.resizeSharpen : 0.f;
-  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp);
+  const FrameBlocks fb = resolveFrameBlocks(e.renderer.params(), frameFacts(fp, fj.fastOptions, e.image.sceneReferred));
+  Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   if (const ValidationResult v = g.validate(); !v.ok) return bail(-1, "engine graph: " + v.error);
   g.computeKeys(ps);
   // mobile / unified memory: tile 1024 keeps the export pool near 320 MB (pixel-architecture.md 16 rule 8)
   const int tile = e.tile > 0 ? e.tile : (x->caps().unifiedMemory ? 1024 : 2048);
-  const Plan plan = Planner::plan(g, requestFromFrame(fp, ExecMode::TiledExport, tile, std::size_t(1) << 30, true), nullptr);
+  const Plan plan = Planner::plan(g, requestFromFrame(fp, fb, ExecMode::TiledExport, tile, std::size_t(1) << 30, true), nullptr);
   if (e.onSize) e.onSize(fp.outW, fp.outH);
-  GpuRun run{plan, g, fp, e.store, *bake, overflowFor(ps, bake->n), &e.renderer, fp.resizeSharpen,
+  GpuRun run{plan, g, fp, fb, e.store, *bake, overflowFor(ps, bake->n), &e.renderer,
              GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, e.target, e.forceStream};
   GpuOut go;
   const int r = runOnGpu(run, go);

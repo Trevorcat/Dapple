@@ -11,8 +11,6 @@
 namespace dapple::engine::gpu {
 
 namespace {
-int lroundi(float v) { return int(std::lround(v)); }
-
 struct SepU {
   std::int32_t size[4], radii[4];
 };
@@ -172,45 +170,15 @@ H GpuRecorder::down(H D, int f, int mode, H dst, const WRect& win, int offX, int
   return dst;
 }
 
-void grainArgs(const FramePlan& P, float& amp, float& period) {
-  period = std::max(1.f, 1.6f * P.spatialScale);
-  amp = P.grain * 0.13f * (period > 1.01f ? 1.5f : 1.f);
-}
-
-SpatialRadii spatialRadii(const FramePlan& P, float resizeSharpen) {
+SpatialRadii spatialRadii(const FramePlan& P, const FrameBlocks& B) {
   SpatialRadii r;
   const float scale = P.spatialScale;
   int haloL = 0, haloC = 0, haloD = 0;
-  if (P.nrLuma > 0) {
-    r.nrLumaR = std::max(1, lroundi((0.8f + 1.8f * P.nrLuma) * scale));
-    haloL = 2 * r.nrLumaR + 1;
-  }
-  if (P.nrColor > 0) {
-    const float rFull = (1.5f + 5.f * P.nrColor) * scale;
-    r.nrChromaF = rFull >= 6.f ? 4 : 2;
-    r.nrChromaRl = std::max(1, lroundi(rFull / float(r.nrChromaF)));
-    haloC = (2 * r.nrChromaRl + 3) * r.nrChromaF;
-  }
-  if (P.dehaze > 0) {
-    r.dehazeMin = std::max(1, lroundi(2.5f * scale));
-    r.dehazeBox = std::max(1, lroundi(3.f * scale));
-  }
-  if (P.clarity != 0) r.clarityR = std::max(2, lroundi(0.02f * 2048.f * scale / 4.f));
-  if (P.texture != 0) {
-    r.textureR = std::max(1, lroundi(2.f * scale));
-    haloD = std::max(haloD, 2 * r.textureR + 1);
-  }
-  r.sharpAmount = P.sharpen > 0 || resizeSharpen > 0 ? P.sharpen + resizeSharpen : 0.f;
-  if (r.sharpAmount > 0) {
-    r.sharpSigma = std::max(0.4f, P.sharpRadius * scale * 0.5f);
-    if (r.sharpSigma > 2.6f) {
-      r.sharpBox = std::max(1, lroundi(std::sqrt(r.sharpSigma * r.sharpSigma * 4.f / 3.f + 0.25f) - 0.5f));
-      haloD = std::max(haloD, 3 * r.sharpBox + 1);
-    } else {
-      r.sharpGauss = std::max(1, int(std::ceil(r.sharpSigma * 3.f)));
-      haloD = std::max(haloD, r.sharpGauss + 1);
-    }
-  }
+  if (B.nrLuma.active()) haloL = 2 * B.nrLuma.radius + 1;
+  if (B.nrChroma.active()) haloC = (2 * B.nrChroma.lowRadius + 3) * B.nrChroma.factor;
+  const engine::detail::Block& D = B.detail;
+  if (D.texture != 0) haloD = std::max(haloD, 2 * D.textureRadius + 1);
+  if (D.sharpAmount > 0) haloD = std::max(haloD, D.sharpBox > 0 ? 3 * D.sharpBox + 1 : D.sharpGauss + 1);
   r.halo = (haloL + haloC + haloD + 8 + 3) / 4 * 4;
   if (P.local && P.localDetail) r.halo += local::detailRadii(*P.local, scale).halo;  // LocalDetail (docs section 40), after the Detail stage
   return r;

@@ -1,7 +1,7 @@
 #pragma once
-// Everything a GPU (or any other) backend needs to reproduce Renderer::renderBakedRgba() for one frame,
-// resolved by the CPU reference so the numbers cannot drift apart: geometry, gain, vignette and the
-// neighbourhood parameters. See Renderer::framePlan() and docs/engine/gpu-backend.md.
+// What the point family (not migrated yet, docs/engine/pipeline-architecture.md section 50) resolves for one frame: geometry, gain, HDR,
+// warp, local, film and the neighbourhood amounts of the families that do not resolve their own block yet. The migrated families
+// (vignette, ...) resolve from EditParams + engine::FrameFacts (core/engine/nodes/frame_blocks.h). See Renderer::framePlan() and docs/engine/gpu-backend.md.
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -29,8 +29,6 @@ struct FramePlan {
   float ox0 = 0.f, oy0 = 0.f, stepX = 1.f, stepY = 1.f, fullW = 0.f, fullH = 0.f;
 
   float gain[3] = {1.f, 1.f, 1.f};  // white balance * exposure, applied to the source before the tone stage
-  float vignette = 0.f;             // -1..1
-  int outputSpace = 0;              // 0 sRGB, 1 Display P3 (export only): the lattice holds P3-encoded values; the vignette then runs on sRGB-encoded ones
   // Single-image HDR (EditParams::hdr, engine only): a smooth gain field applied right after `gain`, before the tone stage. Active when
   // `field` is set and s > 0; resolved by Renderer::hdrBind (which needs the source).
   struct Hdr {
@@ -41,8 +39,7 @@ struct FramePlan {
   } hdr;
 
   // neighbourhood stages, after the quality level / region were applied (see SpatialParams)
-  float nrLuma = 0.f, nrColor = 0.f, dehaze = 0.f, clarity = 0.f, texture = 0.f, sharpen = 0.f, sharpRadius = 1.f,
-        grain = 0.f;
+  float lookGrain = 0.f;  // lookGrain: the look's grain (slider units) the Grain block adds  // lookGrain: the look's grain (slider units) the Grain block adds
   float spatialScale = 1.f;   // radii scale (full-picture long edge / 2048), resolved
   // GPU export of a downscaled picture: extra output sharpening (same radius as `sharpen`) after the Lanczos resize. Set by the
   // GPU path only (EngineSession::exportGpu); the CPU executors never see it. Makes the graph contain a Detail node.
@@ -90,10 +87,6 @@ struct FramePlan {
     int pad = 0;
     bool active() const { return field != nullptr; }
   } warp;
-
-  bool anySpatial() const {
-    return nrLuma > 0 || nrColor > 0 || dehaze != 0 || clarity != 0 || texture != 0 || sharpen > 0 || grain > 0;
-  }
 };
 
 }  // namespace dapple

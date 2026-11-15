@@ -18,8 +18,7 @@ struct DetU {
 };
 }  // namespace
 
-H recordClarityAnalysis(GpuRecorder& r, const SpatialRadii& R, H yy, int lw, int lh) {
-  const int rad = R.clarityR;
+H recordClarityAnalysis(GpuRecorder& r, int rad, H yy, int lw, int lh) {
   const H m = r.blur(2, 2, yy, lw, lh, {rad, rad, rad, rad}, 1, 0, kF32);
   if (m < 0) return -1;
   const H ab0 = r.tr(kF32, lw, lh);
@@ -28,18 +27,17 @@ H recordClarityAnalysis(GpuRecorder& r, const SpatialRadii& R, H yy, int lw, int
   AbU u{};
   u.s[0] = lw;
   u.s[1] = lh;
-  u.eps[0] = 0.045f * 0.045f;
+  u.eps[0] = engine::detail::kGuidedEps;
   r.g.dispatch("gf_ab", pa, {GpuGraph::R(m), GpuGraph::W(ab0)}, r.gx(lw), r.gy(lh), &u, sizeof u);
   return r.blur(2, 2, ab0, lw, lh, {rad, rad, rad, rad}, 1, 0, kF32);
 }
 
 bool recordDetail(GpuRecorder& r, const DetailNode& n, H D) {
-  const FramePlan& P = *n.plan;
-  const SpatialRadii& R = *n.R;
-  const bool clar = P.clarity != 0, tex = P.texture != 0, shp = R.sharpAmount > 0;
+  const engine::detail::Block& R = *n.b;
+  const bool clar = R.clarity != 0, tex = R.texture != 0, shp = R.sharpAmount > 0;
   H texH = -1, shH = -1;
   if (tex) {
-    texH = r.blur(0, 3, D, n.W, n.Hh, {R.textureR, 0, 0, 0}, 2, 0, kR32);
+    texH = r.blur(0, 3, D, n.W, n.Hh, {R.textureRadius, 0, 0, 0}, 2, 0, kR32);
     if (texH < 0) return false;
   }
   if (shp) {
@@ -66,12 +64,12 @@ bool recordDetail(GpuRecorder& r, const DetailNode& n, H D) {
   u.low[0] = n.gridW;
   u.low[1] = n.gridH;
   u.low[2] = 4;
-  u.gains[0] = P.clarity > 0.f ? P.clarity * 1.1f : P.clarity * 0.85f;
-  u.gains[1] = P.texture > 0.f ? P.texture * 1.5f : P.texture * 0.9f;
-  u.gains[2] = P.texture > 0.f ? 1.f : 0.f;
+  u.gains[0] = R.clarityGain;
+  u.gains[1] = R.textureGain;
+  u.gains[2] = R.texturePos ? 1.f : 0.f;
   u.gains[3] = R.sharpAmount;
-  u.sharp[0] = 0.15f;
-  u.sharp[1] = 0.0025f;
+  u.sharp[0] = engine::detail::kSharpLimit;
+  u.sharp[1] = engine::detail::kSharpGate;
   u.grain[0] = n.ep.amp;
   u.grain[1] = n.ep.period;
   r.g.dispatch("detail", p,

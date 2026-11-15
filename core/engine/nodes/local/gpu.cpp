@@ -190,9 +190,7 @@ H recordLocalDetail(GpuRecorder& r, const LocalDetailNode& n, H D) {
   if (R.guided) {
     const H yy = r.tr(kF32, lw, lh);
     if (r.down(D, 4, 1, yy, WRect{0, 0, n.W, n.Hh}, 0, 0, lw, lh) < 0) return -1;
-    SpatialRadii SR;
-    SR.clarityR = R.rg;
-    ab = recordClarityAnalysis(r, SR, yy, lw, lh);
+    ab = recordClarityAnalysis(r, R.rg, yy, lw, lh);
     if (ab < 0) return -1;
   }
   const hal::PipelineH p = r.pl("local_detail", {{0, R.guided ? 1 : 0}, {1, fine ? 1 : 0}, {2, vfine ? 1 : 0}, {10, n.ep.last ? 1 : 0},

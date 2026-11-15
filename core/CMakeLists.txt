@@ -64,6 +64,12 @@ add_library(dapple_core STATIC
   engine/exec/cpu_executor.cpp
   engine/plan/planner.cpp
   engine/nodes/main/cpu_nodes.cpp
+  engine/nodes/frame_blocks.cpp
+  engine/nodes/vignette/vignette.cpp
+  engine/nodes/nr/nr.cpp
+  engine/nodes/grain/grain.cpp
+  engine/nodes/dehaze/dehaze.cpp
+  engine/nodes/detail/detail.cpp
   engine/nodes/demosaic/demosaic_cpu.cpp
   engine/nodes/demosaic/demosaic_session.cpp
   engine/video/video_frame_session.cpp

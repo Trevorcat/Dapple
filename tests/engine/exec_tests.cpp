@@ -267,14 +267,14 @@ Graph graphFor(const EditParams& p, const SourceImage& src, bool exact, FrameKer
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
   const FramePlan fp = hold->framePlan();
-  Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp);
+  const FrameBlocks fb = resolveFrameBlocks(hold->params(), hold->frameFacts());
+  Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp, &fb);
   g.computeKeys(ps);
-  const SpatialParams& sp = hold->spatial();
   rq = PlanRequest{};
   rq.frameW = hold->width();
   rq.frameH = hold->height();
-  rq.nrLuma = sp.nrLuma, rq.nrColor = sp.nrColor, rq.dehaze = sp.dehaze, rq.clarity = sp.clarity, rq.texture = sp.texture;
-  rq.sharpen = sp.sharpen, rq.sharpRadius = sp.sharpRadius, rq.grain = sp.grain, rq.scale = hold->spatialScale();
+  rq.nrLuma = fb.nrLuma.amount, rq.nrColor = fb.nrChroma.amount, rq.dehaze = fb.dehaze.amount, rq.clarity = fb.detail.clarity, rq.texture = fb.detail.texture;
+  rq.sharpen = fb.detail.sharpen, rq.sharpRadius = fb.detail.sharpRadius, rq.grain = fb.grain.amount, rq.scale = hold->spatialScale();
   if (fkOut) *fkOut = hold.get();
   return g;
 }
@@ -433,13 +433,14 @@ void testBench() {
       auto t0 = Clock::now();
       FrameKernels fk(r, src, bake.get(), fo);
       const FramePlan fp = fk.framePlan();
-      Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp);
+      const FrameBlocks fb = resolveFrameBlocks(fk.params(), fk.frameFacts());
+      Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp, &fb);
       g.computeKeys(ps);
       PlanRequest rq;
       rq.frameW = fk.width(), rq.frameH = fk.height();
-      rq.nrLuma = fk.spatial().nrLuma, rq.nrColor = fk.spatial().nrColor, rq.dehaze = fk.spatial().dehaze;
-      rq.clarity = fk.spatial().clarity, rq.texture = fk.spatial().texture, rq.sharpen = fk.spatial().sharpen;
-      rq.sharpRadius = fk.spatial().sharpRadius, rq.grain = fk.spatial().grain, rq.scale = fk.spatialScale();
+      rq.nrLuma = fb.nrLuma.amount, rq.nrColor = fb.nrChroma.amount, rq.dehaze = fb.dehaze.amount;
+      rq.clarity = fb.detail.clarity, rq.texture = fb.detail.texture, rq.sharpen = fb.detail.sharpen;
+      rq.sharpRadius = fb.detail.sharpRadius, rq.grain = fb.grain.amount, rq.scale = fk.spatialScale();
       const Plan plan = Planner::plan(g, rq, &es.cache());
       if (i > 0) ts.push_back(msSince(t0));
       const int w = fk.width(), h = fk.height();

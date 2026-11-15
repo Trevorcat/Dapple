@@ -23,6 +23,10 @@
 #include "dapple/tone.h"
 #include "engine/exec/engine_session.h"
 #include "colour_metrics.h"
+#include "engine/nodes/dehaze/dehaze.h"
+#include "engine/nodes/detail/detail.h"
+#include "engine/nodes/grain/grain.h"
+#include "engine/nodes/nr/nr.h"
 #include "spatial.h"
 
 namespace fs = std::filesystem;
@@ -66,6 +70,34 @@ ImageF exactF(const EditParams& p, const CameraProfile& cam, const SourceImage& 
 }
 
 using Clock = std::chrono::steady_clock;
+
+// One neighbourhood stage alone on a whole picture (the stage functions the CPU nodes run; NR amounts go through the NR family's block).
+// the develop amounts of the stages the bench runs one at a time
+struct BenchAmounts {
+  float nrLuma = 0.f, nrColor = 0.f, dehaze = 0.f, clarity = 0.f, texture = 0.f, sharpen = 0.f, sharpRadius = 1.f, grain = 0.f;
+};
+void benchSpatial(ImageF& img, const BenchAmounts& a) {
+  const float nrLuma = a.nrLuma, nrColor = a.nrColor, dehaze = a.dehaze, grain = a.grain;
+  const int w = img.width, h = img.height;
+  const float scale = float(std::max(w, h)) / 2048.f;
+  SpatialScratch sc;
+  if (const engine::nr::LumaBlock b = engine::nr::lumaFor(nrLuma, scale); b.active()) stageNRLuma(img, sc, b.radius, b.blend, b.inv2);
+  if (const engine::nr::ChromaBlock b = engine::nr::chromaFor(nrColor, scale); b.active())
+    stageNRChroma(img, sc, b.factor, b.lowRadius, b.lumaRadius, b.blend, b.inv2);
+  if (const engine::dehaze::Block b = engine::dehaze::dehazeFor(dehaze, scale); b.solve()) {
+    DehazeSolve sv;
+    std::vector<float> low;
+    int lw = 0, lh = 0;
+    dehazeLowGrid(img, low, lw, lh);
+    dehazeSolveGrid(low, lw, lh, b.minRadius, b.boxRadius, b.omega, sv);
+    stageDehazeApply(img, sc, 0, 0, w, h, sv);
+  } else if (b.active()) {
+    stageDehazeVeil(img, sc, b.veil, b.veilAir);
+  }
+  if (const engine::detail::Block b = engine::detail::detailFor(a.clarity, a.texture, a.sharpen, a.sharpRadius, 0.f, scale); b.active())
+    stageDetail(img, sc, b, nullptr, 0, 0, w, h);
+  if (const engine::grain::Block b = engine::grain::grainFor(grain, scale); b.active()) stageGrain(img, b.period, b.inv, b.amp, 0, 0);
+}
 double msSince(Clock::time_point t0) { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); }
 
 // median of `n` runs after one warm-up
@@ -183,21 +215,21 @@ int editBench(const std::vector<std::string>& args) {
     rows.push_back({"  2a toneMove analysis only (resize 256 + proxy render)",
                     timeMs(repeat, [&] { (void)analyzeTone(scaled, cam, sc.params); })});
     auto spatialOnly = [&](const char* name, auto&& setup) {
-      SpatialParams sp;
-      setup(sp);
+      BenchAmounts am;
+      setup(am);
       rows.push_back({name, timeMs(repeat, [&] {
                         ImageF im = pointOut;
-                        applySpatial(im, sp);
+                        benchSpatial(im, am);
                       })});
     };
     rows.push_back({"  (copy of float image, for reference)", timeMs(repeat, [&] { ImageF im = pointOut; (void)im; })});
-    spatialOnly("3a spatial: sharpen", [&](SpatialParams& s) { s.sharpen = sc.params.sharpen / 100.f; s.sharpRadius = sc.params.sharpRadius / 10.f; });
-    spatialOnly("3b spatial: chroma NR", [&](SpatialParams& s) { s.nrColor = sc.params.nrColor / 100.f; });
-    spatialOnly("3c spatial: luma NR", [&](SpatialParams& s) { s.nrLuma = std::max(sc.params.nrLuma, 30.f) / 100.f; });
-    spatialOnly("3d spatial: clarity", [&](SpatialParams& s) { s.clarity = 0.4f; });
-    spatialOnly("3e spatial: texture", [&](SpatialParams& s) { s.texture = 0.3f; });
-    spatialOnly("3f spatial: dehaze", [&](SpatialParams& s) { s.dehaze = 0.25f; });
-    spatialOnly("3g spatial: grain", [&](SpatialParams& s) { s.grain = 0.2f; });
+    spatialOnly("3a spatial: sharpen", [&](BenchAmounts& s) { s.sharpen = sc.params.sharpen / 100.f; s.sharpRadius = sc.params.sharpRadius / 10.f; });
+    spatialOnly("3b spatial: chroma NR", [&](BenchAmounts& s) { s.nrColor = sc.params.nrColor / 100.f; });
+    spatialOnly("3c spatial: luma NR", [&](BenchAmounts& s) { s.nrLuma = std::max(sc.params.nrLuma, 30.f) / 100.f; });
+    spatialOnly("3d spatial: clarity", [&](BenchAmounts& s) { s.clarity = 0.4f; });
+    spatialOnly("3e spatial: texture", [&](BenchAmounts& s) { s.texture = 0.3f; });
+    spatialOnly("3f spatial: dehaze", [&](BenchAmounts& s) { s.dehaze = 0.25f; });
+    spatialOnly("3g spatial: grain", [&](BenchAmounts& s) { s.grain = 0.2f; });
     rows.push_back({"4 engine exact render total (point+spatial+u8)", timeMs(repeat, [&] {
                       Image8 o8;
                       std::string err;

@@ -13,6 +13,7 @@
 
 #include "dapple/frame_plan.h"
 #include "dapple/renderer.h"
+#include "engine/nodes/frame_facts.h"
 #include "spatial.h"
 
 namespace dapple {
@@ -35,12 +36,13 @@ class FrameKernels {
   bool filmSelected() const;     // a film stock of the library is selected (film path will be tried)
   float filmStrength() const;    // 0..1
   bool filmFull() const { return filmSelected() && filmStrength() >= 1.f; }
-  bool vignetteActive() const;
-  // The neighbourhood stages of this frame (quality, region and, on the exact path, the film outcome applied).
-  const SpatialParams& spatial() const;
-  float spatialScale() const;    // SpatialParams::scale resolved (0 -> own long edge / 2048)
-  // What the GraphBuilder (Full detail) needs: geometry, vignette, spatial amounts.
+  // Radii scale of the neighbourhood stages of this frame (region, region source and, on the exact path, the film outcome applied).
+  float spatialScale() const;
+  // What the GraphBuilder (Full detail) needs: geometry, spatial amounts.
   FramePlan framePlan() const;
+  // What the node families resolve their blocks from (engine/nodes/frame_blocks.h), with the parameters of the frame.
+  engine::FrameFacts frameFacts() const;
+  const EditParams& params() const;
 
   // ---- point block fragments --------------------------------------------------------------------------------------------
   void copyRow(float* px, int n, int x0, int y) const;    // Resize/Source head, no resampling: the source row as it is
@@ -55,7 +57,6 @@ class FrameKernels {
   void hdrBlock(float* px, int n, int x0, int y) const;   // Hdr node (unfused chain): the HDR gain on gained pixels
   void displayStages(float* px, int n) const;             // curves + LUT on an encoded display value (film path)
   void blend(float* main, const float* film, int n) const;  // main += strength * (film - main)
-  void vignette(float* px, int n, int x0, int y) const;
 
   // ---- local adjustments (docs/engine/pipeline-architecture.md section 40) --------------------------------------------------------
   // Source position of output pixel (x, y), normalised by the source size (the photo space of the masks).
@@ -98,6 +99,9 @@ class FrameKernels {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// FrameFacts of a frame resolved without a source (Renderer::framePlan, the GPU path): mapping and radii scale of `fp`, quality of `opt`.
+engine::FrameFacts frameFacts(const FramePlan& fp, const FastOptions& opt, bool sceneReferred);
 
 // A recycled float frame (the renderer's ScratchImage): a fresh 20 MB buffer costs ~5 ms of page faults.
 class ScratchFrame {

@@ -785,7 +785,7 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
   a.frameIndex = f.frameIndex;
   // r.lib / r.stock point into the process-wide default library, which outlives the frame
   if (!filmnode::filmFrameResolved(a, r)) return fail(GpuFailure::Unsupported, "film stock / paper not available");
-  r.clampOut = f.strength >= 1.f && f.displayPlain && in.frame.vignette == 0.f;
+  r.clampOut = f.strength >= 1.f && f.displayPlain && !in.blocks.vignette.active();
   // stock selection (wave 8): an interactive frame of a stock whose tables are not cached shows the previous stock until the background bake landed
   // (the repaint hook fires then); frame fields come from this frame, everything the tables depend on from the previous one, so nothing is baked here
   // An interactive frame never bakes the 33^3 print table: it takes the exact one when cached, else the coarse 17^3 of its own values (frame trace: the A11 showed
@@ -1014,15 +1014,15 @@ struct Executor::Walk {
   // DisplayStages after the film, the blend with the normal branch (strength < 1), the window of the film plane (tiled export)
   const DeviceDisplay* disp = nullptr;
   float strength = 1.f;
-  FramePlan mainPlan;  // P without the vignette: the normal branch of a blend (the vignette follows the blend)
   int filmOx = 0, filmOy = 0;  // frame coordinates of pixel (0, 0) of filmH
   bool filmClamped = false;    // the film plane is already clamped to 0..1 (a pure-clamp film_fin is skipped)
   filmnode::FilmPre pre;
 
-  Walk(GpuRecorder& rec, const GpuRun& run, float resizeSharpen, bool wholeFrame)
-      : r(rec), in(run), P(run.frame), R(spatialRadii(run.frame, resizeSharpen)), whole(wholeFrame) {
-    grainArgs(P, ep.amp, ep.period);
-    ep.grain = P.grain > 0;
+  Walk(GpuRecorder& rec, const GpuRun& run, bool wholeFrame)
+      : r(rec), in(run), P(run.frame), R(spatialRadii(run.frame, run.blocks)), whole(wholeFrame) {
+    ep.amp = in.blocks.grain.amp;
+    ep.period = in.blocks.grain.period;
+    ep.grain = in.blocks.grain.active();
   }
 
   int gridW() const { return glob && !whole ? glob->lw : cdiv(work.w(), 4); }
@@ -1125,9 +1125,7 @@ struct Executor::Walk {
   // the normal branch of a film frame at strength < 1 (Gain + ToneColour(Exact) through the lattice, no vignette): RGBA16F working image
   H mainBranch(int W, int Hh, int ox, int oy) {
     if (lut.n < 2) return r.err = "film blend without a colour lattice", -1;
-    mainPlan = P;
-    mainPlan.vignette = 0.f;
-    PointNode pn{&mainPlan, src, lut, W, Hh, ox, oy, Epilogue{}};
+    PointNode pn{&P, src, lut, W, Hh, ox, oy, Epilogue{}};  // no vignette: it follows the blend
     pn.ldesc = ldesc;  // the normal branch of a blend gets the same local adjustments (its amounts were written by the film input pass)
     pn.lplanes = lplanes;
     GpuPorts ports;
@@ -1156,7 +1154,7 @@ struct Executor::Walk {
     u.geoB[3] = P.stepY;
     u.geoC[0] = P.fullW;
     u.geoC[1] = P.fullH;
-    u.geoC[2] = P.vignette;
+    u.geoC[2] = in.blocks.vignette.amount;
     u.e[0] = e.amp;
     u.e[1] = e.period;
     const bool blend = main >= 0;
@@ -1239,32 +1237,35 @@ struct Executor::Walk {
           rs.point.lplanes = lplanes;
           rs.point.aux0 = needAux ? aux0 : -1;
           rs.point.aux1 = needAux ? aux1 : -1;
+          rs.point.vig = &in.blocks.vignette;
           res = &rs.point;
           ports.out[0] = D;
           impl = gpuImplFor(NodeType::ToneColour);  // the point recipe, whichever node of the chain comes first (Resize has no record function of its own)
           break;
         case NodeType::NRLuma:
-          new (&rs.nrl) NrLumaNode{&P, &R, W, Hh, ox, oy, e};
+          new (&rs.nrl) NrLumaNode{&in.blocks.nrLuma, W, Hh, ox, oy, e};
           res = &rs.nrl;
           ports.in[0] = D;
           break;
         case NodeType::NRChroma:
-          new (&rs.nrc) NrChromaNode{&P, &R, W, Hh, ox, oy, e};
+          new (&rs.nrc) NrChromaNode{&in.blocks.nrChroma, W, Hh, ox, oy, e};
           res = &rs.nrc;
           ports.in[0] = D;
           break;
         case NodeType::Dehaze: {
-          const H dcH = P.dehaze > 0 ? (whole ? dc : (glob ? glob->dc : -1)) : -1;
-          if (P.dehaze > 0 && dcH < 0) return r.err = "dehaze solve missing from the plan", false;
-          new (&rs.dz) DehazeNode{&P, W, Hh, ox, oy, gridW(), gridH(), dcH, e};
+          const dehaze::Block& db = in.blocks.dehaze;
+          const H dcH = db.solve() ? (whole ? dc : (glob ? glob->dc : -1)) : -1;
+          if (db.solve() && dcH < 0) return r.err = "dehaze solve missing from the plan", false;
+          new (&rs.dz) DehazeNode{&db, W, Hh, ox, oy, gridW(), gridH(), dcH, e};
           res = &rs.dz;
           ports.in[0] = D;
           break;
         }
         case NodeType::Detail: {
-          const H abH = P.clarity != 0 ? (whole ? ab : (glob ? glob->ab : -1)) : -1;
-          if (P.clarity != 0 && abH < 0) return r.err = "clarity solve missing from the plan", false;
-          new (&rs.dt) DetailNode{&P, &R, W, Hh, ox, oy, gridW(), gridH(), abH, e};
+          const engine::detail::Block& db = in.blocks.detail;
+          const H abH = db.solve() ? (whole ? ab : (glob ? glob->ab : -1)) : -1;
+          if (db.solve() && abH < 0) return r.err = "clarity solve missing from the plan", false;
+          new (&rs.dt) DetailNode{&db, W, Hh, ox, oy, gridW(), gridH(), abH, e};
           res = &rs.dt;
           ports.in[0] = D;
           break;
@@ -1302,10 +1303,10 @@ struct Executor::Walk {
   bool solve(const Stage& st) {
     const NodeType t = typeOf(st.solveNode);
     if (t == NodeType::Dehaze) {
-      dc = recordDehazeAnalysis(r, R, col, gridW(), gridH());
+      dc = recordDehazeAnalysis(r, in.blocks.dehaze, col, gridW(), gridH());
       return dc >= 0;
     }
-    ab = recordClarityAnalysis(r, R, yy, gridW(), gridH());
+    ab = recordClarityAnalysis(r, in.blocks.detail.guidedRadius, yy, gridW(), gridH());
     return ab >= 0;
   }
 };
@@ -1403,8 +1404,7 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   rec.gBuf = core().gBuf;
   rec.partBuf = core().partBuf;
 
-  const bool down = P.srcW < W_ || P.srcH < H_;
-  Walk w(rec, in, down ? in.resizeSharpen : 0.f, true);
+  Walk w(rec, in, true);  // the output sharpening after a downscale is part of the Detail block (FrameFacts::resizeSharpen)
   w.interior = w.work = WRect{0, 0, fw, fh};
   w.src.img = g.external(*S);
   if (L) w.lut = lutBind(g, *L);
@@ -1547,8 +1547,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   if (!in.target.sink) return fail(GpuFailure::Unsupported, "no tile sink"), Status::Unsupported;
   const int rw = P.srcW, rh = P.srcH;
   const bool down = rw < W_ || rh < H_;
-  const float rsharp = down ? in.resizeSharpen : 0.f;
-  const SpatialRadii R = spatialRadii(P, rsharp);
+  const SpatialRadii R = spatialRadii(P, in.blocks);
   const int maxDim = int(d.caps().maxImage2D);
   int tile = std::max(64, in.plan.grid.tile / 4 * 4);
   while (tile + 2 * R.halo > maxDim && tile > 64) tile = std::max(64, (tile / 2) / 4 * 4);
@@ -1640,7 +1639,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     rec.boxScanMin = core().boxScanOk ? -1 : 0;
     rec.gBuf = core().gBuf;
     rec.partBuf = core().partBuf;
-    Walk wp(rec, in, rsharp, true);
+    Walk wp(rec, in, true);
     wp.interior = wp.work = WRect{0, 0, P.outW, P.outH};
     wp.src.img = g.external(*S);
     if (HD && P.warp.active()) wp.src.warp = g.externalBuf(HD->buf), wp.src.warpOff = warpOff;
@@ -1755,7 +1754,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     rec.partBuf = core().partBuf;
     rec.allocW = int(pool.bucket(std::uint32_t(std::min(P.outW, tile + 2 * R.halo))));
     rec.allocH = int(pool.bucket(std::uint32_t(std::min(P.outH, tile + 2 * R.halo))));
-    Walk w(rec, in, rsharp, false);
+    Walk w(rec, in, false);
     w.interior = interior;
     w.work = work;
     if (L) w.lut = lutBind(g, *L);
@@ -1850,11 +1849,11 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     rec.W = glw;
     rec.H_ = glh;
     if (dehaze) {
-      const H dc = recordDehazeAnalysis(rec, R, gl.color, glw, glh);
+      const H dc = recordDehazeAnalysis(rec, in.blocks.dehaze, gl.color, glw, glh);
       if (dc < 0) return fail(GpuFailure::Transient, err);
       g.copyImage(dc, gl.dc, std::uint32_t(glw), std::uint32_t(glh));
     } else {
-      const H ab = recordClarityAnalysis(rec, R, gl.yy, glw, glh);
+      const H ab = recordClarityAnalysis(rec, in.blocks.detail.guidedRadius, gl.yy, glw, glh);
       if (ab < 0) return fail(GpuFailure::Transient, err);
       g.copyImage(ab, gl.ab, std::uint32_t(glw), std::uint32_t(glh));
     }

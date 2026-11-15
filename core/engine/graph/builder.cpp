@@ -1,6 +1,7 @@
 // GraphBuilder: EditParams + FrameRequest + SessionCtx -> Graph (docs/engine/pipeline-architecture.md 4.5, 4.6).
 // A pure function; nothing is executed here.
 #include "engine/graph/graph.h"
+#include "engine/nodes/frame_blocks.h"
 
 namespace dapple::engine {
 
@@ -64,7 +65,7 @@ NodeId addFilm(Graph& g, NodeId cur, GraphDetail detail) {
 
 }  // namespace
 
-Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePlan* plan) {
+Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePlan* plan, const FrameBlocks* blocks) {
   Graph g;
   const FrameRequest& f = ps.frame();
   const ParamInputs& in = ps.inputs();
@@ -89,6 +90,8 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
   // ---- Full: every stage of the frame as its own node ---------------------------------------------------------------
   FramePlan fallback;
   const FramePlan& fp = plan ? *plan : fallback;
+  const FrameBlocks noBlocks;
+  const FrameBlocks& fb = blocks ? *blocks : noBlocks;
   const EditParams& e = ps.edit();
   NodeId cur = g.add(NodeType::Resize, {Edge{src}});
   if (fp.useGeo) cur = g.add(NodeType::Geometry, {Edge{cur}});
@@ -143,15 +146,15 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
     if (t.hasOverflow && !needMain) g.markOutput(t.overflow, OutputRole::Table);
   }
 
-  if (fp.vignette != 0.f) cur = g.add(NodeType::Vignette, {Edge{cur}});
-  if (fp.nrLuma > 0.f) cur = g.add(NodeType::NRLuma, {Edge{cur}});
-  if (fp.nrColor > 0.f) cur = g.add(NodeType::NRChroma, {Edge{cur}});
-  if (fp.dehaze != 0.f) cur = g.add(NodeType::Dehaze, {Edge{cur}});
-  if (fp.clarity != 0.f || fp.texture != 0.f || fp.sharpen > 0.f || fp.resizeSharpen > 0.f) cur = g.add(NodeType::Detail, {Edge{cur}});
+  if (!vignette::behaviour().isIdentity(&fb.vignette)) cur = g.add(NodeType::Vignette, {Edge{cur}});
+  if (!nr::lumaBehaviour().isIdentity(&fb.nrLuma)) cur = g.add(NodeType::NRLuma, {Edge{cur}});
+  if (!nr::chromaBehaviour().isIdentity(&fb.nrChroma)) cur = g.add(NodeType::NRChroma, {Edge{cur}});
+  if (!dehaze::behaviour().isIdentity(&fb.dehaze)) cur = g.add(NodeType::Dehaze, {Edge{cur}});
+  if (!detail::behaviour().isIdentity(&fb.detail)) cur = g.add(NodeType::Detail, {Edge{cur}});
   if (fp.local && fp.localDetail) cur = g.add(NodeType::LocalDetail, {Edge{cur}});
   // 4.6 / section 14 (Q8): grain is dropped at the interactive tier unless a grain-family slider is being dragged
   const bool keepGrain = f.interactive && grainFamily(f.activeParam) && e.grain > 0.f;
-  if (fp.grain > 0.f || keepGrain) cur = g.add(NodeType::Grain, {Edge{cur}});
+  if (!grain::behaviour().isIdentity(&fb.grain) || keepGrain) cur = g.add(NodeType::Grain, {Edge{cur}});
   cur = g.add(NodeType::Pack8, {Edge{cur}});
   g.markOutput(cur, OutputRole::Frame);
   return g;
