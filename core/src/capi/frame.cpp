@@ -36,7 +36,7 @@ class RenderThread {
   }
   void loop() {
     if (sys::topology().hetero() && !std::getenv("DAPPLE_THREADS")) sys::setAffinity(sys::topology().perf);
-    sys::setInteractivePriority();
+    sys::setInteractivePriority(false);
     tid_.store(sys::gettid_());
     sys::g_class = 1;
     std::unique_lock<std::mutex> lock(m_);

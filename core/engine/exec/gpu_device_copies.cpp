@@ -110,6 +110,7 @@ std::shared_ptr<const hal::ImageH> Executor::resizedSource(int w, int h) {
   if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
   if (s != hal::Status::Ok) return failStatus(s, err), nullptr;  // r retires its image
   r->used = ++rs_->tick;
+  ++resizeBuilt_;
   if (rs_->resized.size() >= 2) {  // retired when the last frame holding it (another executor's export between two tiles) lets go
     auto victim = std::min_element(rs_->resized.begin(), rs_->resized.end(), [](auto& a, auto& b) { return a->used < b->used; });
     rs_->resized.erase(victim);
@@ -118,9 +119,20 @@ std::shared_ptr<const hal::ImageH> Executor::resizedSource(int w, int h) {
   return std::shared_ptr<const hal::ImageH>(r, &r->img);
 }
 
-// Uploads `bytes` of `data` into `dst` through the slot's staging buffer and waits for it.
+// A table / buffer upload submitted by this frame (section 56): Vulkan starts every command buffer with a memory barrier over all earlier submissions and
+// GLES runs one context in order, so the frame that reads the copy is ordered after it on the GPU, and the slot's staging memory is written again only
+// after begin() waited for that slot. The CPU does not wait for the copy there: on the Note10+ app every such wait sat behind the GPU work queued ahead
+// (the previous frame, the keep-warm units, after a pause the wake-up) and cost a drag frame 10 - 44 ms. Metal (not built here) keeps the wait.
+hal::Status Executor::settleUpload(hal::FenceH f) {
+  if (ctx_->api() == hal::Api::Vulkan || ctx_->api() == hal::Api::Gles31) return hal::Status::Ok;
+  return dev().wait(f, kWaitNs);
+}
+
+// Uploads `bytes` of `data` into `dst` through the slot's staging buffer (see settleUpload for the wait).
 bool Executor::upload(hal::BufferH dst, const void* data, std::size_t bytes) {
+  const auto tb = Clock::now();
   auto cl = dev().begin();
+  bufBeginMs_ += msSince(tb);
   if (!cl) return failStatus(hal::Status::Timeout, "");
   std::string err;
   if (!core().ensureStaging(cl->slot(), (bytes + 255) / 256 * 256, err)) return fail(GpuReason::OutOfMemory, err);
@@ -131,7 +143,9 @@ bool Executor::upload(hal::BufferH dst, const void* data, std::size_t bytes) {
   g.copyBufferToBuffer(sr.staging, g.externalBuf(dst), dst.bytes, 0);
   hal::FenceH f;
   hal::Status s = submit(g, *cl, &f, err);
-  if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
+  const auto tw = Clock::now();
+  if (s == hal::Status::Ok) s = settleUpload(f);
+  bufWaitMs_ += msSince(tw);
   return s == hal::Status::Ok || failStatus(s, err);
 }
 
@@ -197,7 +211,7 @@ std::shared_ptr<DeviceTables> Executor::ensureTables(const GpuRun& in) {
   g.copyBufferToImage(sr.staging, g.external(L->lat2), kLat2N, kLat2N, kLat2N, latBytes);
   hal::FenceH f;
   s = submit(g, *cl, &f, err);
-  if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
+  if (s == hal::Status::Ok) s = settleUpload(f);
   if (s != hal::Status::Ok) return failStatus(s, err), nullptr;
 
   ResultCache::Entry e;
@@ -358,8 +372,10 @@ std::shared_ptr<DeviceFilm> Executor::ensureFilm(const filmnode::FilmResolved& r
   if (film_ && film_->epoch == epoch_ && film_->tb.raw == tb.raw && film_->tb.curves == tb.curves && film_->tb.print != tb.print && film_->haveTables &&
       !std::getenv("DAPPLE_FILM_LUT_INPLACE_OFF")) {
     std::string uerr;
-    if (r.quality == 1 && film_->gt.lutN == tb.print->t.lutN && !std::getenv("DAPPLE_FILM_LUT_SYNC")) {
-      // interactive frame: fence and swap, no wait on the frame thread; the frame shows the table that is bound now (the next landing is one frame behind)
+    if (r.quality == 1 && !std::getenv("DAPPLE_FILM_LUT_SYNC")) {
+      // interactive frame: fence and swap, no wait on the frame thread; the frame shows the table that is bound now (the next landing is one frame behind).
+      // Also when the size changes (the settled frame's exact 33^3 -> the drag's coarse 17^3): the frame passes take the size from the bound table, and the
+      // synchronous path below waited for all GPU work (updateGpuPrintLut: waitAll), 28 - 38 ms on the first film drag frame on the Note10+ (section 56).
       if (!film_->gt.lutNextActive) filmnode::startGpuPrintLutUpdate(core(), tb, film_->gt, uerr);
       tb.print = film_->tb.print;
     } else {
@@ -469,7 +485,7 @@ std::shared_ptr<DeviceDisplay> Executor::ensureDisplay(const GpuRun& in) {
   g.copyBufferToImage(sr.staging, g.external(t->lut), std::uint32_t(n), std::uint32_t(n), std::uint32_t(n), curveBytes);
   hal::FenceH f;
   s = submit(g, *cl, &f, err);
-  if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
+  if (s == hal::Status::Ok) s = settleUpload(f);
   if (s != hal::Status::Ok) return failStatus(s, err), nullptr;
   ResultCache::Entry e;
   e.slot = kDeviceDisplaySlot;

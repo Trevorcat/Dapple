@@ -1,5 +1,43 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (56) In-app X-Trans node choice and drag start, measured and fixed (pipeline-architecture.md section 56)
+
+Release APKs of the working tree on 63244fc+, `install -r` only, Note10+ RFCMA05Q5ZX, taps only; scripts, logs, `an_*.py` in `build/perf-20261116f/`. Builds: `before.apk` (diagnostics only), `a1`/`a2` (placement fix; a2 + piggyback fix), `a3` (small first keep-warm units), `a4` (no CPU waits for uploads), `a5` (+ film LUT size change asynchronous; final). Native binaries `build/sched-arm64` under `/data/local/tmp/sch` (removed). State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 28.2-28.8 C, `Thermal Status 0`, no reboot. Props `debug.dapple.frame_profile`, `debug.dapple.diag_sched`, `debug.dapple.diag_upload` set during runs and reset to empty. Files: public samples as `T1116f_{6700.ARW,xs10.RAF,xt50.RAF}`, scanned with `MEDIA_SCANNER_SCAN_FILE`.
+
+### Thread placement (`dapple_sched` / probe lines; nice, allowed-cpu mask)
+| | app before | native | app after |
+|---|---|---|---|
+| verdict probe thread | **nice 10, mask f (cpus 0-3)**: the idle region warm-up thread (`dapple_thread_background`) | nice 0, mask df | before the probe nice 10 / f, **during it nice 0, mask 6f-ff** |
+| verdict (frame) | GPU 332 vs **CPU 1024** ms -> GPU (half path GPU 113 vs CPU 238) | GPU 323 vs CPU 221 -> CPU | GPU 334 vs **CPU 224** -> **CPU** (half GPU 97 vs CPU 52) |
+| frame pool workers | **nice 10** (inherited from a thumbnail thread), mask f0 | nice 0 | **nice 0**, mask f0 |
+| background pool workers | nice -10 (inherited from a Flutter thread) | 0 | 0 |
+| render thread | nice -10, mask f0 (30-70 while core control isolates cores) | | unchanged |
+| fixed workload (256 chunks) | pool 27-55 ms, threads spawned from the frame thread 38-64 ms, single big core 9-13 ms per 32 chunks | spawned from the probe thread 26 ms | pool 27-36 ms; probe thread during the probe 25-26 ms |
+cpusets: `top-app` 0-7, `foreground` 0-2,4-7, `background` 0-3; every app thread was in `/top-app`. The masks of pinned threads lacked 1-3 big cores at times (Qualcomm core control isolates idle cores: 30 / 50 / 6f). The native probe saw the same (df). One first measurement after the placement fix was refused because the mask then lacked cpus 4 and 7. That check was relaxed (section 56) and the next build cached its first probe.
+
+### X-Trans export (exp.sh, one exposure swipe, tap to the `export_jpeg` line; 3 reps; no `gpu node` line = CPU node)
+| | before (63244fc section) | after (a2) | after (a5) |
+|---|---|---|---|
+| X-S10 26 MP | 6.42-6.51 s, demosaic 4.91-4.96 s GPU | 3.51 / 3.67 / 3.55 s, demosaic 2.03-2.14 s **CPU** | **3.65 / 3.50 / 3.52 s**, demosaic 2.06-2.09 s CPU |
+| X-T50 40 MP | 10.29-10.39 s, demosaic 7.56-7.62 s GPU | 5.71 / 5.77 / 5.86 s, demosaic 3.06-3.11 s CPU | **6.08 / 5.84 / 5.87 s**, demosaic 3.14-3.35 s CPU |
+RSS max 871-879 MB (X-S10) and 1108-1119 MB (X-T50), as before. The a5 X-S10 and X-T50 exports were checked by eye, whole picture and a 512 px centre crop: no artefacts.
+
+### First frame of a drag (A6700, drag.sh: 2.3 s pause, 700 ms swipe; ms, first frame median [min-max] / median of the other frames; view latency first / rest)
+| drag | before (63244fc) | after |
+|---|---|---|
+| exposure, no film, 20 | 64.8 / 15.3; latency 79.9 / 29.1 | **15.4 [7.1-31.1] / 8.9**; tables 14.6 / 6.3, upload 0.3 / 0.3, exec 0.5 / 0.5; latency 25.8 / 22.3 (a4) |
+| colour pad, no film, 20 | 131.1 / 49.5; tables 40.5 / 31.2 | **45.7 [35.4-61.6] / 33.1**; tables **41.8 / 28.9**, upload 1.5 / 1.3; latency 59.4 / 46.8 (a4, rung 1080) |
+| tone, no film, 20 | 68.8 / 13.3 (5 drags) | **14.0 [7.4-31.7] / 9.4**; tables 12.8 / 6.9; latency 27.7 / 23.3 (a4) |
+| exposure + film, 20 | 97.7 / 23.0 (10 drags) | **30.5 [16.4-111.1] / 14.0**; tables 26.4 / 13.1, upload 0.4 / 0.0; latency 39.7 / 27.7 (a5; one first frame over 100 ms) |
+The parts of the first frame (`diag_upload`, 8 drags per build, exposure): before, `sub` was 26.8-31.1 ms. Recording took 0.1 ms and `vkQueueSubmit` 0.1 ms; the rest was the keep-warm piggyback's third unit waiting in `begin()` for the frame's own slot. The tone-table upload waited 20-44 ms for its fence. No resized-source rebuilds after the first drag of the photo (`rsz 0`) and no new pool images (`poolNew 0`). The keep-warm windows show the first 256 KB-4 MB unit at 37-545 MB/s after the pause, against `lowMBps` 4.5-5.7 GB/s. After the piggyback fix the first frame was 44.1 ms. With small first units it was 34.5 ms. Without the CPU upload wait it was 15.4 ms. Film: the first drag frame's `ensureFilm` took 28-38 ms (the print LUT changed size from 33^3 to 17^3, then the synchronous update and `waitAll`). With a5 the upload is 0.4 ms. The no-film rows were measured with a4. a5 only changes the film path. The rungs were 1080 (and 810 / 640), where 63244fc used 810: the preview size controller picks a larger rung now that frames are faster.
+Colour-pad tables: 28.9 ms per drag frame at the 1080 rung, 31.2 ms before at 810. The thread placement fix did not change it (pool workload 27-36 ms vs 27-55 ms).
+
+### Not measured / open
+GLES in the app. The first X-Trans export of a fresh install without the region warm-up. The probe always ran from the warm-up here. A probe refused under load and measured again on the export was not observed in the app (it is the desktop test `demosaic.gpu_verdict`). The CPU table stage after a pause is still about 2x a later frame. That remains the gap in the first frame.
+
+### Cleanup
+`adb -s RFCMA05Q5ZX shell rm /sdcard/Pictures/DappleT1116f/T1116f_*`, `rmdir /sdcard/Pictures/DappleT1116f`, `rm /sdcard/Pictures/Dapple/T1116f_*`, `rm -r /data/local/tmp/sch`. The two permitted `ls` forms report both paths absent. Props reset (read back empty). Screenshots of Dapple's UI deleted after reading. One screenshot showed the phone dialer and was deleted at once. During an `install -r` the app was not in front and four taps landed in the dialer: it showed `++++`; no call was placed and nothing else was opened. The app's library still lists the test photos.
+
 ## 2026-11-16 (63244fc) X-Trans export, drag start, session growth
 
 Release APK of HEAD 63244fc (built 05:25, `install -r` at 05:26), Note10+ RFCMA05Q5ZX, taps only, scripts / logs / `an_*.py` in `build/perf-20261116e/`. State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 25.7 C at start, 30.6 C at the end, `Thermal Status 0`, all 8 cores online, no reboot, `debug.dapple.frame_profile` set to 1 and reset to empty. Files: public samples as `T1116e_{xs10.RAF,xt50.RAF,6700.ARW,7rm4.ARW}` (no-film export, one small exposure swipe before the export as in the earlier runs unless noted). No crash, ANR, `exec=cpu`, `reason=` or GPU error line in any log (13 exports, 45 + 10 drags, 2236 growth frames).

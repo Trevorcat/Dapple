@@ -6,6 +6,7 @@
 // Kernels stay pure per-tile functions; none of this touches pixel code.
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -126,13 +127,24 @@ inline void cpuRelax() {
 // the UI thread always wins a core): native frame time rose (27 -> 43 ms median, N5 profile, together with other
 // changes) and UI-thread jank did not improve (mid profile 13.9% -> 19%); with barrier-synchronised passes a
 // preempted low-priority worker holding the last chunk stalls the whole pass. Kept as a single switch point.
+//
+// A thread inherits the nice value of the thread that creates it, so it is set explicitly (section 56): the frame pool is created by whichever
+// thread runs the first parallel job, in the app often a thumbnail or prefetch thread marked background (dapple_thread_background: nice 10). The
+// Note10+ app ran every frame-pool worker at nice 10 (and the background pool's at -10, created from a Flutter thread) where a native binary has 0.
+// `exact`: set kInteractiveNice whatever was inherited (pool workers); otherwise only a lower priority is raised to it (the render thread keeps a
+// higher priority it was started with).
 inline constexpr int kInteractiveNice = 0;
-inline void setInteractivePriority() {
+inline void setInteractivePriority(bool exact = true) {
 #if defined(__APPLE__)
   ::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+  (void)exact;
 #endif
 #ifdef DAPPLE_SYSPERF_LINUX
-  if (kInteractiveNice != 0) ::setpriority(PRIO_PROCESS, gettid_(), kInteractiveNice);
+  errno = 0;
+  const int cur = ::getpriority(PRIO_PROCESS, id_t(gettid_()));
+  if (errno == 0 && (exact ? cur != kInteractiveNice : cur > kInteractiveNice)) ::setpriority(PRIO_PROCESS, id_t(gettid_()), kInteractiveNice);
+#else
+  (void)exact;
 #endif
 }
 

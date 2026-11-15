@@ -241,6 +241,9 @@ class Device {
   // Takes the next frame slot of the ring and waits for its previous work; null on timeout / device loss. Not thread-safe (no
   // Device call is): the engine calls the device only inside a device turn (gpu::DeviceGate, pipeline-architecture.md 52).
   virtual std::unique_ptr<CommandList> begin() = 0;
+  // True when begin() would block now: the slot it takes next still has work on the GPU. Optional work (the keep-warm units queued behind a frame) asks
+  // first and is skipped instead of making the frame's thread wait (section 56).
+  virtual bool nextSlotBusy() = 0;
   virtual Status submit(CommandList&, FenceH* signal) = 0;
   virtual Status wait(FenceH, std::uint64_t timeoutNs) = 0;
   virtual bool poll(FenceH) = 0;

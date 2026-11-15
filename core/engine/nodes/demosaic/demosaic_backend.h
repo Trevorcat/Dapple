@@ -30,6 +30,8 @@ GpuBackend* gpuBackend();
 #ifdef DAPPLE_HAVE_GPU
 // Defined in dapple_gpu (demosaic_gpu.cpp): creates the backend (own device, created on first use) and registers it. Idempotent.
 void installGpuBackend();
+// Tests: called by the verdict probe once it has judged the conditions it starts under, before it times anything (null = none).
+void setProbeStartHookForTest(void (*hook)());
 #endif
 
 }  // namespace dapple::demosaic

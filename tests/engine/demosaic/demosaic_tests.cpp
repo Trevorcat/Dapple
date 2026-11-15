@@ -713,6 +713,84 @@ int testWireCancel() {
 }
 
 #ifdef DAPPLE_HAVE_GPU
+// The node verdict (pipeline-architecture.md 32.11, 56): a probe measured under load (here a finger on a control for the whole probe) is used but not cached
+// on disk; the next use measures again and caches that one. Before section 56 the first measurement was cached whatever it was measured under (the
+// Note10+ app cached a CPU time taken at nice 10 on the efficiency cores and exported X-Trans on the slower GPU node ever after).
+int testGpuVerdict() {
+  std::string why;
+  if (!makeDevice(why)) return 77;
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("dapple_verdict_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(dir);
+  engine::gpu::configure(dir.string(), "verdict-test", "verdict-fp");
+  setEnvVar("DAPPLE_DEMOSAIC_PROBE_SMALL", "1");
+  engine::gpu::setRuntimeEnabled(1);
+  demosaic::installGpuBackend();
+  GpuBackend* b = demosaic::gpuBackend();
+  CHECK(b != nullptr, "no backend");
+  if (!b) return 1;
+  if (!b->available(why)) {  // the backend's own device selection (no software device): skipped
+    std::printf("  backend unavailable: %s\n", why.c_str());
+    demosaic::setGpuBackend(nullptr);
+    return 77;
+  }
+  auto files = [&] {
+    int n = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) n += e.path().filename().string().rfind("demosaic_verdict_", 0) == 0 ? 1 : 0;
+    return n;
+  };
+  Synth s(96, 64, Cfa::Bayer, zoneScene(96, 64));
+  // the injected load: a finger on a control when the probe starts (it waits 0.2 s here, 3 s in the app, then measures anyway); lifted as soon as the probe
+  // has judged its start, so the node's per-tile waits for the finger do not make the test slow
+  demosaic::setInteraction(true);
+  demosaic::setProbeStartHookForTest([] { demosaic::setInteraction(false); });
+  const auto t0 = std::chrono::steady_clock::now();
+  b->prefer(s.d, {0, 0, s.w, s.h}, why);
+  demosaic::setProbeStartHookForTest(nullptr);
+  demosaic::setInteraction(false);
+  std::printf("  probe under load: %.1f s, verdict files %d\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), files());
+  CHECK(files() == 0, "a verdict measured under load was cached");
+  b->prefer(s.d, {0, 0, s.w, s.h}, why);
+  std::printf("  probe at idle: verdict files %d\n", files());
+  CHECK(files() == 1, "the verdict measured at idle was not cached (%d files)", files());
+  demosaic::setGpuBackend(nullptr);
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  return g_fail ? 1 : 0;
+}
+
+// hal::Device::nextSlotBusy (section 56): false on an idle device and after waitAll; whenever it says false, the next begin() finds its slot finished
+// (the keep-warm units queued behind a frame ask it instead of blocking the frame's thread in begin()). Runs on whichever back end the selection takes.
+int testGpuSlots() {
+  std::string why;
+  auto dev = makeDevice(why);
+  if (!dev) return 77;
+  CHECK(!dev->nextSlotBusy(), "idle device reports a busy slot");
+  hal::BufferDesc bd;
+  bd.kind = hal::MemKind::DeviceLocal;
+  bd.storage = true;
+  bd.bytes = 32ull << 20;
+  hal::BufferH a, b;
+  CHECK(dev->createBuffer(bd, &a) == hal::Status::Ok && dev->createBuffer(bd, &b) == hal::Status::Ok, "buffers");
+  if (!a || !b) return 1;
+  int busySeen = 0, freeSeen = 0;
+  for (int i = 0; i < 12; ++i) {
+    const bool busy = dev->nextSlotBusy();
+    (busy ? busySeen : freeSeen)++;
+    auto cl = dev->begin();
+    CHECK(cl != nullptr, "begin");
+    if (!cl) break;
+    cl->copyBufferToBuffer(a, b, bd.bytes, 0);
+    hal::FenceH f;
+    CHECK(dev->submit(*cl, &f) == hal::Status::Ok, "submit");
+  }
+  CHECK(dev->waitAll() == hal::Status::Ok, "waitAll");
+  CHECK(!dev->nextSlotBusy(), "busy after waitAll");
+  std::printf("  %s: next slot busy before %d of 12 begins (32 MB copies back to back), free %d\n", dev->caps().name.c_str(), busySeen, freeSeen);
+  dev->destroy(a);
+  dev->destroy(b);
+  return g_fail ? 1 : 0;
+}
+
 // the decoder's GPU path: backend installed (own device), runtime switch on; a region and the full picture against the CPU node
 int testWireGpu() {
   const auto files = sampleFiles();
@@ -1268,7 +1346,7 @@ int testHalfGpu() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::vector<std::string> all = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "wire_arw2", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu", "half_zone", "half_tiles", "half_flatclip", "half_real", "half_gpu"};
+  const std::vector<std::string> all = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "wire_arw2", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu", "gpu_verdict", "gpu_slots", "half_zone", "half_tiles", "half_flatclip", "half_real", "half_gpu"};
   std::vector<std::string> ids;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--list") {
@@ -1315,6 +1393,8 @@ int main(int argc, char** argv) {
     else if (id == "gpu_real") { const int r = testGpuReal(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "half_gpu") { const int r = testHalfGpu(); if (r == 77 && g_fail == before) return 77; }
     else if (id == "wire_gpu") { const int r = testWireGpu(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "gpu_verdict") { const int r = testGpuVerdict(); if (r == 77 && g_fail == before) return 77; }
+    else if (id == "gpu_slots") { const int r = testGpuSlots(); if (r == 77 && g_fail == before) return 77; }
 #else
     else if (id.rfind("gpu_", 0) == 0) return 77;
 #endif

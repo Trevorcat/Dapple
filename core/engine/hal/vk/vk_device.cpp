@@ -167,6 +167,7 @@ class VkDev final : public Device {
   Status submit(CommandList&, FenceH*) override;
   Status wait(FenceH, std::uint64_t timeoutNs) override;
   bool poll(FenceH) override;
+  bool nextSlotBusy() override;
   Status waitAll() override;
   void waitIdle() override;
   const std::vector<PassTime>& passTimes(FenceH f) const override { return slots_[f.slot < kSlots ? f.slot : 0].times; }
@@ -1217,6 +1218,12 @@ Status VkDev::wait(FenceH f, std::uint64_t ns) {
   if (s.gen != f.gen) return Status::Ok;  // the slot was reused: that submission finished long ago
   return waitSlot(s, ns);
 }
+bool VkDev::nextSlotBusy() {
+  if (lost_) return false;
+  const Slot& s = slots_[nextSlot_];
+  return s.inFlight && vkGetFenceStatus(dev_, s.fence) != VK_SUCCESS;
+}
+
 bool VkDev::poll(FenceH f) {
   if (!f || f.slot >= std::uint32_t(kSlots)) return true;
   Slot& s = slots_[f.slot];

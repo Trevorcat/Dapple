@@ -92,6 +92,7 @@ int mapCoord(int i, int n, Cfa c);
 // A finger is on a control (the app sets this from pointer-down to the end of the drag, dapple_set_interaction): background tile loops (CPU and GPU) wait
 // between tiles, up to 2 s per tile, so a drag never competes with a region / preview decode that is in flight. Cancelled work stops waiting at once.
 void setInteraction(bool on);
+bool interactionActive();  // a finger is on a control (setInteraction)
 void yieldWhileInteracting(const std::atomic<std::uint64_t>* cancelCur, std::uint64_t cancelMine);
 
 // The scaled value of a raw sample at (x, y) (inside the mosaic): max(raw - black, 0) * wb / span, clipped to 1.

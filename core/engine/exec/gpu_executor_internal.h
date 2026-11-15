@@ -233,6 +233,7 @@ class Executor final : public IGpuExecutor {
   std::shared_ptr<DeviceFilm> ensureFilm(const filmnode::FilmResolved& r);
   std::shared_ptr<DeviceDisplay> ensureDisplay(const GpuRun& in);
   bool upload(hal::BufferH dst, const void* data, std::size_t bytes);
+  hal::Status settleUpload(hal::FenceH f);  // after an upload's submission: wait for it only where the back end needs it
 
   Status runWhole(const GpuRun& in, GpuOut& out);
   Status runTiled(const GpuRun& in, GpuOut& out);
@@ -246,6 +247,8 @@ class Executor final : public IGpuExecutor {
   SourceStore* store_ = nullptr;
   std::uint64_t srcId_ = 0;
   int W_ = 0, H_ = 0;
+  int resizeBuilt_ = 0;
+  double bufBeginMs_ = 0, bufWaitMs_ = 0;  // upload(): time in begin() / in the fence wait since the frame started (GpuStats)  // resized copies built by resizedSource since the frame started (GpuStats::resizeBuilt)
   std::shared_ptr<ResidentSource> rs_;
   std::shared_ptr<DeviceFilm> film_;
   // a tiled export's two readback buffers (a tile waits in one for the sink, outside the device turn, while the next is written into the

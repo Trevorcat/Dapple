@@ -40,8 +40,10 @@ class GpuPool {
   // allocation size for a requested dimension: a multiple of 32 (128 above 1024), within the device limit
   std::uint32_t bucket(std::uint32_t v) const;
   void clear();  // device rebuilt / lost: forget everything without touching the (dead) device
+  std::uint64_t created() const { return created_; }  // images created so far (inside device turns)
 
  private:
+  std::uint64_t created_ = 0;
   struct E {
     ImageH im;
     std::uint64_t lastUse = 0;
@@ -129,5 +131,10 @@ const std::vector<PassLog>& lastPassLog();
 
 // Convenience: record + submit + (optionally) wait.
 hal::Status runGraph(hal::Device& dev, GpuGraph& g, hal::CommandList& cl, hal::FenceH* fence, std::string& err);
+// The calling thread's last runGraph split (ms): recording (submitGraph) and the queue submission (diagnostics, section 56).
+struct RunGraphSplit {
+  double recordMs = 0, queueMs = 0;
+};
+RunGraphSplit& lastRunGraphSplit();
 
 }  // namespace dapple::engine::gpu

@@ -182,6 +182,7 @@ class MetalDev final : public Device {
   Status submit(CommandList&, FenceH*) override;
   Status wait(FenceH, std::uint64_t timeoutNs) override;
   bool poll(FenceH) override;
+  bool nextSlotBusy() override;
   Status waitAll() override;
   void waitIdle() override;
   const std::vector<PassTime>& passTimes(FenceH f) const override { return slots_[f.slot < kSlots ? f.slot : 0].times; }
@@ -901,6 +902,14 @@ Status MetalDev::wait(FenceH f, std::uint64_t ns) {
   if (s.gen != f.gen) return Status::Ok;
   return waitSlot(s, ns);
 }
+bool MetalDev::nextSlotBusy() {
+  if (lost_) return false;
+  Slot& s = slots_[nextSlot_];
+  if (!s.inFlight) return false;
+  std::lock_guard<std::mutex> lk(s.m);
+  return s.outstanding != 0;
+}
+
 bool MetalDev::poll(FenceH f) {
   if (!f || f.slot >= std::uint32_t(kSlots)) return true;
   Slot& s = slots_[f.slot];

@@ -23,6 +23,7 @@
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session_internal.h"
 #include "local_eval.h"
+#include "engine/exec/sched_diag.h"
 #include "parallel.h"
 #include "warp_field.h"
 
@@ -125,6 +126,49 @@ bool engineLogOn() {
 #endif
 }
 
+void diagLine(const std::string& l) {
+#if defined(__ANDROID__)
+  __android_log_print(ANDROID_LOG_INFO, "dapple_sched", "%s", l.c_str());
+#else
+  std::fprintf(stderr, "dapple_sched: %s\n", l.c_str());
+#endif
+}
+
+// debug.dapple.diag_sched / DAPPLE_DIAG_SCHED (section 56): at most every 2 s, from the thread that ran a frame, the placement of that thread and of
+// the pools' workers, and a fixed workload timed three ways (threads spawned by this thread on every cpu, this thread alone, the frame pool).
+void schedReport() {
+  static std::atomic<std::int64_t> last{0};
+  const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+  std::int64_t prev = last.load();
+  if (now - prev < 2000 || !last.compare_exchange_strong(prev, now)) return;
+  std::string l = "frame thread " + sched::describe(sched::placementOf());
+  auto pool = [&](const char* name, ThreadPool& p) {
+    l += std::string(" | ") + name + " " + std::to_string(p.size()) + ":";
+    for (int t : p.workerTids()) {
+      const sched::Placement q = sched::placementOf(t);
+      char b[96];
+      std::snprintf(b, sizeof b, " [n%d c%d %llx %s]", q.nice, q.cpus, (unsigned long long)q.mask, q.cpuset.c_str());
+      l += b;
+    }
+  };
+  pool("pool", ThreadPool::instance());
+  pool("bgpool", ThreadPool::background());
+  const double spawned = sched::fixedWorkMs(0), single = sched::fixedWorkMs(1, 32);
+  std::atomic<std::uint32_t> sink{0};
+  const auto t0 = Clock::now();
+  ThreadPool::instance().run(256, 1, [&](int a, int b) {
+    for (int i = a; i < b; ++i) {
+      float x = 1.0f + float(i) * 1e-6f, y = 0.999f;
+      for (int k = 0; k < 200000; ++k) x = x * y + 1e-4f, y = y * 0.99999f + 1e-5f;
+      sink.fetch_add(std::uint32_t(x * 1000.f), std::memory_order_relaxed);
+    }
+  });
+  const double onPool = msSince(t0);
+  char b[200];
+  std::snprintf(b, sizeof b, " | work256 spawned-all %.1f ms, pool %.1f ms, single-thread 32 chunks %.1f ms", spawned, onPool, single);
+  diagLine(l + b);
+}
+
 std::string jsonStr(const std::string& s) {
   std::string o;
   for (char c : s) {
@@ -176,6 +220,7 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
     g = L.gpu;
     cp = L.cpu;
   }
+  if (sched::diagSched()) schedReport();
   if (!doLog || !engineLogOn()) return;
   const SpatialQuality q = job.fastOptions.spatial;
   const char* tier = q == SpatialQuality::Interactive ? "interactive" : q == SpatialQuality::Full ? "full" : "off";
@@ -196,6 +241,18 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
     filmnode::filmAsyncTableStats(&su, &bk, &rq);
     const std::size_t len = std::strlen(line);
     if (len + 64 < sizeof line) std::snprintf(line + len, sizeof line - len, " | film_tables stale %llu baked %llu requested %llu", su, bk, rq);
+  }
+  if (onGpu && sched::diagUpload()) {  // debug.dapple.diag_upload (section 56): the parts of uploadMs, resized-source builds, pool image creations
+    const auto& g2 = out.gpu;
+    char u[300];
+    std::snprintf(u, sizeof u, "up res %.1f rsz %.1f(%d) film %.1f tab %.1f (begin %.1f wait %.1f) aux %.1f loc %.1f rec %.1f sub %.1f (graph %.1f queue %.1f) wait %.1f trim %.1f poolNew %d",
+                  g2.residentMs, g2.resizeMs, g2.resizeBuilt, g2.filmUpMs, g2.tablesUpMs, g2.bufBeginMs, g2.bufWaitMs, g2.auxMs, g2.localMs, g2.recordMs, g2.submitMs,
+                  g2.graphRecMs, g2.queueSubmitMs, g2.waitMs, g2.trimMs, g2.poolCreated);
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "dapple_engine", "frame %dx%d %s", out.w, out.h, u);
+#else
+    std::fprintf(stderr, "dapple_engine: frame %dx%d %s\n", out.w, out.h, u);
+#endif
   }
 #if defined(__ANDROID__)
   __android_log_print(ANDROID_LOG_INFO, "dapple_engine", "%s", line);

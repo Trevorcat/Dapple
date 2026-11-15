@@ -1,6 +1,7 @@
 #include "engine/exec/gpu_scheduler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +35,7 @@ Status GpuPool::acquire(Format f, std::uint32_t w, std::uint32_t h, ImageH* out)
   ImageH im;
   const Status s = d_.createImage({f, w, h, 1}, &im);
   if (s != Status::Ok) return s;
+  ++created_;
   pooled_ += im.bytes;
   all_.push_back({im, 0, false});
   *out = im;
@@ -434,14 +436,24 @@ Status submitGraph(GpuGraph& g, hal::CommandList& cl, std::string& err) {
   return cl.status();
 }
 
+RunGraphSplit& lastRunGraphSplit() {
+  static thread_local RunGraphSplit s;
+  return s;
+}
+
 Status runGraph(hal::Device& dev, GpuGraph& g, hal::CommandList& cl, hal::FenceH* fence, std::string& err) {
+  using Ck = std::chrono::steady_clock;
+  const auto t0 = Ck::now();
   Status s = submitGraph(g, cl, err);
+  const auto t1 = Ck::now();
+  lastRunGraphSplit().recordMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
   if (s != Status::Ok) {
     hal::FenceH f;
     dev.submit(cl, &f);  // closes the recording; the error status keeps it from reaching the queue
     return s;
   }
   s = dev.submit(cl, fence);
+  lastRunGraphSplit().queueMs = std::chrono::duration<double, std::milli>(Ck::now() - t1).count();
   if (s != Status::Ok) err = dev.lastError();
   return s;
 }

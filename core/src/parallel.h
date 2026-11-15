@@ -166,7 +166,12 @@ class ThreadPool {
   void loop(int idx) {
     unsigned seen = 0, warmSeen = 0;
     if (!std::getenv("DAPPLE_THREADS")) sys::setAffinity(sys::poolCpus(sys::topology()));
+    // both pools: normal priority (nice 0), not what the creating thread had (a background thread: nice 10); on Apple the background pool keeps utility QoS
+#if defined(__APPLE__)
     if (!bg_) sys::setInteractivePriority();
+#else
+    sys::setInteractivePriority();
+#endif
     {
       std::lock_guard<std::mutex> lock(mtx_);
       tids_.push_back(sys::gettid_());

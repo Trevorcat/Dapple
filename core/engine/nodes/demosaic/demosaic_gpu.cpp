@@ -1,6 +1,7 @@
 #include "engine/nodes/demosaic/demosaic_gpu.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <mutex>
 
 #include "engine/exec/gpu_runtime.h"
+#include "engine/exec/sched_diag.h"
 #include <cstdio>
 #include <filesystem>
 #include <map>
@@ -406,6 +408,10 @@ hal::Status GpuDemosaic::run(const Desc& d, Rect roi, float* out, std::size_t st
 // the executor (gpu_iface.h) hands out executors and Vulkan handles but no hal::Device; a second device in the process is cheap (the node needs 30 - 80 MB
 // of buffers) and keeps this file out of the executor's files. The runtime switch (dapple_gpu_set_enabled / DAPPLE_GPU / debug.dapple.gpu) is honoured.
 namespace {
+std::atomic<void (*)()>& probeStartHook() {
+  static std::atomic<void (*)()> h{nullptr};
+  return h;
+}
 class DeviceBackend final : public GpuBackend {
  public:
   bool available(std::string& why) override {
@@ -426,12 +432,18 @@ class DeviceBackend final : public GpuBackend {
     if (forced >= 0) return forced == 1 ? true : (why = "DAPPLE_DEMOSAIC_NODE=cpu", false);
     const bool hf = d.half && d.cfa == Cfa::XTrans;  // half-resolution path: its own verdict kind (docs 32.12), the roi is in half-resolution pixels
     const bool region = std::int64_t(roi.w()) * roi.h() * 2 < std::int64_t(d.width) * d.height / (hf ? 4 : 1);
+    if (engine::sched::diagSched() && !region) logLine("prefer() caller " + engine::sched::describe(engine::sched::placementOf()));
     std::lock_guard<std::mutex> lk(mu_);
     std::string w2;
     if (!ensure(w2)) return true;  // run() reports the failure
     const int key = int(d.cfa) * 8 + (d.xtMode >= 1 ? 4 : 0) + (d.hot ? 2 : 0) + (hf ? 64 : 0);
     auto it = verdicts_.find(key);
     if (it == verdicts_.end()) it = verdicts_.emplace(key, measure(d)).first;
+    else if (it->second.provisional && it->second.attempts < kMaxAttempts) {  // taken under load (not cached): measured again on a later use
+      const int n = it->second.attempts;
+      it->second = measure(d);
+      it->second.attempts = n + 1;
+    }
     const bool gpu = region ? it->second.region : it->second.full;
     if (!gpu) why = std::string("slower than the CPU node here (") + it->second.note + ")";
     return gpu;
@@ -464,8 +476,11 @@ class DeviceBackend final : public GpuBackend {
   }
 
  private:
+  static constexpr int kMaxAttempts = 3;  // measurements per process and kind while each one was contended
   struct Verdict {
     bool full = true, region = true;
+    bool provisional = false;  // measured under load (no full-speed placement, a finger on a control, unsteady CPU times): used now, not cached
+    int attempts = 1;
     double ms[4] = {0, 0, 0, 0};  // GPU frame, CPU frame, GPU region, CPU region
     std::string note;
   };
@@ -489,7 +504,7 @@ class DeviceBackend final : public GpuBackend {
     engine::gpu::cacheConfig(&dir, &app, &fp);
     char key[200];
     const bool hf = d.half && d.cfa == Cfa::XTrans;
-    std::snprintf(key, sizeof key, "%s|%s|%s|%s|%d|%d|%d|%d%s", fp.c_str(), app.c_str(), hal::apiName(dev_->caps().api), dev_->caps().key().c_str(), int(d.cfa), d.xtMode, d.hot ? 1 : 0, 2, hf ? "|half1" : "");
+    std::snprintf(key, sizeof key, "%s|%s|%s|%s|%d|%d|%d|%d%s", fp.c_str(), app.c_str(), hal::apiName(dev_->caps().api), dev_->caps().key().c_str(), int(d.cfa), d.xtMode, d.hot ? 1 : 0, 3, hf ? "|half1" : "");
     if (!dir.empty()) {
       char nm[96];
       std::snprintf(nm, sizeof nm, "demosaic_verdict_%016llx.txt", (unsigned long long)std::hash<std::string>{}(key));
@@ -506,9 +521,23 @@ class DeviceBackend final : public GpuBackend {
         }
       }
     }
+    // The probe times the CPU node at the placement real work gets (section 56): the caller may be a background thread (the app's idle region warm-up,
+    // a neighbour's prefetch: nice 10 on the efficiency cores, where the Note10+ measured the CPU node 4.8x slower than natively and chose the GPU).
+    // The CPU node runs on threads the calling thread spawns (they inherit its placement): nice 0 and every cpu for the probe's duration. A probe that
+    // could not get that, ran while a finger was on a control, or saw unsteady CPU times is used for now but not cached, and measured again later.
+    const bool small = std::getenv("DAPPLE_DEMOSAIC_PROBE_SMALL") != nullptr;  // tests: a smaller probe, a shorter wait
+    for (int w = 0; interactionActive() && w < (small ? 50 : 750); ++w) std::this_thread::sleep_for(std::chrono::milliseconds(4));  // up to 3 s for the finger to lift
+    engine::sched::FullSpeedScope place;
+    if (engine::sched::diagSched())
+      logLine("probe thread before " + engine::sched::describe(place.before()) + ", during " + engine::sched::describe(place.after()) + ", work256 spawned-all " +
+              std::to_string(int(engine::sched::fixedWorkMs(0))) + " ms");
+    std::string contended = place.ok() ? "" : "no full-speed placement (" + engine::sched::describe(place.after()) + ")";
+    if (interactionActive()) contended += contended.empty() ? "a finger on a control" : ", a finger on a control";
+    if (auto h = probeStartHook().load()) h();
     const int sizes[2][2] = {{2048, 1536}, {1024, 576}};
+    const int shrink = small ? 8 : 1;  // tests: the same probe on 1/8 of the edge
     for (int k = 0; k < 2; ++k) {
-      const int pw = sizes[k][0], ph = sizes[k][1];
+      const int pw = sizes[k][0] / shrink, ph = sizes[k][1] / shrink;
       std::vector<std::uint16_t> data(std::size_t(pw) * ph);
       std::uint32_t seed = 12345u;
       const float span = 1.f / d.invSpan;
@@ -533,17 +562,22 @@ class DeviceBackend final : public GpuBackend {
           if (gpu_->run(p, all, out.data(), std::size_t(all.w()) * 3, tile_) != hal::Status::Ok) { g = 1e30; break; }
           g = std::min(g, ms(t0));
         }
+      double cr[2] = {0, 0};
       for (int rep = 0; rep < 2; ++rep) {  // the best of two: the first run also pays the first touch of the per-thread planes
         const auto t0 = Ck::now();
         demosaic(p, all, out.data(), std::size_t(all.w()) * 3, 0);
-        c = std::min(c, ms(t0));
+        cr[rep] = ms(t0);
+        c = std::min(c, cr[rep]);
       }
+      if (cr[1] > cr[0] * 1.4 && cr[1] > 5.0 && contended.empty()) contended = "unsteady CPU times";  // the second run is never the slow one when the cores are free
+      if (interactionActive() && contended.find("finger") == std::string::npos) contended += contended.empty() ? "a finger on a control" : ", a finger on a control";
       v.ms[k * 2] = g < 1e29 ? g : -1.0, v.ms[k * 2 + 1] = c;
       (k == 0 ? v.full : v.region) = hf ? g * 1.3 < c : g < c;  // half-resolution path: the GPU must win clearly (the probe is small, the real frame adds read-back and window upload per tile)
     }
-    v.note = noteOf(v, "");
+    v.provisional = !contended.empty();
+    v.note = noteOf(v, v.provisional ? (", measured under load: " + contended + ", not cached").c_str() : "");
     logLine(std::string("verdict frame ") + (v.full ? "GPU" : "CPU") + ", region " + (v.region ? "GPU" : "CPU") + ": " + v.note);
-    if (!path.empty()) {
+    if (!path.empty() && !v.provisional) {
       std::error_code ec;
       std::filesystem::create_directories(dir, ec);
       if (FILE* f = std::fopen(path.c_str(), "w")) {
@@ -580,6 +614,8 @@ class DeviceBackend final : public GpuBackend {
   int tile_ = 1024;
 };
 }  // namespace
+
+void setProbeStartHookForTest(void (*hook)()) { probeStartHook().store(hook); }
 
 void installGpuBackend() {
   static DeviceBackend backend;

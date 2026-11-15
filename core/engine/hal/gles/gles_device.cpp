@@ -311,6 +311,7 @@ class GlesDev final : public Device {
   Status submit(CommandList&, FenceH*) override;
   Status wait(FenceH, std::uint64_t timeoutNs) override;
   bool poll(FenceH) override;
+  bool nextSlotBusy() override;
   Status waitAll() override;
   void waitIdle() override { waitAll(); }
   const std::vector<PassTime>& passTimes(FenceH) const override { return noTimes_; }
@@ -1015,6 +1016,16 @@ Status GlesDev::wait(FenceH f, std::uint64_t timeoutNs) {
   if (st == Status::DeviceLost) lost_ = true;
   return st;
 }
+bool GlesDev::nextSlotBusy() {
+  if (lost_) return false;
+  Slot& s = slots_[nextSlot_];
+  if (s.submitted.load() == s.done.load()) return false;
+  FenceH f;
+  f.slot = std::uint32_t(nextSlot_);
+  f.gen = s.submitted.load();
+  return !poll(f);
+}
+
 bool GlesDev::poll(FenceH f) {
   if (!f) return true;
   Slot& s = slots_[f.slot];

@@ -24,6 +24,7 @@
 #include "engine/exec/big_core.h"
 #include "engine/exec/engine_session.h"
 #include "engine/exec/gpu_executor.h"
+#include "engine/exec/sched_diag.h"
 #include "engine/nodes/film/film_gpu.h"
 #include "engine/nodes/film/film_async.h"
 #include "engine/hal/select.h"
@@ -1234,8 +1235,13 @@ struct KeepWarmPump {
     if (!live.load(std::memory_order_acquire) || ctxRaw != &c || !ring) return;
     hal::Device& dev = c.core().dev();
     const std::uint64_t keep = chunk;
-    chunk = lowBytes(pigUnitMs, sinkBytes);  // sized for the low clock: <= ~unitMs whatever state the clock is in
+    // sized for the low clock (<= ~unitMs whatever state the clock is in) and never above the window's own unit, which starts small and grows with the
+    // measured clock: right after a pause a unit sized by lowMBps (a calibration's clock) ran 8 - 100 ms on the Note10+ and the next frame waited for it
+    chunk = std::min(keep, lowBytes(pigUnitMs, sinkBytes));
     for (int i = 0; i < piggyDepth; ++i) {
+      // never wait for a slot here: with three slots the third unit took the frame's own slot and the frame's thread waited for the frame to finish on
+      // the GPU (Note10+ app, first frame of a drag after a pause: 25 - 31 ms of its submit time, section 56)
+      if (dev.nextSlotBusy()) break;
       if (!submitUnit(dev, nullptr, nullptr)) return void(chunk = keep);
       piggyUnits.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1315,9 +1321,12 @@ struct KeepWarmPump {
     bool failed = false;
     {
       DeviceTurn dl(c->gate(), DeviceGate::Prio::Background);
-      // every window starts with units sized for the slowest state seen so far (the clock is low after a pause), and adapts from there
+      // every window starts with small units (the clock is low after a pause) and adapts from there
       pigUnitMs = unitMs;
-      chunk = lowMBps > 0 ? lowBytes(unitMs, wantSink) : (256ull << 10);
+      // the first units of a window are small whatever was measured before: the first frame of the drag arrives 15 - 25 ms after the touch and its
+      // uploads queue behind the units already submitted; after a pause the Note10+ ran a 4 MB unit sized by lowMBps at 40 - 550 MB/s (8 - 100 ms;
+      // the frame's table upload waited 20 - 35 ms for it, section 56). The adaptation below doubles the unit per measured completion.
+      chunk = 256ull << 10;
       const Clk::time_point a0 = Clk::now();
       failed = c->deviceLost() || !ensure(*c, wantRing, wantSink);
       allocMs = std::chrono::duration<double, std::milli>(Clk::now() - a0).count();
@@ -1368,7 +1377,7 @@ struct KeepWarmPump {
         hal::Device& dev = c->core().dev();
         retire(dev);
         // a real frame may have been requested while this thread waited for the turn: check again inside it
-        if (int(q.size()) < depth && realActive.load(std::memory_order_acquire) == 0 && !(holding && Clk::now() < restUntil)) {
+        if (int(q.size()) < depth && realActive.load(std::memory_order_acquire) == 0 && !(holding && Clk::now() < restUntil) && !dev.nextSlotBusy()) {  // no wait for a slot while holding the turn
           Fly fl{};
           if (!submitUnit(dev, &fl.f, &fl.bytes)) break;
           fl.t = Clk::now();
@@ -1410,6 +1419,7 @@ struct KeepWarmPump {
       json = b;
     }
     if (logLevel >= 1) std::fprintf(stderr, "keepwarm %s\n", b);
+    if (sched::diagUpload()) probeLog(std::string("keepwarm ") + b);  // debug.dapple.diag_upload (section 56)
   }
 };
 KeepWarmPump& pump() {

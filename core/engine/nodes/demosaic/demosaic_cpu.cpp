@@ -554,6 +554,7 @@ namespace {
 std::atomic<bool> g_interaction{false};
 }
 void setInteraction(bool on) { g_interaction.store(on, std::memory_order_relaxed); }
+bool interactionActive() { return g_interaction.load(std::memory_order_relaxed); }
 void yieldWhileInteracting(const std::atomic<std::uint64_t>* cancelCur, std::uint64_t cancelMine) {
   for (int waited = 0; g_interaction.load(std::memory_order_relaxed) && waited < 500; ++waited) {  // 500 x 4 ms
     if (cancelCur && cancelCur->load(std::memory_order_relaxed) != cancelMine) return;

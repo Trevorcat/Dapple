@@ -235,9 +235,22 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   const auto tTurn = Clock::now();
   if (!turnOk()) return failed(Status::Internal);
   hal::Device& d = dev();
+  // the parts of uploadMs (GpuStats; waits for the device between them are not subtracted here, they are rare inside one turn)
+  auto lap = [t = Clock::now()]() mutable {
+    const auto n = Clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(n - t).count();
+    t = n;
+    return ms;
+  };
+  const std::uint64_t poolBefore = core().pool().created();
+  resizeBuilt_ = 0;
+  bufBeginMs_ = bufWaitMs_ = 0;
   if (!ensureResident()) return failed(Status::Internal);
+  out.stats.residentMs = lap();
   const std::shared_ptr<const hal::ImageH> S = resizedSource(P.geo.srcW, P.geo.srcH);
   if (!S) return failed(Status::Internal);
+  out.stats.resizeMs = lap();
+  out.stats.resizeBuilt = resizeBuilt_;
   // the solves the plan found on the device: held before any upload of this frame can evict them
   std::vector<std::pair<NodeId, std::shared_ptr<DeviceSolve>>> hits;
   for (const CacheOp& op : in.plan.cache) {
@@ -255,16 +268,21 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   std::shared_ptr<DeviceTables> L;
   std::shared_ptr<DeviceFilm> DF;
   std::shared_ptr<DeviceDisplay> DD;
+  lap();
   if (in.plan.hasFilm) {
     if (!(DF = ensureFilm(fres))) return failed(Status::Internal);
     if (!(DD = ensureDisplay(in))) return failed(Status::Internal);
   }
+  out.stats.filmUpMs = lap();
   if (lattice && !(L = ensureTables(in))) return failed(Status::Internal);
+  out.stats.tablesUpMs = lap();
   std::shared_ptr<DeviceBuffer> HD;
   int warpOff = 0;
   if ((P.hdr.active() || P.warp.active()) && !(HD = ensureGeoAux(in, warpOff))) return failed(Status::Internal);
+  out.stats.auxMs = lap();
   std::shared_ptr<DeviceBuffer> LDsc, LPl;
   if (!ensureLocal(in, LDsc, LPl)) return failed(Status::Internal);
+  out.stats.localMs = lap();
   // a background frame hands the device to a waiting interactive frame between its uploads and its recording; everything it binds is held
   const double waited0 = turn.waited();
   if (!yieldTurn()) return failed(Status::Internal);
@@ -355,6 +373,10 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   hal::FenceH fence;
   hal::Status s = submit(g, *cl, &fence, err);
   if (s != hal::Status::Ok) return failStatus(s, err), Status::Internal;
+  out.stats.graphRecMs = lastRunGraphSplit().recordMs;
+  out.stats.queueSubmitMs = lastRunGraphSplit().queueMs;
+  out.stats.bufBeginMs = bufBeginMs_;
+  out.stats.bufWaitMs = bufWaitMs_;
   keepWarmAfterSubmit(*ctx_);  // touch hint: a keep-warm unit queued behind this frame (no-op outside a window; never ahead of the frame)
   const auto tWait = Clock::now();
   for (Store& ss : stores) {
@@ -408,6 +430,7 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
     }
   }
   st.uploadMs = uploadMs;
+  st.poolCreated = int(core().pool().created() - poolBefore);
   st.turnWaitMs = turnWaitMs;
   st.prepMs = prepMs;
   st.readbackMs = copyMs;
