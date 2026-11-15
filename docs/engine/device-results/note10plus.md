@@ -1,5 +1,52 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 open and export after the decode work
+
+Build: release APK of HEAD (built 02:27, `install -r`), Note10+ RFCMA05Q5ZX, taps only, same method as the 2026-11-15 sections (logs and scripts in `build/perf-20261116c/`). State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 25.4 C at start, 28.0 C at the end, `Thermal Status 0`, no reboot, `debug.dapple.frame_profile` set to 1 and reset to empty. Files: the three public samples under new names (`T6700_26mp.ARW`, `T7RM4_61mp.ARW`, `TXS10_26mp.RAF`) in a new folder, removed afterwards. Photos identified from the `session_open` names.
+
+### Before / after (median [min-max])
+| | before | after |
+|---|---|---|
+| open, tap to first engine frame, A6700 (5 reps) | 944 | **739** [676-774]; session_open 466 (mosaic 282, block reduction 108, anchor 79), starts 23 ms after the tap |
+| open, X-S10 (5 reps) | 1304 | **1124** [1080-1137]; session_open 843 (unpack 526, mosaic 707 incl. unpack, reduction 75, anchor 58) |
+| open, A7RM4 (5 reps) | 1574 | **1016** [992-1035]; session_open 753 (unpack 193, mosaic 373, reduction 241, anchor 132) |
+| no-film export, tap to done, X-S10 (3 reps) | 6.9 s | **6.5 s** (6.57 / 6.48 / 6.54); render 0.78, encode+write 0.33-0.37 |
+| no-film export, A7RM4 (3 reps) | 6.8 s | **6.1 s** (6.09 / 6.18 / 6.13); `export_stream` 5.79-5.92 s: analyse 0.83, render 0.82, encode 0.66 |
+| no-film export, A6700 (3 reps) | not measured | 2.0 s (2.05 / 1.99 / 2.03); render 0.79-0.81, encode+write 0.51-0.54 |
+| peak footprint (log) / peak sampled VmRSS / VmHWM, X-S10 | RSS 927-939 | 875 MB / 864-869 / 965-970 MB |
+| same, A7RM4 | RSS 850-887 | 824-827 MB / 817-826 / 925-938 MB |
+| same, A6700 | not measured | 933-934 MB / 877-878 / 961-981 MB |
+| zoom to first detail frame, X-S10 / A7RM4 / A6700 (1 rep each) | 926 / 1028 / 911 ms | 910 / 990 / 970 ms (`exec=vulkan`, half-resolution session) |
+| RSS after 5 opens, same photo mostly (A7RM4 x4, A6700, X-S10; grid order shifted), then grid | 696-800 MB, HWM 1005, grid 277 | 845 / 836 / 825 / 826 / 827 MB, HWM 1014, grid 275 |
+| RSS after 5 opens, X-S10, A7RM4, A6700, X-S10, A7RM4 (not like for like) | n/a | 699 / 967 / 887 / 905 / 949 MB, HWM 1127, grid 281 |
+
+Open is **unimodal**: all 15 opens within one cluster, spread 6-12 % per file (the Redmi bimodality did not appear). The time to first frame improved 19 % (A6700), 14 % (X-S10), 35 % (A7RM4); the 61 MP and X-S10 opens are limited by `unpack` (X-S10 526 ms) and block reduction. Memory after the five-open series is about 50-100 MB above the earlier 680-800 MB range; HWM is unchanged (1014 vs 1005 MB) in the same-photo series. The mixed series (two 61 MP opens plus detail sessions) peaks at 1127 MB. Not isolated whether the +50-100 MB is the pinned decode threads, the retained buffers or the different photo order.
+
+### Export paths (from the log)
+* A6700 and X-S10: **whole frame** (`whole-frame peak 842 MB (GPU 370) vs budget 1536 MB`), then `export_jpeg`. X-S10: GPU demosaic in 4 nodes of 6246x896 (26 tiles each, 1.16-1.17 s each, `submit/wait` 1.12 s), `full ...: demosaic + crop/orientation` 4.97-5.00 s. 4 x 896 = 3584 rows; the other 586 rows would be the CPU share, but **the log has no CPU/GPU row split line**, so that number is inferred, not logged. A6700: CPU demosaic 0.39 s (`full`: mosaic 24, demosaic 390, shadow chroma 24).
+* A7RM4 61 MP: `whole-frame peak 1542 MB vs budget 1536 MB` -> **stream** (`lazy` session), `export_stream GPU ... ok (23 windows, 102.4 MP, demosaic 1427-1450 ms CPU)`, analyse 1 pass 1.43-1.47 s (demosaic 0.74 s), row cache 224 MB (2048 rows). Not a banded slide in the sense of per-tile GPU demosaic: Bayer demosaic is CPU, tonemap/colour on GPU.
+* No fallback: no `exec=cpu reason=` in any export, open or zoom log (three `exec=cpu reason=no source store (host frame)` frames at app start are the known warm-up probes), no `VkResult`, no crash, no ANR, no fatal line in logcat.
+
+### Correctness of the exports (viewed)
+Pulled one export per file (`ex_xs10.jpg` 6246x4170, `ex_6700.jpg` 6240x4168, `ex_7rm4.jpg` 9568x6376; downscaled views `*_small.png`, crops `ex_xs10_crop_3584.png`, `ex_7rm4_crop.png`). Dimensions and orientation match the sources, last rows present (no blank or black bottom rows), no garbled tiles, no visible seams or colour shifts between bands; the colour chart's patches and text are clean at 100 % across the 3584-row boundary.
+Seam numbers (`an_seam.py`, row means of RGB, adjacent-row difference summed over channels):
+* X-S10: median 0.48, p99 6.5, max 17.4. At the candidate GPU/CPU boundary (row 3584) the adjacent-row difference is 0.20-0.52 over rows 3576-3592 (median row 0.48): **no step**. The 32-row-above vs 32-row-below mean step at 3584 is 26.7 against a median of 2.8 over the image and a 99th percentile of 109, i.e. image content (the chart's grey bar ends there), not a seam. Row texture (mean |dx| of luma): 1.22 in the last 586 rows vs 1.22 in the 586 before, so the CPU-share rows have the same sharpness as the GPU rows. The largest jumps (rows 158 and 3176-3178) are chart edges spread over 3 rows with 57-65 % same-sign columns, not full-width single-row steps.
+* A6700 (max 4.7 at row 1643) and A7RM4 (max 2.6 at row 2403): no spikes at 896-row multiples; the biggest row-to-row jumps are content edges.
+Not compared pixel for pixel with a CPU render; the exports carry the earlier 光线 edit of the test copies for A6700 (亮 30) and none for the others.
+
+### Drag preview sizes (A6700 copy, no film, `film=off exec=vulkan` on all 400 frames, 3 reps each)
+| drag | rung | engine cpu med / p90 / max | tables | view latency med |
+|---|---|---|---|---|
+| exposure (光线 pad x) | 810x541 for rep 1 (100 frames), 640x428 for reps 2 and 3 (170 frames) | 15.0 / 24.0 / 98.7 | 7.5 | 29.2 |
+| colour pad (diagonal) | 640x428 (130 of 130) | 43.2 / 69.8 / 188 | 33.2 | 59.4 |
+Colour pad holds at 640. Exposure holds at 810 only in the first drag, then **the rung stays at 640 for the next two** (the earlier run had 810 for all 297 frames). Frame times are higher than the earlier A6700 run (15.0 vs 9.6 ms median) on a photo that already had an exposure edit; I did not find which of the two causes the carry-over (not diagnosed).
+
+### Not measured
+Zoom and drag were single / 3 reps; no per-band seam analysis for the GPU/CPU boundary other than at rows 896 x n and 3584 (the true boundary is not logged); no film exports (not requested); tombstones not readable.
+
+### Cleanup
+Removed by exact name: `/sdcard/Pictures/DappleTest1116c/{T6700_26mp.ARW,T7RM4_61mp.ARW,TXS10_26mp.RAF}` (folder removed) and the nine exports `{T6700_26mp,T7RM4_61mp,TXS10_26mp}_dapple.jpg`, `... (1).jpg`, `... (2).jpg` in `/sdcard/Pictures/Dapple/`, MediaStore rows deleted per name; a query by those names finds nothing. The app library still lists the three test photos (no delete action). Screenshots (Dapple UI only) deleted from the scratch dir.
+
 ## 2026-11-16 (b) adaptive preview size from the pixel-dependent part (app only, Dart)
 
 Build: release APK of the working tree (app change only, `install -r`), Note10+ RFCMA05Q5ZX, Battery Saver ON (unchanged), 100 %, 27.9 -> 29.5 C, 60 Hz. Same method / `an_drag.py` as the section below (logs and scripts in `build/perf-20261116b/`). Files: `S6700_26mp.ARW`, `S6700b_26mp.ARW` (public A6700 sample, new folder, removed). Local runs on the fresh copy, global runs on the other.
