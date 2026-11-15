@@ -1,5 +1,49 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (63244fc) X-Trans export, drag start, session growth
+
+Release APK of HEAD 63244fc (built 05:25, `install -r` at 05:26), Note10+ RFCMA05Q5ZX, taps only, scripts / logs / `an_*.py` in `build/perf-20261116e/`. State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 25.7 C at start, 30.6 C at the end, `Thermal Status 0`, all 8 cores online, no reboot, `debug.dapple.frame_profile` set to 1 and reset to empty. Files: public samples as `T1116e_{xs10.RAF,xt50.RAF,6700.ARW,7rm4.ARW}` (no-film export, one small exposure swipe before the export as in the earlier runs unless noted). No crash, ANR, `exec=cpu`, `reason=` or GPU error line in any log (13 exports, 45 + 10 drags, 2236 growth frames).
+
+### Finding: the app exports X-Trans on the GPU node, not the CPU node
+Every X-S10 and X-T50 export logged `gpu node WxH: 117 tiles of 512` (whole frame, one node). The cached in-app verdict (read at open, `dapple_demosaic verdict ... (cached)`): **frame GPU 341 ms vs CPU 1022 ms, region GPU 76 vs CPU 200** (half path: GPU 104 vs CPU 198, 33 vs 47). The native probe on the same phone gave CPU 213 ms vs GPU 326 ms (section 55 below). The in-app CPU probe is 4.8x slower than the native one; the verdict is written once and then reused, so the 2x faster CPU demosaic is not used in the app on this phone. Cause not tested (probe ran in the app during the first photo opens, Battery Saver on; I cannot delete the cached verdict, no `pm clear`). **The one-time probe of the "first X-Trans export after install" was not captured**: I opened X-Trans photos (grid slot identification) before logcat was cleared, so the verdict was already cached for every export below; the first X-S10 export (6.44 s) is therefore not a probe-including number.
+
+### No-film full-size export (tap to the `export_jpeg` / `export_stream` log line, so ~0.1 s less than "done"; 3 reps each, VmRSS sampled every 0.25 s / VmHWM)
+| | before (earlier sections) | after (63244fc) |
+|---|---|---|
+| X-S10 26 MP | 6.5 s (5.0 s GPU demosaic) | first 6.44; reps **6.42 / 6.47 / 6.51**; open 5.15-5.20 (demosaic 4.91-4.96 **GPU**), render 0.75-0.79, encode 0.33-0.37; RSS 863-870 MB, HWM 894-898 MB |
+| X-T50 40 MP | not measured in-app | **10.29 / 10.35 / 10.39**; open 7.82-7.90 (demosaic 7.56-7.62 **GPU**), render 1.51-1.53, encode 0.78-0.82; RSS 1092-1156 MB, HWM 1181-1184 MB |
+| A6700 26 MP | 2.08 s | **2.08 / 2.08 / 2.09**; open 0.57-0.60 (demosaic 0.39-0.40), render 0.79-0.82, encode 0.52-0.57; RSS 867-872, HWM 1073-1076 MB |
+| A7RM4 61 MP (stream) | 6.1 s | **6.04 / 6.09 / 6.12**; analyse 0.83, render 0.82, encode 0.66; RSS 785-825 MB, HWM 868-869 MB |
+Unchanged from before within noise (X-S10 6.5 s -> 6.4-6.5 s) because the GPU node is still used. md5 of X-S10 exports: two runs **without any edit are identical** (`afeab522c8be2cd718b9bdc6b9ff08d5` both). The four exports with the exposure swipe have four different md5 (`e711...`, `75e9...`, `0a08...`, `afea...` = the no-edit one; swipes land on different values, so they are different edits, not a nondeterminism test; mean abs difference between two of them 0.46 / 255, max 10, against the no-edit file 0.03 - 0.46).
+
+### Correctness (X-S10 no-edit export, X-T50 swipe export, pulled to the scratch dir, 100 % crops 512x512 viewed at 2x)
+Sizes 6246x4170 (X-S10) and 7752x5178 (X-T50), EXIF orientation 1, landscape, colours plausible (chart: neutral greys, saturated patches in order; X-T50: foliage, sky, red roofs). No maze / zipper pattern, no false colour on the chart's fine print or on the foliage; one faint green fringe on a dark/light chart edge (X-S10 crop 2, left edge), not seen on the X-T50 crop. Seams: gradient at rows / columns that are multiples of 512 vs all others 1.44 / 1.36 vs 1.14 / 1.12 on X-S10, but multiples of 8 / 16 / 128 give the same 1.45 (chart structure, not a tile seam); X-T50 6.92 / 7.00 vs 6.74 / 6.91. **Against the previous X-S10 export** (`build/perf-20261116c/ex_xs10.jpg`, GPU, an unknown exposure swipe): mean abs 0.23 - 0.43 / 255 over the whole frame depending on which of my exports (no-edit 0.43, max 9; centre 1024x1024 0.41); that includes the edit difference, so it says nothing about CPU vs GPU demosaic parity (both GPU).
+
+### First frame of a drag (A6700 copy, 2.3 s pause before every drag, 700 ms swipe, rung 810x541, `exec=vulkan`; ms, first frame median [min-max] / median of the following frames)
+| drag | total | tablesMs | uploadMs | execMs | waitMs | view latency first / rest |
+|---|---|---|---|---|---|---|
+| exposure, no film, 20 drags | 64.8 [11.6-116.9] / 15.3 | 12.8 / 6.9 | 20.4 [0.5-78] / 5.3 | 27.5 / 0.5 | 0 / 0 | 79.9 (max 120) / 29.1 |
+| colour pad, no film, 20 drags | **131.1** [59.5-155.6] / 49.5 | 40.5 / 31.2 | 60.2 [12-75] / 14.6 | 30.9 / 2.9 | 0 / 0 | 144.3 (max 160) / 66.9 |
+| tone (光线 pad vertical), no film, 5 drags | 68.8 [17.8-74.7] / 13.3 | 8.8 / 7.1 | 21.6 / 4.7 | 21.4 / 0.7 | 0 / 0 | 81.8 / 27.2 |
+| exposure + film, 10 drags (rungs 810 and 640) | **97.7** [44-114] / 23.0 | 23.2 / 18.4 | 32.9 [10-68] / 0 | 36.7 / 3.7 | 0 / 0 | 113.4 (max 158) / 39.0 |
+First frames over 100 ms: 1 of 20 (exposure), 19 of 20 (colour pad), 0 of 5 (tone), 5 of 10 (film exposure). The first frame is still 2 - 8x a later frame: the cost is `execMs` (27 - 37 ms against 0.5 - 3.7) and `uploadMs` (20 - 60 ms against 0 - 15), i.e. the GPU / upload side after the idle pause, not the table stage (tables 1.2 - 1.9x). Before (b95e771, film): first frame 105 - 158 ms, tables 35 - 61, upload 7 - 69; now film 97.7 median with tables 23. No-film first frames were not measured before.
+
+### Session growth (film exposure drag then colour-pad drag alternating, 40 pairs, 1.1 s swipes, 2236 interactive frames, all `film=on exec=vulkan`; rungs 96x64 to 640x428)
+| tablesMs median (p90 / max) | first 200 | middle 200 | last 200 |
+|---|---|---|---|
+| all frames | **17.9** (24.1 / 51.3) | **17.5** (24.2 / 45.9) | **18.1** (25.3 / 42.0) |
+| exposure only (1099 frames) / colour only (1137) | 17.4 / 18.6 | 17.6 / 17.8 | 18.7 / 18.6 |
+No growth (before: 12.5 -> 30 - 35 ms over a session), no frame with tables over 100 ms. The session had already seen ~55 drags before these frames.
+
+### Tone drag
+The 光线 pad is two-axis: horizontal = 暗 / 亮 (exposure, readout "亮 30"), vertical = 高 / 低 (the half-circle icons, contrast / tone). `input swipe 697 1500 697 1900 900` (x on the pad, vertical) drives it: 35 frame lines per drag, table above. The earlier "no frame lines" was therefore a missed pad position, not an `input swipe` limit (pad is about x 246-969, y 1368-1989 in a 1080x2280 screen, 光线 tab at 170, 2147).
+
+### Not measured
+CPU demosaic in the app (cannot force the node in a release app; the cached verdict is GPU); the probe-including first X-Trans export; tone drag with film; thermal / CPU frequency during the exports (status 0 and 30.6 C only); GLES.
+
+### Cleanup
+`adb -s RFCMA05Q5ZX shell rm /sdcard/Pictures/DappleT1116e/T1116e_*`, `rmdir /sdcard/Pictures/DappleT1116e`, `rm /sdcard/Pictures/Dapple/T1116e_*`; the two permitted `ls` forms then report both paths absent. Prop reset (`setprop debug.dapple.frame_profile ""`, reads back empty). Screenshots (Dapple UI and, once, the launcher) deleted. The app's library still lists the test photos (no delete action).
+
 ## 2026-11-16 (55) X-Trans on one node, first drag frame, bounded cache (native binaries, pipeline-architecture.md section 55)
 
 Native binaries only, under `/data/local/tmp/xtp` (removed afterwards): `before` = HEAD b95e771, `after` = this change, arm64 release builds in `build/xtp-before-arm64` / `build/xtp-after-arm64`. Battery Saver ON (`low_power` 1, unchanged), no reboot, no app. Files: public samples `Fujifilm-X-S10-lossless-compressed.RAF` (26 MP), X-T50 `DSCF0118.RAF` (40 MP), A6700 `DSC00002.ARW` (drags), pack `build/film/dapple_new.dfp`.
