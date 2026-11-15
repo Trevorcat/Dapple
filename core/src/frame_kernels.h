@@ -13,23 +13,23 @@
 
 #include "dapple/frame_plan.h"
 #include "dapple/renderer.h"
+#include "engine/nodes/frame_blocks.h"
 #include "engine/nodes/frame_facts.h"
+#include "local_eval.h"
 #include "spatial.h"
 
 namespace dapple {
-namespace local { struct Frame; struct AuxTarget; }
-
-class FrameKernels {
+class FrameKernels final : public local::PixelSource {
  public:
   // lut != null: the baked path (renderBakedImpl: lattice + tone table, region + quality from `opt`);
   // lut == null: the exact path (renderFloat: per-pixel PointOp::apply; `opt.spatial` = Off skips the neighbourhood stages).
   FrameKernels(const Renderer& r, const SourceImage& src, const BakedLut* lut, const FastOptions& opt);
-  ~FrameKernels();
+  ~FrameKernels() override;
   FrameKernels(const FrameKernels&) = delete;
   FrameKernels& operator=(const FrameKernels&) = delete;
 
   bool valid() const;
-  int width() const;
+  int width() const override;
   int height() const;
   bool exactVariant() const;
   bool useGeo() const;           // output pixel (x, y) is a resampling of the source (geometry or region)
@@ -42,6 +42,10 @@ class FrameKernels {
   FramePlan framePlan() const;
   // What the node families resolve their blocks from (engine/nodes/frame_blocks.h), with the parameters of the frame.
   engine::FrameFacts frameFacts() const;
+  // What the frame bound from its source that the families' resolves read (local adjustments, reshaping field); owned by this object.
+  engine::FrameBound frameBound() const;
+  // resolveFrameBlocks(params(), frameFacts(), frameBound())
+  engine::FrameBlocks frameBlocks() const;
   const EditParams& params() const;
 
   // ---- point block fragments --------------------------------------------------------------------------------------------
@@ -58,13 +62,12 @@ class FrameKernels {
   void displayStages(float* px, int n) const;             // curves + LUT on an encoded display value (film path)
   void blend(float* main, const float* film, int n) const;  // main += strength * (film - main)
 
-  // ---- local adjustments (docs/engine/pipeline-architecture.md section 40) --------------------------------------------------------
+  // ---- local::PixelSource (the local adjustments' view of the geometry, docs/engine/pipeline-architecture.md section 40) ------------
   // Source position of output pixel (x, y), normalised by the source size (the photo space of the masks).
-  void srcUV(int x, int y, float& u, float& v) const;
+  void srcUV(int x, int y, float& u, float& v) const override;
   // The pre-gain source value of output pixels x0 .. x0 + n - 1 of row y (copyRow or fetchRow).
-  void sourceRow(float* px, int n, int x0, int y) const;
-  // The resolved local adjustments of this frame (null: none).
-  const local::Frame* localFrame() const;
+  void sourceRow(float* px, int n, int x0, int y) const override;
+  void linearRow(float* px, int n, int x0, int y) const override;  // gain + hdrBlock
 
   // ---- film (super-node until the film engineer's nodes land) -----------------------------------------------------------
   // Streaming path (full-strength film, 8-bit target, no neighbourhood stage): renders the whole frame into rgba.

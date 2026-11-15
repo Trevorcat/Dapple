@@ -14,6 +14,7 @@
 #endif
 
 #include "engine/exec/cpu_executor.h"
+#include "engine/nodes/resize/resize.h"
 #include "local_eval.h"
 #include "warp_field.h"
 #include "engine/plan/plan.h"
@@ -153,15 +154,15 @@ EngineSession::EngineSession() : id_(g_nextId.fetch_add(1)) {
 namespace {
 
 // Local adjustments (docs section 40): the LocalDetail halo and the amount planes of a frame.
-void localRequest(PlanRequest& rq, const local::Frame* lf) {
-  if (!lf || !lf->anyWindow) return;
-  rq.localHalo = local::detailRadii(*lf, rq.scale).halo;
-  local::AuxTarget t;
-  rq.localAux = local::auxLayout(*lf, t);
+void localRequest(PlanRequest& rq, const localadj::Block& b) {
+  if (!b.detail) return;
+  rq.localHalo = b.halo;
+  rq.localAux = b.auxPlanes;
 }
 
-// The resolved local adjustments of a GPU frame (the CPU frames get theirs from FrameKernels). Film frames: none in v1 (40.7).
-void bindLocal(FramePlan& fp, const Renderer& r, const SourceImage& src, bool interactive) {
+// What a GPU frame binds from its source (the CPU frames' FrameKernels bind their own): the region source's radii scale and the portrait
+// reshaping field into the plan, the local adjustments (localadj::bind) returned; the caller keeps them alive for the frame.
+std::shared_ptr<const local::Frame> bindSource(FramePlan& fp, const Renderer& r, const SourceImage& src, bool interactive) {
   if (src.parent && src.parent->fullW > 0 && src.parent->fullH > 0 && fp.srcW > 0 && fp.srcH > 0)  // a region source (docs section 44): radii are fractions of the parent picture
     fp.spatialScale *= float(std::max(src.parent->fullW, src.parent->fullH)) / float(std::max(fp.srcW, fp.srcH));
   if (r.params().reshape.active() && fp.srcW > 0 && fp.srcH > 0 && !src.linear.empty()) {
@@ -181,9 +182,7 @@ void bindLocal(FramePlan& fp, const Renderer& r, const SourceImage& src, bool in
       fp.useGeo = true;
     }
   }
-  if (r.params().local.empty()) return;
-  fp.local = local::bind(r.params().local, src, interactive);
-  fp.localDetail = fp.local && fp.local->anyWindow;
+  return localadj::bind(r.params(), src, interactive);
 }
 
 // What the planner needs besides the graph: frame size, neighbourhood amounts after quality / region / film.
@@ -206,7 +205,7 @@ PlanRequest makeRequest(const FrameKernels& fk, const FrameBlocks& fb, ExecMode 
   rq.vignette = fb.vignette.active();
   rq.useGeo = fk.useGeo();
   rq.outChannels = channels;
-  localRequest(rq, fk.localFrame());
+  localRequest(rq, fb.local);
   return rq;
 }
 
@@ -239,7 +238,7 @@ PlanRequest requestFromFrame(const FramePlan& fp, const FrameBlocks& fb, ExecMod
   rq.vignette = fb.vignette.active();
   rq.useGeo = fp.useGeo;
   rq.outChannels = 4;
-  localRequest(rq, fp.local.get());
+  localRequest(rq, fb.local);
   return rq;
 }
 
@@ -398,7 +397,7 @@ int EngineSession::renderFull(FrameJob& job, const ParamSet& ps, const BakedLut&
   }
   const auto t0 = Clock::now();
   const FramePlan fp = fk.framePlan();
-  const FrameBlocks fb = resolveFrameBlocks(fk.params(), fk.frameFacts());
+  const FrameBlocks fb = fk.frameBlocks();
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   const ValidationResult v = g.validate();
   if (!v.ok) {
@@ -474,7 +473,7 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   fo.spatial = SpatialQuality::Full;
   FramePlan fp = renderer.framePlan(W, H, src.sceneReferred, fo);
   if (!fp.supported) return 1;
-  bindLocal(fp, renderer, src, false);
+  const std::shared_ptr<const local::Frame> lf = bindSource(fp, renderer, src, false);
   ParamInputs in;
   in.edit = params;
   in.frame.exact = true;
@@ -486,7 +485,7 @@ int EngineSession::renderExactGpu(const EditParams& params, const Renderer& rend
   in.ctx.srcW = W;
   in.ctx.srcH = H;
   const ParamSet ps = ParamSet::make(std::move(in));
-  const FrameBlocks fb = resolveFrameBlocks(params, frameFacts(fp, fo, src.sceneReferred));
+  const FrameBlocks fb = resolveFrameBlocks(params, frameFacts(fp, fo, src.sceneReferred), {lf.get(), fp.warp.field.get()});
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);  // the exact variant: ToneColourExact, no table nodes
   if (const ValidationResult v = g.validate(); !v.ok) {
     if (err) *err = "engine graph: " + v.error;
@@ -572,7 +571,7 @@ bool EngineSession::renderExact(const EditParams& params, const Renderer& render
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
   const FramePlan fp = fk.framePlan();
-  const FrameBlocks fb = resolveFrameBlocks(fk.params(), fk.frameFacts());
+  const FrameBlocks fb = fk.frameBlocks();
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   const ValidationResult v = g.validate();
   if (!v.ok) {
@@ -1056,7 +1055,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
   }
   FramePlan fp = job.renderer.framePlan(rw, rh, job.src.sceneReferred, job.fastOptions);
   job.renderer.hdrBind(job.src, fp.hdr, &bake.tone);  // single-image HDR: the field comes from the CPU source (a pure function of source + white balance)
-  bindLocal(fp, job.renderer, job.src, job.fastOptions.spatial == SpatialQuality::Interactive);
+  const std::shared_ptr<const local::Frame> lf = bindSource(fp, job.renderer, job.src, job.fastOptions.spatial == SpatialQuality::Interactive);
   if (job.resizeSharpen > 0.f && (rw < job.store->width() || rh < job.store->height())) fp.resizeSharpen = job.resizeSharpen;  // adds the Detail node
   if (!fp.supported) {
     ++stats_.gpuUnsupported;
@@ -1065,7 +1064,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
     if (gpuForce_) return out.error = frameWhy_, -1;
     return 1;
   }
-  const FrameBlocks fb = resolveFrameBlocks(job.renderer.params(), frameFacts(fp, job.fastOptions, job.src.sceneReferred));
+  const FrameBlocks fb = resolveFrameBlocks(job.renderer.params(), frameFacts(fp, job.fastOptions, job.src.sceneReferred), {lf.get(), fp.warp.field.get()});
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   const ValidationResult v = g.validate();
   if (!v.ok) {
@@ -1169,9 +1168,9 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
   FramePlan fp = e.renderer.framePlan(rw, rh, e.image.sceneReferred, fj.fastOptions);
   e.renderer.hdrBind(e.image, fp.hdr, &bake->tone);
   if (!fp.supported) return bail(1, "unsupported on the GPU: " + fp.why);
-  bindLocal(fp, e.renderer, e.image, false);
+  const std::shared_ptr<const local::Frame> lf = bindSource(fp, e.renderer, e.image, false);
   fp.resizeSharpen = down ? e.resizeSharpen : 0.f;
-  const FrameBlocks fb = resolveFrameBlocks(e.renderer.params(), frameFacts(fp, fj.fastOptions, e.image.sceneReferred));
+  const FrameBlocks fb = resolveFrameBlocks(e.renderer.params(), frameFacts(fp, fj.fastOptions, e.image.sceneReferred), {lf.get(), fp.warp.field.get()});
   Graph g = GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
   if (const ValidationResult v = g.validate(); !v.ok) return bail(-1, "engine graph: " + v.error);
   g.computeKeys(ps);
@@ -1210,7 +1209,7 @@ std::shared_ptr<const SourceImage> EngineSession::resizedSource(const SourceImag
     cache_.put(NodeType::Resize, std::move(moved));
     return hit;
   }
-  const ResizeBakeCtx ctx{&full, longEdge};
+  const resize::BakeCtx ctx{&full, longEdge};
   std::shared_ptr<void> made = bakeNode(NodeType::Resize, &ctx);
   if (!made) return nullptr;
   auto img = as<const SourceImage>(made);

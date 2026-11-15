@@ -17,7 +17,7 @@
 #include <android/log.h>
 #endif
 
-#include "frame_kernels.h"
+#include "spatial.h"
 #include "local_retouch.h"
 #include "parallel.h"
 
@@ -1393,7 +1393,7 @@ void applyLinearCtx(const Frame& f, float u, float v, const float src[3], float 
 }
 }  // namespace
 
-void linearBlock(const Frame& f, const FrameKernels& fk, float* px, int n, int x0, int y, const AuxTarget* aux) {
+void linearBlock(const Frame& f, const PixelSource& fk, float* px, int n, int x0, int y, const AuxTarget* aux) {
   float srcBuf[256 * 3];
   if (f.anyRaster) fk.sourceRow(srcBuf, n, x0, y);
   const bool wantK = aux && aux->data && f.anyWindow;
@@ -1475,13 +1475,12 @@ DetailRadii detailRadii(const Frame& f, float scale) {
   return r;
 }
 
-void detailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, int fw, int fh, float scale, const FrameKernels* fk) {
-  (void)fw, (void)fh;
+void detailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float scale, const Affine* photo, const warp::Field* wf) {
   if (f.retouchW || !f.spots.empty()) {
-    if (!fk) {
+    if (!photo) {
       logOncePerKey("local adjustments: portrait retouch without the frame geometry, skipped");
     } else {
-      retouchDetailWindow(f, img, aux, scale, fk->framePlan());
+      retouchDetailWindow(f, img, aux, scale, *photo, wf);
     }
     if (!f.legacyW) return;
   }
@@ -1607,7 +1606,7 @@ void legacyDetailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float
   });
 }
 
-void maskRow(const Frame& f, const FrameKernels& fk, int index, int y, std::uint8_t* out) {
+void maskRow(const Frame& f, const PixelSource& fk, int index, int y, std::uint8_t* out) {
   const int w = fk.width();
   int ai = -1;
   for (std::size_t a = 0; a < f.adj.size(); ++a)
@@ -1617,8 +1616,7 @@ void maskRow(const Frame& f, const FrameKernels& fk, int index, int y, std::uint
     const int n = std::min(256, w - x0);
     fk.sourceRow(src, n, x0, y);
     std::memcpy(lin, src, std::size_t(n) * 3 * sizeof(float));
-    fk.gain(lin, n);
-    fk.hdrBlock(lin, n, x0, y);
+    fk.linearRow(lin, n, x0, y);
     for (int i = 0; i < n; ++i) {
       float u, v;
       fk.srcUV(x0 + i, y, u, v);

@@ -40,11 +40,6 @@ struct TableBakeCtx {
   bool fast = false;
   float maxV = 0.f;
 };
-// The per-frame parameters of the Resize node's CpuImpl::bake: the source resampled to `longEdge`.
-struct ResizeBakeCtx {
-  const SourceImage* full = nullptr;
-  int longEdge = 0;
-};
 // Runs `type`'s CpuImpl::bake; null payload when the node has no bake or it failed. Payload types: ColourLattice and
 // LatticeOverflow std::vector<float>, ToneAnalysisPre Renderer::TonePre, ToneTable ToneTableOut, Analysis ToneAnalysis,
 // Resize SourceImage.

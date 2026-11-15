@@ -3140,7 +3140,31 @@ still carries the `Renderer`); 9 the film glue (FilmSim / `runFilm` / `streamFil
 - The planner still recomputes window halos from `PlanRequest` amounts (stage C); for migrated families it calls the family's resolve, so
   the formula exists once.
 
-**Status (2026-11-15).** Steps 1-5 done: Vignette, NRLuma / NRChroma, Grain, Dehaze, Detail resolve their own blocks (`nodes/vignette`,
+**Status (2026-11-15).** Steps 1-7 done: Vignette, NRLuma / NRChroma, Grain, Dehaze, Detail resolve their own blocks (`nodes/vignette`,
 `nodes/nr`, `nodes/grain`, `nodes/dehaze`, `nodes/detail`); `SpatialParams` and `FramePlan::{vignette, outputSpace, nrLuma, nrColor, dehaze,
 clarity, texture, sharpen, sharpRadius, grain}` are gone, `GpuRun::resizeSharpen` became `FrameFacts::resizeSharpen` (Detail block), the GPU
-`spatialRadii` keeps only the tile halo. Recorded corpus hashes unchanged; content keys unchanged. Next: step 6 (local).
+`spatialRadii` keeps only the tile halo (now from the blocks alone).
+- Step 6, local adjustments (`nodes/local/local.{h,cpp}`, namespace `engine::localadj`): `localadj::bind(EditParams, SourceImage, interactive)`
+  is the one binding (FrameKernels on the CPU, `bindSource` in the session for GPU frames; the binder owns it), `localadj::resolve(frame, warp,
+  FrameFacts)` the block (bound list, LocalDetail halo and amount planes, radii scale, the frame pixel -> photo metric affine of the portrait
+  retouch, the reshaping field the heal spots follow). `resolveFrameBlocks` takes a third argument, `FrameBound` (what the frame bound from its
+  source: local list, reshaping field). `FramePlan::{local, localDetail}` and `FrameKernels::localFrame()` are gone; `local_eval` /
+  `local_retouch` no longer know FrameKernels or FramePlan: the CPU kernels read the geometry through `local::PixelSource` (FrameKernels
+  implements it until the point family moves), `frameAffine` takes `FrameFacts`. `FrameFacts` gained the source mapping (useGeo, rot, flip,
+  cs, sn, fw, fh, srcW, srcH): the output pixel -> source mapping is frame-level and is what the Geometry block will produce. The CPU
+  LocalDetail no longer builds a whole FramePlan per tile for the retouch affine.
+- Step 7, Resize (`nodes/resize/resize.{h,cpp}`): block (stored size -> frame source size), the Lanczos-3 source window as
+  `NodeBehaviour::inputRect` (the GPU `lanczosWindow` calls it), the CPU bake and its context (`resize::BakeCtx`, was `ResizeBakeCtx` in
+  engine_session.h). The CPU Resize block fragment stays the frame's source row copy (point family: FrameKernels::copyRow).
+Recorded corpus hashes unchanged (163 frames, no re-recording); content keys unchanged (the local list and the reshaping field already enter
+through the LocalLinear / LocalDetail / Geometry keys).
+
+**Left (steps 8-9), and why not in the same session.** `FramePlan` (frame_plan.h) still carries supported/why, sizes, geometry, gain, hdr, warp,
+lookGrain, spatialScale, resizeSharpen, film, display: all produced by `Renderer::framePlan` / `FrameKernels::framePlan` and read by the GPU
+executor and the point / film GPU nodes. `hdrBind`, the gain and the geometry need the Renderer's camera, white-balance gain and HDR proxy, and
+the fused CPU head (`headGainTone`) interleaves geometry, gain, HDR and the tone table per pixel; moving one of them alone would leave two
+mechanisms in one family, so geometry, gain, HDR, warp, tone/colour, display stages, blend and the table bakes (`TableBakeCtx` still carries the
+`Renderer`) move together as step 8. Graph (`graph.h`: the builder takes `FramePlan` for useGeo / hdr), exec (`cpu_executor.h` includes
+frame_kernels.h; `gpu_iface.h`, `engine_session.h`, `gpu_context.cpp` include renderer.h / frame_plan.h) still depend on them until then.
+Next smallest step: an `nodes/point/geometry` block (FrameFacts already holds its numbers) that the GPU point / film-input / local-film-input
+recorders read instead of `FramePlan` geometry fields.

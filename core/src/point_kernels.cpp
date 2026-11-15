@@ -1805,7 +1805,7 @@ struct FrameKernels::Impl {
       hdrP.s = hdr.s, hdrP.ev = hdr.ev, hdrP.key = hdr.key, hdrP.yn = hdr.yn, hdrP.yclip = hdr.yclip;
       hdrP.lo = hdr.lo, hdrP.hi = hdr.hi, hdrP.ls = hdr.ls, hdrP.hp = hdr.hp;
     }
-    if (!r.p_.local.empty()) local = local::bind(r.p_.local, source, opt.spatial == SpatialQuality::Interactive);
+    local = engine::localadj::bind(r.p_, source, opt.spatial == SpatialQuality::Interactive);
     valid = true;
   }
 
@@ -1872,6 +1872,9 @@ const EditParams& FrameKernels::params() const { return impl_->r.p_; }
 engine::FrameFacts FrameKernels::frameFacts() const {
   const Impl& m = *impl_;
   engine::FrameFacts f = mapFacts(m.d);
+  f.useGeo = m.useGeo, f.flip = m.geo.flip, f.rot = m.geo.rot;
+  f.cs = m.geo.cs, f.sn = m.geo.sn, f.fw = m.geo.fw, f.fh = m.geo.fh;
+  f.srcW = m.in.width, f.srcH = m.in.height;
   f.spatialScale = spatialScale();
   f.quality = int(m.opt.spatial);
   f.noise = m.opt.noise;
@@ -1885,6 +1888,9 @@ engine::FrameFacts frameFacts(const FramePlan& fp, const FastOptions& opt, bool 
   engine::FrameFacts f;
   f.ox0 = fp.ox0, f.oy0 = fp.oy0, f.stepX = fp.stepX, f.stepY = fp.stepY;
   f.fullW = fp.fullW, f.fullH = fp.fullH;
+  f.useGeo = fp.useGeo, f.flip = fp.flip, f.rot = fp.rot;
+  f.cs = fp.cs, f.sn = fp.sn, f.fw = fp.fw, f.fh = fp.fh;
+  f.srcW = fp.srcW, f.srcH = fp.srcH;
   f.spatialScale = fp.spatialScale;
   f.quality = int(opt.spatial);
   f.noise = opt.noise;
@@ -1919,8 +1925,6 @@ FramePlan FrameKernels::framePlan() const {
   for (int c = 0; c < 3; ++c) fp.gain[c] = m.gain[c];
   fp.hdr = m.hdr;
   fp.spatialScale = spatialScale();
-  fp.local = m.local;
-  fp.localDetail = m.local && m.local->anyWindow;
   if (m.wf) {
     fp.warp.field = m.wf;
     fp.warp.ax = m.wm.ax, fp.warp.bx = m.wm.bx, fp.warp.ay = m.wm.ay, fp.warp.by = m.wm.by, fp.warp.lpx = m.wm.lpx;
@@ -1942,7 +1946,12 @@ void FrameKernels::sourceRow(float* px, int n, int x0, int y) const {
     copyRow(px, n, x0, y);
   }
 }
-const local::Frame* FrameKernels::localFrame() const { return impl_->local.get(); }
+void FrameKernels::linearRow(float* px, int n, int x0, int y) const {
+  gain(px, n);
+  hdrBlock(px, n, x0, y);
+}
+engine::FrameBound FrameKernels::frameBound() const { return {impl_->local.get(), impl_->wf.get()}; }
+engine::FrameBlocks FrameKernels::frameBlocks() const { return engine::resolveFrameBlocks(params(), frameFacts(), frameBound()); }
 
 void FrameKernels::copyRow(float* px, int n, int x0, int y) const {
   const Impl& m = *impl_;
@@ -2067,7 +2076,7 @@ void FrameKernels::blend(float* main, const float* film, int n) const {
 bool FrameKernels::streamFilm(std::uint8_t* rgba) {
   Impl& m = *impl_;
   if (m.exact || !(m.fr.stock && m.fr.strength >= 1.f) || !rgba || m.win) return false;
-  if (engine::resolveFrameBlocks(m.r.p_, frameFacts()).anyWindow()) return false;  // a neighbourhood stage of a migrated family runs
+  if (frameBlocks().anyWindow()) return false;  // a neighbourhood stage of a migrated family runs
   if (m.opt.keepGrain || (m.opt.fullLongEdge > 0 && m.opt.spatial == SpatialQuality::Full)) return false;  // scale-aware / kept grain: node chain only
   const Renderer& rr = m.r;
   const int w = m.d.w, h = m.d.h;

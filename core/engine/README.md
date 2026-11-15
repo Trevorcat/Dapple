@@ -25,11 +25,15 @@ Adding a node:
 Edge `keyed=false` = scheduling edge only (producer key does not enter the consumer key).
 
 Parameter resolution (docs/engine/pipeline-architecture.md section 50): a node family that resolves its own parameters lives in
-`nodes/<family>/` (`vignette`, `nr`, `dehaze`, `detail`, `grain`): a POD block, `resolve(EditParams, FrameFacts)` that derives every number
-the kernels use, its `NodeBehaviour` (identity, halo) and `CpuImpl`; its `gpu.cpp` records from the same block. `nodes/frame_blocks.h`
-`resolveFrameBlocks` builds the blocks of a frame; the builder wires a node only when its block is not the identity, the executors copy
-`&blocks.<node>` into the node's slot (CPU `bindResolved`, GPU `GpuRun::blocks`). New family = a block + resolve there, a member of
-`FrameBlocks`, nothing in `FramePlan` / `FrameKernels`.
+`nodes/<family>/` (`vignette`, `nr`, `dehaze`, `detail`, `grain`, `local`, `resize`): a POD block, `resolve(EditParams, FrameFacts)` that derives
+every number the kernels use, its `NodeBehaviour` (identity, halo, inputRect) and `CpuImpl`; its `gpu.cpp` records from the same block.
+`nodes/frame_blocks.h` `resolveFrameBlocks(EditParams, FrameFacts, FrameBound)` builds the blocks of a frame (`FrameBound`: what the frame bound
+from its source, e.g. the local adjustments of `localadj::bind`, owned by `FrameKernels` on the CPU and by the session's GPU frame); the builder
+wires a node only when its block is not the identity, the executors copy `&blocks.<node>` into the node's slot (CPU `bindResolved`, GPU
+`GpuRun::blocks`). New family = a block + resolve there, a member of `FrameBlocks`, nothing in `FramePlan` / `FrameKernels`. Resize's block is
+built by the executor that knows the stored size (`resize::resolve(stored, FrameFacts::srcW/H)`); its CPU bake input is `resize::BakeCtx`.
+Not migrated yet: the point family (Geometry, Gain, Hdr, warp, ToneColour, DisplayStages, Blend), the table bakes and the film glue
+(`Renderer`, `FrameKernels`, `FramePlan`).
 
 ## Planner / executor (CPU engineer, docs/engine/pipeline-architecture.md section 17)
 

@@ -22,7 +22,7 @@ bool recordPoint(GpuRecorder& r, const PointNode& n, H D) {
   const int geo = !P.useGeo ? 0 : (P.exact ? 1 : 2);
   const bool hdrOn = P.hdr.active() && n.lut.hdr >= 0;
   const bool warpOn = P.warp.active() && n.src.warp >= 0;
-  const bool localOn = P.local && n.ldesc >= 0 && n.lplanes >= 0;
+  const bool localOn = n.ldesc >= 0 && n.lplanes >= 0;  // bound only when the frame has local adjustments (Executor::ensureLocal)
   const bool localW = localOn && n.aux0 >= 0 && n.aux1 >= 0;
   const hal::PipelineH p = localOn ? r.pl("point_local", {{0, geo}, {1, hdrOn ? 1 : 0}, {3, localW ? 1 : 0}, {4, warpOn ? 1 : 0}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}})
                                    : r.pl("point", {{0, geo}, {1, hdrOn ? 1 : 0}, {4, warpOn ? 1 : 0}, {10, n.ep.last ? 1 : 0}, {11, n.ep.last && n.ep.grain ? 1 : 0}});

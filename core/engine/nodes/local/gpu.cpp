@@ -53,12 +53,13 @@ bool emptyBin(GpuRecorder& r, std::uint32_t& off) {
 
 // Portrait retouch (docs section 43): heal pass, retouch planes, combine. `last`: this part ends the pipeline (the epilogue is ours).
 H recordRetouch(GpuRecorder& r, const LocalDetailNode& n, H D, bool last) {
-  const FramePlan& P = *n.plan;
-  const local::Frame& f = *P.local;
-  const local::Affine A = local::frameAffine(P);
+  const localadj::Block& B = *n.b;
+  const local::Frame& f = *B.frame;
+  local::Affine A;
+  std::copy(B.photo, B.photo + 6, A.m);
   if (!f.spots.empty()) {
     std::vector<local::SpotPx> sp;
-    local::spotsForWindow(f, A, n.ox, n.oy, n.W, n.Hh, sp, P.warp.field.get());
+    local::spotsForWindow(f, A, n.ox, n.oy, n.W, n.Hh, sp, B.warp);
     const bool lastHere = last && !f.retouchW;
     if (!sp.empty() || lastHere) {
       HealU u{};
@@ -119,7 +120,7 @@ H recordRetouch(GpuRecorder& r, const LocalDetailNode& n, H D, bool last) {
     }
   }
   if (!f.retouchW) return D;
-  const float ppu = std::min(float(local::affinePpu(A)), local::haloPpu(f, P.spatialScale));
+  const float ppu = std::min(float(local::affinePpu(A)), local::haloPpu(f, B.scale));
   const local::RetouchRadii R = local::retouchRadii(f.iod * ppu);
   const H lf = r.blur(0, 3, D, n.W, n.Hh, {R.rf, 0, 0, 0}, 2, 0, kR32);
   if (lf < 0) return -1;
@@ -168,14 +169,13 @@ H recordRetouch(GpuRecorder& r, const LocalDetailNode& n, H D, bool last) {
 }  // namespace
 
 H recordLocalDetail(GpuRecorder& r, const LocalDetailNode& n, H D) {
-  const FramePlan& P = *n.plan;
-  if (!P.local) return r.err = "LocalDetail without local adjustments", -1;
-  const local::Frame& f = *P.local;
+  if (!n.b || !n.b->frame) return r.err = "LocalDetail without local adjustments", -1;
+  const local::Frame& f = *n.b->frame;
   if (f.retouchW || !f.spots.empty()) {  // portrait retouch first (docs section 43), then the legacy window ops on its result
     D = recordRetouch(r, n, D, n.ep.last && !f.legacyW);
     if (D < 0 || !f.legacyW) return D;
   }
-  const local::DetailRadii R = local::detailRadii(f, P.spatialScale);
+  const local::DetailRadii R = local::detailRadii(f, n.b->scale);
   const bool fine = f.winUsed[1] || f.winUsed[3], vfine = f.winUsed[2];
   H bf = -1, bs = -1, ab = -1;
   if (fine) {

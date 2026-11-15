@@ -10,6 +10,13 @@ struct FrameFacts {
   // output pixel (x, y) -> position in the whole (geometry-transformed) picture: (ox0 + (x + .5) * stepX, oy0 + (y + .5) * stepY)
   float ox0 = 0.f, oy0 = 0.f, stepX = 1.f, stepY = 1.f;
   float fullW = 0.f, fullH = 0.f;  // size of the whole picture in that space
+  // picture position -> source pixel (before the reshaping warp): centre, flip, straighten (cs, sn), rotate `rot` quarter turns, source of
+  // srcW x srcH. useGeo false: output pixel (x, y) is source pixel (x, y).
+  bool useGeo = false;
+  bool flip = false;
+  int rot = 0;
+  float cs = 1.f, sn = 0.f, fw = 0.f, fh = 0.f;
+  int srcW = 0, srcH = 0;
   float spatialScale = 1.f;        // radii scale of the neighbourhood stages (full-picture long edge / 2048), resolved
   int quality = 2;                 // SpatialQuality: 0 off, 1 interactive, 2 full
   bool noise = true;               // interactive frames: noise reduction runs

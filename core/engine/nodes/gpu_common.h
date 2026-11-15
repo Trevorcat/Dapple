@@ -13,6 +13,7 @@
 #include "engine/exec/gpu_scheduler.h"
 #include "engine/hal/hal.h"
 #include "engine/nodes/frame_blocks.h"
+#include "engine/nodes/resize/resize.h"
 
 namespace dapple::engine::gpu {
 
@@ -37,7 +38,7 @@ void workgroupShape(const hal::DeviceCaps& c, int& lx, int& ly, int& rwg);
 struct SpatialRadii {
   int halo = 0;  // pixels around a tile needed by the local stages, multiple of 4
 };
-SpatialRadii spatialRadii(const FramePlan& p, const FrameBlocks& b);
+SpatialRadii spatialRadii(const FrameBlocks& b);
 
 // The image the point pass samples, and where it sits in the (resized) source space.
 struct SourceBind {
@@ -154,7 +155,7 @@ bool recordDetail(GpuRecorder& r, const DetailNode& n, H D);
 
 // LocalDetail (local adjustments, stage W): returns the new working image (D itself when it is the last pass), -1 on error
 struct LocalDetailNode {
-  const FramePlan* plan;
+  const localadj::Block* b;
   int W, Hh, ox, oy;
   H aux0, aux1;  // the amounts the point pass wrote
   Epilogue ep;
@@ -176,9 +177,9 @@ struct SrcWin {
   int w() const { return x1 - x0; }
   int h() const { return y1 - y0; }
 };
-SrcWin lanczosWindow(int srcW, int srcH, int dstW, int dstH, const WRect& dst);
+SrcWin lanczosWindow(const resize::Block& b, const WRect& dst);  // resize::sourceWindow
 // Adds the two Lanczos passes producing rect `dst` of the resized picture from the source window `win` held in `src`.
-H recordResize(GpuRecorder& r, H src, const SrcWin& win, int srcW, int srcH, int dstW, int dstH, const WRect& dst);
+H recordResize(GpuRecorder& r, H src, const SrcWin& win, const resize::Block& b, const WRect& dst);
 
 // float RGB rows -> RGBA16F image (the resident source upload)
 bool recordConvert(GpuRecorder& r, hal::BufferH staging, H dst, int w, int h, int dx, int dy);

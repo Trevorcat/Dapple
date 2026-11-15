@@ -267,7 +267,7 @@ Graph graphFor(const EditParams& p, const SourceImage& src, bool exact, FrameKer
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
   const FramePlan fp = hold->framePlan();
-  const FrameBlocks fb = resolveFrameBlocks(hold->params(), hold->frameFacts());
+  const FrameBlocks fb = hold->frameBlocks();
   Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp, &fb);
   g.computeKeys(ps);
   rq = PlanRequest{};
@@ -433,7 +433,7 @@ void testBench() {
       auto t0 = Clock::now();
       FrameKernels fk(r, src, bake.get(), fo);
       const FramePlan fp = fk.framePlan();
-      const FrameBlocks fb = resolveFrameBlocks(fk.params(), fk.frameFacts());
+      const FrameBlocks fb = fk.frameBlocks();
       Graph g = GraphBuilder::build(ps, GraphDetail::Full, &fp, &fb);
       g.computeKeys(ps);
       PlanRequest rq;

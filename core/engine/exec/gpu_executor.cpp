@@ -525,7 +525,7 @@ hal::ImageH* Executor::resizedSource(int w, int h) {
   rec.boxScanMin = core().boxScanOk ? -1 : 0;
   const H src = g.external(rs_->img);
   const SrcWin full{0, 0, W_, H_};
-  const H out = recordResize(rec, src, full, W_, H_, w, h, WRect{0, 0, w, h});
+  const H out = recordResize(rec, src, full, resize::resolve(W_, H_, w, h), WRect{0, 0, w, h});
   if (out < 0) {
     dev().destroy(r->img);
     return fail(GpuFailure::Transient, err), nullptr;
@@ -726,7 +726,7 @@ std::shared_ptr<DeviceHdr> Executor::ensureBuffer(NodeType slot, std::uint64_t k
 bool Executor::ensureLocal(const GpuRun& in, std::shared_ptr<DeviceHdr>& desc, std::shared_ptr<DeviceHdr>& planes) {
   desc.reset();
   planes.reset();
-  const local::Frame* f = in.frame.local.get();
+  const local::Frame* f = in.blocks.local.frame;
   if (!f || !(planHasType(in, NodeType::LocalLinear) || in.plan.hasFilm)) return true;  // film frames: stage L on the film input (40.7)
   desc = ensureBuffer(NodeType::LocalDetail, f->descKey, f->desc.data(), f->desc.size() * sizeof(float));
   if (!desc) return false;
@@ -1019,7 +1019,7 @@ struct Executor::Walk {
   filmnode::FilmPre pre;
 
   Walk(GpuRecorder& rec, const GpuRun& run, bool wholeFrame)
-      : r(rec), in(run), P(run.frame), R(spatialRadii(run.frame, run.blocks)), whole(wholeFrame) {
+      : r(rec), in(run), P(run.frame), R(spatialRadii(run.blocks)), whole(wholeFrame) {
     ep.amp = in.blocks.grain.amp;
     ep.period = in.blocks.grain.period;
     ep.grain = in.blocks.grain.active();
@@ -1049,7 +1049,7 @@ struct Executor::Walk {
   // the film input: the resident source, or its geometry gather (rotate / straighten / crop) at the frame size; -1 on error
   H filmInput() {
     H in = src.img;
-    if (P.local && ldesc >= 0 && lplanes >= 0) {  // local adjustments, stage L, on the film's scene input (docs section 40.7): gather + ops in one pass
+    if (this->in.blocks.local.active() && ldesc >= 0 && lplanes >= 0) {  // local adjustments, stage L, on the film's scene input (docs section 40.7): gather + ops in one pass
       if (needAux && aux0 < 0) {
         aux0 = r.tr(kF16, P.outW, P.outH);
         aux1 = r.tr(kF16, P.outW, P.outH);
@@ -1272,7 +1272,7 @@ struct Executor::Walk {
         }
         case NodeType::LocalDetail: {
           if (aux0 < 0) return r.err = "LocalDetail without the amounts of the point pass", false;
-          const LocalDetailNode ln{&P, W, Hh, ox, oy, aux0, aux1, e};
+          const LocalDetailNode ln{&in.blocks.local, W, Hh, ox, oy, aux0, aux1, e};
           const H nd = recordLocalDetail(r, ln, D);
           if (nd < 0) return false;
           D = nd;
@@ -1546,8 +1546,9 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   auto bad = [&](Status s) { return failure_ == GpuFailure::Unsupported ? Status::Unsupported : s; };
   if (!in.target.sink) return fail(GpuFailure::Unsupported, "no tile sink"), Status::Unsupported;
   const int rw = P.srcW, rh = P.srcH;
+  const resize::Block rb = resize::resolve(W_, H_, rw, rh);
   const bool down = rw < W_ || rh < H_;
-  const SpatialRadii R = spatialRadii(P, in.blocks);
+  const SpatialRadii R = spatialRadii(in.blocks);
   const int maxDim = int(d.caps().maxImage2D);
   int tile = std::max(64, in.plan.grid.tile / 4 * 4);
   while (tile + 2 * R.halo > maxDim && tile > 64) tile = std::max(64, (tile / 2) / 4 * 4);
@@ -1728,7 +1729,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     const WRect fp = footprint(P, work);
     SrcWin win{fp.x0, fp.y0, fp.x1, fp.y1};
     if (!resident) {
-      if (down) win = lanczosWindow(W_, H_, rw, rh, fp);
+      if (down) win = lanczosWindow(rb, fp);
       const hal::Status as = pool.acquire(hal::Format::RGBA16F, std::uint32_t(win.w()), std::uint32_t(win.h()), &acquired);
       if (as != hal::Status::Ok) return failStatus(as, "");
       haveAcq = true;
@@ -1788,7 +1789,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     } else {
       const H a = g.external(acquired);
       if (down) {
-        const H s2 = recordResize(rec, a, win, W_, H_, rw, rh, fp);
+        const H s2 = recordResize(rec, a, win, rb, fp);
         if (s2 < 0) ok = false;
         w.src.img = s2;
         w.src.ox = fp.x0;

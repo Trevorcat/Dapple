@@ -9,8 +9,10 @@
 #include <cstdint>
 #include <vector>
 
-#include "dapple/frame_plan.h"
+#include "engine/nodes/frame_facts.h"
 #include "local_eval.h"
+
+namespace dapple::warp { struct Field; }  // core/src/warp_field.h
 
 namespace dapple::local {
 
@@ -42,17 +44,16 @@ struct Blob {
 std::vector<Blob> detectBlobs(const float* rgb, const float* mask, int w, int h, float iodPx, float sens, bool searchSources);
 
 // ---- frame time -------------------------------------------------------------------------------------------------------------------------
-// Frame pixel index (x, y) -> photo metric (units of the photo's long edge), the mapping of FrameKernels::srcUV (affine: crop, rotate, flip,
+// Frame pixel index (x, y) -> photo metric (units of the photo's long edge), the mapping of the frame's PixelSource::srcUV before the warp (affine: crop, rotate, flip,
 // straighten, region).
 struct Affine {
   double m[6] = {1, 0, 0, 0, 1, 0};  // X = m0 x + m1 y + m2, Y = m3 x + m4 y + m5
 };
-Affine frameAffine(const FramePlan& P);
+Affine frameAffine(const engine::FrameFacts& P, const Frame& f);  // the region source's parent metric comes from `f`
 double affinePpu(const Affine& A);  // frame pixels per photo metric unit
 // The pixels per metric unit the halo of a frame is sized for (an upper bound of affinePpu for every frame the engine renders) and the one the
 // retouch radii use (the true one, never above the halo's).
 float haloPpu(const Frame& f, float scale);
-float retouchPpu(const Frame& f, float scale, const FramePlan& P);
 
 struct RetouchRadii {
   int rf = 1, rc = 1, rs = 1, rb = 1;  // L_f box (full resolution, 2 passes), L_c guided box, skin reference box, blotch-scale box (1/4 grid)
@@ -82,7 +83,7 @@ void retouchPlanes(const Frame& f, const ImageF& img, const AuxTarget& aux, cons
 // Retouch ops of a window (after healing): planes + combine.
 void retouchCombineWindow(const Frame& f, ImageF& img, const AuxTarget& aux, const RetouchRadii& R);
 // Heal + retouch of a LocalDetail window (CPU), before the legacy ops.
-void retouchDetailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float scale, const FramePlan& P);
+void retouchDetailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float scale, const Affine& A, const warp::Field* wf);
 
 // The skin weight of a pixel (normalised convolution of the skin reference) from its retouch amounts.
 inline float skinWeight(float ks, float ke, float kr, float kh, float ku) {

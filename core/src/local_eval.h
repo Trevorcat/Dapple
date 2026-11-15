@@ -17,8 +17,8 @@
 namespace dapple {
 namespace jsonlite { struct JValue; }
 bool localFromValue(const jsonlite::JValue& v, std::vector<LocalAdjustment>& out);  // local_adjust.cpp
-class FrameKernels;
 }  // namespace dapple
+namespace dapple::warp { struct Field; }  // core/src/warp_field.h
 
 namespace dapple::local {
 
@@ -130,8 +130,16 @@ struct AuxTarget {
 };
 // The planes a frame needs (only the stage-W ops some adjustment uses) and their slot map.
 int auxLayout(const Frame& f, AuxTarget& t);
+// What the frame's geometry gives the CPU kernels (the point family's source fetch: FrameKernels implements it).
+struct PixelSource {
+  virtual ~PixelSource() = default;
+  virtual int width() const = 0;                                            // frame width
+  virtual void srcUV(int x, int y, float& u, float& v) const = 0;           // source position of output pixel (x, y), normalised by the source size
+  virtual void sourceRow(float* px, int n, int x0, int y) const = 0;        // pre-gain source values of output pixels x0 .. x0 + n - 1 of row y
+  virtual void linearRow(float* px, int n, int x0, int y) const = 0;        // a sourceRow in place -> the stage input (gain, single-image HDR)
+};
 // The LocalLinear block fragment: n pixels of row y starting at x0 (frame coordinates).
-void linearBlock(const Frame& f, const FrameKernels& fk, float* px, int n, int x0, int y, const AuxTarget* aux);
+void linearBlock(const Frame& f, const PixelSource& ps, float* px, int n, int x0, int y, const AuxTarget* aux);
 
 // Radii of LocalDetail at a radii scale (frame long edge / 2048, as the spatial stages).
 struct DetailRadii {
@@ -141,9 +149,10 @@ struct DetailRadii {
   int haloLegacy = 0, haloRetouch = 0, haloHeal = 0;
 };
 DetailRadii detailRadii(const Frame& f, float scale);
-// The LocalDetail window node: `img` is the work window at (ox, oy) of a fw x fh frame, `aux` its amount planes. `fk` (needed by the portrait
-// retouch: the frame's geometry) may be null when the frame has no retouch op and no heal spot.
-void detailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, int fw, int fh, float scale, const FrameKernels* fk = nullptr);
+struct Affine;  // local_retouch.h
+// The LocalDetail window node: `img` is the work window at (aux.ox, aux.oy), `aux` its amount planes. `photo` (frame pixel -> photo metric,
+// needed by the portrait retouch) may be null when the frame has no retouch op and no heal spot; `wf`: the reshaping field the spots follow.
+void detailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float scale, const Affine* photo, const warp::Field* wf);
 // The legacy stage-W ops (clarity .. dehaze) of a window (part of detailWindow).
 void legacyDetailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float scale);
 
@@ -158,7 +167,7 @@ void planeCachePut(std::uint64_t key, std::shared_ptr<const Plane> p);
 void boxRepeat(std::vector<float>& d, int w, int h, int ch, int r);
 
 // One row of the mask of adjustment `index` (0..255) over the output frame of `fk` (UI overlay).
-void maskRow(const Frame& f, const FrameKernels& fk, int index, int y, std::uint8_t* out);
+void maskRow(const Frame& f, const PixelSource& fk, int index, int y, std::uint8_t* out);
 // The stage input of a photo point as the range components see it (UI colour / luminance picker): L* 0..100, hue 0..360, sat.
 void sampleRange(const float lin[3], float& Lstar, float& hue, float& sat);
 

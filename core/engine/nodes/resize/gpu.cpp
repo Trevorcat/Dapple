@@ -1,4 +1,4 @@
-// GPU implementation of Resize (Lanczos-3, separable, any output rectangle from its source window) and the source
+// GPU implementation of Resize (the block and the source window: resize.h) (Lanczos-3, separable, any output rectangle from its source window) and the source
 // conversion (float RGB rows -> RGBA16F). Shaders: resize.comp, convert.comp.
 #include <algorithm>
 #include <cmath>
@@ -14,22 +14,13 @@ struct ResizeU {
 };
 }  // namespace
 
-// Source window (clamped, exclusive end) the Lanczos-3 filter reads to produce `dst` of a srcW x srcH -> dstW x dstH resize.
-SrcWin lanczosWindow(int srcW, int srcH, int dstW, int dstH, const WRect& dst) {
-  SrcWin w;
-  auto axis = [](int srcLen, int dstLen, int d0, int d1, int& lo, int& hi) {
-    const float s = float(srcLen) / float(dstLen), S = std::max(1.f, s);
-    lo = int(std::floor((float(d0) + 0.5f) * s - 0.5f - 3.f * S)) - 1;
-    hi = int(std::floor((float(d1) - 0.5f) * s - 0.5f + 3.f * S)) + 3;
-    lo = std::max(0, lo);
-    hi = std::min(srcLen, hi);
-  };
-  axis(srcW, dstW, dst.x0, dst.x1, w.x0, w.x1);
-  axis(srcH, dstH, dst.y0, dst.y1, w.y0, w.y1);
-  return w;
+SrcWin lanczosWindow(const resize::Block& b, const WRect& dst) {
+  const Rect w = resize::sourceWindow(b, Rect{dst.x0, dst.y0, dst.x1, dst.y1});
+  return SrcWin{w.x0, w.y0, w.x1, w.y1};
 }
 
-H recordResize(GpuRecorder& r, H src, const SrcWin& win, int srcW, int srcH, int dstW, int dstH, const WRect& dst) {
+H recordResize(GpuRecorder& r, H src, const SrcWin& win, const resize::Block& b, const WRect& dst) {
+  const int srcW = b.srcW, srcH = b.srcH, dstW = b.dstW, dstH = b.dstH;
   const hal::PipelineH ph = r.pl("resize", {{0, 0}}), pv = r.pl("resize", {{0, 1}});
   if (!ph || !pv) return -1;
   const float sx = float(srcW) / float(dstW), sy = float(srcH) / float(dstH);

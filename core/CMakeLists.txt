@@ -70,6 +70,8 @@ add_library(dapple_core STATIC
   engine/nodes/grain/grain.cpp
   engine/nodes/dehaze/dehaze.cpp
   engine/nodes/detail/detail.cpp
+  engine/nodes/local/local.cpp
+  engine/nodes/resize/resize.cpp
   engine/nodes/demosaic/demosaic_cpu.cpp
   engine/nodes/demosaic/demosaic_session.cpp
   engine/video/video_frame_session.cpp

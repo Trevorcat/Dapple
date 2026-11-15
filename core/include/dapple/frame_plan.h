@@ -1,6 +1,6 @@
 #pragma once
 // What the point family (not migrated yet, docs/engine/pipeline-architecture.md section 50) resolves for one frame: geometry, gain, HDR,
-// warp, local, film and the neighbourhood amounts of the families that do not resolve their own block yet. The migrated families
+// warp, film and the neighbourhood amounts of the families that do not resolve their own block yet. The migrated families
 // (vignette, ...) resolve from EditParams + engine::FrameFacts (core/engine/nodes/frame_blocks.h). See Renderer::framePlan() and docs/engine/gpu-backend.md.
 #include <cstdint>
 #include <memory>
@@ -11,7 +11,6 @@ namespace dapple {
 
 class Lut3D;
 struct HdrField;  // core/src/hdr_field.h
-namespace local { struct Frame; }  // core/src/local_eval.h
 namespace warp { struct Field; }   // core/src/warp_field.h
 
 struct FramePlan {
@@ -73,10 +72,6 @@ struct FramePlan {
     float lutMix = 0.f;          // 0..1
     std::uint64_t lutId = 0;     // Lut3D::contentId()
   } display;
-  // Local adjustments (docs/engine/pipeline-architecture.md section 40): the resolved list of the frame (null = none). The point pass evaluates the
-  // masks and the scene-linear ops after `gain` / HDR; `localDetail` = the frame has the window ops (LocalDetail node).
-  std::shared_ptr<const local::Frame> local;
-  bool localDetail = false;
   // Portrait reshaping (docs/engine/pipeline-architecture.md section 45): the backward displacement field, applied to the source position after
   // the geometry mapping (s -> s + B(s); grid coordinate = s * a + b, displacement in source pixels = d * lpx). `useGeo` is on whenever it
   // is set (an identity geometry then takes the exact index mapping where the field is zero). `pad` = source pixels the field can move a

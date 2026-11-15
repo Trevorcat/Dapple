@@ -105,7 +105,7 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
     if (needMain) {
       NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
       if (fp.hdr.active()) gain = g.add(NodeType::Hdr, {Edge{gain}});
-      if (fp.local) gain = g.add(NodeType::LocalLinear, {Edge{gain}});
+      if (fb.local.active()) gain = g.add(NodeType::LocalLinear, {Edge{gain}});
       mainOut = g.add(NodeType::ToneColourExact, {Edge{gain}});
     }
     if (useFilm) {
@@ -125,7 +125,7 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
     if (needMain) {
       NodeId gain = g.add(NodeType::Gain, {Edge{cur}});
       if (fp.hdr.active()) gain = g.add(NodeType::Hdr, {Edge{gain}});
-      if (fp.local) gain = g.add(NodeType::LocalLinear, {Edge{gain}});
+      if (fb.local.active()) gain = g.add(NodeType::LocalLinear, {Edge{gain}});
       if (t.hasOverflow) mainOut = g.add(NodeType::ToneColour, {Edge{gain}, Edge{t.tone}, Edge{t.lattice}, Edge{t.overflow}});
       else mainOut = g.add(NodeType::ToneColour, {Edge{gain}, Edge{t.tone}, Edge{t.lattice}});
     }
@@ -151,7 +151,7 @@ Graph GraphBuilder::build(const ParamSet& ps, GraphDetail detail, const FramePla
   if (!nr::chromaBehaviour().isIdentity(&fb.nrChroma)) cur = g.add(NodeType::NRChroma, {Edge{cur}});
   if (!dehaze::behaviour().isIdentity(&fb.dehaze)) cur = g.add(NodeType::Dehaze, {Edge{cur}});
   if (!detail::behaviour().isIdentity(&fb.detail)) cur = g.add(NodeType::Detail, {Edge{cur}});
-  if (fp.local && fp.localDetail) cur = g.add(NodeType::LocalDetail, {Edge{cur}});
+  if (!localadj::detailBehaviour().isIdentity(&fb.local)) cur = g.add(NodeType::LocalDetail, {Edge{cur}});
   // 4.6 / section 14 (Q8): grain is dropped at the interactive tier unless a grain-family slider is being dragged
   const bool keepGrain = f.interactive && grainFamily(f.activeParam) && e.grain > 0.f;
   if (!grain::behaviour().isIdentity(&fb.grain) || keepGrain) cur = g.add(NodeType::Grain, {Edge{cur}});

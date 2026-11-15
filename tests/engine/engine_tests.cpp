@@ -357,7 +357,7 @@ FramePlan planFor(const ParamSet& ps) {
 }
 // the resolved blocks of the migrated node families for the same frame
 FrameBlocks blocksFor(const ParamSet& ps, const FramePlan& plan) {
-  return resolveFrameBlocks(ps.edit(), frameFacts(plan, optsFor(ps), ps.ctx().sceneReferred));
+  return resolveFrameBlocks(ps.edit(), frameFacts(plan, optsFor(ps), ps.ctx().sceneReferred), {nullptr, plan.warp.field.get()});
 }
 
 std::string snapshotText(bool haveFilm) {

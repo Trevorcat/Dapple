@@ -1,6 +1,6 @@
 // CpuImpl of the main-pipeline nodes (docs/engine/pipeline-architecture.md 4.5). Every function wraps an existing kernel:
 // the point nodes are block fragments of FrameKernels (the per-pixel loop of renderer.cpp). The families that resolve their own
-// parameters (Vignette, NR, Dehaze, Detail, Grain: core/engine/nodes/<family>, docs section 50) bring their CpuImpl; this table
+// parameters (Vignette, NR, Dehaze, Detail, Grain, local adjustments: core/engine/nodes/<family>, docs section 50) bring their CpuImpl; this table
 // lists them and bindResolved copies their block from FrameEnv::blocks. Nothing is re-implemented here.
 //
 // Block fragment contract (CpuImpl::block): `px` = n pixels of interleaved float RGB (3 floats, not float4), n <= 256,
@@ -11,7 +11,7 @@
 
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session.h"
-#include "local_eval.h"
+#include "engine/nodes/resize/resize.h"
 #include "parallel.h"
 
 namespace dapple::engine {
@@ -27,15 +27,7 @@ struct DispRes {
   bool replace;
   const int* row0;  // streaming export: frame row of the film band's first row (null: the whole frame)
 };
-struct WinRes {
-  const FrameKernels* fk;
-  float scale;
-};
-struct LocalRes {
-  const FrameKernels* fk;
-  const local::AuxTarget* aux;
-};
-static_assert(sizeof(WinRes) <= kMaxResolvedBytes && sizeof(DispRes) <= kMaxResolvedBytes, "resolved block too large");
+static_assert(sizeof(DispRes) <= kMaxResolvedBytes, "resolved block too large");
 
 // ---- point block fragments ---------------------------------------------------------------------------------------------
 void blkCopy(const void* r, float* px, int n, const PixelPos& pos) {
@@ -52,10 +44,6 @@ void blkHdr(const void* r, float* px, int n, const PixelPos& pos) {
   static_cast<const PtRes*>(r)->fk->hdrBlock(px, n, pos.x, pos.y);
 }
 void blkToneColour(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->toneColour(px, n); }
-void blkLocal(const void* r, float* px, int n, const PixelPos& pos) {
-  const auto* l = static_cast<const LocalRes*>(r);
-  if (const local::Frame* f = l->fk->localFrame()) local::linearBlock(*f, *l->fk, px, n, pos.x, pos.y, l->aux);
-}
 
 thread_local float t_side[256 * 3];  // display-staged film pixels waiting for the Blend that follows in the chain
 
@@ -68,15 +56,6 @@ void blkDisplay(const void* r, float* px, int n, const PixelPos& pos) {
 void blkBlend(const void* r, float* px, int n, const PixelPos&) { static_cast<const PtRes*>(r)->fk->blend(px, t_side, n); }
 
 // ---- tile (window / whole-frame) nodes -------------------------------------------------------------------------------------
-Status tileLocalDetail(CpuTile& t, const void* r) {
-  const auto* w = static_cast<const WinRes*>(r);
-  const local::Frame* f = w->fk->localFrame();
-  if (!f || !f->anyWindow) return Status::Ok;
-  if (!t.aux || !t.aux->data || t.aux->ox != t.ox || t.aux->oy != t.oy || t.aux->w != t.img->width || t.aux->h != t.img->height)
-    return Status::Internal;  // the amounts must come from the head chain of this very window
-  local::detailWindow(*f, *t.img, *t.aux, t.frameW, t.frameH, w->scale, w->fk);
-  return Status::Ok;
-}
 Status tileFilmSim(CpuTile& t, const void* r) {
   // FilmSim as a whole-frame node: the film render of the frame into t.img (super-node until the film nodes land)
   const auto* p = static_cast<const PtRes*>(r);
@@ -149,19 +128,10 @@ Status bakeOverflow(const void* r, std::span<const void* const>, void** out) {
   *out = new std::vector<float>(c.env->renderer.bakeOverflow(c.env->src, base, c.n, c.maxV));
   return Status::Ok;
 }
-// Resize: the frame-global step of the node (the source resampled to the requested long edge). Its payload is the scaled
-// SourceImage the rest of the frame reads (the block fragment `blkCopy` then copies rows of it).
-Status bakeResize(const void* r, std::span<const void* const>, void** out) {
-  const auto& c = *static_cast<const ResizeBakeCtx*>(r);
-  auto* img = new SourceImage();
-  img->sceneReferred = c.full->sceneReferred;
-  img->linear = resizeToLongEdge(c.full->linear, c.longEdge);
-  *out = img;
-  return Status::Ok;
-}
 
 const CpuImpl kSource{nullptr, blkCopy, nullptr, nullptr};
-const CpuImpl kResize{nullptr, blkCopy, nullptr, bakeResize, freeAs<SourceImage>};
+// Resize: the bake is the family's (nodes/resize: the whole source at a long edge); the chain's head copies rows of the frame's source
+const CpuImpl kResize{nullptr, blkCopy, nullptr, resize::bake, resize::freePayload};
 const CpuImpl kLattice{nullptr, nullptr, nullptr, bakeLattice, freeAs<std::vector<float>>};
 const CpuImpl kPre{nullptr, nullptr, nullptr, bakePre, freeAs<Renderer::TonePre>};
 const CpuImpl kToneTable{nullptr, nullptr, nullptr, bakeToneTable, freeAs<ToneTableOut>};
@@ -172,8 +142,6 @@ const CpuImpl kFusedHead{nullptr, blkFusedHead, nullptr, nullptr};
 const CpuImpl kGain{nullptr, blkGain, nullptr, nullptr};
 const CpuImpl kHdr{nullptr, blkHdr, nullptr, nullptr};
 const CpuImpl kToneColour{nullptr, blkToneColour, nullptr, nullptr};
-const CpuImpl kLocalLinear{nullptr, blkLocal, nullptr, nullptr};
-const CpuImpl kLocalDetail{nullptr, nullptr, tileLocalDetail, nullptr};
 const CpuImpl kDisplay{nullptr, blkDisplay, nullptr, nullptr};
 const CpuImpl kBlend{nullptr, blkBlend, nullptr, nullptr};
 
@@ -194,8 +162,8 @@ const CpuImpl* cpuImpl(NodeType t) {
     case NodeType::ToneColour:
     case NodeType::ToneColourExact: return &kToneColour;
     case NodeType::Vignette: return &vignette::cpu();
-    case NodeType::LocalLinear: return &kLocalLinear;
-    case NodeType::LocalDetail: return &kLocalDetail;
+    case NodeType::LocalLinear: return &localadj::linearCpu();
+    case NodeType::LocalDetail: return &localadj::detailCpu();
     case NodeType::DisplayStages: return &kDisplay;
     case NodeType::Blend: return &kBlend;
     case NodeType::NRLuma: return &nr::lumaCpu();
@@ -240,7 +208,8 @@ bool bindResolved(NodeType t, const FrameEnv& env, Resolved& out) {
       new (out.bytes) detail::Block(env.blocks->detail);
       return true;
     case NodeType::LocalDetail:
-      new (out.bytes) WinRes{env.fk, env.fk->spatialScale()};  // read after the film outcome is known
+      if (!env.blocks) return false;
+      new (out.bytes) localadj::Block(env.blocks->local);  // resolved after the film outcome is known (radii scale)
       return true;
     case NodeType::Pack8: return true;
     case NodeType::Vignette:
@@ -248,7 +217,8 @@ bool bindResolved(NodeType t, const FrameEnv& env, Resolved& out) {
       new (out.bytes) vignette::Block(env.blocks->vignette);
       return true;
     case NodeType::LocalLinear:
-      new (out.bytes) LocalRes{env.fk, env.aux};
+      if (!env.blocks) return false;
+      new (out.bytes) localadj::LinearCpu{env.blocks->local.frame, env.fk, env.aux};
       return true;
     default:
       if (!cpuImpl(t) || (!cpuImpl(t)->block && !cpuImpl(t)->tile)) return false;  // table nodes bake, they are not bound per frame

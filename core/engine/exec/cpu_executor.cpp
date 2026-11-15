@@ -79,7 +79,7 @@ struct Run {
   }
 
   bool bind(const Stage& sweep) {
-    blocks = resolveFrameBlocks(fk.params(), fk.frameFacts());
+    blocks = fk.frameBlocks();
     FrameEnv fe;
     fe.fk = &fk;
     fe.blocks = &blocks;
@@ -111,7 +111,7 @@ struct Run {
     return true;
   }
   bool bindWindows(const Stage& last) {
-    blocks = resolveFrameBlocks(fk.params(), fk.frameFacts());
+    blocks = fk.frameBlocks();
     FrameEnv fe;
     fe.fk = &fk;
     fe.blocks = &blocks;
@@ -416,7 +416,7 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
   CancelScope scope(env.cancel.current, env.cancel.mine);
   Run r(plan, env, stats);
   r.single = plan.grid.nx == 1 && plan.grid.ny == 1;
-  if (const local::Frame* lf = env.fk.localFrame(); lf && env.graph.find(NodeType::LocalDetail)) r.auxPlanes = local::auxLayout(*lf, r.aux);
+  if (const FrameBound b = env.fk.frameBound(); b.local && env.graph.find(NodeType::LocalDetail)) r.auxPlanes = local::auxLayout(*b.local, r.aux);
   if (env.cancel.cancelled()) return Status::Cancelled;
 
   // the last TileSweep lists every window node
@@ -437,7 +437,7 @@ Status CpuExecutor::run(const Plan& plan, ExecEnv& env, ExecStats* stats) {
       continue;
     }
     if (!env.fk.exactVariant() && env.fk.filmFull() && env.outChannels == 4 && !env.outF &&
-        !resolveFrameBlocks(env.fk.params(), env.fk.frameFacts()).anyWindow() && !env.fk.localFrame()) {
+        !env.fk.frameBlocks().anyWindow() && !env.fk.frameBound().local) {
       if (env.fk.streamFilm(env.out)) {
         if (stats) stats->streamed = true;
         return Status::Ok;

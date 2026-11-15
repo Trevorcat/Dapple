@@ -219,7 +219,7 @@ Graph fullGraph(const EditParams& p, const SourceImage& src) {
   in.ctx.srcW = src.linear.width;
   in.ctx.srcH = src.linear.height;
   const ParamSet ps = ParamSet::make(std::move(in));
-  const FrameBlocks fb = resolveFrameBlocks(fk.params(), fk.frameFacts());
+  const FrameBlocks fb = fk.frameBlocks();
   return GraphBuilder::build(ps, GraphDetail::FullFilm, &fp, &fb);
 }
 

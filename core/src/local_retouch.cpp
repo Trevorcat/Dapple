@@ -440,8 +440,7 @@ void healSpotsOf(const LocalAdjustment& a, const Frame& f, int adj, const Source
 
 // ---- frame geometry -----------------------------------------------------------------------------------------------------------------------
 namespace {
-void framePoint(const FramePlan& P, double x, double y, double& X, double& Y) {
-  const Frame* lf = P.local.get();
+void framePoint(const engine::FrameFacts& P, const Frame* lf, double x, double y, double& X, double& Y) {
   const bool win = lf && lf->parentW > 0 && lf->parentH > 0;  // a region source: the metric is the parent picture's (section 44)
   const double L = win ? double(std::max(lf->parentW, lf->parentH)) : double(std::max(P.srcW, P.srcH));
   double sx, sy;
@@ -464,12 +463,12 @@ void framePoint(const FramePlan& P, double x, double y, double& X, double& Y) {
 }
 }  // namespace
 
-Affine frameAffine(const FramePlan& P) {
+Affine frameAffine(const engine::FrameFacts& P, const Frame& f) {
   Affine A;
   double X0, Y0, X1, Y1, X2, Y2;
-  framePoint(P, 0, 0, X0, Y0);
-  framePoint(P, 1, 0, X1, Y1);
-  framePoint(P, 0, 1, X2, Y2);
+  framePoint(P, &f, 0, 0, X0, Y0);
+  framePoint(P, &f, 1, 0, X1, Y1);
+  framePoint(P, &f, 0, 1, X2, Y2);
   A.m[0] = X1 - X0, A.m[1] = X2 - X0, A.m[2] = X0;
   A.m[3] = Y1 - Y0, A.m[4] = Y2 - Y0, A.m[5] = Y0;
   return A;
@@ -479,7 +478,6 @@ double affinePpu(const Affine& A) {
   return det > 1e-30 ? 1.0 / std::sqrt(det) : 1.0;
 }
 float haloPpu(const Frame& f, float scale) { return std::max(2048.f * scale, f.srcLong); }
-float retouchPpu(const Frame& f, float scale, const FramePlan& P) { return std::min(float(affinePpu(frameAffine(P))), haloPpu(f, scale)); }
 
 RetouchRadii retouchRadii(float iodPx) {
   RetouchRadii r;
@@ -790,11 +788,10 @@ void retouchCombineWindow(const Frame& f, ImageF& img, const AuxTarget& aux, con
   });
 }
 
-void retouchDetailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float scale, const FramePlan& P) {
-  const Affine A = frameAffine(P);
+void retouchDetailWindow(const Frame& f, ImageF& img, const AuxTarget& aux, float scale, const Affine& A, const warp::Field* wf) {
   if (!f.spots.empty()) {
     std::vector<SpotPx> sp;
-    spotsForWindow(f, A, aux.ox, aux.oy, img.width, img.height, sp, P.warp.field.get());
+    spotsForWindow(f, A, aux.ox, aux.oy, img.width, img.height, sp, wf);
     healWindow(sp, img);
   }
   if (f.retouchW) {

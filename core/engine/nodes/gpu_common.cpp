@@ -170,9 +170,8 @@ H GpuRecorder::down(H D, int f, int mode, H dst, const WRect& win, int offX, int
   return dst;
 }
 
-SpatialRadii spatialRadii(const FramePlan& P, const FrameBlocks& B) {
+SpatialRadii spatialRadii(const FrameBlocks& B) {
   SpatialRadii r;
-  const float scale = P.spatialScale;
   int haloL = 0, haloC = 0, haloD = 0;
   if (B.nrLuma.active()) haloL = 2 * B.nrLuma.radius + 1;
   if (B.nrChroma.active()) haloC = (2 * B.nrChroma.lowRadius + 3) * B.nrChroma.factor;
@@ -180,7 +179,7 @@ SpatialRadii spatialRadii(const FramePlan& P, const FrameBlocks& B) {
   if (D.texture != 0) haloD = std::max(haloD, 2 * D.textureRadius + 1);
   if (D.sharpAmount > 0) haloD = std::max(haloD, D.sharpBox > 0 ? 3 * D.sharpBox + 1 : D.sharpGauss + 1);
   r.halo = (haloL + haloC + haloD + 8 + 3) / 4 * 4;
-  if (P.local && P.localDetail) r.halo += local::detailRadii(*P.local, scale).halo;  // LocalDetail (docs section 40), after the Detail stage
+  if (B.local.detail) r.halo += B.local.halo;  // LocalDetail (docs section 40), after the Detail stage
   return r;
 }
 
