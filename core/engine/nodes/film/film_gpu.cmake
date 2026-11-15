@@ -21,7 +21,7 @@ set(DAPPLE_FILM_GPU_SHADERS
   "film_h3|film_mix3.comp|MODE=1|SIIIIB"
   "film_v3|film_mix3.comp|MODE=2|SSSSSSIB"
   "film_b3|film_mix3.comp|MODE=3|SSI"
-  "film_src|film_src.comp||SI"
+  "film_src|film_src.comp||SIB"
   "film_bmax|film_boost.comp|MODE=0|SB"
   "film_bcon|film_boost.comp|MODE=1|BB"
   "film_bapp|film_boost.comp|MODE=2|SBI"

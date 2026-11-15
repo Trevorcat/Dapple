@@ -1,5 +1,80 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-15 baseline after the planner rewrite
+
+Build: release APK of HEAD bb1cf0f (`app/build/app/outputs/flutter-apk/app-release.apk`, installed with `install -r`), Note10+ SM-N9760, Android 12, Vulkan on Adreno 640 (`gpu probe: api=vulkan ... self-test cached, probe total 9-13 ms`). Method (taps only, the release APK has no debug hooks):
+* Library: three public CC0 RAW samples (`build/rawsamples`: Sony ILCE-6700 ARW 6240x4168 = 26 MP Bayer, Sony ILCE-7RM4 ARW 9568x6376 = 61 MP Bayer, Fujifilm X-S10 lossless RAF 6246x4170 = 26 MP X-Trans) pushed to a throw-away folder, scanned in by MediaStore; `adb shell input tap/swipe` on Dapple's own screens only (grid thumb, tab bar, pad / slider / circle handle).
+* Frame trace: `setprop debug.dapple.frame_profile 1` (one `dapple_engine frame ...` line per frame with `tables / exec / upload`, executor and typed `reason=`), `dapple_view` lines (render / present / latency of the shown frame), `flutter OPEN_TIMING` lines (ms since the tap) and the `session_open` / `dapple_demosaic` stage lines. Drags: 3 reps of a 1.3 s swipe out and 1.3 s back (about 40-140 interactive frames per rep, all frames pooled). Open: 5 cold-process reps (`force-stop`, start, tap) per file. RSS: `/proc/<pid>/status` VmRSS sampled every 0.25 s plus VmHWM.
+* State: **Battery Saver ON (`low_power` 1, not changed)**, battery 100 % on USB, 25.5 C at start / 29.5 C battery, AP 33.1 C at the end, `Thermal Status 0` before and after, screen on, 60 Hz panel only. Raw logs `build/perf-20261115/` (`open_x*_*.log`, `drag_*_*.log`, `zoom_*.log`, `export_*.log`, `rss_*.txt`, `mem_seq.txt`, `cold*.log`, summaries `summary_note10_*.txt`, analysers `an_open.py`, `an_drag.py`).
+
+### A1 Cold start
+`am start -W` TotalTime 333 / 340 / 331 / 326 / 332 ms = `Displayed` +326..340 ms (median **332**). The grid with cached thumbnails is the first screen. Background after that: GPU warm-up "film pipelines + default stock" 617-666 ms (runs the first engine frames; three of them report `exec=cpu reason=no source store (host frame)`, these are warm-up probes, not user frames).
+
+### A2 Open from the grid (ms since the tap, median of 5, min-max)
+| file | first pixels (thumb) | first engine frame ("real_frame") | second full-tier frame ("sharp", settled) | session_open (decode to 2048) | of which unpack / mosaic / reduce / anchor | first frame cpu_ms (tables / exec incl. upload) |
+|---|---|---|---|---|---|---|
+| X-S10 RAF 26 MP X-Trans | 29 (23-48) | **1400** (1367-1434) | 2083 (2036-2113) | 1014 (981-1052) | 681 / 865 (mosaic incl. unpack) / 100 / 53 | 146 (22 / 124, upload 77) |
+| A6700 ARW 26 MP Bayer | 24 (22-39) | **993** (965-999) | 1683 (1663-1688) | 577 (565-605) | 233 / 360 / 151 / 65 | 170 (39 / 131, upload 83) |
+| A7RM4 ARW 61 MP Bayer | 31 (18-35) | **1612** (1600-1626) | 2292 (2283-2315) | 1207 (1187-1221) | 524 / 725 / 320 / 162 | 150 (38 / 112, upload 64) |
+
+* Time split, 61 MP: 1612 = session_open 1207 (RAW decode + preview demosaic on CPU) + first frame 150 (`tables 38` CPU bake, `exec 112` incl. `upload 64`) + ~255 ms not in engine logs (Dart hand-off, swapchain creation `dapple_present`, inferred). Same ~245 ms remainder on the other two files.
+* "Sharp" = the second full-tier 1600 px frame (88-98 ms, `tables 18-21`, upload 13) about 680-700 ms after the first one; the delay is a settle timer, not work (inferred). Region warm-up (256x256) after the picture: 61-77 ms for Bayer (CPU verdict), 1280 ms for X-Trans (GPU verdict, frame GPU 393 vs CPU 1990 ms).
+* Every open also starts a neighbour prefetch (`session_open` of the next photo 3-7 s later, 61 MP: unpack 1.5 s, preview 3.1 s when it overlaps something else), visible as CPU load during a following drag / export.
+* All first frames `exec=vulkan`, picture correct (screenshots viewed).
+
+### A3 Drag frames (interactive tier, A6700, pooled frames; engine `cpu_ms` = frame-thread time, `tables` = CPU table bake on the frame thread, `exec` = record+submit(+wait), `upload` inside exec)
+| drag | film | size the adaptive tier settled at | engine ms median / p90 / max | tables ms (med) | exec ms (med) | view render ms median / p90 | latency ms median | executor |
+|---|---|---|---|---|---|---|---|---|
+| exposure (光线 pad x) | off | 360x240 (171 of 206 frames), 480x321 (35); first drag started at 810x541 / 640x428 and shrank | 24.6 / 39.1 / 130.5 | 12.4 | 11.1 | 25.3 / 39.8 | 39 | vulkan 206 / 206 |
+| colour pad (颜色, 冷暖 x 浓淡 y) | off | 360x240 (117 of 117) | **54.3 / 73.6 / 144.5** | **39.4** | 11.8 | 54.7 / 72.1 | 69 | vulkan |
+| exposure (光线 pad x) | on (N400C) | 360x240 | 32.7 / 44.3 / 224.9 | 27.1 | 3.2 | 33.5 / 47.2 | 48 | vulkan |
+| colour pad | on | 360x240 | 34.0 / 42.4 / 219.5 | 27.0 | 4.3 | 34.7 / 50.7 | 48 | vulkan |
+| film strength (成像 slider) | on | 360x240 136, 480x321 204, 640x428 59 | **1.5 / 11.0 / 99** | 0.4 | 0.9 | 1.9 / 11.8 | 16 | vulkan |
+| film exposure-type pad (成像 pad y) | on | 360x240 134, 480x321 209, 640x428 68 | **1.3 / 9.1 / 166** | 0.2 | 0.8 | 1.7 / 9.6 | 16 | vulkan; `film_tables stale 397 baked 421 requested 421` at the end (tables bake in the background and lag) |
+| 局部 circle: move the area | on | 360x240 123, 480 28, 640 32 | 1.7 / 3.3 / 102 | 0.5 | 0.7 | 3.5 / 54 (max 773) | 19 | vulkan |
+| 局部 circle: move the area | off (film removed afterwards did not take: see below) | 360x240 | 1.7 / 6.8 / 47 | 0.5 | 0.7 | 3.7 / 49 (max 1337) | 18 | vulkan |
+| **局部 pad (光线) on the circle** | **on** | 360x240 | **175.9 / 354.5 / 462** (only 11-14 frames per 2.6 s) | 0.4 | 175 | 182 / 382 | 193 | **cpu 36 of 37**, reason below |
+
+* **GPU to CPU fallback with typed reason (Adreno 640):** `exec=cpu reason=transient GPU failure: recording failed: vkCreateComputePipelines local_film_in|0=0|3=0|4=0|16=16|17=16|18=256|19=256 failed (VkResult -13)` on every frame of the 局部 adjustment drag when a film is selected. The zoom detail frame of the same photo (film + local edit, 1340x1443): `exec=cpu reason=transient GPU failure: ... vkCreateComputePipelines film_src|0=2|4=0|16=16|17=16|18=256|19=256 failed (VkResult -13)`, cpu_ms 797. The same two pipelines fail on the Redmi (Adreno 710) in `dapple_gpu_tests`; the pre-rewrite binary (`build/gles640-arm64`, 2026-11-14) passes the full suite on the same Redmi (see redmi-garnet.md). The failure repeats every frame ("transient"), nothing demotes the executor, so every frame pays pipeline-creation failure plus CPU render.
+* The no-film 局部 pad drag was NOT measured: the film reset tap did not clear the film (the later runs still logged `film=on`), so the 局部 rows marked "off" are really film on. Not retried (device time).
+* Table bake is the CPU cost of the pad and colour drags: colour pad 39 ms of 54 ms, exposure 12 ms of 25 ms (film on: 27 ms of 33 ms). `upload` 7-9 ms per frame without film.
+* Film strength / film pad frames are 1-2 ms on the frame thread because they reuse the last baked film tables (`stale` count grows during the drag, `baked` follows `requested` within ~1 table); GPU time per film frame is not in the log (submit is asynchronous), view latency is 16 ms (one vsync).
+* Zero-copy present works (`dapple_view`: `ext` = all but the first frame, present 0.4 ms median). The panel is 60 Hz, so 16 ms is the floor.
+
+### A4 Zoom (double-tap on the picture, zoom 1.4, tap time from the device clock, +~0.1 s tap latency)
+| file | tap to first detail frame | what happened |
+|---|---|---|
+| X-S10 RAF | 2.0 s (2 reps: 2.03 / 2.02) | half-resolution session (region 3874x4170 > region cap 3200x2400): `half-resolution reconstruction 1008-1011 ms` (X-Trans), frame 1339x1442 `cpu_ms 217-225 (tables 28, exec 189-197, upload 74-77)` |
+| A7RM4 ARW 61 MP | 2.4 s | half-res session decode 886 ms (total 1403), frame 1339x1439 `cpu_ms 276 (tables 66, exec 211, upload 102)` |
+| A6700 ARW 26 MP (carries film + local edit) | 2.2 s | "region skipped, the edit has local adjustments on a film frame", frame 1340x1443 on **CPU 797 ms** (the `film_src` failure above) |
+
+### A5 Export full-size JPEG (tap on the download icon; time = tap to `export_*` line; RSS = sampled VmRSS peak, HWM in brackets)
+| file | edit state | path | tap to done | stages | peak RSS |
+|---|---|---|---|---|---|
+| X-S10 RAF | exposure nudge | whole frame, GPU | 6.3 / 6.9 s | full demosaic 5.4-5.6 s (CPU), render 0.74-0.75, encode+write 0.34-0.38 | 931 MB (940) |
+| A7RM4 61 MP | exposure nudge | streamed, GPU (203 windows) | 6.7 / 6.7 s | analyse 0.86, CPU row demosaic 3.06, render 0.84, encode 0.86 | 879 / 864 MB (882) |
+| A6700 26 MP | film N400C + local circle (persisted from the drag tests) | streamed, **CPU** | 10.8 / 11.2 s | analyse 0.7, CPU demosaic 0.9, render 1.0, encode 1.0-0.84 (stream CPU 9.2-9.7 s) | 1069 / 1047 MB (1076) |
+
+* An export of a photo that was not edited since its last export returns at once with the earlier file (no engine lines; the icon turns green): measured by accident, not a render.
+* The A6700 export used the CPU stream because the photo carries film + local edits (`whole-frame peak 2751 MB (film, GPU 915) vs budget 1536 MB -> stream`; the log does not give a reason for choosing the CPU stream over the GPU stream, inferred: the same film/local GPU pipeline failure). A plain A6700 edit export was not measured.
+* All three outputs were written to the app's gallery folder and deleted afterwards (cleanup below). Outputs not viewed.
+
+### A6 Resident memory (VmRSS, MB)
+Grid after start 283 | after photo 1 (X-S10) 801 | 2 (7RM4) 682 | 3 610 | 4 606 | 5 598 | **after back to the grid 282** (`memory_trim 1: released 352 MB`; `dumpsys meminfo` at the end: TOTAL PSS 205 MB, RSS 326 MB, Graphics 70 MB, Native 68 MB). VmHWM 931 MB for the whole sequence. Leaving the editor writes a 2048 px JPEG (`export_jpeg 2048x1365 render 119 / 265 ms, encode 36-49 ms`) and trims within 0.15-0.27 s.
+
+### Findings in short (6 largest costs, details in the chat report)
+1. `film_src` and `local_film_in` Vulkan pipelines fail to create on Adreno 640 and 710 (VkResult -13): film + local drags 176 ms/frame on CPU, film zoom 797 ms, export on CPU 11 s. Regression against the 2026-11-14 build.
+2. CPU table bakes on the frame thread: 39 of 54 ms (colour pad), 12-27 ms of every exposure frame.
+3. Open to first frame 1.0-1.6 s: CPU decode + preview demosaic (session_open 0.58-1.2 s) plus ~250 ms outside the engine.
+4. Zoom to first detail 2.0-2.4 s: half-resolution session rebuilt from the RAW (X-Trans 1.0 s reconstruction), no region path above the 3200x2400 cap.
+5. Export 6.3-11 s: whole-frame X-Trans demosaic 5.4 s on CPU, 61 MP row demosaic 3.1 s on CPU.
+6. Adaptive tier collapses to 360x240 in every non-film drag (frame cost above budget); the first frame of the first exposure drag took cpu_ms 99 (view render 133, upload 67), one run only.
+
+### Not measured / cleanup
+Not measured: the no-film 局部 pad drag (see A3), a plain no-edit A6700 export, per-pass GPU time in the app (not in the frame log), a film-strength drag GPU time, GLES, Redmi in-app (cannot install). Cleanup: removed by exact path from the phone `/sdcard/Pictures/DappleTest1115/{P6700_26mp.ARW,P7RM4_61mp.ARW,PXS10_26mp.RAF}` (and the folder, MediaStore rows deleted) and the 8 exports the app wrote to `/sdcard/Pictures/Dapple/`: `P6700_26mp_dapple.jpg`, `P6700_26mp_dapple (1).jpg`, `P7RM4_61mp_dapple.jpg`, `P7RM4_61mp_dapple (1).jpg`, `PXS10_26mp_dapple.jpg`, `... (1).jpg`, `... (2).jpg`, `... (3).jpg` (files older than today in that folder were not touched); `debug.dapple.frame_profile` reset to empty; no files were pushed to `/data/local/tmp`. The app stays installed (updated with `install -r`); its library still lists the three test photos (rows pointing at deleted files) because there is no delete action and `pm clear` is forbidden. Screenshots (`s_*.png`) only show Dapple's own screens.
+
+---
+
 Borrowed owner phone, temporary permission. Same tools and methodology as `pixel5.md` (`build/pixel5-arm64-gpu` CLI + `dapple_gpu_tests`, `build/gles-android-arm64/dapple_gles_check`, `build/pixel5/main10/m10`, sustain script `build/note10/sustain.sh`). Raw logs: `build/note10/logs/`, screenshots `build/note10/s*.png`. Fixtures: synthetic only. Find N5 numbers come from `find-n5.md` / `build/n5/logs/`.
 
 **Caveat for every timing: Android Battery Saver was ON (`settings get global low_power` = 1, "Battery Saver is currently: ON", sticky), battery 40-42 % on USB.** Settings may not be changed in this session, so all timings are "battery saver on" and they are bimodal (4.1b). Re-run with Battery Saver off before final conclusions.

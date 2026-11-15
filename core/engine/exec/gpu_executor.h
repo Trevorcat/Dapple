@@ -2,12 +2,16 @@
 // GpuExecutor: runs a Plan (plan/plan.h) on a HAL device (docs/engine/pipeline-architecture.md 5.1 - 5.9, section 50).
 //
 //   gpu::Core      device + transient pool + per-frame-slot host buffers + deferred destruction (one per device generation; gpu_core.cpp)
+//   gpu::DeviceGate who may call the device now: one turn per job (a submission, an upload chunk, an export tile), interactive first (52)
 //   gpu::Context   process-wide: backend selection (Vulkan -> GLES 3.1), start-up self-test, device rebuild, epoch (gpu_context.cpp)
 //   gpu::Executor  per EngineSession (IGpuExecutor): runs the Plan's stages over the plan's tiles (gpu_executor.cpp), keeps the device copies
 //                  of the source, tables, solves and buffers in the session's ResultCache (gpu_device_copies.cpp), records a job (a frame or
 //                  a tile) through the nodes' GpuImpls (gpu_walk.cpp)
 //
 // Which executor runs a frame, and what a failure means, is decided by EngineSession (exec/engine_session.cpp, 5.9).
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -43,8 +47,8 @@ class Core {
   SlotRes& slot(int i) { return slots_[i]; }
   bool ensureStaging(int slot, std::uint64_t bytes, std::string& err);
   bool ensureReadback(int slot, std::uint64_t bytes, std::string& err);
-  // Gives the slots' grown host buffers back (staging to its initial 8 MB, readback freed; both grow again on use). The device must be idle and
-  // no frame in flight (memory trim: the context mutex held, after waitIdle). Returns the bytes released.
+  // Gives the slots' grown host buffers back (staging to its initial 8 MB, readback freed; both grow again on use). Inside a device turn (no
+  // readback crosses a turn in a frame slot); waits for the device itself. Returns the bytes released.
   std::size_t trimStaging();
   hal::BufferH gBuf, partBuf;  // dehaze statistics + reduction partials (device local)
   bool boxScanOk = true;       // the running-sum box passed its start-up check on this device (else the direct sum is used)
@@ -55,13 +59,16 @@ class Core {
     std::vector<hal::PassTime> times;
   };
   Stats statsOf(hal::FenceH f);
-  // Uploads packed float RGB rows of `rgb` (row pitch `pitchFloats`) into `dst` at (dx, dy) through the convert pass.
-  bool uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h, const hal::ImageH& dst, int dx, int dy, std::string& err);
+  // Uploads packed float RGB rows of `rgb` (row pitch `pitchFloats`) into `dst` at (dx, dy) through the convert pass, in submissions of
+  // 24 MB. `between` (optional) runs between two submissions (a background upload hands the device to a waiting interactive frame there);
+  // false stops the upload.
+  bool uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h, const hal::ImageH& dst, int dx, int dy, std::string& err,
+                    const std::function<bool()>& between = {});
 
   // Deferred destruction (no waitIdle): a device resource released while work already submitted may still read it (a cache eviction, a
   // session closing) is destroyed once the first fenced submission after its release has completed. retire(): any thread. submitted():
-  // every fenced submission (executors, under the context mutex). collect(): destroys what is safe (under the context mutex; `all` after the
-  // device went idle); returns the bytes freed.
+  // every fenced submission (inside a device turn). collect(): destroys what is safe (inside a device turn; `all` after the device went
+  // idle); returns the bytes freed.
   void retire(hal::ImageH h);
   void retire(hal::BufferH h);
   void submitted(hal::FenceH f);
@@ -85,6 +92,57 @@ class Core {
   std::vector<Retired> retired_;
 };
 
+// The device is externally synchronised as a whole (no HAL call is thread-safe, every back end; pipeline-architecture.md 52). A *turn* is the
+// right to call it for one job: one begin..submit (+ the fence wait and readback copy of a whole frame), one upload chunk, one export tile,
+// one keep-warm unit, a trim, a rebuild. Interactive waiters are served first (FIFO among them), then background waiters (FIFO): a drag frame
+// waits for the job in flight, never for a whole background frame. The holder also holds queueMutex(), the lock the presenter takes alone
+// for its own use of the VkQueue (the lease). Lock order: Executor::runMtx_ -> gate -> queueMutex -> leaves (retire, cache, sources).
+class DeviceGate {
+ public:
+  enum class Prio : int { Background = 0, Interactive = 1 };
+  void lock(Prio p);
+  void unlock();
+  bool interactiveWaiting();
+  std::mutex& queueMutex() { return queue_; }
+
+ private:
+  std::mutex m_;
+  std::condition_variable cv_;
+  bool held_ = false;
+  std::uint64_t next_[2] = {0, 0}, serving_[2] = {0, 0};  // tickets per priority
+  std::mutex queue_;
+};
+
+// RAII turn. yield(): a background holder hands the device to a waiting interactive turn and takes it back (true when it did; device state
+// the holder did not keep alive may have changed meanwhile, the epoch included). release() / acquire(): give the turn up for a while.
+class DeviceTurn {
+ public:
+  DeviceTurn(DeviceGate& g, DeviceGate::Prio p) : g_(g), p_(p) { g_.lock(p_); }
+  ~DeviceTurn() {
+    if (held_) g_.unlock();
+  }
+  DeviceTurn(const DeviceTurn&) = delete;
+  DeviceTurn& operator=(const DeviceTurn&) = delete;
+  bool yield() {
+    if (!held_ || p_ == DeviceGate::Prio::Interactive || !g_.interactiveWaiting()) return false;
+    g_.unlock();
+    g_.lock(p_);
+    return true;
+  }
+  void release() {
+    if (held_) g_.unlock(), held_ = false;
+  }
+  void acquire() {
+    if (!held_) g_.lock(p_), held_ = true;
+  }
+  bool held() const { return held_; }
+
+ private:
+  DeviceGate& g_;
+  DeviceGate::Prio p_;
+  bool held_ = true;
+};
+
 struct ContextOptions {
   hal::DeviceOptions device;  // allowSoftware, deviceIndex, profile, blocklist, pipelineCachePath, poolBudgetBytes, presentExtensions
   bool selfTest = true;       // render a known pattern through the whole pipeline before the first use
@@ -106,16 +164,17 @@ class Context : public std::enable_shared_from_this<Context> {
   std::string deviceText() const;           // caps text + the workgroup shape the kernels use
   const std::string& selfTestReport() const;
   std::string selectionJson() const;        // hal::Selection::statusJson of the creation (attempts, reasons)
-  Core& core();
+  Core& core();  // the current device generation (any thread; use the device only inside a turn)
   std::size_t pooledBytes() const;
   std::unique_ptr<IGpuExecutor> createExecutor();
-  // Device loss (5.9): builds a fresh device of the same API once; executors drop their device copies and re-create them lazily
-  // from their SourceStore / tables. False when the rebuild or its self-test failed or was already done once.
+  // Device loss (5.9): builds a fresh device of the same API once, in a turn of its own; executors drop their device copies and re-create
+  // them lazily from their SourceStore / tables (a frame between two of its turns stops, see Executor::turnOk). False when the rebuild or
+  // its self-test failed or was already done once.
   bool rebuild(std::string& err);
   int rebuilds() const;
   bool deviceLost() const;
   std::uint64_t epoch() const;
-  std::mutex& mutex();
+  DeviceGate& gate();
   // The shared device copy of a SourceStore (executors of one context reading the same store share it); `make` creates it.
   std::shared_ptr<void> residentFor(std::uint64_t identity, const std::function<std::shared_ptr<void>()>& make);
   const ContextOptions& options() const;

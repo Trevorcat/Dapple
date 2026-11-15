@@ -8,6 +8,7 @@
 //  - cuts the recording into several submissions when the estimated work per submission is too high (mobile GPUs
 //    reset on submissions of seconds, pipeline-architecture.md 16 rule 1).
 // Same algorithm as phase 1's vk::Graph / Engine::submit, expressed on HAL handles.
+#include <atomic>
 #include <cstdint>
 #include <initializer_list>
 #include <string>
@@ -22,7 +23,7 @@ using hal::Format;
 using hal::ImageH;
 using hal::PipelineH;
 
-// Pooled working images keyed by (format, size); a steady-state frame allocates nothing.
+// Pooled working images keyed by (format, size); a steady-state frame allocates nothing. Used inside device turns only (section 52).
 class GpuPool {
  public:
   explicit GpuPool(hal::Device& d) : d_(d) {}
@@ -31,7 +32,7 @@ class GpuPool {
   GpuPool& operator=(const GpuPool&) = delete;
   hal::Status acquire(Format f, std::uint32_t w, std::uint32_t h, ImageH* out);
   void release(const ImageH& im);
-  std::size_t pooledBytes() const { return pooled_; }
+  std::size_t pooledBytes() const { return pooled_.load(std::memory_order_relaxed); }  // any thread (memory reports)
   std::size_t freeBytes() const;
   // Destroys the least recently used free images beyond `keepFree` bytes (waits for the device: a free image may still
   // be referenced by the last submission).
@@ -48,7 +49,7 @@ class GpuPool {
   };
   hal::Device& d_;
   std::vector<E> all_;
-  std::size_t pooled_ = 0;
+  std::atomic<std::size_t> pooled_{0};  // written inside device turns only
   std::uint64_t tick_ = 0;
 };
 

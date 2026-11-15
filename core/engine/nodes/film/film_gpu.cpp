@@ -698,7 +698,7 @@ bool finishGpuPrintLutUpdate(gpu::Core& core, GpuFilmTables& out) {
   if (!out.lutNextActive) return false;
   hal::Device& dev = core.dev();
   if (!dev.poll(out.lutFence)) return false;  // the copy is still running: the frame keeps the old table
-  dev.destroy(out.lut);  // frames are waited for before the next one starts: nothing in flight references it
+  core.retire(out.lut);  // a frame into the presenter's image is not waited for: destroyed once the work submitted before has completed
   out.lut = out.lutNext;
   out.lutNext = {};
   out.lutN = out.lutNextN;

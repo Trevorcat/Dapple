@@ -238,10 +238,9 @@ class Device {
   virtual void flush(BufferH, std::uint64_t off, std::uint64_t n) = 0;
   virtual void invalidate(BufferH, std::uint64_t off, std::uint64_t n) = 0;
 
-  // Waits for the slot's previous work; null on timeout / device loss. `pinned` slots are skipped (their readback
-  // buffer is still being consumed by the host).
+  // Takes the next frame slot of the ring and waits for its previous work; null on timeout / device loss. Not thread-safe (no
+  // Device call is): the engine calls the device only inside a device turn (gpu::DeviceGate, pipeline-architecture.md 52).
   virtual std::unique_ptr<CommandList> begin() = 0;
-  virtual void pinSlot(int slot) = 0;  // -1 = none
   virtual Status submit(CommandList&, FenceH* signal) = 0;
   virtual Status wait(FenceH, std::uint64_t timeoutNs) = 0;
   virtual bool poll(FenceH) = 0;

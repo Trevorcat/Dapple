@@ -4,7 +4,7 @@ set(DAPPLE_GPU_SHADERS
   "point|point.comp||SBSSII"
   "point_local|point.comp|LOCAL=1|SBSSIIBBBII"
   "local_detail|local_detail.comp||SSSSSSII"
-  "local_film_in|local_film_in.comp||SIBBII"
+  "local_film_in|local_film_in.comp||SIBBIIB"
   "local_heal|local_heal.comp||SBII"
   "local_rt_down|local_rt_down.comp||SSSII"
   "local_retouch|local_retouch.comp||SSSSSSSII"

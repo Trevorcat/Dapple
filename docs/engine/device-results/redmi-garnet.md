@@ -1,5 +1,64 @@
 # Xiaomi Redmi (2312DRA50C "garnet") device results, wave 8, 2026-11-12
 
+## 2026-11-15 baseline after the planner rewrite
+
+Native binaries only, built from a clean worktree of bb1cf0f (arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`, `dapple_stage_bench`, `dapple_drag_bench`, `dapple_gpu_tests`, `libdapple.so`), pushed to `/data/local/tmp/perf1115` and removed afterwards. Method:
+* `dapple_stage_bench <raw> out.jpg` with `DAPPLE_GPU=1 DAPPLE_BENCH_ORDER=warmup` (the app's decode stages through the C API; engine stage lines read from `logcat -s dapple_engine dapple_demosaic`), 3 reps each of the same three public CC0 files as the Note10+ (A6700 ARW 26 MP, A7RM4 ARW 61 MP, X-S10 RAF 26 MP X-Trans).
+* `dapple_drag_bench a6700.ARW dapple.dfp <le> <frames>` with `DAPPLE_GPU=1 DAPPLE_BENCH_SETTLE_MS=1500` (C API session path, host readback; 1080 px long edge = the app's top interactive tier, 480 px = the lower tier); `dapple_gpu_tests` (full) and `--film-timing 24mp` with `DAPPLE_FILM_DATA`. No `taskset`.
+* State: Android 16, Battery Saver off (`low_power` 0), 100 % on USB, thermal status 0 before and after, keyguard showing (screen locked, `KEYCODE_WAKEUP` sent once before the drag bench; nothing else touched), 120 Hz panel. No settings changed. Vulkan only (the GLES path was not run). Raw logs `build/perf-20261115/redmi_*`.
+
+### B1 Decode stages (ms, three reps, `dapple_stage_bench`)
+| step | X-S10 RAF (26 MP X-Trans) | A6700 ARW (26 MP) | A7RM4 ARW (61 MP) |
+|---|---|---|---|
+| open preview 2048 (total) | 983 / 877 / 872 | 507 / 510 / 463 | 1095 / 1026 / 1044 |
+| of which unpack / preview mosaic / block reduction / anchor | 630-685 / 688-775 / 69-119 / 44-55 | 152-155 / 207-223 / 144-161 / 69-78 | 320-331 / 426-454 / 353-373 / 146-165 |
+| detail (preview 4096) | 1312 / 1262 / 1847 (half-res reconstruction 1221-1737) | 244 / 249 / 232 | 526 / 495 / 458 |
+| warm-up region 256x256 | 2855 / 2880 / 5218 | 1189 / 1169 / 1165 | 1176 / 1165 / 1153 |
+| first 1:1 region 1604x3382 / pan | 682 / 671 (r1); 725 / 718 (r3) | 141 / 138; 123 / 114 | 133 / 135; 124 / 113 |
+| export: full open | 2636 / 2626 / 2946 | 580 / 580 / 599 | 835 / 822 / 837 |
+| export: render + encode (`export_jpeg` whole frame, bench has no stream budget) | 1737 / 1664 / **5211** (render 1459 / 1419 / 4715) | 1703 / 2218 / 1858 | 2652 / 2462 / 3225 |
+| `session_open` footprint peak at export | 622 MB | 640 MB | 1168 MB |
+
+Demosaic verdicts (the engine's own GPU-vs-CPU probe): Bayer frame CPU 50-53 ms vs GPU 160-171 ms, region CPU 12-21 vs GPU 40-47 (CPU wins, so Bayer demosaic and preview stay on CPU); X-Trans frame GPU 283-289 vs CPU 587-1776 ms, region GPU 63-67 vs CPU 189-353 (GPU). The X-Trans CPU numbers moved 3x between reps (587 / 645 / 1776): clock state of the phone (screen locked); the third X-S10 rep is slow everywhere (detail 1847, region 5218, render 4715).
+
+### B2 Interactive and film frames (`dapple_drag_bench`, A6700, film pack, median ms of 20 / 30 frames; first / max in brackets where large)
+| case | 1080 px | 480 px |
+|---|---|---|
+| still | 46.0 | 11.5 |
+| exposure (film on) | 65.4 | 18.6 |
+| film strength | 53.4 (max 128) | 15.9 (max 80) |
+| film shoot (exposure type) | 34.9 | 17.4 |
+| film print | 56.9 | 26.1 |
+| film black | 54.4 | 19.6 |
+| film latitude | 45.1 | 23.9 |
+| film wb | 57.1 | 32.8 |
+| film warmth | 81.0 | 24.6 |
+| film tint | 72.7 | 25.5 |
+| film exp | 79.2 | 22.5 |
+| film grain | 33.4 (first 176) | 18.8 (first 103) |
+
+Against a 120 Hz budget (8.3 ms) every 1080 px case misses, at 480 px the median is 11-33 ms; first grain frame is a cold pipeline (176 / 103 ms). Same ballpark as the 2026-11-12 wave 8 tables (480 px: strength 9.7, film_exp 15.9; here 15.9 and 22.5; the wave 8 frames were measured on a hot clock, these include the locked-screen low clock).
+
+### B3 `dapple_gpu_tests` (Vulkan, Adreno 710, `deviceKey 5143:7010000:80267063`, 65 s)
+* Self-test ok (`point+geometry mean dE 0.040 p99 0.75`, `spatial 0.076 / 0.86`), per-stage parity tables, tiled seam tests (tile 128..2048, 0 differing pixels, 4000x2667 streamed 537-1588 ms per case), steady state (frame 11: 17 passes, 72.1 ms wall, pool 496.6 MB), 24 MP film timing below.
+* **FAILED (6 failures), a regression:** `vkCreateComputePipelines film_src|0=2|4=0|16=16|17=16|18=256|19=256 failed (VkResult -13)` (also `0=1`) in "film + geometry + vignette", "film strength 30 + geometry + vignette + NR/sharpen" (640x448 and 1536x1024: `render failed`) and in the tiled film seam tests ("film strength 55 + curves + LUT + straighten/crop", "film strength 80 + rot90 + downscale 900": `whole != nullptr`). `--quick` fails 4 of the same. The pre-rewrite binary (`build/gles640-arm64/bin/dapple_gpu_tests`, 2026-11-14 17:09, pushed temporarily) on the same phone: **full run PASSED (0 failures), `--quick` PASSED**. On the Note10+ app the same pipeline fails (`film_src`, and `local_film_in` for 局部 + film), see note10plus.md: the engine falls back to CPU for those frames (`reason=transient GPU failure: recording failed: vkCreateComputePipelines ...`). Cause in code: not located (no source read); the specialization values 16/16/256/256 are the workgroup / reduce sizes the planner passes (`api vulkan workgroup 16x16 (reduce 256)`), so the new pipeline-key path for the film source gather is the suspect (inferred).
+* C API hook table (`render_frame interactive 1000 px mean 1.19 p99 9.2 max 30`) is identical in the old and the new binary (same digits), so not a regression of this change (the test compares different frame setups).
+
+### B4 24 MP film export, tiled GPU vs CPU (`--film-timing 24mp`, 6000x4000, ms)
+| case | CPU export | GPU tiled export (first) | pool kept |
+|---|---|---|---|
+| film strength 100 | 8623 | 4911 (7399) | 512 MB |
+| film strength 60 | 9312 | 5083 (5639) | 512 MB |
+| film + curves + look LUT | 3936 | 4722 (5297) | 512 MB |
+| film strength 60 + curves + LUT | 6502 | 4980 (5618) | 512 MB |
+
+1600 px final film frame: CPU 514-634 ms, GPU 204-207 ms (x2.5-3.1). The GPU film export is slower than the CPU for "film + curves + LUT" (x0.8). Non-film tiled 24 MP / 60 MP export bench and Vulkan vs GLES comparison: not run (no binary for it in this build set; GLES not exercised).
+
+### B5 Not measured / cleanup
+Not measured: GLES, 60 MP tiled export on a synthetic frame (stage bench exports the real A7RM4 whole-frame: 2.5-3.2 s render+encode plus 0.8 s open), per-pass GPU profile (`DAPPLE_GPU_PROFILE` not set). Cleanup: `/data/local/tmp/perf1115` (binaries, `old/`, `dapple.dfp`, three RAWs, `out.jpg`) removed with `rm -rf`; no props were set on this phone; the worktree `build/perf-wt` was removed (it had a real `tools/` folder, no junction); the arm64 build tree `build/perf-wt-arm64` is kept.
+
+---
+
 Native only. The app could not be installed: `adb install -r` fails with `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user` (MIUI `AdbInstallActivity` of `com.miui.securitycenter` waits for a tap on the phone; the screenshot of the prompt is black, a secure window). No setting was changed and no input was injected. Nothing was installed, so **no in-app number (logcat `dapple_view`, cadence, first photo, rotation, background/return, 30 s app session) exists**. The APK built from this tree is `build/redmi/app-w8-arm64.apk` (not installed).
 
 ## 1. Device facts (getprop / dumpsys)

@@ -3221,5 +3221,43 @@ Left for stage C: the planner still takes halos / footprints from `PlanRequest`,
   memory configuration, device = half the device pool budget, the pool trimmed to what the cache leaves), GreedyDual-Size eviction, its own
   mutex, payloads returned by value. Device copies are released through `gpu::Core::retire` (destroyed once the first fenced submission
   after the release has completed; no `waitIdle` in any resource destructor).
-- **Not changed:** the context mutex is still held for a whole GPU frame (the frame slots' readback buffers are reused by the next `begin()`;
+- **Not changed (since replaced by section 52's device turns):** the context mutex is still held for a whole GPU frame (the frame slots' readback buffers are reused by the next `begin()`;
   narrowing it needs per-executor slot ownership); `GpuPool::trim` still waits for the device before freeing pool images.
+
+## 52. Device turns instead of a frame-long context lock (engine, 2026-11-15)
+
+Before: `Executor::run` held `Context::mutex()` for a whole frame, so every session on the device (drag frame, export band, import
+thumbnail, film prebake, warm-up, region, video) ran frame by frame; a drag frame waited for a whole background frame.
+
+What the lock protected (all of it stays device-exclusive, only its span changes):
+- **HAL device** (every back end): the frame-slot ring (`nextSlot_`, slot fences / generations, per-slot uniform ring and timestamps),
+  object creation / destruction, the pipeline cache. Vulkan: command pools / buffers per slot and `VkQueue` are externally synchronised,
+  the descriptor-set cache (`sets_`, trimmed in `begin()`) is device-global. GLES: one context on one GL thread (`GlThread`); the
+  callers' side (slot ring, command vectors, `touched` readbacks) is plain data. Metal: the command queue is thread-safe, encoders and the
+  slot ring are not. None of the three is safe for two recordings at once, so the HAL stays externally synchronised as a whole.
+- **gpu::Core**: the transient pool, the slots' staging / readback / weights / taps buffers (valid from `begin()` until the slot is reused),
+  `gBuf` / `partBuf`, `collect()`. `retire()` / `submitted()` have their own mutex (unchanged).
+- **Context**: the device rebuild (core swap + epoch), the presenter's queue (lease), the keep-warm pump's buffers.
+- **ResidentSource** (shared by the executors of one store): `have`, the image, the resized variants.
+
+Now (`DeviceGate`, gpu_executor.h): a *turn* is the device for one job: one begin..submit (+ its fence wait and readback copy for a whole
+frame), one upload chunk, one tile of an export, one keep-warm unit, a trim, a rebuild. Locks, in order: `Executor::runMtx_` (per session,
+the executor's own state across a frame) -> gate (who holds the turn) -> `queueMtx` (the device / VkQueue; the presenter's lease takes only
+this one, for its own submits) -> `Core::retireMtx_` / `ResultCache::m_` / `Context::srcMtx` (leaves). Unlocked: validation, planning,
+`checkEpoch`, cache bookkeeping, the export sink (it reads the executor's own double-buffered readback buffers, not a frame slot), CPU film /
+table bakes. `pinSlot` is gone: no readback crosses a turn in a frame slot.
+
+Priority: a run is *interactive* when its request is (`FrameRequest::interactive`, the drag tier) or when it renders to the presenter's
+image; everything else is background. The gate serves interactive waiters first (FIFO among them), then background waiters FIFO. A
+background holder gives the turn up between every two submissions it controls (each export tile; each 24 MB chunk of a source upload
+yields when an interactive frame waits), so a drag frame waits for at most the job in flight. GLES gets the same rule: the turn decides
+which session posts to the GL thread next; Metal / Vulkan identical.
+
+Rebuild / teardown: `Context::rebuild` takes a turn (interactive priority), swaps the core and bumps the epoch; `Context::core()` reads
+an atomic pointer (the lost core is kept alive). Every turn re-checks the epoch: a frame whose device was rebuilt between two of its turns
+stops with a transient failure (the session retries on the new device) and never touches the new device with old handles. Resized
+source variants are shared pointers, so a tile in flight keeps its variant while another session evicts it.
+
+Verification without ThreadSanitizer (not available on this Windows toolchain): the reasoning above per structure, and
+`engine.gpu_concurrency` (4 sessions on 4 threads, results byte-identical to single-threaded ones; interactive p95 latency under a running
+tiled export bounded by ~one tile), repeated 20 times.

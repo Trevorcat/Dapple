@@ -73,6 +73,14 @@ if(TARGET dapple_gpu)
   if(NOT MSVC)
     target_compile_options(dapple_gpu_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
+  # The descriptor binding strings of the Vulkan shader table against the SPIR-V (the layout is built from the string; Adreno rejects a mismatch,
+  # SwiftShader does not). Not on Apple (Metal has its own table).
+  if(NOT APPLE)
+    add_executable(dapple_shader_binding_tests ${PROJECT_SOURCE_DIR}/core/gpu/tests/shader_bindings_test.cpp)
+    target_include_directories(dapple_shader_binding_tests PRIVATE "${CMAKE_BINARY_DIR}/core/gpu/gen")
+    add_dependencies(dapple_shader_binding_tests dapple_gpu)
+    add_test(NAME gpu_shader_bindings COMMAND dapple_shader_binding_tests)
+  endif()
   add_test(NAME gpu_parity COMMAND dapple_gpu_tests)
   set_tests_properties(gpu_parity PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
   # The emulator's software Vulkan: its ICD manifest names the library relative to itself, which the Windows loader
@@ -94,7 +102,7 @@ if(TARGET dapple_gpu)
   if(NOT MSVC)
     target_compile_options(dapple_gpu_engine_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
-  foreach(_t hal box sched select external probe)
+  foreach(_t hal box sched select external probe concurrency)
     add_test(NAME engine.gpu_${_t} COMMAND dapple_gpu_engine_tests ${_t})
     set_tests_properties(engine.gpu_${_t} PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
   endforeach()
@@ -110,7 +118,7 @@ if(TARGET dapple_gpu)
       ENVIRONMENT "VK_DRIVER_FILES=${_ss_icd};VK_ICD_FILENAMES=${_ss_icd};DAPPLE_GPU_SOFTWARE=1")
   endif()
   if(EXISTS "${DAPPLE_SWIFTSHADER_LIB}")
-    foreach(_t hal box sched select external probe)
+    foreach(_t hal box sched select external probe concurrency)
       add_test(NAME engine.gpu_${_t}_swiftshader COMMAND dapple_gpu_engine_tests ${_t})
       set_tests_properties(engine.gpu_${_t}_swiftshader PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77
         ENVIRONMENT "VK_DRIVER_FILES=${_ss_icd};VK_ICD_FILENAMES=${_ss_icd};DAPPLE_GPU_SOFTWARE=1")
@@ -593,6 +601,8 @@ set(_dapple_heavy
   engine.conformance
   engine.exec_tiles
   engine.golden_full
+  engine.gpu_concurrency
+  engine.gpu_concurrency_swiftshader
   engine.gpu_box
   engine.gpu_box_swiftshader
   engine.gpu_external

@@ -9,6 +9,7 @@
 //   Executor       IGpuExecutor: validation, the whole-frame and the tiled run, failure reporting (GpuFailure + GpuReason).
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -83,20 +84,22 @@ struct DeviceDisplay : DeviceCopy {
   DisplayBind bind(GpuGraph& g) const;
 };
 // The device copy of one SourceStore (RGBA16F) and its Lanczos-resized variants. Shared by every executor of a context that reads the same
-// store (a frame session and its export session do not upload the 24 MP twice); lives while one of them uses it.
+// store (a frame session and its export session do not upload the 24 MP twice); lives while one of them uses it. Its fields change inside
+// device turns only; a frame holds what it binds (the source, a resized variant) by shared pointer across its turns, so another session
+// evicting a variant between two tiles of an export retires it only after the export let go.
 struct ResidentSource : DeviceCopy {
   hal::ImageH img;
   bool have = false;
-  struct Resized {
+  struct Resized : DeviceCopy {
     int w = 0, h = 0;
     hal::ImageH img;
     std::uint64_t used = 0;
+    ~Resized() { retire(img); }
   };
-  std::vector<std::unique_ptr<Resized>> resized;
+  std::vector<std::shared_ptr<Resized>> resized;
   std::uint64_t tick = 0;
   ~ResidentSource() {
     if (have) retire(img);
-    for (auto& r : resized) retire(r->img);
   }
 };
 // The film tables of the current film frame (raw LUT, print + scan LUT, curves, sRGB decode) and its grain sampler tables, kept by the
@@ -177,6 +180,25 @@ class Executor final : public IGpuExecutor {
   void releaseLocked();
   void checkEpoch(const GpuRun& in);
 
+  // Device turns of a frame (section 52). A Turn is taken with the run's priority; on its end (while held, same device) the deferred
+  // destruction is collected and the cache's device limit follows the pool. turnOk(): right after (re)taking it, the device is still the one
+  // this frame's handles belong to (a rebuild in between: transient failure, the session retries). yieldTurn(): a background frame hands the
+  // device to a waiting interactive frame between two of its jobs.
+  class Turn {
+   public:
+    Turn(Executor& x, const GpuRun& in);
+    ~Turn();
+    void release() { t_.release(); }
+    void acquire() { t_.acquire(); }
+
+   private:
+    Executor& x_;
+    const GpuRun& in_;
+    DeviceTurn t_;
+  };
+  bool turnOk();
+  bool yieldTurn();
+
   // failure reporting: the class follows the reason (a device error is classified by its hal::Status)
   bool fail(GpuReason why, const std::string& msg);
   bool failStatus(hal::Status s, const std::string& msg);
@@ -193,7 +215,7 @@ class Executor final : public IGpuExecutor {
   // device copies (gpu_device_copies.cpp)
   void bindSource(SourceStore& s);
   bool ensureResident();
-  hal::ImageH* resizedSource(int w, int h);
+  std::shared_ptr<const hal::ImageH> resizedSource(int w, int h);  // the resident source or a resized variant, held
   std::shared_ptr<DeviceTables> ensureTables(const GpuRun& in);
   // the HDR buffer of the point pass with the reshaping field appended (section 45): HDR grid (when active) then the field; `warpOff` =
   // the field's float offset
@@ -211,12 +233,18 @@ class Executor final : public IGpuExecutor {
   bool validate(const GpuRun& in);
 
   std::shared_ptr<Context> ctx_;
+  std::mutex runMtx_;  // the executor's own state across a frame's turns (run vs release / destruction from another thread)
+  DeviceGate::Prio prio_ = DeviceGate::Prio::Background;
+  DeviceTurn* turn_ = nullptr;  // the running frame's turn (yieldTurn)
   std::uint64_t epoch_ = 0;
   SourceStore* store_ = nullptr;
   std::uint64_t srcId_ = 0;
   int W_ = 0, H_ = 0;
   std::shared_ptr<ResidentSource> rs_;
   std::shared_ptr<DeviceFilm> film_;
+  // a tiled export's two readback buffers (a tile waits in one for the sink, outside the device turn, while the next is written into the
+  // other); grown on demand, kept for the next export of this session
+  hal::BufferH tileRb_[2];
   filmnode::FilmResolved lastFilmR_{};  // the last film frame that rendered: the stand-in while another stock's tables are baked in the background
   bool haveLastFilmR_ = false;
 

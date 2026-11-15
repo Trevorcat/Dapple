@@ -1,6 +1,8 @@
 // GpuExecutor (IGpuExecutor): validates a Plan against the nodes' GpuImpls, records it (gpu_walk.cpp) over the plan's tiles with the
 // device copies of the frame (gpu_device_copies.cpp), and reports what happened: Status, GpuFailure and the typed GpuReason. A whole frame
 // records every stage into one command list; a tiled export records one job per tile and sweep of the plan (the CPU executor's windows).
+// The device is used in turns (pipeline-architecture.md 52): a whole frame is one turn (a background one hands the device over between its
+// uploads and its recording), a tiled export one turn per tile; the export's sink runs outside them.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -48,12 +50,12 @@ bool everyNodeRecords(const GpuRun& in, std::string& which) {
 Executor::Executor(std::shared_ptr<Context> c) : ctx_(std::move(c)) { epoch_ = ctx_->epoch(); }
 
 Executor::~Executor() {
-  std::lock_guard<std::mutex> lk(ctx_->mutex());
+  std::lock_guard<std::mutex> lk(runMtx_);
   releaseLocked();
 }
 
 void Executor::release() {
-  std::lock_guard<std::mutex> lk(ctx_->mutex());
+  std::lock_guard<std::mutex> lk(runMtx_);
   releaseLocked();
 }
 
@@ -62,8 +64,35 @@ void Executor::releaseLocked() {
   rs_.reset();
   store_ = nullptr;
   film_.reset();
-  if (epoch_ == ctx_->epoch()) core().collect();
+  if (epoch_ == ctx_->epoch()) {
+    for (hal::BufferH& b : tileRb_) core().retire(b);
+    DeviceTurn t(ctx_->gate(), DeviceGate::Prio::Background);
+    core().collect();
+  }
+  tileRb_[0] = tileRb_[1] = hal::BufferH{};
 }
+
+Executor::Turn::Turn(Executor& x, const GpuRun& in) : x_(x), in_(in), t_(x.ctx_->gate(), x.prio_) { x_.turn_ = &t_; }
+
+Executor::Turn::~Turn() {
+  if (t_.held() && x_.epoch_ == x_.ctx_->epoch()) {
+    x_.core().collect();  // device copies released while frames were in flight, now unused
+    // One device budget (the pool budget) for the frames' working images and the session's cached device copies: the cache gets what the
+    // pool's working set leaves, at least 1/8 of the budget (the current frame's tables and solves). Set between frames, so a plan's cache
+    // hits stay.
+    const std::size_t budget = x_.dev().poolBudget(), pooled = x_.core().pool().pooledBytes();
+    in_.cache.setDeviceLimit(std::max(budget / 8, budget > pooled ? budget - pooled : std::size_t(0)));
+  }
+  x_.turn_ = nullptr;
+}
+
+bool Executor::turnOk() {
+  if (ctx_->epoch() != epoch_) return fail(GpuReason::DeviceError, "the device was rebuilt during this frame");  // transient: the session retries
+  if (dev().state() == hal::DeviceState::Lost) return fail(GpuReason::DeviceLost, "device lost");
+  return true;
+}
+
+bool Executor::yieldTurn() { return !turn_ || !turn_->yield() || turnOk(); }
 
 // A rebuilt device invalidates every handle: forget them (the lost device is kept alive by the Context).
 void Executor::checkEpoch(const GpuRun& in) {
@@ -73,6 +102,7 @@ void Executor::checkEpoch(const GpuRun& in) {
   film_.reset();
   rs_.reset();
   store_ = nullptr;
+  tileRb_[0] = tileRb_[1] = hal::BufferH{};  // the lost device's
   epoch_ = e;
 }
 
@@ -133,8 +163,9 @@ bool Executor::validate(const GpuRun& in) {
 }
 
 Status Executor::run(const GpuRun& in, GpuOut& out) {
-  std::lock_guard<std::mutex> lk(ctx_->mutex());
+  std::lock_guard<std::mutex> lk(runMtx_);
   [[maybe_unused]] detail::BigCoreScope pin;
+  prio_ = in.interactive ? DeviceGate::Prio::Interactive : DeviceGate::Prio::Background;
   checkEpoch(in);
   failure_ = GpuFailure::None;
   reason_ = GpuReason::None;
@@ -148,9 +179,6 @@ Status Executor::run(const GpuRun& in, GpuOut& out) {
     reason_ = GpuReason::Injected;
     err_ = "injected failure (test)";
     s = failure_ == GpuFailure::Unsupported ? Status::Unsupported : Status::Internal;
-  } else if (dev().state() == hal::DeviceState::Lost) {
-    fail(GpuReason::DeviceLost, "device lost");
-    s = Status::Internal;
   } else if (!validate(in)) {
     s = Status::Unsupported;
   } else if (in.cancel.cancelled()) {
@@ -160,13 +188,6 @@ Status Executor::run(const GpuRun& in, GpuOut& out) {
     bindSource(in.store);
     s = in.plan.mode == ExecMode::TiledExport ? runTiled(in, out) : runWhole(in, out);
     if (s != Status::Ok && s != Status::Cancelled && failure_ == GpuFailure::None) failure_ = GpuFailure::Transient, reason_ = GpuReason::DeviceError;
-  }
-  core().collect();  // device copies released while frames were in flight, now unused
-  // One device budget (the pool budget) for the frames' working images and the session's cached device copies: the cache gets what the pool's
-  // working set leaves, at least 1/8 of the budget (the current frame's tables and solves). Set between frames, so a plan's cache hits stay.
-  {
-    const std::size_t budget = dev().poolBudget(), pooled = core().pool().pooledBytes();
-    in.cache.setDeviceLimit(std::max(budget / 8, budget > pooled ? budget - pooled : std::size_t(0)));
   }
   out.failure = failure_;
   out.reason = reason_;
@@ -186,15 +207,29 @@ static double trimPool(Core& core) {
 // ---- whole frame ----------------------------------------------------------------------------------------------------------------------
 Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   const auto t0 = Clock::now();
-  hal::Device& d = dev();
   const point::Blocks& P = in.frame;
-  const hal::DeviceCaps& caps = d.caps();
+  const hal::DeviceCaps& caps = ctx_->caps();
   const int fw = P.geo.outW, fh = P.geo.outH;
   if (fw <= 0 || fh <= 0 || std::uint32_t(fw) > caps.maxImage2D || std::uint32_t(fh) > caps.maxImage2D)
     return fail(GpuReason::FrameTooLarge, "frame size outside the device limits"), Status::Unsupported;
   if (!canResident(W_, H_)) return fail(GpuReason::SourceTooLarge, "source too large for a resident GPU copy"), Status::Unsupported;
+  // CPU preparation without the device: the film's tables and plan (process-wide caches; a first bake is 100-300 ms on a phone)
+  filmnode::FilmResolved fres;
+  if (in.plan.hasFilm) {
+    // all intermediates of the film (E, E2, q, D, grain, linear light, ...) are RGBA32F frames: bounded by the device memory
+    if (std::uint64_t(fw) * fh * 288 > std::uint64_t(double(caps.deviceLocalBytes) * 0.45))
+      return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
+    if (!filmResolve(in, fres)) return Status::Unsupported;
+    filmnode::FilmTablesHandle warm;
+    filmnode::tablesFor(fres, warm);
+    filmnode::planOf(fres);
+  }
+
+  Turn turn(*this, in);
+  if (!turnOk()) return failed(Status::Internal);
+  hal::Device& d = dev();
   if (!ensureResident()) return failed(Status::Internal);
-  hal::ImageH* S = resizedSource(P.geo.srcW, P.geo.srcH);
+  const std::shared_ptr<const hal::ImageH> S = resizedSource(P.geo.srcW, P.geo.srcH);
   if (!S) return failed(Status::Internal);
   // the solves the plan found on the device: held before any upload of this frame can evict them
   std::vector<std::pair<NodeId, std::shared_ptr<DeviceSolve>>> hits;
@@ -213,12 +248,7 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   std::shared_ptr<DeviceTables> L;
   std::shared_ptr<DeviceFilm> DF;
   std::shared_ptr<DeviceDisplay> DD;
-  filmnode::FilmResolved fres;
   if (in.plan.hasFilm) {
-    // all intermediates of the film (E, E2, q, D, grain, linear light, ...) are RGBA32F frames: bounded by the device memory
-    if (std::uint64_t(fw) * fh * 288 > std::uint64_t(double(caps.deviceLocalBytes) * 0.45))
-      return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
-    if (!filmResolve(in, fres)) return Status::Unsupported;
     if (!(DF = ensureFilm(fres))) return failed(Status::Internal);
     if (!(DD = ensureDisplay(in))) return failed(Status::Internal);
   }
@@ -228,6 +258,8 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   if ((P.hdr.active() || P.warp.active()) && !(HD = ensureGeoAux(in, warpOff))) return failed(Status::Internal);
   std::shared_ptr<DeviceBuffer> LDsc, LPl;
   if (!ensureLocal(in, LDsc, LPl)) return failed(Status::Internal);
+  // a background frame hands the device to a waiting interactive frame between its uploads and its recording; everything it binds is held
+  if (!yieldTurn()) return failed(Status::Internal);
   const double uploadMs = msSince(t0);
   if (in.cancel.cancelled()) return fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled;
 
@@ -375,18 +407,19 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
 }
 
 // ---- tiled export: the plan's tiles, one job per tile and sweep -------------------------------------------------------------------------
+// One device turn per tile (and per global solve): between two tiles any waiting session gets the device, an interactive frame first. The
+// tile's pixels go into one of two readback buffers of this export; they are waited for in the next tile's turn and handed to the sink
+// outside any turn (the sink may encode or write a file).
 Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   const auto t0 = Clock::now();
-  hal::Device& d = dev();
-  GpuPool& pool = core().pool();
-  const double gpu0 = d.gpuAccumMs();
   const point::Blocks& P = in.frame;
+  const hal::DeviceCaps& caps = ctx_->caps();
   if (!in.target.sink) return fail(GpuReason::NoSink, "no tile sink"), Status::Unsupported;
   const int rw = P.geo.srcW, rh = P.geo.srcH;
   const resize::Block rb = resize::resolve(W_, H_, rw, rh);
   const bool down = rw < W_ || rh < H_;
   const int halo = in.plan.maxHalo(), tile = in.plan.grid.tile;
-  if (tile + 2 * halo > int(d.caps().maxImage2D)) return fail(GpuReason::FrameTooLarge, "device image limit too small for the plan's tiles"), Status::Unsupported;
+  if (tile + 2 * halo > int(caps.maxImage2D)) return fail(GpuReason::FrameTooLarge, "device image limit too small for the plan's tiles"), Status::Unsupported;
 
   const bool filmFrame = in.plan.hasFilm;
   if (filmFrame && in.plan.needAux)  // the side planes of a film frame come from its whole-frame input pass
@@ -396,6 +429,25 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     const GpuImpl* gi = gpuImplFor(in.graph.nodes()[id].type);
     lattice |= gi && gi->lattice;
   });
+  filmnode::FilmResolved fres;
+  if (filmFrame) {  // the whole-frame part of the film (E2, q) is kept on the device while the tiles run
+    if (std::uint64_t(P.geo.outW) * P.geo.outH * 128 > std::uint64_t(double(caps.deviceLocalBytes) * 0.5))
+      return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
+    if (!filmResolve(in, fres)) return Status::Unsupported;
+    filmnode::FilmTablesHandle warm;  // CPU bakes without the device (process-wide caches)
+    filmnode::tablesFor(fres, warm);
+    filmnode::planOf(fres);
+  }
+  // the source: resident (small enough) or streamed per tile; a film export keeps it resident (the whole-frame film part reads all of it)
+  const bool resident = filmFrame ? (canResident(W_, H_) && canResident(rw, rh))
+                                  : (!in.forceStream && canResident(W_, H_) && canResident(rw, rh) && std::uint64_t(W_) * H_ <= 40000000ull);
+  if (filmFrame && !resident) return fail(GpuReason::FilmNotResident, "film export needs the source resident on the device"), Status::Unsupported;
+
+  Turn turn(*this, in);
+  if (!turnOk()) return failed(Status::Internal);
+  hal::Device& d = dev();
+  GpuPool& pool = core().pool();
+  const double gpu0 = d.gpuAccumMs();  // (other sessions' work in between counts too)
   std::shared_ptr<DeviceTables> L;
   if (lattice && !(L = ensureTables(in))) return failed(Status::Internal);
   std::shared_ptr<DeviceBuffer> HD;
@@ -405,38 +457,31 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   if (!ensureLocal(in, LDsc, LPl)) return failed(Status::Internal);
   std::shared_ptr<DeviceFilm> DF;
   std::shared_ptr<DeviceDisplay> DD;
-  filmnode::FilmResolved fres;
-  if (filmFrame) {  // the whole-frame part of the film (E2, q) is kept on the device while the tiles run
-    if (std::uint64_t(P.geo.outW) * P.geo.outH * 128 > std::uint64_t(double(d.caps().deviceLocalBytes) * 0.5))
-      return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
-    if (!filmResolve(in, fres)) return Status::Unsupported;
+  if (filmFrame) {
     if (!(DF = ensureFilm(fres))) return failed(Status::Internal);
     if (!(DD = ensureDisplay(in))) return failed(Status::Internal);
   }
-
-  // the source: resident (small enough) or streamed per tile; a film export keeps it resident (the whole-frame film part reads all of it)
-  const bool resident = filmFrame ? (canResident(W_, H_) && canResident(rw, rh))
-                                  : (!in.forceStream && canResident(W_, H_) && canResident(rw, rh) && std::uint64_t(W_) * H_ <= 40000000ull);
-  if (filmFrame && !resident) return fail(GpuReason::FilmNotResident, "film export needs the source resident on the device"), Status::Unsupported;
-  hal::ImageH* S = nullptr;
+  std::shared_ptr<const hal::ImageH> S;  // held across the tiles' turns
   if (resident) {
     if (!ensureResident()) return failed(Status::Internal);
     if (!(S = resizedSource(rw, rh))) return failed(Status::Internal);
   }
 
   // persistent images of the export: the 1/4 grids and solves of the GlobalSolve stages, the whole-frame film part. Released through the
-  // deferred destruction (the last tiles may still be in flight when an error returns early).
+  // deferred destruction (the last tiles may still be in flight when an error returns early); forgotten when the device was rebuilt meanwhile
+  // (they belong to the lost one).
   struct Keep {
-    Core& core;
+    Executor& x;
     std::deque<hal::ImageH> images;  // stable addresses
     ~Keep() {
-      for (hal::ImageH& i : images) core.retire(i);
+      if (x.epoch_ != x.ctx_->epoch()) return;
+      for (hal::ImageH& i : images) x.core().retire(i);
     }
     hal::ImageH* add() {
       images.emplace_back();
       return &images.back();
     }
-  } keep{core(), {}};
+  } keep{*this, {}};
   const int glw = cdiv(P.geo.outW, 4), glh = cdiv(P.geo.outH, 4);
   struct Global {
     NodeId node;
@@ -509,28 +554,42 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     if (in.cancel.cancelled()) return fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled;
   }
 
+  // An output tile: `pend` is submitted (its readback buffer is being written), `ready` has been waited for and goes to the sink next.
   struct Pending {
-    int slot = -1;
+    int buf = -1;
     hal::FenceH fence;
     WRect interior;
   };
-  Pending pend;
+  Pending pend, ready;
   int passes = 0, barriers = 0, parts = 0;
   std::string err;
-  auto flush = [&]() -> bool {
-    if (pend.slot < 0) return true;
+  auto readbackFor = [&](int i, std::size_t bytes) -> bool {  // inside the turn
+    hal::BufferH& b = tileRb_[i];
+    if (b && b.bytes >= bytes) return true;
+    core().retire(b);
+    b = hal::BufferH{};
+    const hal::Status s = d.createBuffer({bytes, hal::MemKind::Readback, false}, &b);
+    return s == hal::Status::Ok || failStatus(s, "");
+  };
+  auto waitPending = [&]() -> bool {  // inside the turn
+    if (pend.buf < 0) return true;
     const hal::Status ws = d.wait(pend.fence, kWaitNs);
     if (ws != hal::Status::Ok) return failStatus(ws, "");
-    const bool ok = in.target.sink(pend.interior.x0, pend.interior.y0, pend.interior.w(), pend.interior.h(),
-                                   static_cast<const std::uint8_t*>(core().slot(pend.slot).readback.mapped), std::size_t(pend.interior.w()) * 4);
-    pend.slot = -1;
-    d.pinSlot(-1);
+    ready = pend;
+    pend.buf = -1;
+    return true;
+  };
+  auto sinkReady = [&]() -> bool {  // outside the turn: the buffer is this export's, the next tile writes the other one
+    if (ready.buf < 0) return true;
+    const bool ok = in.target.sink(ready.interior.x0, ready.interior.y0, ready.interior.w(), ready.interior.h(),
+                                   static_cast<const std::uint8_t*>(tileRb_[ready.buf].mapped), std::size_t(ready.interior.w()) * 4);
+    ready.buf = -1;
     if (!ok) fail(GpuReason::SinkAborted, "export aborted by the sink");
     return ok;
   };
   auto wrect = [](const Rect& r) { return WRect{r.x0, r.y0, r.x1, r.y1}; };
 
-  // one sweep over one tile of the plan
+  // one sweep over one tile of the plan (inside the tile's turn)
   auto runTile = [&](const Stage& st, const TileWin& tw) -> bool {
     const WRect interior = wrect(tw.interior), work = wrect(tw.work);
     // 1. the source window of a streamed export (the plan's, the CPU executor's) is uploaded first (the upload takes frame slots of its own)
@@ -550,6 +609,11 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
         if (!base) return fail(GpuReason::DeviceError, "source store cannot be read");
         return fail(d.state() == hal::DeviceState::Lost ? GpuReason::DeviceLost : GpuReason::DeviceError, err);
       }
+    }
+    const int rbuf = pend.buf == 0 ? 1 : 0;  // the buffer the sink is not reading
+    if (st.output && !readbackFor(rbuf, std::size_t(interior.w()) * interior.h() * 4)) {
+      if (haveAcq) pool.release(acquired);
+      return false;
     }
     auto cl = d.begin();
     if (!cl) {
@@ -609,10 +673,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     if (ok) ok = w.sweep(st) && w.accumulate(st);
     if (ok && st.output) {
       if (w.o8 < 0) ok = false;
-      const std::size_t bytes = std::size_t(interior.w()) * interior.h() * 4;
-      if (ok && !core().ensureReadback(slot, bytes, err)) ok = false;
-      else if (ok)
-        g.copyImageToBuffer(w.o8, core().slot(slot).readback, std::uint32_t(interior.x0 - work.x0), std::uint32_t(interior.y0 - work.y0), std::uint32_t(interior.w()),
+      else
+        g.copyImageToBuffer(w.o8, tileRb_[rbuf], std::uint32_t(interior.x0 - work.x0), std::uint32_t(interior.y0 - work.y0), std::uint32_t(interior.w()),
                             std::uint32_t(interior.h()));
     }
     if (!ok) {
@@ -630,11 +692,10 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
       parts += sst.parts;
     }
     if (st.output) {
-      if (!flush()) return false;  // previous tile: its GPU work ran while this one was recorded
-      pend.slot = slot;
+      if (!waitPending()) return false;  // previous tile: its GPU work ran while this one was recorded
+      pend.buf = rbuf;
       pend.fence = fence;
       pend.interior = interior;
-      d.pinSlot(slot);
     }
     return true;
   };
@@ -660,20 +721,33 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     return ss == hal::Status::Ok || failStatus(ss, err);
   };
 
+  // the next job's turn: the device may have been rebuilt or lost while this export waited
+  auto take = [&]() {
+    turn.acquire();
+    return turnOk();
+  };
   int sweeps = 0, tiles = 0;
   for (const Stage& st : in.plan.stages) {
     if (st.kind == StageKind::TileSweep) {
       ++sweeps;
       for (const TileWin& t : st.tiles) {
         if (in.cancel.cancelled()) return fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled;
-        if (!runTile(st, t)) return failed(Status::Internal);
+        if (!take() || !runTile(st, t)) return failed(Status::Internal);
+        turn.release();
+        if (!sinkReady()) return failed(Status::Internal);
         tiles += st.output;
       }
-      if (st.output && !flush()) return failed(Status::Internal);
+      if (st.output) {
+        if (!take() || !waitPending()) return failed(Status::Internal);
+        turn.release();
+        if (!sinkReady()) return failed(Status::Internal);
+      }
     } else if (st.kind == StageKind::GlobalSolve) {
-      if (!globalPass(st)) return failed(Status::Internal);
+      if (!take() || !globalPass(st)) return failed(Status::Internal);
+      turn.release();
     }
   }
+  if (!take()) return failed(Status::Internal);
   if (d.waitAll() != hal::Status::Ok) return failStatus(hal::Status::Timeout, ""), Status::Internal;
   trimPool(core());
   out.w = P.geo.outW;

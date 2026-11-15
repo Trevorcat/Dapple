@@ -36,7 +36,7 @@ std::string statusJson();
 void keepWarm(int ms);
 // Real-frame bracket for the keep-warm pump: +1 when a foreground frame is requested, -1 when it returned (cheap, any thread).
 void keepWarmFrame(int delta);
-// GPU executor, right after a foreground frame was submitted (context mutex held): queues keep-warm units behind it while a window is open.
+// GPU executor, right after a foreground frame was submitted (inside its device turn): queues keep-warm units behind it while a window is open.
 class Context;
 void keepWarmAfterSubmit(Context& c);
 // Diagnostics of the last keep-warm window: {"units":..,"gpuMs":..,"firstMBps":..,"lastMBps":..,...}

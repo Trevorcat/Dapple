@@ -1,7 +1,8 @@
 // GPU engine tests (ctest "engine.gpu_*"): HAL + scheduler + the O(1) box filter + submission splitting + engine selection.
-//   dapple_gpu_engine_tests [hal] [box] [sched] [select] [bench-box]
+//   dapple_gpu_engine_tests [hal] [box] [sched] [select] [external] [probe] [concurrency] [bench-box]
 // Exit code 77 = no Vulkan device. Env: DAPPLE_GPU_SOFTWARE=1 accepts SwiftShader.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -541,6 +542,178 @@ int testExternal() {
   return 0;
 }
 
+// Several sessions on one device at the same time (pipeline-architecture.md section 52): every result equals the single-threaded result of the
+// same request, and an interactive frame waits for about one tile of a running tiled export, not for the whole export.
+//   phase 1 (latency): a tiled export loops on one thread; another thread renders small interactive frames and measures each frame's wall
+//                      time while the export runs, against the frame alone and the export's time per tile.
+//   phase 2 (stress):  4 threads, separate sessions: interactive frames, background whole frames (thumbnail-like), a tiled export, a streamed
+//                      tiled export (source uploaded per tile); every result is compared byte for byte with its single-threaded reference.
+// DAPPLE_CONC_ITERS overrides the interactive frame count of phase 2 (default 300).
+int testConcurrency() {
+  std::printf("== concurrent sessions: bit-identical results, interactive latency under a tiled export ==\n");
+  eg::ContextOptions o;
+  o.selfTest = false;
+  if (const char* v = std::getenv("DAPPLE_GPU_SOFTWARE")) o.device.allowSoftware = v[0] == '1';
+  std::string err;
+  std::shared_ptr<eg::Context> ctx = eg::Context::create(o, err);
+  if (!ctx) {
+    std::printf("  no GPU device: %s\n", err.c_str());
+    return 77;
+  }
+  std::printf("  device: %s (%s)\n", ctx->caps().name.c_str(), hal::apiName(ctx->api()));
+  const auto cams = CameraRegistry::withBuiltins();
+  const CameraProfile& cam = cams.resolve("", "");
+  using Clk = std::chrono::steady_clock;
+  auto ms = [](Clk::time_point a, Clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+
+  // the requests: an interactive drag frame, a background whole frame, a tiled export (resident) and a streamed tiled export
+  const SourceImage small = gpu::makeTestImage(320, 240), mid = gpu::makeTestImage(640, 480), big = gpu::makeTestImage(1600, 1200);
+  EditParams pi;
+  pi.exposure = 0.3f;
+  pi.contrast = 15;
+  pi.sharpen = 40;
+  EditParams pb;
+  pb.exposure = -0.2f;
+  pb.nrLuma = 20;
+  pb.dehaze = 15;
+  pb.clarity = 20;
+  EditParams pe;
+  pe.exposure = 0.1f;
+  pe.clarity = 25;
+  pe.sharpen = 30;
+  pe.vignette = -20;
+  engine::point::Params ri = engine::point::resolve(pi, cam, nullptr), rb = engine::point::resolve(pb, cam, nullptr), re = engine::point::resolve(pe, cam, nullptr),
+                        rs = engine::point::resolve(pe, cam, nullptr);
+  struct Out {
+    std::vector<std::uint8_t> px;
+    int w = 0, h = 0;
+    bool ok = false;
+  };
+  auto frame = [&](gpu::Rig& rig, const EditParams& p, engine::point::Params& r, const SourceImage& s, bool interactive) {
+    engine::FrameJob job{p, r, s, nullptr, cam, nullptr, {}, {}, {}};
+    job.request.bakeSize = 33;
+    job.request.interactive = interactive;
+    job.fastOptions.spatial = interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
+    job.store = &rig.store;
+    engine::FrameResult res;
+    Out o;
+    o.ok = rig.es.renderFrame(job, res) && res.rgba && res.executor != "cpu";
+    if (res.rgba) o.px.assign(res.rgba, res.rgba + std::size_t(res.w) * res.h * 4), o.w = res.w, o.h = res.h;
+    std::free(res.rgba);
+    return o;
+  };
+  const int tile = 256;
+  auto exportTiled = [&](gpu::Rig& rig, engine::point::Params& r, bool stream, engine::GpuStats* st) {
+    Out o;
+    std::string e;
+    o.ok = rig.exportTiled(
+        pe, r, big, 0, 33, tile, stream, 0.f,
+        [&](int w, int h) {
+          o.w = w, o.h = h;
+          o.px.assign(std::size_t(w) * h * 4, 0);
+        },
+        [&](int x, int y, int w, int h, const std::uint8_t* px, std::size_t stride) {
+          for (int j = 0; j < h; ++j) std::memcpy(&o.px[(std::size_t(y + j) * o.w + x) * 4], px + std::size_t(j) * stride, std::size_t(w) * 4);
+          return true;
+        },
+        st, e);
+    if (!o.ok) std::printf("  export failed: %s\n", e.c_str());
+    return o;
+  };
+  auto same = [](const Out& a, const Out& b) { return a.ok && b.ok && a.w == b.w && a.h == b.h && a.px == b.px; };
+
+  gpu::Rig rigI(ctx, small, cam), rigB(ctx, mid, cam), rigE(ctx, big, cam), rigS(ctx, big, cam);
+  // single-threaded references (the second call: warm caches, the steady state the threads see)
+  frame(rigI, pi, ri, small, true);
+  const Out refI = frame(rigI, pi, ri, small, true);
+  frame(rigB, pb, rb, mid, false);
+  const Out refB = frame(rigB, pb, rb, mid, false);
+  engine::GpuStats est;
+  exportTiled(rigE, re, false, &est);
+  const auto te0 = Clk::now();
+  const Out refE = exportTiled(rigE, re, false, &est);
+  const double exportMs = ms(te0, Clk::now());
+  const Out refS = exportTiled(rigS, rs, true, nullptr);
+  CHECK(refI.ok && refB.ok && refE.ok && refS.ok, "single-threaded references on the GPU");
+  if (!(refI.ok && refB.ok && refE.ok && refS.ok)) return 0;
+  const int tiles = std::max(1, est.tiles);
+  const double tileMs = exportMs / tiles;
+  std::vector<double> alone;
+  for (int i = 0; i < 15; ++i) {
+    const auto t = Clk::now();
+    frame(rigI, pi, ri, small, true);
+    alone.push_back(ms(t, Clk::now()));
+  }
+  std::sort(alone.begin(), alone.end());
+  const double aloneMs = alone[alone.size() / 2];
+  std::printf("  alone: interactive frame %.2f ms (median), export %.1f ms over %d tiles = %.2f ms per tile\n", aloneMs, exportMs, tiles, tileMs);
+
+  // ---- phase 1: interactive frames while a tiled export runs ----
+  {
+    std::atomic<bool> stop{false}, exporting{false};
+    std::atomic<int> exportBad{0}, exportsDone{0};
+    std::thread ex([&] {
+      while (!stop.load()) {
+        exporting.store(true);
+        const Out o = exportTiled(rigE, re, false, nullptr);
+        exportBad += !same(o, refE);
+        ++exportsDone;
+      }
+      exporting.store(false);
+    });
+    while (!exporting.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::vector<double> lat;
+    int bad = 0;
+    const auto t0 = Clk::now();
+    while (lat.size() < 60 && ms(t0, Clk::now()) < 120000) {
+      const auto t = Clk::now();
+      const Out o = frame(rigI, pi, ri, small, true);
+      lat.push_back(ms(t, Clk::now()));
+      bad += !same(o, refI);
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));  // a drag: frames with a short gap
+    }
+    stop.store(true);
+    ex.join();
+    std::sort(lat.begin(), lat.end());
+    const double med = lat[lat.size() / 2], p95 = lat[std::size_t(double(lat.size() - 1) * 0.95)], mx = lat.back();
+    std::printf("  LATENCY interactive under export: median %.2f ms, p95 %.2f ms, max %.2f ms (alone %.2f ms, tile %.2f ms, export %.1f ms; %d exports ran)\n", med,
+                p95, mx, aloneMs, tileMs, exportMs, exportsDone.load());
+    CHECK(bad == 0 && exportBad.load() == 0, "phase 1: %d interactive and %d export results differ from the single-threaded ones", bad, exportBad.load());
+    // the bound: the frame itself (twice: its host work runs beside the export's), the tile in flight on the GPU, the one being recorded and
+    // the one waited for, plus 3 ms of scheduling noise. Before section 52 the frame waited for the rest of the whole export.
+    const double bound = 2.0 * aloneMs + 3.0 * tileMs + 3.0;
+    CHECK(p95 <= bound, "p95 latency %.2f ms above about one tile (bound %.2f ms; export %.1f ms)", p95, bound, exportMs);
+  }
+
+  // ---- phase 2: 4 threads, 4 sessions, results compared with the references ----
+  {
+    int iters = 300;
+    if (const char* v = std::getenv("DAPPLE_CONC_ITERS")) iters = std::max(1, std::atoi(v));
+    std::atomic<bool> stop{false};
+    std::atomic<int> badI{0}, badB{0}, badE{0}, badS{0}, nB{0}, nE{0}, nS{0};
+    std::thread tb([&] {
+      while (!stop.load()) badB += !same(frame(rigB, pb, rb, mid, false), refB), ++nB;
+    });
+    std::thread te([&] {
+      while (!stop.load()) badE += !same(exportTiled(rigE, re, false, nullptr), refE), ++nE;
+    });
+    std::thread ts([&] {
+      while (!stop.load()) badS += !same(exportTiled(rigS, rs, true, nullptr), refS), ++nS;
+    });
+    for (int i = 0; i < iters; ++i) badI += !same(frame(rigI, pi, ri, small, true), refI);
+    stop.store(true);
+    tb.join();
+    te.join();
+    ts.join();
+    std::printf("  STRESS %d interactive, %d background, %d tiled exports, %d streamed exports: %d / %d / %d / %d differ\n", iters, nB.load(), nE.load(), nS.load(),
+                badI.load(), badB.load(), badE.load(), badS.load());
+    CHECK(badI.load() == 0 && badB.load() == 0 && badE.load() == 0 && badS.load() == 0, "every concurrent result equals its single-threaded reference");
+    CHECK(nE.load() > 0 && nS.load() > 0 && nB.load() > 0, "every thread ran");
+  }
+  return 0;
+}
+
 int benchBox() {
   std::printf("== box microbench: 6000x4000 plane, GPU ms per pass (median of 5) ==\n");
   std::string err;
@@ -720,6 +893,7 @@ int main(int argc, char** argv) {
   run("bench-box", benchBox);
   run("external", testExternal);
   run("select", testSelect);
+  run("concurrency", testConcurrency);
   if (on("probe")) {
     const int r = testDefaultProbe(argv[0]);
     if (r == 77) rc = rc ? rc : 77;

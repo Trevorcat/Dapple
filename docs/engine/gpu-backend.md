@@ -336,7 +336,7 @@ cmake ... -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDR
 - **描述符**：每个 pass 的描述符集按 `(管线, 帧槽参数缓冲, 各资源 id)` 缓存，稳态帧零 `vkAllocateDescriptorSets`/`vkUpdateDescriptorSets`；参数块走动态偏移 UBO 环（每槽 512 KB，每 pass <= 256 B），没有 push constant 大小限制。缓存过大时只在记录前整体重置。
 - **pass 图**：`Graph` 记录 dispatch / 拷贝节点与它们读写的资源。`Engine::submit` 先做**依赖分层调度**（RAW/WAR/WAW，同层独立链的 pass 相邻，如 texture / sharpen / clarity 分析），再按物理资源跟踪冒险，**仅在确有依赖时**插一个合并的内存屏障（所有图像常驻 GENERAL 布局，首次使用时惰性转换）。一帧一个命令缓冲、一次 `vkQueueSubmit`、一个 fence；没有 `vkQueueWaitIdle`；等待是 `vkWaitForFences`（驱动内睡眠，无忙等）。可选时间戳（`BackendOptions::profile`）给出逐 pass GPU 时间。
 - **融合**：点算子（几何重采样 + 增益 + tone 表 + 格点 + 第二格点 + 暗角）是**一个** kernel（`point.comp`，几何模式用 specialization 常量：恒等 / 精确索引 / Catmull-Rom）；链上最后一个 kernel 通过 `LAST/GRAIN` 常量同时完成 grain 与 RGBA8 打包，不需要单独的收尾 pass。
-- **异步回读**：结果经 `vkCmdCopyImageToBuffer` 进入 `HOST_CACHED` 的帧槽回读缓冲，`wait()` 后 memcpy 到调用方缓冲；tile 导出用 3 个帧槽流水（上一 tile 的 sink 与下一 tile 的 GPU 工作重叠，被 sink 占用的槽被 `pinSlot` 保护）。
+- **异步回读**：结果经 `vkCmdCopyImageToBuffer` 进入 `HOST_CACHED` 的帧槽回读缓冲，`wait()` 后 memcpy 到调用方缓冲；tile 导出改用执行器自己的两块回读缓冲交替（上一 tile 的 sink 在设备轮次之外与下一 tile 的 GPU 工作重叠；`pinSlot` 已删除，见 pipeline-architecture.md 52）。
 - **源图常驻**：`Session::setSource` 只记录身份；首次渲染时用 `convert.comp` 把 float RGB（staging 双缓冲 24 MB 分块，CPU 只做 memcpy）转成 RGBA16F 上传一次；缩放副本（Lanczos）按尺寸缓存 2 份；格点（41³/65³ RGBA32F）+ tone 表 + 第二格点按烘焙 key 缓存 2 份，仅在烘焙结果变化时上传（~1 MB）。
 
 ### 10.3 管线映射（GPU kernel <-> CPU 参考）

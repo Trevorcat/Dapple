@@ -75,8 +75,8 @@ the universal one is not handled), present on a thread other than the rendering 
 Interactive frames now go GPU executor -> presenter image on the SAME VkDevice -> swapchain; no host readback, no staging upload.
 
 - **One device**: on Android the HAL enables the surface/swapchain extensions by default (`DAPPLE_GPU_PRESENT=0` turns them off; gpu_context.cpp). `GpuProvider::lease()` (gpu_iface.h) hands the
-  presenter {native handles, a keep-alive of the Context, the context mutex that serialises the shared VkQueue, a generation}. `VkPresenter` adopts instance/device/queue
-  (`DAPPLE_PRESENT_ADOPT=0` forces the old private device). Every use of the queue (submit, present, waitIdle) takes the context mutex, which the executor holds for a whole frame.
+  presenter {native handles, a keep-alive of the Context, the device gate's queue mutex that serialises the shared VkQueue, a generation}. `VkPresenter` adopts instance/device/queue
+  (`DAPPLE_PRESENT_ADOPT=0` forces the old private device). Every use of the queue (submit, present, waitIdle) takes that mutex, which the engine holds for one device turn (one job, pipeline-architecture.md 52).
 - **Image on the engine device**: `Presenter::beginExternal(w,h)` returns the slot's `ExternalTarget` (ring of 2 R8G8B8A8 TRANSFER_SRC|DST images, grown on demand, size estimated from the last
   frame scaled by the long-edge ratio +3%). The view passes it as `DappleFrameRequest::external` (`DappleExternalImage`, dapple_c.h). The executor copies its final pass into it (layoutIn UNDEFINED ->
   TRANSFER_SRC) and does not wait. `presentExternal(w,h)` records barrier + scaled blit into the acquired swapchain image and presents. No semaphores between the two: same queue, the barrier at the start of the

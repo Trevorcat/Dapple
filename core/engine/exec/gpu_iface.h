@@ -99,6 +99,7 @@ struct GpuRun {
   GpuCancel cancel;
   GpuTarget target;
   bool forceStream = false;     // tests: never keep the source resident (streaming path of a tiled export)
+  bool interactive = false;     // a drag frame / a frame into the presenter's image: its device turns go before background ones (section 52)
 };
 
 struct GpuOut {
@@ -144,8 +145,8 @@ class GpuProvider {
   // Adopted-device mode of the presenter (docs/engine/present.md): the native handles plus what makes using them safe.
   //   keepAlive   holds the context (VkInstance / VkDevice) alive for as long as the presenter has objects on it, also after a
   //               demotion / rebuild replaced it in the provider
-  //   queueMutex  serialises every use of handles.queue (vkQueueSubmit / vkQueuePresentKHR / vkDeviceWaitIdle) with the executor,
-  //               which holds it for a whole frame
+  //   queueMutex  serialises every use of handles.queue (vkQueueSubmit / vkQueuePresentKHR / vkDeviceWaitIdle) with the engine, which
+  //               holds it for one device turn (one job, never a whole background frame; pipeline-architecture.md 52)
   //   generation  changes when the device behind the handles was replaced
   // False on GLES, when the GPU is off or unavailable, or when the device was created without the present extensions.
   struct DeviceLease {
@@ -158,7 +159,7 @@ class GpuProvider {
   // Why enabled() is false (diagnostics, FrameResult::why): "GPU disabled (debug.dapple.gpu=0)", "GPU self-test running", "GPU self-test failed: ...".
   virtual std::string inactiveReason() { return "GPU disabled"; }
   // Memory (pipeline-architecture.md 42.9): frees the free images of the active device's pool beyond `keepFree` bytes (0 = all) and the
-  // device's descriptor caches; returns the bytes released. Waits for the frame in flight (context mutex).
+  // device's descriptor caches; returns the bytes released. Takes a device turn (waits for the job in flight).
   virtual std::size_t trimPool(std::size_t keepFree) { (void)keepFree; return 0; }
   // The active device: unified memory?, the pool's budget, and the driver's budget / usage of the device-local heaps where the backend
   // reports them (VK_EXT_memory_budget; *budget = 0 when unknown). False = no active device.

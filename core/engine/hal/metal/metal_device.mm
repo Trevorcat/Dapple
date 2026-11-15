@@ -179,7 +179,6 @@ class MetalDev final : public Device {
   void flush(BufferH, std::uint64_t, std::uint64_t) override {}
   void invalidate(BufferH, std::uint64_t, std::uint64_t) override {}
   std::unique_ptr<CommandList> begin() override;
-  void pinSlot(int s) override { pinned_ = s; }
   Status submit(CommandList&, FenceH*) override;
   Status wait(FenceH, std::uint64_t timeoutNs) override;
   bool poll(FenceH) override;
@@ -233,7 +232,7 @@ class MetalDev final : public Device {
   std::unordered_map<int, MImage*> dummies_;
   std::mutex pipeMtx_;
   Slot slots_[kSlots];
-  int nextSlot_ = 0, pinned_ = -1;
+  int nextSlot_ = 0;
   std::atomic<std::uint64_t> nextId_{1};
   std::atomic<bool> lost_{false};
   std::atomic<double> gpuAccum_{0};
@@ -855,10 +854,6 @@ std::unique_ptr<CommandList> MetalDev::begin() {
   if (lost_) return nullptr;
   int idx = nextSlot_;
   nextSlot_ = (nextSlot_ + 1) % kSlots;
-  if (idx == pinned_) {
-    idx = nextSlot_;
-    nextSlot_ = (nextSlot_ + 1) % kSlots;
-  }
   Slot& s = slots_[idx];
   if (s.inFlight && waitSlot(s, 30ull * 1000 * 1000 * 1000) != Status::Ok) return nullptr;
   s.failed = false;

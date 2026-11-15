@@ -107,7 +107,8 @@ Core::Stats Core::statsOf(hal::FenceH f) {
   return s;
 }
 
-bool Core::uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h, const hal::ImageH& dst, int dx, int dy, std::string& err) {
+bool Core::uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h, const hal::ImageH& dst, int dx, int dy, std::string& err,
+                        const std::function<bool()>& between) {
   const std::size_t rowBytes = std::size_t(w) * 12;
   const std::size_t chunkBytes = 24u << 20;
   const int rows = int(std::max<std::size_t>(1, std::min<std::size_t>(std::size_t(h), chunkBytes / rowBytes)));
@@ -130,6 +131,7 @@ bool Core::uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h,
     // the convert pass reads the staging buffer: build the dispatch by hand (the uniform carries the chunk placement)
     if (!recordConvert(rec, s.staging, out, w, n, dx, dy + y)) return err = e2, false;
     if (runGraph(*dev_, g, *cl, nullptr, err) != hal::Status::Ok) return false;
+    if (between && y + n < h && !between()) return err = "upload stopped between two submissions", false;
   }
   if (dev_->waitAll() != hal::Status::Ok) return err = dev_->lastError(), false;
   return true;

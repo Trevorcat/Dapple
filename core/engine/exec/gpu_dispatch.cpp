@@ -175,6 +175,7 @@ int EngineSession::renderGpu(FrameJob& job, const ParamSet& ps, const BakedLut& 
   const std::shared_ptr<const std::vector<float>> over = overflowFor(ps, bake.n);
   GpuRun run{plan, graph_, cache_, fp, draft.blocks, *job.store, bake, over.get(), &job.point, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, {}, false};
   run.target.external = job.gpuTarget;
+  run.interactive = job.request.interactive || job.gpuTarget != nullptr;  // a drag frame, or a frame into the presenter's image
   GpuOut go;
   const auto t1 = Clock::now();
   const int r = runOnGpu(run, go);

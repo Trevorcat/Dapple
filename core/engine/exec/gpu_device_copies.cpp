@@ -43,38 +43,51 @@ void Executor::bindSource(SourceStore& s) {
   }));
 }
 
+// The upload (24 MB submissions) goes into an image of this frame and hands the device to a waiting interactive frame between two
+// submissions; it is published at the end, inside the turn. Another executor of the same store that published meanwhile wins (ours is retired).
 bool Executor::ensureResident() {
   if (!rs_ || !store_) return fail(GpuReason::SourceTooLarge, "no source");
   if (rs_->have) return true;
   if (!canResident(W_, H_)) return fail(GpuReason::SourceTooLarge, "source too large for a resident GPU copy");
-  hal::Status s = dev().createImage({hal::Format::RGBA16F, std::uint32_t(W_), std::uint32_t(H_), 1}, &rs_->img);
+  hal::ImageH img;
+  hal::Status s = dev().createImage({hal::Format::RGBA16F, std::uint32_t(W_), std::uint32_t(H_), 1}, &img);
   if (s != hal::Status::Ok) return failStatus(s, "");
   std::size_t pitch = 0;
   const float* px = store_->window(0, 0, W_, H_, pitch);
   std::string err;
-  if (!px || !core().uploadRgbF32(px, pitch, W_, H_, rs_->img, 0, 0, err)) {
-    dev().destroy(rs_->img);  // never bound: nothing submitted reads it
+  bool rebuilt = false;
+  const std::function<bool()> between = [&] { return yieldTurn() || (rebuilt = true, false); };
+  if (!px || !core().uploadRgbF32(px, pitch, W_, H_, img, 0, 0, err, between)) {
+    if (rebuilt) return false;  // the device was rebuilt meanwhile: the image belongs to the lost one (turnOk set the failure)
+    core().retire(img);         // chunks of it may still be in flight
     if (!px) return fail(GpuReason::DeviceError, "source store cannot be read");
     return dev().state() == hal::DeviceState::Lost ? fail(GpuReason::DeviceLost, err) : fail(GpuReason::DeviceError, err);
   }
+  if (rs_->have) {
+    core().retire(img);
+    return true;
+  }
+  rs_->img = img;
   rs_->have = true;
   return true;
 }
 
-// The resident source resized (Lanczos-3) to w x h; cached (two sizes).
-hal::ImageH* Executor::resizedSource(int w, int h) {
-  if (w == W_ && h == H_) return &rs_->img;
+// The resident source resized (Lanczos-3) to w x h; cached (two sizes). The result holds the image (aliasing pointer) for the frame.
+std::shared_ptr<const hal::ImageH> Executor::resizedSource(int w, int h) {
+  if (w == W_ && h == H_) return std::shared_ptr<const hal::ImageH>(rs_, &rs_->img);
   for (auto& r : rs_->resized)
     if (r->w == w && r->h == h) {
       r->used = ++rs_->tick;
-      return &r->img;
+      return std::shared_ptr<const hal::ImageH>(r, &r->img);
     }
   if (!canResident(w, h)) return fail(GpuReason::SourceTooLarge, "resized source too large"), nullptr;
-  auto r = std::make_unique<ResidentSource::Resized>();
+  auto r = std::make_shared<ResidentSource::Resized>();
+  r->ctx = ctx_;
+  r->epoch = epoch_;
   r->w = w;
   r->h = h;
   hal::Status s = dev().createImage({hal::Format::RGBA16F, std::uint32_t(w), std::uint32_t(h), 1}, &r->img);
-  if (s != hal::Status::Ok) return failStatus(s, ""), nullptr;
+  if (s != hal::Status::Ok) return r->img = {}, failStatus(s, ""), nullptr;
   auto cl = dev().begin();
   if (!cl) {
     dev().destroy(r->img);
@@ -95,18 +108,14 @@ hal::ImageH* Executor::resizedSource(int w, int h) {
   hal::FenceH f;
   s = submit(g, *cl, &f, err);
   if (s == hal::Status::Ok) s = dev().wait(f, kWaitNs);
-  if (s != hal::Status::Ok) {
-    core().retire(r->img);
-    return failStatus(s, err), nullptr;
-  }
+  if (s != hal::Status::Ok) return failStatus(s, err), nullptr;  // r retires its image
   r->used = ++rs_->tick;
-  if (rs_->resized.size() >= 2) {  // a frame of the other executor sharing this source may still read the victim: retired, not destroyed
+  if (rs_->resized.size() >= 2) {  // retired when the last frame holding it (another executor's export between two tiles) lets go
     auto victim = std::min_element(rs_->resized.begin(), rs_->resized.end(), [](auto& a, auto& b) { return a->used < b->used; });
-    core().retire((*victim)->img);
     rs_->resized.erase(victim);
   }
-  rs_->resized.push_back(std::move(r));
-  return &rs_->resized.back()->img;
+  rs_->resized.push_back(r);
+  return std::shared_ptr<const hal::ImageH>(r, &r->img);
 }
 
 // Uploads `bytes` of `data` into `dst` through the slot's staging buffer and waits for it.

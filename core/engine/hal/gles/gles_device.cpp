@@ -308,7 +308,6 @@ class GlesDev final : public Device {
   void invalidate(BufferH, std::uint64_t off, std::uint64_t n) override;
 
   std::unique_ptr<CommandList> begin() override;
-  void pinSlot(int s) override { pinned_ = s; }
   Status submit(CommandList&, FenceH*) override;
   Status wait(FenceH, std::uint64_t timeoutNs) override;
   bool poll(FenceH) override;
@@ -356,7 +355,7 @@ class GlesDev final : public Device {
   std::atomic<bool> lost_{false};
   std::atomic<std::uint64_t> uid_{1};
   Slot slots_[kSlots];
-  int nextSlot_ = 0, pinned_ = -1;
+  int nextSlot_ = 0;
   GLuint nearest_ = 0;
   std::unordered_map<std::string, std::unique_ptr<GPipe>> pipes_;
   std::mutex pipeMu_;
@@ -939,10 +938,6 @@ std::unique_ptr<CommandList> GlesDev::begin() {
   if (lost_) return nullptr;
   int idx = nextSlot_;
   nextSlot_ = (nextSlot_ + 1) % kSlots;
-  if (idx == pinned_) {
-    idx = nextSlot_;
-    nextSlot_ = (nextSlot_ + 1) % kSlots;
-  }
   Slot& s = slots_[idx];
   if (s.submitted.load() != s.done.load()) {
     FenceH f;

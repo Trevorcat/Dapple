@@ -118,10 +118,15 @@ bool boxSelfTest(Core& core, std::string& report) {
 struct Context::Impl {
   ContextOptions opt;
   std::unique_ptr<Core> core;
+  std::atomic<Core*> cur{nullptr};             // core.get(), readable without a turn (a rebuild swaps it inside one)
   std::vector<std::unique_ptr<Core>> retired;  // lost devices: kept alive so stale handles never meet a destroyed device
   hal::Api api = hal::Api::Null;
   std::string selfTest, selection;
-  std::mutex mtx;
+  DeviceGate gate;
+  void setCore(std::unique_ptr<Core> c) {
+    core = std::move(c);
+    cur.store(core.get(), std::memory_order_release);
+  }
   std::atomic<std::uint64_t> epoch{1};
   int rebuilds = 0;
   bool owning = true;
@@ -133,15 +138,40 @@ struct Context::Impl {
 Context::Context() : d_(new Impl) {}
 Context::~Context() = default;
 hal::Api Context::api() const { return d_->api; }
-const hal::DeviceCaps& Context::caps() const { return d_->core->dev().caps(); }
+const hal::DeviceCaps& Context::caps() const { return d_->cur.load(std::memory_order_acquire)->dev().caps(); }
 const std::string& Context::selfTestReport() const { return d_->selfTest; }
 std::string Context::selectionJson() const { return d_->selection; }
-Core& Context::core() { return *d_->core; }
-std::size_t Context::pooledBytes() const { return d_->core->pool().pooledBytes(); }
+Core& Context::core() { return *d_->cur.load(std::memory_order_acquire); }
+std::size_t Context::pooledBytes() const { return d_->cur.load(std::memory_order_acquire)->pool().pooledBytes(); }
 int Context::rebuilds() const { return d_->rebuilds; }
-bool Context::deviceLost() const { return d_->core->dev().state() == hal::DeviceState::Lost; }
+bool Context::deviceLost() const { return d_->cur.load(std::memory_order_acquire)->dev().state() == hal::DeviceState::Lost; }
 std::uint64_t Context::epoch() const { return d_->epoch.load(); }
-std::mutex& Context::mutex() { return d_->mtx; }
+DeviceGate& Context::gate() { return d_->gate; }
+
+// ---- device turns ----
+void DeviceGate::lock(Prio p) {
+  const int i = int(p);
+  {
+    std::unique_lock<std::mutex> lk(m_);
+    const std::uint64_t t = next_[i]++;
+    cv_.wait(lk, [&] { return !held_ && serving_[i] == t && (p == Prio::Interactive || serving_[1] == next_[1]); });
+    held_ = true;
+    ++serving_[i];
+  }
+  queue_.lock();
+}
+void DeviceGate::unlock() {
+  queue_.unlock();
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    held_ = false;
+  }
+  cv_.notify_all();
+}
+bool DeviceGate::interactiveWaiting() {
+  std::lock_guard<std::mutex> lk(m_);
+  return serving_[1] != next_[1];
+}
 std::shared_ptr<void> Context::residentFor(std::uint64_t identity, const std::function<std::shared_ptr<void>()>& make) {
   std::lock_guard<std::mutex> lk(d_->srcMtx);
   for (auto it = d_->sources.begin(); it != d_->sources.end();) it = it->second.expired() ? d_->sources.erase(it) : std::next(it);
@@ -359,7 +389,7 @@ std::shared_ptr<Context> Context::create(const ContextOptions& opt, std::string&
       std::shared_ptr<Context> view(new Context);
       view->d_->owning = false;
       view->d_->api = dev.caps().api;
-      view->d_->core = Core::view(dev, e);
+      view->d_->setCore(Core::view(dev, e));
       if (!view->d_->core) return why = e, false;
       std::string boxReport;
       st.boxOk = boxSelfTest(*view->d_->core, boxReport);
@@ -368,7 +398,7 @@ std::shared_ptr<Context> Context::create(const ContextOptions& opt, std::string&
       const bool ok = pipelineSelfTest(view, report);
       st.report = report + "; " + boxReport;
       if (!ok) why = report;
-      view->d_->core.reset();
+      view->d_->setCore(nullptr);
       if (opt.cacheStore) opt.cacheStore(devKey, ok, st.boxOk, ok ? st.report : report);
       return ok;
     };
@@ -384,7 +414,7 @@ std::shared_ptr<Context> Context::create(const ContextOptions& opt, std::string&
   }
   c->d_->api = sel.api;
   std::string e2;
-  c->d_->core = Core::adopt(std::move(sel.device), e2);
+  c->d_->setCore(Core::adopt(std::move(sel.device), e2));
   if (!c->d_->core) return err = e2, nullptr;
   c->d_->core->boxScanOk = st.boxOk;
   c->d_->selfTest = st.report;
@@ -394,7 +424,9 @@ std::shared_ptr<Context> Context::create(const ContextOptions& opt, std::string&
 bool Context::rebuild(std::string& err) {
   std::unique_ptr<Core> fresh;
   {
-    std::lock_guard<std::mutex> lk(d_->mtx);
+    // a turn of its own: no job is on the device while the core is swapped; a frame between two of its turns sees the new epoch at its next
+    // turn and stops (Executor::turnOk)
+    DeviceTurn turn(d_->gate, DeviceGate::Prio::Interactive);
     if (d_->rebuilds >= 1) return err = "device already rebuilt once in this process", false;
     ++d_->rebuilds;
     hal::Selection sel = hal::selectDevice(d_->opt.device, d_->api == hal::Api::Gles31 ? "gles" : d_->api == hal::Api::Metal ? "metal" : "vulkan");
@@ -405,12 +437,17 @@ bool Context::rebuild(std::string& err) {
     fresh = Core::adopt(std::move(sel.device), err);
     if (!fresh) return false;
     d_->retired.push_back(std::move(d_->core));
-    d_->core = std::move(fresh);
+    d_->setCore(std::move(fresh));
     d_->epoch.fetch_add(1);
+    if (d_->opt.selfTest) {
+      std::string boxReport;
+      d_->core->boxScanOk = boxSelfTest(*d_->core, boxReport);
+      d_->selfTest = boxReport;
+    }
   }
-  if (d_->opt.selfTest) {
-    std::string boxReport, report;
-    d_->core->boxScanOk = boxSelfTest(*d_->core, boxReport);
+  if (d_->opt.selfTest) {  // frames through executors: they take turns themselves
+    std::string report;
+    const std::string boxReport = d_->selfTest;
     std::shared_ptr<Context> self = shared_from_this();
     if (!pipelineSelfTest(self, report)) return err = "self-test failed after the device rebuild: " + report, false;
     d_->selfTest = report + "; " + boxReport;
@@ -805,7 +842,7 @@ class ProviderImpl final : public GpuProvider {
   std::size_t trimPool(std::size_t keepFree) override {
     std::shared_ptr<Context> c = peek();
     if (!c || c->deviceLost()) return 0;
-    std::lock_guard<std::mutex> lk(c->mutex());  // the executors hold it for a whole frame: the pool is not in use while we hold it
+    DeviceTurn turn(c->gate(), DeviceGate::Prio::Background);  // no job between begin and submit: the pool's free images are free
     const std::size_t before = c->pooledBytes();
     c->core().pool().trim(keepFree);
     c->core().dev().trim();
@@ -841,7 +878,7 @@ class ProviderImpl final : public GpuProvider {
     if (!out || !c || !c->nativeHandles(&h) || !h.swapchainEnabled) return false;
     out->handles = h;
     out->keepAlive = c;
-    out->queueMutex = &c->mutex();
+    out->queueMutex = &c->gate().queueMutex();
     out->generation = c->epoch();
     return true;
   }
@@ -1058,7 +1095,7 @@ std::string statusJson() { return provider().statusJson(); }
 // runs, up to three units sized for the low clock are queued right BEHIND it (piggyback: costs that frame nothing, keeps the GPU busy while the host
 // reads back and prepares the next; the next frame waits for at most their remainder); one spinning thread on the big cores for the whole window. Window: from touch-down, at least `burst_ms`; until the first real frame or `holdMs`
 // (a finger that has not moved yet); after the first real frame `dragMs` more (the drag holds the clock from there); never more than `maxMs`.
-// Every device call holds the context mutex (the HAL device is not thread-safe; a frame holds it for its whole run), and only for the call itself.
+// Every device call happens inside a background device turn (the HAL device is not thread-safe; section 52), and only for the call itself.
 namespace {
 struct KeepWarmPump {
   using Clk = std::chrono::steady_clock;
@@ -1072,7 +1109,7 @@ struct KeepWarmPump {
   std::atomic<std::uint64_t> realSeq{0};
   std::atomic<bool> live{false};   // a window is open: piggyback units are wanted
   std::atomic<int> piggyUnits{0};  // units queued behind real frames in this window
-  // device state: touched only with the context mutex held
+  // device state: touched only inside a device turn
   std::weak_ptr<Context> ctxOf;  // the context the buffers belong to
   Context* ctxRaw = nullptr;
   hal::BufferH ring, sink;
@@ -1113,7 +1150,7 @@ struct KeepWarmPump {
     detail::pinCurrentThreadToBigCores();  // the pump polls fences: a prompt wake-up keeps the gaps between units short
     std::unique_lock<std::mutex> lk(m);
     for (;;) {
-      // The working set (12 MB) is kept for the life of the context: allocating it costs ~25-50 ms on a phone, with the context mutex held, which a
+      // The working set (12 MB) is kept for the life of the context: allocating it costs ~25-50 ms on a phone, inside a device turn, which a
       // touch must never make a real frame wait for. It is allocated by the prepare call (at idle, once per photo), else by the first touch.
       cv.wait(lk, [&] { return prepare || Clk::now() < deadline; });
       const bool prep = prepare;
@@ -1126,7 +1163,7 @@ struct KeepWarmPump {
   void release() {
     std::shared_ptr<Context> c = ctxOf.lock();
     if (!c) return;
-    std::lock_guard<std::mutex> dl(c->mutex());
+    DeviceTurn dl(c->gate(), DeviceGate::Prio::Background);
     hal::Device& dev = c->core().dev();
     dev.waitAll();
     if (ring) dev.destroy(ring);
@@ -1136,7 +1173,7 @@ struct KeepWarmPump {
     ctxOf.reset();
     ctxRaw = nullptr;
   }
-  bool ensure(Context& c, std::uint64_t wantRing, std::uint64_t wantSink) {  // context mutex held
+  bool ensure(Context& c, std::uint64_t wantRing, std::uint64_t wantSink) {  // inside a device turn
     hal::Device& dev = c.core().dev();
     if (ring && ringBytes >= wantRing && sink && sinkBytes >= wantSink) return true;
     if (ring) dev.destroy(ring);
@@ -1156,7 +1193,7 @@ struct KeepWarmPump {
     ringBytes = wantRing, sinkBytes = wantSink, off = 0;
     return true;
   }
-  // one unit: copy `chunk` bytes of the ring (rolling offset) into the sink; context mutex held
+  // one unit: copy `chunk` bytes of the ring (rolling offset) into the sink; inside a device turn
   bool submitUnit(hal::Device& dev, hal::FenceH* f, std::uint64_t* bytes) {
     std::unique_ptr<hal::CommandList> cl = dev.begin();
     if (!cl) return false;
@@ -1168,7 +1205,7 @@ struct KeepWarmPump {
     if (bytes) *bytes = n;
     return true;
   }
-  // Executor::run, right after a frame's submission (context mutex held by the caller)
+  // Executor::run, right after a frame's submission (inside the frame's device turn)
   void piggyback(Context& c) {
     if (!live.load(std::memory_order_acquire) || ctxRaw != &c || !ring) return;
     hal::Device& dev = c.core().dev();
@@ -1186,7 +1223,7 @@ struct KeepWarmPump {
     if (!c) return;
     if (ctxOf.lock() != c) {
       release();
-      std::lock_guard<std::mutex> dl(c->mutex());
+      DeviceTurn dl(c->gate(), DeviceGate::Prio::Background);
       ctxOf = c;
       ctxRaw = c.get();
     }
@@ -1253,7 +1290,7 @@ struct KeepWarmPump {
     piggyUnits.store(0);
     bool failed = false;
     {
-      std::lock_guard<std::mutex> dl(c->mutex());
+      DeviceTurn dl(c->gate(), DeviceGate::Prio::Background);
       // every window starts with units sized for the slowest state seen so far (the clock is low after a pause), and adapts from there
       pigUnitMs = unitMs;
       chunk = lowMBps > 0 ? lowBytes(unitMs, wantSink) : (256ull << 10);
@@ -1302,11 +1339,11 @@ struct KeepWarmPump {
       }
       bool submitted = false;
       {
-        std::lock_guard<std::mutex> dl(c->mutex());
+        DeviceTurn dl(c->gate(), DeviceGate::Prio::Background);
         if (c->deviceLost()) break;
         hal::Device& dev = c->core().dev();
         retire(dev);
-        // a real frame may have been requested while this thread waited for the mutex: check again under it
+        // a real frame may have been requested while this thread waited for the turn: check again inside it
         if (int(q.size()) < depth && realActive.load(std::memory_order_acquire) == 0 && !(holding && Clk::now() < restUntil)) {
           Fly fl{};
           if (!submitUnit(dev, &fl.f, &fl.bytes)) break;
@@ -1323,7 +1360,7 @@ struct KeepWarmPump {
     }
     live.store(false, std::memory_order_release);
     if (prep) {  // the calibration waits for its last units
-      std::lock_guard<std::mutex> dl(c->mutex());
+      DeviceTurn dl(c->gate(), DeviceGate::Prio::Background);
       hal::Device& dev = c->core().dev();
       for (int i = 0; i < 2000 && !q.empty(); ++i) {
         retire(dev);
