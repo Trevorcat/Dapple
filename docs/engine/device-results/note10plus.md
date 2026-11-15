@@ -1,5 +1,58 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (b95e771) stalls, spikes, rungs, export profile
+
+Build: release APK of HEAD b95e771 (built 03:38, `install -r`), Note10+ RFCMA05Q5ZX, taps only, scripts / logs / analysis in `build/perf-20261116d/` (`xdrag.sh`, `fdrag.sh`, `rdrag.sh`, `exp1.sh`, `an*.py`; the timing split is read from the `frame_profile` line: tablesMs = tables + prep, uploadMs = upload, waitMs = turn, execMs = exec - prep - upload - turn). State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 29.8 - 30.1 C, `Thermal Status 0`, no reboot, `debug.dapple.frame_profile` set to 1 and reset to empty. **CPU: all 8 cores online (`0-7`).** `scaling_max_freq` is readable only for cores 4-7: **2016000 kHz on all four, while `cpuinfo_max_freq` is 2419200 (4-6) / 2841600 (core 7)**, i.e. 83 % / 71 % of the hardware maximum (cause not tested; Battery Saver is the likely one, not proven). Cores 0-3: `scaling_max` not readable, `cpuinfo_max` 1785600, current 1.56-1.79 GHz. Current frequency during the exports: A7RM4 CPU phase (2 s in) cores 0-3 at 1.79 GHz, core 4 at 1.40-1.61 GHz, core 7 at 2.02 GHz (the cap); during the X-S10 GPU phase cores 4-6 sat at 710 MHz. Files: the three public samples as `T1116d_6700.ARW`, `T1116d_7rm4.ARW`, `T1116d_xs10.RAF`, scanned in with `MEDIA_SCANNER_SCAN_FILE` broadcasts (no media query).
+
+### Before / after
+| | before (earlier sections) | after (b95e771) |
+|---|---|---|
+| exposure drag during the 61 MP export, view latency med / p90 / max | 31.5 / 60 / 358 ms, one 315-358 ms frame in 4 of 5 runs | **25.0 / 38.0 / 112.5** (5 runs, 998 shown frames; per-run max 108 / 103 / 113 / 103 / 94); idle in the same session 27.1 / 38.5 / 99.0 (373 frames) |
+| frames > 100 ms / > 300 ms (view latency) | 4 of 5 runs had one frame > 300 | 4 / 0 (one 102-113 ms frame in runs 1-4); engine frame (cpu_ms) max 84.6, none > 100 |
+| `waitMs` (turn wait) under the export | not measured | 0.0 on every frame (191-203 per run) |
+| film global drag frames with tablesMs > 100 | 18 of 521 (3.5 %), 0.3-1.5 s | **0 of 2129** (exposure 764 + 381, colour pad 614 + 370; 40 drags), max tablesMs 68.0, all `film=on exec=vulkan`, no `reason=` |
+| first 5 frames of each new drag after a 2 s pause (200 frames) | the spikes were here | tablesMs median 19-34, max 68.0, none > 100; the first frame of each rep is 105-158 ms in total (tables 20-68 + exec 30-62 + upload 20-69), 31 such frames, the rest of the drag is normal |
+| view latency over all 2294 film frames | | > 100 ms: 145, > 300: 0, max 265 |
+| exposure rung (no film, X-S10 copy, 3 drags) | 810, then 640, 640 | **810x541 on all three** (284 frames) |
+| colour pad rung (no film) | 640 | **810** on all three |
+| film exposure / colour pad rung | 640 / 640 | **810 / 810** (A6700 copy) |
+
+Rungs per drag (frame = engine cpu_ms median; split = tablesMs / execMs / uploadMs medians; waitMs max 0.0-0.1 everywhere; the rung never changed inside a drag; no-film on the X-S10 copy, film on the A6700 copy):
+| drag | drags | rung | frame ms (per drag) | tablesMs / execMs / uploadMs |
+|---|---|---|---|---|
+| exposure, no film | 3 | 810x541 x3 | 8.8 / 14.8 / 13.8 | 6.2-8.2 / 0.3-0.4 / 1.0-5.8 |
+| colour pad, no film | 3 | 810x541 x3 | 42.3 / 41.5 / 53.6 | 29.5-31.4 / 0.6-2.7 / 11-19 |
+| 局部 circle, 光线 pad x, no film | 3 | 810x541 x3 | 9.2 / 9.8 / 10.1 | 0.3-0.4 / 0.4-0.7 / 7.8-8.4 |
+| exposure + film | 3 | 810x541 x3 | 32.3 / 37.8 / 40.6 | 30.5-35.2 / 0.9-1.9 / 0 |
+| colour pad + film | 3 | 810x541 x3 | 41.4 / 41.0 / 40.8 | 35.2-37.2 / 1.8-2.9 / 0 |
+
+Film table time grew over the session on the same drag (exposure + film tablesMs median 12.5, then 25.0, then 30-35 ms in the three exposure runs; temperature flat at 30 C, status 0); not diagnosed.
+
+### Export profile, no film, once per file (in-app, `T1116d_*`)
+| stage | A6700 26 MP | X-S10 26 MP | A7RM4 61 MP |
+|---|---|---|---|
+| path and why | whole frame: peak 841 MB (GPU 370) vs budget 1536 MB (available x 0.5 - 96 = 3385, ceiling 1536, room 3579) | whole frame: 842 MB (GPU 370) vs 1536 (3373 / 1536 / 3579) | **stream**: whole-frame peak 1542 MB (GPU 436) vs 1536 (3346 / 1536 / 3511) |
+| decode / full open | 547 ms (mosaic 30, demosaic 373 CPU, shadow chroma 23) | 5238 ms (mosaic 49, **demosaic + crop 5000**, chroma 50) | lazy open 115 ms |
+| demosaic where | CPU | GPU nodes 4 x 6246x896 (26 tiles each), 1159-1166 ms each (submit/wait 1121-1130, window build 25-31, read-back hand-off 7-9); the CPU row share is not logged | CPU, 1441 ms over 23 windows (102.4 MP, row cache 224 MB) |
+| analysis pass | in the open | in the open | 1 pass 1465 ms (demosaic 739) |
+| render | 811 | 762 | 823 |
+| encode + write | 567 | 349 | 659 |
+| total (log) | tap to `export_jpeg` line 2.08 s | 6.5 s | `export_stream` 5887 ms (peak 824 MB); tap to line 6.1 s |
+
+Readback and wait are not separate lines in the export logs.
+Redmi (2026-11-16 native bench, after; not the same harness): A6700 FULL open 416 (demosaic 352), render 1112, encode 285, total 1848; X-S10 open 2356 (demosaic 2279), render 1072, encode 220, total 3663; A7RM4 analysis 1424, window demosaic 616, total 4853.
+**What is slower here:** X-S10 demosaic 5000 vs 2279 ms (**2.2x**, +2.7 s of the gap; the four GPU nodes alone take 4.65 s, so the Adreno 640 rows are the bottleneck); A7RM4 window demosaic 1441 vs 616 ms (**2.3x**, +0.8 s; CPU, big cores capped at 2.02 GHz); encode 567 vs 285 ms (A6700, **2.0x**) and 349 vs 220 (X-S10, 1.6x). The analysis pass is the same (1465 vs 1424) and the A6700 demosaic is near equal (373 vs 352). Render is faster here (762 vs 1072, 811 vs 1112). So the 61 MP and X-S10 exports are limited by demosaic (CPU windows / GPU nodes) and the JPEG encode on slower cores, not by the path choice.
+**Export with the drag** (5 runs, drag started 0.6 s after the tap): export_stream 10.5-10.8 s (alone 5.9), analysis pass 6.16-6.40 s (alone 1.47; demosaic 5.4 s vs 0.74), render 0.99 vs 0.82, encode 0.98 vs 0.66; a 4096 detail session of the same photo decoded at the same time (4192 ms). The stalls are gone but the export takes about 4.7 s longer under a drag: the cost moved from the frames to the export's CPU phase.
+
+### Anything broken
+No crash (crash buffer empty), no ANR line, no `exec=cpu` or `reason=` in any drag, rung or export log of this run, no `VkResult`, no GPU error. The interactive tier rose to 1080x720 in some frames of 4 of the 5 drag-under-export runs (not looked into).
+
+### Not measured
+Tone drag (a vertical swipe on the 光线 pad produced no frame lines in two attempts, so no number); no-film runs used the X-S10 photo and film runs the A6700 (film could not be removed again without many undo taps); 局部 pad without film only; CPU row share of the X-S10 demosaic (not logged); per-stage readback; the Redmi comparison is native bench vs in-app; `scaling_max_freq` of cores 0-3; one export per file, so no spread.
+
+### Cleanup
+`adb -s RFCMA05Q5ZX shell rm /sdcard/Pictures/DappleT1116d/T1116d_*`, `rmdir /sdcard/Pictures/DappleT1116d`, `rm /sdcard/Pictures/Dapple/T1116d_*`; the two permitted `ls` forms then report both paths absent. `debug.dapple.frame_profile` reset (reads back empty). Screenshots (Dapple UI only) deleted. The app's library still lists the test photos (no delete action); the app was force-stopped.
+
 ## 2026-11-16 open and export after the decode work
 
 Build: release APK of HEAD (built 02:27, `install -r`), Note10+ RFCMA05Q5ZX, taps only, same method as the 2026-11-15 sections (logs and scripts in `build/perf-20261116c/`). State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 25.4 C at start, 28.0 C at the end, `Thermal Status 0`, no reboot, `debug.dapple.frame_profile` set to 1 and reset to empty. Files: the three public samples under new names (`T6700_26mp.ARW`, `T7RM4_61mp.ARW`, `TXS10_26mp.RAF`) in a new folder, removed afterwards. Photos identified from the `session_open` names.
