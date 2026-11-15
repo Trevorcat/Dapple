@@ -210,10 +210,13 @@ class _IconPainter extends CustomPainter {
         }
         break;
       case DI.texture:
-        // 质地: the pad's 颗粒 square, clean at one corner and grained toward the other (the category runs from smooth to textured)
-        rr(3.5, 3.5, 17, 17, 4.5);
-        for (final d in const [(15.6, 8.0, 0.85), (11.4, 12.2, 0.85), (16.2, 12.0, 1.15), (8.0, 15.8, 0.85), (12.6, 16.2, 1.15), (16.4, 16.4, 1.3)]) {
-          canvas.drawCircle(Offset(d.$1, d.$2), d.$3, fill);
+        // 质地: a field of grain with no frame, fine at the top right and coarse toward the bottom left (the category runs from smooth to textured).
+        // No outline on purpose: 局部 is the framed one, so the two differ in silhouette and not only in what is inside.
+        for (var row = 0; row < 4; row++) {
+          for (var col = 0; col < 4; col++) {
+            final t = ((3 - col) + row) / 6.0;
+            canvas.drawCircle(Offset(5.25 + col * 4.5, 5.25 + row * 4.5), 0.75 + 1.05 * t, fill);
+          }
         }
         break;
       case DI.local:
