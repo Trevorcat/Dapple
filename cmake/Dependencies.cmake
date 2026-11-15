@@ -43,6 +43,88 @@ if(DAPPLE_LIBRAW_LOCKPATCH)
   endforeach()
 endif()
 
+# Local patch 2 (docs/legal/libraw.md, "Patch 2: parallel decompression"): (a) sony_arw2_load_raw (Sony ARW 2.3, the 8-bit-per-pixel compressed ARW,
+# e.g. the A7R IV) decodes its rows on all cores: every row is one independent run of 16-byte blocks, so the rows are read in chunks of 256 into a
+# buffer (one zero pad byte per row, as the original row buffer has) and decoded with an OpenMP loop; same bytes in, same samples out (serial without
+# OpenMP). (b) fuji_decode_loop schedules its strips dynamically: a phone has fast and slow cores, and a static split could give two strips to a slow
+# core. Idempotent (marker "dapple patch 2"); a LibRaw update that changes these lines fails the configure here instead of building unpatched.
+set(_lr_arw "${libraw_SOURCE_DIR}/src/decoders/decoders_dcraw.cpp")
+file(READ "${_lr_arw}" _lr_txt)
+if(NOT _lr_txt MATCHES "dapple patch 2")
+  set(_lr_a_old [=[  data = (uchar *)calloc(raw_width + 1,1);
+  try
+  {
+    for (row = 0; row < height; row++)
+    {
+      checkCancel();
+      fread(data, 1, raw_width, ifp);
+      for (dp = data, col = 0; col < raw_width - 30; dp += 16)
+      {]=])
+  set(_lr_a_new [=[  const int dapple_chunk = 256;  // dapple patch 2: rows read in chunks, decoded in parallel (each row is independent)
+  const size_t dapple_stride = size_t(raw_width) + 1;
+  data = (uchar *)calloc(dapple_stride * dapple_chunk, 1);
+  try
+  {
+    for (int dapple_row0 = 0; dapple_row0 < height; dapple_row0 += dapple_chunk)
+    {
+      checkCancel();
+      const int dapple_rows = MIN(dapple_chunk, height - dapple_row0);
+      for (int k = 0; k < dapple_rows; k++)
+        fread(data + size_t(k) * dapple_stride, 1, raw_width, ifp);
+#ifdef LIBRAW_USE_OPENMP
+#pragma omp parallel for schedule(dynamic, 8)
+#endif
+    for (row = dapple_row0; row < dapple_row0 + dapple_rows; row++)
+    {
+      uchar *dp;
+      ushort pix[16];
+      int col, val, max, min, imax, imin, sh, bit, i;
+      for (dp = data + size_t(row - dapple_row0) * dapple_stride, col = 0; col < raw_width - 30; dp += 16)
+      {]=])
+  set(_lr_b_old [=[        col -= col & 1 ? 1 : 31;
+      }
+    }
+  }
+  catch (...)
+  {
+    free(data);
+    throw;
+  }
+  if (imgdata.rawparams.specials & LIBRAW_RAWSPECIAL_SONYARW2_DELTATOVALUE)
+    maximum = 10000;]=])
+  set(_lr_b_new [=[        col -= col & 1 ? 1 : 31;
+      }
+    }
+    }
+  }
+  catch (...)
+  {
+    free(data);
+    throw;
+  }
+  if (imgdata.rawparams.specials & LIBRAW_RAWSPECIAL_SONYARW2_DELTATOVALUE)
+    maximum = 10000;]=])
+  string(FIND "${_lr_txt}" "${_lr_a_old}" _lr_a_at)
+  string(FIND "${_lr_txt}" "${_lr_b_old}" _lr_b_at)
+  if(_lr_a_at LESS 0 OR _lr_b_at LESS 0)
+    message(FATAL_ERROR "LibRaw patch 2 (sony_arw2_load_raw) does not apply to ${_lr_arw}: update the patch or the LibRaw version (docs/legal/libraw.md)")
+  endif()
+  string(REPLACE "${_lr_a_old}" "${_lr_a_new}" _lr_txt "${_lr_txt}")
+  string(REPLACE "${_lr_b_old}" "${_lr_b_new}" _lr_txt "${_lr_txt}")
+  file(WRITE "${_lr_arw}" "${_lr_txt}")
+endif()
+set(_lr_fuji "${libraw_SOURCE_DIR}/src/decoders/fuji_compressed.cpp")
+file(READ "${_lr_fuji}" _lr_txt)
+if(NOT _lr_txt MATCHES "dapple patch 2")
+  set(_lr_f_old "#pragma omp parallel for private(cur_block) shared(errcnt)\n")
+  string(FIND "${_lr_txt}" "${_lr_f_old}" _lr_f_at)
+  if(_lr_f_at LESS 0)
+    message(FATAL_ERROR "LibRaw patch 2 (fuji_decode_loop) does not apply to ${_lr_fuji}: update the patch or the LibRaw version (docs/legal/libraw.md)")
+  endif()
+  string(REPLACE "${_lr_f_old}" "#pragma omp parallel for private(cur_block) shared(errcnt) schedule(dynamic, 1) // dapple patch 2: strips to whichever core is free\n" _lr_txt "${_lr_txt}")
+  file(WRITE "${_lr_fuji}" "${_lr_txt}")
+endif()
+
 file(GLOB_RECURSE DAPPLE_LIBRAW_SOURCES CONFIGURE_DEPENDS "${libraw_SOURCE_DIR}/src/*.cpp")
 # *_ph.cpp are placeholder units that are #included by other sources.
 list(FILTER DAPPLE_LIBRAW_SOURCES EXCLUDE REGEX "_ph\\.cpp$")
