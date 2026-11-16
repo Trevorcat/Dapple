@@ -378,8 +378,7 @@ void testCases(GpuCtx& G, bool grainOnly, int w = 960, int h = 640, const std::v
 }
 
 // A mixture of one plane: GPU vs the CPU engine, in units of the dynamic range of the plane.
-void testMixture(GpuCtx& G) {
-  const int w = 200, h = 150;
+void testMixture(GpuCtx& G, int w = 200, int h = 150) {
   std::vector<float> plane(std::size_t(w) * h);
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x)
@@ -427,7 +426,7 @@ void testMixture(GpuCtx& G) {
       ++g_failures;
       continue;
     }
-    if (std::string(c.name).find("sigma 1.8") != std::string::npos) {
+    if (w == 200 && h == 150 && std::string(c.name).find("sigma 1.8") != std::string::npos) {
       // brute-force reference with reflect boundary, double precision
       std::vector<float> w1; int r1 = 0; fd::gaussTaps(1.8, w1, r1);
       auto refl = [](int i, int n) { const int per = 2 * n; i %= per; if (i < 0) i += per; return i < n ? i : per - 1 - i; };
@@ -447,6 +446,15 @@ void testMixture(GpuCtx& G) {
         worst = std::max(worst, e);
         if (x < 3 || y < 3 || x >= w - 3 || y >= h - 3) worstEdge = std::max(worstEdge, e);
       }
+    if (std::getenv("DAPPLE_FILM_HASH")) {  // bit hash of the GPU result (equality gate of the refactors)
+      std::uint64_t hh = 1469598103934665603ull;
+      for (float v : gpu) {
+        std::uint32_t b;
+        std::memcpy(&b, &v, 4);
+        hh = (hh ^ b) * 1099511628211ull;
+      }
+      std::printf("HASH mixture %s %dx%d %016llx\n", c.name, w, h, static_cast<unsigned long long>(hh));
+    }
     std::printf("  %-36s max abs diff %.3g (border band %.3g), plane range 3.5 => %.3f %%\n", c.name, worst, worstEdge, 100.0 * worst / 3.5);
     CHECK(worst / 3.5 < 0.005);
   }
@@ -712,7 +720,12 @@ void testFrames() {
          p.filmStock = "kodak_portra_400"; p.filmStrength = 50; p.toneCurve = {{0.f, 0.f}, {128.f, 107.f}, {255.f, 255.f}}; p.lutAmount = 60; p.vignette = -20; },
        nullptr, true, true, true},
   };
-  for (const std::pair<int, int>& sz : {std::pair<int, int>{640, 448}, std::pair<int, int>{1536, 1024}}) {
+  // DAPPLE_FILM_HASH=1: also odd sizes, and print an FNV-1a hash of every GPU frame ("HASH <case> <size> <hash>"): the equality gate of the film refactors
+  // (run before and after, diff the HASH lines)
+  const bool hashRun = std::getenv("DAPPLE_FILM_HASH") != nullptr;
+  std::vector<std::pair<int, int>> sizes = {{640, 448}, {1536, 1024}};
+  if (hashRun) sizes = {{640, 448}, {1536, 1024}, {641, 449}, {1111, 777}};
+  for (const std::pair<int, int>& sz : sizes) {
     const SourceImage src = dapple::gpu::makeTestImage(sz.first, sz.second);
     dapple::gpu::Rig rig(ctx, src, cam);
     for (const Case& c : cases) {
@@ -743,6 +756,11 @@ void testFrames() {
         }
       } else {
         gpu = rig.render(p, r, src, fo, 41, gw, gh, &st, err, 0, 0.f, look);
+      }
+      if (hashRun && gpu) {
+        std::uint64_t hh = 1469598103934665603ull;
+        for (std::size_t i = 0; i < std::size_t(gw) * gh * 4; ++i) hh = (hh ^ gpu[i]) * 1099511628211ull;
+        std::printf("HASH %s %dx%d %016llx\n", c.name, sz.first, sz.second, static_cast<unsigned long long>(hh));
       }
       if (!cpu || !gpu || w != gw || h != gh) {
         std::printf("  %-34s %dx%d: render failed: %s\n", c.name, sz.first, sz.second, err.c_str());
@@ -792,7 +810,11 @@ int main(int argc, char** argv) {
   }
   std::printf("device: %s\n", G.dev().caps().text().c_str());
   const std::string id = argc >= 2 ? argv[1] : "";
-  if (id == "mixture") testMixture(G);
+  if (id == "mixture") {
+    testMixture(G);
+    if (std::getenv("DAPPLE_FILM_HASH"))
+      for (const std::pair<int, int>& sz : {std::pair<int, int>{201, 151}, {37, 29}, {513, 331}, {1000, 3}, {64, 64}}) testMixture(G, sz.first, sz.second);
+  }
   else if (id == "bench") testBench(G);
   else if (id == "merge") testMerge(G);
   else if (id.empty() || id == "all") testCases(G, false);

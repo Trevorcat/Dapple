@@ -411,8 +411,22 @@ struct Mix3 {
     }
     return acc;
   }
-  // `src`: full resolution (W x Hh) RGBA32F input, or the half-resolution input when `half`.
-  H mixture(H src, int W, int Hh, const fd::Mixture* mix, bool half) {
+  // The components of a mixture by pyramid level, for a picture of W x Hh (or its half-resolution input when `half`).
+  struct Plan {
+    double w0[3] = {0, 0, 0};
+    std::vector<std::vector<Comp3>> per[3];  // [channel][level]
+    int maxLevel = 0;
+    bool half = false;
+    void level(int k, std::vector<Comp3> (&out)[3]) const {
+      for (int c = 0; c < 3; ++c) out[c] = per[c][std::size_t(k)];
+    }
+  };
+  Plan plan(int W, int Hh, const fd::Mixture* mix, bool half) const {
+    Plan pn;
+    pn.half = half;
+    double* w0 = pn.w0;
+    std::vector<std::vector<Comp3>>* per = pn.per;
+    int& maxLevel = pn.maxLevel;
     const double kMinLowSigma = half ? 1.6 : (fastLow ? 1.0 : 2.0), lowCut = fastLow ? 2.0 : 3.0;
     int avail = 0;
     {
@@ -425,9 +439,6 @@ struct Mix3 {
         ++avail;
       }
     }
-    double w0[3];
-    std::vector<std::vector<Comp3>> per[3];  // [channel][level]
-    int maxLevel = 0;
     for (int c = 0; c < 3; ++c) {
       w0[c] = mix[c].w0;
       per[c].resize(std::size_t(avail) + 1);
@@ -470,41 +481,72 @@ struct Mix3 {
         maxLevel = std::max(maxLevel, k);
       }
     }
-    auto level = [&](int k, std::vector<Comp3> (&out)[3]) {
-      for (int c = 0; c < 3; ++c) out[c] = per[c][std::size_t(k)];
-    };
-    std::vector<Comp3> lv[3];
-    if (maxLevel == 0) {
-      level(0, lv);
-      return combine(src, W, Hh, w0, lv, -1, 0, 0);
-    }
-    std::vector<H> P(std::size_t(maxLevel) + 1, -1), L(std::size_t(maxLevel) + 2, -1);
-    std::vector<int> pw(std::size_t(maxLevel) + 1), ph(std::size_t(maxLevel) + 1);
-    pw[0] = W;
-    ph[0] = Hh;
-    if (!half) P[0] = src;
-    for (int k = 1; k <= maxLevel; ++k) {
-      pw[std::size_t(k)] = (pw[std::size_t(k) - 1] + 1) / 2;
-      ph[std::size_t(k)] = (ph[std::size_t(k) - 1] + 1) / 2;
-      if (k == 1 && half) {
-        P[1] = src;
-        continue;
-      }
-      P[std::size_t(k)] = down(P[std::size_t(k) - 1], pw[std::size_t(k) - 1], ph[std::size_t(k) - 1]);
-    }
+    return pn;
+  }
+  // Size of pyramid level k of a W x Hh picture (a half-resolution input is level 1).
+  static void levelSize(int W, int Hh, int k, int& w, int& h) {
+    w = W;
+    h = Hh;
+    for (int i = 0; i < k; ++i) w = (w + 1) / 2, h = (h + 1) / 2;
+  }
+  // The level-2 input plane of the picture (the 4 x 4 box average of the mixture's input); `p1` = its level-1 plane (the input itself when `half`).
+  // Only a mixture with components on levels >= 2 needs it.
+  H level1(H src, int W, int Hh, bool half) {
+    if (half) return src;
+    return down(src, W, Hh);
+  }
+  H level2Input(H p1, int W, int Hh, bool half) {
+    int w1, h1;
+    levelSize(W, Hh, 1, w1, h1);
+    return down(p1, w1, h1);
+  }
+  // L2: the accumulator plane of every component on levels >= 2, upsampled level by level to level 2. `p2` = level2Input of the whole picture.
+  // -1 when the plan has no component above level 1.
+  H buildLow(const Plan& pn, H p2, int W, int Hh) {
+    if (pn.maxLevel < 2) return -1;
     const double zero[3] = {0, 0, 0};
-    for (int k = maxLevel; k >= 1; --k) {
-      level(k, lv);
-      L[std::size_t(k)] = combine(P[std::size_t(k)], pw[std::size_t(k)], ph[std::size_t(k)], zero, lv, k < maxLevel ? L[std::size_t(k) + 1] : -1,
-                                  k < maxLevel ? pw[std::size_t(k) + 1] : 0, k < maxLevel ? ph[std::size_t(k) + 1] : 0);
+    std::vector<H> P(std::size_t(pn.maxLevel) + 1, -1);
+    std::vector<int> pw(std::size_t(pn.maxLevel) + 2), ph(std::size_t(pn.maxLevel) + 2);
+    for (int k = 2; k <= pn.maxLevel + 0; ++k) levelSize(W, Hh, k, pw[std::size_t(k)], ph[std::size_t(k)]);
+    P[2] = p2;
+    for (int k = 3; k <= pn.maxLevel; ++k) P[std::size_t(k)] = down(P[std::size_t(k) - 1], pw[std::size_t(k) - 1], ph[std::size_t(k) - 1]);
+    H L = -1;
+    std::vector<Comp3> lv[3];
+    for (int k = pn.maxLevel; k >= 2; --k) {
+      pn.level(k, lv);
+      L = combine(P[std::size_t(k)], pw[std::size_t(k)], ph[std::size_t(k)], zero, lv, k < pn.maxLevel ? L : -1, k < pn.maxLevel ? pw[std::size_t(k) + 1] : 0,
+                  k < pn.maxLevel ? ph[std::size_t(k) + 1] : 0);
     }
+    return L;
+  }
+  // Levels 1 and 0 of a window (here: the whole picture W x Hh), plus the Catmull-Rom upsample of `L2`. `p1` = level1(src).
+  H combineWindow(const Plan& pn, H src, H p1, int W, int Hh, H L2) {
+    std::vector<Comp3> lv[3];
+    const double zero[3] = {0, 0, 0};
+    if (pn.maxLevel == 0) {
+      pn.level(0, lv);
+      return combine(src, W, Hh, pn.w0, lv, -1, 0, 0);
+    }
+    int w1, h1, w2, h2;
+    levelSize(W, Hh, 1, w1, h1);
+    levelSize(W, Hh, 2, w2, h2);
+    pn.level(1, lv);
+    const H L1 = combine(p1, w1, h1, zero, lv, L2, L2 >= 0 ? w2 : 0, L2 >= 0 ? h2 : 0);
     // final level: dst = w0 * src + comps(src) + up2(L1); the half input has no level-0 components
-    if (half) {
+    if (pn.half) {
       std::vector<Comp3> none[3];
-      return combine(L[1], W, Hh, zero, none, L[1], pw[1], ph[1]);
+      return combine(L1, W, Hh, zero, none, L1, w1, h1);
     }
-    level(0, lv);
-    return combine(src, W, Hh, w0, lv, L[1], pw[1], ph[1]);
+    pn.level(0, lv);
+    return combine(src, W, Hh, pn.w0, lv, L1, w1, h1);
+  }
+  // `src`: full resolution (W x Hh) RGBA32F input, or the half-resolution input when `half`.
+  H mixture(H src, int W, int Hh, const fd::Mixture* mix, bool half) {
+    const Plan pn = plan(W, Hh, mix, half);
+    if (pn.maxLevel == 0) return combineWindow(pn, src, -1, W, Hh, -1);
+    const H p1 = level1(src, W, Hh, half);
+    const H L2 = pn.maxLevel >= 2 ? buildLow(pn, level2Input(p1, W, Hh, half), W, Hh) : H(-1);
+    return combineWindow(pn, src, p1, W, Hh, L2);
   }
 };
 
