@@ -61,9 +61,9 @@ Offset _fromRef(Offset p) => Offset((p.dx / kFilmMapRef.width - 0.5) / kFilmMapX
 /// and axes as the stocks, docs/film/film-map.md; the asset carries the same numbers with `measured: true`). A modern dot may land close to a
 /// stock (通透 vs the Portra family, 鲜明 on Superia 200 / Velvia): the layout nudges them apart and the diamond shape tells the families apart.
 const kModernCluster = {
-  'modern_clean': Offset(-0.281, 0.424),
-  'modern_vivid': Offset(0.541, 0.746),
-  'modern_soft': Offset(-0.747, 0.020),
+  'modern_clean': Offset(-0.269, 0.420),
+  'modern_vivid': Offset(0.557, 0.742),
+  'modern_soft': Offset(-0.751, 0.016),
 };
 
 /// Places the stocks of [catalog] and the modern renderings. Deterministic.

@@ -140,8 +140,8 @@ struct EditParams {
   // between a dark and a light median, filmBlack the paper black (-1 matte, 0 true Dmax, +1 display black), filmLatitude the
   // in-range fraction the stock is rescued to (0.55 .. 0.80 .. 0.98).
   float filmShoot = 0.f, filmPrint = 0.f, filmBlack = 0.f, filmLatitude = 0.f;
-  // Film white balance (胶片白平衡), 0..1: 0 = the digital white balance (the scene white reaches the film as its own reference white), 1 =
-  // the stock's own balance sees the scene's real light (degree of adaptation D = 1 - filmWb).
+  // Film white balance (胶片白平衡), -1..1: -1 = the scene light fully neutralised (the scene white reaches the film as its own reference
+  // white), 0 = half of the difference kept (default), +1 = the stock's own balance sees the scene's real light (D = 0.5 - 0.5 * filmWb).
   float filmWb = 0.f;
   // Internal, not serialised: CIE xy of the scene's as-shot illuminant (the C layer sets it from the RAW's white balance; 0 = unknown).
   float filmSceneX = 0.f, filmSceneY = 0.f;

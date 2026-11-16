@@ -1180,7 +1180,7 @@ int seqCheck() {
                         {"film_print", [](EditParams& p, float v) { p.filmPrint = v; }, -1, 1},
                         {"film_black", [](EditParams& p, float v) { p.filmBlack = v; }, -1, 1},
                         {"film_latitude", [](EditParams& p, float v) { p.filmLatitude = v; }, -1, 1},
-                        {"film_wb", [](EditParams& p, float v) { p.filmWb = v; }, 0, 1},
+                        {"film_wb", [](EditParams& p, float v) { p.filmWb = v; }, -1, 1},
                         {"film_warmth", [](EditParams& p, float v) { p.filmWarmth = v; }, -30, 30},
                         {"film_tint", [](EditParams& p, float v) { p.filmTint = v; }, -30, 30},
                         {"exposure", [](EditParams& p, float v) { p.exposure = v; }, -1, 1}};

@@ -95,7 +95,7 @@ List<SliderSpec> _buildSpecs() {
     // EditState.toWire like the other film_* keys; nothing else on the Dart side is needed).
     const SliderSpec('film_shoot', '拍摄曝光', -1, 1, 0, Fmt.signed, EGroup.style), // X of 曝光: 欠曝 -1 .. 过曝 +1
     const SliderSpec('film_print', '冲印深浅', -1, 1, 0, Fmt.signed, EGroup.style), // Y of 曝光: 深 -1 .. 浅 +1
-    const SliderSpec('film_wb', '胶片白平衡', 0, 1, 0, Fmt.signed, EGroup.style), // X of 质感, one-sided: 0 数码白平衡 (default) .. 1 胶片白平衡 (the stock's own balance)
+    const SliderSpec('film_wb', '胶片白平衡', -1, 1, 0, Fmt.signed, EGroup.style), // X of 质感: -1 数码白平衡 (the scene light fully neutralised), 0 half (default), +1 胶片白平衡 (the stock's own response to the scene light)
     const SliderSpec('film_black', '黑位', -1, 1, 0, Fmt.signed, EGroup.style), // Y of 质感: -1 抬黑 (matte lifted black), 0 paper black, +1 压黑 (deeper)
     const SliderSpec('film_latitude', '宽容度', -1, 1, 0, Fmt.signed, EGroup.style), // ruler 宽容度: -1..+1 = 55..98 % (0 = 80 %)
   ];
@@ -495,6 +495,7 @@ class EditState {
   }
 
   Map<String, dynamic> toJson() => {
+        'v': kEditSchema,
         if (look != null) 'look': look,
         'lookStrength': lookStrength,
         if (palette != null) 'palette': [palette!.dx, palette!.dy],
@@ -513,6 +514,7 @@ class EditState {
 
   factory EditState.fromJson(Map<String, dynamic> j) {
     final pal = j['palette'];
+    final schema = (j['v'] as num?)?.toInt() ?? 1;
     final e = EditState(
       look: j['look'] as String?,
       lookStrength: ((j['lookStrength'] as num?) ?? 100).toDouble(),
@@ -531,8 +533,23 @@ class EditState {
       local: LocalList.fromJson(j['local']),
       reshape: Reshape.fromJson(j['reshape']),
     );
-    return e.palette == null ? e : migratePalette(e);
+    final m = e.palette == null ? e : migratePalette(e);
+    return schema < 2 ? _migrateFilmWb(m) : m;
   }
+}
+
+/// Version of the stored edit (the "v" of [EditState.toJson]). 1 (no "v"): film_wb ran 0..1 (0 neutralised, 1 the film's own response).
+/// 2: film_wb runs -1..1 (0 half, the default); an explicit v of version 1 becomes 2v - 1 and renders as before.
+const kEditSchema = 2;
+
+EditState _migrateFilmWb(EditState e) {
+  double m(double v) => (2 * v - 1).clamp(-1.0, 1.0).toDouble();
+  final v = e.values['film_wb'];
+  final pads = {
+    for (final p in e.pads.entries)
+      p.key: p.value.off.containsKey('film_wb') ? p.value.copyWith(off: {...p.value.off, 'film_wb': m(p.value.off['film_wb']!)}) : p.value,
+  };
+  return e.copyWith(values: v == null ? null : {...e.values, 'film_wb': m(v)}, pads: pads);
 }
 
 Map<String, PadState> _padsFromJson(Object? j) {

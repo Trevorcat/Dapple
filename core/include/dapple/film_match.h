@@ -74,8 +74,8 @@ constexpr float kFilmGreyCard = 0.184f;
 // eight showcase stocks between -1 and +1 EV, less towards the shoulder): the compensation is the display key divided by it.
 constexpr float kFilmSystemGamma = 1.15f;
 // Owner decision (option C): only this share of the scene-key compensation is applied (the film chain keeps depth, the highlights
-// of a high-key scene roll off in the paper). DAPPLE_FILM_SCENE_EV_SCALE=1 reproduces the previous default.
-constexpr float kFilmSceneKeyScale = 0.5f;
+// of a high-key scene roll off in the paper). 0.25 since 2026-11-16 (0.5 before: DAPPLE_FILM_SCENE_EV_SCALE=0.5 reproduces it, 1 the one before).
+constexpr float kFilmSceneKeyScale = 0.25f;
 constexpr float kFilmShadowFloorY = 0.004f;  // floor of a pixel's luminance in the metering average
 // Per-stock usability guarantee: the share of scene pixels that must fall inside the stock's [toe, shoulder]; a stock whose range
 // fits keeps the shared exposure, a narrow one is moved just enough (docs section 18). The user's film_latitude moves it.
@@ -208,10 +208,10 @@ float filmPrintConstantAt(const std::shared_ptr<const film::FilmLibrary>& lib, c
                           float deltaEv);
 
 // ---- film_wb: film white balance (胶片白平衡) ------------------------------------------------------------------------------
-// The scene illuminant (CIE xy) the current white balance declares white, and the degree of adaptation D = 1 - film_wb of the film's input.
+// The scene illuminant (CIE xy) the current white balance declares white, and the degree of adaptation D = 1 - (0.5 + 0.5 * film_wb) of the film's input.
 // The as-shot illuminant (EditParams::filmSceneX/Y, from the RAW) is put back and the user's white balance edit re-declares which colour is
 // neutral: the light is the as-shot light seen through the gain that the edit applies (a WB edit changes the assumed scene illuminant).
-// *D = 1 and *x = *y = 0 when film_wb is 0 or the scene illuminant is unknown: the film's own balance, exactly today's behaviour.
+// *D = 1 and *x = *y = 0 when film_wb is -1 or the scene illuminant is unknown: the scene light fully neutralised (film_wb 0 keeps half of the difference, +1 all of it).
 void filmInputAdaptation(const EditParams& p, double* x, double* y, double* D);
 void applyFilmWb(film::FilmParams& fp, const EditParams& p);
 // CIE xy of the stock's reference illuminant (profile info.reference_illuminant); false when unknown.

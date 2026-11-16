@@ -1,115 +1,115 @@
 {
   "fujifilm_c200": {
     "x": 0.633,
-    "y": 0.732,
+    "y": 0.736,
     "type": "neg",
     "code": "N200A"
   },
   "kodak_gold_200": {
-    "x": 0.025,
-    "y": -0.009,
+    "x": 0.026,
+    "y": -0.005,
     "type": "neg",
     "code": "N200B"
   },
   "kodak_verita_200d": {
-    "x": -0.402,
-    "y": -0.917,
+    "x": -0.417,
+    "y": -0.935,
     "type": "neg",
     "code": "N200C"
   },
   "kodak_ektar_100": {
-    "x": 0.172,
-    "y": 0.066,
+    "x": 0.168,
+    "y": 0.072,
     "type": "neg",
     "code": "N100"
   },
   "kodak_portra_160": {
-    "x": -0.227,
+    "x": -0.235,
     "y": 0.021,
     "type": "neg",
     "code": "N160"
   },
   "fujifilm_pro_400h": {
-    "x": 0.063,
-    "y": 0.203,
+    "x": 0.062,
+    "y": 0.219,
     "type": "neg",
     "code": "N400A"
   },
   "fujifilm_xtra_400": {
     "x": 0.842,
-    "y": 0.939,
+    "y": 0.945,
     "type": "neg",
     "code": "N400B"
   },
   "kodak_portra_400": {
-    "x": 0.061,
-    "y": 0.027,
+    "x": 0.055,
+    "y": 0.021,
     "type": "neg",
     "code": "N400C"
   },
   "kodak_ultramax_400": {
-    "x": 0.04,
-    "y": -0.203,
+    "x": 0.05,
+    "y": -0.208,
     "type": "neg",
     "code": "N400D"
   },
   "kodak_portra_800": {
-    "x": -0.04,
-    "y": -0.311,
+    "x": -0.043,
+    "y": -0.355,
     "type": "neg",
     "code": "N800"
   },
   "kodak_portra_800_push1": {
-    "x": 0.615,
-    "y": 0.454,
+    "x": 0.61,
+    "y": 0.447,
     "type": "neg",
     "code": "N800+1"
   },
   "kodak_portra_800_push2": {
-    "x": 0.994,
+    "x": 0.995,
     "y": 0.845,
     "type": "neg",
     "code": "N800+2"
   },
   "kodak_vision3_50d": {
     "x": -0.207,
-    "y": -0.278,
+    "y": -0.294,
     "type": "cine",
     "code": "C50D"
   },
   "kodak_vision3_200t": {
-    "x": -0.372,
-    "y": -0.579,
+    "x": -0.37,
+    "y": -0.586,
     "type": "cine",
     "code": "C200T"
   },
   "kodak_vision3_250d": {
-    "x": -0.353,
-    "y": -0.589,
+    "x": -0.361,
+    "y": -0.609,
     "type": "cine",
     "code": "C250D"
   },
   "kodak_vision3_500t": {
-    "x": -0.53,
-    "y": -0.55,
+    "x": -0.551,
+    "y": -0.556,
     "type": "cine",
     "code": "C500T"
   },
   "fujifilm_provia_100f": {
-    "x": -0.885,
-    "y": 0.005,
+    "x": -0.897,
+    "y": 0.002,
     "type": "rev",
     "code": "R100A"
   },
   "fujifilm_velvia_100": {
-    "x": 0.429,
-    "y": 0.48,
+    "x": 0.432,
+    "y": 0.481,
     "type": "rev",
     "code": "R100B"
   },
   "kodak_ektachrome_100": {
-    "x": -0.757,
-    "y": -0.56,
+    "x": -0.755,
+    "y": -0.567,
     "type": "rev",
     "code": "R100C"
   },
@@ -120,24 +120,24 @@
     "code": "R64"
   },
   "modern_clean": {
-    "x": -0.281,
-    "y": 0.424,
+    "x": -0.269,
+    "y": 0.42,
     "type": "modern",
     "kind": "modern",
     "code": "M-CLEAR",
     "measured": true
   },
   "modern_vivid": {
-    "x": 0.541,
-    "y": 0.746,
+    "x": 0.557,
+    "y": 0.742,
     "type": "modern",
     "kind": "modern",
     "code": "M-VIVID",
     "measured": true
   },
   "modern_soft": {
-    "x": -0.747,
-    "y": 0.02,
+    "x": -0.751,
+    "y": 0.016,
     "type": "modern",
     "kind": "modern",
     "code": "M-SOFT",

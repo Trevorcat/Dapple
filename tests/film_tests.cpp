@@ -1474,7 +1474,7 @@ void testFilmMatch() {
     (void)en1; (void)en2; (void)er1; (void)er2; (void)ed1; (void)es;
     // EV_scene formula: 50 -> 0, clamps
     CHECK_NEAR(sceneKeyEv(50.f), 0.0, 0.02);
-    CHECK(sceneKeyEv(2.f) == kFilmSceneEvMin && sceneKeyEv(100.f) <= kFilmSceneEvMax);
+    CHECK(sceneKeyEv(2.f) >= kFilmSceneEvMin && sceneKeyEv(2.f) < -1.f && sceneKeyEv(100.f) <= kFilmSceneEvMax);  // 0.25 of the compensation no longer reaches the clamp at L* 2
     CHECK(sceneKeyEv(70.f) > sceneKeyEv(60.f));
     // the print constant puts the grey card (box speed + convention) at L* 50 relative to the paper white
     for (const char* id : {"kodak_portra_400", "kodak_vision3_250d"}) {
@@ -1671,9 +1671,9 @@ void testFilmMatch() {
           if (cct > 0) sceneXy(cct, e.filmSceneX, e.filmSceneY);
           return e;
         };
-        // film_wb = 0 is the digital white balance: bit-identical to a render that knows nothing of the scene light, for any WB setting
+        // film_wb = -1 is the digital white balance (the scene light fully neutralised): bit-identical to a render that knows nothing of the scene light, for any WB setting
         for (float temp : {0.f, 35.f, -50.f}) {
-          EditParams a = edit("kodak_portra_400", 3200, 0.f), b = edit("kodak_portra_400", 0, 0.f);
+          EditParams a = edit("kodak_portra_400", 3200, -1.f), b = edit("kodak_portra_400", 0, -1.f);
           a.temperature = b.temperature = temp;
           a.tint = b.tint = temp * 0.3f;
           CHECK(sameBits(renderF(a, cam, nullptr, src, false), renderF(b, cam, nullptr, src, false)));
@@ -1697,12 +1697,12 @@ void testFilmMatch() {
         CHECK(greyCast(edit("kodak_vision3_500t", 3200, 1.f), nullptr) < 10.0);
         // the cast grows with film_wb
         double prev = -1;
-        for (float w : {0.f, 0.25f, 0.5f, 0.75f, 1.f}) {
+        for (float w : {-1.f, -0.5f, 0.f, 0.5f, 1.f}) {  // -1 neutralised, 0 the half-way default, 1 the film's own response
           const double cc = greyCast(edit("kodak_portra_400", 3200, w), nullptr);
           CHECK(cc > prev);
           prev = cc;
         }
-        // the user's white balance edit re-declares the scene light: at film_wb 1 it changes the render, at 0 it is the plain digital white balance
+        // the user's white balance edit re-declares the scene light: at film_wb 1 it changes the render, at -1 it is the plain digital white balance
         {
           EditParams a = edit("kodak_portra_400", 3200, 1.f), b = a;
           b.temperature = 40.f;
@@ -1742,7 +1742,7 @@ void testFilmMatch() {
                     pad.effectiveLo[0], pad.effectiveLo[1], pad.effectiveLo[2], pad.effectiveLo[3], pad.effectiveHi[0], pad.effectiveHi[1], pad.effectiveHi[2], pad.effectiveHi[3]);
         CHECK(std::fabs(pad.sceneCct - 3200.f) < 150.f && pad.referenceCct > 2800.f);
         CHECK(pad.effectiveLo[2] && pad.effectiveHi[2]);  // film_black: the paper mapping is on
-        CHECK(!pad.effectiveLo[3]);                       // film_wb has no negative end
+        CHECK(pad.effectiveLo[3]);                        // film_wb: both ends move the light (-1 neutralised, +1 the film's own)
         const bool tungsten = std::string(id) == "kodak_vision3_500t", slide = std::string(id) == "kodak_kodachrome_64";
         CHECK(pad.effectiveHi[3]);  // 3200 K against the stock's reference light
         if (tungsten) {             // its own light: nothing to do

@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
       {"film_print", "film_print", -1, 1, ""},
       {"film_black", "film_black", -1, 1, ""},
       {"film_latitude", "film_latitude", -1, 1, ""},
-      {"film_wb", "film_wb", 0, 1, ""},
+      {"film_wb", "film_wb", -1, 1, ""},
       {"film_warmth", "film_warmth", -30, 30, ""},
       {"film_tint", "film_tint", -30, 30, ""},
       {"film_exp", "film_exp", -1, 1, ""},

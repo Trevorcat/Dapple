@@ -135,7 +135,7 @@ List<PadItem> padItems(PadCat cat, {bool printed = true, bool modern = false}) {
         _s('film_grain', '颗粒', _pct),
         _s('film_halation', '光晕', _pct),
         _s('film_black', '黑位', _sg100, step: 0.01),
-        _s('film_wb', '白平衡', (v) => '${(v * 100).round()}', step: 0.01),
+        _s('film_wb', '白平衡', _sg100, step: 0.01),
         _s('film_latitude', '宽容度', _lat, step: 0.01),
         if (printed) _s('film_warmth', '冲印冷暖', _sg),
         if (printed) _s('film_tint', '冲印色调', _sg),

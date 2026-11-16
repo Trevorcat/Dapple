@@ -223,7 +223,7 @@ class FrameTraceRun {
         final t = Stopwatch()..start();
         Map<String, dynamic> at(double u) => pad == 'exposure'
             ? {'film_shoot': -0.7 + 1.4 * u, 'film_print': -0.7 + 1.4 * u}
-            : {'film_wb': u, 'film_black': -0.7 + 1.4 * u};
+            : {'film_wb': -1 + 2 * u, 'film_black': -0.7 + 1.4 * u};
         final active = pad == 'exposure' ? 'film_shoot' : 'film_wb';
         var n = 0;
         while (t.elapsedMilliseconds < dragMs) {

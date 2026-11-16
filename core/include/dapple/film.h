@@ -166,7 +166,7 @@ struct CameraParams {
   // Film white balance (EditParams::filmWb, CLI --adapt / --scene-cct): the scene's illuminant as assumed by the current white balance (CIE xy,
   // 0 = unknown = full adaptation) and the degree of adaptation D (CAT16) of the film's input: 1 = the scene white reaches the film as its own
   // reference white (the model's behaviour, digital white balance), 0 = the scene illuminant reaches the film unadapted (a daylight stock
-  // under tungsten goes orange). D = 1 - filmWb.
+  // under tungsten goes orange). D = 0.5 - 0.5 * filmWb.
   double sceneWhiteX = 0.0, sceneWhiteY = 0.0, adaptationDegree = 1.0;
   std::array<double, 3> filterUv{0.0, 410.0, 8.0}, filterIr{0.0, 675.0, 15.0};  // (amplitude, nm, width nm)
   DiffusionFilterParams diffusionFilter;

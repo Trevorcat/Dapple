@@ -1,6 +1,7 @@
 # dapple golden corpus (docs/engine/pipeline-architecture.md 10.1). Recorded from the unchanged renderer; 15 analysis hashes re-baselined by step a4b (docs/engine, section 17.3).
 # platform arch=x86_64 avx2=1 film=1
 # 44 interactive frames re-recorded for the 53-node interactive lattice (docs/engine/pipeline-architecture.md 57; dE2000 against the old frames: mean 0.03-0.09, p99 0.4-1.5); every settled frame is unchanged
+# 9 film frames re-recorded 2026-11-16 for the film defaults (kFilmSceneKeyScale 0.25, film_wb 0 = half neutralised); the 154 other frames are unchanged
 direct_default/f0 ac22c1103a795183:a083a7cae2d7dd4e
 direct_base/f0 072c568e576f93e3:676d2bc7e42ea9a6
 baked_final_default/f0 cb3d466567561855:21fca42632c6f2dd
@@ -68,17 +69,17 @@ detail/all_exact 141ccdcbc22aff48
 lut/final c2276254de61d093:955841a9bd93c2b9
 lut/interactive 5afa1ddcf6109ea1:841387dbacb0528e
 lut/exact c35b1f0f5d476eeb
-film/full_final 77d37edf6cab01a6:6195c16057a91f3d
-film/full_interactive 26b66d5453f3b576:7e7cf664d982b295
-film/full_warm_interactive 7a635368a006b1eb:dfb36be457b328d3
-film/blend50_interactive 2a5f840f095d9806:29f6a2610c9595f0
-film/blend50_final a53a54ab6fbcefd0:66f896ac4169c1ce
-film/full_spatial_final b283f5362dbb0c91:04bed117b6878821
-film/full_geometry 80f6d36a86502626:f7cbd704d3ff1c55
-film/full_region 80542d3c139cbe1d:644fc276c1ec2d7a
+film/full_final 022631cc759d3f94:70c2067f7fddc5f3
+film/full_interactive 69dfd4da54dd40c7:6cbb60b643fb9c5b
+film/full_warm_interactive 7086e17db30dbf90:cf1c74ff00f30278
+film/blend50_interactive 68352c506a3a001b:7a5a5b188d9834e2
+film/blend50_final a5c17c019635f9a6:7e7ef40c29df9271
+film/full_spatial_final 29b021bcbfc5a514:ed19e38320c3a527
+film/full_geometry 66a7156b8893c742:f45b94c2b6285be2
+film/full_region e5c71ab692936857:3f01d045dea708f0
 film/strength0 ee8e57a50ce2d2ca:05563bfa9936664e
 film/off ee8e57a50ce2d2ca:a4a8bbefc228282b
-film/exact_blend 5aee881f068afcdc:3c65f073faf626ac
+film/exact_blend a79b961cc5857a3f:e455eae26fe6e5e8
 drag_exposure/d0 85ac30244b3ef7d2:3a43e7c7cc27752e
 drag_exposure/d1 b8253691d457e7f9:094db6c026723d8a
 drag_exposure/d2 8cff3b7f8314d000:a40aaf4e2a7fff00

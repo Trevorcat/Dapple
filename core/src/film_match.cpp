@@ -483,7 +483,8 @@ float sceneKeyEv(float keyL) {
 void filmInputAdaptation(const EditParams& p, double* x, double* y, double* D) {
   *x = *y = 0.0;
   *D = 1.0;
-  const double wb = std::clamp(double(p.filmWb), 0.0, 1.0);
+  // film_wb is two-sided: -1 fully neutralised, 0 half (default), +1 the film's own response to the scene light; kept share 0.5 + 0.5 * film_wb
+  const double wb = 0.5 + 0.5 * std::clamp(double(p.filmWb), -1.0, 1.0);
   if (!(wb > 0.0) || !(p.filmSceneX > 0.f) || !(p.filmSceneY > 0.f)) return;
   namespace fd = film::detail;
   EditParams c = p;
@@ -1052,8 +1053,7 @@ FilmPadInfo filmPadInfo(const MeterInputs& in) try {
     const bool haveRef = stock && filmReferenceXy(*stock, &rx, &ry);
     if (haveRef) pad.referenceCct = float(xyToCct(rx, ry));
     if (in.sceneX > 0 && in.sceneY > 0) pad.sceneCct = float(xyToCct(in.sceneX, in.sceneY));
-    pad.effectiveLo[3] = false;  // 0 is the lowest film_wb: no negative end
-    pad.effectiveHi[3] = haveRef && in.sceneX > 0 && std::hypot(in.sceneX - rx, in.sceneY - ry) > 0.004;
+    pad.effectiveHi[3] = pad.effectiveLo[3] = haveRef && in.sceneX > 0 && std::hypot(in.sceneX - rx, in.sceneY - ry) > 0.004;  // both ends move the light
   }
   return pad;
 } catch (...) {

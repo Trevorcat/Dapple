@@ -5,6 +5,7 @@ import 'package:dapple/model/catalog.dart' show lookById;
 import 'package:dapple/model/film_map.dart';
 import 'package:dapple/model/pad_model.dart';
 import 'package:dapple/model/params.dart';
+import 'package:dapple/screens/editor/editor_controller.dart' show typedToStored, storedToTyped;
 import 'package:flutter_test/flutter_test.dart';
 
 import '../support/film_fixture.dart';
@@ -63,6 +64,19 @@ void main() {
       monotone(PadCat.texture, 'sharpen', x: true);
       monotone(PadCat.texture, 'grain', x: false);
       monotone(PadCat.texture, 'nrColor', x: false, up: false); // 干净 is the bottom: more noise reduction there
+    });
+
+    test('film_wb is two-sided: both ends round-trip through the pad state and the typed text', () {
+      final it = padItems(PadCat.film).firstWhere((i) => i.id == 'film_wb');
+      expect([it.min, it.max], [-1, 1]);
+      for (final v in [-1.0, -0.5, 0.0, 0.5, 1.0]) {
+        final e = EditState.empty.copyWith(film: 'kodak_portra_400');
+        final w = applyPadState(e, PadCat.film, PadState(off: {'film_wb': v}), ctx);
+        expect(w.value('film_wb'), closeTo(v, 1e-9));
+        final back = padStateOf(w.copyWith(pads: {}), PadCat.film, ctx);
+        expect(back.off['film_wb'] ?? 0, closeTo(v, 1e-9));
+        expect(typedToStored(it, double.parse(storedToTyped(it, v))), closeTo(v, 1e-9));
+      }
     });
 
     test('the strength strip: 0 = no effect, the middle = the defaults, above = heavier', () {

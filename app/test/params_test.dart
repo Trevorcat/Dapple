@@ -55,4 +55,33 @@ void main() {
     expect(u.canUndo, isFalse);
     expect(u.redo(a), c);
   });
+
+  group('film_wb is two-sided (edit schema 2)', () {
+    test('range -1..1, default 0, and the stored edit carries its version', () {
+      final sp = specByKey['film_wb']!;
+      expect([sp.min, sp.max, sp.def], [-1, 1, 0]);
+      expect(EditState.empty.toJson()['v'], kEditSchema);
+    });
+
+    test('an edit saved before schema 2 migrates v -> 2v - 1 (renders as before)', () {
+      EditState load(Map<String, dynamic> values, [Map<String, dynamic>? pads]) => EditState.fromJson({
+            'film': 'kodak_portra_400',
+            'values': values,
+            'pads': ?pads,
+          });
+      expect(load({'film_wb': 0.0}).value('film_wb'), -1);
+      expect(load({'film_wb': 0.5}).value('film_wb'), 0);
+      expect(load({'film_wb': 1.0}).value('film_wb'), 1);
+      expect(load({'film_grain': 50.0}).value('film_wb'), 0, reason: 'no explicit value: the new default');
+      final p = load({'film_wb': 0.25}, {'film': {'x': 0, 'y': 0, 'a': 0.5, 'off': {'film_wb': 0.25}}});
+      expect(p.pads['film']!.off['film_wb'], -0.5);
+    });
+
+    test('a schema 2 edit round-trips unchanged', () {
+      final e = EditState.empty.copyWith(film: 'kodak_portra_400', values: {'film_wb': -0.4});
+      final r = EditState.fromJson(e.toJson());
+      expect(r.value('film_wb'), -0.4);
+      expect(EditState.fromJson(r.toJson()).value('film_wb'), -0.4);
+    });
+  });
 }
