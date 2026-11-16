@@ -1205,6 +1205,19 @@ void markMatchStale() { g_matchStale.store(true); }
 void notifyRepaintIfMatchStale() {
   if (g_matchStale.exchange(false)) notifyLanded();
 }
+void requestRepaintSoon() {
+  static std::atomic<bool> pending{false};
+  if (pending.exchange(true)) return;
+  try {
+    std::thread([] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(12));
+      pending.store(false);
+      notifyLanded();
+    }).detach();
+  } catch (...) {
+    pending.store(false);
+  }
+}
 }  // namespace dapple::engine::filmnode
 
 // ---- stock selection (wave 8): the film map selects stocks live while the finger slides ----------------------------------------------------------

@@ -1,5 +1,21 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (film drag flicker: match easing)
+
+Release APKs of the working tree before / after the fix (`install -r`), Note10+ RFCMA05Q5ZX, taps and swipes only (resumed-activity check before every input), scripts and logs in `build/perf-20261116i/` (`drag.sh`, `map.sh`, `an.py`, `abs.py`, `ft.py`). `debug.dapple.frame_profile` 2 for the traces (the view reads the picture back), 1 for the frame times; reset to empty. Public sample `T1116i_a.ARW` (A6700). Drags: 3 s `input swipe`, 5 per gesture. **Before** the stock was N400C (puck in the centre), **after** N200B (the app kept the earlier selection; same pad coordinates): the two sets are comparable in kind, not frame for frame.
+
+Per-drag count of frame-to-frame jumps of the mean luma above 0.01 (absolute; 0..1) and the largest jump, excluding the first two frames of a drag:
+| gesture | before (steps per drag; max jump; frames) | after |
+|---|---|---|
+| 成像 pad (exposure) | 14 18 18 19 20; 0.037; 712 | 4 4 1 3 2; 0.075 (cold first drag, first frames); 565 |
+| 颜色 pad with film | 3 1 1 1 1; 0.175 (first drag); 349 | 5 1 0 1 0; 0.085 (first drag); 347 |
+| film map (3 s swipe; stock changes included) | 6 6 3 3 3; 0.21; 44 | 8 22 3 3 3; 0.22; 135 |
+Per-frame jump p90 on the exposure pad 0.0111 before, 0.0044 after. Match landings: every 20-25 ms (exposure pad), 200 ms (colour pad); after the fix the used EV changes each frame (eased), so the "landing interval" is no longer visible in the trace. The film map jumps are real stock changes (2 EV) and not eased when the stock has a remembered match; the larger counts after come from more frames logged (more repaints), not larger steps. Not enough reps to call the map unchanged or better.
+
+Frame times, `frame_profile` 1, cpu_ms of interactive film frames (first / rest median, rest p90, max): exposure pad before 3.4 / 1.4, p90 9.3, max 47.6 (590 frames); after 4.1 / 1.7, p90 14.5, max 85.8 (586); colour pad before 34.5 / 20.4, p90 30.4, max 64.1; after 37.6 / 20.9, p90 29.3, max 66.9. The exposure pad rest p90 and max are higher after (extra repaint frames while the values converge); not investigated further.
+
+Cleanup: `rm /sdcard/Pictures/DappleT1116i/T1116i_*`, `rmdir /sdcard/Pictures/DappleT1116i`, `ls` of that directory reports it absent; property reset (reads back empty); screenshots deleted (they showed only Dapple's UI); app force-stopped. The app library keeps its entry for the photo.
+
 ## 2026-11-16 (5a57516) film exports on the GPU stream
 
 Release APK of HEAD 5a57516 (built 14:17, `install -r` 14:17), Note10+ RFCMA05Q5ZX, taps only (every input preceded by a resumed-activity check), scripts / logs / pulled exports in `build/perf-20261116h/`. State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 28.8 C at start, 31.6 C at the end, `Thermal Status 0`, no reboot. `debug.dapple.frame_profile` set to 1, reset to empty. Files: public samples as `T1116h_{6700.ARW,6700b.ARW,7rm4.ARW,xs10.RAF,xt50.RAF}`, scanned with `MEDIA_SCANNER_SCAN_FILE`. **Film: N400C at 100 % for every run** (picked from the 成像 panel). No crash, ANR, `exec=cpu`, `reason=`, `FilmTiledLocal`, `vkAllocateMemory` or GPU error line in any log. Every film export ran as `export_stream GPU ... ok`.

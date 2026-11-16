@@ -10,6 +10,9 @@ void removeTableLandedListener(TableLandedFn fn, void* user);
 bool filmTablesStale();
 // the film match of a frame was the previous result while a background refresh runs: markMatchStale before queueing, notifyRepaintIfMatchStale when it landed
 void markMatchStale();
+// Repaint the newest snapshot of the live views in about 12 ms (at most one request outstanding): the easing of the film match values keeps converging
+// after the finger stopped.
+void requestRepaintSoon();
 void notifyRepaintIfMatchStale();
 
 struct FilmResolved;

@@ -389,7 +389,12 @@ FilmPrintRange filmPrintRange(const std::shared_ptr<const film::FilmLibrary>& li
   return {};
 }
 
-float solvePrintEv(const std::function<float(float)>& printL, float target, const FilmPrintRange& range, FilmMatchInfo* info, float tolerance) {
+float& filmPrintStartHint() {
+  thread_local float v = std::nanf("");
+  return v;
+}
+
+float solvePrintEv(const std::function<float(float)>& printL, float target, const FilmPrintRange& range, FilmMatchInfo* info, float tolerance, float startEv) {
   FilmMatchInfo local;
   FilmMatchInfo& m = info ? *info : local;
   float t = target;
@@ -408,7 +413,7 @@ float solvePrintEv(const std::function<float(float)>& printL, float target, cons
     return printL(e) - t;
   };
   const float limLo = -kFilmMaxPrintEv, limHi = range.ok ? std::min(range.maxPrintEv, kFilmMaxPrintEv) : kFilmMaxPrintEv;
-  float xa = std::clamp(0.f, limLo, limHi), fa = f(xa), xb = xa, fb = fa;
+  float xa = std::clamp(startEv, limLo, limHi), fa = f(xa), xb = xa, fb = fa;
   float ev = xa, fbest = fa;
   if (std::fabs(fa) > tol) {
     const float dir = fa < 0.f ? 1.f : -1.f;  // brighter print = higher L*
@@ -923,7 +928,8 @@ FilmExposure solveMeter(const MeterInputs& in, FilmMatchInfo* info) try {
       const float tgt = lAuto + (lTo - lAuto) * std::fabs(s);
       auto pl = [&](float e) { return in.medianL(filmEv, e); };
       const float autoPrint = printEv;
-      printEv = solvePrintEv(pl, tgt, range, &mi);
+      const float hint = filmPrintStartHint();
+      printEv = solvePrintEv(pl, tgt, range, &mi, 0.35f, std::isfinite(hint) ? hint : 0.f);
       printEv = s > 0.f ? std::max(printEv, autoPrint) : std::min(printEv, autoPrint);  // the end of the pad never moves the other way
     }
   }

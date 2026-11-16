@@ -107,7 +107,14 @@ struct DappleView {
         ExternalTarget et;
         DappleExternalImage ei{};
         bool ext = false;
-        if (histW > 0 && histH > 0) {
+        bool hostForced = false;  // debug.dapple.frame_profile=2: the picture comes back to the host so the engine can log its luminance
+#if defined(__ANDROID__)
+        {
+          char pv[PROP_VALUE_MAX] = {0};
+          hostForced = __system_property_get("debug.dapple.frame_profile", pv) > 0 && pv[0] == '2';
+        }
+#endif
+        if (histW > 0 && histH > 0 && !hostForced) {
           const double k = (s.longEdge > 0 && histReqLong > 0) ? double(s.longEdge) / double(histReqLong) : 1.0;
           const int cw = int(histW * k * 1.03) + 8, ch = int(histH * k * 1.03) + 8;  // headroom: crops / straighten change the size a little
           std::string berr;
@@ -195,7 +202,7 @@ struct DappleView {
     bool perFrame = false;
     {
       char pv[PROP_VALUE_MAX] = {0};
-      perFrame = __system_property_get("debug.dapple.frame_profile", pv) > 0 && pv[0] == '1';
+      perFrame = __system_property_get("debug.dapple.frame_profile", pv) > 0 && (pv[0] == '1' || pv[0] == '2');
     }
     if (status == DAPPLE_VIEW_SHOWN && ((shown.load() % 30) == 0 || perFrame || renderMs + presentMs > 33.0))
       __android_log_print(ANDROID_LOG_INFO, "dapple_view",

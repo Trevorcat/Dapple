@@ -273,7 +273,10 @@ FilmPrintRange filmPrintRange(const std::shared_ptr<const film::FilmLibrary>& li
 
 // Stage B: the print EV (|ev| <= kFilmMaxPrintEv) at which printL(ev), the median L* of the print, equals `target` clamped into
 // `range`. Fills printEv / keyL / printL / paper range / printBound / printEvals of `info`.
-float solvePrintEv(const std::function<float(float)>& printL, float target, const FilmPrintRange& range, FilmMatchInfo* info = nullptr, float tolerance = 0.35f);
+float solvePrintEv(const std::function<float(float)>& printL, float target, const FilmPrintRange& range, FilmMatchInfo* info = nullptr, float tolerance = 0.35f, float startEv = 0.f);
+// Warm start of the print-pad solve (film_print != 0) for the background refresh of an interactive film drag: the thread-local start of the bracket, NaN = the
+// cold start at 0 that every settled frame and every export uses. Only the worker of the interactive match sets it (core/src/capi/film.cpp).
+float& filmPrintStartHint();
 
 // The paper-to-screen mapping of stage C (scanner white / black correction of the film model: the print's white and black
 // reference map to display white / black, the print exposure keeps mid-grey where it was) is on in the develop pipeline when

@@ -3,7 +3,7 @@
 namespace {
 
 // Computes (and stores in the session's key list) the film match of `params`. The caller holds s->matchMtx (filmCache and the proxy belong to it).
-FilmExposure computeFilmMatch(DappleSession* s, const EditParams& params, const std::string& lutFile, const std::string& key, bool interactive, bool uncached) {
+FilmExposure computeFilmMatch(DappleSession* s, const EditParams& params, const std::string& lutFile, const std::string& key, bool interactive, bool uncached, float warmPrintEv = std::nanf("")) {
   if (!s->keyProxy) {
     auto kp = std::make_shared<SourceImage>();
     kp->sceneReferred = s->source.sceneReferred;
@@ -14,9 +14,14 @@ FilmExposure computeFilmMatch(DappleSession* s, const EditParams& params, const 
   if (!lutFile.empty()) lut = loadLut(lutFile);
   s->filmCache.proxyOwner = s->keyProxy;
   s->filmCache.lutOwner = lut;
+  struct HintScope {  // warm start of the print-pad solve: the previous landed print EV of this stock (interactive background solves only)
+    explicit HintScope(float v) { dapple::filmPrintStartHint() = v; }
+    ~HintScope() { dapple::filmPrintStartHint() = std::nanf(""); }
+  } hintScope(warmPrintEv);
   const FilmExposure ev = uncached ? matchFilmExposure(params, *s->camera, lut.get(), *s->keyProxy)
                                    : matchFilmExposureCached(params, *s->camera, lut.get(), lutFile, *s->keyProxy, s->filmCache, !interactive);
-  const bool exact = uncached || !s->filmCache.lastApprox;
+  const bool warmed = std::isfinite(warmPrintEv) && params.filmPrint != 0.f;  // a warm-started print solve is within its tolerance of the cold one, not equal: settled frames solve cold
+  const bool exact = uncached || (!s->filmCache.lastApprox && !warmed);
   std::lock_guard<std::mutex> lock(s->keyMtx);
   for (auto it = s->filmKeys.begin(); it != s->filmKeys.end(); ++it)
     if (it->key == key) {
@@ -26,6 +31,7 @@ FilmExposure computeFilmMatch(DappleSession* s, const EditParams& params, const 
   if (s->filmKeys.size() >= 12) s->filmKeys.erase(s->filmKeys.begin());
   s->filmKeys.push_back({key, ev, exact});
   s->lastMatchStock = params.filmStock;
+  s->stockLast[params.filmStock] = ev;
   return ev;
 }
 
@@ -69,7 +75,13 @@ void queueFilmMatch(DappleSession* s, const EditParams& params, const std::strin
           std::lock_guard<std::mutex> kl(s->keyMtx);
           for (auto& e : s->filmKeys) hit |= e.key == k;
         }
-        if (!hit) computeFilmMatch(s, p, lf, k, true, false);
+        float warm = std::nanf("");
+        {
+          std::lock_guard<std::mutex> kl(s->keyMtx);
+          auto it = s->stockLast.find(p.filmStock);
+          if (it != s->stockLast.end()) warm = it->second.printEv;
+        }
+        if (!hit) computeFilmMatch(s, p, lf, k, true, false, warm);
       } catch (...) {
       }
       bool more;
@@ -94,6 +106,18 @@ void queueFilmMatch(DappleSession* s, const EditParams& params, const std::strin
 
 namespace capi {
 
+namespace {
+double (*g_filmClock)() = nullptr;
+constexpr double kFilmEaseSeconds = 0.08;  // time constant of the interactive match easing
+constexpr float kFilmEaseSnap = 0.004f;    // closer than this (EV) to the target the used value is the target
+double filmNowSeconds() {
+  if (g_filmClock) return g_filmClock();
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+
+void setFilmClockForTest(double (*fn)()) { g_filmClock = fn; }
+
 EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath, bool interactive) {
   params.filmKeyEv = 0.f;
   params.filmPrintEv = 0.f;
@@ -110,35 +134,68 @@ EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath,
     const char* e = std::getenv("DAPPLE_FILM_MATCH_ASYNC");
     return !(e && e[0] == '0') && !dapple::deterministicMode();
   }();
+  bool repaintSoon = false;
   {
     std::lock_guard<std::mutex> lock(s->keyMtx);
+    // Interactive frames (async match on): the match values a frame uses ease toward their target instead of stepping when a background solve lands
+    // (section 57). `target` = the exact cached value (hits too) or the newest landed match of this stock; `direct` = take it as it is.
+    static const bool easeOff = [] {  // DAPPLE_FILM_EASE=0: the match values step as before (A/B switch, the test)
+      const char* e = std::getenv("DAPPLE_FILM_EASE");
+      return e && e[0] == '0';
+    }();
+    auto easeTo = [&](const FilmExposure& target, bool direct, int kind) {
+      const double now = filmNowSeconds();
+      auto& u = s->filmUsed;
+      const bool sameStock = u.valid && u.stock == params.filmStock;
+      const double dt = now - u.t;
+      float ev = target.filmEv, pev = target.printEv;
+      if (u.valid && !direct && !easeOff && dt <= 0.5 && (sameStock || !s->stockLast.count(params.filmStock))) {
+        const float a = float(1.0 - std::exp(-std::max(dt, 0.0) / kFilmEaseSeconds));
+        ev = u.ev + (target.filmEv - u.ev) * a;
+        pev = u.pev + (target.printEv - u.pev) * a;
+        if (std::fabs(ev - target.filmEv) < kFilmEaseSnap && std::fabs(pev - target.printEv) < kFilmEaseSnap) ev = target.filmEv, pev = target.printEv;
+      }
+      u = {true, params.filmStock, ev, pev, now};
+      repaintSoon = ev != target.filmEv || pev != target.printEv;
+      params.filmKeyEv = ev;
+      params.filmPrintEv = pev;
+      dapple::ftrace::with([&](dapple::ftrace::Rec& x) {
+        x.matchKind = kind;
+        x.filmEv = ev;
+        std::snprintf(x.stock, sizeof x.stock, "%s", params.filmStock.c_str());
+      });
+    };
+    const bool easing = asyncOn && interactive && !uncached;
     // A result that interpolated remembered medians (a print solve while a slider moves) serves interactive frames only; the frame after the
     // drag solves for real (docs/engine/pipeline-architecture.md section 26).
     for (auto& e : s->filmKeys)
       if (e.key == key && (e.exact || interactive)) {
-        params.filmKeyEv = e.ev.filmEv;
-        params.filmPrintEv = e.ev.printEv;
-        dapple::ftrace::with([&](dapple::ftrace::Rec& x) {
-          x.matchKind = e.exact ? dapple::ftrace::kMatchHit : dapple::ftrace::kMatchInterp;
-          x.filmEv = e.ev.filmEv;
-          std::snprintf(x.stock, sizeof x.stock, "%s", params.filmStock.c_str());
-        });
+        const int kind = e.exact ? dapple::ftrace::kMatchHit : dapple::ftrace::kMatchInterp;
+        if (easing) {
+          easeTo(e.ev, false, kind);
+        } else {
+          params.filmKeyEv = e.ev.filmEv;
+          params.filmPrintEv = e.ev.printEv;
+          dapple::ftrace::with([&](dapple::ftrace::Rec& x) {
+            x.matchKind = kind;
+            x.filmEv = e.ev.filmEv;
+            std::snprintf(x.stock, sizeof x.stock, "%s", params.filmStock.c_str());
+          });
+        }
+        if (repaintSoon) dapple::engine::filmnode::requestRepaintSoon();
         return params;
       }
-    if (asyncOn && interactive && !uncached && !s->filmKeys.empty()) {  // any stock: while another stock is selected the frame shows the previous stock too
-      // previous result of the same stock now, the new one on the background pool
-      const FilmExposure& prev = s->filmKeys.back().ev;
-      params.filmKeyEv = prev.filmEv;
-      // a stock that has no match of its own yet (the film map slides across stocks): the print exposure is the stock's neutral 0, the value of its prebaked
-      // coarse table (a hit costs nothing, a bake ~25 ms on the A11) and not the previous stock's solved print EV; the repaint hook refines after the match lands
-      params.filmPrintEv = s->lastMatchStock != params.filmStock ? 0.f : prev.printEv;
-      dapple::ftrace::with([&](dapple::ftrace::Rec& x) {
-        x.matchKind = dapple::ftrace::kMatchStalePrev;
-        x.filmEv = prev.filmEv;
-        std::snprintf(x.stock, sizeof x.stock, "%s", params.filmStock.c_str());
-      });
+    if (easing && !s->filmKeys.empty()) {  // any stock: while another stock is selected the frame shows the previous stock too
+      // The newest landed match of this stock now (a stock the map visited before shows its own match at once), the new one on the background pool.
+      // A stock without a match: the previous stock's film EV and the neutral print EV 0 (the value of its prebaked coarse table), eased from what the
+      // last frame showed; the repaint hook refines after the match lands.
+      auto it = s->stockLast.find(params.filmStock);
+      const bool known = it != s->stockLast.end();
+      FilmExposure target = known ? it->second : FilmExposure{s->filmKeys.back().ev.filmEv, 0.f};
+      easeTo(target, known && !(s->filmUsed.valid && s->filmUsed.stock == params.filmStock), dapple::ftrace::kMatchStalePrev);
       dapple::engine::filmnode::markMatchStale();
       queueFilmMatch(s, params, lutFile, key);
+      if (repaintSoon) dapple::engine::filmnode::requestRepaintSoon();
       return params;
     }
   }
@@ -157,6 +214,10 @@ EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath,
   });
   params.filmKeyEv = ev.filmEv;
   params.filmPrintEv = ev.printEv;
+  if (asyncOn && interactive && !uncached) {  // the first frame of a drag solved for itself: the next ones ease from what it showed
+    std::lock_guard<std::mutex> lock(s->keyMtx);
+    s->filmUsed = {true, params.filmStock, ev.filmEv, ev.printEv, filmNowSeconds()};
+  }
   return params;
 }
 

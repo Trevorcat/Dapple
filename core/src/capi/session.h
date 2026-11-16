@@ -94,6 +94,15 @@ struct DappleSession {
   };
   std::vector<FilmKeyEntry> filmKeys;
   std::string lastMatchStock;  // stock of the newest filmKeys entry (keyMtx)
+  // The match values an interactive film frame actually used (keyMtx): they ease toward the latest landed match instead of stepping when a background solve lands
+  // (docs/engine/pipeline-architecture.md section 57). stockLast = the newest landed match of each stock (the film map's remembered match).
+  struct FilmUsed {
+    bool valid = false;
+    std::string stock;
+    float ev = 0.f, pev = 0.f;
+    double t = 0.0;
+  } filmUsed;
+  std::map<std::string, dapple::FilmExposure> stockLast;
   // background refresh of the match while a slider moves (queueFilmMatch)
   std::mutex matchMtx;  // filmCache + keyProxy: the frame thread (exact solves) and the refresh worker
   std::mutex asyncMtx;
@@ -196,6 +205,8 @@ void guardedVoid(Fn&& fn) {
 // `params` with EditParams::filmKeyEv set: the EV that puts the film render's median lightness where the normal develop
 // render of the same edit has it (film_match.h). A few film evaluations of the 256 px proxy, cached by key.
 EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath = nullptr, bool interactive = false);
+// Clock of the match easing in seconds (tests inject one; null = steady_clock). Not part of the C API.
+void setFilmClockForTest(double (*fn)());
 
 // ---- whole-frame rendering (render.cpp) ----
 // The exact (reference / export) variant through the Planner and the CpuExecutor. Frames of more than 16 MP are split into tiles.

@@ -23,6 +23,7 @@
 #include "engine/exec/cpu_executor.h"
 #include "engine/exec/engine_session_internal.h"
 #include "local_eval.h"
+#include "engine/nodes/film/frame_trace.h"
 #include "engine/exec/sched_diag.h"
 #include "parallel.h"
 #include "warp_field.h"
@@ -185,6 +186,7 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
   const std::string reason = onGpu ? std::string() : (out.why.empty() ? std::string("none given") : out.why);
   ExecLog& L = execLog();
   bool doLog = false;
+  bool lumaProp = false;
   double maxMs = 0;
   std::uint64_t g = 0, cp = 0;
   {
@@ -204,7 +206,8 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
 #if defined(__ANDROID__)
     {
       char pv[PROP_VALUE_MAX] = {0};
-      everyProp = __system_property_get("debug.dapple.frame_profile", pv) > 0 && pv[0] == '1';
+      everyProp = __system_property_get("debug.dapple.frame_profile", pv) > 0 && (pv[0] == '1' || pv[0] == '2');
+      lumaProp = everyProp && pv[0] == '2';  // '2': also the film values and the luminance of the frame (the view then reads the picture back)
     }
 #endif
     // a frame whose CPU side alone took over 25 ms is always logged (wave 8: any frame over 33 ms in a drag must be attributable from logcat)
@@ -221,6 +224,45 @@ void noteFrame(const FrameJob& job, const FrameResult& out) {
     cp = L.cpu;
   }
   if (sched::diagSched()) schedReport();
+  if (lumaProp) {  // debug.dapple.frame_profile=2: what the frame showed (film exposure values, table generation, luminance of the picture)
+    dapple::ftrace::S().on.store(true);
+    dapple::ftrace::Rec r;
+    {
+      std::lock_guard<std::mutex> lk(dapple::ftrace::S().m);
+      r = dapple::ftrace::S().cur;
+    }
+    double mean = -1, med = -1;
+    if (out.rgba && out.w > 0 && out.h > 0) {
+      std::uint32_t hist[256] = {0};
+      const std::size_t n = std::size_t(out.w) * std::size_t(out.h);
+      const std::size_t step = std::max<std::size_t>(1, n / 60000);
+      double sum = 0;
+      std::size_t cnt = 0;
+      for (std::size_t i = 0; i < n; i += step) {
+        const std::uint8_t* p = out.rgba + i * 4;
+        const int y = int((p[0] * 2126 + p[1] * 7152 + p[2] * 722) / 10000);
+        ++hist[y];
+        sum += y;
+        ++cnt;
+      }
+      std::size_t acc = 0;
+      int m = 0;
+      for (; m < 255; ++m) {
+        acc += hist[m];
+        if (acc * 2 >= cnt) break;
+      }
+      mean = sum / double(cnt) / 255.0;
+      med = double(m) / 255.0;
+    }
+    char b[320];
+    std::snprintf(b, sizeof b, "film_trace stock=%s mk=%d ev=%.4f pev=%.4f pk=%d gen=%llu wgen=%llu luma_mean=%.5f luma_med=%.5f p50=%.4f", r.stock, r.matchKind, double(job.params.filmKeyEv),
+                  double(job.params.filmPrintEv), r.printKind, (unsigned long long)r.printGen, (unsigned long long)r.wantedGen, mean, med, double(out.analysis.p50));
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "dapple_engine", "%s", b);
+#else
+    std::fprintf(stderr, "dapple_engine: %s\n", b);
+#endif
+  }
   if (!doLog || !engineLogOn()) return;
   const SpatialQuality q = job.fastOptions.spatial;
   const char* tier = q == SpatialQuality::Interactive ? "interactive" : q == SpatialQuality::Full ? "full" : "off";

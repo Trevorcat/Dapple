@@ -1308,6 +1308,83 @@ void testTouchHeat() {
   CHECK(heated == 0);
 }
 
+// Interactive film frames change their match values smoothly (docs/engine/pipeline-architecture.md section 57): a steady film_shoot drag with the async
+// match on and an injected clock; no step of the used film / print EV exceeds the easing's share of the distance to the landed target, and the settled
+// frame after the drag renders what a fresh session renders for the same parameters.
+double g_easeClock = 0.0;
+double easeClock() { return g_easeClock; }
+std::uint64_t hashImage(const DappleImage& im) {
+  std::uint64_t h = 1469598103934665603ull;
+  for (std::size_t i = 0; i < std::size_t(im.width) * im.height * 4; ++i) h = (h ^ im.rgba[i]) * 1099511628211ull;
+  return h;
+}
+void testFilmEase() {
+  if (!g_lib) {
+    std::printf("  no film pack\n");
+    return;
+  }
+  capi::setFilmClockForTest(&easeClock);
+  auto render = [&](DappleSession* s, float shoot, int flags, DappleImage* im) {
+    char json[160];
+    std::snprintf(json, sizeof json, "{\"film\": \"kodak_portra_400\", \"film_strength\": 100, \"film_shoot\": %.4f}", double(shoot));
+    DappleFrameRequest rq{};
+    rq.size = sizeof rq;
+    rq.long_edge = 320;
+    rq.flags = flags;
+    return dapple_session_render_frame(s, json, nullptr, &rq, im, nullptr);
+  };
+  auto* s = new DappleSession;
+  s->source = makeScene(1600, 1067, true, 3);
+  s->camera = &camA();
+  const double dt = 0.033, a = 1.0 - std::exp(-dt / 0.08);
+  std::vector<float> used;
+  float jump = 0.f, worst = 0.f;
+  int landings = 0;
+  float lastTarget = 1e9f;
+  float prevEv = 0.f, prevPev = 0.f;
+  for (int i = 0; i < 90; ++i) {
+    g_easeClock += dt;
+    DappleImage im{};
+    CHECK(render(s, -0.6f + 0.012f * float(i), DAPPLE_FRAME_INTERACTIVE, &im) == DAPPLE_OK);
+    dapple_free_image(&im);
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));  // the background solves land in between
+    float ev, pev, tev, tpev;
+    {
+      std::lock_guard<std::mutex> lk(s->keyMtx);
+      ev = s->filmUsed.ev, pev = s->filmUsed.pev;
+      const auto it = s->stockLast.find("kodak_portra_400");
+      tev = it != s->stockLast.end() ? it->second.filmEv : ev;
+      tpev = it != s->stockLast.end() ? it->second.printEv : pev;
+    }
+    if (i > 0) {
+      const float step = std::fabs(ev - prevEv) + std::fabs(pev - prevPev);
+      const float dist = std::fabs(tev - prevEv) + std::fabs(tpev - prevPev);  // distance of the newest landed target from what the last frame showed
+      if (std::getenv("DAPPLE_EASE_DUMP")) std::printf("  %d used %.4f %.4f target %.4f %.4f\n", i, double(ev), double(pev), double(tev), double(tpev));
+      worst = std::max(worst, step);
+      jump = std::max(jump, dist);
+      CHECK(step <= float(a) * dist + 0.004f * 2.f + 1e-4f);
+    }
+    if (tev != lastTarget) ++landings, lastTarget = tev;
+    prevEv = ev, prevPev = pev;
+  }
+  std::printf("  landings %d, largest step %.4f EV, largest distance to target %.4f EV, ease share per frame %.3f\n", landings, double(worst), double(jump), a);
+  CHECK(landings >= 2 && jump > 0.02f);  // the drag must actually move the target, or the check above proves nothing
+  CHECK(worst <= float(a) * jump + 0.01f);
+  // settled frame: exact match, same pixels as a session that never saw an interactive frame
+  DappleImage ia{}, ib{};
+  CHECK(render(s, 0.5f, 0, &ia) == DAPPLE_OK);
+  auto* f = new DappleSession;
+  f->source = makeScene(1600, 1067, true, 3);
+  f->camera = &camA();
+  CHECK(render(f, 0.5f, 0, &ib) == DAPPLE_OK);
+  CHECK(ia.rgba && ib.rgba && hashImage(ia) == hashImage(ib));
+  dapple_free_image(&ia);
+  dapple_free_image(&ib);
+  delete s;
+  delete f;
+  capi::setFilmClockForTest(nullptr);
+}
+
 int main(int argc, char** argv) {
   struct T {
     const char* id;
@@ -1315,10 +1392,17 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"hash", testHash},           {"registry", testRegistry},     {"validate", testValidate},
                      {"snapshots", testSnapshots}, {"keys", testKeys},             {"conformance", testConformance}, {"conformance_small", testConformanceSmall},
-                     {"cache", testCache},         {"reuse", testReuse}, {"reuse_small", testReuseSmall}, {"tables", testTables},           {"overhead", testOverhead}, {"long_session", testLongSession}, {"touch_heat", testTouchHeat}};
+                     {"cache", testCache},         {"reuse", testReuse}, {"reuse_small", testReuseSmall}, {"tables", testTables},           {"overhead", testOverhead}, {"long_session", testLongSession}, {"touch_heat", testTouchHeat}, {"film_ease", testFilmEase}};
   if (argc >= 2 && std::string(argv[1]) == "--list") {
     for (const T& t : tests) std::printf("%s\n", t.id);
     return 0;
+  }
+  if (argc >= 2 && std::string(argv[1]) == "film_ease") {  // the one test that needs the timing dependent paths (async match) on
+#ifdef _WIN32
+    _putenv_s("DAPPLE_DETERMINISTIC", "0");
+#else
+    setenv("DAPPLE_DETERMINISTIC", "0", 1);
+#endif
   }
   loadFilm();
   bool ran = false;
