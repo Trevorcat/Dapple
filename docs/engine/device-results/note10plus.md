@@ -1,5 +1,40 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (f78c661) 61 MP export, lattice 53
+
+Release APK of HEAD f78c661 (built 11:48, `install -r` 11:49), Note10+ RFCMA05Q5ZX, taps only (every input preceded by a resumed-activity check), scripts / logs in `build/perf-20261116g/`. State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 26.3 C at start, 29.5 C at the end, `Thermal Status 0`, no reboot. `debug.dapple.frame_profile` set to 1, reset to empty. Files: public samples as `T1116g_{6700.ARW,7rm4.ARW,xs10.RAF,xt50.RAF}`, scanned with `MEDIA_SCANNER_SCAN_FILE`. No crash, ANR, `exec=cpu`, `reason=` or GPU error line in any log (12 + 2 exports, 60 + 20 drags, 12 opens).
+
+### No-film full-size export (exposure swipe before the export as before; tap to the export log line; 3 reps; RSS sampled every 0.25 s)
+| | before (63244fc / earlier) | after (f78c661) |
+|---|---|---|
+| A7RM4 61 MP (stream, CPU demosaic) | 6.04 - 6.12 s (analyse 0.83, render 0.82, encode 0.66) | **4.34 / 4.42 / 4.46 s to log, `export_stream` 4112 / 4068 / 4133 ms**; analyses 803-829 ms (demosaic 329-350), render pass 3856-3928 (source windows 524-551, upload 294-310, record 647-688, wait for previous tile 1029-1071, sink 417-426), encoder finish 175-188, file write 15-20, other 9-10; RSS max 808-812 MB, HWM 916-931 MB |
+| A6700 26 MP | 2.08 s | 1.89 / 1.95 / 2.00 s (demosaic 210-224, render 783-800, encode+write 526-620); RSS 877-934 MB |
+| X-S10 26 MP | 3.5-3.65 s | 3.48 / 3.49 / 3.61 s (demosaic 1960-2093 CPU, render 760-771, encode 341-372); RSS 867-881 MB |
+| X-T50 40 MP | 5.8-6.1 s | 5.51 / 5.39 / 5.20 s (demosaic 2961-3201 CPU, render 1083-1141, encode 751-820); RSS 1111-1119 MB |
+The stage timers add up to the total (render + encoder finish + file write + other = `export_stream` ms). Path: A7RM4 `stream`, whole-frame peak 1542 MB against budget 1536 MB; the other three whole-frame, X-Trans on the CPU node.
+Correctness: A7RM4 9568x6376 and A6700 6240x4168 pulled and viewed (whole picture, 600 px centre crop of the A7RM4): orientation 1, colours plausible, no seam, band or missing row seen; no constant row or column, largest row-mean / column-mean step 0.9 / 0.7 levels (A7RM4), 1.5 / 1.5 (A6700, scene edges). md5: two further A7RM4 exports with no edit between them are identical (`0c4df305c0d2dc259ad26a58eb6d1ba6` both); the third swipe export has the same md5, the first two swipe exports differ (`91d6763a...`, `e9e38450...`: different swipe values). The two no-edit exports wrote no export log line (log window), the files exist.
+
+### Colour pad and tone / exposure drags (A6700, 2.3 s pause, 700 ms swipe; ms, first / rest median; exec=vulkan)
+| drag | before | after |
+|---|---|---|
+| colour pad, no film, 20 | 45.7 / 33.1, tables 41.8 / 28.9 (rung 1080) | **43.8 [28.6-129.6] / 30.0**, tables 38.5 / 25.9, upload 1.4 / 1.3, exec 0.4 / 0.5; rung 810; 1 first frame over 100 ms |
+| colour pad, film, 20 | | 28.9 [20.7-107.0] / 20.3, tables 25.5 / 16.8, upload 0.3 / 0.0; rungs 810 and 1080 (a film picked from the panel, `film=on`) |
+| exposure, no film, 10 | 15.4 / 8.9 | 14.5 / 8.9, tables 13.3 / 6.3 |
+| tone, no film, 10 | 14.0 / 9.4 | 13.7 / 9.6, tables 10.7 / 6.7 |
+The colour rung was 810 here, 1080 before, so that row is not like for like.
+
+### Colour during a drag against after release (held touch via `input motionevent`, same pad position, screenshots of the photo area)
+Last frame before the mid-drag screenshot was interactive (810x541), the settled frame (1080x721, full) came 2 s after release. Mean / p99 absolute difference per channel (R, G, B, 0-255): full resolution 8.5 / 9.4 / 7.5 and 52 / 58 / 57 (detail and edges: the rungs differ in size); low-passed to 1/8: mean 2.0 / 1.9 / 1.8, p99 10 / 9 / 11; mean colour of the area 112.7 / 116.1 / 91.8 during against 111.0 / 114.7 / 90.5 after. The picture does not jump in colour, a shift of about 1.5 levels in the mean. One run, screenshot timing about 1 s after the last move (the held touch makes it reliable; a swipe cannot be timed).
+
+### Open to first frame (tap to first frame line; 3 reps)
+A6700 700 / 744 / 803 ms (before 739), X-S10 1130 / 1110 / 1077 (1124), A7RM4 1050 / 1028 / 1043 (1016), X-T50 947 / 936 / 940 (no earlier number). No regression.
+
+### Not measured
+GLES, the first X-Trans export of a fresh install, thermal / frequency during exports, film drags at the 1080 rung only.
+
+### Cleanup
+`adb -s RFCMA05Q5ZX shell rm /sdcard/Pictures/DappleT1116g/T1116g_*`, `rmdir /sdcard/Pictures/DappleT1116g`, `rm /sdcard/Pictures/Dapple/T1116g_*`; the two permitted `ls` forms report both absent. Prop reset. Screenshots (Dapple UI only) deleted. The app library keeps its entries for the test photos (no delete action; no `pm clear`).
+
 ## 2026-11-16 (57) Smaller colour lattice for interactive frames that rebuild it (pipeline-architecture.md section 57)
 
 Native `dapple_drag_bench a6700.ARW dapple.dfp 810 60 'pads colour'` (DAPPLE_GPU=1, interaction flag set as the app does, bake 57 requested, analysis on, tone strength 60), arm64 release build of the working tree, RFCMA05Q5ZX in `/data/local/tmp/lattice53` (removed afterwards), 3 runs alternating before / after with a 20 s pause. Before = `DAPPLE_INTERACTIVE_LATTICE=0` (57^3 as the app asks), after = the engine default 53^3, same binary. Tables ms and frame ms (wall of `render_frame`), median / p90 of the 59 frames after the first, per run:
