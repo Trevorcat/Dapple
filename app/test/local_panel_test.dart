@@ -52,7 +52,7 @@ Finder key(String k) => find.byKey(ValueKey(k));
 
 Future<void> tapKey(WidgetTester t, String k) async {
   // a short side pane scrolls the shape card and the portrait chips rather than shrinking their 56 dp tiles (U7)
-  if (k.startsWith('kind-') || k.startsWith('face-') || k.startsWith('chip-')) await t.ensureVisible(key(k));
+  if (k.startsWith('kind-') || k.startsWith('face-') || k.startsWith('chip-') || k.startsWith('local-') || k.startsWith('act-') || k == 'items-button' || k == 'header-back') await t.ensureVisible(key(k));
   await t.tap(key(k));
   await settle(t, 4);
 }
@@ -455,12 +455,15 @@ void main() {
       ('phone', phonePhys, phoneDpr, false),
       ('owner fold outer', ownerPhys, ownerDpr, false),
       ('fold inner (side pane)', n5Phys, n5Dpr, false),
-      ('landscape phone (side pane)', const Size(2400, 1080), 2.75, true),
+      ('landscape phone (column)', const Size(2400, 1080), 2.75, true),
       ('tablet', const Size(2560, 1600), 2, true),
     ];
     for (final (name, phys, dpr, _) in windows) {
+      // the landscape phone is a wide, low window: the column layout (the owner's decision of 2026-11-16), not the side pane
+      final column = name.startsWith('landscape phone');
       for (final dark in [false, true]) {
         testWidgets('$name ${dark ? 'dark' : 'light'}: card, pads, actions, items, brush tools without overflow', (t) async {
+          if (column) debugFoldLayouts = true;
           final r = await openLocal(t, phys: phys, dpr: dpr, dark: dark);
           expect(t.takeException(), isNull, reason: 'shape card');
           await addViaCard(t, 'radial');

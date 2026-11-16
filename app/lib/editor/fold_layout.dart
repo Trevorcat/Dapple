@@ -60,6 +60,13 @@ bool isNearSquareLarge(Size s) {
   return r >= 0.66 && r <= 1.52;
 }
 
+/// A wide, low window (a slab phone held in landscape): at least 1.6 times as wide as high, short side under 600 dp, at least 560 dp wide. A workbench under the
+/// photo is impossible at this height; the controls stand in a column at the holding hand's short edge (owner's decision, 2026-11-16).
+bool isWideLow(Size s) => s.width >= s.height * kWideLowRatio && s.shortestSide < 600 && s.width >= kWideLowMinW && !isCoverSize(s);
+
+const double kWideLowMinW = 560;
+const double kWideLowRatio = 1.6; // a small, nearly square window (600 x 560) is not a landscape phone
+
 /// The mode for a window of [size], its [crease] and a photo of [aspect] (width / height after crop and rotation).
 /// Test hook: false keeps the ordinary phone / side-pane layouts on every window (the tests of that placement logic run on fold-sized windows).
 bool debugFoldLayouts = true;
@@ -84,6 +91,7 @@ FoldMode foldModeOf(Size size, FoldCrease? crease, double aspect, {double topIns
     final other = aspect >= 1 ? FoldMode.column : FoldMode.bench;
     return area(other) > area(natural) * kFoldSwitchGain ? other : natural;
   }
+  if (isWideLow(size) && !(crease != null && crease.halfOpened)) return FoldMode.column;
   return FoldMode.none;
 }
 
@@ -103,7 +111,7 @@ const double kBenchPhotoMin = 300; // the photo area keeps the cluster's height 
 
 /// Where everything goes. The rectangles are in window coordinates.
 class FoldPlan {
-  const FoldPlan({required this.mode, required this.photo, this.controls = Rect.zero, this.info = Rect.zero, this.work = Rect.zero, this.split});
+  const FoldPlan({required this.mode, required this.photo, this.controls = Rect.zero, this.info = Rect.zero, this.work = Rect.zero, this.split, this.low = false});
   static const none = FoldPlan(mode: FoldMode.none, photo: Rect.zero);
 
   final FoldMode mode;
@@ -119,6 +127,9 @@ class FoldPlan {
 
   /// Column: a horizontal fold that crosses the column splits it into an upper and a lower block here (top and bottom of the band).
   final (double, double)? split;
+
+  /// The column of a wide, low window: tighter rows (see FoldColumn); the photo and the column keep to the system insets.
+  final bool low;
 
   /// A half-opened window wide enough for the workbench's two halves under the fold ([info] and [work] are set).
   bool get hasHalves => !info.isEmpty;
@@ -188,6 +199,18 @@ class FoldPlan {
         return FoldPlan(mode: mode, photo: Rect.fromLTWH(0, top, w, photoH), controls: Rect.fromLTRB(0, benchTop, w, bottom), info: infoR, work: workR);
       case FoldMode.column:
         final bottom = h - bottomInset;
+        if (isWideLow(size)) {
+          // the photo whole at the full height on the side away from the hand, the column on the holding side; both keep to the
+          // system insets on their outer edges (a cut-out, the gesture bar)
+          final hr = hand == Hand.right;
+          final outerC = math.max(8.0, hr ? pad.right : pad.left), outerP = math.max(0.0, hr ? pad.left : pad.right);
+          final availW = w - outerC - outerP;
+          final pw = math.min((bottom - top) * aspect, availW - kColumnMin);
+          final cw = (availW - pw).clamp(kColumnMin, kColumnMax).toDouble();
+          final col = hr ? Rect.fromLTWH(w - outerC - cw, top + 4, cw, bottom - top - 8) : Rect.fromLTWH(outerC, top + 4, cw, bottom - top - 8);
+          final ar = hr ? Rect.fromLTRB(outerP, top, col.left, bottom) : Rect.fromLTRB(col.right, top, w - outerP, bottom);
+          return FoldPlan(mode: mode, photo: Rect.fromLTWH(ar.left, ar.top, ar.width, math.min(ar.height, ar.width / aspect)), controls: col, low: true);
+        }
         // the photo is shown whole at the full height; the column takes the width it leaves (within its limits), on the holding side, so
         // no empty strip is left beside the photo: only when the column is at its widest does the photo sit in the middle of the rest
         final photoW = math.min((bottom - top) * aspect, w - kColumnMin);

@@ -440,7 +440,8 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
       ctl.local.headerInnerW = cw - 2 * Sp.l;
     }
     // 局部's tool strip hangs under the photo, as on the phone
-    if (w?.group == EGroup.local && localToolsShown(ctl)) region = Rect.fromLTRB(region.left, region.top, region.right, math.max(region.top, region.bottom - toolStripH(region.width)));
+    // (the wide, low window keeps the strip in its column: nothing but the corner buttons lies over or under the photo)
+    if (!p.low && w?.group == EGroup.local && localToolsShown(ctl)) region = Rect.fromLTRB(region.left, region.top, region.right, math.max(region.top, region.bottom - toolStripH(region.width)));
     return _PanelGeo(region: region, panel: panel, dock: dock, place: PanelPlace.bottom, open: w != null, group: w?.group, collapsed: false);
   }
 
@@ -722,7 +723,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
         animation: _t,
         builder: (context, _) {
           final g = _geoNow();
-          if (g.group != EGroup.local || !localToolsShown(ctl)) return const SizedBox.shrink();
+          if (g.group != EGroup.local || !localToolsShown(ctl) || fp.low) return const SizedBox.shrink();
           final r = g.region;
           // photo and strip are one group: the strip hangs directly under the photo's lower edge (the photo is centred in the region
           // that already excludes the strip's line, so the group is centred); a second line grows upward from the line's bottom
@@ -816,7 +817,9 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
                       animation: _t,
                       builder: (context, _) {
                         final pr = _photoRect();
-                        return Positioned(top: pr.top + 8, left: pr.left + 8, width: math.max(0.0, pr.width - 16), child: EditorTopBar(app: app, ctl: ctl, photoId: () => id, onBack: _onBackButton, onMore: _toggleMenu, immersive: imm));
+                        // a narrow photo beside the low window's column: the bar keeps its width and reaches over the free area beside the photo, never the column
+                        final barW = fp.low ? math.min(math.max(pr.width - 16, 300.0), fp.photo.right - pr.left - 8) : pr.width - 16;
+                        return Positioned(top: pr.top + 8, left: pr.left + 8, width: math.max(0.0, barW), child: EditorTopBar(app: app, ctl: ctl, photoId: () => id, onBack: _onBackButton, onMore: _toggleMenu, immersive: imm));
                       },
                     );
                   }

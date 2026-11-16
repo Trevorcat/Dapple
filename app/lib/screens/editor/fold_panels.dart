@@ -11,7 +11,7 @@ import '../../editor/window_manager.dart' show Hand;
 import '../../model/params.dart';
 import '../../theme/tokens.dart';
 import 'editor_controller.dart';
-import 'local_panel.dart' show LocalHeader;
+import 'local_panel.dart' show LocalHeader, LocalToolStrip, localToolsShown, toolStripH;
 import 'pad_dock.dart' show DockItem, padDockH, padDockOrder;
 import 'pad_panel.dart';
 
@@ -278,6 +278,7 @@ class FoldColumn extends StatelessWidget {
             ]);
           },
         );
+    if (plan.low) return _low(context, c, r, withHandle);
     final split = plan.split;
     if (split == null) {
       return Positioned.fromRect(
@@ -302,5 +303,58 @@ class FoldColumn extends StatelessWidget {
         child: Container(key: const ValueKey('fold-column-low'), decoration: foldCard(c), clipBehavior: Clip.antiAlias, child: Column(children: [header(), Expanded(child: FoldWork(ctl: ctl))])),
       ),
     ]);
+  }
+
+  /// The column of a wide, low window (a slab phone held in landscape). Every row keeps its natural height, in this order of priority when
+  /// the height runs short: the pad (at least [kPadMinH]), the title row, the five categories; the histogram is dropped first, the
+  /// two-line title row (readout on its own line) gives way to the one-line one next. If even that does not fit (large text) the
+  /// column scrolls. 局部's tool strip stands between the title row and the pad: nothing interactive is left under the photo.
+  Widget _low(BuildContext context, DC c, Rect r, Widget Function(Widget) withHandle) {
+    return Positioned.fromRect(
+      rect: r,
+      child: Container(
+        key: const ValueKey('fold-column'),
+        decoration: foldCard(c),
+        clipBehavior: Clip.antiAlias,
+        child: withHandle(ListenableBuilder(
+          listenable: Listenable.merge([ctl.wm, ctl.edits, ctl.editingRow, ctl.local, ctl.app.editTick]),
+          builder: (context, _) => LayoutBuilder(builder: (context, cons) {
+            final g = ctl.wm.focused?.group ?? EGroup.light;
+            final innerW = r.width - 2 * Sp.l;
+            ctl.local.headerInnerW = innerW;
+            final lines = foldHeaderLines(ctl, innerW, textScale);
+            final strip = g == EGroup.local && localToolsShown(ctl);
+            final stripH = strip ? toolStripH(r.width - 16) : 0.0;
+            const handleBand = 10.0;
+            final catsH = padDockH(textScale);
+            final bodyMin = kPadMinH + kPanelTopGap + kPanelBottomPad;
+            final sideH = PanelHeader.heightOf(textScale: textScale, side: true, subTappable: true, lines: lines) + Sp.xs;
+            final compH = PanelHeader.heightOf(textScale: textScale, side: false, lines: lines);
+            final h = cons.maxHeight;
+            final fixed = handleBand + catsH + stripH;
+            final side = h - fixed - sideH >= bodyMin;
+            final hdrH = side ? sideH : compH;
+            final room = h - fixed - hdrH - bodyMin;
+            // the histogram block: 16 above (the swap handle's band), the card, 4 below
+            final histBlock = room >= 80 ? math.min(room, 112.0) : 0.0;
+            final scrolls = room < 0;
+            final rows = <Widget>[
+              if (histBlock > 0)
+                SizedBox(height: histBlock + handleBand, child: Padding(padding: const EdgeInsets.fromLTRB(Sp.l, 16, Sp.l, Sp.xs), child: HistogramCard(ctl: ctl)))
+              else
+                const SizedBox(height: handleBand),
+              Padding(padding: const EdgeInsets.symmetric(horizontal: Sp.xs), child: FoldCatGrid(ctl: ctl)),
+              Padding(padding: EdgeInsets.only(top: side ? Sp.xs : 0), child: PanelHeaderOf(ctl: ctl, group: g, side: side, textScale: textScale)),
+              if (strip) SizedBox(height: stripH, child: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: LocalToolStrip(ctl: ctl))),
+            ];
+            final work = FoldWork(ctl: ctl);
+            if (scrolls) {
+              return SingleChildScrollView(physics: const ClampingScrollPhysics(), child: Column(children: [...rows, SizedBox(height: bodyMin, child: work)]));
+            }
+            return Column(children: [...rows, Expanded(child: work)]);
+          }),
+        )),
+      ),
+    );
   }
 }
