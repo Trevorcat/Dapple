@@ -11,7 +11,7 @@ import '../../editor/handedness.dart';
 import '../../editor/haptics.dart';
 import '../../editor/window_manager.dart';
 import '../../model/bases.dart';
-import '../../model/film_pad.dart';
+import '../../model/film_catalog.dart' show FilmGroup;
 import '../../services/base_swatch_sources.dart';
 import '../../services/base_swatches.dart';
 import '../../models.dart' show Photo;
@@ -87,11 +87,9 @@ class EditorController extends ChangeNotifier implements GestureSink {
     required this.analysis,
     required this.onSwipe,
     required this.onToggleImmersive,
-    this.filmPadFetcher,
     this.lookSwatchSource,
     LocalAi? localAi,
   }) {
-    edits.addListener(_maybeRefreshRanges);
     local = LocalController(this, ai: localAi);
   }
 
@@ -109,9 +107,6 @@ class EditorController extends ChangeNotifier implements GestureSink {
   final ValueChanged<int> onSwipe;
   final VoidCallback onToggleImmersive;
 
-  /// Asks the engine for the film pads' effective ranges (dapple_session_film_pad_json); null = the live session.
-  /// Tests inject a fake.
-  final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
 
   /// Where the colour looks' swatches come from; null = the engine. Tests inject a fake.
   final SwatchSource Function(String photoId, String? baseId)? lookSwatchSource;
@@ -139,63 +134,6 @@ class EditorController extends ChangeNotifier implements GestureSink {
   }
 
   final PanelSel sel = PanelSel();
-
-  /// Which ends of the film pad axes change the render for the current photo and stock. Everything is effective until
-  /// the engine answers (or when it cannot). Refreshed, debounced and off the UI thread, when the photo, the stock or
-  /// film_shoot changes; never while a finger is down.
-  final ValueNotifier<FilmPadRanges> filmRanges = ValueNotifier(FilmPadRanges.all);
-  Timer? _rangesTimer;
-  String _rangesSig = '';
-  int _rangesGen = 0;
-
-  void _maybeRefreshRanges() {
-    final e = edit;
-    final sig = '$id|${e.film}|${e.filmPaper}|${e.value('film_shoot')}';
-    if (sig == _rangesSig) return;
-    _rangesSig = sig;
-    _rangesTimer?.cancel();
-    if (e.film == null || isModernId(e.film)) {
-      // no stock: nothing to ask the engine; a modern rendering has no shoot / print axes, both pad axes are dead
-      _rangesGen++;
-      final want = e.film == null ? FilmPadRanges.all : FilmPadRanges.inert;
-      if (filmRanges.value != want) {
-        filmRanges.value = want;
-        _bump();
-      }
-      return;
-    }
-    _rangesTimer = Timer(const Duration(milliseconds: 300), _fetchRanges);
-  }
-
-  Future<void> _fetchRanges() async {
-    if (dragging.value) {
-      _rangesTimer = Timer(const Duration(milliseconds: 300), _fetchRanges); // never during a drag
-      return;
-    }
-    final gen = ++_rangesGen;
-    final p = app.photoById(id);
-    if (p == null) return;
-    String? json;
-    try {
-      json = await (filmPadFetcher ?? _liveFetch)(app.wireParams(p));
-    } catch (_) {
-      json = null;
-    }
-    if (gen != _rangesGen) return; // a newer request supersedes this answer
-    final r = FilmPadRanges.parse(json);
-    if (r != filmRanges.value) {
-      filmRanges.value = r;
-      _bump();
-    }
-  }
-
-  Future<String?> _liveFetch(Map<String, dynamic> params) async {
-    if (!app.sessions.available) return null;
-    final p = app.photoById(id);
-    if (p == null) return null;
-    final s = await app.sessions.get(p);
-    return s?.filmPadJson(params);
-  }
 
   final ReadoutModel readout = ReadoutModel();
 
@@ -231,7 +169,11 @@ class EditorController extends ChangeNotifier implements GestureSink {
   String get id => photoId();
   EditState get edit => app.editOf(id);
 
-  PadCtx get padCtx => PadCtx(defaultTone: app.settings.toneStrength, defaultLookId: app.settings.defaultLookId);
+  PadCtx get padCtx => PadCtx(
+        defaultTone: app.settings.toneStrength,
+        defaultLookId: app.settings.defaultLookId,
+        reversal: app.film.stock(edit.film)?.group == FilmGroup.slide,
+      );
 
   void _bump() {
     edits.value++;
@@ -370,17 +312,9 @@ class EditorController extends ChangeNotifier implements GestureSink {
   PadState padView(PadCat cat) => padViewOf(edit, cat, padCtx);
   PadState padFull(PadCat cat) => padStateOf(edit, cat, padCtx);
 
-  /// Reachable pad area (only the film pad has dead ends).
-  PadLimits padLimits(PadCat cat) {
-    if (cat != PadCat.film) return PadLimits.full;
-    final r = filmRanges.value;
-    return PadLimits(
-      xLo: r.lo('film_shoot') ? -1 : 0,
-      xHi: r.hi('film_shoot') ? 1 : 0,
-      yLo: r.lo('film_print') ? -1 : 0,
-      yHi: r.hi('film_print') ? 1 : 0,
-    );
-  }
+  /// Reachable pad area. A film stock always has the full pad: the engine maps the full travel of each axis onto whatever range is
+  /// reachable for the photo. A modern rendering has no shoot / print axes: the 曝光 pad is dimmed and the cursor stays at the centre.
+  PadLimits padLimits(PadCat cat) => cat == PadCat.film && isModernId(edit.film) ? const PadLimits(xLo: 0, xHi: 0, yLo: 0, yHi: 0) : PadLimits.full;
 
   String? get defaultStockId {
     final c = app.film;
@@ -915,12 +849,9 @@ class EditorController extends ChangeNotifier implements GestureSink {
 
   @override
   void dispose() {
-    edits.removeListener(_maybeRefreshRanges);
     if (_filmPointer != null) GestureBinding.instance.pointerRouter.removeRoute(_filmPointer!, _filmRoute);
     filmPress.dispose();
     local.dispose();
-    _rangesTimer?.cancel();
-    filmRanges.dispose();
     _lookSw?.dispose();
     lookTick.dispose();
     _idleTimer?.cancel();

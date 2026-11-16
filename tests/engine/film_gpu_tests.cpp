@@ -226,6 +226,7 @@ struct CaseSpec {
   int fullLongEdge = 0;          // scale-aware grain against a full-resolution render of this long edge
   ef::FilmFx fx;                 // highlight boost / enlarger diffusion filter
   float formatScale = 1.f;       // film frame size scale (a smaller format = smaller pixels in micrometres: the dye-cloud blur and the micro-structure show)
+  float printEv = 0.f, filmExposure = 0.f;  // scan lamp / print exposure and film EV (film_print / film_shoot results)
 };
 
 ef::FilmFx boostFx(float ev, float range = 0.3f, float protect = 1.0f) {
@@ -260,6 +261,8 @@ void runCase(GpuCtx& G, const hal::ImageH& src, const ImageF& in, const CaseSpec
   a.fullLongEdge = c.fullLongEdge;
   a.fx = c.fx;
   a.formatScale = c.formatScale;
+  a.printEv = c.printEv;
+  a.filmExposure = c.filmExposure;
   ef::FilmResolved r;
   ef::filmFrameResolved(a, r);
   if (c.fx.boostEv > 0.f || c.fx.enlargerFilter) {  // the executor asks this before it records anything: boost and enlarger diffusion are GPU effects now
@@ -354,6 +357,9 @@ void testCases(GpuCtx& G, bool grainOnly, int w = 960, int h = 640, const std::v
       {"enlarger glimmerglass (portra, no halation)", "kodak_portra_400", w, h, 2, 0.f, 0.f, 0.15, 1.5, false, false, 0, enlFx(1)},
       {"enlarger cinebloom x2 (ektar, interactive)", "kodak_ektar_100", w, h, 1, 0.f, 100.f, 0.15, 1.5, false, false, 0, enlFx(4, 0.8f, 2.f)},
       {"enlarger pro_mist strong (vision3 + 2383)", "kodak_vision3_500t", w, h, 2, 0.f, 100.f, 0.15, 1.5, false, false, 0, enlFx(3, 1.0f)},
+      // a scan above its automatic lamp cap (film_print +1: +1 EV) and a film_shoot -1 compensation (film EV -1.3, scan +0.7 EV)
+      {"scan lamp +1 EV above the cap (velvia)", "fujifilm_velvia_100", w, h, 2, 0.f, 100.f, 0.15, 1.5, false, false, 0, {}, 1.f, 1.f, 0.f},
+      {"film_shoot -1 compensation (velvia, scan +0.7 EV)", "fujifilm_velvia_100", w, h, 2, 0.f, 100.f, 0.15, 1.5, false, false, 0, {}, 1.f, 0.7f, -1.3f},
       {"enlarger on a slide (no print: unchanged)", "fujifilm_velvia_100", w, h, 2, 0.f, 100.f, 0.15, 1.5, false, false, 0, enlFx(2)},
       {"enlarger, spatial off (dropped)", "kodak_portra_400", w, h, 0, 0.f, 0.f, 0.1, 1.0, false, false, 0, enlFx(2)},
       {"boost + enlarger", "kodak_portra_400", w, h, 2, 0.f, 100.f, 0.15, 1.5, false, false, 0, [] { auto f = enlFx(2, 1.0f, 2.f); f.boostEv = 1.2f; f.protectEv = 1.0f; return f; }()},

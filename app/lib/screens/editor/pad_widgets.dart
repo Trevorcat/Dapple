@@ -116,7 +116,7 @@ class _FieldPainter extends CustomPainter {
   bool shouldRepaint(_FieldPainter o) => o.cat != cat || o.radius != radius || !identical(o.icons, icons);
 }
 
-/// The moving part: the cursor, and the grey-out of the ends the engine says change nothing (film pad).
+/// The moving part: the cursor, and the grey-out of an unreachable area (the 曝光 pad of a modern rendering).
 /// The cursor layer of a pad (public so tests can read the reachable area it dims).
 class PadCursorPainter extends CustomPainter {
   PadCursorPainter(this.x, this.y, this.limits, this.radius);
@@ -177,7 +177,7 @@ class CatPadSource extends PadSource {
   final EditorController ctl;
   final PadCat cat;
   @override
-  Listenable get changes => Listenable.merge([ctl.app.editTick, ctl.filmRanges, ctl.lookTick]);
+  Listenable get changes => Listenable.merge([ctl.app.editTick, ctl.lookTick]);
   @override
   PadState get view => ctl.padView(cat);
   @override

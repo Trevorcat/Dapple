@@ -92,7 +92,7 @@ List<SliderSpec> _buildSpecs() {
     const SliderSpec('film_exp', '胶片曝光', -60, 60, 0, Fmt.ev, EGroup.style),
     // Film exposure pad and the black-point / latitude rulers (docs/design/editor-panel.md §5): normalised offsets in [-1, +1], 0 = automatic.
     // NATIVE BINDING: the engine reads these five keys (film_wb included) from the edit JSON as plain floats, missing = 0 (they travel in
-    // EditState.toWire like the other film_* keys; nothing else on the Dart side is needed). Their effective ranges per photo and stock come from dapple_session_film_pad_json (model/film_pad.dart).
+    // EditState.toWire like the other film_* keys; nothing else on the Dart side is needed).
     const SliderSpec('film_shoot', '拍摄曝光', -1, 1, 0, Fmt.signed, EGroup.style), // X of 曝光: 欠曝 -1 .. 过曝 +1
     const SliderSpec('film_print', '冲印深浅', -1, 1, 0, Fmt.signed, EGroup.style), // Y of 曝光: 深 -1 .. 浅 +1
     const SliderSpec('film_wb', '胶片白平衡', 0, 1, 0, Fmt.signed, EGroup.style), // X of 质感, one-sided: 0 数码白平衡 (default) .. 1 胶片白平衡 (the stock's own balance)

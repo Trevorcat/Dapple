@@ -55,7 +55,7 @@ void openEditor(BuildContext context, AppState app, String photoId, {EGroup? ini
 }
 
 class EditorPage extends StatefulWidget {
-  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.filmPadFetcher, this.lookSwatchSource, this.initialGroup, this.initialRow, this.initialCollapsed = false, this.initialHold, this.localAi, this.initialZoom});
+  const EditorPage({super.key, required this.app, required this.photoId, this.resamplePointers = true, this.lookSwatchSource, this.initialGroup, this.initialRow, this.initialCollapsed = false, this.initialHold, this.localAi, this.initialZoom});
   final AppState app;
   final String photoId;
 
@@ -77,7 +77,6 @@ class EditorPage extends StatefulWidget {
   final (double, double, double)? initialZoom;
 
   /// Test hook: replaces the engine query for the film pads' effective ranges.
-  final Future<String?> Function(Map<String, dynamic> params)? filmPadFetcher;
 
   /// Test hook: where the colour looks' swatches come from (photo id, current base id).
   final SwatchSource Function(String photoId, String? baseId)? lookSwatchSource;
@@ -135,7 +134,6 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
       analysis: () => _analysis(ph, false),
       onSwipe: _go,
       onToggleImmersive: () => ctl.immersive.value = !ctl.immersive.value,
-      filmPadFetcher: widget.filmPadFetcher,
       lookSwatchSource: widget.lookSwatchSource,
       localAi: widget.localAi ?? (app.sessions.available ? EngineLocalAi(app) : const NoLocalAi()),
     );

@@ -45,6 +45,7 @@ Offset padAt(WidgetTester t, PadCat c, double x, double y) {
 PadState viewOf(AppState app, String id, PadCat c) => padViewOf(app.editOf(id), c, ctx);
 
 void main() {
+  _reversalPad();
   // these tests are about the ordinary panel placement (side pane on a wide window); the fold layouts have their own tests (fold_layout_test.dart)
   setUp(() => debugFoldLayouts = false);
   tearDown(() => debugFoldLayouts = true);
@@ -729,3 +730,24 @@ void _noHorizontalScroll(WidgetTester t) {
   expect(find.descendant(of: panel, matching: find.byType(ListView)), findsNothing);
 }
 
+
+void _reversalPad() {
+  group('the 曝光 pad on a slide runs 淡 -> 浓 like on a negative', () {
+    const slide = PadCtx(defaultTone: 60, reversal: true);
+    test('right is 浓: a slide gets a negative film_shoot, a negative a positive one; the print axis is the same', () {
+      final neg = padRecipe(PadCat.film, 1, 0.5, 0.5, ctx: ctx), rev = padRecipe(PadCat.film, 1, 0.5, 0.5, ctx: slide);
+      expect(neg['film_shoot'], closeTo(0.8, 1e-9));
+      expect(rev['film_shoot'], closeTo(-0.8, 1e-9));
+      expect(rev['film_print'], neg['film_print']);
+      expect(padRecipe(PadCat.film, -1, 0, 0.5, ctx: slide)['film_shoot'], closeTo(0.8, 1e-9));
+    });
+    test('round trip: the cursor x stays, the stored film_shoot is the engine value', () {
+      for (final c in [ctx, slide]) {
+        final e = applyPadState(const EditState(film: 'x'), PadCat.film, const PadState(x: 0.5, y: 0.2, a: 0.5), c);
+        expect(padViewOf(e, PadCat.film, c).x, 0.5);
+        expect(e.value('film_shoot'), closeTo(c.reversal ? -0.4 : 0.4, 1e-9));
+        expect(padStateOf(e, PadCat.film, c).x, 0.5);
+      }
+    });
+  });
+}

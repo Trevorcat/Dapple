@@ -24,7 +24,7 @@ const ctx = PadCtx(defaultTone: 60);
 const ownerPhys = Size(1140, 2616);
 const ownerDpr = 2.75;
 
-Future<(AppState, String)> openWith(WidgetTester t, {String title = '外滩夕阳', String? crop, Future<String?> Function(Map<String, dynamic>)? fetch, Size phys = ownerPhys, double dpr = ownerDpr}) async {
+Future<(AppState, String)> openWith(WidgetTester t, {String title = '外滩夕阳', String? crop, Size phys = ownerPhys, double dpr = ownerDpr}) async {
   setView(t, phys, dpr);
   await loadTestFonts();
   final app = AppState.demo();
@@ -36,7 +36,7 @@ Future<(AppState, String)> openWith(WidgetTester t, {String title = '外滩夕�
     child: MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: buildTheme(Brightness.light),
-      home: EditorPage(app: app, photoId: id, resamplePointers: false, filmPadFetcher: fetch),
+      home: EditorPage(app: app, photoId: id, resamplePointers: false),
     ),
   ));
   await settle(t);
@@ -201,92 +201,23 @@ void main() {
     });
   });
 
-  group('film pad: effective ranges (the engine says which ends change the render)', () {
-    String hiOff(String key) => '{"ok":true,"effective_hi":{"$key":false}}';
-
-    testWidgets('a dead half is unreachable and dimmed; the live half still works', (t) async {
-      final (app, id) = await openWith(t, fetch: (_) async => hiOff('film_print'));
-      app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
-      await t.pump();
-      await settle(t, 6); // the 300 ms debounce, then the answer
-      await tapDock(t, EGroup.style);
-      final cursor = t.widgetList<CustomPaint>(find.descendant(of: find.byKey(const ValueKey('pad-film')), matching: find.byType(CustomPaint))).firstWhere((w) => w.painter is PadCursorPainter);
-      final lim = (cursor.painter! as PadCursorPainter).limits;
-      expect(lim.yHi, 0, reason: 'film_print +1 changes nothing: the top half is dead');
-      expect(lim.isFull, isFalse);
-      final f = await Finger.down(t, padAt(t, PadCat.film, 0.5, 0.8));
-      await f.up();
-      expect(viewOf(app, id, PadCat.film).y, 0, reason: 'the cursor stops at the centre line');
-      expect(viewOf(app, id, PadCat.film).x, closeTo(0.5, 0.03));
-      final g = await Finger.down(t, padAt(t, PadCat.film, 0.2, -0.8));
-      await g.up();
-      expect(viewOf(app, id, PadCat.film).y, closeTo(-0.8, 0.03), reason: 'the bottom half is live');
-      expect(app.editOf(id).value('film_print'), closeTo(-0.8 * 0.65, 0.02));
-    });
-
-    testWidgets('a dead axis: the pad stays but that axis is stuck at automatic; both dead: nothing moves', (t) async {
-      final (app, id) = await openWith(t, fetch: (_) async => '{"ok":true,"effective_lo":{"film_shoot":false},"effective_hi":{"film_shoot":false}}');
-      app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
-      await settle(t, 6);
-      await tapDock(t, EGroup.style);
-      final f = await Finger.down(t, padAt(t, PadCat.film, 0.7, 0.6));
-      await f.up();
-      expect(viewOf(app, id, PadCat.film).x, 0, reason: 'film_shoot is dead on both ends');
-      expect(viewOf(app, id, PadCat.film).y, closeTo(0.6, 0.03));
-      expect(app.editOf(id).value('film_shoot'), 0);
-    });
-
-    testWidgets('both axes dead: the pad does not move at all', (t) async {
-      final (app, id) = await openWith(t,
-          fetch: (_) async => '{"ok":true,"effective_lo":{"film_shoot":false,"film_print":false},"effective_hi":{"film_shoot":false,"film_print":false}}');
-      app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
-      await settle(t, 6);
-      await tapDock(t, EGroup.style);
-      final f = await Finger.down(t, padAt(t, PadCat.film, 0.7, 0.6));
-      await f.drag(const Offset(-40, 40));
-      await f.up();
-      expect(viewOf(app, id, PadCat.film).x, 0);
-      expect(viewOf(app, id, PadCat.film).y, 0);
-    });
-
-    testWidgets('the ranges refresh after a stock change and after a drag that moved film_shoot, never during the drag', (t) async {
-      var calls = 0;
-      final (app, id) = await openWith(t, fetch: (_) async {
-        calls++;
-        return '{"ok":true}';
-      });
-      app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
-      await settle(t, 6);
-      expect(calls, 1);
+  group('film pad: no narrowed range for a film stock', () {
+    testWidgets('a slide stock: the whole pad is undimmed and the cursor reaches the top and the bottom', (t) async {
+      final (app, id) = await openWith(t);
       app.applyEdit(id, (e) => e.copyWith(film: 'fujifilm_velvia_100'));
       await settle(t, 6);
-      expect(calls, 2, reason: 'a new stock asks again');
       await tapDock(t, EGroup.style);
-      final f = await Finger.down(t, padAt(t, PadCat.film, 0, 0));
-      await f.drag(const Offset(60, 0));
-      await settle(t, 5); // longer than the debounce, finger still down
-      expect(calls, 2, reason: 'never while a finger is down');
+      final cursor = t.widgetList<CustomPaint>(find.descendant(of: find.byKey(const ValueKey('pad-film')), matching: find.byType(CustomPaint))).firstWhere((w) => w.painter is PadCursorPainter);
+      expect((cursor.painter! as PadCursorPainter).limits.isFull, isTrue);
+      final f = await Finger.down(t, padAt(t, PadCat.film, 0.5, 1));
       await f.up();
-      await settle(t, 6);
-      expect(calls, 3, reason: 'after the drag film_shoot changed: ask again');
-    });
-
-    testWidgets('a tolerant parser path: garbage, an exception or a "not ok" answer all mean everything is reachable', (t) async {
-      for (final answer in <Future<String?> Function(Map<String, dynamic>)>[
-        (_) async => 'not json at all',
-        (_) async => throw StateError('no engine'),
-        (_) async => '{"ok":false,"effective_hi":{"film_print":false}}',
-        (_) async => null,
-      ]) {
-        final (app, id) = await openWith(t, fetch: answer);
-        app.applyEdit(id, (e) => e.copyWith(film: 'kodak_portra_400'));
-        await settle(t, 6);
-        await tapDock(t, EGroup.style);
-        final f = await Finger.down(t, padAt(t, PadCat.film, 0, 1));
-        await f.up();
-        expect(viewOf(app, id, PadCat.film).y, closeTo(1, 0.03), reason: 'everything reachable');
-        await t.pumpWidget(const SizedBox());
-      }
+      expect(viewOf(app, id, PadCat.film).y, closeTo(1, 0.03), reason: 'the bright end is reachable on a slide');
+      expect(viewOf(app, id, PadCat.film).x, closeTo(0.5, 0.03));
+      expect(app.editOf(id).value('film_print'), greaterThan(0.5));
+      final g = await Finger.down(t, padAt(t, PadCat.film, -0.7, -1));
+      await g.up();
+      expect(viewOf(app, id, PadCat.film).y, closeTo(-1, 0.03));
+      expect(viewOf(app, id, PadCat.film).x, closeTo(-0.7, 0.03));
     });
   });
 

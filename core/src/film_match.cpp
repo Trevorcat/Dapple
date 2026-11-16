@@ -374,6 +374,7 @@ FilmPrintRange filmPrintRange(const std::shared_ptr<const film::FilmLibrary>& li
   const float lw = patch(8.f, scan ? 0.f : 8.f), lb = patch(-8.f, scan ? 0.f : -8.f);
   if (lw < 0.f || lb < 0.f) return r;
   r.ok = true;
+  r.scan = scan;
   r.lWhite = lw;
   r.lBlack = lb;
   r.yWhite = float(yOfLightness(lw));
@@ -859,6 +860,19 @@ float targetDisplayL(const FilmPrintRange& r, float relL) {
   const float y = r.yWhite * float(yOfLightness(double(relL)));
   return std::clamp(lightnessOfY(double(y)), r.loL, r.hiL);
 }
+// A scan (no print) may be exposed above the automatic lamp cap: raise the print range to `newMax` stops (the white limit follows).
+void liftScanRange(FilmPrintRange& r, float newMax) {
+  if (!(newMax > r.maxPrintEv)) return;
+  r.hiL = lightnessOfY(yOfLightness(double(r.hiL)) * std::exp2(double(newMax - r.maxPrintEv)));
+  r.maxPrintEv = newMax;
+}
+
+float compEv(float def, const char* env) {  // the env override is for measurements
+  const char* e = std::getenv(env);
+  return e ? std::strtof(e, nullptr) : def;
+}
+float scanCompUpEv() { return compEv(kFilmScanCompUpEv, "DAPPLE_FILM_SCAN_COMP_UP_EV"); }
+float scanCompDownEv() { return compEv(kFilmScanCompDownEv, "DAPPLE_FILM_SCAN_COMP_DOWN_EV"); }
 }  // namespace
 
 FilmExposure solveMeter(const MeterInputs& in, FilmMatchInfo* info) try {
@@ -884,19 +898,42 @@ FilmExposure solveMeter(const MeterInputs& in, FilmMatchInfo* info) try {
     if (pv && pv[0] && pv[0] != '0' && reversal && filmExposureWindow(lat, in.stFull, lo, hi)) autoEv = hi;
   }
   float filmEv = std::clamp(shootEv(in.stFull, lat, autoEv, in.shoot), -9.f, 9.f);
-  if (reversal && in.shoot != 0.f && in.medianL) {
-    // a slide's brightness is its exposure: keep the override inside a usable median (L* 33 .. 86), bisecting towards the automatic EV
-    auto usable = [&](float e) {
-      const float m = in.medianL(e, filmPrintConstant(in.lib, in.film, in.paper, 0.f));
-      return m >= kFilmSafeMedianMin && m <= kFilmSafeMedianMax;
-    };
-    if (!usable(filmEv)) {
-      float good = autoEv, bad = filmEv;
-      for (int i = 0; i < 7; ++i) {
-        const float mid = 0.5f * (good + bad);
-        (usable(mid) ? good : bad) = mid;
+  // film_shoot is the character of the exposure on the film, not the brightness: a slide (or any scan: the lamp constant is fixed) shows
+  // every shoot step directly as brightness, so the scan exposure is solved to hold the median of the automatic render. The compensation
+  // is bounded (kFilmScanCompUpEv / kFilmScanCompDownEv); the film EV travel is shortened (bisection) to what that bound can hold.
+  float holdTarget = 0.f, holdPrint = 0.f;
+  bool hold = false;
+  FilmPrintRange holdRange;
+  if (in.shoot != 0.f && in.medianL) {
+    holdRange = filmPrintRange(in.lib, in.film, in.paper);
+    if (holdRange.ok && (reversal || holdRange.scan)) {
+      hold = true;
+      holdPrint = filmPrintConstant(in.lib, in.film, in.paper, 0.f);
+      const float autoFilmEv = std::clamp(autoEv, -9.f, 9.f);
+      holdTarget = in.medianL(autoFilmEv, holdPrint);
+      const float up = scanCompUpEv(), down = scanCompDownEv();
+      holdRange.hiL = std::max(holdRange.hiL, holdTarget);  // the target is a median that the automatic render already reaches
+      holdRange.loL = std::min(holdRange.loL, holdTarget);
+      if (holdRange.scan) liftScanRange(holdRange, std::max(holdRange.maxPrintEv, holdPrint) + up);
+      const bool under = in.shoot < 0.f;
+      // holdable: the lamp can bring the median of this film EV back to the target within +up / -down (the direction follows the stock:
+      // an under-exposed slide is dark, an under-exposed negative scanned as it is is light)
+      auto holdable = [&](float e) {
+        if (in.medianL(e, holdPrint) < holdTarget) return in.medianL(e, std::min(holdPrint + up, kFilmMaxPrintEv)) >= holdTarget;
+        return in.medianL(e, std::max(holdPrint - down, -kFilmMaxPrintEv)) <= holdTarget;
+      };
+      // the travel of the axis ends at the film EV whose hold needs +kFilmScanCompUpEv (-1) / -kFilmScanCompDownEv (+1) of scan exposure; the full
+      // -1..+1 maps linearly in film EV onto that range (never wider than the latitude rule allows)
+      float edge = std::clamp(shootEv(in.stFull, lat, autoEv, under ? -1.f : 1.f), -9.f, 9.f);
+      if (!holdable(edge)) {
+        float good = autoFilmEv, bad = edge;
+        for (int i = 0; i < 8; ++i) {
+          const float mid = 0.5f * (good + bad);
+          (holdable(mid) ? good : bad) = mid;
+        }
+        edge = good;
       }
-      filmEv = good;
+      filmEv = autoFilmEv + std::fabs(std::clamp(in.shoot, -1.f, 1.f)) * (edge - autoFilmEv);
     }
   }
   mi.shootEv = filmEv;
@@ -917,14 +954,29 @@ FilmExposure solveMeter(const MeterInputs& in, FilmMatchInfo* info) try {
   float printEv = reversal ? filmPrintConstant(in.lib, in.film, in.paper, 0.f)
                            : filmPrintConstantAt(in.lib, in.film, in.paper, mi.printDelta);
   mi.printConst = printEv;
+  if (hold) {
+    FilmMatchInfo held;
+    auto pl = [&](float e) { return in.medianL(filmEv, e); };
+    printEv = solvePrintEv(pl, holdTarget, holdRange, &held, 0.3f, holdPrint);
+    mi.printConst = printEv;
+    if (std::getenv("DAPPLE_MATCH_TRACE"))
+      std::fprintf(stderr, "scan hold: shoot %+.2f film EV %+.2f (auto %+.2f) scan EV %+.2f median target %.1f\n", in.shoot, filmEv, std::clamp(autoEv, -9.f, 9.f), printEv, holdTarget);
+  }
   if (in.print != 0.f && in.medianL) {
-    const FilmPrintRange range = filmPrintRange(in.lib, in.film, in.paper);
+    FilmPrintRange range = filmPrintRange(in.lib, in.film, in.paper);
     if (range.ok) {
       const float s = std::clamp(in.print, -1.f, 1.f);
+      if (range.scan && s > 0.f) {  // no print: the positive end may lift the scan above the automatic cap by a bounded amount
+        const float cap = std::max(range.maxPrintEv, printEv);
+        const float raised = cap + kFilmScanLiftEv * s;
+        range.hiL = lightnessOfY(yOfLightness(double(range.hiL)) * std::exp2(double(raised - range.maxPrintEv)));
+        range.maxPrintEv = raised;
+      }
       const float lAuto = in.medianL(filmEv, printEv);
       const float lEnd = targetDisplayL(range, s < 0.f ? kFilmPrintDarkL : kFilmPrintLightL);
-      // -1 never brightens and +1 never darkens (the automatic median may already lie beyond the end of the band)
-      const float lTo = s < 0.f ? std::min(lEnd, lAuto) : std::max(lEnd, lAuto);
+      // -1 never brightens and +1 never darkens; each end moves the median by at least kFilmPrintMinStepL (the automatic median may
+      // already lie beyond the end of the band), within what the paper / scan reaches (solvePrintEv clamps into the range)
+      const float lTo = s < 0.f ? std::min(lEnd, lAuto - kFilmPrintMinStepL) : std::max(lEnd, lAuto + kFilmPrintMinStepL);
       const float tgt = lAuto + (lTo - lAuto) * std::fabs(s);
       auto pl = [&](float e) { return in.medianL(filmEv, e); };
       const float autoPrint = printEv;

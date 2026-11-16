@@ -1,11 +1,9 @@
 // The film library as data (catalog grouping, names, swatches, no trademarks in the UI), the effective-range parser of the
 // film pads, the film keys on the wire, and the licences page. (The panel itself is tested in pad_panel_test.dart.)
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:dapple/model/film_catalog.dart';
 import 'package:dapple/model/film_names.dart';
-import 'package:dapple/model/film_pad.dart';
 import 'package:dapple/model/pad_model.dart' show latitudePercent;
 import 'package:dapple/model/params.dart';
 import 'package:dapple/screens/library/licenses_page.dart';
@@ -103,40 +101,6 @@ void main() {
     });
   });
 
-  group('effective ranges of the film pads', () {
-    String json(Map<String, dynamic> m) => jsonEncode({'ok': true, ...m});
-    test('the parser is tolerant: missing fields, wrong types, garbage and an old engine all mean effective', () {
-      for (final s in [null, '', 'nonsense', '[]', '{}', '{"ok":false}', '{"ok":true}', '{"effective_lo":3,"effective_hi":"no"}']) {
-        final r = FilmPadRanges.parse(s);
-        for (final k in filmPadKeys) {
-          expect(r.lo(k) && r.hi(k), isTrue, reason: '$s $k');
-        }
-        expect(r, FilmPadRanges.all);
-      }
-      final r = FilmPadRanges.parse(json({
-        'effective_lo': {'film_wb': false, 'film_latitude': false},
-        'effective_hi': {'film_print': false, 'film_wb': false, 'film_shoot': 'x'},
-        'scene_k': 4600,
-        'stock_kelvin': 5500.4,
-      }));
-      expect(r.hi('film_print'), isFalse);
-      expect(r.lo('film_print'), isTrue, reason: 'a missing field is effective');
-      expect(r.dead('film_wb'), isTrue);
-      expect(r.sceneK, 4600);
-      expect(r.stockK, 5500);
-      expect(FilmPadRanges.parse(json({'effective_hi': {'film_wb': true}, 'effective_lo': {'film_wb': false}})).dead('film_wb'), isFalse,
-          reason: 'film_wb is one-sided: only its +1 end counts');
-      expect(FilmPadRanges.parse(json({'scene_k': 'warm', 'stock_k': -3})).sceneK, isNull, reason: 'garbage temperatures are ignored');
-      expect(r.dead('film_latitude'), isFalse, reason: 'only the lower end is dead');
-      expect(r.dead('film_print'), isFalse);
-      expect(r.hi('film_shoot'), isTrue, reason: 'a non-bool is ignored');
-      // the per-key object form
-      final p = FilmPadRanges.parse(json({'film_black': {'effective_lo': false, 'effective_hi': false}}));
-      expect(p.dead('film_black'), isTrue);
-      expect(p.dead('film_shoot'), isFalse);
-    });
-
-  });
 
   group('edit state', () {
     test('latitude scale: -1 / 0 / +1 = 55 / 80 / 98 %, piecewise linear, and back', () {

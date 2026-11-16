@@ -84,7 +84,15 @@ constexpr float kFilmRangeFractionMin = 0.55f, kFilmRangeFractionMax = 0.98f;  /
 constexpr float kFilmShootEdgeFraction = 0.55f;  // film_shoot +-1: the EV where the in-range share drops to this
 constexpr float kFilmShootMaxEv = 3.f;           // ... never further than this from the automatic exposure
 constexpr float kFilmPrintDarkL = 30.f, kFilmPrintLightL = 85.f;  // film_print -1 / +1: median L* relative to the paper white
-constexpr float kFilmSafeMedianMin = 33.f, kFilmSafeMedianMax = 86.f;  // film_shoot never leaves this median for a slide
+// film_print +-1 moves the median at least this many L* units from the automatic one when the band end is closer or on the wrong side
+// (still limited by what the paper / scan can reach), so neither end of the print axis is ever dead.
+constexpr float kFilmPrintMinStepL = 8.f;
+// A film with no print (scan / slide): the automatic exposure stops at the lamp cap (clear film = display white); film_print +1 may lift the
+// scan exposure this many stops above the automatic value (film_print 0 is unchanged).
+constexpr float kFilmScanLiftEv = 1.f;
+// film_shoot on a scan holds the automatic median with the scan exposure: -1 maps to the film EV whose hold needs +kFilmScanCompUpEv,
+// +1 to the film EV whose hold needs -kFilmScanCompDownEv (the travel is bounded on both sides by the compensation it needs).
+constexpr float kFilmScanCompUpEv = 0.7f, kFilmScanCompDownEv = 0.7f;
 constexpr float kFilmMatteBlackY = 0.02f;                           // film_black -1: relative luminance of the lifted black
 
 // Which edge of the latitude window decided the result.
@@ -267,6 +275,7 @@ struct FilmPrintRange {
   float lWhite = 0.f, lBlack = 0.f;  // L* of paper white / black
   float yWhite = 0.f, yBlack = 0.f;  // relative luminance (1 = perfect white diffuser under the viewing light)
   float loL = 0.f, hiL = 0.f;        // usable range: black raised by kPaperBlackMarginD, white lowered by kPaperWhiteMarginD
+  bool scan = false;                 // no print: the scan of the film itself
   float maxPrintEv = kFilmMaxPrintEv;  // scan / projection (no print): the lamp may not lift the clear film above that white
 };
 FilmPrintRange filmPrintRange(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& film, const std::string& paper);

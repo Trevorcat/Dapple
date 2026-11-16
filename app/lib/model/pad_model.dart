@@ -54,9 +54,13 @@ enum PadIconKind { moon, sun, contrastLow, contrastHigh, cold, warm, pale, rich,
 
 /// What the recipes need to know about the app's settings.
 class PadCtx {
-  const PadCtx({this.defaultTone = 60, this.defaultLookId = 'std'});
+  const PadCtx({this.defaultTone = 60, this.defaultLookId = 'std', this.reversal = false});
   final double defaultTone;
   final String defaultLookId;
+
+  /// The film stock is a slide: more exposure is the paler picture, so the 淡 / 浓 axis of the 成像 pad runs against film_shoot
+  /// (right = 浓 = less exposure). The 分项 slider keeps the engine's meaning.
+  final bool reversal;
 }
 
 enum ItemKind { value, tone, look }
@@ -201,7 +205,7 @@ Map<String, double> padRecipe(PadCat cat, double x, double y, double a, {PadCtx 
       };
     case PadCat.film:
       return {
-        'film_shoot': x * 0.8,
+        'film_shoot': (ctx.reversal ? -x : x) * 0.8,
         'film_print': y * 0.65,
         // the bundle: the film effect fades in over the lower half (grain and halation with it); above the middle the
         // effect is complete, grain and halation grow towards the top of their range (read from the param spec: the

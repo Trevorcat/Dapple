@@ -77,7 +77,7 @@ std::string filmMatchKeyLean(const EditParams& p) {
   // The key stays complete for those; otherwise a warmth / tint drag is not a new match.
   std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
   const film::FilmStock* s = lib ? lib->find(p.filmStock) : nullptr;
-  const bool needsMedian = p.filmPrint != 0.f || !s || (s->positive() && p.filmShoot != 0.f);
+  const bool needsMedian = p.filmPrint != 0.f || !s || (p.filmShoot != 0.f && (s->positive() || p.filmPaper == "none"));
   if (!needsMedian) k.filmWarmth = k.filmTint = k.filmWb = 0.f;
   return toJson(k);
 }

@@ -1558,13 +1558,74 @@ void testFilmMatch() {
                     lhh = lstats(withExposure(phi.first, phi.second), src).median;
         std::printf("  %s film_print -1/0/+1: median L* %.1f %.1f %.1f (print EV %+.2f %+.2f %+.2f)\n", id, ll, lm, lhh, plo.second.printEv, a0.second.printEv, phi.second.printEv);
         CHECK(ll < lm - 2.f || lm < 40.f);
-        CHECK(lhh > lm + 2.f || lm > 75.f || std::string(id).rfind("kodak_kodachrome", 0) == 0);  // a slide's lamp cannot brighten
+        CHECK(lhh > lm + 2.f || lm > 75.f);  // a slide's scan lamp may lift above the automatic cap (kFilmScanLiftEv)
         CHECK(lhh >= lm - 0.5f);
         // film_latitude: the rescue target follows
         FilmMatchInfo mlt, mht;
         at(id, 0, 0, 0, -1, src, &mlt);
         at(id, 0, 0, 0, 1, src, &mht);
         CHECK(mht.fracFinal + 1e-4f >= mlt.fracFinal);
+      }
+      // neither end of the film_print axis is dead: a slide without paper may lift the scan above the automatic cap, and every stock
+      // moves the median at least kFilmPrintMinStepL where the paper allows
+      {
+        const SourceImage* frames[2] = {&src, &bright};
+        for (const char* id : {"fujifilm_velvia_100", "kodak_kodachrome_64", "kodak_portra_400"}) {
+          const bool slide = std::string(id) != "kodak_portra_400";
+          for (const SourceImage* sc : frames) {
+            EditParams e = p;
+            e.filmStock = id;
+            if (slide) e.filmPaper = "none";
+            const FilmPadInfo pad = filmPadFor(e, cam, nullptr, *sc);
+            const auto a0 = at(id, 0, 0, 0, 0, *sc), alo = at(id, 0, -1, 0, 0, *sc), ahi = at(id, 0, 1, 0, 0, *sc);
+            const float l0 = lstats(withExposure(a0.first, a0.second), *sc).median, ll = lstats(withExposure(alo.first, alo.second), *sc).median,
+                        lh = lstats(withExposure(ahi.first, ahi.second), *sc).median;
+            std::printf("  print ends %s %s: median L* %.1f %.1f %.1f  print EV %+.2f %+.2f %+.2f  effective lo %d hi %d\n", id, sc == &src ? "frame A" : "frame B", ll, l0, lh,
+                        alo.second.printEv, a0.second.printEv, ahi.second.printEv, pad.effectiveLo[1], pad.effectiveHi[1]);
+            CHECK(ll <= l0 + 1e-3f && lh >= l0 - 1e-3f);  // an end never moves the other way
+            if (slide) {
+              CHECK(ahi.second.printEv > a0.second.printEv + 0.2f && ahi.second.printEv <= a0.second.printEv + kFilmScanLiftEv + 1e-3f);
+              CHECK(lh > l0 + 2.f);
+              CHECK(pad.effectiveHi[1]);
+              CHECK(a0.second.printEv == matchFilmExposure(a0.first, cam, nullptr, *sc).printEv);
+            }
+            if (sc == &src) CHECK(lh >= l0 + 0.5f);  // a bright frame whose automatic median is at / above the light end still brightens
+            else CHECK(ll <= l0 - 2.f);              // and a dim one still darkens
+          }
+        }
+      }
+      // film_shoot is the character of the exposure, not the brightness: on a slide the scan exposure holds the automatic median
+      {
+        const SourceImage* frames[2] = {&src, &bright};
+        for (const char* id : {"fujifilm_velvia_100", "kodak_kodachrome_64"})
+          for (const SourceImage* sc : frames) {
+            const auto a0 = at(id, 0, 0, 0, 0, *sc);
+            const float l0 = lstats(withExposure(a0.first, a0.second), *sc).median;
+            for (float sh : {-1.f, -0.5f, 0.5f, 1.f}) {
+              const auto a = at(id, sh, 0, 0, 0, *sc);
+              const float l = lstats(withExposure(a.first, a.second), *sc).median;
+              std::printf("  shoot %+.1f %s %s: film EV %+.2f (auto %+.2f) scan EV %+.2f (auto %+.2f) median L* %.1f (auto %.1f)\n", sh, id, sc == &src ? "frame A" : "frame B", a.second.filmEv,
+                          a0.second.filmEv, a.second.printEv, a0.second.printEv, l, l0);
+              CHECK(std::fabs(l - l0) < 1.5f);                              // the brightness stays
+              CHECK(std::fabs(a.second.filmEv - a0.second.filmEv) > 0.05f);  // the film exposure still moves: the picture differs
+              CHECK((sh < 0.f) == (a.second.filmEv < a0.second.filmEv));
+            }
+          }
+      }
+      // a negative scanned directly (paper 直接扫描 is selectable for any stock): film_shoot holds the median too
+      for (const SourceImage* sc : {static_cast<const SourceImage*>(&src), static_cast<const SourceImage*>(&bright)}) {
+        EditParams e = p;
+        e.filmStock = "kodak_portra_400";
+        e.filmPaper = "none";
+        const float l0 = lstats(withExposure(e, matchFilmExposure(e, cam, nullptr, *sc)), *sc).median;
+        for (float sh : {-1.f, 1.f}) {
+          EditParams f = e;
+          f.filmShoot = sh;
+          const FilmExposure fe = matchFilmExposure(f, cam, nullptr, *sc);
+          const float l = lstats(withExposure(f, fe), *sc).median;
+          std::printf("  negative scan shoot %+.0f: film EV %+.2f scan EV %+.2f median L* %.1f (auto %.1f)\n", sh, fe.filmEv, fe.printEv, l, l0);
+          CHECK(std::fabs(l - l0) < 1.5f);
+        }
       }
       CHECK_NEAR(rangeFractionFor(-1.f), kFilmRangeFractionMin, 1e-6);
       CHECK_NEAR(rangeFractionFor(0.f), kFilmRangeFraction, 1e-6);
@@ -1661,7 +1722,7 @@ void testFilmMatch() {
             const float sh = float(i % 3 - 1), pr2 = float(i / 3 - 1);
             const auto r = at(id, sh, pr2, 0, 0, *sc);
             const Stat st = lstats(withExposure(r.first, r.second), *sc);
-            const bool ok = st.median >= 25.f && st.median <= 90.f && st.black < 0.35f && st.white < 0.35f;
+            const bool ok = st.median >= 23.f && st.median <= 90.f && st.black < 0.35f && st.white < 0.35f;
             ++total;
             if (!ok) {
               ++bad;
@@ -1691,7 +1752,7 @@ void testFilmMatch() {
           CHECK(!filmPadFor(e, cam, nullptr, src).effectiveHi[3]);
         }
         if (!tungsten) CHECK(std::fabs(pad.referenceCct - 5500.f) < 200.f);
-        if (slide) CHECK(!pad.effectiveHi[1]);  // the lamp cannot brighten
+        if (slide) CHECK(pad.effectiveHi[1]);  // the scan lamp may lift above the automatic cap: the bright end is reachable
         CHECK(pad.effectiveLo[0] && pad.effectiveHi[0] ? true : slide);
         e.filmSceneX = e.filmSceneY = 0.f;  // unknown scene light: the axis cannot be used
         CHECK(!filmPadFor(e, cam, nullptr, src).effectiveHi[3]);

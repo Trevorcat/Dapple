@@ -102,7 +102,7 @@ Future<(AppState, String)> openEditor(WidgetTester t) async {
     child: MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: buildTheme(Brightness.light),
-      home: EditorPage(app: app, photoId: id, resamplePointers: false, filmPadFetcher: (_) async => null,
+      home: EditorPage(app: app, photoId: id, resamplePointers: false,
         lookSwatchSource: (pid, base) {
           lookBases.add(base);
           final f = FakeSource('looks|$pid|$base', lookImgs);
