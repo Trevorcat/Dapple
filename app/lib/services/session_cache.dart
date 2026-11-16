@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import '../models.dart';
 import '../native/dapple_session.dart';
 import '../state/app_state.dart';
+import 'library_prune.dart';
 
 typedef _Src = ({String path, bool temp});
 
@@ -41,6 +42,10 @@ class SessionCache {
   Future<({int w, int h})?> Function(Photo ph)? testFullSize;
   @visibleForTesting
   Future<DappleSession?> Function(Photo ph)? testOpener;
+
+  /// Why the last open of a photo failed (cleared when a new open starts): the editor says so instead of spinning for ever.
+  final Map<String, SourceFailure> _failed = {};
+  SourceFailure? failureOf(String id) => _failed[id];
 
   bool get available => testAvailable ?? (!_app.isDemo && DappleSession.isAvailable);
 
@@ -125,8 +130,9 @@ class SessionCache {
           final s = await _app.resolveSource(ph);
           if (s.temp) _temp[ph.id] = s.path;
           return s;
-        } catch (_) {
+        } catch (e) {
           _src.remove(ph.id);
+          _failed[ph.id] = classifySourceError(e);
           return null;
         }
       });
@@ -155,13 +161,15 @@ class SessionCache {
   }
 
   Future<DappleSession?> _openNew(Photo ph, bool background) async {
+    _failed.remove(ph.id);
     try {
       if (testOpener != null) return await testOpener!(ph);
       final src = await _resolve(ph);
       if (src == null) throw '没有源文件';
       return await DappleSession.open(src.path, full: false, longEdge: 2048, background: background);
-    } catch (_) {
+    } catch (e) {
       _open.remove(ph.id);
+      _failed.putIfAbsent(ph.id, () => classifySourceError(e)); // the source's own answer (set by _resolve) wins
       return null;
     }
   }
@@ -302,6 +310,9 @@ class SessionCache {
     _detailId = null;
     if (f != null) unawaited(f.then((s) => s?.close()));
   }
+
+  /// Closes [id]'s session (a photo that left the library).
+  Future<void> close(String id) => _close(id);
 
   Future<void> _close(String id) async {
     if (id == _detailId || id == _regionId) closeDetail();

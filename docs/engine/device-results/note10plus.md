@@ -698,3 +698,16 @@ The first native build in the worktree took 17 min (ninja pools 4 compile / 2 li
 * Device (Note10+, fresh app data, `build/dev3/app5-arm64.apk`, built from a worktree of HEAD 9a19297 plus the uncommitted hunks): first shot, badge `RAW + JPEG · 待确认`: `shot 1 (RAW_JPEG): saved 1/2` at +0.83 s, DNG missing after 3 s, `RAW_JPEG failed on this lens, now RAW`, shot 3 (RAW) saved at +1.8 s, the editor opened on the DNG, the library thumbnail is the engine's develop of the DNG, `Pictures/Dapple` got `DAP_..._003913.dng` (24 415 080 B) and `DAP_..._003913.jpg` (21.4 MB, developed, 3008x4016) (`b_01..b_04`). Second shot: badge `RAW`, saved in 0.77 s, no stall.
 * `sample2.dng`: `build/dev3/note10plus/sample2.dng` (24 415 080 B, same format as sample.dng). The phone lies on its back, the scene is a dark flat surface at close range, not a normal scene. **The engine's develop of it is dark with strong magenta/purple noise** (developed JPEG mean RGB about 60/40/60; the camera's own JPEG of the same spot had looked mid grey earlier): worth checking in the DNG opcode work (black level, as-shot neutral, lens shading opcodes, auto exposure for a very dark frame).
 * Cleanup: test files in `Pictures/Dapple` deleted (MediaStore rows too, folder removed); the app's private library copies are gone because I ran `pm clear` on the app (only test photos and default settings were in it), then re-granted CAMERA and READ_EXTERNAL_STORAGE with `pm grant`; the app stays installed. The `dapple_capture` strategy memory was cleared with it, so the next camera use on this phone starts with RAW+JPEG again and learns RAW-only after one 3 s stall.
+
+## 2026-11-16 (a9d76de, in the app, battery saver on) Film exports after the quarter-scale low planes
+
+One export each, stock kodak_portra_400 at the stock's own grain and halation, `export_stream GPU ... ok`:
+
+| file | total (ms) | before (5a57516) |
+|---|---|---|
+| A6700 26 MP | 4470 | 7250 |
+| X-S10 26 MP | 5884 | 8700 |
+| X-T50 40 MP | 9474 | 15000 |
+| A7RM4 61 MP | 9266 | 18700 |
+
+Largest stage: waiting for the GPU tiles (A6700 2305, X-T50 3876, A7RM4 5834 ms). Without film: A7RM4 3762 ms (was 4300 - 4500). No tile seams (neighbour-difference ratio at tile multiples 0.98 - 1.09). Film pad drags (one large 2 s swipe, not comparable with the earlier slow drags): exposure pad frame p50 / p90 18.7 / 28.2 ms, colour pad 29.0 / 37.4 ms; the print-table easing has still no like-for-like phone measurement.

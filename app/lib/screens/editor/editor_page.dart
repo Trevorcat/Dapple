@@ -21,6 +21,7 @@ import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../models.dart';
 import '../../services/editor_engine.dart';
+import '../../services/library_prune.dart' show SourceFailure;
 import '../../state/app_state.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart';
@@ -796,6 +797,11 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
               )
             : const SizedBox.shrink(),
       ),
+      // the photo's source is gone or cannot be opened: one line and the one step that helps, over the photo and every control under the bar
+      ListenableBuilder(
+        listenable: engine,
+        builder: (context, _) => engine.openFailure == null ? const SizedBox.shrink() : Positioned.fill(child: _openFailed(engine.openFailure!)),
+      ),
       // 3 top bar and dock (hidden in immersive mode)
       ValueListenableBuilder<bool>(
         valueListenable: ctl.immersive,
@@ -833,10 +839,16 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
                   rect: _geoNow().dock,
                   child: IgnorePointer(
                     ignoring: imm,
-                    child: AnimatedOpacity(
-                      opacity: imm ? 0 : 1,
-                      duration: const Duration(milliseconds: 150),
-                      child: Align(alignment: Alignment.center, child: PadDock(ctl: ctl)),
+                    child: ListenableBuilder(
+                      listenable: engine,
+                      builder: (context, _) => IgnorePointer(
+                        ignoring: engine.openFailure != null,
+                        child: AnimatedOpacity(
+                          opacity: imm || engine.openFailure != null ? 0 : 1,
+                          duration: const Duration(milliseconds: 150),
+                          child: Align(alignment: Alignment.center, child: PadDock(ctl: ctl)),
+                        ),
+                      ),
                     ),
                   ),
                 ),
@@ -977,6 +989,49 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
   /// Progress hint while the placeholder is still on screen: only appears after [hintDelay] (a quick open
   /// never shows it), a spinner without words (guidelines 10.13), fixed in the photo's top leading corner.
   Widget _previewPill() => OpenTiming.legacy ? const DelayedBusy(key: ValueKey('preview-busy'), delay: Duration.zero) : const DelayedBusy(key: ValueKey('preview-busy'));
+
+  /// Shown instead of the photo and the controls when no session can be opened (guidelines 10.13: what happened, then the one step that
+  /// helps; the original gone or broken can only be removed). Back stays in the top bar above it.
+  Widget _openFailed(SourceFailure why) {
+    final c = context.c;
+    final msg = why == SourceFailure.gone ? '原文件已不在这台设备上' : '这张照片无法打开';
+    return ColoredBox(
+      key: const ValueKey('open-failed'),
+      color: c.stage,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: Sp.xl),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text(msg, key: const ValueKey('open-failed-text'), textAlign: TextAlign.center, style: T.body17(c.text, w: FontWeight.w500)),
+            const SizedBox(height: Sp.l),
+            SizedBox(
+              width: 200,
+              child: KeyedSubtree(
+                key: const ValueKey('open-failed-remove'),
+                child: SecondaryButton('从图库移除', height: 48, onPressed: _removeUnopenable),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  /// 从图库移除: back to the library first, the entry goes once the page has left (the page reads its photo while it animates out).
+  void _removeUnopenable() {
+    final photo = app.photoById(id);
+    if (photo == null) {
+      Navigator.of(context).pop(); // already gone from the library
+      return;
+    }
+    final route = ModalRoute.of(context);
+    Navigator.of(context).pop();
+    if (route == null) {
+      app.removeUnopenable(photo);
+    } else {
+      unawaited(route.completed.then((_) => app.removeUnopenable(photo)));
+    }
+  }
 
   Widget _photoStage() {
     return ListenableBuilder(

@@ -30,6 +30,7 @@ import '../services/ftp_ingest.dart';
 import '../services/usb_ingest.dart';
 import '../services/ingest.dart';
 import '../services/ingest_log.dart';
+import '../services/library_prune.dart';
 import '../services/live_bridge.dart';
 import '../services/merge_check.dart';
 import '../services/merge_engine.dart';
@@ -693,6 +694,7 @@ class AppState extends ChangeNotifier {
     if (nativeOk) unawaited(MemoryPolicy.start(this)); // device memory class -> engine, onTrimMemory, image cache bound (42.9)
     await _loadFilm();
     await _loadLibrary();
+    await pruneMissingSources(); // before the repair: a missing thumbnail of a dead entry would queue it for development
     _repairPaths();
     await _loadDetection();
     ready = true;
@@ -899,6 +901,7 @@ class AppState extends ChangeNotifier {
       await _prefs.setInt('ingestSince', since);
       scanDone = true;
       notifyListeners();
+      unawaited(pruneMissingSources());
     } catch (e) {
       debugPrint('scan failed: $e');
     } finally {
@@ -1007,6 +1010,60 @@ class AppState extends ChangeNotifier {
     });
   }
 
+  /// A photo that cannot be opened in the editor (its original is gone, or cannot be decoded): the entry and its thumbnail go, the phone's
+  /// own files are not touched. Unlike [removeFromLibrary] there is nothing to undo: the picture cannot be shown any more.
+  void removeUnopenable(Photo ph) {
+    if (_photos.remove(ph.id) == null) return;
+    unawaited(sessions.close(ph.id));
+    _tryDelete(ph.previewPath);
+    changed();
+    showToast('已移除「${ph.title}」');
+  }
+
+  bool _pruning = false;
+
+  /// Takes the entries whose source file no longer exists out of the library, with their thumbnails. One batch, looked up off the UI
+  /// thread ([missingSourceIds]); an entry goes only when the answer is a certain "no such file" in a folder that exists. Entries that are
+  /// still arriving, queued or developing (an import in progress), the photo the editor has open, non-photo kinds, ids of camera uploads, and every case where the
+  /// lookup fails for another reason (permission, card out) stay. Returns the number removed.
+  Future<int> pruneMissingSources() async {
+    if (isDemo || _pruning) return 0;
+    _pruning = true;
+    try {
+      bool candidate(Photo ph) =>
+          (ph.status == PhotoStatus.done || ph.status == PhotoStatus.failed) &&
+          ph.kind == PhotoKind.photo &&
+          ph.path != null &&
+          !ph.id.startsWith('ftp:arr:') &&
+          !ph.id.startsWith('usb:arr:');
+      final probes = <SourceProbe>[
+        for (final ph in _photos.values.where(candidate))
+          (id: ph.id, paths: [ph.path!, p.join(inbox.path, p.basename(ph.path!))]),
+      ];
+      final dead = await missingSourceIds(probes);
+      if (dead.isEmpty || importing) return 0; // an import started meanwhile: the next pass decides
+      var n = 0;
+      for (final id in dead) {
+        final ph = _photos[id];
+        if (ph == null || !candidate(ph) || sessions.current == id) continue; // changed while the batch ran / open in the editor right now
+        _photos.remove(id);
+        _tryDelete(ph.previewPath);
+        unawaited(sessions.close(id));
+        n++;
+      }
+      if (n > 0) {
+        ingestLog('library: $n photo(s) whose source file is gone were removed');
+        changed();
+      }
+      return n;
+    } catch (e) {
+      debugPrint('prune library failed: $e');
+      return 0;
+    } finally {
+      _pruning = false;
+    }
+  }
+
   /// Debug builds only (DebugOpen `{"purgeCaptures":true}`): removes every in-app capture (`cap:` ids) and its private files from the library.
   /// The library has no delete action; this is how test shots are cleaned up on a device.
   int purgeCaptures() {
@@ -1104,6 +1161,13 @@ class AppState extends ChangeNotifier {
 
   /// Tests: puts a bare photo with [id] into the library.
   @visibleForTesting
+  /// Tests: the folders a non-demo app reads and writes (library file, inbox), without the platform's path provider.
+  @visibleForTesting
+  void useFoldersForTest(Directory docs) {
+    _docs = docs;
+    inbox = Directory(p.join(docs.path, 'inbox'));
+  }
+
   void simulatePhotoForTest(Object idOrPhoto) {
     final ph = idOrPhoto is Photo ? idOrPhoto : Photo(id: idOrPhoto as String, name: idOrPhoto, addedMs: 1, status: PhotoStatus.done);
     _photos[ph.id] = ph;

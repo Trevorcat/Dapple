@@ -15,6 +15,7 @@ import '../native/dapple_session.dart';
 import 'adaptive_quality.dart';
 import 'edit_interaction.dart';
 import 'gpu_view_backend.dart';
+import 'library_prune.dart';
 import 'memory_policy.dart';
 import 'perf_probe.dart';
 import 'session_cache.dart';
@@ -343,7 +344,11 @@ class EditorEngine extends ChangeNotifier {
   bool get live => app.sessions.available && photo?.demo == null;
 
   /// True while the picture shown is a placeholder, not yet the engine's render.
-  bool get previewOnly => live && image == null;
+  bool get previewOnly => live && image == null && openFailure == null;
+
+  /// Set when the photo's session could not be opened (the source is gone, or cannot be read / decoded): the editor says so and offers to
+  /// remove the photo instead of waiting. Cleared by [attach] and by the next successful open.
+  SourceFailure? openFailure;
 
   /// [neighbors] (next, previous) are decoded in the background once this photo is on screen.
   void attach(Photo p, {List<Photo> neighbors = const []}) {
@@ -380,6 +385,7 @@ class EditorEngine extends ChangeNotifier {
     }
     if (photo?.id != p.id) app.sessions.closeDetail(); // the high-resolution session belongs to one photo
     photo = p;
+    openFailure = null;
     _neighbors = neighbors;
     _gpuDetachSession();
     _disposeImages();
@@ -494,7 +500,9 @@ class EditorEngine extends ChangeNotifier {
         _dirty = false;
         final ph = photo!;
         final s = await app.sessions.get(ph);
+        if (s == null && myGen == _gen) openFailure = app.sessions.failureOf(ph.id) ?? SourceFailure.unreadable;
         if (s == null || myGen != _gen) break;
+        openFailure = null;
         final interactive = _interactiveNow;
         final params = app.wireParams(ph);
         if (hideLocal) params.remove('local'); // 局部's 对比: the photo without its local areas
