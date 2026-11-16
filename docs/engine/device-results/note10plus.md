@@ -1,5 +1,51 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (5a57516) film exports on the GPU stream
+
+Release APK of HEAD 5a57516 (built 14:17, `install -r` 14:17), Note10+ RFCMA05Q5ZX, taps only (every input preceded by a resumed-activity check), scripts / logs / pulled exports in `build/perf-20261116h/`. State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 28.8 C at start, 31.6 C at the end, `Thermal Status 0`, no reboot. `debug.dapple.frame_profile` set to 1, reset to empty. Files: public samples as `T1116h_{6700.ARW,6700b.ARW,7rm4.ARW,xs10.RAF,xt50.RAF}`, scanned with `MEDIA_SCANNER_SCAN_FILE`. **Film: N400C at 100 % for every run** (picked from the 成像 panel). No crash, ANR, `exec=cpu`, `reason=`, `FilmTiledLocal`, `vkAllocateMemory` or GPU error line in any log. Every film export ran as `export_stream GPU ... ok`.
+
+**Method note:** an export of an unchanged edit state is served from the app's export cache (no stream line, file copied in about 1 s), so reps 2 and 3 of the first batch were cache hits and are not counted. Fresh reps used the small exposure swipe before the export (as in the earlier sections): **3 fresh reps for A6700, 2 for X-S10, X-T50 and A7RM4** (the time budget did not allow a third).
+
+### Full-size JPEG export with N400C (tap to the `export_stream` line; RSS sampled every 0.25 s; HWM from /proc)
+| | total ms (fresh reps) | stage split of rep 1 (ms) | MP demosaiced | RSS max / HWM MB |
+|---|---|---|---|---|
+| A6700 26 MP | 7253 / 7260 / 7259 | analysis 413 (demosaic 144), render 6681 = source windows 693 + upload 200 + film walks 2144 + record 419 + submit 93 + wait for previous tile 2846 + sink 234 + other 51; encoder finish 58, write 24 | 26.3 in analysis + 10.9 in 5 windows | 808-827 / 970-975 |
+| A6700 + 局部 circle (亮 30) | 7696 / 7682 / 7744 | analysis 451, film walks 2425, wait 2940, record 436 | same | 809 / 967-969 |
+| X-S10 26 MP | 8652 / 8776 | analysis 2348 (CPU X-Trans demosaic 2038), render 6178 = windows 624 + upload 186 + film walks 1996 + record 394 + submit 99 + wait 2599 + sink 238; finish 40, write 24 | 26.0 (analysis only, 0 windows) | 800 / 970-972 |
+| X-T50 40 MP | 15082 / 14876 | analysis 3491 (demosaic 3028), render 11395 = windows 976 + upload 318 + film walks 3771 + record 626 + submit 146 + wait 5105 + sink 376; finish 38, write 71 | 40.1 (analysis only) | 1030 / 1055-1082 |
+| A7RM4 61 MP | 18733 / 18945 | analysis 851 (demosaic 367), render 17616 = windows 1723 (demosaic 1042) + upload 640 + film walks 5575 + record 931 + submit 209 + wait 7940 + sink 535; finish 150, write 54 | 64.1 in analysis + **124.2 in 28 windows (4328 rows demosaiced twice or more, 2048 from the cache)** | 891-912 / 920-935 |
+
+The stage timers add up to the total (render + encoder finish + file write + other); "GPU busy 0 ms" is logged in all (counter not filled). Before (from the brief, not re-measured): A6700 film + 局部 on the CPU stream 13.6 s, RSS 1.10 GB; now 7.7 s and 0.97 GB HWM. I have no in-app before numbers for X-S10, X-T50, A7RM4 with film. The largest stage everywhere is "wait for the previous tile" (about 35-45 % of the total), then the film walks (about 30 %).
+
+### Correctness (A6700 6240x4168, X-S10 6246x4170, X-T50 7752x5178, A7RM4 9568x6376; one export per file pulled, orientation tag 1)
+Looked at the whole picture plus a 900x600 100 % crop across a 640 multiple per file (A7RM4 on flat sky at x = 3840; A6700 also with the 局部 circle at x = 3200): grain continuous, no grid, no band, no colour step, no black or missing tile, bottom and right edges normal (last 4 columns / rows within 1-3 levels of the 8 before them, no pixel below 2). Mean absolute difference of adjacent columns at x = 640k against all other columns (grey): A6700 8.59 vs 8.51 (rows 8.40 vs 8.59), X-S10 7.64 vs 7.45 (7.28 vs 7.47), X-T50 9.35 vs 9.51 (8.80 vs 9.43), A7RM4 5.18 vs 4.98 (5.47 vs 4.98, scene edges). A phase scan (mean local ratio per position mod 640) shows no spike at phase 639 in any file; the best phase is at an arbitrary offset in each (ratio 1.07-1.19, over 8-14 samples). Flat A7RM4 sky strip: 5.18 at the seams, other phases 4.78-5.31. Mean colour step across a seam (16 px left against right): median 0.14 (A7RM4 sky), 0.24-1.3 elsewhere against 0.11-0.8 at an offset of 320. A6700 + 局部: 6.56 vs 6.28 in the circle band, the brightening continues over the tile borders. Not a pixel-for-pixel comparison with a CPU render.
+
+### Determinism
+A6700 with N400C and no other edit, exported in the first app session and again from a second copy of the file (`T1116h_6700b.ARW`, separate process, 7312 ms): the two JPEGs are byte identical, md5 `da5921f635e79363357c712a4e34bb25` both (20667845 bytes). An unchanged re-export of the same photo is served from the cache, so the second copy was used to force a second computation.
+
+### No film, same build
+A6700 whole frame (`export_jpeg`): 1.94 s tap to the log line (open 391, render 802, encode+write 591; RSS 851 MB, HWM 919 MB). A7RM4 61 MP stream: 4178 ms (analysis 813, render 3188, finish 149; 41.4 MP in 10 windows, no film walks; RSS 788 MB, HWM 929 MB), against 4.34-4.46 s at f78c661. No regression.
+
+### Interactive drags with N400C selected (X-S10, 5 each, 700 ms swipe, interactive frames, exec=vulkan, film=on; ms first / rest median)
+| drag | frame total | tables | upload | rungs |
+|---|---|---|---|---|
+| exposure | 30.2 [16.1-98.1] / 10.1 | 17.9 / 8.8 | 0.5 / 0.0 | 810 and 1080 |
+| colour pad | 32.2 [28.5-82.0] / 14.2 | 30.3 / 12.7 | 0.4 / 0.0 | 810 and 1080 |
+
+No first frame over 100 ms, waitMs 0. Earlier film colour pad (f78c661, 20 drags): 28.9 / 20.3, so no sign of a slowdown.
+
+### Drag during an A7RM4 film export (exposure swipes back and forth for 18.6 s, starting 1.3 s after the tap)
+Export: **33.0 s** against 18.7-18.9 s alone, still on the GPU stream; the CPU demosaic of the windows took 14.0 s against 1.04 s (source windows 14720 ms), turn 1182 ms, peak footprint 1281 MB (892 alone), encode 1129. Drag: 512 interactive frames, `exec=vulkan`, film on, rungs 810 (387) and 1080 (125); frame total median 15.9 / p90 34.9 / max 201 ms; tables median 14.4; **waitMs median 0.0, max 90.9**; view latency **median 28.9 / p90 58.9 / max 287.6 ms, 18 of 512 over 100 ms**; 8 frames over 100 ms in frame ms. Drag alone (X-S10 film, rest frames): view latency median 24-27 ms. The film walks do not hold the GPU for the drag, but the drag costs the export about 14 s (CPU demosaic contention, as in the earlier no-film section) and about 400 MB more memory.
+
+### Slower or worse
+Nothing slower than the CPU stream. X-S10 and X-T50 run the CPU X-Trans demosaic inside the analysis pass (2.0 s, 3.0 s) before the GPU render. A7RM4 film exports demosaic the windows twice over (124 MP for a 61 MP picture, 1.0 s CPU) because the film windows and the low-plane walks re-read rows.
+
+### Not measured
+Third fresh rep for X-S10, X-T50 and A7RM4; an in-app "before" for film exports other than the 13.6 s A6700 figure; film + local detail operation (`FilmTiledLocal` CPU path); GLES; other stocks; CPU frequency.
+
+### Cleanup
+`adb -s RFCMA05Q5ZX shell rm /sdcard/Pictures/DappleT1116h/T1116h_*`, `rmdir /sdcard/Pictures/DappleT1116h`, `rm /sdcard/Pictures/Dapple/T1116h_*`; the two permitted `ls` forms report both absent. Prop reset (empty). Screenshots deleted (only crops of the public samples remain in `build/perf-20261116h/`). The app library keeps its entries for the test photos (no `pm clear`).
+
 ## 2026-11-16 (f78c661) 61 MP export, lattice 53
 
 Release APK of HEAD f78c661 (built 11:48, `install -r` 11:49), Note10+ RFCMA05Q5ZX, taps only (every input preceded by a resumed-activity check), scripts / logs in `build/perf-20261116g/`. State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 26.3 C at start, 29.5 C at the end, `Thermal Status 0`, no reboot. `debug.dapple.frame_profile` set to 1, reset to empty. Files: public samples as `T1116g_{6700.ARW,7rm4.ARW,xs10.RAF,xt50.RAF}`, scanned with `MEDIA_SCANNER_SCAN_FILE`. No crash, ANR, `exec=cpu`, `reason=` or GPU error line in any log (12 + 2 exports, 60 + 20 drags, 12 opens).
