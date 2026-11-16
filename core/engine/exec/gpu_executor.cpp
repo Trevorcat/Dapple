@@ -458,27 +458,31 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
 
   const bool filmFrame = in.plan.hasFilm;
   if (filmFrame && in.plan.needAux)  // the side planes of a film frame come from its whole-frame input pass
-    return fail(GpuReason::FilmTiledLocal, "tiled film export with local detail ops (docs section 40.7): CPU executor"), Status::Unsupported;
+    return fail(GpuReason::FilmTiledLocal, "tiled film export with local detail ops (docs sections 40.7, 59): the stage-W amounts of a window are not computed per window on the GPU: CPU executor"),
+           Status::Unsupported;
   bool lattice = false;
   in.plan.forEachNode([&](NodeId id) {
     const GpuImpl* gi = gpuImplFor(in.graph.nodes()[id].type);
     lattice |= gi && gi->lattice;
   });
   filmnode::FilmResolved fres;
-  if (filmFrame) {  // the whole-frame part of the film (the level-2 planes of its mixtures) is kept on the device while the tiles run; the source is resident
-    if (std::uint64_t(P.geo.outW) * P.geo.outH * 128 > std::uint64_t(double(caps.deviceLocalBytes) * 0.5))
-      return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
+  int filmGrow = 0;  // pixels a film tile's source window reaches around the tile's work window (film window + the mixtures' reach + alignment)
+  if (filmFrame) {  // the whole-frame part of the film (the level-2 planes of its mixtures, 1.5 B/px, and their input plane, 0.5 B/px) is kept on the device while the tiles run
     if (!filmResolve(in, fres)) return Status::Unsupported;
-    if (tile + 2 * (halo + filmnode::filmWindowHalo(fres) + filmnode::filmMixHalo(fres)) > int(caps.maxImage2D))  // the film window grows the work window
+    filmGrow = filmnode::filmWindowHalo(fres) + filmnode::filmMixHalo(fres) + 4;
+    if (tile + 2 * (halo + filmGrow) > int(caps.maxImage2D))  // the film window grows the work window
       return fail(GpuReason::FrameTooLarge, "device image limit too small for the film windows"), Status::Unsupported;
+    // device memory: a film window costs ~128 B per pixel of transients (a frame that is one tile: the whole frame), the kept planes 2 B per pixel of the frame
+    const std::uint64_t outPx = std::uint64_t(P.geo.outW) * P.geo.outH;
+    const std::uint64_t winPx = std::uint64_t(std::min(P.geo.outW, tile + 2 * (halo + filmGrow))) * std::uint64_t(std::min(P.geo.outH, tile + 2 * (halo + filmGrow)));
+    if (winPx * 128 + outPx * 2 > std::uint64_t(double(caps.deviceLocalBytes) * 0.5))
+      return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
     filmnode::FilmTablesHandle warm;  // CPU bakes without the device (process-wide caches)
     filmnode::tablesFor(fres, warm);
     filmnode::planOf(fres);
   }
-  // the source: resident (small enough) or streamed per tile; a film export keeps it resident (the whole-frame film part reads all of it)
-  const bool resident = filmFrame ? (canResident(W_, H_) && canResident(rw, rh))
-                                  : (!in.forceStream && canResident(W_, H_) && canResident(rw, rh) && std::uint64_t(W_) * H_ <= 40000000ull);
-  if (filmFrame && !resident) return fail(GpuReason::FilmNotResident, "film export needs the source resident on the device"), Status::Unsupported;
+  // the source: resident (small enough) or streamed per tile; a streamed film export reads it in bands too: the walks that build the low planes, then the tiles' windows
+  const bool resident = !in.forceStream && canResident(W_, H_) && canResident(rw, rh) && (filmFrame || std::uint64_t(W_) * H_ <= 40000000ull);
 
   Turn turn(*this, in);
   if (!turnOk()) return failed(Status::Internal);
@@ -542,48 +546,10 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     for (const Global& gl : globals) w.solves.push_back(SolveRes{gl.node, gl.accum, g.external(*gl.grid), g.external(*gl.solved)});
   };
 
-  // ---- film: the level-2 planes of the mixtures over the whole frame, once (1/16 of the pixels and less; windows recompute the rest); the tiles read
-  // them as persistent images. One tile covering the frame builds them itself. ----
+  // ---- film: the level-2 planes of the mixtures are built by walks over windows of the picture before the tiles (below); the tiles read them as persistent
+  // images. One tile covering the frame builds them itself. ----
   hal::ImageH *filmLow[3] = {nullptr, nullptr, nullptr};
   bool filmAny = false;
-  if (filmFrame && (P.geo.outW > tile || P.geo.outH > tile)) {
-    auto cl = d.begin();
-    if (!cl) return failStatus(hal::Status::Timeout, ""), Status::Internal;
-    std::string perr;
-    GpuGraph g(d, pool);
-    GpuRecorder rec(d, g, perr);
-    recorderFor(rec, cl->slot());
-    Walk wp(rec, in, true);
-    wp.interior = wp.work = WRect{0, 0, P.geo.outW, P.geo.outH};
-    wp.job.src.img = g.external(*S);
-    if (HD && P.warp.active()) wp.job.src.warp = g.externalBuf(HD->buf), wp.job.src.warpOff = warpOff;
-    wp.fres = &fres;
-    wp.ftab = &DF->gt;
-    wp.fplan = &DF->pr;
-    if (LDsc && LPl) {
-      wp.job.ldesc = g.externalBuf(LDsc->buf);
-      wp.job.lplanes = g.externalBuf(LPl->buf);
-    }
-    filmnode::FilmPre pre;
-    if (!wp.filmLowPass(pre)) return failRecord(rec, perr), failed(Status::Internal);
-    filmAny = pre.any;
-    int lw = 0, lh = 0;
-    filmnode::filmLowSize(P.geo.outW, P.geo.outH, lw, lh);
-    hal::Status ms = hal::Status::Ok;
-    const gpu::H lows[3] = {pre.lowPre, pre.lowHalo, pre.lowDir};
-    for (int i = 0; i < 3; ++i) {
-      if (lows[i] < 0) continue;
-      filmLow[i] = keep.add();
-      if (ms == hal::Status::Ok) ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(lw), std::uint32_t(lh), 1}, filmLow[i]);
-      if (ms == hal::Status::Ok) g.copyImage(lows[i], g.external(*filmLow[i]), std::uint32_t(lw), std::uint32_t(lh));
-    }
-    if (ms != hal::Status::Ok) return failStatus(ms, ""), Status::Internal;
-    hal::FenceH fence;
-    ms = submit(g, *cl, &fence, perr);
-    if (ms == hal::Status::Ok) ms = d.wait(fence, kWaitNs);
-    if (ms != hal::Status::Ok) return failStatus(ms, perr), Status::Internal;
-    if (in.cancel.cancelled()) return fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled;
-  }
 
   // An output tile: `pend` is submitted (its readback buffer is being written), `ready` has been waited for and goes to the sink next.
   struct Pending {
@@ -594,7 +560,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   Pending pend, ready;
   int passes = 0, barriers = 0, parts = 0;
   const Core::UploadTimes up0 = core().uploadTimes();
-  double tSrc = 0, tUp = 0, tRec = 0, tSub = 0, tWait = 0, tSink = 0, tTurn = 0;  // host time per stage of the tile loop (GpuStats::tSrcMs ...)
+  double tSrc = 0, tUp = 0, tRec = 0, tSub = 0, tWait = 0, tSink = 0, tTurn = 0, tLow = 0;  // host time per stage of the tile loop (GpuStats::tSrcMs ...)
   std::string err;
   auto readbackFor = [&](int i, std::size_t bytes) -> bool {  // inside the turn
     hal::BufferH& b = tileRb_[i];
@@ -629,12 +595,15 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   // The source window of a streamed tile (the plan's, the CPU executor's), read before the tile's turn: the store may demosaic a band of the
   // picture for it (hundreds of ms on a phone), host work that must not hold the device while an interactive frame waits.
   struct SrcRead {
-    SrcWin win;
+    WRect fp;    // the rect of the source grid the work reads
+    SrcWin win;  // what the store is asked for (the Lanczos support of fp when the source is resized)
     const float* base = nullptr;
     std::size_t pitch = 0;
   };
-  auto readSource = [&](const TileWin& tw, SrcRead& sr) -> bool {
-    const WRect fp = wrect(tw.source);
+  // the source rect of a rect of the picture: through the geometry (the plan's sourceOf; the Resize node, when there is one, scales the grid before it)
+  auto srcRectOfPicture = [&](int x0, int y0, int x1, int y1) { return wrect(point::sourceWindow(P, Rect{x0, y0, x1, y1})); };
+  auto readRect = [&](SrcRead& sr) -> bool {
+    const WRect fp = sr.fp;
     sr.win = SrcWin{fp.x0, fp.y0, fp.x1, fp.y1};
     if (resident) return true;
     if (down) sr.win = lanczosWindow(rb, fp);
@@ -643,6 +612,14 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     tSrc += msSince(ts);
     return sr.base || fail(GpuReason::DeviceError, "source store cannot be read");
   };
+  auto readSource = [&](const TileWin& tw, SrcRead& sr) -> bool {
+    if (filmFrame)  // a film tile reads its work window grown by the film window and the mixtures' reach
+      sr.fp = srcRectOfPicture(std::max(0, tw.work.x0 - filmGrow), std::max(0, tw.work.y0 - filmGrow), std::min(P.geo.outW, tw.work.x1 + filmGrow),
+                               std::min(P.geo.outH, tw.work.y1 + filmGrow));
+    else
+      sr.fp = wrect(tw.source);
+    return readRect(sr);
+  };
 
   // one sweep over one tile of the plan (inside the tile's turn)
   auto runTile = [&](const Stage& st, const TileWin& tw, const SrcRead& sr) -> bool {
@@ -650,7 +627,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     // 1. the source window of a streamed export is uploaded first (the upload takes frame slots of its own)
     hal::ImageH acquired;
     bool haveAcq = false;
-    const WRect fp = wrect(tw.source);
+    const WRect fp = sr.fp;
     const SrcWin win = sr.win;
     if (!resident) {
       const hal::Status as = pool.acquire(hal::Format::RGBA16F, std::uint32_t(win.w()), std::uint32_t(win.h()), &acquired);
@@ -779,6 +756,79 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     return ss == hal::Status::Ok || failStatus(ss, err);
   };
 
+  // ---- film, streamed source: the walks that build the low planes read the picture band by band; every window is its own graph and device turn, and its
+  // source window is read from the store before the turn (a drag frame waits for no demosaic: section 54). The planes are persistent images. ----
+  hal::ImageH* filmP2 = nullptr;
+  filmnode::FilmLowPlan lowPlan;
+  auto filmWalkWindow = [&](int stage, const filmnode::FilmWin& tl, const SrcRead& sr) -> bool {  // inside the turn
+    hal::ImageH acquired;
+    const SrcWin win = sr.win;
+    if (!resident) {
+      const hal::Status as = pool.acquire(hal::Format::RGBA16F, std::uint32_t(win.w()), std::uint32_t(win.h()), &acquired);
+      if (as != hal::Status::Ok) return failStatus(as, "");
+      if (!core().uploadRgbF32(sr.base, sr.pitch, win.w(), win.h(), acquired, 0, 0, err, {}, ctx_->api() != hal::Api::Vulkan && ctx_->api() != hal::Api::Gles31)) {
+        pool.release(acquired);
+        return fail(d.state() == hal::DeviceState::Lost ? GpuReason::DeviceLost : GpuReason::DeviceError, err);
+      }
+    }
+    auto cl = d.begin();
+    if (!cl) {
+      if (!resident) pool.release(acquired);
+      return failStatus(hal::Status::Timeout, "");
+    }
+    GpuGraph g(d, pool);
+    GpuRecorder rec(d, g, err);
+    recorderFor(rec, cl->slot());
+    Walk wp(rec, in, true);
+    wp.interior = wp.work = WRect{0, 0, P.geo.outW, P.geo.outH};
+    bool ok = true;
+    if (resident) {
+      wp.job.src.img = g.external(*S);
+    } else if (down) {
+      const H s2 = recordResize(rec, g.external(acquired), win, rb, sr.fp);
+      ok = s2 >= 0;
+      wp.job.src.img = s2;
+      wp.job.src.ox = sr.fp.x0;
+      wp.job.src.oy = sr.fp.y0;
+    } else {
+      wp.job.src.img = g.external(acquired);
+      wp.job.src.ox = win.x0;
+      wp.job.src.oy = win.y0;
+    }
+    if (HD && P.warp.active()) wp.job.src.warp = g.externalBuf(HD->buf), wp.job.src.warpOff = warpOff;
+    wp.fres = &fres;
+    wp.ftab = &DF->gt;
+    wp.fplan = &DF->pr;
+    if (LDsc && LPl) {
+      wp.job.ldesc = g.externalBuf(LDsc->buf);
+      wp.job.lplanes = g.externalBuf(LPl->buf);
+    }
+    if (ok)
+      ok = filmnode::recordFilmLowWindow(rec, fres, DF->gt, lowPlan, stage, P.geo.outW, P.geo.outH, tl, wp.filmSrcFn(), g.external(*filmP2),
+                                         filmLow[0] ? g.external(*filmLow[0]) : H(-1), filmLow[1] ? g.external(*filmLow[1]) : H(-1));
+    if (!ok) {
+      if (!resident) pool.release(acquired);
+      return failRecord(rec, err);
+    }
+    const hal::Status ss = submit(g, *cl, nullptr, err);
+    if (!resident) pool.release(acquired);
+    return ss == hal::Status::Ok || failStatus(ss, err);
+  };
+  auto filmBuildLow = [&](int stage) -> bool {  // inside the turn
+    auto cl = d.begin();
+    if (!cl) return failStatus(hal::Status::Timeout, "");
+    GpuGraph g(d, pool);
+    GpuRecorder rec(d, g, err);
+    recorderFor(rec, cl->slot());
+    const H low = filmnode::recordFilmLowBuild(rec, fres, stage, P.geo.outW, P.geo.outH, g.external(*filmP2));
+    if (low < 0) return failRecord(rec, err);
+    g.copyImage(low, g.external(*filmLow[stage]), std::uint32_t(lowPlan.l2w), std::uint32_t(lowPlan.l2h));
+    hal::FenceH fence;
+    hal::Status ss = submit(g, *cl, &fence, err);
+    if (ss == hal::Status::Ok) ss = d.wait(fence, kWaitNs);
+    return ss == hal::Status::Ok || failStatus(ss, err);
+  };
+
   // the next job's turn: the device may have been rebuilt or lost while this export waited
   auto take = [&]() {
     struct Lap {
@@ -791,6 +841,50 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   };
   int sweeps = 0, tiles = 0;
   turn.release();  // every job below takes its own turn (the first tile's source is read without one)
+  if (filmFrame && (P.geo.outW > tile || P.geo.outH > tile)) {
+    const auto tLow0 = Clock::now();
+    const double lowSrc0 = tSrc, lowTurn0 = tTurn;
+    struct LowLap {
+      double& acc;
+      Clock::time_point t;
+      const double& src;
+      const double& turn;
+      double s0, t0;
+      ~LowLap() { acc += msSince(t) - (src - s0) - (turn - t0); }
+    } lowLap{tLow, tLow0, tSrc, tTurn, lowSrc0, lowTurn0};
+    const int fw = P.geo.outW, fh = P.geo.outH;
+    if (!filmnode::filmLowPlan(fres, fw, fh, lowPlan)) return fail(GpuReason::FilmEffect, "film GPU: the film has no window form"), Status::Unsupported;
+    filmAny = lowPlan.any;
+    if (lowPlan.any) {
+      if (!take()) return failed(Status::Internal);
+      filmP2 = keep.add();
+      hal::Status ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(lowPlan.l2w), std::uint32_t(lowPlan.l2h), 1}, filmP2);
+      for (int i = 0; i < 3 && ms == hal::Status::Ok; ++i) {
+        if (!lowPlan.need[i]) continue;
+        filmLow[i] = keep.add();
+        ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(lowPlan.l2w), std::uint32_t(lowPlan.l2h), 1}, filmLow[i]);
+      }
+      turn.release();
+      if (ms != hal::Status::Ok) return failStatus(ms, ""), Status::Internal;
+      constexpr int kBand = filmnode::FilmLowPlan::kBand;
+      for (int stage = 0; stage < 3; ++stage) {
+        if (!lowPlan.need[stage]) continue;
+        for (int y0 = 0; y0 < fh; y0 += kBand)
+          for (int x0 = 0; x0 < fw; x0 += kBand) {
+            if (in.cancel.cancelled()) return fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled;
+            const filmnode::FilmWin tl{x0, y0, std::min(kBand, fw - x0), std::min(kBand, fh - y0)};
+            const filmnode::FilmWin ow = filmnode::filmLowSourceWindow(lowPlan, stage, fw, fh, tl);
+            SrcRead sr;
+            sr.fp = srcRectOfPicture(ow.x0, ow.y0, ow.x0 + ow.w, ow.y0 + ow.h);
+            if (!readRect(sr)) return in.cancel.cancelled() ? (fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled) : failed(Status::Internal);
+            if (!take() || !filmWalkWindow(stage, tl, sr)) return failed(Status::Internal);
+            turn.release();
+          }
+        if (!take() || !filmBuildLow(stage)) return failed(Status::Internal);
+        turn.release();
+      }
+    }
+  }
   for (const Stage& st : in.plan.stages) {
     if (st.kind == StageKind::TileSweep) {
       ++sweeps;
@@ -825,7 +919,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   out.stats.parts = parts;
   out.stats.tiles = tiles;
   out.stats.sweeps = sweeps;
-  out.stats.tSrcMs = tSrc, out.stats.tUpMs = tUp, out.stats.tRecMs = tRec, out.stats.tSubMs = tSub, out.stats.tWaitMs = tWait, out.stats.tSinkMs = tSink, out.stats.tTurnMs = tTurn;
+  out.stats.tSrcMs = tSrc, out.stats.tUpMs = tUp, out.stats.tRecMs = tRec, out.stats.tSubMs = tSub, out.stats.tWaitMs = tWait, out.stats.tSinkMs = tSink, out.stats.tTurnMs = tTurn, out.stats.tLowMs = tLow;
   {
     const Core::UploadTimes up1 = core().uploadTimes();
     out.stats.tUpCopyMs = up1.copyMs - up0.copyMs, out.stats.tUpSubMs = up1.submitMs - up0.submitMs, out.stats.tUpWaitMs = up1.waitMs - up0.waitMs;

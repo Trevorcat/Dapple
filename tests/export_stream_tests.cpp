@@ -43,6 +43,18 @@
 #include "local_eval.h"
 #include "mem_probe.h"
 
+#if defined(_WIN32)
+#include <io.h>
+#define DUP(fd) _dup(fd)
+#define DUP2(a, b) _dup2(a, b)
+#define CLOSEFD(fd) _close(fd)
+#else
+#include <unistd.h>
+#define DUP(fd) dup(fd)
+#define DUP2(a, b) dup2(a, b)
+#define CLOSEFD(fd) close(fd)
+#endif
+
 namespace fs = std::filesystem;
 using namespace dapple;
 
@@ -56,6 +68,7 @@ static int g_fail = 0;
   } while (0)
 
 static fs::path root() {
+  if (const char* e = std::getenv("DAPPLE_TEST_ROOT")) return fs::path(e);  // on a phone: the pushed folder (build/rawsamples, core/data/film)
 #ifdef DAPPLE_SOURCE_DIR
   return fs::path(DAPPLE_SOURCE_DIR);
 #else
@@ -709,6 +722,139 @@ static int testFilmGpu() {
   return 0;
 }
 
+// ---- filmstream: a streamed film export on the GPU (section 59) --------------------------------------------------------------------------------
+// The GPU executor streams a film: the low planes are built by band walks over the source, each tile reads its window. It must equal the whole-frame
+// GPU export of the same tiles bit for bit (same arithmetic, the source read from windows instead of resident), and stay within the film GPU / CPU
+// parity budget of the CPU film stream (whole film frame mean <= 0.3 codes after a 4 x box). A film with local detail ops is declined by the GPU
+// (typed reason FilmTiledLocal) and streams on the CPU. The peak of the GPU stream must not exceed the CPU stream's.
+static std::string fnvHex(const std::vector<std::uint8_t>& b) {
+  std::uint64_t h = 1469598103934665603ull;
+  for (std::uint8_t c : b) h = (h ^ c) * 1099511628211ull;
+  char s[24];
+  std::snprintf(s, sizeof s, "%016llx", (unsigned long long)h);
+  return s;
+}
+// The log goes to stderr on the desktop: run `fn` with stderr redirected to a file and return what it wrote.
+template <class F>
+static std::string captureStderr(const fs::path& file, F&& fn) {
+  std::fflush(stderr);
+  const int saved = DUP(2);
+  std::FILE* f = std::freopen(file.string().c_str(), "wb", stderr);
+  (void)f;
+  fn();
+  std::fflush(stderr);
+  DUP2(saved, 2);
+  CLOSEFD(saved);
+  const auto b = readAll(file);
+  return std::string(b.begin(), b.end());
+}
+static int exportEx(const std::string& raw, const std::string& params, int longEdge, bool p3, const std::string& out, mem::Sampler* smp = nullptr, double* ms = nullptr) {
+  loadFilm();
+  if (params.find("raster") != std::string::npos) setRaster();
+  const auto t0 = Clock::now();
+  DappleSession* s = dapple_session_open(raw.c_str(), DAPPLE_QUALITY_FULL, 0);
+  if (!s) return DAPPLE_ERROR;
+  if (smp) smp->stage("export");
+  const int rc = dapple_session_export_jpeg_ex(s, params.c_str(), nullptr, longEdge, 92, out.c_str(), p3 ? R"({"colorSpace":"p3"})" : "{}");
+  if (rc != DAPPLE_OK) std::printf("  export failed: %s\n", dapple_last_error());
+  if (smp) smp->stage("close");
+  dapple_session_close(s);
+  if (ms) *ms = msSince(t0);
+  return rc;
+}
+
+static int testFilmStream() {
+  if (dapple_gpu_set_enabled(1) != 1) {
+    std::printf("  SKIP: no GPU executor here\n");
+    return 77;
+  }
+  std::vector<fs::path> raws;
+  for (const char* f : {"build/rawsamples/Sony/ILCE-6700/DSC00002.ARW", "build/rawsamples/Fujifilm/X-S10/Fujifilm-X-S10-lossless-compressed.RAF"})
+    if (fs::exists(root() / f)) raws.push_back(root() / f);
+  if (const char* only = std::getenv("DAPPLE_STREAM_TEST_RAW")) raws = {fs::path(only)};
+  if (raws.empty()) {
+    std::printf("  SKIP: no RAW sample under build/rawsamples\n");
+    return 77;
+  }
+  const bool quick = std::getenv("DAPPLE_FILMSTREAM_QUICK") != nullptr;  // software GPU: one stock, the base case and the radial case
+  const fs::path dir = root() / "build" / "exp-out" / "filmstream";
+  fs::create_directories(dir);
+  setEnv("DAPPLE_ENGINE_TILE", "512");
+  setEnv("DAPPLE_EXPORT_STREAM_TILE", "512");
+  setEnv("DAPPLE_FILM_TILES", "1");
+  const std::string portra = R"("film":"kodak_portra_400","film_grain":100,"film_halation":100)", vision = R"("film":"kodak_vision3_500t","film_grain":100,"film_halation":100)";
+  const std::string radial = R"("local":{"v":1,"items":[{"id":"a","strength":100,"mask":[{"kind":"radial","op":"add","cx":0.3,"cy":0.6,"rx":0.2,"ry":0.15,"angle":20,"feather":40}],"adjust":{"exposure":30,"saturation":20}}]})";
+  const std::string detail = R"("local":{"v":1,"items":[{"id":"a","strength":100,"mask":[{"kind":"radial","op":"add","cx":0.3,"cy":0.6,"rx":0.2,"ry":0.15,"angle":20,"feather":40}],"adjust":{"exposure":30,"clarity":40}}]})";
+  struct Case {
+    std::string id, params;
+    int longEdge;
+    bool p3, parity, cpuOnly;  // parity: also against the CPU stream; cpuOnly: the GPU declines (typed reason) and the stream runs on the CPU
+  };
+  std::vector<Case> cases = {{"portra", "{" + portra + "}", 0, false, true, false}, {"vision3", "{" + vision + "}", 0, false, true, false},
+                             {"portra_p3", "{" + portra + "}", 0, true, false, false}, {"portra_2048", "{" + portra + "}", 2048, false, false, false},
+                             {"portra_geo", "{" + portra + R"(,"crop":"4:3","straighten":5})", 0, false, false, false},
+                             {"portra_radial", "{" + portra + "," + radial + "}", 0, false, false, false},
+                             {"portra_detail", "{" + portra + "," + detail + "}", 0, false, false, true}};
+  if (quick) cases = {cases[0], cases[5], cases[6]};
+  for (const fs::path& rawp : raws) {
+    const std::string raw = rawp.string(), tag = rawp.stem().string().substr(0, 12);
+    for (const Case& c : cases) {
+      const std::string base = (dir / (tag + "_" + c.id)).string();
+      dapple_gpu_set_enabled(1);
+      setEnv("DAPPLE_EXPORT_STREAM", "off");
+      double msW = 0, msS = 0, msC = 0;
+      const bool whole = c.cpuOnly ? false : exportEx(raw, c.params, c.longEdge, c.p3, base + "_whole.jpg", nullptr, &msW) == DAPPLE_OK;
+      setEnv("DAPPLE_EXPORT_STREAM", "on");
+      mem::Sampler smpG;
+      int rcS = 0;
+      const std::string log = captureStderr(base + "_stream.log", [&] { rcS = exportEx(raw, c.params, c.longEdge, c.p3, base + "_stream.jpg", &smpG, &msS); });
+      smpG.finish();
+      const bool ranGpu = log.find("export_stream GPU") != std::string::npos && log.find(": ok (render pass") != std::string::npos;
+      const bool declined = log.find("GPU declined") != std::string::npos;
+      const bool logSeen = !log.empty();  // Android writes the log to logcat, not to stderr: the log checks are then skipped (the files are compared all the same)
+      CHECK(rcS == DAPPLE_OK);
+      const auto bs = readAll(base + "_stream.jpg");
+      if (c.cpuOnly) {
+        // the GPU declined (FilmTiledLocal: the stage-W amounts of a window are not computed per window): the film runs on the CPU, the demosaic on the GPU
+        // (the file with everything on the CPU differs only by the demosaic's own GPU / CPU parity)
+        dapple_gpu_set_enabled(0);
+        CHECK(exportEx(raw, c.params, c.longEdge, c.p3, base + "_cpu.jpg", nullptr, &msC) == DAPPLE_OK);
+        const double m4 = meanAbs4x(decodeJpeg(bs), decodeJpeg(readAll(base + "_cpu.jpg")));
+        std::printf("  %-12s %-13s film + local detail: GPU declined %d, ran on the GPU %d; vs the CPU stream: mean %.3f after a 4x box\n", tag.c_str(), c.id.c_str(), declined ? 1 : 0,
+                    ranGpu ? 1 : 0, m4);
+        CHECK((declined || !logSeen) && !ranGpu && m4 <= 0.1);
+        continue;
+      }
+      CHECK(whole && (ranGpu || !logSeen));
+      const auto bw = readAll(base + "_whole.jpg");
+      const bool same = !bw.empty() && bw == bs;
+      Diff d;
+      if (!same) d = diff(decodeJpeg(bw), decodeJpeg(bs));
+      std::printf("  %-12s %-13s whole GPU %.0f ms vs stream GPU %.0f ms: %s", tag.c_str(), c.id.c_str(), msW, msS, same ? "bytes identical" : "DIFFER");
+      if (!same) std::printf(" (max %d code, %zu px)", d.maxCode, d.differing);
+      CHECK(same || (d.sizeOk && d.maxCode == 0));
+      if (c.parity) {
+        dapple_gpu_set_enabled(0);
+        mem::Sampler smpC;
+        CHECK(exportEx(raw, c.params, c.longEdge, c.p3, base + "_cpu.jpg", &smpC, &msC) == DAPPLE_OK);
+        smpC.finish();
+        const Image8 ig = decodeJpeg(bs), ic = decodeJpeg(readAll(base + "_cpu.jpg"));
+        const Diff dc = diff(ig, ic);
+        const double m4 = meanAbs4x(ig, ic);
+        const double gMB = double(smpG.peak() - std::min(smpG.peak(), smpG.base())) / 1048576.0, cMB = double(smpC.peak() - std::min(smpC.peak(), smpC.base())) / 1048576.0;
+        std::printf("; vs CPU stream (%.0f ms): max %d, mean %.3f after a 4x box; peak above the start: GPU %.0f MB, CPU %.0f MB; CPU stream hash %s", msC, dc.maxCode, m4, gMB, cMB,
+                    fnvHex(readAll(base + "_cpu.jpg")).c_str());
+        CHECK(dc.sizeOk && m4 <= 0.3);
+        CHECK(gMB <= cMB);
+      }
+      std::printf("\n");
+    }
+  }
+  dapple_gpu_set_enabled(0);
+  for (const char* v : {"DAPPLE_ENGINE_TILE", "DAPPLE_EXPORT_STREAM_TILE", "DAPPLE_FILM_TILES", "DAPPLE_EXPORT_STREAM"}) setEnv(v, nullptr);
+  return 0;
+}
+
 // ---- cancel -------------------------------------------------------------------------------------------------------------------------------
 static int testCancel() {
   const fs::path raw = sampleRaw();
@@ -1175,6 +1321,7 @@ int main(int argc, char** argv) {
   else if (id == "peak") testPeak();
   else if (id == "capi") rc = testCapi();
   else if (id == "filmgpu") rc = testFilmGpu();
+  else if (id == "filmstream") rc = testFilmStream();
   else if (id == "cancel") rc = testCancel();
   else if (id == "policy") rc = testPolicy();
   else if (id == "budget") rc = testBudget();

@@ -34,6 +34,10 @@ int main(int argc, char** argv) {
   if (argc < 3) return std::fprintf(stderr, "usage: %s raw open|export [out.jpg]\n", argv[0]), 2;
   const bool exportMode = std::strcmp(argv[2], "export") == 0 || std::strcmp(argv[2], "dragexport") == 0;
   if (exportMode && argc < 4) return std::fprintf(stderr, "export needs out.jpg\n"), 2;
+  if (const char* fd = std::getenv("DAPPLE_FILM_DATA")) {  // the film library (a phone: the pushed folder holding dapple.dfp)
+    const std::string pack = std::string(fd) + "/dapple.dfp";
+    if (dapple_film_load_pack(pack.c_str()) != DAPPLE_OK) std::fprintf(stderr, "film pack %s: %s\n", pack.c_str(), dapple_last_error());
+  }
   const char* params = std::getenv("DAPPLE_BENCH_PARAMS") ? std::getenv("DAPPLE_BENCH_PARAMS") : "{}";
   if (const char* pdir = std::getenv("DAPPLE_BENCH_PROBE")) {
     dapple_gpu_configure(pdir, "bench-1", "bench-fp");

@@ -65,7 +65,15 @@ std::shared_ptr<const xstream::Analyses> lazyAnalyses(DappleSession* s, xstream:
     // phones: at most 256 MB (42.9): the cache buys 10-40 % of the time, the peak is what gets an app killed
     const xstream::Budget bud = xstream::currentBudget();
     const std::size_t budget = bud.bytes;
-    const std::size_t machinery = std::size_t(s->lazy->width) * (s->streamFilm ? 4100u : 2700u) * 12u;
+    // A film streamed on the GPU (section 59) holds no E2 / DIR band planes: the heap machinery of a plain stream (2700 rows), the device's share of
+    // the film (the three low planes and the input plane they are built from, 2 B per pixel of the frame; the tile pool of a 640 px film tile with its
+    // halo, ~48 MB) in rows of this width. ~4000 rows at 26 and 61 MP, like the CPU film's 4100.
+    std::size_t rowsOfMachinery = s->streamFilm ? 4100u : 2700u;
+#ifdef DAPPLE_HAVE_GPU
+    if (s->streamFilm && dapple::engine::gpu::runtimeEnabled())
+      rowsOfMachinery = 2700u + std::size_t(s->lazy->height) / 6u + (std::size_t(48) << 20) / (std::size_t(s->lazy->width) * 12u);
+#endif
+    const std::size_t machinery = std::size_t(s->lazy->width) * rowsOfMachinery * 12u;
     // X-Trans: a window demosaiced again costs ~4x a Bayer one (Note10+, 40 MP film: 29 windows = 26 s of 45 s with a 227 MB cache), so the whole
     // picture is cached when it is at most 512 MB (40 MP: 481 MB) and the budget has room for it
     std::size_t cap = bud.rowCacheCap;
@@ -140,7 +148,8 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
         },
         extraLongEdges);
   }
-  // a film stock streams on the CPU in bands (section 42.6): the GPU executor keeps a film frame resident (it would read the whole picture)
+  // a film stock streams on the GPU too (section 59): its low planes are built by band walks over the source, the tiles read their windows; a film the
+  // GPU cannot window (local detail ops, highlight boost) is declined and streams on the CPU in bands (section 42.6)
   const bool film = engine::point::filmActive(paramsIn);
   xstream::Wants want;
   want.longEdges = extraLongEdges;
@@ -178,11 +187,12 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
   mem::mark("render");
 #ifdef DAPPLE_HAVE_GPU
   dapple::engine::gpu::installProvider();
-  if (!film && dapple::engine::gpu::runtimeEnabled() && (outLongEdge <= 0 || outLongEdge >= 1500)) {  // as renderSessionParams: the GPU export, its tiles streamed
+  if (dapple::engine::gpu::runtimeEnabled() && (outLongEdge <= 0 || outLongEdge >= 1500)) {  // as renderSessionParams: the GPU export, its tiles streamed
     std::lock_guard<std::mutex> lock(s->exportMtx);
     bs.setCancel(s->exportEngine.cancelCell(), s->exportEngine.ticket());
     const double mpx0 = bs.demosaicMpx(), dms0 = bs.demosaicMs();  // the render pass's share of the counters (the analysis pass came first)
     xstream::BandSourceStore store(bs);
+    bs.setRetainCache(film);  // the film's walks and its tile pass read the picture several times: the cached rows stay for the next pass (section 59)
     dapple::engine::EngineSession::GpuExport e{params, point, virt, store, *s->camera, lut.get()};
     e.outLongEdge = outLongEdge;
     e.forceStream = true;
@@ -230,12 +240,14 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
     const auto tg0 = std::chrono::steady_clock::now();
     const int r = s->exportEngine.exportGpu(e, &gst, &err);
     const double gpuWall = msSince(tg0);
+    bs.setRetainCache(false);
+    if (film && r == 0) bs.dropCache();
     stageLog("export_stream GPU %dx%d -> long edge %d: %s (render pass %llu windows, %.1f MP of %.1f MP, demosaic %.0f ms %s%s; rows demosaiced: %d, twice or more: %d, from the cache: %d)", W, H, int(outLongEdge),
              r == 0 ? "ok" : r > 0 ? "GPU declined" : err.c_str(), (unsigned long long)(bs.windows() - windows0), bs.demosaicMpx() - mpx0, double(W) * H / 1e6, bs.demosaicMs() - dms0,
              bs.gpu() ? "GPU" : "CPU", bs.fellBack() ? ", fell back" : "", bs.rowsDemosaiced(), bs.rowsDemosaicedAgain(), bs.rowsNotDemosaiced());
-    stageLog("export_stream GPU render %.0f ms = source windows %.0f (demosaic %.0f, copies %.0f) + upload %.0f (host copy %.0f, convert submit %.0f, device wait %.0f) + record %.0f + submit %.0f + wait for the previous tile %.0f + sink %.0f (pack %.0f, hand-off %.0f) + turn %.0f + other %.0f; GPU busy %.0f ms, %d tiles",
-             gpuWall, gst.tSrcMs, bs.demosaicMs() - dms0, gst.tSrcMs - (bs.demosaicMs() - dms0), gst.tUpMs, gst.tUpCopyMs, gst.tUpSubMs, gst.tUpWaitMs, gst.tRecMs, gst.tSubMs, gst.tWaitMs, gst.tSinkMs, packMs, handMs, gst.tTurnMs,
-             gpuWall - gst.tSrcMs - gst.tUpMs - gst.tRecMs - gst.tSubMs - gst.tWaitMs - gst.tSinkMs - gst.tTurnMs, gst.gpuMs, gst.tiles);
+    stageLog("export_stream GPU render %.0f ms = source windows %.0f (demosaic %.0f, copies %.0f) + upload %.0f (host copy %.0f, convert submit %.0f, device wait %.0f) + film walks %.0f + record %.0f + submit %.0f + wait for the previous tile %.0f + sink %.0f (pack %.0f, hand-off %.0f) + turn %.0f + other %.0f; GPU busy %.0f ms, %d tiles",
+             gpuWall, gst.tSrcMs, bs.demosaicMs() - dms0, gst.tSrcMs - (bs.demosaicMs() - dms0), gst.tUpMs, gst.tUpCopyMs, gst.tUpSubMs, gst.tUpWaitMs, gst.tLowMs, gst.tRecMs, gst.tSubMs, gst.tWaitMs, gst.tSinkMs, packMs, handMs, gst.tTurnMs,
+             gpuWall - gst.tSrcMs - gst.tUpMs - gst.tLowMs - gst.tRecMs - gst.tSubMs - gst.tWaitMs - gst.tSinkMs - gst.tTurnMs, gst.gpuMs, gst.tiles);
     if (r == 0) return 1;
     if (r < 0 || aborted) {
       setError(aborted ? "cancelled" : (err.empty() ? "GPU export failed" : err));

@@ -354,7 +354,7 @@ const float* BandSource::rows(int x0, int y0, int x1, int y1, std::size_t& pitch
     return win_.data.data();
   }
   // the walk goes down the picture: cached blocks above it are not read again
-  for (auto it = cache_.begin(); it != cache_.end();)
+  for (auto it = cache_.begin(); it != cache_.end() && !retain_;)
     if (it->y1 <= y0) {
       cacheBytes_ -= it->px.size() * sizeof(float);
       it = cache_.erase(it);

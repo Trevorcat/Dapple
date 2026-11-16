@@ -101,6 +101,23 @@ struct FilmPre {
 void filmLowSize(int w, int h, int& lw, int& lh);
 // Builds the low planes by walks over windows of the film input (the source of a window comes from `src`; the planes are the only thing that stays).
 // Not needed when one window covers the frame (recordFilmWindow then builds them itself).
+// The same walks window by window, for a source that is read band by band (each window its own graph and device turn). `FilmLowPlan` says which walks
+// the film needs (need[0] = camera mixture input E, [1] = halation input pre(E), [2] = DIR input) and how far a walk's window reaches around its tile;
+// filmLowPlan is false when the film has no window form (highlight boost, unsupported effect). A walk: for every tile of kBand px (row-major) the window
+// filmLowSourceWindow(tile) of the film input is handed to `src`, recordFilmLowWindow writes the tile's share into the level-2 input plane `p2`
+// (l2w x l2h, RGBA16F, any content) and recordFilmLowBuild makes the low plane of the stage from the complete p2 (-1 on error). Walk 1 needs the
+// low plane of walk 0 (`lowPre`) and walk 2 those of 0 and 1.
+struct FilmLowPlan {
+  static constexpr int kBand = 512;
+  bool any = false, need[3] = {false, false, false};
+  int grow[3] = {0, 0, 0};
+  int l2w = 0, l2h = 0;
+};
+bool filmLowPlan(const FilmResolved& res, int w, int h, FilmLowPlan& out);
+FilmWin filmLowSourceWindow(const FilmLowPlan& lp, int stage, int w, int h, const FilmWin& tile);
+bool recordFilmLowWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmLowPlan& lp, int stage, int w, int h, const FilmWin& tile,
+                         const FilmSrcFn& src, gpu::H p2, gpu::H lowPre, gpu::H lowHalo);
+gpu::H recordFilmLowBuild(gpu::GpuRecorder& r, const FilmResolved& res, int stage, int w, int h, gpu::H p2);
 bool recordFilmLow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmSrcFn& src, int w, int h, FilmPre& out);
 // The develop / grain / print / scan chain over `win`, with the exposure, the camera / halation mixtures and the DIR field recomputed inside the window
 // (grown by the mixtures' reach and aligned: no frame-sized E2 / q). The image is only valid inside `win` shrunk by filmWindowHalo() on the sides that are

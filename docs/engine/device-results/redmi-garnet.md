@@ -1,5 +1,55 @@
 # Xiaomi Redmi (2312DRA50C "garnet") device results, wave 8, 2026-11-12
 
+## 2026-11-16 (59) Film stocks stream on the GPU: 26 MP 9.7 -> 7.5 s, 61 MP 23.1 -> 21.6 s, X-S10 21 - 32 -> 10 - 12 s (native binaries, pipeline-architecture.md section 59)
+
+Native binaries only, under `/data/local/tmp/fs59` (removed afterwards): `before` = HEAD 47e7a96 (`git archive` into `build/zz_arm_before_src`, built in `build/zz_arm_before`; plus the bench's film-pack line below), `after` = this change (`build/zz_arm_after`). arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`. Adreno 710 (Vulkan), `DAPPLE_GPU=1`. `dapple_open_bench <raw> export out.jpg` with `DAPPLE_BENCH_PARAMS` = `{"film":"kodak_portra_400"}` (grain 100 + halation 100 are the defaults) and `DAPPLE_FILM_DATA` (the bench now loads `dapple.dfp` from that folder). Stage lines from `logcat -s dapple_engine` (read, not cleared). No app, no install, no setting changed, no reboot; alternating before / after, 3 reps; logcat of the `before` run also holds the lines of earlier runs (identical analysis lines).
+
+### Totals (open + render + encode, ms) and peak RSS (VmHWM), 3 reps
+| file | before (CPU film stream) | after (GPU film stream) | peak RSS before -> after |
+|---|---|---|---|
+| A6700 26 MP, Portra 400 | 9661, 9733, 17601 | **7490, 7573, 7496** | 698 - 700 -> **609** MB |
+| A6700 + one radial local adjustment (exposure + saturation) | 10918, 10787, 10752 | **8578, 7724, 7777** | 700 - 701 -> **610** MB |
+| A7RM4 61 MP | 34974, 22970, 23112 | **21757, 20540, 21644** | 896 -> **704** MB |
+| X-S10 26 MP X-Trans | 21142, 25615, 32034 | **11520, 10178, 12055** | 743 - 745 -> **603 - 604** MB |
+
+The `before` figures spread (17.6 s once for the A6700, 32 s for the X-S10: the analysis pass alone took 7.8 s in that run, 2.6 s after) because the CPU stream is the part that slows down when the phone warms; the `after` figures do not. The exports of one binary are byte-identical to each other (one md5 per file and binary in all 24 runs). Stage-log footprint (+ over the start): A6700 683 -> 595 MB (+494 -> +403), A7RM4 874 -> 688 (+610 -> +421), X-S10 727 -> 589 (+537 -> +398).
+
+### Executor per tile, fallbacks, megapixels demosaiced (after)
+Every run: GPU on every tile (A6700 117 tiles of 640, A7RM4 247, X-S10 117), no fallback, no declined export (before: CPU stream, 17 / 25 bands). Demosaiced: A6700 26.3 MP in the analysis pass + 10.9 in the render pass (cache 256 MB = 3584 of 4168 rows) = 37.2 MP; A7RM4 64.1 + 124.2 = 188.3 MP (cache 224 MB = 2048 of 6376 rows: each of the three walks / the tile pass demosaics the other 68 %); X-S10 26.0 + 0 (the 298 MB cache holds the whole X-Trans picture). Row cache copies are the second cost of a pass (A6700 1.45 s, A7RM4 1.7 s).
+
+### Stage split of one run each (ms; the terms add up to the total)
+| | A6700 before | A6700 after | A6700 + radial after | A7RM4 before | A7RM4 after | X-S10 before | X-S10 after |
+|---|---|---|---|---|---|---|---|
+| analysis pass | 524 | 539 | 534 | in the next row (not in the HEAD log) | 919 | 7809 | 2610 |
+| film match, tables, other before the render pass | 1137 | 1200 | 1234 | 2025 (with the analysis) | 1139 | 2810 | 2652 |
+| CPU film stream (bands) | 7798 | - | - | 20593 | - | 20903 | - |
+| GPU render pass | - | 5719 | 5906 | - | 16900 | - | 4991 |
+|   source windows (demosaic) | | 1607 (155) | 1608 (146) | | 2971 (1296) | | 1528 (0) |
+|   upload | | 324 | 317 | | 1059 | | 245 |
+|   film walks (the low planes) | | 1216 | 1299 | | 3944 | | 996 |
+|   record + submit | | 391 | 416 | | 757 | | 370 |
+|   wait for the previous tile (device time) | | 1307 | 1365 | | 6137 | | 1111 |
+|   sink (RGBA -> RGB pack, hand-off) | | 798 | 825 | | 1938 | | 652 |
+|   turn + other | | 75 | 75 | | 93 | | 89 |
+| encoder finish + file write + other | 101 | 31 | 33 | 160 | 103 | 256 | 42 |
+| **total (without the 50 - 60 ms session open)** | 9559 | **7489** | **7707** | 22778 | **19061** | 31777 | **10295** |
+
+### JPEG difference before (CPU film) -> after (GPU film), one run each
+| | mean / p99 / max abs code | 4 x 4 box mean (budget 0.3) | dE2000 mean / p99 / max (every second row) |
+|---|---|---|---|
+| A6700 | 0.95 / 6 / 54 | 0.215 | 0.58 / 3.65 / 17.8 |
+| A6700 + radial | 0.97 / 6 / 61 | 0.220 | 0.59 / 3.64 / 15.7 |
+| A7RM4 | 0.71 / 5 / 115 | 0.188 | 0.60 / 4.63 / 38.3 |
+| X-S10 | 1.04 / 6 / 39 | 0.235 | 0.86 / 4.83 / 17.0 |
+
+The difference is the film GPU / CPU parity (per-pixel grain, RGBA16F planes), as in section 42.6; no file is slower on the GPU stream than on the CPU stream.
+
+### Tests on the phone
+`dapple_gpu_tests`: PASSED (0 failures; Adreno 710, Vulkan). `dapple_film_gpu_tests`: ok (all cases); `dapple_film_gpu_tests tiles`: 0 differing values for every tile size (256 / 512 / 1024) of every case, including the 9504 x 611 DIR case. `dapple_export_stream_tests filmstream` (A6700 and X-S10; `DAPPLE_TEST_ROOT` = the pushed folder; the log checks are skipped on Android, the files are compared): passed (0 failures): streamed GPU film export == whole-frame GPU film export byte for byte in 12 of 12 cases (Portra + grain + halation, Vision 3, Display P3, long edge 2048, crop + straighten, radial local); against the CPU film stream the 4 x 4 box mean is 0.215 / 0.218 (A6700 Portra / Vision 3) and 0.235 / 0.239 (X-S10); film + local detail ops: the stream equals the CPU stream (mean 0.000, the GPU declines it: `FilmTiledLocal`); peak footprint above the start of the stream: GPU 298 / 302 MB (A6700), 238 / 291 MB (X-S10) against CPU 548 / 543 and 575 / 576 MB. `dapple_open_bench` got `DAPPLE_FILM_DATA` (loads `dapple.dfp`), `dapple_export_stream_tests` got `DAPPLE_TEST_ROOT`, for running them from a pushed folder.
+
+### Largest remaining stage (61 MP, 19.1 s)
+The GPU wait of the tiles (6.1 s: the film's own work on the Adreno 710), then the walks (3.9 s: three passes over 61 MP of source, each window its own turn), the source windows (3.0 s: 1.3 s demosaic, 1.7 s copies out of the cache), the sink pack (1.9 s) and the upload (1.1 s). Not measured: Adreno 640 (Note10+), GLES, the app, thermal state.
+
 ## 2026-11-16 (58) 61 MP streamed export 4.6 - 4.9 s -> 2.9 - 3.0 s: stage split, vectorised Bayer demosaic (native binaries, pipeline-architecture.md section 58)
 
 Native binaries only, under `/data/local/tmp/strm` (removed afterwards): `before` = HEAD e936f88 (`build/stream-before-arm64`), `after` = this change (`build/stream-after-arm64`, built with the other engineer's working-tree edits to `core/engine/nodes/point` / `host_tables.cpp` / `engine_session.h`, which HEAD does not have). arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`; `DAPPLE_GPU=1`, GPU probe as the app (`DAPPLE_BENCH_PROBE`), the demosaic verdict is CPU on this phone in both (frame GPU 172 ms vs CPU 45 ms). `dapple_open_bench <raw> export out.jpg` (editor session, then `dapple_export_intent` + FULL session + `dapple_session_export_jpeg`, quality 92), `adb logcat -s dapple_engine` for the stage lines, peak RSS from `VmHWM`. Battery Saver off, no reboot, no app. Samples: `build/rawsamples/Sony/ILCE-7RM4/DSC00396.ARW` (61 MP, streams: whole-frame peak 1542 MB > budget 1536 MB), `ILCE-6700/DSC00002.ARW` (26 MP, whole frame). The first run after a push is slower (15.9 s once on the 61 MP file: probe and cold caches) and is not in the tables.

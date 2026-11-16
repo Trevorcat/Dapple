@@ -585,7 +585,7 @@ endif()
 if(TARGET dapple_gpu)  # the GPU executor ids need the GPU export path (DAPPLE_HAVE_GPU comes from this link)
   target_link_libraries(dapple_export_stream_tests PRIVATE dapple_gpu)
 endif()
-foreach(id region rowwalk reductions encoder mixbands mixbands_small filmbands filmbands_small synthetic synthetic_small synthetic_xt_small peak capi filmgpu cancel policy budget memtrim)
+foreach(id region rowwalk reductions encoder mixbands mixbands_small filmbands filmbands_small synthetic synthetic_small synthetic_xt_small peak capi filmgpu filmstream cancel policy budget memtrim)
   add_test(NAME export_stream.${id} COMMAND dapple_export_stream_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(export_stream.${id} PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77)
 endforeach()
@@ -593,6 +593,9 @@ if(TARGET dapple_gpu AND _ss_icd)  # the same matrix on the GPU executor (SwiftS
   add_test(NAME export_stream.capi_gpu_swiftshader COMMAND dapple_export_stream_tests capi WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(export_stream.capi_gpu_swiftshader PROPERTIES TIMEOUT 3600 SKIP_RETURN_CODE 77
     ENVIRONMENT "VK_DRIVER_FILES=${_ss_icd};VK_ICD_FILENAMES=${_ss_icd};DAPPLE_GPU_SOFTWARE=1;DAPPLE_STREAM_TEST_GPU=1")
+  add_test(NAME export_stream.filmstream_swiftshader COMMAND dapple_export_stream_tests filmstream WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(export_stream.filmstream_swiftshader PROPERTIES TIMEOUT 3600 SKIP_RETURN_CODE 77
+    ENVIRONMENT "VK_DRIVER_FILES=${_ss_icd};VK_ICD_FILENAMES=${_ss_icd};DAPPLE_GPU_SOFTWARE=1;DAPPLE_FILMSTREAM_QUICK=1")
   add_test(NAME export_stream.gpuoom_swiftshader COMMAND dapple_export_stream_tests gpuoom WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(export_stream.gpuoom_swiftshader PROPERTIES TIMEOUT 1800 SKIP_RETURN_CODE 77
     ENVIRONMENT "VK_DRIVER_FILES=${_ss_icd};VK_ICD_FILENAMES=${_ss_icd};DAPPLE_GPU_SOFTWARE=1")
@@ -643,6 +646,8 @@ set(_dapple_heavy
   export_stream.capi_gpu_swiftshader
   export_stream.filmbands
   export_stream.filmgpu
+  export_stream.filmstream
+  export_stream.filmstream_swiftshader
   export_stream.gpuoom_swiftshader
   export_stream.peak
   export_stream.policy

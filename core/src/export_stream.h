@@ -113,6 +113,9 @@ class BandSource {
   void keep(const ImageF& rowsOfWindow, int y0, int ya, int yb);  // rows [ya, yb) of a full-width window starting at row y0
   void applyShadowFloorToCache();                                  // the floor was decided after the rows were kept
   void dropCache();
+  // A walk that reads the picture more than once (a film's walks and its tile pass) keeps the cached blocks it has passed: the next pass copies them
+  // instead of demosaicing them again. The default drops them as a walk passes (one pass, the cache's memory comes back).
+  void setRetainCache(bool on) { retain_ = on; }
   std::size_t cacheBytes() const { return cacheBytes_; }
   std::uint64_t cacheHits() const { return cacheHits_; }
   int cachedRows() const;
@@ -146,6 +149,7 @@ class BandSource {
   };
   std::vector<Block> cache_;  // disjoint, any order
   std::size_t cacheBudget_ = 0, cacheBytes_ = 0;
+  bool retain_ = false;
   std::uint64_t cacheHits_ = 0;
   bool fromCache(int x0, int y0, int x1, int y1);
   std::vector<std::uint8_t> rowCount_;

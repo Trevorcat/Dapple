@@ -52,7 +52,6 @@ enum class GpuReason : std::uint8_t {
   FilmEffect,         // an effect the GPU film does not port (the recorder flagged it)
   FilmEnlargerTiled,  // tiled export of a film with the enlarger diffusion filter (a whole-frame blur)
   FilmTiledLocal,     // tiled film export with local detail ops
-  FilmNotResident,    // film export without a resident source
   NoSink,             // tiled export without a tile sink
   SinkAborted,        // the tile sink returned false
   // transient: the CPU takes the frame, the device copies are released
@@ -82,6 +81,7 @@ struct GpuStats {
   // tiled export (runTiled), host wall time per stage: the source window read (the store's demosaic and copies), the window's upload, recording the tile's graph,
   // submitting it, waiting for the previous tile's pixels, the sink (pack + encoder hand-off), taking the device turn
   double tSrcMs = 0, tUpMs = 0, tRecMs = 0, tSubMs = 0, tWaitMs = 0, tSinkMs = 0, tTurnMs = 0;
+  double tLowMs = 0;  // a film's walks that build the low planes (upload, record, submit, build waits), without their source reads (in tSrcMs) and turn waits (tTurnMs)
   double tUpCopyMs = 0, tUpSubMs = 0, tUpWaitMs = 0;  // inside tUpMs: host copy into the staging buffer, recording + submitting the convert pass, waiting for the device
   int resizeBuilt = 0;    // the frame built a resized copy of the source (a Resize pass + a fence wait) instead of reusing a kept one
   int poolCreated = 0;    // working images the pool had to create for this frame (none in a steady drag)

@@ -1082,78 +1082,94 @@ H dirInput(FilmCtx& c, const FilmPlanData& pd, H E2, const FilmWin& ow) {
 }
 }  // namespace
 
-bool recordFilmLow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmSrcFn& srcFn, int w, int h, FilmPre& out) {
-  out = FilmPre{};
+bool filmLowPlan(const FilmResolved& res, int w, int h, FilmLowPlan& out) {
+  out = FilmLowPlan{};
   const auto pd = planOf(res);
-  if (!filmPreflight(r, res, tb, *pd)) return false;
+  if (!pd->error.empty()) return false;
   const fd::SpatialPlan& pl = pd->plan;
   if (!pl.any()) return true;
   out.any = true;
-  if (pl.boost) {  // the maximum of the frame is a whole-frame reduction: no window form
-    r.unsupported = true, r.err = "film GPU: highlight boost needs the whole frame";
-    return false;
-  }
+  if (pl.boost) return false;  // the maximum of the frame is a whole-frame reduction: no window form
+  const MixPlans mp = mixPlansOf(res, *pd, w, h);
+  out.need[0] = mp.hasPre && mp.pre.maxLevel >= 2;
+  out.need[1] = mp.hasHalo && mp.halo.maxLevel >= 2;
+  out.need[2] = mp.hasDir && mp.dir.maxLevel >= 2;
+  const int reachPre = mp.hasPre ? Mix3::planReach(mp.pre) : 0, reachHalo = mp.hasHalo ? Mix3::planReach(mp.halo) : 0;
+  out.grow[0] = 0;
+  out.grow[1] = reachPre;
+  out.grow[2] = reachPre + reachHalo;
+  filmLowSize(w, h, out.l2w, out.l2h);
+  return true;
+}
+
+FilmWin filmLowSourceWindow(const FilmLowPlan& lp, int stage, int w, int h, const FilmWin& tile) { return alignedWindow(tile, lp.grow[stage], w, h); }
+
+bool recordFilmLowWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmLowPlan& lp, int stage, int w, int h, const FilmWin& tile,
+                         const FilmSrcFn& srcFn, gpu::H p2, gpu::H lowPre, gpu::H lowHalo) {
+  const auto pd = planOf(res);
+  if (!filmPreflight(r, res, tb, *pd)) return false;
   FilmCtx c(r, res, tb);
   Mix3 mix3{r};
   mix3.fastLow = filmFastLow(res);
   const MixPlans mp = mixPlansOf(res, *pd, w, h);
-  const bool needPre = mp.hasPre && mp.pre.maxLevel >= 2, needHalo = mp.hasHalo && mp.halo.maxLevel >= 2, needDir = mp.hasDir && mp.dir.maxLevel >= 2;
-  int l2w, l2h;
-  filmLowSize(w, h, l2w, l2h);
-  const int reachPre = mp.hasPre ? Mix3::planReach(mp.pre) : 0, reachHalo = mp.hasHalo ? Mix3::planReach(mp.halo) : 0;
-  constexpr int kBand = 512;  // interior of a walk window (multiple of 4: its level-2 samples are those of the picture)
-  // One walk: every window of the picture, the input of the stage's mixture over the window grown by the reach of the stages before it, and the
-  // window's share of that mixture's level-2 input plane (4 x 4 box average of the input); then the low plane of the whole picture is built from it.
-  // stage 0: pre mixture input = E;  1: halo mixture input = pre(E);  2: DIR input = point(halo(pre(E)))
-  H lowPre = -1, lowHalo = -1;
-  auto walk = [&](int stage, const Mix3::Plan& pn) -> H {
-    const int grow = stage == 0 ? 0 : stage == 1 ? reachPre : reachPre + reachHalo;
-    const H p2 = mix3.img(l2w, l2h);
-    for (int y0 = 0; y0 < h; y0 += kBand)
-      for (int x0 = 0; x0 < w; x0 += kBand) {
-        const FilmWin tile{x0, y0, std::min(kBand, w - x0), std::min(kBand, h - y0)};
-        const FilmWin ow = alignedWindow(tile, grow, w, h);
-        const FilmSrc s = srcFn(ow);
-        if (s.img < 0) return -1;
-        H in = c.point(0, false, s.img, c.rawH, ow.w, ow.h, 0, nullptr, 0, 0, s.ox, s.oy);
-        if (in < 0) return -1;
-        if (stage >= 1 && mp.hasPre) in = mixOver(mix3, mp.pre, in, ow, w, h, lowPre);
-        if (stage >= 2 && mp.hasHalo) in = mixOver(mix3, mp.halo, in, ow, w, h, lowHalo);
-        int pw = ow.w, ph = ow.h;  // size of the plane that is boxed down to level 2
-        H p1;
-        if (stage == 2) {
-          const H q = dirInput(c, *pd, in, ow);
-          if (q < 0) return -1;
-          if (pn.half) {
-            p1 = q;
-          } else {
-            p1 = mix3.down(q, ow.w, ow.h);
-          }
-        } else {
-          p1 = mix3.down(in, ow.w, ow.h);
-        }
-        pw = (ow.w + 1) / 2;
-        ph = (ow.h + 1) / 2;
-        mix3.downInto(p1, pw, ph, (tile.x0 - ow.x0) / 4, (tile.y0 - ow.y0) / 4, (tile.w + 3) / 4, (tile.h + 3) / 4, p2, tile.x0 / 4, tile.y0 / 4);
-        if (!mix3.ok) return -1;
-      }
-    return mix3.buildLow(pn, p2, w, h);
-  };
-  if (needPre) {
-    lowPre = walk(0, mp.pre);
-    if (lowPre < 0) return false;
+  const FilmWin ow = filmLowSourceWindow(lp, stage, w, h, tile);
+  const FilmSrc s = srcFn(ow);
+  if (s.img < 0) return false;
+  H in = c.point(0, false, s.img, c.rawH, ow.w, ow.h, 0, nullptr, 0, 0, s.ox, s.oy);
+  if (in < 0) return false;
+  if (stage >= 1 && mp.hasPre) in = mixOver(mix3, mp.pre, in, ow, w, h, lowPre);
+  if (stage >= 2 && mp.hasHalo) in = mixOver(mix3, mp.halo, in, ow, w, h, lowHalo);
+  H p1;
+  if (stage == 2) {
+    const H q = dirInput(c, *pd, in, ow);
+    if (q < 0) return false;
+    p1 = mp.dir.half ? q : mix3.down(q, ow.w, ow.h);
+  } else {
+    p1 = mix3.down(in, ow.w, ow.h);
   }
-  if (needHalo) {
-    lowHalo = walk(1, mp.halo);
-    if (lowHalo < 0) return false;
-  }
-  if (needDir) {
-    out.lowDir = walk(2, mp.dir);
-    if (out.lowDir < 0) return false;
-  }
-  out.lowPre = lowPre;
-  out.lowHalo = lowHalo;
+  const int pw = (ow.w + 1) / 2, ph = (ow.h + 1) / 2;  // size of the plane that is boxed down to level 2
+  mix3.downInto(p1, pw, ph, (tile.x0 - ow.x0) / 4, (tile.y0 - ow.y0) / 4, (tile.w + 3) / 4, (tile.h + 3) / 4, p2, tile.x0 / 4, tile.y0 / 4);
   return mix3.ok;
+}
+
+gpu::H recordFilmLowBuild(gpu::GpuRecorder& r, const FilmResolved& res, int stage, int w, int h, gpu::H p2) {
+  const auto pd = planOf(res);
+  Mix3 mix3{r};
+  mix3.fastLow = filmFastLow(res);
+  const MixPlans mp = mixPlansOf(res, *pd, w, h);
+  const Mix3::Plan& pn = stage == 0 ? mp.pre : stage == 1 ? mp.halo : mp.dir;
+  const H low = mix3.buildLow(pn, p2, w, h);
+  return mix3.ok ? low : H(-1);
+}
+
+bool recordFilmLow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmSrcFn& srcFn, int w, int h, FilmPre& out) {
+  out = FilmPre{};
+  const auto pd = planOf(res);
+  if (!filmPreflight(r, res, tb, *pd)) return false;
+  FilmLowPlan lp;
+  if (!filmLowPlan(res, w, h, lp)) {
+    r.unsupported = true, r.err = "film GPU: highlight boost needs the whole frame";
+    return false;
+  }
+  out.any = lp.any;
+  if (!lp.any) return true;
+  Mix3 mix3{r};
+  H low[3] = {-1, -1, -1};
+  for (int stage = 0; stage < 3; ++stage) {
+    if (!lp.need[stage]) continue;
+    const H p2 = mix3.img(lp.l2w, lp.l2h);
+    for (int y0 = 0; y0 < h; y0 += FilmLowPlan::kBand)
+      for (int x0 = 0; x0 < w; x0 += FilmLowPlan::kBand) {
+        const FilmWin tile{x0, y0, std::min(FilmLowPlan::kBand, w - x0), std::min(FilmLowPlan::kBand, h - y0)};
+        if (!recordFilmLowWindow(r, res, tb, lp, stage, w, h, tile, srcFn, p2, low[0], low[1])) return false;
+      }
+    low[stage] = recordFilmLowBuild(r, res, stage, w, h, p2);
+    if (low[stage] < 0) return false;
+  }
+  out.lowPre = low[0];
+  out.lowHalo = low[1];
+  out.lowDir = low[2];
+  return true;
 }
 
 bool filmEndsClamped(const FilmResolved& res) {

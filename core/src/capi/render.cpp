@@ -86,6 +86,7 @@ bool gpuExport(DappleSession* s, const EditParams& params, engine::point::Params
   }
   std::string err;
   const int r = s->exportEngine.exportGpu(e, nullptr, &err);
+  if (r != 0) stageLog("export: the whole-frame GPU export did not run (%s): the CPU renders", err.empty() ? "declined" : err.c_str());
   // an allocation failure on the device (pipeline-architecture.md 42.9): the caller switches a full-size export to bands instead of a slower whole-frame
   // CPU render that needs even more memory
   if (r != 0 && (err.find("out of memory") != std::string::npos || err.find("OutOfMemory") != std::string::npos ||

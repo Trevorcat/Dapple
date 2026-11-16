@@ -43,7 +43,6 @@ const char* gpuReasonName(GpuReason r) {
     case GpuReason::FilmEffect: return "film effect not ported";
     case GpuReason::FilmEnlargerTiled: return "film enlarger filter in a tiled export";
     case GpuReason::FilmTiledLocal: return "tiled film export with local detail";
-    case GpuReason::FilmNotResident: return "film export without a resident source";
     case GpuReason::NoSink: return "no tile sink";
     case GpuReason::SinkAborted: return "sink aborted";
     case GpuReason::OutOfMemory: return "out of memory";

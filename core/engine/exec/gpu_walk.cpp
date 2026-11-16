@@ -48,7 +48,9 @@ filmnode::FilmSrc Walk::filmInputRect(int wx0, int wy0, int ww, int wh) {
     u.a[1] = P.geo.srcH;
     u.a[2] = ww;
     u.a[3] = wh;
-    u.b[2] = wx0;  // origin of this image in the picture (the bound source is the whole frame's: b[0], b[1] = 0)
+    u.b[0] = job.src.ox;  // origin of the bound source image (0 for a resident source, the window's for a streamed one)
+    u.b[1] = job.src.oy;
+    u.b[2] = wx0;  // origin of this image in the picture
     u.b[3] = wy0;
     u.geoA[0] = P.geo.cs;
     u.geoA[1] = P.geo.sn;
@@ -71,7 +73,7 @@ filmnode::FilmSrc Walk::filmInputRect(int wx0, int wy0, int ww, int wh) {
                  r.gy(wh), &u, sizeof u);
     return {g, 0, 0};
   }
-  return {src, wx0, wy0};  // the resident source: the window's pixel (0, 0) is the picture's (x0, y0)
+  return {src, wx0 - job.src.ox, wy0 - job.src.oy};  // the bound source (resident: ox = 0; a streamed window starts at src.ox): window pixel (0, 0) is the picture's (x0, y0)
 }
 
 H Walk::filmInput() {
