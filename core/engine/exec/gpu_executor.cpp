@@ -597,6 +597,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   };
   Pending pend, ready;
   int passes = 0, barriers = 0, parts = 0;
+  const Core::UploadTimes up0 = core().uploadTimes();
+  double tSrc = 0, tUp = 0, tRec = 0, tSub = 0, tWait = 0, tSink = 0, tTurn = 0;  // host time per stage of the tile loop (GpuStats::tSrcMs ...)
   std::string err;
   auto readbackFor = [&](int i, std::size_t bytes) -> bool {  // inside the turn
     hal::BufferH& b = tileRb_[i];
@@ -608,7 +610,9 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   };
   auto waitPending = [&]() -> bool {  // inside the turn
     if (pend.buf < 0) return true;
+    const auto tw = Clock::now();
     const hal::Status ws = d.wait(pend.fence, kWaitNs);
+    tWait += msSince(tw);
     if (ws != hal::Status::Ok) return failStatus(ws, "");
     ready = pend;
     pend.buf = -1;
@@ -616,9 +620,11 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   };
   auto sinkReady = [&]() -> bool {  // outside the turn: the buffer is this export's, the next tile writes the other one
     if (ready.buf < 0) return true;
+    const auto ts = Clock::now();
     const bool ok = in.target.sink(ready.interior.x0, ready.interior.y0, ready.interior.w(), ready.interior.h(),
                                    static_cast<const std::uint8_t*>(tileRb_[ready.buf].mapped), std::size_t(ready.interior.w()) * 4);
     ready.buf = -1;
+    tSink += msSince(ts);
     if (!ok) fail(GpuReason::SinkAborted, "export aborted by the sink");
     return ok;
   };
@@ -636,7 +642,9 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     sr.win = SrcWin{fp.x0, fp.y0, fp.x1, fp.y1};
     if (resident) return true;
     if (down) sr.win = lanczosWindow(rb, fp);
+    const auto ts = Clock::now();
     sr.base = store_->window(sr.win.x0, sr.win.y0, sr.win.w(), sr.win.h(), sr.pitch);
+    tSrc += msSince(ts);
     return sr.base || fail(GpuReason::DeviceError, "source store cannot be read");
   };
 
@@ -652,7 +660,13 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
       const hal::Status as = pool.acquire(hal::Format::RGBA16F, std::uint32_t(win.w()), std::uint32_t(win.h()), &acquired);
       if (as != hal::Status::Ok) return failStatus(as, "");
       haveAcq = true;
-      if (!core().uploadRgbF32(sr.base, sr.pitch, win.w(), win.h(), acquired, 0, 0, err)) {
+      const auto tu = Clock::now();
+      // Vulkan starts every command buffer with a memory barrier over earlier submissions and GLES runs one context in order (settleUpload): the tile's graph is
+      // ordered after the copy on the GPU, the CPU goes on with the next window while the device works. The staging slot is written again only after begin()
+      // has waited for it. (The wait sat in front of the previous tile's GPU work: 500 ms of a 61 MP export on a phone.)
+      const bool upOk = core().uploadRgbF32(sr.base, sr.pitch, win.w(), win.h(), acquired, 0, 0, err, {}, ctx_->api() != hal::Api::Vulkan && ctx_->api() != hal::Api::Gles31);
+      tUp += msSince(tu);
+      if (!upOk) {
         pool.release(acquired);
         return fail(d.state() == hal::DeviceState::Lost ? GpuReason::DeviceLost : GpuReason::DeviceError, err);
       }
@@ -662,6 +676,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
       if (haveAcq) pool.release(acquired);
       return false;
     }
+    const auto tr = Clock::now();
     auto cl = d.begin();
     if (!cl) {
       if (haveAcq) pool.release(acquired);
@@ -729,7 +744,10 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
       return failRecord(rec, err);
     }
     hal::FenceH fence;
+    tRec += msSince(tr);
+    const auto tsub = Clock::now();
     const hal::Status s = submit(g, *cl, &fence, err);
+    tSub += msSince(tsub);
     if (haveAcq) pool.release(acquired);
     if (s != hal::Status::Ok) return failStatus(s, err);
     {
@@ -770,6 +788,11 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
 
   // the next job's turn: the device may have been rebuilt or lost while this export waited
   auto take = [&]() {
+    struct Lap {
+      double& acc;
+      Clock::time_point t;
+      ~Lap() { acc += msSince(t); }
+    } lap{tTurn, Clock::now()};
     turn.acquire();
     return turnOk();
   };
@@ -809,6 +832,11 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   out.stats.parts = parts;
   out.stats.tiles = tiles;
   out.stats.sweeps = sweeps;
+  out.stats.tSrcMs = tSrc, out.stats.tUpMs = tUp, out.stats.tRecMs = tRec, out.stats.tSubMs = tSub, out.stats.tWaitMs = tWait, out.stats.tSinkMs = tSink, out.stats.tTurnMs = tTurn;
+  {
+    const Core::UploadTimes up1 = core().uploadTimes();
+    out.stats.tUpCopyMs = up1.copyMs - up0.copyMs, out.stats.tUpSubMs = up1.submitMs - up0.submitMs, out.stats.tUpWaitMs = up1.waitMs - up0.waitMs;
+  }
   return Status::Ok;
 }
 

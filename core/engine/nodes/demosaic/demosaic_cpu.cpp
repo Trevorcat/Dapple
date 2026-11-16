@@ -10,6 +10,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -44,7 +45,9 @@ inline float bayerGreen(const float* p, int ww) {  // p at a red / blue sample
   return (wh * gh + wv * gv) / (wh + wv);
 }
 
-void bayerTile(const Desc& d, const float* S, Rect roi, float* out, std::size_t stride) {
+// The scalar reference of the Bayer node: one pixel at a time, the arithmetic the GPU kernel mirrors. bayerTile below computes the same values a row of one
+// phase at a time (demosaicReference() runs this one: the test that says the two are bit-identical).
+void bayerTileScalar(const Desc& d, const float* S, Rect roi, float* out, std::size_t stride) {
   const int H = kHaloBayer, rw = roi.w(), rh = roi.h(), ww = rw + 2 * H, wh = rh + 2 * H;
   const int ox = pmod(roi.x0 - H, 2), oy = pmod(roi.y0 - H, 2);
   auto colAt = [&](int i, int j) { return int(d.cfa3[((j + oy) & 1) * 2 + ((i + ox) & 1)]); };
@@ -86,6 +89,160 @@ void bayerTile(const Desc& d, const float* S, Rect roi, float* out, std::size_t 
         px[r] = d.clampOut ? clamp01(v) : v;
       }
     }
+  }
+}
+
+
+// The same arithmetic on phase planes, a whole row of one phase at a time (the Bayer CPU node, 4 floats / 8 floats a step once the compiler vectorises the
+// loops; every expression below is the scalar one above, statement for statement, so the result is bit-identical on every platform and for any contraction
+// the compiler applies to an expression). The window is split into its four 2 x 2 phases P[a][b] (row parity a, column parity b of the window); a neighbour
+// at (dy, dx) of a pixel of phase (a, b) is a contiguous run of phase ((a + dy) & 1, (b + dx) & 1) shifted by ((a + dy) >> 1, (b + dx) >> 1).
+void bayerTile(const Desc& d, const float* S, Rect roi, float* out, std::size_t stride) {
+  const int H = kHaloBayer, rw = roi.w(), rh = roi.h(), ww = rw + 2 * H, wh = rh + 2 * H;
+  const int ox = pmod(roi.x0 - H, 2), oy = pmod(roi.y0 - H, 2);
+  const int pw = (ww + 1) / 2, ph = (wh + 1) / 2;
+  const std::size_t plane = std::size_t(pw) * ph;
+  thread_local std::vector<float> PB, GB, RB;
+  if (PB.size() < 4 * plane) PB.resize(4 * plane);
+  if (GB.size() < 2 * plane) GB.resize(2 * plane);  // the two red / blue phases
+  if (RB.size() < std::size_t(6) * (pw + 8)) RB.resize(std::size_t(6) * (pw + 8));
+  int col[2][2];
+  const float* P[2][2];
+  const float* G[2][2];
+  int gi = 0;
+  for (int a = 0; a < 2; ++a)
+    for (int b = 0; b < 2; ++b) {
+      col[a][b] = int(d.cfa3[((a + oy) & 1) * 2 + ((b + ox) & 1)]);
+      P[a][b] = PB.data() + std::size_t(2 * a + b) * plane;
+      G[a][b] = col[a][b] == 1 ? P[a][b] : GB.data() + std::size_t(gi++) * plane;
+    }
+  // 1. the window into its phases
+  for (int j = 0; j < wh; ++j) {
+    const float* __restrict row = S + std::size_t(j) * ww;
+    float* __restrict e = PB.data() + std::size_t(2 * (j & 1)) * plane + std::size_t(j >> 1) * pw;
+    float* __restrict o = e + plane;
+    const int half = ww / 2;
+    for (int m = 0; m < half; ++m) {
+      e[m] = row[2 * m];
+      o[m] = row[2 * m + 1];
+    }
+    if (ww & 1) e[half] = row[ww - 1];
+  }
+  // pointer to the run of phase (a + dy, b + dx) that lines up with index m of pixel row n of phase (a, b)
+  auto at = [&](const float* const (&pl)[2][2], int a, int b, int dy, int dx, int n) -> const float* {
+    return pl[(a + dy) & 1][(b + dx) & 1] + std::ptrdiff_t(n + ((a + dy) >> 1)) * pw + ((b + dx) >> 1);
+  };
+  // 2. green at the red / blue samples (where the scalar code reads them: window rows and columns 3 .. size - 4)
+  for (int a = 0; a < 2; ++a)
+    for (int b = 0; b < 2; ++b) {
+      if (col[a][b] == 1) continue;
+      const int n0 = (4 - a) / 2, n1 = (wh - 4 - a) / 2, m0 = (4 - b) / 2, m1 = (ww - 4 - b) / 2;
+      for (int n = n0; n <= n1; ++n) {
+        const float* __restrict pc = at(P, a, b, 0, 0, n);
+        const float* __restrict pl = at(P, a, b, 0, -1, n);
+        const float* __restrict pr = at(P, a, b, 0, 1, n);
+        const float* __restrict pl2 = at(P, a, b, 0, -2, n);
+        const float* __restrict pr2 = at(P, a, b, 0, 2, n);
+        const float* __restrict pu = at(P, a, b, -1, 0, n);
+        const float* __restrict pd = at(P, a, b, 1, 0, n);
+        const float* __restrict pu2 = at(P, a, b, -2, 0, n);
+        const float* __restrict pd2 = at(P, a, b, 2, 0, n);
+        const float* __restrict pul = at(P, a, b, -1, -1, n);
+        const float* __restrict pur = at(P, a, b, -1, 1, n);
+        const float* __restrict pdl = at(P, a, b, 1, -1, n);
+        const float* __restrict pdr = at(P, a, b, 1, 1, n);
+        float* __restrict g = const_cast<float*>(at(G, a, b, 0, 0, n));
+        for (int m = m0; m <= m1; ++m) {
+          const float C = pc[m], l = pl[m], r = pr[m], l2 = pl2[m], r2 = pr2[m], u = pu[m], dn = pd[m], u2 = pu2[m], d2 = pd2[m];
+          float gh = 0.5f * (l + r) + 0.25f * (2.f * C - l2 - r2);
+          float gv = 0.5f * (u + dn) + 0.25f * (2.f * C - u2 - d2);
+          gh = std::min(std::max(gh, std::min(l, r)), std::max(l, r));
+          gv = std::min(std::max(gv, std::min(u, dn)), std::max(u, dn));
+          const float dh = std::fabs(l - r) + std::fabs(2.f * C - l2 - r2) + 0.5f * (std::fabs(pul[m] - pur[m]) + std::fabs(pdl[m] - pdr[m]));
+          const float dv = std::fabs(u - dn) + std::fabs(2.f * C - u2 - d2) + 0.5f * (std::fabs(pul[m] - pdl[m]) + std::fabs(pur[m] - pdr[m]));
+          const float wh_ = 1.f / sq(kEps + dh), wv = 1.f / sq(kEps + dv);
+          g[m] = (wh_ * gh + wv * gv) / (wh_ + wv);
+        }
+      }
+    }
+  // 3. red, green, blue of every output pixel, one phase run at a time, then interleaved into the output row
+  const float mx[9] = {d.m[0], d.m[1], d.m[2], d.m[3], d.m[4], d.m[5], d.m[6], d.m[7], d.m[8]};
+  const bool clampOut = d.clampOut;
+  const int cnt[2] = {(rw + 1) / 2, rw / 2};
+  float* const R0 = RB.data();
+  for (int y = 0; y < rh; ++y) {
+    const int a = (y + H) & 1, n = (y + H) >> 1;
+    for (int b = 0; b < 2; ++b) {
+      const int c = col[a][b], T = cnt[b];
+      float* __restrict o0 = R0 + std::size_t(3 * b) * (pw + 8);
+      float* __restrict o1 = o0 + (pw + 8);
+      float* __restrict o2 = o1 + (pw + 8);
+      const float* __restrict sc = at(P, a, b, 0, 0, n) + 2;
+      const float* __restrict gc = at(G, a, b, 0, 0, n) + 2;
+      if (c == 1) {
+        const int hc = col[a][1 - b];  // colour of the horizontal neighbours (0 or 2)
+        const float* __restrict sl = at(P, a, b, 0, -1, n) + 2;
+        const float* __restrict sr = at(P, a, b, 0, 1, n) + 2;
+        const float* __restrict su = at(P, a, b, -1, 0, n) + 2;
+        const float* __restrict sd = at(P, a, b, 1, 0, n) + 2;
+        const float* __restrict gl = at(G, a, b, 0, -1, n) + 2;
+        const float* __restrict gr = at(G, a, b, 0, 1, n) + 2;
+        const float* __restrict gu = at(G, a, b, -1, 0, n) + 2;
+        const float* __restrict gd = at(G, a, b, 1, 0, n) + 2;
+        const bool hRed = hc == 0;
+        for (int t = 0; t < T; ++t) {
+          const float g = gc[t];
+          const float dh = 0.5f * ((sl[t] - gl[t]) + (sr[t] - gr[t]));
+          const float dv = 0.5f * ((su[t] - gu[t]) + (sd[t] - gd[t]));
+          float rgb[3];
+          rgb[1] = g;
+          rgb[0] = hRed ? g + dh : g + dv;
+          rgb[2] = hRed ? g + dv : g + dh;
+          for (int q = 0; q < 3; ++q) rgb[q] = clamp01(rgb[q]);
+          for (int r = 0; r < 3; ++r) {
+            const float v = mx[r * 3] * rgb[0] + mx[r * 3 + 1] * rgb[1] + mx[r * 3 + 2] * rgb[2];
+            (r == 0 ? o0 : r == 1 ? o1 : o2)[t] = clampOut ? clamp01(v) : v;
+          }
+        }
+      } else {
+        const float* __restrict sUR = at(P, a, b, -1, 1, n) + 2;
+        const float* __restrict sDL = at(P, a, b, 1, -1, n) + 2;
+        const float* __restrict sUL = at(P, a, b, -1, -1, n) + 2;
+        const float* __restrict sDR = at(P, a, b, 1, 1, n) + 2;
+        const float* __restrict gUR = at(G, a, b, -1, 1, n) + 2;
+        const float* __restrict gDL = at(G, a, b, 1, -1, n) + 2;
+        const float* __restrict gUL = at(G, a, b, -1, -1, n) + 2;
+        const float* __restrict gDR = at(G, a, b, 1, 1, n) + 2;
+        const bool isRed = c == 0;
+        for (int t = 0; t < T; ++t) {
+          const float g = gc[t];
+          const float d1 = 0.5f * ((sUR[t] - gUR[t]) + (sDL[t] - gDL[t]));
+          const float d2 = 0.5f * ((sUL[t] - gUL[t]) + (sDR[t] - gDR[t]));
+          const float g1 = std::fabs(gUR[t] - g) + std::fabs(gDL[t] - g);
+          const float g2 = std::fabs(gUL[t] - g) + std::fabs(gDR[t] - g);
+          const float w1 = 1.f / sq(kEps + g1), w2 = 1.f / sq(kEps + g2);
+          const float other = g + (w1 * d1 + w2 * d2) / (w1 + w2);
+          float rgb[3];
+          rgb[1] = g;
+          rgb[0] = isRed ? sc[t] : other;
+          rgb[2] = isRed ? other : sc[t];
+          for (int q = 0; q < 3; ++q) rgb[q] = clamp01(rgb[q]);
+          for (int r = 0; r < 3; ++r) {
+            const float v = mx[r * 3] * rgb[0] + mx[r * 3 + 1] * rgb[1] + mx[r * 3 + 2] * rgb[2];
+            (r == 0 ? o0 : r == 1 ? o1 : o2)[t] = clampOut ? clamp01(v) : v;
+          }
+        }
+      }
+    }
+    float* o = out + std::size_t(y) * stride;
+    const float* e0 = R0;
+    const float* e1 = e0 + (pw + 8);
+    const float* e2 = e1 + (pw + 8);
+    const float* f0 = e2 + (pw + 8);
+    const float* f1 = f0 + (pw + 8);
+    const float* f2 = f1 + (pw + 8);
+    for (int t = 0; t < cnt[0]; ++t) o[6 * t] = e0[t], o[6 * t + 1] = e1[t], o[6 * t + 2] = e2[t];
+    for (int t = 0; t < cnt[1]; ++t) o[6 * t + 3] = f0[t], o[6 * t + 4] = f1[t], o[6 * t + 5] = f2[t];
   }
 }
 
@@ -570,6 +727,11 @@ float scaleSample(const Desc& d, int x, int y) {
   return std::min(v * d.wb[d.cfa4[ph]] * d.invSpan, 1.f);
 }
 
+void demosaicWindowRef(const Desc& d, const float* S, Rect roi, float* out, std::size_t strideFloats) {
+  if (d.cfa == Cfa::Bayer) bayerTileScalar(d, S, roi, out, strideFloats);
+  else demosaicWindow(d, S, roi, out, strideFloats);
+}
+
 void demosaicWindow(const Desc& d, const float* S, Rect roi, float* out, std::size_t strideFloats) {
   if (d.cfa == Cfa::Bayer) bayerTile(d, S, roi, out, strideFloats);
   else if (d.xtMode >= 1) xtransTileCand(d, S, roi, out, strideFloats);
@@ -613,18 +775,48 @@ void buildWindow(const Desc& d, Rect roi, std::vector<float>& S) {
   std::vector<int> xs(ww);
   for (int i = 0; i < ww; ++i) xs[i] = mapCoord(roi.x0 - H + i, d.width, d.cfa);
   const int P = d.period;
+  // Rows of the same phase (row of the colour pattern, row of the black table) share their per-column multiplier and black level: those two tables are made once
+  // per class of rows for this window, and the scaling of a row is then one loop over contiguous samples (vectorised) plus the mirrored margins one by one.
+  const int L = std::lcm(P, std::max(1, d.blackRows));
+  thread_local std::vector<float> wbT, blkT;
+  thread_local std::vector<int> classOf;
+  classOf.assign(std::size_t(L), -1);
+  int classes = 0;
+  const std::size_t tbl = std::size_t(ww);
+  if (wbT.size() < tbl * std::size_t(L)) wbT.resize(tbl * std::size_t(L)), blkT.resize(tbl * std::size_t(L));
+  const int lo = std::min(ww, std::max(0, H - roi.x0)), hi = std::max(lo, std::min(ww, d.width - (roi.x0 - H)));
   for (int j = 0; j < wh; ++j) {
     const int ay = roi.y0 - H + j, y = mapCoord(ay, d.height, d.cfa);
     float* row = S0.data() + std::size_t(j) * ww;
     const std::uint16_t* src = d.data + std::size_t(y) * d.width;
-    for (int i = 0; i < ww; ++i) {
-      // the sample comes from the mapped pixel; the colour phase and the black table phase from the window position (what the GPU kernel sees)
-      const int ax = roi.x0 - H + i;
-      const int c4 = d.cfa4[pmod(ay, P) * P + pmod(ax, P)];
-      const float blk = d.black[pmod(ay, d.blackRows) * d.blackCols + pmod(ax, d.blackCols)];
-      const float v = std::max(float(src[xs[i]]) - blk, 0.f) * d.wb[c4] * d.invSpan;
-      row[i] = std::min(v, 1.f);
+    const int cl = pmod(ay, L);
+    if (classOf[std::size_t(cl)] < 0) {
+      classOf[std::size_t(cl)] = classes;
+      float* wbr = wbT.data() + tbl * std::size_t(classes);
+      float* bkr = blkT.data() + tbl * std::size_t(classes);
+      for (int i = 0; i < ww; ++i) {
+        // the colour phase and the black table phase come from the window position (what the GPU kernel sees)
+        const int ax = roi.x0 - H + i;
+        wbr[i] = d.wb[d.cfa4[pmod(ay, P) * P + pmod(ax, P)]];
+        bkr[i] = d.black[pmod(ay, d.blackRows) * d.blackCols + pmod(ax, d.blackCols)];
+      }
+      ++classes;
     }
+    const float* __restrict wbr = wbT.data() + tbl * std::size_t(classOf[std::size_t(cl)]);
+    const float* __restrict bkr = blkT.data() + tbl * std::size_t(classOf[std::size_t(cl)]);
+    const float inv = d.invSpan;
+    auto one = [&](int i) {  // the sample comes from the mapped pixel
+      const float v = std::max(float(src[xs[i]]) - bkr[i], 0.f) * wbr[i] * inv;
+      row[i] = std::min(v, 1.f);
+    };
+    for (int i = 0; i < lo; ++i) one(i);
+    const int ax0 = roi.x0 - H;  // interior: xs[i] == ax0 + i
+    float* __restrict rw = row;
+    for (int i = lo; i < hi; ++i) {
+      const float v = std::max(float(src[ax0 + i]) - bkr[i], 0.f) * wbr[i] * inv;
+      rw[i] = std::min(v, 1.f);
+    }
+    for (int i = hi; i < ww; ++i) one(i);
   }
   if (E) {
     const int iw = roi.w() + 2 * (H - E), ih = roi.h() + 2 * (H - E);
@@ -670,6 +862,14 @@ void demosaic(const Desc& d, Rect roi, float* out, std::size_t strideFloats, int
   runTiles(d, roi, threads, 256, [&](Rect t, std::vector<float>& S) {
     buildWindow(d, t, S);
     demosaicWindow(d, S.data(), t, out + std::size_t(t.y0 - roi.y0) * strideFloats + std::size_t(t.x0 - roi.x0) * 3, strideFloats);
+  });
+}
+
+void demosaicReference(const Desc& d, Rect roi, float* out, std::size_t strideFloats, int threads) {
+  if (roi.empty()) return;
+  runTiles(d, roi, threads, 256, [&](Rect t, std::vector<float>& S) {
+    buildWindow(d, t, S);
+    demosaicWindowRef(d, S.data(), t, out + std::size_t(t.y0 - roi.y0) * strideFloats + std::size_t(t.x0 - roi.x0) * 3, strideFloats);
   });
 }
 

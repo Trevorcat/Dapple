@@ -609,7 +609,7 @@ int main(int argc, char** argv) {
         std::vector<double> firsts, rests;
         std::vector<std::pair<int, double>> repTables;  // (drag, table ms) of the frames after the first: the session's trend
         std::string lastJson;
-        std::vector<double> t;
+        std::vector<double> t, tabAll;
         int slow = 0, slowTables = 0, withTables = 0;
         for (int rep = 0; rep < reps; ++rep) {
         if (rep > 0 && pauseMs > 0) std::this_thread::sleep_for(std::chrono::milliseconds(pauseMs));
@@ -644,6 +644,7 @@ int main(int argc, char** argv) {
           double tables = -1;  // the frame's measured table time when the analysis reports it ("timing":{"tablesMs":...})
           if (an) {
             if (const char* p = std::strstr(an, "\"tablesMs\":")) tables = std::atof(p + 11), ++withTables;
+            if (tables >= 0 && t.size() > 1) tabAll.push_back(tables);
             dapple_free_string(an);
           }
           if (settleEdge > 0) {
@@ -702,6 +703,11 @@ int main(int argc, char** argv) {
         std::sort(r.begin(), r.end());
         std::printf("  %-22s first %7.1f  median %7.1f  max %7.1f  min %7.1f  | %zu frames, over 100 ms %d (tables over 100 ms %d of %d reported)\n", name.c_str(), t[0],
                     r[r.size() / 2], r.back(), r.front(), t.size(), slow, slowTables, withTables);
+        if (!tabAll.empty()) {  // tables ms and frame ms of the frames after the first: median / p90
+          std::sort(tabAll.begin(), tabAll.end());
+          std::printf("  %-22s tables median %.1f p90 %.1f | frame median %.1f p90 %.1f ms\n", name.c_str(), tabAll[tabAll.size() / 2], tabAll[tabAll.size() * 9 / 10], r[r.size() / 2],
+                      r[r.size() * 9 / 10]);
+        }
         std::fflush(stdout);
       }
     dapple_session_close(s);

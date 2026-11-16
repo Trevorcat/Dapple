@@ -1033,6 +1033,99 @@ void testTables() {
   render(es, p, res);
   std::free(res.rgba);
   CHECK(bakeCounters().latticeEvaluated.load() == ev0 + 3);  // + the fresh session's
+
+  // ---- the interactive lattice (section 57): an interactive frame that must bake the colour lattice bakes the smaller one -------------------------------
+  // the app asks for 57 on every interactive frame and for the default size (65) on the settled frame
+  const int nI = interactiveLatticeN();
+  CHECK(nI > 0 && nI < 57);
+  auto renderI = [&](EngineSession& es2, const EditParams& e, bool interactive, FrameResult& r) {
+    engine::point::Params pr = engine::point::resolve(e, camA(), nullptr);
+    engine::point::setToneProxy(pr, &proxy);
+    FrameJob job{e, pr, src, &proxy, camA(), nullptr, {}, {}, {}};
+    job.request.bakeSize = interactive ? 57 : 65;
+    job.request.interactive = interactive;
+    job.request.wantAnalysis = true;
+    job.request.fastAnalysis = interactive;
+    job.fastOptions.spatial = interactive ? SpatialQuality::Interactive : SpatialQuality::Full;
+    CHECK(es2.renderFrame(job, r));
+  };
+  auto hashOf = [](const FrameResult& r) {
+    std::uint64_t h = 1469598103934665603ull;
+    for (std::size_t i = 0; i < std::size_t(r.w) * r.h * 4; ++i) h = (h ^ r.rgba[i]) * 1099511628211ull;
+    return h;
+  };
+  auto latOrders = [](EngineSession& es2) {
+    std::vector<int> o;
+    for (const ResultCache::Entry& le : es2.cache().entries(slotOf(NodeType::ColourLattice))) o.push_back(le.order);
+    std::sort(o.begin(), o.end());
+    return o;
+  };
+  {
+    EngineSession es2;
+    EditParams q = edit0();
+    q.toneStrength = 60.f;
+    auto count = [] { return bakeCounters().latticeEvaluated.load(); };
+    // a colour drag bakes the small lattice on every frame
+    std::uint64_t c0 = count();
+    for (int i = 0; i < 6; ++i) {
+      q.saturation = float(10 + 6 * i);
+      FrameResult r;
+      renderI(es2, q, true, r);
+      CHECK(r.bake == FrameResult::Bake::LatticeBake && r.rgba);
+      CHECK(r.bakeN == nI);
+      std::free(r.rgba);
+    }
+    CHECK(count() == c0 + 6);
+    for (const int o : latOrders(es2)) CHECK(o == nI);
+    // exposure, white balance and tone drags keep the lattice they have: no bake at all
+    c0 = count();
+    for (const Change& c : changes) {
+      if (c.colour) continue;
+      c.apply(q);
+      FrameResult r;
+      renderI(es2, q, true, r);
+      CHECK(r.bake != FrameResult::Bake::LatticeBake && r.bakeN == nI && r.rgba);
+      std::free(r.rgba);
+    }
+    CHECK(count() == c0);
+    // the settled frame bakes the full lattice once and equals the settled frame of a session that never dragged
+    FrameResult settled;
+    renderI(es2, q, false, settled);
+    CHECK(settled.bake == FrameResult::Bake::LatticeBake && settled.bakeN == 65 && count() == c0 + 1);
+    {
+      EngineSession fresh2;
+      FrameResult f;
+      renderI(fresh2, q, false, f);
+      CHECK(f.bakeN == 65 && hashOf(f) == hashOf(settled));
+      std::free(f.rgba);
+    }
+    // the next drag: the same colour stage reuses the settled lattice (nothing is baked at 57), a new colour value bakes the small one
+    c0 = count();
+    for (int i = 0; i < 3; ++i) {
+      q.exposure += 0.1f;
+      FrameResult r;
+      renderI(es2, q, true, r);
+      CHECK(r.bake != FrameResult::Bake::LatticeBake && r.bakeN == 65);
+      std::free(r.rgba);
+    }
+    CHECK(count() == c0);
+    for (int i = 0; i < 3; ++i) {
+      q.saturation += 5.f;
+      FrameResult r;
+      renderI(es2, q, true, r);
+      CHECK(r.bake == FrameResult::Bake::LatticeBake && r.bakeN == nI);
+      std::free(r.rgba);
+    }
+    CHECK(count() == c0 + 3);
+    // settle again, then a second drag over the first colour values: every lattice is still one of the two sizes
+    FrameResult settled2;
+    renderI(es2, q, false, settled2);
+    CHECK(settled2.bakeN == 65 && count() == c0 + 4);
+    std::free(settled2.rgba);
+    for (const int o : latOrders(es2)) CHECK(o == nI || o == 65);
+    std::free(settled.rgba);
+    std::printf("  interactive lattice %d: colour drag bakes %d, tone/exposure/wb reuse, settle bakes 65 once and equals a fresh settled frame\n", nI, nI);
+  }
 }
 // the same drag sequences on a 640 px source (shorter lists): the reuse rules and determinism of the engine: in the default run
 void testReuseSmall() { reuseImpl(true); }

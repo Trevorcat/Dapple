@@ -90,6 +90,9 @@ std::shared_ptr<const xstream::Analyses> lazyAnalyses(DappleSession* s, xstream:
     std::lock_guard<std::mutex> ml(s->matchMtx);
     if (!s->keyProxy) s->keyProxy = a->p256;
   }
+  stageLog("export_stream analyses %dx%d: %d pass(es) %.0f ms = window reads %.0f (demosaic %.0f, band copies %.0f) + row cache copies %.0f + shadow samples %.0f + reductions %.0f + guide / grid %.0f + other %.0f", s->lazy->width,
+           s->lazy->height, a->passes, a->ms, a->msWindow, bs.demosaicMs(), bs.bandCopyMs(), a->msKeep, a->msLuma, a->msFeed, a->msGrid,
+           a->ms - a->msWindow - a->msKeep - a->msLuma - a->msFeed - a->msGrid);
   stageLog("export_stream analyses %dx%d: %d pass(es) %.0f ms (demosaic %.0f ms, %.1f MP), shadow floor %d, %d reductions, guide grids %d, %s demosaic, row cache %.0f MB (%d rows)", s->lazy->width,
            s->lazy->height, a->passes, a->ms, bs.demosaicMs(), bs.demosaicMpx(), a->shadow ? 1 : 0, int(a->reduced.size()), a->guide ? int(a->guide->grids.size()) : 0, bs.gpu() ? "GPU" : "CPU",
            double(bs.cacheBytes()) / 1048576.0, bs.cachedRows());
@@ -178,6 +181,7 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
   if (!film && dapple::engine::gpu::runtimeEnabled() && (outLongEdge <= 0 || outLongEdge >= 1500)) {  // as renderSessionParams: the GPU export, its tiles streamed
     std::lock_guard<std::mutex> lock(s->exportMtx);
     bs.setCancel(s->exportEngine.cancelCell(), s->exportEngine.ticket());
+    const double mpx0 = bs.demosaicMpx(), dms0 = bs.demosaicMs();  // the render pass's share of the counters (the analysis pass came first)
     xstream::BandSourceStore store(bs);
     dapple::engine::EngineSession::GpuExport e{params, point, virt, store, *s->camera, lut.get()};
     e.outLongEdge = outLongEdge;
@@ -185,32 +189,53 @@ int streamRender(DappleSession* s, const EditParams& paramsIn, const char* lutPa
     // tiles of 512: the device pool (shared memory on phones) stays small; the GPU executor is tile-invariant (same pixels at any tile size)
     e.tile = 512;
     if (const char* te = std::getenv("DAPPLE_EXPORT_STREAM_TILE")) e.tile = std::max(64, std::atoi(te) / 4 * 4);
-    std::vector<std::uint8_t> band;
+    std::vector<std::uint8_t> band, row;
     int ow = 0, bandY = -1;
     bool aborted = false;
+    double packMs = 0, handMs = 0;  // the sink's 4 -> 3 channel pack, the band's hand-off (progress + encoder push, which waits for the strip before)
     e.onSize = [&](int w, int h) {
       ow = w;
       sized(w, h);
     };
     e.target.sink = [&](int x, int y, int tw, int th, const std::uint8_t* rgba, std::size_t stride) {
-      if (y != bandY) {  // tiles arrive in raster order: a new band row
+      const auto tp = std::chrono::steady_clock::now();
+      if (y != bandY) {  // tiles arrive in raster order: a new band row (every pixel of it is written by its tiles)
         bandY = y;
-        band.assign(std::size_t(th) * ow * 3, 0);
+        band.resize(std::size_t(th) * ow * 3);
       }
       for (int j = 0; j < th; ++j) {
         const std::uint8_t* src = rgba + std::size_t(j) * stride;
         std::uint8_t* dst = band.data() + (std::size_t(j) * ow + x) * 3;
-        for (int i = 0; i < tw; ++i) dst[3 * i] = src[4 * i], dst[3 * i + 1] = src[4 * i + 1], dst[3 * i + 2] = src[4 * i + 2];
+        // the readback memory is mapped device memory (uncached on a phone: narrow loads from it are slow): the row is copied out with wide loads first,
+        // then packed RGBA -> RGB with one 4-byte copy per pixel (the alpha byte is overwritten by the next pixel's red), the last pixel by its three bytes
+        row.resize(std::size_t(tw) * 4);
+        std::memcpy(row.data(), src, std::size_t(tw) * 4);
+        const std::uint8_t* rp = row.data();
+        int i = 0;
+        for (; i + 1 < tw; ++i) std::memcpy(dst + 3 * i, rp + 4 * i, 4);
+        if (i < tw) dst[3 * i] = rp[4 * i], dst[3 * i + 1] = rp[4 * i + 1], dst[3 * i + 2] = rp[4 * i + 2];
       }
+      packMs += msSince(tp);
       if (x + tw < ow) return true;
       bandY = -1;
-      if (!progressSink(y, th, band.data())) return !(aborted = true);
+      const auto th0 = std::chrono::steady_clock::now();
+      const bool handed = progressSink(y, th, band.data());
+      handMs += msSince(th0);
+      if (!handed) return !(aborted = true);
       return true;
     };
     std::string err;
-    const int r = s->exportEngine.exportGpu(e, nullptr, &err);
-    stageLog("export_stream GPU %dx%d -> long edge %d: %s (%llu windows, %.1f MP, demosaic %.0f ms %s%s)", W, H, int(outLongEdge), r == 0 ? "ok" : r > 0 ? "GPU declined" : err.c_str(),
-             (unsigned long long)bs.windows(), bs.demosaicMpx(), bs.demosaicMs(), bs.gpu() ? "GPU" : "CPU", bs.fellBack() ? ", fell back" : "");
+    dapple::engine::GpuStats gst;
+    bs.resetRowCounts();
+    const auto tg0 = std::chrono::steady_clock::now();
+    const int r = s->exportEngine.exportGpu(e, &gst, &err);
+    const double gpuWall = msSince(tg0);
+    stageLog("export_stream GPU %dx%d -> long edge %d: %s (render pass %llu windows, %.1f MP of %.1f MP, demosaic %.0f ms %s%s; rows demosaiced: %d, twice or more: %d, from the cache: %d)", W, H, int(outLongEdge),
+             r == 0 ? "ok" : r > 0 ? "GPU declined" : err.c_str(), (unsigned long long)(bs.windows() - windows0), bs.demosaicMpx() - mpx0, double(W) * H / 1e6, bs.demosaicMs() - dms0,
+             bs.gpu() ? "GPU" : "CPU", bs.fellBack() ? ", fell back" : "", bs.rowsDemosaiced(), bs.rowsDemosaicedAgain(), bs.rowsNotDemosaiced());
+    stageLog("export_stream GPU render %.0f ms = source windows %.0f (demosaic %.0f, copies %.0f) + upload %.0f (host copy %.0f, convert submit %.0f, device wait %.0f) + record %.0f + submit %.0f + wait for the previous tile %.0f + sink %.0f (pack %.0f, hand-off %.0f) + turn %.0f + other %.0f; GPU busy %.0f ms, %d tiles",
+             gpuWall, gst.tSrcMs, bs.demosaicMs() - dms0, gst.tSrcMs - (bs.demosaicMs() - dms0), gst.tUpMs, gst.tUpCopyMs, gst.tUpSubMs, gst.tUpWaitMs, gst.tRecMs, gst.tSubMs, gst.tWaitMs, gst.tSinkMs, packMs, handMs, gst.tTurnMs,
+             gpuWall - gst.tSrcMs - gst.tUpMs - gst.tRecMs - gst.tSubMs - gst.tWaitMs - gst.tSinkMs - gst.tTurnMs, gst.gpuMs, gst.tiles);
     if (r == 0) return 1;
     if (r < 0 || aborted) {
       setError(aborted ? "cancelled" : (err.empty() ? "GPU export failed" : err));

@@ -1,5 +1,56 @@
 # Xiaomi Redmi (2312DRA50C "garnet") device results, wave 8, 2026-11-12
 
+## 2026-11-16 (58) 61 MP streamed export 4.6 - 4.9 s -> 2.9 - 3.0 s: stage split, vectorised Bayer demosaic (native binaries, pipeline-architecture.md section 58)
+
+Native binaries only, under `/data/local/tmp/strm` (removed afterwards): `before` = HEAD e936f88 (`build/stream-before-arm64`), `after` = this change (`build/stream-after-arm64`, built with the other engineer's working-tree edits to `core/engine/nodes/point` / `host_tables.cpp` / `engine_session.h`, which HEAD does not have). arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`; `DAPPLE_GPU=1`, GPU probe as the app (`DAPPLE_BENCH_PROBE`), the demosaic verdict is CPU on this phone in both (frame GPU 172 ms vs CPU 45 ms). `dapple_open_bench <raw> export out.jpg` (editor session, then `dapple_export_intent` + FULL session + `dapple_session_export_jpeg`, quality 92), `adb logcat -s dapple_engine` for the stage lines, peak RSS from `VmHWM`. Battery Saver off, no reboot, no app. Samples: `build/rawsamples/Sony/ILCE-7RM4/DSC00396.ARW` (61 MP, streams: whole-frame peak 1542 MB > budget 1536 MB), `ILCE-6700/DSC00002.ARW` (26 MP, whole frame). The first run after a push is slower (15.9 s once on the 61 MP file: probe and cold caches) and is not in the tables.
+
+### 61 MP, GPU stream path, ms (3 reps, alternating before / after)
+| | before | after |
+|---|---|---|
+| total (open + render + encode) | 4994, 4876, 4890 (two earlier batches 4625 - 5103) | **2934, 3030, 2933** (earlier batches, before the last changes: 2940 - 3217) |
+| peak RSS (VmHWM) / stage-log footprint | 597.7 - 598.0 MB / 584 MB | **581.5 - 581.6 MB** / **568 MB** |
+| export JPEG md5 | `36863d66c9fbdbaa7841199a74af6e94` in all 9 runs | the same, all 9 runs |
+
+Stage split of one run, before (HEAD + the timers only, single instrumented run, 5116 ms; the HEAD binary itself logs only the analysis pass (1401 - 1449, demosaic 782 - 819) and the cumulative demosaic (1395 - 1443)) and after (final binary, rep 1, 2890 ms in the export + 44 ms opening the session = 2934):
+| stage | before | after |
+|---|---|---|
+| analysis pass | 1606 | **885** |
+|   window reads: demosaic (61.0 / 64.1 MP) | 855 | 473 |
+|   window reads: band copies | 47 | 38 |
+|   row cache copies | 429 | 132 |
+|   shadow samples / reductions / other | 22 / 240 / 13 | 20 / 210 / 12 |
+| render pass (GPU, 247 tiles) | 3302 | **1857** |
+|   source windows: demosaic (41.4 MP, 4328 rows once) | 705 | 320 |
+|   source windows: copies out of the cache / rolling band | 348 | 306 |
+|   upload (host copy into staging, convert submit, device wait) | 1339 | 374 (326, 39, 0) |
+|   record + submit | 103 | 59 |
+|   wait for the previous tile (device time not hidden) | in the upload | 371 |
+|   sink: RGBA -> RGB pack / encoder hand-off | 442 / 317 | 300 / 81 |
+|   other (turn, bookkeeping) | 47 | 47 |
+| encoder finish (last strip + assembly) | 164 | 105 |
+| file write | 15 | 11 |
+| other | 9 | 8 |
+| **export total** | **5116** (HEAD binary 4575 - 4951) | **2890** |
+The stages add up to the totals (885 + 1857 + 22 = 2764 render; + 105 + 11 + 9 = 2890; within 1 %).
+
+### Demosaic alone (`dapple_demosaic_tests speed`, synthetic 24 MP Bayer, ms)
+| | before | after |
+|---|---|---|
+| 1 thread | 826 | **252** (scalar node with the new window scaling 623; `bayer_vec`: 254 vs 623) |
+| 6 threads | 180 | **107** (bound by writing the 288 MB output) |
+| 812 x 812 windows, 6 threads | 33.7 ns / px | **20.8 ns / px** |
+
+### 26 MP A6700 (whole-frame path), ms (3 reps)
+| | before | after |
+|---|---|---|
+| total | 2132, 2066, 2079 (earlier batches 1864 - 2086) | **1856, 1817, 1860** |
+| full open (decode + demosaic) | 407 - 413 | **331 - 352** |
+| render / encode+write (one log line) | 1133 / 343 | 1104 / 367 |
+| peak RSS | 691.2 - 692.8 MB | 691.4 - 693.4 MB (the same within the spread; the binary also carries the other engineer's working-tree edits) |
+| md5 | `0bcb265c1c42a5fe14c504eecaab1749` | the same |
+
+`dapple_demosaic_tests bayer_vec flat pair edges tiles threads` on the phone (two Bayer sample files in the working directory): pass, the vectorised node equals the scalar one bit for bit (also on arm64, where clang fuses multiply-adds within an expression). Not measured: GLES, the app, the Note10+ (the 6.1 s of the owner's phone), thermal state.
+
 ## 2026-11-16 (55) X-Trans on one node, first drag frame, bounded cache (native binaries, pipeline-architecture.md section 55)
 
 Native binaries only, under `/data/local/tmp/xtp` (removed afterwards): `before` = HEAD b95e771, `after` = this change, arm64 release builds in `build/xtp-before-arm64` / `build/xtp-after-arm64`. Battery Saver off (`low_power` 0, unchanged), no reboot, no app. Files: public samples `Fujifilm-X-S10-lossless-compressed.RAF` (26 MP), X-T50 `DSCF0118.RAF` (40 MP), A6700 `DSC00002.ARW` (drags), pack `build/film/dapple_new.dfp`.

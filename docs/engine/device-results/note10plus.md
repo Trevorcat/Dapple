@@ -1,5 +1,15 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (57) Smaller colour lattice for interactive frames that rebuild it (pipeline-architecture.md section 57)
+
+Native `dapple_drag_bench a6700.ARW dapple.dfp 810 60 'pads colour'` (DAPPLE_GPU=1, interaction flag set as the app does, bake 57 requested, analysis on, tone strength 60), arm64 release build of the working tree, RFCMA05Q5ZX in `/data/local/tmp/lattice53` (removed afterwards), 3 runs alternating before / after with a 20 s pause. Before = `DAPPLE_INTERACTIVE_LATTICE=0` (57^3 as the app asks), after = the engine default 53^3, same binary. Tables ms and frame ms (wall of `render_frame`), median / p90 of the 59 frames after the first, per run:
+
+| colour pad | tables median (p90) before | tables after | frame median (p90) before | frame after |
+|---|---|---|---|---|
+| no film | 28.8 (29.9) / 27.5 (28.8) / 27.9 (29.3) | **24.9 (26.7) / 25.5 (27.2) / 24.4 (26.3)** | 41.4 (44.2) / 40.1 (42.4) / 41.3 (43.7) | **38.2 (40.3) / 38.7 (40.8) / 37.9 (39.2)** |
+| film (Portra 400, full strength) | 15.0 (20.0) / 15.2 (21.5) / 15.4 (22.0) | 14.8 (20.8) / 15.3 (21.8) / 16.0 (20.4) | 38.6 (44.8) / 39.2 (45.4) / 39.6 (44.6) | 38.8 (47.3) / 39.1 (44.7) / 39.8 (45.9) |
+The gain is the 20 % of the lattice bake the size removes: about 3 ms of tables and 3 ms of frame (-11 % / -8 %) without film; with a full-strength film the colour lattice is a stub, so nothing changes (and nothing is lost). First frames (cold process) 610 - 650 ms without film in both. No frame over 100 ms. Not measured: the app, the 1080 rung, GLES, the settled frame on the phone (it is the same 65^3 bake as before).
+
 ## 2026-11-16 (56) In-app X-Trans node choice and drag start, measured and fixed (pipeline-architecture.md section 56)
 
 Release APKs of the working tree on 63244fc+, `install -r` only, Note10+ RFCMA05Q5ZX, taps only; scripts, logs, `an_*.py` in `build/perf-20261116f/`. Builds: `before.apk` (diagnostics only), `a1`/`a2` (placement fix; a2 + piggyback fix), `a3` (small first keep-warm units), `a4` (no CPU waits for uploads), `a5` (+ film LUT size change asynchronous; final). Native binaries `build/sched-arm64` under `/data/local/tmp/sch` (removed). State: **Battery Saver ON (`low_power` 1, unchanged)**, battery 100 % on USB, 28.2-28.8 C, `Thermal Status 0`, no reboot. Props `debug.dapple.frame_profile`, `debug.dapple.diag_sched`, `debug.dapple.diag_upload` set during runs and reset to empty. Files: public samples as `T1116f_{6700.ARW,xs10.RAF,xt50.RAF}`, scanned with `MEDIA_SCANNER_SCAN_FILE`.

@@ -230,7 +230,7 @@ static void testRowWalk() {
   for (bool xt : {false, true})
     for (int flip : {0, 3, 6})
       for (int mode : {0, 1, 2}) {  // 0 rows, 1 rows after an analysis pass with a row cache, 2 columns
-        const int cacheRows = mode == 1 ? 300 : 0;
+        const int cacheRows = mode == 1 ? 520 : 0;  // more than the first tile window (tile + 2 halo rows), as an export's cache is
         const bool cols = mode == 2;
         auto m = makeMosaic(1501, 1203, xt, false, flip);
         const ImageF full = demosaic::demosaicFull(*m);
@@ -246,6 +246,7 @@ static void testRowWalk() {
           }
         }
         const double mp0 = bs.demosaicMpx();
+        bs.resetRowCounts();  // row accounting of the walk itself (not of the analysis pass above)
         int bad = 0, rects = 0;
         const int nx = (W + tile - 1) / tile, ny = (H + tile - 1) / tile;
         for (int k = 0; k < nx * ny; ++k) {
@@ -269,6 +270,17 @@ static void testRowWalk() {
                     mode == 0 ? "rows            " : mode == 1 ? "rows after cache" : "columns         ", bad, rects, walked);
         CHECK(bad == 0);
         if (!cols) CHECK(walked < 1.25);  // rows: about one picture (the bands overlap by the halo)
+        if (!cols) {
+          // every row is demosaiced once while walking along rows: the halo rows of the next row of tiles come from the rolling band. The only repeat is the very
+          // first window (a walk down a column looks the same at its first rect, so it is a window of its own: at most one tile with its halo, none when the
+          // analysis pass's cache holds the top rows)
+          const int again = bs.rowsDemosaicedAgain(), once = bs.rowsDemosaiced(), cached = bs.rowsNotDemosaiced();
+          std::printf("    rows demosaiced %d (twice or more: %d), not demosaiced (cache) %d of %d\n", once, again, cached, H);
+          CHECK(again <= (mode == 0 ? tile + 2 * halo : 0));
+          CHECK(once + cached == H);
+          if (mode == 1) CHECK(cached >= 300);
+          if (mode == 0) CHECK(once == H);
+        }
       }
 }
 

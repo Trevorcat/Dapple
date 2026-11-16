@@ -41,6 +41,7 @@ class JpegStripEncoder {
   bool push(const std::uint8_t* rgb, int rows, std::size_t strideBytes = 0);  // false: encode failed / more rows than the picture has
   Result<std::vector<std::uint8_t>> finish();
   bool stripped() const;
+  double waitedMs() const;  // time push() spent waiting for the previous strip's encode (stage log)
   std::size_t bufferBytes() const;
 
  private:

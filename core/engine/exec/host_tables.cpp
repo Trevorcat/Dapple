@@ -2,6 +2,7 @@
 // CpuImpl::bake, cached in the session's ResultCache under their effective keys, assembled into the frame's BakedLut (kBakeSlot). Also the
 // Resize node's bake (the session source at a smaller long edge).
 #include <algorithm>
+#include <cstdlib>
 #include <unordered_set>
 
 #include "engine/exec/engine_session_internal.h"
@@ -18,6 +19,15 @@ std::shared_ptr<T> as(const std::shared_ptr<void>& p) {
   return std::static_pointer_cast<T>(p);
 }
 }  // namespace
+
+int interactiveLatticeN() {
+  // DAPPLE_INTERACTIVE_LATTICE=<n> overrides the size (0 = the requested size is baked as asked: the measurement tool compares sizes with it)
+  static const int v = [] {
+    if (const char* e = std::getenv("DAPPLE_INTERACTIVE_LATTICE")) return std::atoi(e);
+    return kInteractiveLatticeN;
+  }();
+  return v;
+}
 
 std::shared_ptr<void> bakeNode(NodeType type, const void* resolved, std::span<const void* const> inputs) {
   const CpuImpl* impl = NodeRegistry::instance().desc(type).cpu;
@@ -94,7 +104,10 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
   const NodeInstance* anN = g.find(NodeType::Analysis);
   const NodeInstance* ovN = g.find(NodeType::LatticeOverflow);
   if (!latN) return out.error = "graph without a colour lattice", nullptr;
-  const int nReq = std::clamp(n, 17, 65);
+  int nReq = std::clamp(n, 17, 65);
+  // an interactive frame that has to bake the colour lattice bakes the smaller one (section 57); a cached lattice at least that fine (a settled 65, a
+  // 57 of an earlier session) is still found and reused, and a non-interactive frame asks for what it asked for
+  if (const int cap = interactiveLatticeN(); job.request.interactive && cap > 0 && nReq > cap) nReq = cap;
   const TableEnv env{job.point, job.src};
   const bool move = job.params.toneStrength > 0.f;
   using session::Clock;
@@ -233,6 +246,7 @@ std::shared_ptr<const BakedLut> EngineSession::runHostTables(FrameJob& job, cons
     }
     out.hasAnalysis = true;
   }
+  if (bl) out.bakeN = bl->n;
   return bl;
 }
 

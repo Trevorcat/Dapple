@@ -3,6 +3,7 @@
 #include "engine/exec/gpu_executor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include "engine/nodes/gpu_common.h"
@@ -108,7 +109,7 @@ Core::Stats Core::statsOf(hal::FenceH f) {
 }
 
 bool Core::uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h, const hal::ImageH& dst, int dx, int dy, std::string& err,
-                        const std::function<bool()>& between) {
+                        const std::function<bool()>& between, bool waitDevice) {
   const std::size_t rowBytes = std::size_t(w) * 12;
   const std::size_t chunkBytes = 24u << 20;
   const int rows = int(std::max<std::size_t>(1, std::min<std::size_t>(std::size_t(h), chunkBytes / rowBytes)));
@@ -118,12 +119,15 @@ bool Core::uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h,
     if (!cl) return err = dev_->lastError().empty() ? "no frame slot" : dev_->lastError(), false;
     if (!ensureStaging(cl->slot(), rowBytes * std::size_t(n), err)) return false;
     SlotRes& s = slots_[cl->slot()];
+    const auto tCopy = std::chrono::steady_clock::now();
     auto* dstp = static_cast<std::uint8_t*>(s.staging.mapped);
     if (pitchFloats == std::size_t(w) * 3) {
       std::memcpy(dstp, rgb + std::size_t(y) * pitchFloats, rowBytes * std::size_t(n));
     } else {
       for (int j = 0; j < n; ++j) std::memcpy(dstp + std::size_t(j) * rowBytes, rgb + std::size_t(y + j) * pitchFloats, rowBytes);
     }
+    const auto tSub = std::chrono::steady_clock::now();
+    upCopyMs_ = upCopyMs_.load() + std::chrono::duration<double, std::milli>(tSub - tCopy).count();
     GpuGraph g(*dev_, *pool_);
     std::string e2;
     GpuRecorder rec(*dev_, g, e2);
@@ -131,9 +135,13 @@ bool Core::uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h,
     // the convert pass reads the staging buffer: build the dispatch by hand (the uniform carries the chunk placement)
     if (!recordConvert(rec, s.staging, out, w, n, dx, dy + y)) return err = e2, false;
     if (runGraph(*dev_, g, *cl, nullptr, err) != hal::Status::Ok) return false;
+    upSubmitMs_ = upSubmitMs_.load() + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tSub).count();
     if (between && y + n < h && !between()) return err = "upload stopped between two submissions", false;
   }
+  if (!waitDevice) return true;
+  const auto tWait = std::chrono::steady_clock::now();
   if (dev_->waitAll() != hal::Status::Ok) return err = dev_->lastError(), false;
+  upWaitMs_ = upWaitMs_.load() + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tWait).count();
   return true;
 }
 // ---- deferred destruction --------------------------------------------------------------------------------------------------------------------

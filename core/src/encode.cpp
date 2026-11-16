@@ -2,6 +2,8 @@
 #include <stb_image_write.h>
 
 #include <fstream>
+#include <chrono>
+#include <deque>
 #include <future>
 
 #include "dapple/encode.h"
@@ -175,24 +177,46 @@ struct JpegStripEncoder::Impl {
   std::vector<std::uint8_t> buf;                 // the strip being filled (or the whole picture when it is not stripped)
   int filled = 0, done = 0;                      // rows in buf, rows handed over so far
   std::vector<std::vector<std::uint8_t>> parts;  // encoded strips (reserved up front: the worker writes into its element)
-  std::future<bool> pending;                     // the previous strip, encoding on a worker while the next band renders
-  std::vector<std::uint8_t> pendingBuf;
+  // The finished strips encode on workers while the next bands render: up to kInFlight at once (a strip is an independent JPEG, so the bytes do not depend on
+  // how many run together). One more strip buffer per extra strip in flight.
+  static constexpr std::size_t kInFlight = 2;
+  struct Job {
+    std::future<bool> done;
+    std::vector<std::uint8_t> rows;
+  };
+  std::deque<Job> inflight;
+  std::vector<std::uint8_t> spare;  // a finished strip's buffer, reused for the next one to fill
   bool failed = false;
-  bool wait() {
-    if (pending.valid() && !pending.get()) failed = true;
+  double waitedMs = 0;  // time push() was blocked on a strip's encode (the encoder is the slower stage when this grows)
+  bool waitOldest() {
+    const auto t0 = std::chrono::steady_clock::now();
+    Job j = std::move(inflight.front());
+    inflight.pop_front();
+    if (!j.done.get()) failed = true;
+    waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    spare.swap(j.rows);
+    return !failed;
+  }
+  bool wait() {  // every strip handed over so far has been encoded
+    while (!inflight.empty()) waitOldest();
     return !failed;
   }
   bool encodeStrip() {  // the filled rows of buf -> parts[i], on a worker
-    if (!wait()) return false;
+    while (inflight.size() >= kInFlight)
+      if (!waitOldest()) return false;
+    if (failed) return false;
     const std::size_t i = parts.size();
     parts.emplace_back();
-    pendingBuf.swap(buf);
-    if (buf.size() != pendingBuf.size()) buf.assign(pendingBuf.size(), 0);
+    Job j;
+    j.rows.swap(buf);
+    if (!spare.empty()) buf.swap(spare);
+    if (buf.size() != j.rows.size()) buf.assign(j.rows.size(), 0);
     const int rows = filled;
     filled = 0;
     std::vector<std::uint8_t>* dst = &parts[i];
-    const std::uint8_t* src = pendingBuf.data();
-    pending = std::async(std::launch::async, [this, dst, src, rows] { return stbi_write_jpg_to_func(vecSink, dst, W, rows, 3, src, o.quality) != 0; });
+    const std::uint8_t* src = j.rows.data();
+    j.done = std::async(std::launch::async, [this, dst, src, rows] { return stbi_write_jpg_to_func(vecSink, dst, W, rows, 3, src, o.quality) != 0; });
+    inflight.push_back(std::move(j));
     return true;
   }
 };
@@ -206,10 +230,17 @@ JpegStripEncoder::JpegStripEncoder(int width, int height, const JpegOptions& opt
   m.buf.assign(std::size_t(m.strips ? std::min(m.SR, height) : std::max(height, 0)) * std::size_t(std::max(width, 0)) * 3, 0);
 }
 JpegStripEncoder::~JpegStripEncoder() {
-  if (impl_ && impl_->pending.valid()) impl_->pending.wait();
+  if (impl_)
+    for (auto& j : impl_->inflight)
+      if (j.done.valid()) j.done.wait();
 }
 bool JpegStripEncoder::stripped() const { return impl_->strips; }
-std::size_t JpegStripEncoder::bufferBytes() const { return impl_->buf.capacity() + impl_->pendingBuf.capacity(); }
+double JpegStripEncoder::waitedMs() const { return impl_->waitedMs; }
+std::size_t JpegStripEncoder::bufferBytes() const {
+  std::size_t n = impl_->buf.capacity() + impl_->spare.capacity();
+  for (const auto& j : impl_->inflight) n += j.rows.capacity();
+  return n;
+}
 
 bool JpegStripEncoder::push(const std::uint8_t* rgb, int rows, std::size_t stride) {
   Impl& m = *impl_;
@@ -234,7 +265,7 @@ Result<std::vector<std::uint8_t>> JpegStripEncoder::finish() {
     return fail("JPEG encode failed");
   }
   std::vector<std::uint8_t>().swap(m.buf);
-  std::vector<std::uint8_t>().swap(m.pendingBuf);
+  std::vector<std::uint8_t>().swap(m.spare);
   std::vector<std::vector<std::uint8_t>>().swap(m.parts);
   addSegments(m.o, out);
   return out;

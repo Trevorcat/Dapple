@@ -397,6 +397,11 @@ add_executable(dapple_drag_bench engine/drag_bench.cpp)
 target_link_libraries(dapple_drag_bench PRIVATE dapple)
 target_include_directories(dapple_drag_bench PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
 
+# Interactive colour-lattice size: dE2000 of drag frames baked at 33..57 against the 57 frame and the settled frame (docs/engine/pipeline-architecture.md 57)
+add_executable(dapple_lattice_size_bench engine/lattice_size_bench.cpp)
+target_link_libraries(dapple_lattice_size_bench PRIVATE dapple)
+target_include_directories(dapple_lattice_size_bench PRIVATE ${PROJECT_SOURCE_DIR}/core/include)
+
 # Strip-parallel baseline JPEG encoder: same decoded pixels as the single-threaded encode, two decoders
 add_executable(dapple_jpeg_mt_tests jpeg_mt_tests.cpp)
 target_link_libraries(dapple_jpeg_mt_tests PRIVATE dapple_core dapple_stb)
@@ -667,7 +672,7 @@ endforeach()
 
 # Timing-sensitive (present.loop_view measures a frame loop, demosaic.wire_cancel a cancel latency) or not yet safe next to other test processes (film.c_api crashes only when run in parallel:
 # shared state still to be found): run them alone so the default run does not report load as failures.
-foreach(_t present.loop_view film.c_api demosaic.wire_cancel engine.gpu_concurrency engine.gpu_concurrency_swiftshader base_previews.cancel engine.overhead)
+foreach(_t present.loop_view film.c_api demosaic.wire_cancel engine.gpu_concurrency engine.gpu_concurrency_swiftshader base_previews.cancel engine.overhead engine.long_session demosaic.gpu_verdict engine.touch_heat)
   if(TEST ${_t})
     set_tests_properties(${_t} PROPERTIES RUN_SERIAL TRUE)
   endif()

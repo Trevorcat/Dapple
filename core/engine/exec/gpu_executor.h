@@ -51,6 +51,7 @@ class Core {
   // readback crosses a turn in a frame slot); waits for the device itself. Returns the bytes released.
   std::size_t trimStaging();
   hal::BufferH gBuf, partBuf;  // dehaze statistics + reduction partials (device local)
+  std::atomic<double> upCopyMs_{0}, upSubmitMs_{0}, upWaitMs_{0};
   bool boxScanOk = true;       // the running-sum box passed its start-up check on this device (else the direct sum is used)
   // Frame statistics of a finished submission
   struct Stats {
@@ -61,9 +62,15 @@ class Core {
   Stats statsOf(hal::FenceH f);
   // Uploads packed float RGB rows of `rgb` (row pitch `pitchFloats`) into `dst` at (dx, dy) through the convert pass, in submissions of
   // 24 MB. `between` (optional) runs between two submissions (a background upload hands the device to a waiting interactive frame there);
-  // false stops the upload.
+  // false stops the upload. waitDevice = false: do not wait for the copy on the CPU (the caller's next submission is ordered after it on the GPU: Vulkan, GLES).
   bool uploadRgbF32(const float* rgb, std::size_t pitchFloats, int w, int h, const hal::ImageH& dst, int dx, int dy, std::string& err,
-                    const std::function<bool()>& between = {});
+                    const std::function<bool()>& between = {}, bool waitDevice = true);
+  // Where uploadRgbF32 spent its time since the process started (stage log of a streamed export: the host copy into the staging buffer, the convert pass's
+  // recording and submission, the wait for the device); read as differences around an export
+  struct UploadTimes {
+    double copyMs = 0, submitMs = 0, waitMs = 0;
+  };
+  UploadTimes uploadTimes() const { return {upCopyMs_.load(), upSubmitMs_.load(), upWaitMs_.load()}; }
 
   // Deferred destruction (no waitIdle): a device resource released while work already submitted may still read it (a cache eviction, a
   // session closing) is destroyed once the first fenced submission after its release has completed. retire(): any thread. submitted():

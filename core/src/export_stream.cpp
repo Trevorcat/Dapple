@@ -142,6 +142,18 @@ bool openLazy(int W, int H, std::string* why, std::size_t extraBytes, bool film)
   return need > budget;
 }
 
+// fn(a, b) for row ranges [a, b) of [0, n), on the pool's workers (a memory copy of many rows: one core does not saturate a phone's memory bandwidth)
+template <class F>
+void parallelRows(int n, F&& fn) {
+  constexpr int kChunk = 16;
+  const int chunks = (n + kChunk - 1) / kChunk;
+  if (chunks <= 1) {
+    if (n > 0) fn(0, n);
+    return;
+  }
+  parallelFor(chunks, [&](int c) { fn(c * kChunk, std::min(n, (c + 1) * kChunk)); });
+}
+
 // ---- BandSource ----------------------------------------------------------------------------------------------------------------------------
 BandSource::BandSource(std::shared_ptr<const MosaicImage> mosaic) : m_(std::move(mosaic)) {
   if (!m_) return;
@@ -160,6 +172,9 @@ void BandSource::dropCache() {
 }
 void BandSource::keep(const ImageF& win, int y0, int ya, int yb) {
   if (cacheBudget_ == 0 || win.width != W_ || yb <= ya) return;
+  // the render starts at the top and the cache ends up holding the top rows that fit: a band that starts below the line the budget allows is never kept
+  // (copying it only to evict it again cost 430 ms of a 61 MP analysis pass on a phone)
+  if (ya >= int(cacheBudget_ / (std::size_t(W_) * 3 * sizeof(float)))) return;
   // only rows not cached yet (the blocks stay disjoint)
   for (const Block& b : cache_) {
     if (b.y0 <= ya && ya < b.y1) ya = b.y1;
@@ -235,12 +250,15 @@ bool BandSource::demosaicRows(int ya, int yb, float* dst) {
   fellBack_ |= fb;
   if (shadow_) shadowChromaFloorRows(dst, W_, yb - ya, pitch);
   ++windows_;
+  countRows(ya, yb);
   px_ += std::uint64_t(W_) * std::uint64_t(yb - ya);
   ms_ += msSince(t0);
   return true;
 }
 
 bool BandSource::band(int b0, int b1) {
+  const auto tBand = Clock::now();
+  const double ms0 = ms_;
   const std::size_t pitch = std::size_t(W_) * 3;
   // rows the previous band shares with this one move to the top (a walk down the picture: the halo rows of the next row of tiles)
   const std::size_t need = std::size_t(b1 - b0) * pitch;
@@ -249,7 +267,16 @@ bool BandSource::band(int b0, int b1) {
     ImageF().data.swap(win_.data);  // growing: the old buffer goes first (never two bands alive); its rows are demosaiced again
   } else if (bandOk_ && win_.width == W_ && b0 >= rowsY0_ && b0 < rowsY0_ + win_.height) {
     kept = std::min(rowsY0_ + win_.height, b1) - b0;
-    if (b0 > rowsY0_) std::memmove(win_.data.data(), win_.row(b0 - rowsY0_), std::size_t(kept) * pitch * sizeof(float));
+    if (b0 > rowsY0_) {
+      // the kept rows move up by `shift` rows: when the source and the destination do not overlap the rows are copied by all the workers
+      const int shift = b0 - rowsY0_;
+      float* base = win_.data.data();
+      if (kept <= shift) {
+        parallelRows(kept, [&](int a, int b) { std::memcpy(base + std::size_t(a) * pitch, base + std::size_t(a + shift) * pitch, std::size_t(b - a) * pitch * sizeof(float)); });
+      } else {
+        std::memmove(base, win_.row(shift), std::size_t(kept) * pitch * sizeof(float));
+      }
+    }
   }
   bandOk_ = false;
   // one buffer for every band of the export: the allocation (and its pages) is reused, the window is never freed and made again
@@ -263,7 +290,9 @@ bool BandSource::band(int b0, int b1) {
       if (b.y0 <= y && y < b.y1) hit = &b;
     if (hit) {  // cached rows (the analysis pass made them)
       const int e = std::min(b1, hit->y1);
-      std::memcpy(win_.row(y - b0), hit->px.data() + std::size_t(y - hit->y0) * pitch, std::size_t(e - y) * pitch * sizeof(float));
+      const float* from = hit->px.data() + std::size_t(y - hit->y0) * pitch;
+      float* to = win_.row(y - b0);
+      parallelRows(e - y, [&](int a, int b) { std::memcpy(to + std::size_t(a) * pitch, from + std::size_t(a) * pitch, std::size_t(b - a) * pitch * sizeof(float)); });
       y = e;
       continue;
     }
@@ -277,6 +306,7 @@ bool BandSource::band(int b0, int b1) {
   if (!demosaiced && kept < b1 - b0) ++cacheHits_;
   peakBytes_ = std::max(peakBytes_, win_.data.size() * sizeof(float));
   bandOk_ = true;
+  copyMs_ += std::max(0.0, msSince(tBand) - (ms_ - ms0));
   return true;
 }
 
@@ -299,6 +329,7 @@ const ImageF* BandSource::window(int x0, int y0, int x1, int y1) {
   if (win_.width != x1 - x0 || win_.height != y1 - y0) return nullptr;
   if (shadow_) shadowChromaFloor(win_);
   ++windows_;
+  countRows(y0, y1);
   px_ += std::uint64_t(x1 - x0) * std::uint64_t(y1 - y0);
   ms_ += msSince(t0);
   peakBytes_ = std::max(peakBytes_, win_.data.size() * sizeof(float));
@@ -496,16 +527,26 @@ bool analyse(BandSource& src, const SourceImage& meta, const Wants& want, Analys
     for (int bi = 0; bi < nb; ++bi) {
       const int y0 = (up ? nb - 1 - bi : bi) * B, y1 = std::min(H, y0 + B);
       const int b0 = up ? y0 : std::max(0, y0 - K), b1 = up ? std::min(H, y1 + K) : y1;  // the footprint overlap below (up) / above (down)
+      auto tl = Clock::now();
+      auto lap = [&](double& acc) {
+        const auto n = Clock::now();
+        acc += std::chrono::duration<double, std::milli>(n - tl).count();
+        tl = n;
+      };
       const ImageF* buf = src.window(0, b0, W, b1);
       if (!buf) return fail("cancelled");
+      lap(out.msWindow);
       src.keep(*buf, b0, y0, y1);
+      lap(out.msKeep);
       // shadow-floor decision samples: every 4th row / column (before the floor)
       if (decide)
         for (int y = (y0 + 3) / 4 * 4; y < y1; y += 4) {
           const float* p = buf->row(y - b0);
           for (int x = 0; x < W; x += 4) luma.push_back(shadowChromaLuma(p + 3 * x));
         }
+      lap(out.msLuma);
       for (RowResizer& r : rz) r.feed(*buf, b0, b1);
+      lap(out.msFeed);
       for (int j = 0; j < gh; ++j) {
         const int y = gridRowY[std::size_t(j)];
         if (y < y0 || y >= y1) continue;
@@ -540,6 +581,7 @@ bool analyse(BandSource& src, const SourceImage& meta, const Wants& want, Analys
           });
         }
       }
+      lap(out.msGrid);
       if (progress && !progress(float(bi + 1) / float(nb) * (pass == 0 ? 1.f : 0.5f))) return fail("cancelled");
     }
     for (const RowResizer& r : rz)

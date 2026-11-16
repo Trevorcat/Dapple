@@ -1102,6 +1102,101 @@ void testSpeed() {
   }
 }
 
+// The vectorised Bayer node (phase planes, a row of one phase at a time) against its scalar reference: bit for bit, on the four CFA phases, odd sizes and
+// odd region origins, a noise mosaic (clipped samples, extremes), non-trivial white balance and matrix, with and without the output clamp, and on the
+// public Bayer sample files. Also prints the speed of both on one thread.
+bool sameBits(const std::vector<float>& a, const std::vector<float>& b, std::size_t* at = nullptr) {
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+      if (at) *at = i;
+      return false;
+    }
+  return true;
+}
+void testBayerVec() {
+  static const char* kPat[4] = {"RGGB", "GRBG", "GBRG", "BGGR"};
+  std::uint32_t rng = 12345u;
+  auto next = [&]() { return rng = rng * 1664525u + 1013904223u; };
+  int cases = 0;
+  for (int pat = 0; pat < 4; ++pat)
+    for (const auto& sz : {std::pair<int, int>{257, 131}, {9, 9}, {1, 7}, {600, 3}, {64, 64}, {333, 250}}) {
+      const int w = sz.first, h = sz.second;
+      Synth s(w, h, Cfa::Bayer, zoneScene(w, h));
+      for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 2; ++x) {
+          const int col = kPat[pat][y * 2 + x] == 'R' ? 0 : kPat[pat][y * 2 + x] == 'G' ? 1 : 2;
+          s.d.cfa3[y * 2 + x] = std::uint8_t(col);
+          s.d.cfa4[y * 2 + x] = std::uint8_t(col);
+        }
+      for (std::size_t i = 0; i < s.raw.size(); ++i) {  // zone plate under noise, some saturated and some black samples
+        const std::uint32_t r = next() >> 8;
+        if (r % 23 == 0) s.raw[i] = std::uint16_t(r & 1 ? 16383 : 0);
+        else if (r % 5 == 0) s.raw[i] = std::uint16_t(std::clamp<int>(int(s.raw[i]) + int(r % 4001) - 2000, 0, 16383));
+      }
+      const float mtx[9] = {1.3f, -0.2f, -0.1f, -0.1f, 1.2f, -0.1f, 0.0f, -0.3f, 1.3f};
+      std::memcpy(s.d.m, mtx, sizeof mtx);
+      s.d.wb[0] = 1.8f, s.d.wb[2] = 1.4f;
+      for (int clampOut = 0; clampOut < 2; ++clampOut) {
+        s.d.clampOut = clampOut != 0;
+        const Rect rois[3] = {{0, 0, w, h}, {w > 4 ? 3 : 0, h > 4 ? 1 : 0, w, h}, {w > 8 ? 2 : 0, h > 8 ? 5 : 0, w > 8 ? w - 1 : w, h > 8 ? h - 2 : h}};
+        for (const Rect& roi : rois) {
+          std::vector<float> a(std::size_t(roi.w()) * roi.h() * 3), b(a.size());
+          dapple::demosaic::demosaic(s.d, roi, a.data(), std::size_t(roi.w()) * 3, 3);
+          dapple::demosaic::demosaicReference(s.d, roi, b.data(), std::size_t(roi.w()) * 3, 3);
+          std::size_t at = 0;
+          CHECK(sameBits(a, b, &at), "%s %dx%d roi (%d,%d)-(%d,%d) clamp %d: first difference at float %zu", kPat[pat], w, h, roi.x0, roi.y0, roi.x1, roi.y1, clampOut, at);
+          ++cases;
+        }
+      }
+    }
+  std::printf("  bayer_vec: %d synthetic cases (4 CFA phases, odd sizes / origins, noise + clipped samples) bit-identical to the scalar node\n", cases);
+  {  // the public samples
+    int files = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::recursive_directory_iterator("build/rawsamples", ec)) {
+      if (!e.is_regular_file() || files >= 12) continue;
+      std::string ext = e.path().extension().string();
+      for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+      if (ext != ".arw" && ext != ".cr2" && ext != ".cr3" && ext != ".nef" && ext != ".raf" && ext != ".dng" && ext != ".orf" && ext != ".rw2") continue;
+      auto mr = decodeRawMosaic(e.path(), {});
+      if (!mr || mr->cfa != CfaKind::Bayer) continue;
+      const Desc d = makeDesc(*mr);
+      const int w = std::min(mr->width - 8, 1501), h = std::min(mr->height - 8, 901);
+      const Rect roi{(mr->width / 3) | 1, (mr->height / 3) | 1, std::min(mr->width, ((mr->width / 3) | 1) + w), std::min(mr->height, ((mr->height / 3) | 1) + h)};
+      std::vector<float> a(std::size_t(roi.w()) * roi.h() * 3), b(a.size());
+      dapple::demosaic::demosaic(d, roi, a.data(), std::size_t(roi.w()) * 3, 0);
+      dapple::demosaic::demosaicReference(d, roi, b.data(), std::size_t(roi.w()) * 3, 0);
+      std::size_t at = 0;
+      CHECK(sameBits(a, b, &at), "%s: first difference at float %zu", e.path().filename().string().c_str(), at);
+      // and the picture's own corner (the mirrored border of the window)
+      const Rect c0{0, 0, std::min(mr->width, 777), std::min(mr->height, 555)};
+      std::vector<float> a2(std::size_t(c0.w()) * c0.h() * 3), b2(a2.size());
+      dapple::demosaic::demosaic(d, c0, a2.data(), std::size_t(c0.w()) * 3, 0);
+      dapple::demosaic::demosaicReference(d, c0, b2.data(), std::size_t(c0.w()) * 3, 0);
+      CHECK(sameBits(a2, b2, &at), "%s corner: first difference at float %zu", e.path().filename().string().c_str(), at);
+      ++files;
+    }
+    std::printf("  bayer_vec: %d public Bayer sample files bit-identical to the scalar node\n", files);
+    if (!files) std::printf("  (no Bayer sample files under build/rawsamples)\n");
+  }
+  {  // speed, one thread, 24 MP
+    const int w = 6000, h = 4000;
+    Synth s(w, h, Cfa::Bayer, zoneScene(w, h));
+    std::vector<float> a(std::size_t(w) * h * 3);
+    double v = 1e30, r = 1e30;
+    for (int rep = 0; rep < 2; ++rep) {
+      auto t0 = std::chrono::steady_clock::now();
+      dapple::demosaic::demosaic(s.d, {0, 0, w, h}, a.data(), std::size_t(w) * 3, 1);
+      v = std::min(v, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      t0 = std::chrono::steady_clock::now();
+      dapple::demosaic::demosaicReference(s.d, {0, 0, w, h}, a.data(), std::size_t(w) * 3, 1);
+      r = std::min(r, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::printf("  bayer_vec: 24 MP on one thread: vectorised %.0f ms, scalar %.0f ms (%.2fx)\n", v, r, r / v);
+  }
+}
+
 void testThreads() {
   for (Cfa c : {Cfa::Bayer, Cfa::XTrans}) {
     Synth s(400, 300, c, zoneScene(400, 300));
@@ -1346,7 +1441,7 @@ int testHalfGpu() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::vector<std::string> all = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "wire_arw2", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu", "gpu_verdict", "gpu_slots", "half_zone", "half_tiles", "half_flatclip", "half_real", "half_gpu"};
+  const std::vector<std::string> all = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "bayer_vec", "cache", "wire_region", "wire_anchor", "wire_anchor_fast", "wire_preview", "wire_cache", "wire_cancel", "wire_arw2", "gpu_parity", "gpu_tiles", "gpu_real", "wire_gpu", "gpu_verdict", "gpu_slots", "half_zone", "half_tiles", "half_flatclip", "half_real", "half_gpu"};
   std::vector<std::string> ids;
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--list") {
@@ -1355,7 +1450,7 @@ int main(int argc, char** argv) {
     }
     ids.push_back(argv[i]);
   }
-  if (ids.empty()) ids = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "cache"};
+  if (ids.empty()) ids = {"flat", "pair", "edges", "zoneplate", "blockzone", "hotpixel", "hotfilter", "clip", "tiles", "threads", "bayer_vec", "cache"};
   int rc = 0;
   for (const auto& id : ids) {
     std::printf("[%s]\n", id.c_str());
@@ -1373,6 +1468,7 @@ int main(int argc, char** argv) {
     else if (id == "half_tiles") testHalfTiles();
     else if (id == "half_flatclip") testHalfFlatClip();
     else if (id == "threads") testThreads();
+    else if (id == "bayer_vec") testBayerVec();
     else if (id == "pair") testPair();
     else if (id == "speed") testSpeed();
     else if (id == "cache") testCache();

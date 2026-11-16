@@ -20,7 +20,7 @@ target_include_directories(dapple_demosaic_tests PRIVATE ${PROJECT_SOURCE_DIR}/c
 if(NOT MSVC)
   target_compile_options(dapple_demosaic_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-foreach(_t flat pair edges zoneplate blockzone hotpixel hotfilter clip tiles threads cache half_zone half_tiles half_flatclip)
+foreach(_t flat pair edges zoneplate blockzone hotpixel hotfilter clip tiles threads bayer_vec cache half_zone half_tiles half_flatclip)
   add_test(NAME demosaic.${_t} COMMAND dapple_demosaic_tests ${_t} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(demosaic.${_t} PROPERTIES TIMEOUT 600)
 endforeach()

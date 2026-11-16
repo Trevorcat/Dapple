@@ -29,6 +29,10 @@ namespace dapple::engine {
 using point::TableBakeCtx;
 using point::TableEnv;
 using point::ToneTableOut;
+// Lattice size an interactive frame bakes when it has to rebuild the colour lattice (a request for more is lowered to it; 0 = off). Docs 57.
+constexpr int kInteractiveLatticeN = 53;
+int interactiveLatticeN();
+
 // Runs `type`'s CpuImpl::bake; null payload when the node has no bake or it failed. Payload types: ColourLattice and
 // LatticeOverflow std::vector<float>, ToneAnalysisPre engine::point::TonePre, ToneTable ToneTableOut, Analysis ToneAnalysis,
 // Resize SourceImage.
@@ -87,6 +91,7 @@ struct FrameResult {
   std::string error;
   // what this frame did (tests, edit-bench)
   enum class Bake : std::uint8_t { FullHit, LatticeReuse, LatticeBake } bake = Bake::FullHit;
+  int bakeN = 0;         // lattice size the frame used (the colour lattice of its bake)
   std::string executor;  // "cpu", "vulkan" or "gles31": who produced the pixels (Full mode)
   std::string why;       // when the CPU rendered although a GPU was asked for or could have been: the reason (Unsupported text, "GPU self-test running", ...)
   bool external = false; // the pixels are in FrameJob::gpuTarget, not in rgba

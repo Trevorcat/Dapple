@@ -100,6 +100,8 @@ float scaleSample(const Desc& d, int x, int y);
 
 // Demosaic `roi` (inside the mosaic) into `out`: interleaved RGB float, row stride `strideFloats` (>= 3 * roi.w()). `threads` = 0: all cores.
 void demosaic(const Desc& d, Rect roi, float* out, std::size_t strideFloats, int threads = 0);
+// The same through the scalar reference of the Bayer node (one pixel at a time): the vectorised node must equal it bit for bit (tests; X-Trans: demosaic()).
+void demosaicReference(const Desc& d, Rect roi, float* out, std::size_t strideFloats, int threads = 0);
 
 // One tile on prepared data (shared by the threads of demosaic() and by the tests). `S` is the scaled window of
 // (roi.w() + 2 halo) x (roi.h() + 2 halo) floats whose (0,0) is absolute (roi.x0 - halo, roi.y0 - halo); the result is roi.w() x roi.h().

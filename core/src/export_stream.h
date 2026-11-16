@@ -5,6 +5,7 @@
 // analyses come from exact reductions built band by band in one pass (analyse()), and the render runs in bands whose source pixels are demosaiced
 // on demand from the mosaic (BandSource), straight into the JPEG strip encoder. Peak memory is the mosaic + a few bands + the reductions, whatever
 // the picture size.
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -115,6 +116,13 @@ class BandSource {
   std::size_t cacheBytes() const { return cacheBytes_; }
   std::uint64_t cacheHits() const { return cacheHits_; }
   int cachedRows() const;
+  // Row accounting (stage log, tests): how often each picture row was demosaiced since resetRowCounts() (a rolling band keeps the rows it shares with the next
+  // tile row, so a streamed render demosaics a row once; rows the analysis pass cached are not demosaiced at all)
+  void resetRowCounts() { rowCount_.assign(std::size_t(std::max(H_, 0)), 0); }
+  int rowsDemosaiced() const { return int(std::count_if(rowCount_.begin(), rowCount_.end(), [](std::uint8_t c) { return c > 0; })); }
+  int rowsDemosaicedAgain() const { return int(std::count_if(rowCount_.begin(), rowCount_.end(), [](std::uint8_t c) { return c > 1; })); }
+  int rowsNotDemosaiced() const { return int(rowCount_.size()) - rowsDemosaiced(); }
+  double bandCopyMs() const { return copyMs_; }  // time of the rolling band outside the demosaic (kept-row moves, cached-row copies, buffer growth)
 
  private:
   std::shared_ptr<const MosaicImage> m_;
@@ -140,6 +148,13 @@ class BandSource {
   std::size_t cacheBudget_ = 0, cacheBytes_ = 0;
   std::uint64_t cacheHits_ = 0;
   bool fromCache(int x0, int y0, int x1, int y1);
+  std::vector<std::uint8_t> rowCount_;
+  double copyMs_ = 0;
+  void countRows(int ya, int yb) {
+    if (rowCount_.size() != std::size_t(std::max(H_, 0))) rowCount_.assign(std::size_t(std::max(H_, 0)), 0);
+    for (int y = ya; y < yb; ++y)
+      if (rowCount_[std::size_t(y)] < 255) ++rowCount_[std::size_t(y)];
+  }
 };
 
 // SourceStore over a BandSource (the GPU executor's streamed tiles ask it for one window per tile).
@@ -173,6 +188,8 @@ struct Analyses {
   std::vector<std::pair<int, std::shared_ptr<SourceImage>>> reduced;  // (long edge, picture)
   std::shared_ptr<local::GuideCapture> guide;
   double ms = 0;
+  // where the pass spent its time (stage log): window reads (demosaic + the band's copies), the row cache's copies, the shadow-floor samples, the reductions' rows, guide / grid
+  double msWindow = 0, msKeep = 0, msLuma = 0, msFeed = 0, msGrid = 0;
   int passes = 0;
   std::shared_ptr<SourceImage> at(int longEdge) const {
     for (const auto& r : reduced)

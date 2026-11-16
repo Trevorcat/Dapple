@@ -97,17 +97,23 @@ int streamExportJpeg(DappleSession* s, const EditParams& ep, const char* lutPath
     quarter = std::max(1, (std::max(fw, fh) + 3) / 4);
     extra.push_back(quarter);
   }
+  const double preMs = msSince(t0);
+  const auto tr0 = std::chrono::steady_clock::now();
   const int r = streamRender(s, ep, lutPath, outLongEdge, onSize, sink, extra);
   if (r <= 0) return r;
   if (!metaOk) return -1;
+  const double renderMs = msSince(tr0), encWaitMs = enc ? enc->waitedMs() : 0.0;
   mem::mark("encode");
+  const auto tf0 = std::chrono::steady_clock::now();
   auto bytes = enc->finish();
   enc.reset();
+  const double finishMs = msSince(tf0);
   if (!bytes) {
     setError(bytes.error().message);
     return -1;
   }
   bool written = false;
+  double writeMs = 0;
   if (hdr) {
     mem::mark("gainmap");
     auto plain = [&](const HdrDecision& d) -> int {
@@ -152,14 +158,18 @@ int streamExportJpeg(DappleSession* s, const EditParams& ep, const char* lutPath
       }
     }
   } else {
+    const auto tw0 = std::chrono::steady_clock::now();
     auto w = writeJpegBytes(*bytes, toPath(outPath));
     if (!w) {
       setError(w.error().message);
       return -1;
     }
+    writeMs = msSince(tw0);
   }
   s->bands.reset();  // the row cache goes with the export
   smp.finish();
+  stageLog("export_stream stages: before the render %.0f + render (analyses, windows, GPU, hand-off) %.0f [encoder waits inside it: %.0f] + encoder finish %.0f + file write %.0f + other %.0f = %.0f ms", preMs,
+           renderMs, encWaitMs, finishMs, writeMs, msSince(t0) - preMs - renderMs - finishMs - writeMs, msSince(t0));
   stageLog("export_stream %s %dx%d%s in %.0f ms: peak footprint %.0f MB (+%.0f over the start, available at the start %.0f MB): %s", outPath ? pathToUtf8(toPath(outPath).filename()).c_str() : "",
            dims.width, dims.height, hdr ? (written ? " Ultra HDR" : " (plain)") : "", msSince(t0), double(smp.peak()) / 1048576.0, double(smp.peak() - std::min(smp.peak(), smp.base())) / 1048576.0,
            double(avail0) / 1048576.0, smp.summary().c_str());
