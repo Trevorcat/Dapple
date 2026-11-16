@@ -22,6 +22,9 @@ layout(std140, binding = 0) uniform P {
   ivec4 dim;     // w, h (of the output), r (largest radius of the pass), offset of the pass's tap table in `tv` (vec4 units)
   ivec4 sz;      // MODE 0: size of the source; MODE 2 / 3: size of the low-resolution plane B (the allocation is larger); MODE 2: zw = workgroup shape
   vec4 w0;       // per channel weight of A
+  ivec4 org;     // MODE 0: xy = where the output lands in the destination image, zw = first source block (output pixels) read; windows of the picture:
+                 // MODE 2 / 3: xy = origin of this output window in the picture at its own level (even): the Catmull-Rom phases and the reflect of `B`
+                 // (the whole-picture low plane) are those of the picture
 } u;
 
 // component j, tap k of the pass: tv[dim.w + j * 20 + k].rgb = tap of channel r, g, b (host written while recording)
@@ -80,9 +83,10 @@ vec3 upsampled(ivec2 p) {
   const ivec2 lsz = u.sz.xy;
   const vec4 wE = vec4(-0.0234375, 0.2265625, 0.8671875, -0.0703125);
   const vec4 wO = vec4(-0.0703125, 0.8671875, 0.2265625, -0.0234375);
-  const bool ox = (p.x & 1) != 0, oy = (p.y & 1) != 0;
+  const ivec2 pp = p + u.org.xy;  // picture coordinates (origin even: the parity of p is the picture's)
+  const bool ox = (pp.x & 1) != 0, oy = (pp.y & 1) != 0;
   const vec4 wx = ox ? wO : wE, wy = oy ? wO : wE;
-  const int jy = p.y >> 1, ix = p.x >> 1;
+  const int jy = pp.y >> 1, ix = pp.x >> 1;
   const int byy = oy ? jy - 1 : jy - 2;
   const int bxx = ox ? ix - 1 : ix - 2;
   const int c0 = reflectIdx(bxx, lsz.x), c1 = reflectIdx(bxx + 1, lsz.x), c2 = reflectIdx(bxx + 2, lsz.x), c3 = reflectIdx(bxx + 3, lsz.x);
@@ -160,14 +164,15 @@ void main() {
   if (p.x >= u.dim.x || p.y >= u.dim.y) return;
 #if MODE == 0
   const int sw = u.sz.x, sh = u.sz.y;
-  const int ya = min(2 * p.y, sh - 1), yb = min(2 * p.y + 1, sh - 1);
+  const ivec2 sp = p + u.org.zw;  // output pixel of the window the block belongs to
+  const int ya = min(2 * sp.y, sh - 1), yb = min(2 * sp.y + 1, sh - 1);
   vec4 v;
-  if (2 * p.x + 1 < sw)
-    v = 0.25 * (texelFetch(uA, ivec2(2 * p.x, ya), 0) + texelFetch(uA, ivec2(2 * p.x + 1, ya), 0) +
-                texelFetch(uA, ivec2(2 * p.x, yb), 0) + texelFetch(uA, ivec2(2 * p.x + 1, yb), 0));
+  if (2 * sp.x + 1 < sw)
+    v = 0.25 * (texelFetch(uA, ivec2(2 * sp.x, ya), 0) + texelFetch(uA, ivec2(2 * sp.x + 1, ya), 0) +
+                texelFetch(uA, ivec2(2 * sp.x, yb), 0) + texelFetch(uA, ivec2(2 * sp.x + 1, yb), 0));
   else
-    v = 0.5 * (texelFetch(uA, ivec2(2 * p.x, ya), 0) + texelFetch(uA, ivec2(2 * p.x, yb), 0));
-  imageStore(uOut, p, h16v(vec4(v.rgb, 1.0)));
+    v = 0.5 * (texelFetch(uA, ivec2(2 * sp.x, ya), 0) + texelFetch(uA, ivec2(2 * sp.x, yb), 0));
+  imageStore(uOut, p + u.org.xy, h16v(vec4(v.rgb, 1.0)));
 #elif MODE == 1
   const int r = u.dim.z, w = u.dim.x;
   const vec3 c0 = texelFetch(uA, p, 0).rgb;

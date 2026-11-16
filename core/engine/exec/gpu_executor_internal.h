@@ -157,8 +157,10 @@ struct Walk {
   WRect interiorWin() const { return WRect{interior.x0 - work.x0, interior.y0 - work.y0, interior.x1 - work.x0, interior.y1 - work.y0}; }
   // FilmFrame stage: the film input (the resident source, its geometry gather, or the local adjustments' stage L on it) -> the film chain
   H filmInput();
+  filmnode::FilmSrc filmInputRect(int x0, int y0, int w, int h);  // the same over a window of the frame (a frame-sized image: the window is a sub-rectangle)
+  filmnode::FilmSrcFn filmSrcFn();                                // for the film window code (valid as long as the Walk)
   bool filmStage();
-  bool filmPrePass(filmnode::FilmPre& out);  // tiled export: the whole-frame part of the film, once
+  bool filmLowPass(filmnode::FilmPre& out);  // tiled export: the low planes of the film's mixtures (the only part that belongs to the whole picture), once
   bool filmWindowStage();                    // tiled export: the film over the work rect grown by the film halo
   bool sweep(const Stage& st);
   bool accumulate(const Stage& st);

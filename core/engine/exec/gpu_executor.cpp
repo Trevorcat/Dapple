@@ -465,10 +465,12 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     lattice |= gi && gi->lattice;
   });
   filmnode::FilmResolved fres;
-  if (filmFrame) {  // the whole-frame part of the film (E2, q) is kept on the device while the tiles run
+  if (filmFrame) {  // the whole-frame part of the film (the level-2 planes of its mixtures) is kept on the device while the tiles run; the source is resident
     if (std::uint64_t(P.geo.outW) * P.geo.outH * 128 > std::uint64_t(double(caps.deviceLocalBytes) * 0.5))
       return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
     if (!filmResolve(in, fres)) return Status::Unsupported;
+    if (tile + 2 * (halo + filmnode::filmWindowHalo(fres) + filmnode::filmMixHalo(fres)) > int(caps.maxImage2D))  // the film window grows the work window
+      return fail(GpuReason::FrameTooLarge, "device image limit too small for the film windows"), Status::Unsupported;
     filmnode::FilmTablesHandle warm;  // CPU bakes without the device (process-wide caches)
     filmnode::tablesFor(fres, warm);
     filmnode::planOf(fres);
@@ -540,10 +542,11 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     for (const Global& gl : globals) w.solves.push_back(SolveRes{gl.node, gl.accum, g.external(*gl.grid), g.external(*gl.solved)});
   };
 
-  // ---- film: exposure, mixtures and the DIR field over the whole frame, once; the tiles read them as persistent images ----
-  hal::ImageH *filmE2 = nullptr, *filmQ = nullptr, *filmDisp = nullptr;
+  // ---- film: the level-2 planes of the mixtures over the whole frame, once (1/16 of the pixels and less; windows recompute the rest); the tiles read
+  // them as persistent images. One tile covering the frame builds them itself. ----
+  hal::ImageH *filmLow[3] = {nullptr, nullptr, nullptr};
   bool filmAny = false;
-  if (filmFrame) {
+  if (filmFrame && (P.geo.outW > tile || P.geo.outH > tile)) {
     auto cl = d.begin();
     if (!cl) return failStatus(hal::Status::Timeout, ""), Status::Internal;
     std::string perr;
@@ -562,26 +565,19 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
       wp.job.lplanes = g.externalBuf(LPl->buf);
     }
     filmnode::FilmPre pre;
-    if (!wp.filmPrePass(pre)) return failRecord(rec, perr), failed(Status::Internal);
+    if (!wp.filmLowPass(pre)) return failRecord(rec, perr), failed(Status::Internal);
     filmAny = pre.any;
+    int lw = 0, lh = 0;
+    filmnode::filmLowSize(P.geo.outW, P.geo.outH, lw, lh);
     hal::Status ms = hal::Status::Ok;
-    auto mkImg = [&](hal::ImageH*& im) {
-      im = keep.add();
-      if (ms == hal::Status::Ok) ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH), 1}, im);
-    };
-    if (pre.any) {
-      mkImg(filmE2);
-      if (pre.q >= 0) mkImg(filmQ);
-    } else {
-      mkImg(filmDisp);
+    const gpu::H lows[3] = {pre.lowPre, pre.lowHalo, pre.lowDir};
+    for (int i = 0; i < 3; ++i) {
+      if (lows[i] < 0) continue;
+      filmLow[i] = keep.add();
+      if (ms == hal::Status::Ok) ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(lw), std::uint32_t(lh), 1}, filmLow[i]);
+      if (ms == hal::Status::Ok) g.copyImage(lows[i], g.external(*filmLow[i]), std::uint32_t(lw), std::uint32_t(lh));
     }
     if (ms != hal::Status::Ok) return failStatus(ms, ""), Status::Internal;
-    if (pre.any) {
-      g.copyImage(pre.e2, g.external(*filmE2), std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
-      if (pre.q >= 0) g.copyImage(pre.q, g.external(*filmQ), std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
-    } else {
-      g.copyImage(pre.disp, g.external(*filmDisp), std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
-    }
     hal::FenceH fence;
     ms = submit(g, *cl, &fence, perr);
     if (ms == hal::Status::Ok) ms = d.wait(fence, kWaitNs);
@@ -706,12 +702,9 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
       w.job.disp = DD->bind(g);
       w.job.strength = P.film.strength;
       w.pre.any = filmAny;
-      if (filmAny) {
-        w.pre.e2 = g.external(*filmE2);
-        if (filmQ) w.pre.q = g.external(*filmQ);
-      } else {
-        w.pre.disp = g.external(*filmDisp);
-      }
+      if (filmLow[0]) w.pre.lowPre = g.external(*filmLow[0]);
+      if (filmLow[1]) w.pre.lowHalo = g.external(*filmLow[1]);
+      if (filmLow[2]) w.pre.lowDir = g.external(*filmLow[2]);
     }
     bindGlobals(g, w);
     bool ok = true;

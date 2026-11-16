@@ -282,6 +282,7 @@ struct Mix3U {
   std::int32_t dim[4];
   std::int32_t sz[4];
   float w0[4];
+  std::int32_t org[4];  // film_mix3.comp: MODE 0 destination / source offsets, MODE 2 / 3 origin of the window in the picture
 };
 // film_v3 reads its taps straight through the texture path (no shared-memory column tile) on unified-memory GPUs (phone SoCs: Adreno
 // 840 runs it 2.2x faster, find-n5.md); the staged version stays for discrete GPUs (a few percent faster there).
@@ -335,8 +336,22 @@ struct Mix3 {
     pass("film_d3", {}, u, {GpuGraph::R(src), GpuGraph::W(d)}, dw, dh);
     return d;
   }
+  // The box average of the window `src` (sw x sh) for the output pixels [sx, sx + cw) x [sy, sy + ch) of its down plane, written into `dst` (a plane of
+  // the whole picture's size) at (dx, dy): the tile's share of a plane that is assembled window by window.
+  void downInto(H src, int sw, int sh, int sx, int sy, int cw, int ch, H dst, int dx, int dy) {
+    Mix3U u{};
+    u.dim[0] = cw;
+    u.dim[1] = ch;
+    u.sz[0] = sw;
+    u.sz[1] = sh;
+    u.org[0] = dx;
+    u.org[1] = dy;
+    u.org[2] = sx;
+    u.org[3] = sy;
+    pass("film_d3", {}, u, {GpuGraph::R(src), GpuGraph::W(dst)}, cw, ch);
+  }
   // dst = w0 * src + comps(src) (+ upsample of `up`), size w x h; comps[c] = the components of channel c at this level
-  H combine(H src, int w, int h, const double w0[3], std::vector<Comp3> comps[3], H up, int upW, int upH) {
+  H combine(H src, int w, int h, const double w0[3], std::vector<Comp3> comps[3], H up, int upW, int upH, int orgX = 0, int orgY = 0) {
     for (int c = 0; c < 3; ++c)
       std::stable_sort(comps[c].begin(), comps[c].end(), [](const Comp3& a, const Comp3& b) { return a.r > b.r; });
     std::size_t nj = 0;
@@ -348,6 +363,8 @@ struct Mix3 {
     base.sz[0] = hasUp ? upW : 0;
     base.sz[1] = hasUp ? upH : 0;
     for (int c = 0; c < 3; ++c) base.w0[c] = float(w0[c]);
+    base.org[0] = orgX;
+    base.org[1] = orgY;
     if (nj == 0) {
       const H dst = img(w, h);
       pass("film_b3", {{2, hasUp}}, base, {GpuGraph::R(src), GpuGraph::R(hasUp ? up : src), GpuGraph::W(dst)}, w, h);
@@ -421,7 +438,7 @@ struct Mix3 {
       for (int c = 0; c < 3; ++c) out[c] = per[c][std::size_t(k)];
     }
   };
-  Plan plan(int W, int Hh, const fd::Mixture* mix, bool half) const {
+  static Plan plan(int W, int Hh, const fd::Mixture* mix, bool half, bool fastLow) {
     Plan pn;
     pn.half = half;
     double* w0 = pn.w0;
@@ -519,34 +536,54 @@ struct Mix3 {
     }
     return L;
   }
-  // Levels 1 and 0 of a window (here: the whole picture W x Hh), plus the Catmull-Rom upsample of `L2`. `p1` = level1(src).
-  H combineWindow(const Plan& pn, H src, H p1, int W, int Hh, H L2) {
+  // Levels 1 and 0 of a window of the picture: the window's input `src` (ww x wh) with origin (ox, oy) in the picture (multiples of 4 unless 0; the window
+  // ends on a multiple of 4 or at the picture's edge), plus the Catmull-Rom upsample of `L2`, the whole picture's level-2 accumulator plane
+  // (l2w x l2h). `p1` = level1(src). Inside the window shrunk by the support of the level-1 / level-0 components every value is that of the whole picture.
+  H combineWindow(const Plan& pn, H src, H p1, int ww, int wh, H L2, int l2w, int l2h, int ox, int oy) {
     std::vector<Comp3> lv[3];
     const double zero[3] = {0, 0, 0};
     if (pn.maxLevel == 0) {
       pn.level(0, lv);
-      return combine(src, W, Hh, pn.w0, lv, -1, 0, 0);
+      return combine(src, ww, wh, pn.w0, lv, -1, 0, 0);
     }
-    int w1, h1, w2, h2;
-    levelSize(W, Hh, 1, w1, h1);
-    levelSize(W, Hh, 2, w2, h2);
+    int w1, h1;
+    levelSize(ww, wh, 1, w1, h1);
     pn.level(1, lv);
-    const H L1 = combine(p1, w1, h1, zero, lv, L2, L2 >= 0 ? w2 : 0, L2 >= 0 ? h2 : 0);
+    const H L1 = combine(p1, w1, h1, zero, lv, L2, L2 >= 0 ? l2w : 0, L2 >= 0 ? l2h : 0, ox / 2, oy / 2);
     // final level: dst = w0 * src + comps(src) + up2(L1); the half input has no level-0 components
     if (pn.half) {
       std::vector<Comp3> none[3];
-      return combine(L1, W, Hh, zero, none, L1, w1, h1);
+      return combine(L1, ww, wh, zero, none, L1, w1, h1);
     }
     pn.level(0, lv);
-    return combine(src, W, Hh, pn.w0, lv, L1, w1, h1);
+    return combine(src, ww, wh, pn.w0, lv, L1, w1, h1);
+  }
+  // The whole picture W x Hh as one window: levels 2.. built here.
+  H mixture(const Plan& pn, H src, int W, int Hh) {
+    if (pn.maxLevel == 0) return combineWindow(pn, src, -1, W, Hh, -1, 0, 0, 0, 0);
+    const H p1 = level1(src, W, Hh, pn.half);
+    const H L2 = pn.maxLevel >= 2 ? buildLow(pn, level2Input(p1, W, Hh, pn.half), W, Hh) : H(-1);
+    int l2w, l2h;
+    levelSize(W, Hh, 2, l2w, l2h);
+    return combineWindow(pn, src, p1, W, Hh, L2, l2w, l2h, 0, 0);
   }
   // `src`: full resolution (W x Hh) RGBA32F input, or the half-resolution input when `half`.
-  H mixture(H src, int W, int Hh, const fd::Mixture* mix, bool half) {
-    const Plan pn = plan(W, Hh, mix, half);
-    if (pn.maxLevel == 0) return combineWindow(pn, src, -1, W, Hh, -1);
-    const H p1 = level1(src, W, Hh, half);
-    const H L2 = pn.maxLevel >= 2 ? buildLow(pn, level2Input(p1, W, Hh, half), W, Hh) : H(-1);
-    return combineWindow(pn, src, p1, W, Hh, L2);
+  H mixture(H src, int W, int Hh, const fd::Mixture* mix, bool half) { return mixture(plan(W, Hh, mix, half, fastLow), src, W, Hh); }
+  // Reach of a plan in full-resolution pixels: how far from a pixel the input must be valid for the value of the window combine to be the picture's.
+  // Level 0 components read the input directly; level 1 components read the 2 x 2 box plane (2 x radius), the Catmull-Rom up-sample of level 1 reaches 2
+  // pixels of level 1 and the box adds one pixel. Levels >= 2 come from the whole-picture plane.
+  static int planReach(const Plan& pn) {
+    int r0 = 0, r1 = 0;
+    for (int c = 0; c < 3; ++c) {
+      for (const Comp3& k : pn.per[c][0]) r0 = std::max(r0, k.r);
+      if (pn.per[c].size() > 1)
+        for (const Comp3& k : pn.per[c][1]) r1 = std::max(r1, k.r);
+    }
+    bool any1 = false;
+    for (int c = 0; c < 3; ++c) any1 |= pn.per[c].size() > 1 && !pn.per[c][1].empty();
+    int h = pn.half ? 0 : r0;
+    if (any1) h = std::max(h, 2 * (r1 + 2) + 3);
+    return h;
   }
 };
 
@@ -961,58 +998,162 @@ static std::atomic<float> g_interactiveMsPerMpx{0.f};
 void setFilmInteractiveMsPerMpx(float v) { g_interactiveMsPerMpx = v; }
 float filmInteractiveMsPerMpx() { return g_interactiveMsPerMpx.load(); }
 
-bool recordFilmPre(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, H src, int w, int h, FilmPre& out) {
-  out = FilmPre{};
-  const auto pd = planOf(res);
-  if (!pd->error.empty()) {
-    r.unsupported = true, r.err = "film GPU: unsupported effect";
-    return false;
-  }
-  if (pd->split && !tb.split) {
-    r.unsupported = true, r.err = "film GPU: the enlarger diffusion tables are not uploaded";
-    return false;
-  }
-  const fd::SpatialPlan& pl = pd->plan;
-  FilmCtx c(r, res, tb);
-  if (!pl.any()) {  // the fused point chain
-    out.disp = c.point(3, false, src, c.rawH, w, h);
-    return out.disp >= 0;
-  }
-  out.any = true;
-  H E = c.point(0, false, src, c.rawH, w, h);
-  if (E < 0) return false;
-  if (pl.boost) {  // highlight boost: the maximum of the frame (reduction), the constants, then the curve; all on the device
-    E = recordBoost(r, E, w, h, pl);
-    if (E < 0) return false;
-  }
-  Mix3 mix3{r};  // three channels at once
-  { static const bool fl = [] { const char* e = std::getenv("DAPPLE_FILM_FASTLOW"); return !(e && e[0] == '0'); }(); mix3.fastLow = fl && res.quality == 1; }
-  H E2 = E;
+// ---- the mixtures of a film frame: plans, reach, windows ----------------------------------------------------------------------------------
+namespace {
+bool filmFastLow(const FilmResolved& res) {
+  static const bool fl = [] { const char* e = std::getenv("DAPPLE_FILM_FASTLOW"); return !(e && e[0] == '0'); }();
+  return fl && res.quality == 1;
+}
+// The camera diffusion (pre), the halation / scatter (halo) and the DIR inhibitor mixtures of a w x h frame, as the passes run them.
+struct MixPlans {
+  Mix3::Plan pre, halo, dir;
+  bool hasPre = false, hasHalo = false, hasDir = false;
+};
+MixPlans mixPlansOf(const FilmResolved& res, const FilmPlanData& pd, int w, int h) {
+  const fd::SpatialPlan& pl = pd.plan;
   fd::Mixture preM[3] = {pl.pre[0], pl.pre[1], pl.pre[2]}, haloM[3] = {pl.halo[0], pl.halo[1], pl.halo[2]};
   if (res.quality == 1 && mergeEnabled())
     for (int c = 0; c < 3; ++c) {
       if (pl.preMix) mergeSmallComps(preM[c]);
       if (pl.haloMix) mergeSmallComps(haloM[c]);
     }
-  if (pl.preMix) E2 = mix3.mixture(E2, w, h, preM, false);
-  if (pl.haloMix) E2 = mix3.mixture(E2, w, h, haloM, false);
-  H Q = -1;
-  if (pl.dirDiffuse) {
-    if (pd->dirHalf) {
-      const int hw = (w + 1) / 2, hh = (h + 1) / 2;
-      const H qh = c.point(4, false, E2, c.rawH, hw, hh, 0, nullptr, w, h);
-      if (qh < 0) return false;
-      Q = mix3.mixture(qh, w, h, pl.dir, true);
-    } else {
-      const H q = c.point(5, false, E2, c.rawH, w, h);
-      if (q < 0) return false;
-      Q = mix3.mixture(q, w, h, pl.dir, false);
-    }
+  const bool fl = filmFastLow(res);
+  MixPlans mp;
+  mp.hasPre = pl.preMix;
+  mp.hasHalo = pl.haloMix;
+  mp.hasDir = pl.dirDiffuse;
+  if (mp.hasPre) mp.pre = Mix3::plan(w, h, preM, false, fl);
+  if (mp.hasHalo) mp.halo = Mix3::plan(w, h, haloM, false, fl);
+  if (mp.hasDir) mp.dir = Mix3::plan(w, h, pl.dir, pd.dirHalf, fl);
+  return mp;
+}
+// A window of the frame grown by `grow`, aligned outwards to multiples of 4 (the box phases and the Catmull-Rom parities of the pyramid are the picture's),
+// clipped to the frame.
+FilmWin alignedWindow(const FilmWin& w, int grow, int fw, int fh) {
+  FilmWin o;
+  o.x0 = std::max(0, (w.x0 - grow) & ~3);
+  o.y0 = std::max(0, (w.y0 - grow) & ~3);
+  const int x1 = std::min(fw, (w.x0 + w.w + grow + 3) & ~3), y1 = std::min(fh, (w.y0 + w.h + grow + 3) & ~3);
+  o.w = x1 - o.x0;
+  o.h = y1 - o.y0;
+  return o;
+}
+bool coversFrame(const FilmWin& w, int fw, int fh) { return w.x0 == 0 && w.y0 == 0 && w.w == fw && w.h == fh; }
+// One mixture over the window `ow` of the input `in` (the window's size): the whole frame builds its levels itself, a window reads the low plane `L2`.
+H mixOver(Mix3& m, const Mix3::Plan& pn, H in, const FilmWin& ow, int fw, int fh, H L2) {
+  if (coversFrame(ow, fw, fh)) return m.mixture(pn, in, fw, fh);
+  if (pn.maxLevel == 0) return m.combineWindow(pn, in, -1, ow.w, ow.h, -1, 0, 0, ow.x0, ow.y0);
+  const H p1 = m.level1(in, ow.w, ow.h, pn.half);
+  int l2w, l2h;
+  Mix3::levelSize(fw, fh, 2, l2w, l2h);
+  return m.combineWindow(pn, in, p1, ow.w, ow.h, pn.maxLevel >= 2 ? L2 : H(-1), l2w, l2h, ow.x0, ow.y0);
+}
+}  // namespace
+
+void filmLowSize(int w, int h, int& lw, int& lh) { Mix3::levelSize(w, h, 2, lw, lh); }
+
+int filmMixHalo(const FilmResolved& res, int which) {
+  const auto pd = planOf(res);
+  if (!pd->error.empty() || !pd->plan.any()) return 0;
+  const MixPlans mp = mixPlansOf(res, *pd, 1 << 16, 1 << 16);  // the reach does not depend on the size (only 1/2^k of a picture < 2 px has fewer levels)
+  int h = 0;
+  if (which != 1) h += (mp.hasPre ? Mix3::planReach(mp.pre) : 0) + (mp.hasHalo ? Mix3::planReach(mp.halo) : 0);
+  if (which != 0) h += mp.hasDir ? Mix3::planReach(mp.dir) : 0;
+  return h;
+}
+
+namespace {
+bool filmPreflight(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmPlanData& pd) {
+  if (!pd.error.empty()) {
+    r.unsupported = true, r.err = "film GPU: unsupported effect";
+    return false;
   }
-  if (!mix3.ok || E2 < 0) return false;
-  out.e2 = E2;
-  out.q = Q;
+  if (pd.split && !tb.split) {
+    r.unsupported = true, r.err = "film GPU: the enlarger diffusion tables are not uploaded";
+    return false;
+  }
+  (void)res;
   return true;
+}
+// The DIR inhibitor mixture's input from E2 over a window (point pass of the half-resolution box, or of the full resolution).
+H dirInput(FilmCtx& c, const FilmPlanData& pd, H E2, const FilmWin& ow) {
+  if (pd.dirHalf) return c.point(4, false, E2, c.rawH, (ow.w + 1) / 2, (ow.h + 1) / 2, 0, nullptr, ow.w, ow.h);
+  return c.point(5, false, E2, c.rawH, ow.w, ow.h);
+}
+}  // namespace
+
+bool recordFilmLow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmSrcFn& srcFn, int w, int h, FilmPre& out) {
+  out = FilmPre{};
+  const auto pd = planOf(res);
+  if (!filmPreflight(r, res, tb, *pd)) return false;
+  const fd::SpatialPlan& pl = pd->plan;
+  if (!pl.any()) return true;
+  out.any = true;
+  if (pl.boost) {  // the maximum of the frame is a whole-frame reduction: no window form
+    r.unsupported = true, r.err = "film GPU: highlight boost needs the whole frame";
+    return false;
+  }
+  FilmCtx c(r, res, tb);
+  Mix3 mix3{r};
+  mix3.fastLow = filmFastLow(res);
+  const MixPlans mp = mixPlansOf(res, *pd, w, h);
+  const bool needPre = mp.hasPre && mp.pre.maxLevel >= 2, needHalo = mp.hasHalo && mp.halo.maxLevel >= 2, needDir = mp.hasDir && mp.dir.maxLevel >= 2;
+  int l2w, l2h;
+  filmLowSize(w, h, l2w, l2h);
+  const int reachPre = mp.hasPre ? Mix3::planReach(mp.pre) : 0, reachHalo = mp.hasHalo ? Mix3::planReach(mp.halo) : 0;
+  constexpr int kBand = 512;  // interior of a walk window (multiple of 4: its level-2 samples are those of the picture)
+  // One walk: every window of the picture, the input of the stage's mixture over the window grown by the reach of the stages before it, and the
+  // window's share of that mixture's level-2 input plane (4 x 4 box average of the input); then the low plane of the whole picture is built from it.
+  // stage 0: pre mixture input = E;  1: halo mixture input = pre(E);  2: DIR input = point(halo(pre(E)))
+  H lowPre = -1, lowHalo = -1;
+  auto walk = [&](int stage, const Mix3::Plan& pn) -> H {
+    const int grow = stage == 0 ? 0 : stage == 1 ? reachPre : reachPre + reachHalo;
+    const H p2 = mix3.img(l2w, l2h);
+    for (int y0 = 0; y0 < h; y0 += kBand)
+      for (int x0 = 0; x0 < w; x0 += kBand) {
+        const FilmWin tile{x0, y0, std::min(kBand, w - x0), std::min(kBand, h - y0)};
+        const FilmWin ow = alignedWindow(tile, grow, w, h);
+        const FilmSrc s = srcFn(ow);
+        if (s.img < 0) return -1;
+        H in = c.point(0, false, s.img, c.rawH, ow.w, ow.h, 0, nullptr, 0, 0, s.ox, s.oy);
+        if (in < 0) return -1;
+        if (stage >= 1 && mp.hasPre) in = mixOver(mix3, mp.pre, in, ow, w, h, lowPre);
+        if (stage >= 2 && mp.hasHalo) in = mixOver(mix3, mp.halo, in, ow, w, h, lowHalo);
+        int pw = ow.w, ph = ow.h;  // size of the plane that is boxed down to level 2
+        H p1;
+        if (stage == 2) {
+          const H q = dirInput(c, *pd, in, ow);
+          if (q < 0) return -1;
+          if (pn.half) {
+            p1 = q;
+          } else {
+            p1 = mix3.down(q, ow.w, ow.h);
+          }
+        } else {
+          p1 = mix3.down(in, ow.w, ow.h);
+        }
+        pw = (ow.w + 1) / 2;
+        ph = (ow.h + 1) / 2;
+        mix3.downInto(p1, pw, ph, (tile.x0 - ow.x0) / 4, (tile.y0 - ow.y0) / 4, (tile.w + 3) / 4, (tile.h + 3) / 4, p2, tile.x0 / 4, tile.y0 / 4);
+        if (!mix3.ok) return -1;
+      }
+    return mix3.buildLow(pn, p2, w, h);
+  };
+  if (needPre) {
+    lowPre = walk(0, mp.pre);
+    if (lowPre < 0) return false;
+  }
+  if (needHalo) {
+    lowHalo = walk(1, mp.halo);
+    if (lowHalo < 0) return false;
+  }
+  if (needDir) {
+    out.lowDir = walk(2, mp.dir);
+    if (out.lowDir < 0) return false;
+  }
+  out.lowPre = lowPre;
+  out.lowHalo = lowHalo;
+  return mix3.ok;
 }
 
 bool filmEndsClamped(const FilmResolved& res) {
@@ -1025,23 +1166,67 @@ bool filmEndsClamped(const FilmResolved& res) {
   return fuseDev && pd->scanStage && pd->scan.r <= 0 && !us;  // = encodeHere of recordFilmWindow
 }
 
-FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pres, const FilmPre& pre, int fw, int fh,
-                         const FilmWin& win) {
+FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pres, const FilmPre& pre, const FilmSrcFn& srcFn,
+                         int fw, int fh, const FilmWin& win) {
   const FilmImg none{};
-  if (!pre.any) return pre.disp >= 0 ? FilmImg{pre.disp, 0, 0} : none;
   const auto pd = planOf(res);
+  if (!filmPreflight(r, res, tb, *pd)) return none;
   const fd::SpatialPlan& pl = pd->plan;
   const PointU u0 = pointUniforms(res, tb, win.w, win.h);
   FilmCtx c(r, res, tb);
-  Mix mix{r};  // single plane mixtures (glare field)
   const int w = win.w, h = win.h, x0 = win.x0, y0 = win.y0;
-  const bool hasQ = pre.q >= 0;
+  if (!pl.any()) {  // the fused point chain over the window
+    const FilmSrc s = srcFn(win);
+    if (s.img < 0) return none;
+    const H o = c.point(3, false, s.img, c.rawH, w, h, 0, nullptr, 0, 0, s.ox, s.oy);
+    return o >= 0 ? FilmImg{o, x0, y0} : none;
+  }
+  // ---- exposure and the mixtures, recomputed over the window grown by their reach (aligned): E -> pre -> halo -> E2, and the DIR field Q ----
+  H E2 = -1, Q = -1;
+  int ex = 0, ey = 0;  // origin of the window in the E2 / Q images
+  {
+    const MixPlans mp = mixPlansOf(res, *pd, fw, fh);
+    const FilmWin ow = alignedWindow(win, filmMixHalo(res), fw, fh);
+    const bool whole = coversFrame(ow, fw, fh);
+    if (pl.boost && !whole) {
+      r.unsupported = true, r.err = "film GPU: highlight boost needs the whole frame";
+      return none;
+    }
+    if (!whole && ((mp.hasPre && mp.pre.maxLevel >= 2 && pre.lowPre < 0) || (mp.hasHalo && mp.halo.maxLevel >= 2 && pre.lowHalo < 0) ||
+                   (mp.hasDir && mp.dir.maxLevel >= 2 && pre.lowDir < 0))) {
+      r.err = "film GPU: a film window needs the low planes of the picture";
+      return none;
+    }
+    const FilmSrc s = srcFn(ow);
+    if (s.img < 0) return none;
+    H E = c.point(0, false, s.img, c.rawH, ow.w, ow.h, 0, nullptr, 0, 0, s.ox, s.oy);
+    if (E < 0) return none;
+    if (pl.boost) {  // highlight boost: the maximum of the frame (reduction), the constants, then the curve; all on the device
+      E = recordBoost(r, E, ow.w, ow.h, pl);
+      if (E < 0) return none;
+    }
+    Mix3 mix3{r};  // three channels at once
+    mix3.fastLow = filmFastLow(res);
+    E2 = E;
+    if (mp.hasPre) E2 = mixOver(mix3, mp.pre, E2, ow, fw, fh, pre.lowPre);
+    if (mp.hasHalo) E2 = mixOver(mix3, mp.halo, E2, ow, fw, fh, pre.lowHalo);
+    if (mp.hasDir) {
+      const H qi = dirInput(c, *pd, E2, ow);
+      if (qi < 0) return none;
+      Q = mixOver(mix3, mp.dir, qi, ow, fw, fh, pre.lowDir);
+    }
+    if (!mix3.ok || E2 < 0) return none;
+    ex = x0 - ow.x0;
+    ey = y0 - ow.y0;
+  }
+  Mix mix{r};  // single plane mixtures (glare field)
+  const bool hasQ = Q >= 0;
   // Without grain (and without the enlarger diffusion detour) nothing sits between the develop and the print step: they run as one pass
   // (film_point / film_pd MODE 8), which saves a full-frame RGBA16F write and read. The grain drag and the final tier keep the two passes.
   const bool fuseDev = !pd->plan.grain.active && !pd->split;
   H D = -1;
   if (!fuseDev) {
-    D = c.point(1, hasQ, pre.e2, hasQ ? pre.q : c.rawH, w, h, 0, nullptr, 0, 0, x0, y0);
+    D = c.point(1, hasQ, E2, hasQ ? Q : c.rawH, w, h, 0, nullptr, 0, 0, ex, ey);
     if (D < 0) return none;
   }
 
@@ -1164,7 +1349,7 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
     off = 0;
   }
   if (fuseDev && !pd->scanStage) {
-    const H o = c.point(8, hasQ, pre.e2, hasQ ? pre.q : c.rawH, w, h, 0, nullptr, 0, 0, x0, y0);
+    const H o = c.point(8, hasQ, E2, hasQ ? Q : c.rawH, w, h, 0, nullptr, 0, 0, ex, ey);
     return o >= 0 ? FilmImg{o, x0, y0} : none;
   }
   if (!pd->scanStage) {
@@ -1222,8 +1407,8 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
     u.dim[0] = w;
     u.dim[1] = h;
     u.lutN[1] = u.lutN[2] = off;
-    u.org[0] = fuseDev ? x0 : 0;
-    u.org[1] = fuseDev ? y0 : 0;
+    u.org[0] = fuseDev ? ex : 0;
+    u.org[1] = fuseDev ? ey : 0;
     for (int ch = 0; ch < 3; ++ch) u.dsub[ch] = dsub[ch];
     u.dmin[3] = tb.glareRgb[0];  // linear display white (film_point.comp FUSED_POST)
     u.dscale[3] = tb.glareRgb[1];
@@ -1233,7 +1418,7 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
     u.src[2] = field >= 0 ? 1 : 0;
     L = r.g.transient(hal::Format::RGBA16F, std::uint32_t(w), std::uint32_t(h));
     r.g.dispatch("film_pd", p,
-                 {GpuGraph::R(fuseDev ? pre.e2 : D), GpuGraph::R(fuseDev && hasQ ? pre.q : c.rawH), GpuGraph::R(split ? c.lut3H : c.lutH), GpuGraph::R(split ? c.paperH : c.curH), GpuGraph::W(L),
+                 {GpuGraph::R(fuseDev ? E2 : D), GpuGraph::R(fuseDev && hasQ ? Q : c.rawH), GpuGraph::R(split ? c.lut3H : c.lutH), GpuGraph::R(split ? c.paperH : c.curH), GpuGraph::W(L),
                   GpuGraph::R(field >= 0 ? field : r.dummy(hal::Format::R32F)), GpuGraph::R(r.g.externalBuf(tb.decode))},
                  r.gx(w), r.gy(h), &u, sizeof u);
   }
@@ -1265,9 +1450,9 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
 }
 
 H recordFilmFrame(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pres, H src, int w, int h) {
-  FilmPre pre;
-  if (!recordFilmPre(r, res, tb, src, w, h, pre)) return -1;
-  return recordFilmWindow(r, res, tb, pres, pre, w, h, FilmWin{0, 0, w, h}).img;
+  const FilmPre pre;  // one window = the frame builds the low planes itself
+  const FilmSrcFn whole = [src](const FilmWin&) { return FilmSrc{src, 0, 0}; };
+  return recordFilmWindow(r, res, tb, pres, pre, whole, w, h, FilmWin{0, 0, w, h}).img;
 }
 
 bool gpuMixtureForTest(gpu::Core& core, const float* plane, int w, int h, const void* mixture, bool half, std::vector<float>& out,
@@ -1324,6 +1509,8 @@ namespace dapple::engine::gpu {
 // The film nodes' GpuImpl (engine/nodes/node_list.inc): the FilmFrame stage records them as a whole (filmnode::recordFilmFrame, or
 // recordFilmPre + recordFilmWindow per tile of a tiled export).
 const GpuImpl* filmGpu() {
+  static const bool hooked = (filmnode::setMixHaloHook(filmnode::filmMixHalo), true);
+  (void)hooked;
   static const GpuImpl impl{{}, nullptr, nullptr, nullptr, false, 0, false, true};
   return &impl;
 }

@@ -5,6 +5,7 @@
 //
 // Rect conventions: every function derives the pixels it computes from its OUTPUT view; input windows must cover the output
 // rect grown by the node's halo. Boundary policy: scipy 'reflect' against CpuCtx::frame.
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -648,6 +649,15 @@ Status runScan(const CpuCtx&, const void* res, std::span<const ImageView> in, st
 
 // ---- registration -----------------------------------------------------------------------------------------------------------------------------
 namespace {
+std::atomic<MixHaloFn> g_mixHalo{nullptr};
+}
+void setMixHaloHook(MixHaloFn fn) { g_mixHalo = fn; }
+int mixHaloOf(const FilmResolved& res, int which) {
+  const MixHaloFn f = g_mixHalo.load();
+  return f ? f(res, which) : 0;
+}
+
+namespace {
 
 bool identityOf(NodeType t, const void* res) {
   const FilmResolved& r = R(res);
@@ -673,6 +683,8 @@ bool identityFn(const void* res) { return identityOf(T, res); }
 Halo haloOf(NodeType t, const void* res) {
   const FilmResolved& r = R(res);
   if (!r.stock) return {};
+  if (t == NodeType::FilmBlurExposure) return {mixHaloOf(r, 0), mixHaloOf(r, 0)};
+  if (t == NodeType::FilmDirField) return {mixHaloOf(r, 1), mixHaloOf(r, 1)};
   const auto pd = planOf(r);
   if (t == NodeType::FilmGrain) return {pd->Hd + pd->Hg, pd->Hd + pd->Hg};
   if (t == NodeType::FilmScan) return {pd->Hs, pd->Hs};
@@ -685,10 +697,10 @@ NodeBehaviour behaviourFor(NodeType t) {
   NodeBehaviour b;
   b.resolvedBytes = sizeof(FilmResolved);
   switch (t) {
-    case NodeType::FilmBlurExposure: b.isIdentity = identityFn<NodeType::FilmBlurExposure>; break;
+    case NodeType::FilmBlurExposure: b.isIdentity = identityFn<NodeType::FilmBlurExposure>; b.halo = haloFn<NodeType::FilmBlurExposure>; break;
     case NodeType::FilmPrintExposure: b.isIdentity = identityFn<NodeType::FilmPrintExposure>; break;
     case NodeType::FilmEnlargerBlur: b.isIdentity = identityFn<NodeType::FilmEnlargerBlur>; break;
-    case NodeType::FilmDirField: b.isIdentity = identityFn<NodeType::FilmDirField>; break;
+    case NodeType::FilmDirField: b.isIdentity = identityFn<NodeType::FilmDirField>; b.halo = haloFn<NodeType::FilmDirField>; break;
     case NodeType::FilmGrain: b.isIdentity = identityFn<NodeType::FilmGrain>; b.halo = haloFn<NodeType::FilmGrain>; break;
     case NodeType::FilmGlare: b.isIdentity = identityFn<NodeType::FilmGlare>; break;
     case NodeType::FilmScan: b.isIdentity = identityFn<NodeType::FilmScan>; b.halo = haloFn<NodeType::FilmScan>; break;

@@ -352,7 +352,14 @@ int EngineSession::exportGpu(GpuExport& e, GpuStats* stats, std::string* err) {
   rq.filmTiles = true;
   rq.maxSide = int(x->caps().maxImage2D);
   rq.device = true;
-  const Plan plan = Planner::plan(graph_, rq, nullptr);
+  Plan plan = Planner::plan(graph_, rq, nullptr);
+  if (plan.hasFilm && plan.mode == ExecMode::TiledExport) {  // a film window grows the tile by the film's reach on every side: tiles wide enough that the windows cost at most 1.5 x
+    const int want = std::min(plan.filmTileFor(1.5), std::max(64, rq.maxSide - 2 * (plan.maxHalo() + plan.filmHalo)));
+    if (want > plan.grid.tile) {
+      rq.tile = want;
+      plan = Planner::plan(graph_, rq, nullptr);
+    }
+  }
   if (e.onSize) e.onSize(fp.geo.outW, fp.geo.outH);
   const std::shared_ptr<const std::vector<float>> over = overflowFor(ps, bake->n);
   GpuRun run{plan, graph_, cache_, fp, draft.blocks, e.store, *bake, over.get(), &e.point, GpuCancel{&latest_, latest_.load(std::memory_order_relaxed)}, e.target,

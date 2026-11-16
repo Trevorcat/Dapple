@@ -16,6 +16,7 @@
 // Everything is derived from the node declarations: footprint class, fusion group, behaviour (identity, halo, inputRect), solve, work
 // planes, precision. The planner has no list of node types.
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <vector>
 
@@ -83,6 +84,7 @@ struct Plan {
   std::size_t peakCpuBytes = 0;
   NodeId sink = 0;                 // the node that writes the output (Footprint::Sink)
   bool hasFilm = false;            // FilmFrame stage present
+  int filmHalo = 0;                // pixels a film window reads around its work window (sum of the film nodes' halos); a tile's film window = work + filmHalo
   bool needAux = false;            // a node reads the side planes the head writes (NodeDesc::readsAux)
   bool unsupported = false;        // no executor can run this plan (reason in `why`)
   const char* why = "";
@@ -90,6 +92,11 @@ struct Plan {
     int n = 0;
     for (const Stage& s : stages) n += s.kind == StageKind::TileSweep;
     return n;
+  }
+  // Smallest tile (multiple of 64) whose window (tile + 2 x (sweep halo + film halo)) is at most `factor` times the tile's area: (1 + 2H/T)^2 <= factor.
+  int filmTileFor(double factor = 1.5) const {
+    const double h = double(maxHalo() + filmHalo);
+    return (int(std::ceil(2.0 * h / (std::sqrt(factor) - 1.0)) ) + 63) / 64 * 64;
   }
   int maxHalo() const {
     int h = 0;

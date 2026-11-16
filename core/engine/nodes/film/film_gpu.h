@@ -2,6 +2,7 @@
 // Film simulation on the GPU executor (docs/engine/pipeline-architecture.md 8.1, step b4 (2)): the film nodes as compute passes
 // appended to a GpuGraph. The tables are the CPU bake (FilmTableRaw / Curves / PrintScan payloads) uploaded as they are, so the
 // colour science exists once (docs 3: tables are always baked on the CPU).
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -73,14 +74,7 @@ float filmInteractiveMsPerMpx();
 gpu::H recordFilmFrame(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pr, gpu::H src,
                        int w, int h);
 
-// ---- whole-frame stage + windows (tiled export; recordFilmFrame is both for one window = the frame) ----------------------------------------
-// The whole-frame stage: exposure, (highlight boost), the camera / halation mixtures and the DIR inhibitor field. `any` = false: the film has
-// no spatial effect and `disp` is the finished display image of the frame.
-struct FilmPre {
-  gpu::H e2 = -1, q = -1, disp = -1;
-  bool any = false;
-};
-bool recordFilmPre(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, gpu::H src, int w, int h, FilmPre& out);
+// ---- windows of a film frame (tiled export; recordFilmFrame is the same code with one window = the frame) ------------------------------------
 // A rectangle of the frame in frame coordinates; the display image of a window starts at (x0, y0) of the picture.
 struct FilmWin {
   int x0 = 0, y0 = 0, w = 0, h = 0;
@@ -89,16 +83,39 @@ struct FilmImg {
   gpu::H img = -1;  // RGBA16F display image (sRGB encoded, unclamped); -1 on error (`r.err`)
   int ox = 0, oy = 0;  // frame coordinates of its pixel (0, 0)
 };
-// The develop / grain / print / scan chain over `win`. The image is only valid inside `win` shrunk by filmWindowHalo() on the sides that are
-// not a frame border (the caller passes a window grown by the halo and clipped to the frame): the values there are those of a whole-frame run.
-// `pre` carries the frame-sized E2 / q images (externals of a persistent copy in a tiled export). fw x fh = the frame.
+// The film's input (linear ProPhoto, ungained, RGBA32F) over a window: pixel (i, j) of the window is pixel (i + ox, j + oy) of `img`. The window handed
+// to the function is aligned (origin and size multiples of 4 unless it meets the frame's edge). The source may be resident (a frame-sized image: ox = x0)
+// or only the window (ox = 0).
+struct FilmSrc {
+  gpu::H img = -1;
+  int ox = 0, oy = 0;
+};
+using FilmSrcFn = std::function<FilmSrc(const FilmWin&)>;
+// The part of a film frame that belongs to the whole picture and is kept between the windows: the level-2 accumulator planes (1/16 of the pixels, RGBA16F)
+// of the camera / halation / DIR mixtures, each -1 when its mixture has no component above level 1 or is absent. `any` = the film has spatial effects.
+struct FilmPre {
+  gpu::H lowPre = -1, lowHalo = -1, lowDir = -1;
+  bool any = false;
+};
+// Size of those planes for a w x h frame.
+void filmLowSize(int w, int h, int& lw, int& lh);
+// Builds the low planes by walks over windows of the film input (the source of a window comes from `src`; the planes are the only thing that stays).
+// Not needed when one window covers the frame (recordFilmWindow then builds them itself).
+bool recordFilmLow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmSrcFn& src, int w, int h, FilmPre& out);
+// The develop / grain / print / scan chain over `win`, with the exposure, the camera / halation mixtures and the DIR field recomputed inside the window
+// (grown by the mixtures' reach and aligned: no frame-sized E2 / q). The image is only valid inside `win` shrunk by filmWindowHalo() on the sides that are
+// not a frame border (the caller passes a window grown by that halo and clipped to the frame): the values there are those of a whole-frame run.
+// fw x fh = the frame. A window that does not cover the frame needs `pre` from recordFilmLow (when the film has mixtures above level 1).
 // True when the last film pass of this frame clamps to 0..1 itself (film_pd ENCODE with FilmResolved::clampOut): the executor then skips film_fin when that
 // would be a pure clamp.
 bool filmEndsClamped(const FilmResolved& res);
 
-FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pr, const FilmPre& pre, int fw, int fh,
-                         const FilmWin& win);
+FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pr, const FilmPre& pre, const FilmSrcFn& src,
+                         int fw, int fh, const FilmWin& win);
+// Reach of the develop / grain / print / scan chain (pixels around a window it reads), and of the exposure mixtures (camera + halation, DIR field) that are
+// recomputed inside the window; the two add up. Per node, for NodeBehaviour::halo: filmMixHalo(res, 0) = camera + halation, 1 = DIR.
 int filmWindowHalo(const FilmResolved& res);
+int filmMixHalo(const FilmResolved& res, int which = -1);
 // False for the enlarger diffusion filter (a whole-frame blur after the grain): such a film cannot be exported in tiles.
 bool filmWindowable(const FilmResolved& res);
 

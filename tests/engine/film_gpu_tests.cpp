@@ -778,6 +778,103 @@ void testFrames() {
   }
 }
 
+// Film windows (stage 2 of the film without frame-sized planes): the same film frame rendered as one window (the whole-frame path) and as tiled
+// exports of 256, 512 and 1024 px must give identical pixels; every tile recomputes E2 and q inside its window from the low planes of the picture.
+// Also prints the halo of the stocks. DAPPLE_FILM_TILES_LIST=1 prints the class of every stock of the library and stops.
+void testTiles() {
+  std::string err;
+  eg::ContextOptions co;
+  co.device.allowSoftware = std::getenv("DAPPLE_GPU_SOFTWARE") != nullptr;
+  auto ctx = eg::Context::create(co, err);
+  if (!ctx) {
+    std::printf("no usable GPU context: %s\n", err.c_str());
+    std::exit(77);
+  }
+  if (!library()) std::exit(77);
+  film::setLibrary(library());
+  if (std::getenv("DAPPLE_FILM_TILES_LIST")) {
+    for (const std::string& n : library()->names()) {
+      const ef::FilmResolved r = resolved(n.c_str(), std::getenv("DAPPLE_FILM_TILES_W") ? std::atoi(std::getenv("DAPPLE_FILM_TILES_W")) : 4000, std::getenv("DAPPLE_FILM_TILES_W") ? std::atoi(std::getenv("DAPPLE_FILM_TILES_W")) * 2 / 3 : 3000, 2);
+      const auto pd = ef::planOf(r);
+      const auto& pl = pd->plan;
+      std::printf("STOCK %-28s pre %d halo %d dir %d half %d grain %d scan %d | window halo %d mix halo %d (pre+halo %d, dir %d)\n", n.c_str(), pl.preMix, pl.haloMix,
+                  pl.dirDiffuse, pd->dirHalf, pl.grain.active, pd->scanStage, ef::filmWindowHalo(r), ef::filmMixHalo(r), ef::filmMixHalo(r, 0), ef::filmMixHalo(r, 1));
+    }
+    return;
+  }
+  CameraRegistry cams = CameraRegistry::withBuiltins();
+  const CameraProfile& cam = cams.resolve("", "");
+  struct Case {
+    const char* name;
+    std::function<void(EditParams&)> set;
+    bool wide = false;  // a picture wide enough (the pixel pitch of a 60 MP file) that the DIR field runs at half resolution
+  };
+  const std::vector<Case> cases = {
+      {"vision3 500T 9504 px wide (DIR half res)", [](EditParams& p) { p.filmStock = "kodak_vision3_500t"; p.filmGrain = 100; }, true},
+      {"portra 400 (halation, grain 100)", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmGrain = 100; p.filmHalation = 100; }},
+      {"vision3 500T (DIR, halation 200)", [](EditParams& p) { p.filmStock = "kodak_vision3_500t"; p.filmHalation = 200; }},
+      {"velvia 100 (no mixtures, no grain)", [](EditParams& p) { p.filmStock = "fujifilm_velvia_100"; p.filmGrain = 0; p.filmHalation = 0; }},
+      {"portra 400 + crop 4:5, straighten 3", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.straighten = 3.f; p.crop = "4:5"; p.vignette = -30; }},
+  };
+  const std::vector<std::pair<int, int>> sizes = {{200, 150}, {641, 449}, {1111, 777}, {2049, 1031}};
+  const std::vector<std::pair<int, int>> wideSizes = {{9504, 611}};
+  for (const Case& c : cases) {
+    for (const std::pair<int, int>& sz : c.wide ? wideSizes : sizes) {
+      const SourceImage src = dapple::gpu::makeTestImage(sz.first, sz.second);
+      dapple::gpu::Rig rig(ctx, src, cam);
+      EditParams p;
+      p.exposure = 0.3f;
+      p.contrast = 15;
+      c.set(p);
+      engine::point::Params r = engine::point::resolve(p, cam, nullptr);
+      FastOptions fo;
+      fo.spatial = SpatialQuality::Full;
+      int gw = 0, gh = 0;
+      engine::GpuStats st;
+      std::uint8_t* whole = rig.render(p, r, src, fo, 41, gw, gh, &st, err, 0, 0.f, nullptr);
+      if (!whole) {
+        std::printf("  %-40s %dx%d: whole render failed: %s\n", c.name, sz.first, sz.second, err.c_str());
+        ++g_failures;
+        continue;
+      }
+      std::string line;
+      for (int tile : {256, 512, 1024}) {
+        std::vector<std::uint8_t> img;
+        int tw = 0, th = 0;
+        const bool ok = rig.exportTiled(p, r, src, 0, 41, tile, false, 0.f, [&](int ow, int oh) { tw = ow; th = oh; img.assign(std::size_t(ow) * oh * 4, 255); },
+                                        [&](int x, int y, int bw, int bh, const std::uint8_t* rgba, std::size_t stride) {
+                                          for (int j = 0; j < bh; ++j) std::memcpy(img.data() + (std::size_t(y + j) * tw + x) * 4, rgba + std::size_t(j) * stride, std::size_t(bw) * 4);
+                                          return true;
+                                        },
+                                        &st, err, nullptr);
+        char b[96];
+        if (!ok || tw != gw || th != gh) {
+          std::snprintf(b, sizeof b, "  tile %d: FAILED (%s)", tile, err.c_str());
+          ++g_failures;
+        } else {
+          std::size_t diff = 0, first = SIZE_MAX;
+          int maxd = 0;
+          for (std::size_t i = 0; i < std::size_t(gw) * gh; ++i)
+            for (int k = 0; k < 3; ++k) {
+              const int d = std::abs(int(img[4 * i + k]) - int(whole[4 * i + k]));
+              if (d) {
+                ++diff;
+                maxd = std::max(maxd, d);
+                if (first == SIZE_MAX) first = i;
+              }
+            }
+          if (diff) std::snprintf(b, sizeof b, "  tile %d: %zu values differ (max %d, first at %zu,%zu)", tile, diff, maxd, first % gw, first / gw);
+          else std::snprintf(b, sizeof b, "  tile %d: 0 differ", tile);
+          CHECK(diff == 0);
+        }
+        line += b;
+      }
+      std::printf("  %-38s %4dx%-4d%s\n", c.name, gw, gh, line.c_str());
+      std::free(whole);
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -790,6 +887,11 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::string(argv[1]) == "plan") {
     testPlan();
     return 0;
+  }
+  if (argc >= 2 && std::string(argv[1]) == "tiles") {
+    testTiles();
+    std::printf(g_failures ? "FAILED: %d check(s)\n" : "ok\n", g_failures);
+    return g_failures ? 1 : 0;
   }
   if (argc >= 2 && std::string(argv[1]) == "frames") {
     testFrames();

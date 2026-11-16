@@ -86,6 +86,11 @@ void resolveFilm(const ParamSet& ps, const FrameGeom& geom, FilmResolved& out);
 
 const CpuImpl& cpuImpl(NodeType t);                 // run / bake of a film node type
 const NodeBehaviour& behaviour(NodeType t);         // resolve / isIdentity / halo of a film node type
+// Reach of the exposure mixtures a film window recomputes (which: 0 = camera diffusion + halation, 1 = the DIR inhibitor field, -1 = all), in pixels
+// of the frame. Computed by the GPU engine (the level plan of its mixtures); 0 where the GPU engine is not linked.
+using MixHaloFn = int (*)(const FilmResolved&, int which);
+void setMixHaloHook(MixHaloFn fn);
+int mixHaloOf(const FilmResolved& res, int which);
 bool isFilmNode(NodeType t);
 // descriptors, registered in engine/nodes/node_list.inc
 NodeDesc tableRawDesc();

@@ -91,6 +91,11 @@ Plan Planner::plan(const Graph& g, const PlanRequest& rq, const ResultCache* cac
     }
     if (d.fusion == Fusion::Film) {
       film.nodes.push_back(n.id);
+      if (d.behaviour && d.behaviour->halo)
+        if (const void* fb = reg.block(n.type, rq.view)) {  // the film windows grow by the sum of the film nodes' halos (mixtures, grain, scan)
+          const Halo fh = d.behaviour->halo(fb);
+          p.filmHalo += std::max(fh.x, fh.y);
+        }
       continue;
     }
     if (d.fusion == Fusion::Head) {

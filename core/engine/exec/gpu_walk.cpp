@@ -24,7 +24,7 @@ SolveRes* Walk::solveOf(NodeId id) {
   return nullptr;
 }
 
-H Walk::filmInput() {
+filmnode::FilmSrc Walk::filmInputRect(int wx0, int wy0, int ww, int wh) {
   const point::Blocks& P = in.frame;
   H src = job.src.img;
   if (in.blocks.local.active() && job.ldesc >= 0 && job.lplanes >= 0) {  // local adjustments, stage L, on the film's scene input (40.7)
@@ -32,10 +32,10 @@ H Walk::filmInput() {
       job.aux0 = r.tr(kF16, P.geo.outW, P.geo.outH);
       job.aux1 = r.tr(kF16, P.geo.outW, P.geo.outH);
     }
-    const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
-    const LocalFilmInNode ln{&P, job.src, P.geo.outW, P.geo.outH, 0, 0, job.ldesc, job.lplanes, needAux ? job.aux0 : -1, needAux ? job.aux1 : -1};
-    if (!recordLocalFilmIn(r, ln, g)) return -1;
-    return g;
+    const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(ww), std::uint32_t(wh));
+    const LocalFilmInNode ln{&P, job.src, ww, wh, wx0, wy0, job.ldesc, job.lplanes, needAux ? job.aux0 : -1, needAux ? job.aux1 : -1};
+    if (!recordLocalFilmIn(r, ln, g)) return {};
+    return {g, 0, 0};
   }
   if (P.geo.useGeo) {
     struct U {
@@ -46,8 +46,10 @@ H Walk::filmInput() {
     } u{};
     u.a[0] = P.geo.srcW;
     u.a[1] = P.geo.srcH;
-    u.a[2] = P.geo.outW;
-    u.a[3] = P.geo.outH;
+    u.a[2] = ww;
+    u.a[3] = wh;
+    u.b[2] = wx0;  // origin of this image in the picture (the bound source is the whole frame's: b[0], b[1] = 0)
+    u.b[3] = wy0;
     u.geoA[0] = P.geo.cs;
     u.geoA[1] = P.geo.sn;
     u.geoA[2] = P.geo.fw;
@@ -63,13 +65,19 @@ H Walk::filmInput() {
     const bool warpOn = P.warp.active() && job.src.warp >= 0;
     if (warpOn) warpUniform(P.warp, job.src, u.w);
     const hal::PipelineH p = r.pl("film_src", {{0, P.geo.exact ? 1 : 2}, {4, warpOn ? 1 : 0}});
-    if (!p) return -1;
-    const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(P.geo.outW), std::uint32_t(P.geo.outH));
-    r.g.dispatch("film_src", p, {GpuGraph::R(job.src.img), GpuGraph::W(g), GpuGraph::R(warpOn ? job.src.warp : r.g.externalBuf(r.gBuf))}, r.gx(P.geo.outW),
-                 r.gy(P.geo.outH), &u, sizeof u);
-    src = g;
+    if (!p) return {};
+    const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(ww), std::uint32_t(wh));
+    r.g.dispatch("film_src", p, {GpuGraph::R(job.src.img), GpuGraph::W(g), GpuGraph::R(warpOn ? job.src.warp : r.g.externalBuf(r.gBuf))}, r.gx(ww),
+                 r.gy(wh), &u, sizeof u);
+    return {g, 0, 0};
   }
-  return src;
+  return {src, wx0, wy0};  // the resident source: the window's pixel (0, 0) is the picture's (x0, y0)
+}
+
+H Walk::filmInput() {
+  const point::Blocks& P = in.frame;
+  const filmnode::FilmSrc s = filmInputRect(0, 0, P.geo.outW, P.geo.outH);
+  return s.img;
 }
 
 bool Walk::filmStage() {
@@ -81,10 +89,12 @@ bool Walk::filmStage() {
   return job.film >= 0;
 }
 
-bool Walk::filmPrePass(filmnode::FilmPre& out) {
-  const H src = filmInput();
-  if (src < 0) return false;
-  return filmnode::recordFilmPre(r, *fres, *ftab, src, in.frame.geo.outW, in.frame.geo.outH, out);
+filmnode::FilmSrcFn Walk::filmSrcFn() {
+  return [this](const filmnode::FilmWin& w) { return filmInputRect(w.x0, w.y0, w.w, w.h); };
+}
+
+bool Walk::filmLowPass(filmnode::FilmPre& out) {
+  return filmnode::recordFilmLow(r, *fres, *ftab, filmSrcFn(), in.frame.geo.outW, in.frame.geo.outH, out);
 }
 
 bool Walk::filmWindowStage() {
@@ -95,7 +105,7 @@ bool Walk::filmWindowStage() {
   win.y0 = std::max(0, work.y0 - halo);
   win.w = std::min(P.geo.outW, work.x1 + halo) - win.x0;
   win.h = std::min(P.geo.outH, work.y1 + halo) - win.y0;
-  const filmnode::FilmImg fi = filmnode::recordFilmWindow(r, *fres, *ftab, *fplan, pre, P.geo.outW, P.geo.outH, win);
+  const filmnode::FilmImg fi = filmnode::recordFilmWindow(r, *fres, *ftab, *fplan, pre, filmSrcFn(), P.geo.outW, P.geo.outH, win);
   if (fi.img < 0) return false;
   job.film = fi.img;
   job.filmOx = fi.ox;
