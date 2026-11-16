@@ -122,7 +122,8 @@ Status bakeCurves(const void* resolved, std::span<const void* const> inputs, voi
 Status bakePrintScan(const void* resolved, std::span<const void* const> inputs, void** payloadOut);
 void freePayload(void*);
 // The three tables from the process-wide cache (per-table keys); false when a bake failed.
-bool tablesFor(const FilmResolved& r, FilmTablesHandle& out);
+// `advance` false: a warm-up call whose tables no frame renders from (the eased interactive print table does not move).
+bool tablesFor(const FilmResolved& r, FilmTablesHandle& out, bool advance = true);
 // Counters of the background print tables (wave 8): frames that used a stale table while the worker bakes, tables the worker finished, requests made.
 void filmAsyncTableStats(unsigned long long* staleUses, unsigned long long* baked, unsigned long long* requested);
 

@@ -1385,6 +1385,65 @@ void testFilmEase() {
   capi::setFilmClockForTest(nullptr);
 }
 
+// A steady film_print / film_black drag with the print worker on: the coarse print table of a frame's own values lands a few frames late, so without easing the
+// picture shows a stale table and jumps when the bake lands (section 60). With the easing no per-frame change of the mean luminance exceeds a small multiple of the
+// drag's own per-frame change; the settled frame is a fresh session's settled frame. (DAPPLE_FILM_EASE=0 makes the largest step several times the drag's rate.)
+double meanLuma(const DappleImage& im) {
+  double s = 0;
+  const std::size_t n = std::size_t(im.width) * im.height;
+  for (std::size_t i = 0; i < n; ++i) s += 0.2126 * im.rgba[4 * i] + 0.7152 * im.rgba[4 * i + 1] + 0.0722 * im.rgba[4 * i + 2];
+  return s / (255.0 * double(n));
+}
+void testFilmPrintEase() {
+  if (!g_lib) {
+    std::printf("  no film pack\n");
+    return;
+  }
+  g_easeClock = 100.0;
+  capi::setFilmClockForTest(&easeClock);
+  auto render = [&](DappleSession* s, float pr, float bl, int flags, DappleImage* im) {
+    char json[200];
+    std::snprintf(json, sizeof json, "{\"film\": \"kodak_portra_400\", \"film_strength\": 100, \"film_print\": %.4f, \"film_black\": %.4f}", double(pr), double(bl));
+    DappleFrameRequest rq{};
+    rq.size = sizeof rq;
+    rq.long_edge = 320;
+    rq.flags = flags;
+    rq.active_param = (flags & DAPPLE_FRAME_INTERACTIVE) ? "film_print" : nullptr;
+    return dapple_session_render_frame(s, json, nullptr, &rq, im, nullptr);
+  };
+  auto* s = new DappleSession;
+  s->source = makeScene(1600, 1067, true, 3);
+  s->camera = &camA();
+  const int N = 70;
+  std::vector<double> y;
+  for (int i = 0; i < N; ++i) {
+    g_easeClock += 0.033;
+    DappleImage im{};
+    CHECK(render(s, -0.7f + 0.02f * float(i), 0.4f - 0.01f * float(i), DAPPLE_FRAME_INTERACTIVE, &im) == DAPPLE_OK);
+    y.push_back(meanLuma(im));
+    dapple_free_image(&im);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  }
+  double worst = 0, rate = std::fabs(y[N - 1] - y[0]) / double(N - 1);
+  for (int i = 1; i < N; ++i) worst = std::max(worst, std::fabs(y[i] - y[i - 1]));
+  std::printf("  print drag: largest luminance step %.4f, drag rate %.4f per frame (%.1fx)\n", worst, rate, worst / std::max(rate, 1e-9));
+  CHECK(rate > 0.0005);  // the drag must change the picture
+  CHECK(worst <= 4.0 * rate + 0.004);
+  // let the repaint-driven convergence run: a stopped finger ends on the target (the eased table snaps within an 8-bit code)
+  DappleImage ia{}, ib{};
+  CHECK(render(s, 0.7f, -0.3f, 0, &ia) == DAPPLE_OK);
+  auto* f = new DappleSession;
+  f->source = makeScene(1600, 1067, true, 3);
+  f->camera = &camA();
+  CHECK(render(f, 0.7f, -0.3f, 0, &ib) == DAPPLE_OK);
+  CHECK(ia.rgba && ib.rgba && hashImage(ia) == hashImage(ib));
+  dapple_free_image(&ia);
+  dapple_free_image(&ib);
+  delete s;
+  delete f;
+  capi::setFilmClockForTest(nullptr);
+}
+
 int main(int argc, char** argv) {
   struct T {
     const char* id;
@@ -1392,12 +1451,12 @@ int main(int argc, char** argv) {
   };
   const T tests[] = {{"hash", testHash},           {"registry", testRegistry},     {"validate", testValidate},
                      {"snapshots", testSnapshots}, {"keys", testKeys},             {"conformance", testConformance}, {"conformance_small", testConformanceSmall},
-                     {"cache", testCache},         {"reuse", testReuse}, {"reuse_small", testReuseSmall}, {"tables", testTables},           {"overhead", testOverhead}, {"long_session", testLongSession}, {"touch_heat", testTouchHeat}, {"film_ease", testFilmEase}};
+                     {"cache", testCache},         {"reuse", testReuse}, {"reuse_small", testReuseSmall}, {"tables", testTables},           {"overhead", testOverhead}, {"long_session", testLongSession}, {"touch_heat", testTouchHeat}, {"film_ease", testFilmEase}, {"film_print_ease", testFilmPrintEase}};
   if (argc >= 2 && std::string(argv[1]) == "--list") {
     for (const T& t : tests) std::printf("%s\n", t.id);
     return 0;
   }
-  if (argc >= 2 && std::string(argv[1]) == "film_ease") {  // the one test that needs the timing dependent paths (async match) on
+  if (argc >= 2 && (std::string(argv[1]) == "film_ease" || std::string(argv[1]) == "film_print_ease")) {  // the tests that need the timing dependent paths (async match) on
 #ifdef _WIN32
     _putenv_s("DAPPLE_DETERMINISTIC", "0");
 #else

@@ -894,9 +894,95 @@ bool asyncTables() {
   }();
   return on;
 }
+
+// ---- eased coarse print table (docs/engine/pipeline-architecture.md section 60) ------------------------------------------------------------------
+// An interactive frame shows the table it wants (or the newest landed one) only through a first-order filter: eased += (1 - exp(-dt / 80 ms)) * (target - eased),
+// element by element, so a table that lands (or a stale one that is replaced) cross-fades instead of stepping. One state per process (interactive frames of
+// one live session); a change of stock / paper / mapping / table size or a pause > 0.5 s takes the target as it is.
+double (*g_tableClock)() = nullptr;
+constexpr double kPrintEaseSeconds = 0.08;
+constexpr float kPrintEaseSnap = 0.002f;  // max |target - eased| below this (half an 8-bit code of the encoded output): the target itself
+struct PrintEase {
+  std::mutex m;
+  Hash128 base{};
+  double t = 0;
+  bool valid = false, converging = false;
+  std::shared_ptr<const PrintTable> cur;
+};
+PrintEase& printEase() {
+  static auto* e = new PrintEase;  // leaked (see rawsLru)
+  return *e;
+}
+bool printEaseOff() {
+  static const bool off = [] {
+    const char* e = std::getenv("DAPPLE_FILM_EASE");
+    return e && e[0] == '0';
+  }();
+  return off;
+}
+double printEaseNow() {
+  if (g_tableClock) return g_tableClock();
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+bool sameLayout(const fd::FilmTables& a, const fd::FilmTables& b) {
+  return a.lutN == b.lutN && a.lut.size() == b.lut.size() && a.split == b.split && a.lut1.size() == b.lut1.size() && a.lut3.size() == b.lut3.size() &&
+         a.paperCurve.size() == b.paperCurve.size();
+}
+// `advance` false: a warm-up call (no frame renders from it) must not move the filter.
+std::shared_ptr<const PrintTable> easedPrint(const Hash128& base, const std::shared_ptr<const PrintTable>& target, bool advance, bool* converging) {
+  *converging = false;
+  if (printEaseOff() || !advance || !target) return target;
+  PrintEase& e = printEase();
+  std::lock_guard<std::mutex> lock(e.m);
+  const double now = printEaseNow();
+  const double dt = now - e.t;
+  if (!(e.valid && e.base == base && e.cur && sameLayout(e.cur->t, target->t) && dt <= 0.5)) {
+    e.valid = true, e.base = base, e.t = now, e.cur = target, e.converging = false;
+    return target;
+  }
+  if (dt < 0.001) {  // a second call of the same frame
+    *converging = e.converging;
+    return e.cur;
+  }
+  e.t = now;
+  const fd::FilmTables& T = target->t;
+  const fd::FilmTables& C = e.cur->t;
+  float worst = 0.f;
+  for (std::size_t i = 0; i < T.lut.size(); ++i) worst = std::max(worst, std::fabs(T.lut[i] - C.lut[i]));
+  if (worst < kPrintEaseSnap) {
+    e.cur = target;
+    e.converging = false;
+    return target;
+  }
+  const float a = float(1.0 - std::exp(-std::max(dt, 0.0) / kPrintEaseSeconds));
+  auto n = std::make_shared<PrintTable>(*target);
+  n->gen = ftrace::nextGen();
+  auto mix = [a](auto& dst, const auto& cur, const auto& tgt) {
+    for (std::size_t i = 0; i < tgt.size(); ++i) dst[i] = cur[i] + (tgt[i] - cur[i]) * a;
+  };
+  mix(n->t.lut, C.lut, T.lut);
+  if (T.split) {
+    mix(n->t.lut1, C.lut1, T.lut1);
+    mix(n->t.lut3, C.lut3, T.lut3);
+    mix(n->t.paperCurve, C.paperCurve, T.paperCurve);
+  }
+  for (int i = 0; i < 4; ++i) {
+    n->t.dmin[i] = C.dmin[i] + (T.dmin[i] - C.dmin[i]) * a;
+    n->t.dscale[i] = C.dscale[i] + (T.dscale[i] - C.dscale[i]) * a;
+    n->t.glareRgb[i] = C.glareRgb[i] + (T.glareRgb[i] - C.glareRgb[i]) * a;
+    n->t.dminS[i] = C.dminS[i] + (T.dminS[i] - C.dminS[i]) * a;
+    n->t.dscaleS[i] = C.dscaleS[i] + (T.dscaleS[i] - C.dscaleS[i]) * a;
+  }
+  e.cur = n;
+  e.converging = true;
+  *converging = true;
+  return n;
+}
 }  // namespace
 
-bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
+void setFilmTableClockForTest(double (*fn)()) { g_tableClock = fn; }
+
+bool tablesFor(const FilmResolved& r, FilmTablesHandle& out, bool advance) {
   const bool traceHere = ftrace::on() && ThreadPool::tlUse() != &ThreadPool::background();
   double tablesMs = 0;
   ftrace::Timer traceTimer(traceHere ? &tablesMs : nullptr);
@@ -943,8 +1029,10 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
   // One table size for a whole drag: a drag frame takes the coarse table of its own values when it is cached, even when the exact one is too (the exact
   // table is only the first choice when no coarse one exists, and then a coarse table of the same values is baked behind it); the settled frame queues the
   // coarse table of its values so that the next drag starts on the coarse tier (frame trace: 1 - 3 table size changes per drag before).
+  bool easeCoarse = false;
   if (r.coarse && !(cachedPeek(prints, kp) && !cachedPeek(printsCoarseLru(), kc))) {
     if (asyncTables()) {
+      easeCoarse = true;
       out.print = cachedFind(printsCoarseLru(), kc);
       traceKind = ftrace::kCoarse;
       if (!out.print) {
@@ -970,6 +1058,11 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out) {
     if (asyncTables() && !cachedPeek(printsCoarseLru(), kc)) printWorker().request(r, kc, base);  // the coarse twin of these values (next drag, or the rest of this one)
   }
   if (out.print && !usedStale) noteLastPrint(base, out.print);
+  if (easeCoarse && out.print) {  // the frame shows the target through the filter; the filter keeps converging after the finger stopped
+    bool converging = false;
+    out.print = easedPrint(base, out.print, advance, &converging);
+    if (converging) requestRepaintSoon();
+  }
   if (traceHere && out.print) {
     traceTimer.dst = nullptr;
     const std::uint64_t gen = out.print->gen;

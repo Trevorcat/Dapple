@@ -226,7 +226,7 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
       return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
     if (!filmResolve(in, fres)) return Status::Unsupported;
     filmnode::FilmTablesHandle warm;
-    filmnode::tablesFor(fres, warm);
+    filmnode::tablesFor(fres, warm, false);
     filmnode::planOf(fres);
   }
 
@@ -478,7 +478,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     if (winPx * 128 + outPx * 2 > std::uint64_t(double(caps.deviceLocalBytes) * 0.5))
       return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
     filmnode::FilmTablesHandle warm;  // CPU bakes without the device (process-wide caches)
-    filmnode::tablesFor(fres, warm);
+    filmnode::tablesFor(fres, warm, false);
     filmnode::planOf(fres);
   }
   // the source: resident (small enough) or streamed per tile; a streamed film export reads it in bands too: the walks that build the low planes, then the tiles' windows

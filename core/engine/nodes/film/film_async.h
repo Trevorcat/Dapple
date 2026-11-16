@@ -13,6 +13,8 @@ void markMatchStale();
 // Repaint the newest snapshot of the live views in about 12 ms (at most one request outstanding): the easing of the film match values keeps converging
 // after the finger stopped.
 void requestRepaintSoon();
+// The clock of the interactive print-table easing (tests; nullptr = steady clock).
+void setFilmTableClockForTest(double (*fn)());
 void notifyRepaintIfMatchStale();
 
 struct FilmResolved;

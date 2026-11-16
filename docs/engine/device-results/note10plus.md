@@ -1,5 +1,9 @@
 # Samsung Galaxy Note10+ (SM-N9760) device results, 2026-11-12
 
+## 2026-11-16 (print-table easing): phone measurement not done
+
+The change (section 60b: the interactive coarse print table is eased, 26 of 71 steps on the exposure pad were table-generation-only) was verified on the desktop only (`engine.film_print_ease`). The Note10+ measurement was not run: a public sample pushed to a new directory does not appear in the app's photo grid without a media scan (the grid still listed 40 photos), and the other ways in (the system file picker, `cmd media`, `content query`) are outside the privacy rules of the task. The installed build is the previous one (15:10); the stock selected there was not checked either, so the N400C / N200B mix-up of the previous run is still open. Cleanup: the pushed file and directory removed (`ls` reports the directory absent), the debug property reset to empty, no screenshots kept.
+
 ## 2026-11-16 (film drag flicker: match easing)
 
 Release APKs of the working tree before / after the fix (`install -r`), Note10+ RFCMA05Q5ZX, taps and swipes only (resumed-activity check before every input), scripts and logs in `build/perf-20261116i/` (`drag.sh`, `map.sh`, `an.py`, `abs.py`, `ft.py`). `debug.dapple.frame_profile` 2 for the traces (the view reads the picture back), 1 for the frame times; reset to empty. Public sample `T1116i_a.ARW` (A6700). Drags: 3 s `input swipe`, 5 per gesture. **Before** the stock was N400C (puck in the centre), **after** N200B (the app kept the earlier selection; same pad coordinates): the two sets are comparable in kind, not frame for frame.

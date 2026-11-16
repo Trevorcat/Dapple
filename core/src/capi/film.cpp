@@ -116,7 +116,10 @@ double filmNowSeconds() {
 }
 }  // namespace
 
-void setFilmClockForTest(double (*fn)()) { g_filmClock = fn; }
+void setFilmClockForTest(double (*fn)()) {
+  g_filmClock = fn;
+  dapple::engine::filmnode::setFilmTableClockForTest(fn);
+}
 
 EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath, bool interactive) {
   params.filmKeyEv = 0.f;
