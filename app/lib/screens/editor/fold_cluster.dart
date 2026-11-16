@@ -8,6 +8,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
+import '../../widgets/float_bar.dart' show kFloatBarRadius;
 
 import '../../editor/fold_layout.dart';
 import '../../model/film_map.dart';
@@ -437,7 +438,7 @@ class _Rail extends StatelessWidget {
     return ListenableBuilder(
       listenable: Listenable.merge([ctl.wm, ctl.edits, ctl.app.editTick, ctl.local]),
       builder: (context, _) => GlassCapsule(
-      radius: 28,
+      radius: kFloatBarRadius,
       child: SingleChildScrollView(
         key: const ValueKey('cluster-rail'),
         physics: const ClampingScrollPhysics(),

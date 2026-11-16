@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:dapple/editor/panel_layout.dart';
+import 'package:dapple/screens/editor/pad_dock.dart' show padDockH;
 import 'package:flutter_test/flutter_test.dart';
 
 class Dev {
@@ -33,7 +34,7 @@ PanelLayout solve(Dev d, double aspect, {double needBottom = 192, double needSid
       size: d.size,
       regionTop: d.regionTop,
       paneTop: d.safeTop + 8,
-      dockH: 56,
+      dockH: padDockH(1.0),
       dockBottom: d.dockBottom,
       aspect: aspect,
       needBottom: needBottom,
@@ -112,7 +113,7 @@ void main() {
       expect(tr.dock.top, greaterThanOrEqualTo(tr.panel.bottom));
       expect(tr.panel.width, closeTo(sw - 12, 0.01));
       final lead = solvePanelLayout(
-          size: d.size, regionTop: d.regionTop, paneTop: d.safeTop + 8, dockH: 56, dockBottom: d.dockBottom, aspect: 0.75, needBottom: 192, needSide: 228, trailing: false, force: PanelPlace.side);
+          size: d.size, regionTop: d.regionTop, paneTop: d.safeTop + 8, dockH: padDockH(1.0), dockBottom: d.dockBottom, aspect: 0.75, needBottom: 192, needSide: 228, trailing: false, force: PanelPlace.side);
       expect(lead.panel.left, closeTo(12, 0.01), reason: d.name);
       expect(lead.photoRegion.left, closeTo(sw, 0.01));
     }

@@ -229,7 +229,7 @@ class BallGeo {
   static const double ballD = 76, ringD = 52, edgeGap = 136, railW = 64;
 
   /// One category item of the rail (the dock's item: icon over word) at text scale 1; [BallGeo.of] takes the scaled height.
-  static const double railItem = 56;
+  static const double railItem = 60;
   static const int railCount = 5;
   static const double ringUp = 110, gripDown = 48;
   static const double gripW = 44, gripH = 30, pillW = 52, pillH = 36;

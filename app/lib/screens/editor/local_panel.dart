@@ -831,7 +831,20 @@ class LocalItemised extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, cons) {
         final tight = cons.maxHeight < 200;
-        return Column(
+        // Below the fixed lines (chips 48 + ruler 64) and a small radar the body scrolls under the photo instead of overflowing (the dock's
+        // 60 dp leaves a 393 dp landscape phone's pane ~109 dp tall): the radar keeps [_kRadarMinH] and the lines stay whole.
+        final scroll = cons.maxHeight < _kItemFixedH + _kRadarMinH;
+        final radar = RadarView(
+          key: ValueKey('local-radar-${lc.itemGroup}'),
+          ctl: ctl,
+          cat: PadCat.light,
+          items: items,
+          selected: sel,
+          onSelect: ctl.selectItem,
+          source: lc.items,
+        );
+        final column = Column(
+          mainAxisSize: scroll ? MainAxisSize.min : MainAxisSize.max,
           children: [
             Row(
               children: [
@@ -850,25 +863,19 @@ class LocalItemised extends StatelessWidget {
               ],
             ),
             SizedBox(height: tight ? 0 : Sp.xs),
-            Expanded(
-              child: RadarView(
-                key: ValueKey('local-radar-${lc.itemGroup}'),
-                ctl: ctl,
-                cat: PadCat.light,
-                items: items,
-                selected: sel,
-                onSelect: ctl.selectItem,
-                source: lc.items,
-              ),
-            ),
+            if (scroll) SizedBox(height: _kRadarMinH, child: radar) else Expanded(child: radar),
             SizedBox(height: tight ? 0 : Sp.s),
             ItemRuler(ctl: ctl, cat: PadCat.light, item: items[sel], source: lc.items),
           ],
         );
+        return scroll ? SingleChildScrollView(child: column) : column;
       },
     );
   }
 }
+
+/// The 分项 body's fixed lines (group chips 48 + ruler 64, measured) and the smallest radar it keeps before it scrolls.
+const double _kItemFixedH = 112, _kRadarMinH = 64;
 
 // ------------------------------------------------------------------ tool strip (on the photo)
 

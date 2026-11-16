@@ -209,8 +209,8 @@ void main() {
   });
 
   test('the clearance pages keep at their end covers the inset, the gap and the capsule', () {
-    expect(kFloatBarH, 56);
-    expect(kFloatBarRadius, 28, reason: 'the dock capsule radius');
+    expect(kFloatBarH, 60);
+    expect(kFloatBarRadius, 30, reason: 'the dock capsule radius');
   });
 }
 

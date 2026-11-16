@@ -12,6 +12,7 @@ import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../theme/tokens.dart';
 import '../../widgets/controls.dart' show kHit;
+import '../../widgets/float_bar.dart' show capsuleH, kFloatBarH, kFloatBarRadius;
 import '../../widgets/icons.dart';
 import 'editor_controller.dart';
 import 'editor_overlays.dart' show GlassCapsule;
@@ -61,7 +62,7 @@ class PadDock extends StatelessWidget {
           ]),
         );
         return GlassCapsule(
-          radius: 28,
+          radius: kFloatBarRadius,
           child: iw * n <= cons.maxWidth + 0.5 ? row : SizedBox(width: cons.maxWidth, child: SingleChildScrollView(scrollDirection: Axis.horizontal, child: row)),
         );
       }),
@@ -226,8 +227,10 @@ class DockItemFace extends StatelessWidget {
     }
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
-      decoration: BoxDecoration(color: on ? c.accentSoft : null, borderRadius: BorderRadius.circular(26 * k)),
+      decoration: BoxDecoration(color: on ? c.accentSoft : null, borderRadius: BorderRadius.circular((kFloatBarH / 2 - 2) * k)),
+      // the column sits 1 dp below the centre (10 dp above the icon, 8 below the label), as in the float bar
       child: Column(mainAxisAlignment: MainAxisAlignment.center, mainAxisSize: MainAxisSize.min, children: [
+        SizedBox(height: 2 * k),
         SizedBox(
           width: iconSize,
           height: iconSize,
@@ -236,7 +239,7 @@ class DockItemFace extends StatelessWidget {
             if (mark != null) Positioned(left: iconSize + k, top: -1 * k, child: mark),
           ]),
         ),
-        SizedBox(height: 4 * k),
+        SizedBox(height: 2 * k),
         // one line at any text size: a long word shrinks to the item rather than wrapping under it (text scale 2.0)
         FittedBox(fit: BoxFit.scaleDown, child: Text(label, maxLines: 1, softWrap: false, style: _scaled(T.cap(fg, w: on ? FontWeight.w600 : FontWeight.w400), k))),
       ]),
@@ -246,8 +249,8 @@ class DockItemFace extends StatelessWidget {
 
 TextStyle _scaled(TextStyle s, double k) => k == 1 ? s : s.copyWith(fontSize: (s.fontSize ?? 12) * k);
 
-/// Dock height: 56, taller when the label (12 / 16, guidelines 3.2) grows with the system text size (icon 24 + gap 4 + label + margins).
-double padDockH(double textScale) => textScale <= 1.0 ? 56.0 : 34 + 16 * textScale;
+/// Dock height: the float bar's 60, taller when the label (12 / 16, guidelines 3.2) grows with the system text size (one formula, [capsuleH]).
+double padDockH(double textScale) => capsuleH(textScale);
 
 /// The popup above the dock while an item is held: the pad at full size, the photo stays where it is.
 class HoldPopupLayer extends StatelessWidget {

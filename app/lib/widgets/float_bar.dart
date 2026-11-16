@@ -1,5 +1,5 @@
-// The floating capsule of the home shell (docs/design/guidelines.md 15.6): the editor dock's own surface (the frosted [GlassCapsule], radius 28,
-// 56 dp items, a tinted pill for the selected one), centred above the bottom inset. Pages scroll underneath it and end with
+// The floating capsule of the home shell (docs/design/guidelines.md 15.6): the editor dock's own surface (the frosted [GlassCapsule], radius 30,
+// 60 dp items, a tinted pill for the selected one), centred above the bottom inset. Pages scroll underneath it and end with
 // [floatBarClearance] of space, so the last row and any bottom action clear it.
 import 'dart:math' as math;
 
@@ -10,12 +10,16 @@ import '../theme/tokens.dart';
 import 'icons.dart';
 
 /// Height of the capsule's items (the dock's), the gap between it and the bottom inset, the radius (the dock's).
-const double kFloatBarH = 56, kFloatBarGap = 12, kFloatBarRadius = 28;
+const double kFloatBarH = 60, kFloatBarGap = 12, kFloatBarRadius = kFloatBarH / 2;
 
-/// The capsule's height: 56, taller when the 12 / 16 label grows with the system text size (icon 24 + gap 2 + label + margin 4).
+/// The capsule's and the dock's height at text scale [ts] (the one source): 60, taller when the 12 / 16 label grows with the system
+/// text size (icon 24 + gap 2 + label + 18 of margin and air: 10 above the icon, 8 below the label at scale 1).
+double capsuleH(double ts) => ts <= 1.0 ? kFloatBarH : 36 + 16 * ts;
+
+/// The capsule's height at the system text size.
 double floatBarH(BuildContext context) {
   final ts = MediaQuery.textScalerOf(context).scale(12) / 12;
-  return ts <= 1.0 ? kFloatBarH : 32 + 16 * ts;
+  return capsuleH(ts);
 }
 
 /// The bottom edge the capsule stands on: the larger of the bottom inset and the system gesture inset (guidelines 15.6: nothing a finger
@@ -89,11 +93,13 @@ class FloatBarItem extends StatelessWidget {
             height: floatBarH(context),
             child: Container(
               margin: const EdgeInsets.all(2),
-              decoration: BoxDecoration(color: primary ? c.primaryContainer : (selected ? c.accentSoft : null), borderRadius: BorderRadius.circular(26)),
+              decoration: BoxDecoration(color: primary ? c.primaryContainer : (selected ? c.accentSoft : null), borderRadius: BorderRadius.circular(kFloatBarH / 2 - 2)),
+              // the column sits 1 dp below the centre: 10 dp above the icon, 8 below the label
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  const SizedBox(height: 2),
                   DIcon(icon, size: 24, color: fg, filled: selected || primary),
                   const SizedBox(height: 2),
                   FittedBox(fit: BoxFit.scaleDown, child: Text(label, maxLines: 1, softWrap: false, style: T.cap(fg, w: selected || primary ? FontWeight.w600 : FontWeight.w400))),
