@@ -72,6 +72,32 @@ bool Executor::ensureResident() {
   return true;
 }
 
+// The level-2 reduction of the source (the store's, reduce_l2.h) on the device: 1/16 of the source's pixels, uploaded once per store.
+std::shared_ptr<const hal::ImageH> Executor::reducedSource() {
+  if (!rs_ || !store_) return fail(GpuReason::SourceTooLarge, "no source"), nullptr;
+  if (!rs_->haveL2) {
+    const ReducedL2* l2 = store_->reducedL2();
+    if (!l2 || l2->w <= 0 || l2->h <= 0) return fail(GpuReason::DeviceError, "source store cannot be reduced"), nullptr;
+    hal::ImageH img;
+    hal::Status s = dev().createImage({hal::Format::RGBA16F, std::uint32_t(l2->w), std::uint32_t(l2->h), 1}, &img);
+    if (s != hal::Status::Ok) return failStatus(s, ""), nullptr;
+    std::string err;
+    if (!core().uploadRgbF32(l2->rgb.data(), std::size_t(l2->w) * 3, l2->w, l2->h, img, 0, 0, err)) {
+      core().retire(img);
+      return (dev().state() == hal::DeviceState::Lost ? fail(GpuReason::DeviceLost, err) : fail(GpuReason::DeviceError, err)), nullptr;
+    }
+    if (rs_->haveL2) {
+      core().retire(img);
+    } else {
+      rs_->l2img = img;
+      rs_->l2w = l2->w;
+      rs_->l2h = l2->h;
+      rs_->haveL2 = true;
+    }
+  }
+  return std::shared_ptr<const hal::ImageH>(rs_, &rs_->l2img);
+}
+
 // The resident source resized (Lanczos-3) to w x h; cached (two sizes). The result holds the image (aliasing pointer) for the frame.
 std::shared_ptr<const hal::ImageH> Executor::resizedSource(int w, int h) {
   if (w == W_ && h == H_) return std::shared_ptr<const hal::ImageH>(rs_, &rs_->img);

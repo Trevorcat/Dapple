@@ -71,8 +71,6 @@ void setFilmV3Verdict(int direct);
 // Measured at warm-up: milliseconds per megapixel of an interactive film frame on this device (0 = not measured). Seeds the interactive size.
 void setFilmInteractiveMsPerMpx(float v);
 float filmInteractiveMsPerMpx();
-gpu::H recordFilmFrame(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pr, gpu::H src,
-                       int w, int h);
 
 // ---- windows of a film frame (tiled export; recordFilmFrame is the same code with one window = the frame) ------------------------------------
 // A rectangle of the frame in frame coordinates; the display image of a window starts at (x0, y0) of the picture.
@@ -91,34 +89,33 @@ struct FilmSrc {
   int ox = 0, oy = 0;
 };
 using FilmSrcFn = std::function<FilmSrc(const FilmWin&)>;
+// The film input at a quarter of the picture's scale (ceil(W / 4) x ceil(H / 4), RGBA32F): the level-2 reduction of the source through the picture's geometry
+// (section 59). The low planes of the mixtures are built from it.
+using FilmQuarterFn = std::function<FilmSrc()>;
 // The part of a film frame that belongs to the whole picture and is kept between the windows: the level-2 accumulator planes (1/16 of the pixels, RGBA16F)
 // of the camera / halation / DIR mixtures, each -1 when its mixture has no component above level 1 or is absent. `any` = the film has spatial effects.
+// A window that finds a plane it needs missing makes all of them from `quarter` (a frame that is one window, interactive frames, whole-frame exports).
 struct FilmPre {
   gpu::H lowPre = -1, lowHalo = -1, lowDir = -1;
   bool any = false;
+  FilmQuarterFn quarter;
 };
 // Size of those planes for a w x h frame.
 void filmLowSize(int w, int h, int& lw, int& lh);
-// Builds the low planes by walks over windows of the film input (the source of a window comes from `src`; the planes are the only thing that stays).
-// Not needed when one window covers the frame (recordFilmWindow then builds them itself).
-// The same walks window by window, for a source that is read band by band (each window its own graph and device turn). `FilmLowPlan` says which walks
-// the film needs (need[0] = camera mixture input E, [1] = halation input pre(E), [2] = DIR input) and how far a walk's window reaches around its tile;
-// filmLowPlan is false when the film has no window form (highlight boost, unsupported effect). A walk: for every tile of kBand px (row-major) the window
-// filmLowSourceWindow(tile) of the film input is handed to `src`, recordFilmLowWindow writes the tile's share into the level-2 input plane `p2`
-// (l2w x l2h, RGBA16F, any content) and recordFilmLowBuild makes the low plane of the stage from the complete p2 (-1 on error). Walk 1 needs the
-// low plane of walk 0 (`lowPre`) and walk 2 those of 0 and 1.
+// Which low planes the film needs (need[0] = camera mixture, [1] = halation, [2] = DIR; a mixture needs one when it has components above level 1) and their
+// size; false when the film has no window form (highlight boost, unsupported effect).
 struct FilmLowPlan {
-  static constexpr int kBand = 512;
   bool any = false, need[3] = {false, false, false};
-  int grow[3] = {0, 0, 0};
   int l2w = 0, l2h = 0;
 };
 bool filmLowPlan(const FilmResolved& res, int w, int h, FilmLowPlan& out);
-FilmWin filmLowSourceWindow(const FilmLowPlan& lp, int stage, int w, int h, const FilmWin& tile);
-bool recordFilmLowWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmLowPlan& lp, int stage, int w, int h, const FilmWin& tile,
-                         const FilmSrcFn& src, gpu::H p2, gpu::H lowPre, gpu::H lowHalo);
-gpu::H recordFilmLowBuild(gpu::GpuRecorder& r, const FilmResolved& res, int stage, int w, int h, gpu::H p2);
-bool recordFilmLow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmSrcFn& src, int w, int h, FilmPre& out);
+// Records the low planes of a w x h frame from its quarter-scale film input `qs` into `out` (transient images of this graph). `boosted`: the frame has the
+// highlight boost, whose constants the full-resolution exposure of this graph made (recordBoost); it is applied to the quarter-scale exposure too.
+bool recordFilmLowQuarter(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmSrc& qs, int w, int h, FilmPre& out,
+                          bool boosted = false);
+// Appends the film passes for a w x h frame whose film input is `src`. `quarter`: the film input at a quarter of the scale; null = the 4 x 4 box of `src`.
+gpu::H recordFilmFrame(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pr, gpu::H src, int w, int h,
+                       const FilmQuarterFn* quarter = nullptr);
 // The develop / grain / print / scan chain over `win`, with the exposure, the camera / halation mixtures and the DIR field recomputed inside the window
 // (grown by the mixtures' reach and aligned: no frame-sized E2 / q). The image is only valid inside `win` shrunk by filmWindowHalo() on the sides that are
 // not a frame border (the caller passes a window grown by that halo and clipped to the frame): the values there are those of a whole-frame run.

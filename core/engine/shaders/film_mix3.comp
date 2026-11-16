@@ -17,6 +17,7 @@ layout(constant_id = 0) const int NJ = 4;          // components in this pass (1
 layout(constant_id = 1) const bool BASE = true;    // MODE 2
 layout(constant_id = 2) const bool HAS_UP = false; // MODE 2 / 3: an upsampled lower level is added
 layout(constant_id = 3) const bool DIRECT = false; // MODE 2: taps read straight from the texture path (no shared-memory column tile)
+layout(constant_id = 4) const bool UP_SAME = false; // MODE 2 / 3: the added plane B has the output's size (added as it is, not upsampled)
 
 layout(std140, binding = 0) uniform P {
   ivec4 dim;     // w, h (of the output), r (largest radius of the pass), offset of the pass's tap table in `tv` (vec4 units)
@@ -78,6 +79,7 @@ int reflectIdx(int i, int n) {
 
 #if MODE == 2 || MODE == 3
 vec3 upsampled(ivec2 p) {
+  if (UP_SAME) return texelFetch(uB, p, 0).rgb;
   // levelCombine up path: even / odd output column and row use the two Catmull-Rom phases (t = 0.75 / 0.25)
   // (wave 8: weights picked once as vec4 by parity and the four column indices hoisted out of the row loop: no dynamically indexed arrays)
   const ivec2 lsz = u.sz.xy;

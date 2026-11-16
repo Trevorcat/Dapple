@@ -8,8 +8,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 
 #include "dapple/decoder.h"
+#include "engine/exec/reduce_l2.h"
 
 namespace dapple::engine {
 
@@ -27,6 +30,35 @@ class SourceStore {
   virtual const float* window(int x0, int y0, int w, int h, std::size_t& pitchFloats) = 0;
   // The CPU image when the store is memory backed (bakes of the table nodes read it); null otherwise.
   virtual const SourceImage* image() const { return nullptr; }
+  // The level-2 box reduction of the picture (reduce_l2.h): the film's low planes are built from it (section 59). Computed once from window() in bands of 512
+  // rows and kept with the store (a store whose pixels change calls invalidateReduced()); a streamed store hands over what its analysis pass made.
+  virtual const ReducedL2* reducedL2() {
+    std::lock_guard<std::mutex> lk(l2Mtx_);
+    if (!l2_) {
+      auto r = std::make_unique<ReducedL2>();
+      const int W = width(), H = height();
+      r->init(W, H);
+      for (int y = 0; y < H; y += 512) {
+        const int n = std::min(512, H - y);
+        std::size_t pitch = 0;
+        const float* p = window(0, y, W, n, pitch);
+        if (!p) return nullptr;
+        reduceL2Rows(p, pitch, W, y, y + n, *r);
+      }
+      l2_ = std::move(r);
+    }
+    return l2_.get();
+  }
+
+ protected:
+  void invalidateReduced() {
+    std::lock_guard<std::mutex> lk(l2Mtx_);
+    l2_.reset();
+  }
+
+ private:
+  std::mutex l2Mtx_;
+  std::unique_ptr<ReducedL2> l2_;
 };
 
 class MemorySourceStore final : public SourceStore {
@@ -43,7 +75,10 @@ class MemorySourceStore final : public SourceStore {
   }
   const SourceImage* image() const override { return &img_; }
   // The pixels were replaced in place (HDR merge result stored in the same SourceImage): resident copies are stale.
-  void touch() { id_ = next(); }
+  void touch() {
+    id_ = next();
+    invalidateReduced();
+  }
 
  private:
   static std::uint64_t next() {

@@ -24,6 +24,50 @@ SolveRes* Walk::solveOf(NodeId id) {
   return nullptr;
 }
 
+// The film input at a quarter of the picture's scale (section 59): the level-2 reduction of the source (job.src.l2), taken through the same geometry, warp
+// and local stage L as the full-resolution input with the mapping scaled by 4: quarter pixel (i, j) is the input at the centre of the 4 x 4 block of the
+// picture it stands for. ceil(outW / 4) x ceil(outH / 4), RGBA32F.
+filmnode::FilmSrc Walk::filmInputQuarter() {
+  const point::Blocks& P = in.frame;
+  const int qw = (P.geo.outW + 3) / 4, qh = (P.geo.outH + 3) / 4;
+  if (job.src.l2 < 0) return {};
+  const H g = r.g.transient(hal::Format::RGBA32F, std::uint32_t(qw), std::uint32_t(qh));
+  if (in.blocks.local.active() && job.ldesc >= 0 && job.lplanes >= 0) {
+    const LocalFilmInNode ln{&P, job.src, qw, qh, 0, 0, job.ldesc, job.lplanes, -1, -1, true};
+    if (!recordLocalFilmIn(r, ln, g)) return {};
+    return {g, 0, 0};
+  }
+  struct U {
+    std::int32_t a[4], b[4];
+    float geoA[4], geoB[4], geoC[4];
+    std::int32_t c[4];
+    float q[4];
+    WarpU w;
+  } u{};
+  u.a[0] = P.geo.srcW;
+  u.a[1] = P.geo.srcH;
+  u.a[2] = qw;
+  u.a[3] = qh;
+  if (P.geo.useGeo) {
+    u.geoA[0] = P.geo.cs, u.geoA[1] = P.geo.sn, u.geoA[2] = P.geo.fw, u.geoA[3] = P.geo.fh;
+    u.geoB[0] = P.geo.ox0, u.geoB[1] = P.geo.oy0, u.geoB[2] = P.geo.stepX * 4.f, u.geoB[3] = P.geo.stepY * 4.f;
+    u.geoC[0] = P.geo.fullW, u.geoC[1] = P.geo.fullH;
+    u.c[0] = P.geo.rot;
+    u.c[1] = P.geo.flip ? 1 : 0;
+  } else {  // no geometry: the identity mapping of the output onto the source grid
+    u.geoA[0] = 1.f, u.geoA[2] = float(P.geo.srcW), u.geoA[3] = float(P.geo.srcH);
+    u.geoB[2] = u.geoB[3] = 4.f;
+    u.geoC[0] = float(P.geo.srcW), u.geoC[1] = float(P.geo.srcH);
+  }
+  u.q[0] = job.src.l2kx, u.q[1] = job.src.l2ky, u.q[2] = float(job.src.l2w), u.q[3] = float(job.src.l2h);
+  const bool warpOn = P.warp.active() && job.src.warp >= 0;
+  if (warpOn) warpUniform(P.warp, job.src, u.w);
+  const hal::PipelineH p = r.pl("film_src", {{0, 2}, {4, warpOn ? 1 : 0}});
+  if (!p) return {};
+  r.g.dispatch("film_src", p, {GpuGraph::R(job.src.l2), GpuGraph::W(g), GpuGraph::R(warpOn ? job.src.warp : r.g.externalBuf(r.gBuf))}, r.gx(qw), r.gy(qh), &u, sizeof u);
+  return {g, 0, 0};
+}
+
 filmnode::FilmSrc Walk::filmInputRect(int wx0, int wy0, int ww, int wh) {
   const point::Blocks& P = in.frame;
   H src = job.src.img;
@@ -42,6 +86,7 @@ filmnode::FilmSrc Walk::filmInputRect(int wx0, int wy0, int ww, int wh) {
       std::int32_t a[4], b[4];
       float geoA[4], geoB[4], geoC[4];
       std::int32_t c[4];
+      float q[4];
       WarpU w;
     } u{};
     u.a[0] = P.geo.srcW;
@@ -85,7 +130,8 @@ H Walk::filmInput() {
 bool Walk::filmStage() {
   const H src = filmInput();
   if (src < 0) return false;
-  job.film = filmnode::recordFilmFrame(r, *fres, *ftab, *fplan, src, in.frame.geo.outW, in.frame.geo.outH);
+  const filmnode::FilmQuarterFn quarter = [this] { return filmInputQuarter(); };
+  job.film = filmnode::recordFilmFrame(r, *fres, *ftab, *fplan, src, in.frame.geo.outW, in.frame.geo.outH, job.src.l2 >= 0 ? &quarter : nullptr);
   job.filmClamped = job.film >= 0 && filmnode::filmEndsClamped(*fres);
   job.filmOx = job.filmOy = 0;
   return job.film >= 0;
@@ -93,10 +139,6 @@ bool Walk::filmStage() {
 
 filmnode::FilmSrcFn Walk::filmSrcFn() {
   return [this](const filmnode::FilmWin& w) { return filmInputRect(w.x0, w.y0, w.w, w.h); };
-}
-
-bool Walk::filmLowPass(filmnode::FilmPre& out) {
-  return filmnode::recordFilmLow(r, *fres, *ftab, filmSrcFn(), in.frame.geo.outW, in.frame.geo.outH, out);
 }
 
 bool Walk::filmWindowStage() {
@@ -107,6 +149,7 @@ bool Walk::filmWindowStage() {
   win.y0 = std::max(0, work.y0 - halo);
   win.w = std::min(P.geo.outW, work.x1 + halo) - win.x0;
   win.h = std::min(P.geo.outH, work.y1 + halo) - win.y0;
+  pre.quarter = [this] { return filmInputQuarter(); };  // a window that covers the frame builds the low planes itself
   const filmnode::FilmImg fi = filmnode::recordFilmWindow(r, *fres, *ftab, *fplan, pre, filmSrcFn(), P.geo.outW, P.geo.outH, win);
   if (fi.img < 0) return false;
   job.film = fi.img;

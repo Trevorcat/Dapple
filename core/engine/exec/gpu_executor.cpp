@@ -251,6 +251,12 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   if (!S) return failed(Status::Internal);
   out.stats.resizeMs = lap();
   out.stats.resizeBuilt = resizeBuilt_;
+  // a film with mixtures above level 1 builds their low planes from the source's level-2 reduction (section 59)
+  std::shared_ptr<const hal::ImageH> L2;
+  if (in.plan.hasFilm) {
+    filmnode::FilmLowPlan lp;
+    if (filmnode::filmLowPlan(fres, fw, fh, lp) && (lp.need[0] || lp.need[1] || lp.need[2]) && !(L2 = reducedSource())) return failed(Status::Internal);
+  }
   // the solves the plan found on the device: held before any upload of this frame can evict them
   std::vector<std::pair<NodeId, std::shared_ptr<DeviceSolve>>> hits;
   for (const CacheOp& op : in.plan.cache) {
@@ -307,6 +313,11 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   Walk w(rec, in, true);
   w.interior = w.work = WRect{0, 0, fw, fh};
   w.job.src.img = g.external(*S);
+  if (L2) {
+    w.job.src.l2 = g.external(*L2);
+    w.job.src.l2w = rs_->l2w, w.job.src.l2h = rs_->l2h;
+    w.job.src.l2kx = float(W_) / float(P.geo.srcW) / 4.f, w.job.src.l2ky = float(H_) / float(P.geo.srcH) / 4.f;
+  }
   if (L) w.job.lut = lutBind(g, *L);
   if (HD && P.hdr.active()) w.job.lut.hdr = g.externalBuf(HD->buf);
   if (HD && P.warp.active()) w.job.src.warp = g.externalBuf(HD->buf), w.job.src.warpOff = warpOff;
@@ -475,13 +486,13 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     // device memory: a film window costs ~128 B per pixel of transients (a frame that is one tile: the whole frame), the kept planes 2 B per pixel of the frame
     const std::uint64_t outPx = std::uint64_t(P.geo.outW) * P.geo.outH;
     const std::uint64_t winPx = std::uint64_t(std::min(P.geo.outW, tile + 2 * (halo + filmGrow))) * std::uint64_t(std::min(P.geo.outH, tile + 2 * (halo + filmGrow)));
-    if (winPx * 128 + outPx * 2 > std::uint64_t(double(caps.deviceLocalBytes) * 0.5))
+    if (winPx * 128 + outPx * 3 / 2 > std::uint64_t(double(caps.deviceLocalBytes) * 0.5))
       return fail(GpuReason::FrameTooLarge, "film frame too large for the device memory"), Status::Unsupported;
     filmnode::FilmTablesHandle warm;  // CPU bakes without the device (process-wide caches)
     filmnode::tablesFor(fres, warm, false);
     filmnode::planOf(fres);
   }
-  // the source: resident (small enough) or streamed per tile; a streamed film export reads it in bands too: the walks that build the low planes, then the tiles' windows
+  // the source: resident (small enough) or streamed per tile; a streamed film export reads it in bands: the tiles' windows (the low planes come from the source's level-2 reduction, no rows are read for them)
   const bool resident = !in.forceStream && canResident(W_, H_) && canResident(rw, rh) && (filmFrame || std::uint64_t(W_) * H_ <= 40000000ull);
 
   Turn turn(*this, in);
@@ -507,6 +518,19 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     if (!ensureResident()) return failed(Status::Internal);
     if (!(S = resizedSource(rw, rh))) return failed(Status::Internal);
   }
+  // a film with mixtures above level 1 builds their low planes from the source's level-2 reduction (section 59); the tiles read the planes
+  std::shared_ptr<const hal::ImageH> L2;
+  filmnode::FilmLowPlan lowPlan;
+  if (filmFrame) {
+    if (!filmnode::filmLowPlan(fres, P.geo.outW, P.geo.outH, lowPlan)) return fail(GpuReason::FilmEffect, "film GPU: the film has no window form"), Status::Unsupported;
+    if (lowPlan.any && (lowPlan.need[0] || lowPlan.need[1] || lowPlan.need[2]) && !(L2 = reducedSource())) return failed(Status::Internal);
+  }
+  auto bindL2 = [&](GpuGraph& g, Walk& w) {
+    if (!L2) return;
+    w.job.src.l2 = g.external(*L2);
+    w.job.src.l2w = rs_->l2w, w.job.src.l2h = rs_->l2h;
+    w.job.src.l2kx = float(W_) / float(P.geo.srcW) / 4.f, w.job.src.l2ky = float(H_) / float(P.geo.srcH) / 4.f;
+  };
 
   // persistent images of the export: the 1/4 grids and solves of the GlobalSolve stages, the whole-frame film part. Released through the
   // deferred destruction (the last tiles may still be in flight when an error returns early); forgotten when the device was rebuilt meanwhile
@@ -546,7 +570,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     for (const Global& gl : globals) w.solves.push_back(SolveRes{gl.node, gl.accum, g.external(*gl.grid), g.external(*gl.solved)});
   };
 
-  // ---- film: the level-2 planes of the mixtures are built by walks over windows of the picture before the tiles (below); the tiles read them as persistent
+  // ---- film: the level-2 planes of the mixtures are built from the quarter-scale film input before the tiles (below); the tiles read them as persistent
   // images. One tile covering the frame builds them itself. ----
   hal::ImageH *filmLow[3] = {nullptr, nullptr, nullptr};
   bool filmAny = false;
@@ -667,6 +691,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     if (L) w.job.lut = lutBind(g, *L);
     if (HD && P.hdr.active()) w.job.lut.hdr = g.externalBuf(HD->buf);
     if (HD && P.warp.active()) w.job.src.warp = g.externalBuf(HD->buf), w.job.src.warpOff = warpOff;
+    bindL2(g, w);
     if (LDsc && LPl) {
       w.job.ldesc = g.externalBuf(LDsc->buf);
       w.job.lplanes = g.externalBuf(LPl->buf);
@@ -756,73 +781,31 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
     return ss == hal::Status::Ok || failStatus(ss, err);
   };
 
-  // ---- film, streamed source: the walks that build the low planes read the picture band by band; every window is its own graph and device turn, and its
-  // source window is read from the store before the turn (a drag frame waits for no demosaic: section 54). The planes are persistent images. ----
-  hal::ImageH* filmP2 = nullptr;
-  filmnode::FilmLowPlan lowPlan;
-  auto filmWalkWindow = [&](int stage, const filmnode::FilmWin& tl, const SrcRead& sr) -> bool {  // inside the turn
-    hal::ImageH acquired;
-    const SrcWin win = sr.win;
-    if (!resident) {
-      const hal::Status as = pool.acquire(hal::Format::RGBA16F, std::uint32_t(win.w()), std::uint32_t(win.h()), &acquired);
-      if (as != hal::Status::Ok) return failStatus(as, "");
-      if (!core().uploadRgbF32(sr.base, sr.pitch, win.w(), win.h(), acquired, 0, 0, err, {}, ctx_->api() != hal::Api::Vulkan && ctx_->api() != hal::Api::Gles31)) {
-        pool.release(acquired);
-        return fail(d.state() == hal::DeviceState::Lost ? GpuReason::DeviceLost : GpuReason::DeviceError, err);
-      }
-    }
-    auto cl = d.begin();
-    if (!cl) {
-      if (!resident) pool.release(acquired);
-      return failStatus(hal::Status::Timeout, "");
-    }
-    GpuGraph g(d, pool);
-    GpuRecorder rec(d, g, err);
-    recorderFor(rec, cl->slot());
-    Walk wp(rec, in, true);
-    wp.interior = wp.work = WRect{0, 0, P.geo.outW, P.geo.outH};
-    bool ok = true;
-    if (resident) {
-      wp.job.src.img = g.external(*S);
-    } else if (down) {
-      const H s2 = recordResize(rec, g.external(acquired), win, rb, sr.fp);
-      ok = s2 >= 0;
-      wp.job.src.img = s2;
-      wp.job.src.ox = sr.fp.x0;
-      wp.job.src.oy = sr.fp.y0;
-    } else {
-      wp.job.src.img = g.external(acquired);
-      wp.job.src.ox = win.x0;
-      wp.job.src.oy = win.y0;
-    }
-    if (HD && P.warp.active()) wp.job.src.warp = g.externalBuf(HD->buf), wp.job.src.warpOff = warpOff;
-    wp.fres = &fres;
-    wp.ftab = &DF->gt;
-    wp.fplan = &DF->pr;
-    if (LDsc && LPl) {
-      wp.job.ldesc = g.externalBuf(LDsc->buf);
-      wp.job.lplanes = g.externalBuf(LPl->buf);
-    }
-    if (ok)
-      ok = filmnode::recordFilmLowWindow(rec, fres, DF->gt, lowPlan, stage, P.geo.outW, P.geo.outH, tl, wp.filmSrcFn(), g.external(*filmP2),
-                                         filmLow[0] ? g.external(*filmLow[0]) : H(-1), filmLow[1] ? g.external(*filmLow[1]) : H(-1));
-    if (!ok) {
-      if (!resident) pool.release(acquired);
-      return failRecord(rec, err);
-    }
-    const hal::Status ss = submit(g, *cl, nullptr, err);
-    if (!resident) pool.release(acquired);
-    return ss == hal::Status::Ok || failStatus(ss, err);
-  };
-  auto filmBuildLow = [&](int stage) -> bool {  // inside the turn
+  // ---- film: the low planes of the mixtures are built once from the quarter-scale film input (one small graph and device turn: 1/16 of the pixels in every
+  // step, no source rows are read), before the tiles; the tiles read them as persistent images. ----
+  auto filmBuildLow = [&]() -> bool {  // inside the turn
     auto cl = d.begin();
     if (!cl) return failStatus(hal::Status::Timeout, "");
     GpuGraph g(d, pool);
     GpuRecorder rec(d, g, err);
     recorderFor(rec, cl->slot());
-    const H low = filmnode::recordFilmLowBuild(rec, fres, stage, P.geo.outW, P.geo.outH, g.external(*filmP2));
-    if (low < 0) return failRecord(rec, err);
-    g.copyImage(low, g.external(*filmLow[stage]), std::uint32_t(lowPlan.l2w), std::uint32_t(lowPlan.l2h));
+    Walk wp(rec, in, true);
+    wp.interior = wp.work = WRect{0, 0, P.geo.outW, P.geo.outH};
+    bindL2(g, wp);
+    if (HD && P.warp.active()) wp.job.src.warp = g.externalBuf(HD->buf), wp.job.src.warpOff = warpOff;
+    if (LDsc && LPl) {
+      wp.job.ldesc = g.externalBuf(LDsc->buf);
+      wp.job.lplanes = g.externalBuf(LPl->buf);
+    }
+    wp.fres = &fres;
+    wp.ftab = &DF->gt;
+    wp.fplan = &DF->pr;
+    filmnode::FilmPre made;
+    const filmnode::FilmSrc qs = wp.filmInputQuarter();
+    if (qs.img < 0 || !filmnode::recordFilmLowQuarter(rec, fres, DF->gt, qs, P.geo.outW, P.geo.outH, made)) return failRecord(rec, err);
+    const H lows[3] = {made.lowPre, made.lowHalo, made.lowDir};
+    for (int i = 0; i < 3; ++i)
+      if (lowPlan.need[i]) g.copyImage(lows[i], g.external(*filmLow[i]), std::uint32_t(lowPlan.l2w), std::uint32_t(lowPlan.l2h));
     hal::FenceH fence;
     hal::Status ss = submit(g, *cl, &fence, err);
     if (ss == hal::Status::Ok) ss = d.wait(fence, kWaitNs);
@@ -843,46 +826,27 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   turn.release();  // every job below takes its own turn (the first tile's source is read without one)
   if (filmFrame && (P.geo.outW > tile || P.geo.outH > tile)) {
     const auto tLow0 = Clock::now();
-    const double lowSrc0 = tSrc, lowTurn0 = tTurn;
+    const double lowTurn0 = tTurn;
     struct LowLap {
       double& acc;
       Clock::time_point t;
-      const double& src;
       const double& turn;
-      double s0, t0;
-      ~LowLap() { acc += msSince(t) - (src - s0) - (turn - t0); }
-    } lowLap{tLow, tLow0, tSrc, tTurn, lowSrc0, lowTurn0};
-    const int fw = P.geo.outW, fh = P.geo.outH;
-    if (!filmnode::filmLowPlan(fres, fw, fh, lowPlan)) return fail(GpuReason::FilmEffect, "film GPU: the film has no window form"), Status::Unsupported;
+      double t0;
+      ~LowLap() { acc += msSince(t) - (turn - t0); }
+    } lowLap{tLow, tLow0, tTurn, lowTurn0};
     filmAny = lowPlan.any;
-    if (lowPlan.any) {
+    if (lowPlan.any && (lowPlan.need[0] || lowPlan.need[1] || lowPlan.need[2])) {
       if (!take()) return failed(Status::Internal);
-      filmP2 = keep.add();
-      hal::Status ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(lowPlan.l2w), std::uint32_t(lowPlan.l2h), 1}, filmP2);
+      hal::Status ms = hal::Status::Ok;
       for (int i = 0; i < 3 && ms == hal::Status::Ok; ++i) {
         if (!lowPlan.need[i]) continue;
         filmLow[i] = keep.add();
         ms = d.createImage({hal::Format::RGBA16F, std::uint32_t(lowPlan.l2w), std::uint32_t(lowPlan.l2h), 1}, filmLow[i]);
       }
+      if (ms != hal::Status::Ok) return turn.release(), failStatus(ms, ""), Status::Internal;
+      if (in.cancel.cancelled()) return turn.release(), fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled;
+      if (!filmBuildLow()) return failed(Status::Internal);
       turn.release();
-      if (ms != hal::Status::Ok) return failStatus(ms, ""), Status::Internal;
-      constexpr int kBand = filmnode::FilmLowPlan::kBand;
-      for (int stage = 0; stage < 3; ++stage) {
-        if (!lowPlan.need[stage]) continue;
-        for (int y0 = 0; y0 < fh; y0 += kBand)
-          for (int x0 = 0; x0 < fw; x0 += kBand) {
-            if (in.cancel.cancelled()) return fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled;
-            const filmnode::FilmWin tl{x0, y0, std::min(kBand, fw - x0), std::min(kBand, fh - y0)};
-            const filmnode::FilmWin ow = filmnode::filmLowSourceWindow(lowPlan, stage, fw, fh, tl);
-            SrcRead sr;
-            sr.fp = srcRectOfPicture(ow.x0, ow.y0, ow.x0 + ow.w, ow.y0 + ow.h);
-            if (!readRect(sr)) return in.cancel.cancelled() ? (fail(GpuReason::Cancelled, "cancelled"), Status::Cancelled) : failed(Status::Internal);
-            if (!take() || !filmWalkWindow(stage, tl, sr)) return failed(Status::Internal);
-            turn.release();
-          }
-        if (!take() || !filmBuildLow(stage)) return failed(Status::Internal);
-        turn.release();
-      }
     }
   }
   for (const Stage& st : in.plan.stages) {

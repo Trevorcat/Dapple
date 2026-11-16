@@ -16,6 +16,7 @@ layout(std140, binding = 0) uniform P {
   vec4 geoB;   // ox0, oy0, stepX, stepY
   vec4 geoC;   // fullW, fullH
   ivec4 c;     // rot, flip
+  vec4 q;      // quarter-scale film input (section 59): kx, ky (grid -> reduced picture), reduced size; kx = 0: the full-resolution input
   ivec4 wI;
   vec4 wB;
   vec4 wC;
@@ -31,7 +32,10 @@ layout(binding = 7, std430) readonly buffer Warp { float wg[]; };
 #define WARP_AT(i) wg[i]
 #include "warp.glsl"
 
-vec3 srcAt(int x, int y) { return texelFetch(uSrc, ivec2(clamp(x, 0, u.a.x - 1), clamp(y, 0, u.a.y - 1)) - u.b.xy, 0).rgb; }
+vec3 srcAt(int x, int y) {
+  const ivec2 lim = u.q.x > 0.0 ? ivec2(u.q.zw) : u.a.xy;
+  return texelFetch(uSrc, ivec2(clamp(x, 0, lim.x - 1), clamp(y, 0, lim.y - 1)) - u.b.xy, 0).rgb;
+}
 void cubicW(float t, out float w[4]) {
   const float t2 = t * t, t3 = t2 * t;
   w[0] = -0.5 * t3 + t2 - 0.5 * t;
@@ -55,6 +59,15 @@ vec3 sampleCubic(float x, float y) {
     o += wy[j] * acc;
   }
   return max(o, vec3(0.0));
+}
+
+vec3 sampleLinearQ(float x, float y) {
+  x -= 0.5;
+  y -= 0.5;
+  const float fx = floor(x), fy = floor(y);
+  const int ix = int(fx), iy = int(fy);
+  const float tx = x - fx, ty = y - fy;
+  return mix(mix(srcAt(ix, iy), srcAt(ix + 1, iy), tx), mix(srcAt(ix, iy + 1), srcAt(ix + 1, iy + 1), tx), ty);
 }
 
 void main() {
@@ -82,7 +95,8 @@ void main() {
     bool moved = false;
     if (WARP) moved = warpDisplace(sx, sy);
     uv = vec2(sx, sy) / vec2(u.a.xy);
-    if (GEO == 1 && !moved) v = srcAt(int(floor(sx)), int(floor(sy)));
+    if (u.q.x > 0.0) v = max(sampleLanczos3(sx * u.q.x, sy * u.q.y), vec3(0.0));
+    else if (GEO == 1 && !moved) v = srcAt(int(floor(sx)), int(floor(sy)));
     else if (moved) v = sampleLanczos3(sx, sy);
     else v = sampleCubic(sx, sy);
   }

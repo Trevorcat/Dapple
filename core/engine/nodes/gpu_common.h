@@ -42,6 +42,11 @@ struct SourceBind {
   // portrait reshaping (section 45): the buffer that holds the field (the HDR buffer: field after the HDR grid) and its float offset
   H warp = -1;
   int warpOff = 0;
+  // the level-2 reduction of the source picture (reduce_l2.h) as an image of l2w x l2h, and the factors from the frame's source grid to it (the film's
+  // quarter-scale input, section 59); -1: none
+  H l2 = -1;
+  int l2w = 0, l2h = 0;
+  float l2kx = 0.f, l2ky = 0.f;
 };
 // Uniform block tail of the shaders that include warp.glsl
 struct WarpU {
@@ -197,6 +202,7 @@ struct LocalFilmInNode {
   SourceBind src;
   int W, Hh, ox, oy;
   H ldesc, lplanes, aux0, aux1;
+  bool quarter = false;  // the film input at a quarter of the picture's scale (n.W x n.Hh pixels = the picture's ceil(W / 4)): src.l2 sampled through the geometry
 };
 bool recordLocalFilmIn(GpuRecorder& r, const LocalFilmInNode& n, H out);
 

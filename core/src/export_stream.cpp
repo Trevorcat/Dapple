@@ -515,12 +515,14 @@ bool analyse(BandSource& src, const SourceImage& meta, const Wants& want, Analys
         gacc.emplace_back(std::size_t(s.first) * s.second * 3, 0.0);
       }
     }
+    auto l2 = std::make_shared<engine::ReducedL2>();  // the level-2 box reduction (the last pass's rows win: it sees the floored picture)
+    l2->init(W, H);
     std::vector<float> luma;
     if (decide) luma.reserve(std::size_t(W / 4 + 1) * std::size_t(H / 4 + 1));
 
     int K = 2;
     for (const RowResizer& r : rz) K = std::max(K, r.footprint());
-    const int B = std::max(512, K);  // one demosaic call per 512 rows (fewer GPU round trips)
+    const int B = (std::max(512, K) + 3) / 4 * 4;  // one demosaic call per 512 rows (fewer GPU round trips)
     // bottom to top when the rows may be kept for the render (it starts at the top); the raster guide's area sums need top to bottom
     const bool up = !gc && pass == 0;
     const int nb = (H + B - 1) / B;
@@ -545,6 +547,13 @@ bool analyse(BandSource& src, const SourceImage& meta, const Wants& want, Analys
           for (int x = 0; x < W; x += 4) luma.push_back(shadowChromaLuma(p + 3 * x));
         }
       lap(out.msLuma);
+      {  // the level-2 reduction: block rows are independent (disjoint rows of the output), 64 rows per task
+        const int chunk = 64, nch = (y1 - y0 + chunk - 1) / chunk;
+        parallelFor(nch, [&](int k) {
+          const int ra = y0 + k * chunk, rb = std::min(y1, ra + chunk);
+          engine::reduceL2Rows(buf->row(ra - b0), std::size_t(W) * 3, W, ra, rb, *l2);
+        });
+      }
       for (RowResizer& r : rz) r.feed(*buf, b0, b1);
       lap(out.msFeed);
       for (int j = 0; j < gh; ++j) {
@@ -602,6 +611,7 @@ bool analyse(BandSource& src, const SourceImage& meta, const Wants& want, Analys
       out.reduced.emplace_back(edges[k], s);
     }
     out.grid = mkSrc(std::move(grid));
+    out.l2 = l2;
     if (gc) {
       for (std::size_t gi = 0; gi < gc->grids.size(); ++gi) {
         local::GuideCapture::Grid& g = gc->grids[gi];

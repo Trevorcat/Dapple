@@ -762,6 +762,15 @@ void testFrames() {
         for (std::size_t i = 0; i < std::size_t(gw) * gh * 4; ++i) hh = (hh ^ gpu[i]) * 1099511628211ull;
         std::printf("HASH %s %dx%d %016llx\n", c.name, sz.first, sz.second, static_cast<unsigned long long>(hh));
       }
+      if (const char* dd = std::getenv("DAPPLE_FILM_DUMP"); dd && gpu) {  // DAPPLE_FILM_DUMP=dir: every GPU frame as raw RGBA8 (before / after comparisons)
+        static int n = 0;
+        char fn[512];
+        std::snprintf(fn, sizeof fn, "%s/%03d_%dx%d.rgba", dd, n++, gw, gh);
+        if (FILE* f = std::fopen(fn, "wb")) {
+          std::fwrite(gpu, 1, std::size_t(gw) * gh * 4, f);
+          std::fclose(f);
+        }
+      }
       if (!cpu || !gpu || w != gw || h != gh) {
         std::printf("  %-34s %dx%d: render failed: %s\n", c.name, sz.first, sz.second, err.c_str());
         ++g_failures;

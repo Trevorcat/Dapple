@@ -1,5 +1,22 @@
 # Xiaomi Redmi (2312DRA50C "garnet") device results, wave 8, 2026-11-12
 
+## 2026-11-16 (59, stage 4) The film's low planes from a quarter-scale run: A7RM4 61 MP 20.0 -> 12.0 - 12.5 s, A6700 26 MP 7.5 -> 6.3 - 7.0 s (native binaries, pipeline-architecture.md section 59)
+
+Native binaries under `/data/local/tmp/dc59` (removed afterwards): `before` = HEAD e0d385c (`git archive` into `build/dc-head-src`, built in `build/dc-head-arm64`), `after` = this change (`build/dc-after-arm64`); arm64-v8a, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`, `DAPPLE_AI=OFF` for both. Adreno 710 (Vulkan), `dapple_open_bench <raw> export out.jpg`, `DAPPLE_GPU=1`, `{"film":"kodak_portra_400","film_grain":100,"film_halation":100}`, 3 reps alternating, stage log from `logcat -d -s dapple_engine`. Serial 268a8ef9 only.
+
+| file | total before (ms) | total after (ms) | peak RSS before -> after (MiB) | MP demosaiced in the render pass before -> after |
+|---|---|---|---|---|
+| A6700 26 MP | 7486, 9111, 7537 | 6329, 6511, 7050 | 590 -> 553 | 10.9 -> 3.6 (+26.3 analysis) |
+| A7RM4 61 MP | 20004, 19751, 21552 | 12509, 12442, 12039 | 683 -> 680 | 124.2 -> 41.4 (+64.1 analysis) |
+| X-S10 26 MP | 16756, 16876, 12201 | 9018, 9809, 9640 | 585 -> 613 | 0 (cached whole) |
+| X-T50 40 MP | 25741, 17938, 17803 | 14511, 14076, 13769 | 797 -> 833 | 0 (cached whole) |
+
+X-S10 / X-T50 totals move with the CPU X-Trans demosaic of the analysis pass (3.4 or 7.8 s in the same binary); the render pass is the comparable part: X-S10 5.7 -> 3.6 - 3.8 s, X-T50 9.8 - 10.5 -> 6.7 - 7.2 s, A6700 5.7 -> 4.4 - 4.8 s, A7RM4 17.2 - 18.3 -> 10.0 - 10.4 s. Stage split of a run (after, ms): A7RM4 source windows 808 - 1160 (demosaic 370 - 479), upload 534 - 607, low planes 417 - 434 (before: film walks 3900 - 4600), record 130, submit 410 - 595, wait for the previous tile 5742 - 6297, analysis pass 1010; A6700 source windows 860 - 940, upload 290, low planes 283 - 529, wait for the tile 1380 - 1460. The new low-plane graph costs 0.3 - 0.7 s (pipelines of its first use included). Largest remaining stage: the GPU time of the tiles (film on the Adreno 710).
+
+Tile size: forced tile 1024 on the first version (cache arithmetic unchanged): A7RM4 11.8 - 12.2 s but peak 864 MB (+85 MB), A6700 5.7 s, 712 MB (+72 MB); with the cache arithmetic updated (pool 96 MB, H / 8 rows, no retained blocks) and `filmTileFor(1.3)` (1024 px at 61 MP, ~700 at 26 MP) the peaks are 680 and 553 MiB. 26 MP is 0.2 - 0.9 s slower than at 640 px (encoder tail of a larger last band), 61 MP 2 s faster.
+
+JPEG difference before -> after (one pair each, outputs identical across the 3 reps of a binary): A6700 mean 0.53 / p99 5 / max 47 codes (dE2000 mean 0.35, p99 3.2); A7RM4 0.10 / 2 / 109 (0.09, 2.2); X-S10 0.29 / 4 / 39 (0.25, 3.5); X-T50 0.62 / 5 / 81 (0.47, 3.9). Tests on the phone: `dapple_gpu_tests` 0 failures, `dapple_film_gpu_tests` ok and `tiles` 0 differing values, `export_stream.filmstream` 12 / 12 byte-identical, box means vs the CPU stream A6700 0.219 / 0.221, X-S10 0.235 / 0.239.
+
 ## 2026-11-16 (59) Film stocks stream on the GPU: 26 MP 9.7 -> 7.5 s, 61 MP 23.1 -> 21.6 s, X-S10 21 - 32 -> 10 - 12 s (native binaries, pipeline-architecture.md section 59)
 
 Native binaries only, under `/data/local/tmp/fs59` (removed afterwards): `before` = HEAD 47e7a96 (`git archive` into `build/zz_arm_before_src`, built in `build/zz_arm_before`; plus the bench's film-pack line below), `after` = this change (`build/zz_arm_after`). arm64-v8a, NDK 28.2, android-29, Release, `DAPPLE_GPU=ON DAPPLE_GLES=ON`. Adreno 710 (Vulkan), `DAPPLE_GPU=1`. `dapple_open_bench <raw> export out.jpg` with `DAPPLE_BENCH_PARAMS` = `{"film":"kodak_portra_400"}` (grain 100 + halation 100 are the defaults) and `DAPPLE_FILM_DATA` (the bench now loads `dapple.dfp` from that folder). Stage lines from `logcat -s dapple_engine` (read, not cleared). No app, no install, no setting changed, no reboot; alternating before / after, 3 reps; logcat of the `before` run also holds the lines of earlier runs (identical analysis lines).

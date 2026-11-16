@@ -224,6 +224,7 @@ struct FiU {
   std::int32_t a[4], b[4];
   float geoA[4], geoB[4], geoC[4];
   std::int32_t c[4];
+  float q[4];
   WarpU w;
 };
 }  // namespace
@@ -231,7 +232,7 @@ struct FiU {
 bool recordLocalFilmIn(GpuRecorder& r, const LocalFilmInNode& n, H out) {
   const point::Blocks& F = *n.frame;
   const point::Geometry& P = F.geo;
-  const int geo = !P.useGeo ? 0 : (P.exact ? 1 : 2);
+  const int geo = n.quarter ? 2 : !P.useGeo ? 0 : (P.exact ? 1 : 2);
   const bool w = n.aux0 >= 0 && n.aux1 >= 0;
   const bool warpOn = F.warp.active() && n.src.warp >= 0;
   const hal::PipelineH p = r.pl("local_film_in", {{0, geo}, {3, w ? 1 : 0}, {4, warpOn ? 1 : 0}});
@@ -244,9 +245,21 @@ bool recordLocalFilmIn(GpuRecorder& r, const LocalFilmInNode& n, H out) {
   u.geoB[0] = P.ox0, u.geoB[1] = P.oy0, u.geoB[2] = P.stepX, u.geoB[3] = P.stepY;
   u.geoC[0] = P.fullW, u.geoC[1] = P.fullH;
   u.c[0] = P.rot, u.c[1] = P.flip ? 1 : 0;
+  if (n.quarter) {  // the centre of the 4 x 4 block of every quarter pixel; a frame without geometry is the identity mapping
+    if (P.useGeo) {
+      u.geoB[2] = P.stepX * 4.f, u.geoB[3] = P.stepY * 4.f;
+    } else {
+      u.geoA[0] = 1.f, u.geoA[1] = 0.f, u.geoA[2] = float(P.srcW), u.geoA[3] = float(P.srcH);
+      u.geoB[0] = u.geoB[1] = 0.f, u.geoB[2] = u.geoB[3] = 4.f;
+      u.geoC[0] = float(P.srcW), u.geoC[1] = float(P.srcH);
+      u.c[0] = 0, u.c[1] = 0;
+    }
+    u.b[0] = u.b[1] = u.b[2] = u.b[3] = 0;
+    u.q[0] = n.src.l2kx, u.q[1] = n.src.l2ky, u.q[2] = float(n.src.l2w), u.q[3] = float(n.src.l2h);
+  }
   if (warpOn) warpUniform(F.warp, n.src, u.w);
   r.g.dispatch("local_film_in", p,
-               {GpuGraph::R(n.src.img), GpuGraph::W(out), GpuGraph::R(n.ldesc), GpuGraph::R(n.lplanes), w ? GpuGraph::W(n.aux0) : GpuGraph::R(r.dummy(kF16)),
+               {GpuGraph::R(n.quarter ? n.src.l2 : n.src.img), GpuGraph::W(out), GpuGraph::R(n.ldesc), GpuGraph::R(n.lplanes), w ? GpuGraph::W(n.aux0) : GpuGraph::R(r.dummy(kF16)),
                 w ? GpuGraph::W(n.aux1) : GpuGraph::R(r.dummy(kF16)), GpuGraph::R(warpOn ? n.src.warp : n.lplanes)},
                r.gx(n.W), r.gy(n.Hh), &u, sizeof u);
   return true;

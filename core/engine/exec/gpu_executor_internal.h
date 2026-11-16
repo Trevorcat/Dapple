@@ -95,6 +95,10 @@ struct DeviceDisplay : DeviceCopy {
 struct ResidentSource : DeviceCopy {
   hal::ImageH img;
   bool have = false;
+  // the level-2 reduction of the source (reduce_l2.h, RGBA16F, l2w x l2h): the film's low planes are built from it (section 59)
+  hal::ImageH l2img;
+  bool haveL2 = false;
+  int l2w = 0, l2h = 0;
   struct Resized : DeviceCopy {
     int w = 0, h = 0;
     hal::ImageH img;
@@ -105,6 +109,7 @@ struct ResidentSource : DeviceCopy {
   std::uint64_t tick = 0;
   ~ResidentSource() {
     if (have) retire(img);
+    if (haveL2) retire(l2img);
   }
 };
 // The film tables of the current film frame (raw LUT, print + scan LUT, curves, sRGB decode) and its grain sampler tables, kept by the
@@ -159,8 +164,8 @@ struct Walk {
   H filmInput();
   filmnode::FilmSrc filmInputRect(int x0, int y0, int w, int h);  // the same over a window of the frame (a frame-sized image: the window is a sub-rectangle)
   filmnode::FilmSrcFn filmSrcFn();                                // for the film window code (valid as long as the Walk)
+  filmnode::FilmSrc filmInputQuarter();                           // the film input at a quarter of the scale: the source's level-2 reduction (job.src.l2) through the geometry
   bool filmStage();
-  bool filmLowPass(filmnode::FilmPre& out);  // tiled export: the low planes of the film's mixtures (the only part that belongs to the whole picture), once
   bool filmWindowStage();                    // tiled export: the film over the work rect grown by the film halo
   bool sweep(const Stage& st);
   bool accumulate(const Stage& st);
@@ -224,6 +229,7 @@ class Executor final : public IGpuExecutor {
   void bindSource(SourceStore& s);
   bool ensureResident();
   std::shared_ptr<const hal::ImageH> resizedSource(int w, int h);  // the resident source or a resized variant, held
+  std::shared_ptr<const hal::ImageH> reducedSource();               // the level-2 reduction of the source on the device, held (null: failed)
   std::shared_ptr<DeviceTables> ensureTables(const GpuRun& in);
   // the HDR buffer of the point pass with the reshaping field appended (section 45): HDR grid (when active) then the field; `warpOff` =
   // the field's float offset

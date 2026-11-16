@@ -113,7 +113,7 @@ class BandSource {
   void keep(const ImageF& rowsOfWindow, int y0, int ya, int yb);  // rows [ya, yb) of a full-width window starting at row y0
   void applyShadowFloorToCache();                                  // the floor was decided after the rows were kept
   void dropCache();
-  // A walk that reads the picture more than once (a film's walks and its tile pass) keeps the cached blocks it has passed: the next pass copies them
+  // A walk that reads the picture more than once keeps the cached blocks it has passed: the next pass copies them
   // instead of demosaicing them again. The default drops them as a walk passes (one pass, the cache's memory comes back).
   void setRetainCache(bool on) { retain_ = on; }
   std::size_t cacheBytes() const { return cacheBytes_; }
@@ -170,9 +170,13 @@ class BandSourceStore final : public engine::SourceStore {
   bool sceneReferred() const override { return true; }
   std::uint64_t identity() const override { return id_; }
   const float* window(int x0, int y0, int w, int h, std::size_t& pitchFloats) override;
+  // The level-2 reduction the analysis pass made (one pass over the picture already); without one the base class reads the picture again.
+  void setReducedL2(std::shared_ptr<const engine::ReducedL2> r) { l2_ = std::move(r); }
+  const engine::ReducedL2* reducedL2() override { return l2_ ? l2_.get() : SourceStore::reducedL2(); }
 
  private:
   static std::uint64_t next();
+  std::shared_ptr<const engine::ReducedL2> l2_;
   BandSource& src_;
   std::uint64_t id_;
 };
@@ -189,6 +193,7 @@ struct Wants {
 struct Analyses {
   bool shadow = false;  // the shadow-chroma floor applies (the BandSource was switched on)
   std::shared_ptr<SourceImage> p256, p512, grid;
+  std::shared_ptr<engine::ReducedL2> l2;  // the 4 x 4 box reduction of the picture (what the film's low planes are built from, section 59)
   std::vector<std::pair<int, std::shared_ptr<SourceImage>>> reduced;  // (long edge, picture)
   std::shared_ptr<local::GuideCapture> guide;
   double ms = 0;

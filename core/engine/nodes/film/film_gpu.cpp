@@ -277,6 +277,7 @@ struct Comp3 {
   int r = 0;
   std::vector<float> w;  // half taps, unit sum
   float weight = 0;
+  float sigma = 0;  // the component's sigma in pixels of the picture (the quarter-scale evaluation of levels 0 and 1 scales it)
 };
 struct Mix3U {
   std::int32_t dim[4];
@@ -351,7 +352,8 @@ struct Mix3 {
     pass("film_d3", {}, u, {GpuGraph::R(src), GpuGraph::W(dst)}, cw, ch);
   }
   // dst = w0 * src + comps(src) (+ upsample of `up`), size w x h; comps[c] = the components of channel c at this level
-  H combine(H src, int w, int h, const double w0[3], std::vector<Comp3> comps[3], H up, int upW, int upH, int orgX = 0, int orgY = 0) {
+  // `upSame`: `up` is a plane of the output's size that is added as it is (the quarter-scale evaluation), not a lower level that is upsampled
+  H combine(H src, int w, int h, const double w0[3], std::vector<Comp3> comps[3], H up, int upW, int upH, int orgX = 0, int orgY = 0, bool upSame = false) {
     for (int c = 0; c < 3; ++c)
       std::stable_sort(comps[c].begin(), comps[c].end(), [](const Comp3& a, const Comp3& b) { return a.r > b.r; });
     std::size_t nj = 0;
@@ -367,7 +369,7 @@ struct Mix3 {
     base.org[1] = orgY;
     if (nj == 0) {
       const H dst = img(w, h);
-      pass("film_b3", {{2, hasUp}}, base, {GpuGraph::R(src), GpuGraph::R(hasUp ? up : src), GpuGraph::W(dst)}, w, h);
+      pass("film_b3", {{2, hasUp}, {4, upSame ? 1 : 0}}, base, {GpuGraph::R(src), GpuGraph::R(hasUp ? up : src), GpuGraph::W(dst)}, w, h);
       return dst;
     }
     H acc = -1;
@@ -420,7 +422,7 @@ struct Mix3 {
       const H A = first ? src : acc;
       const H dst = img(w, h);
       const H d = r.dummy(hal::Format::RGBA16F);
-      pass("film_v3", {{0, nc}, {1, first ? 1 : 0}, {2, first && hasUp ? 1 : 0}, {3, v3Direct(r.dev) ? 1 : 0}}, vu,
+      pass("film_v3", {{0, nc}, {1, first ? 1 : 0}, {2, first && hasUp ? 1 : 0}, {3, v3Direct(r.dev) ? 1 : 0}, {4, upSame ? 1 : 0}}, vu,
            {GpuGraph::R(t[0]), GpuGraph::R(nc > 1 ? t[1] : d), GpuGraph::R(nc > 2 ? t[2] : d), GpuGraph::R(nc > 3 ? t[3] : d), GpuGraph::R(A),
             GpuGraph::R(first && hasUp ? up : A), GpuGraph::W(dst), GpuGraph::R(tapsH)},
            w, h);
@@ -494,6 +496,7 @@ struct Mix3 {
         lc.r = rr;
         lc.w = taps;
         lc.weight = float(g.w);
+        lc.sigma = float(g.sigma);
         per[c][std::size_t(k)].push_back(std::move(lc));
         maxLevel = std::max(maxLevel, k);
       }
@@ -557,6 +560,32 @@ struct Mix3 {
     }
     pn.level(0, lv);
     return combine(src, ww, wh, pn.w0, lv, L1, w1, h1);
+  }
+  // The mixture on the quarter-scale plane `in` (qw x qh, the level-2 grid of the picture): w0 * in + the components of levels 0 and 1 evaluated directly on
+  // it with their sigma divided by 4 (a component below 0.3 px counts as identity weight) + `L2`, the accumulator of the components above (the same size,
+  // -1 when there are none). It is the mixture's output at level 2 (section 59).
+  H quarterApply(const Plan& pn, H in, int qw, int qh, H L2) {
+    double w0[3] = {pn.w0[0], pn.w0[1], pn.w0[2]};
+    std::vector<Comp3> lv[3];
+    for (int c = 0; c < 3; ++c)
+      for (std::size_t k = 0; k < std::min<std::size_t>(2, pn.per[c].size()); ++k)
+        for (const Comp3& cp : pn.per[c][k]) {
+          const double sq = double(cp.sigma) / 4.0;
+          std::vector<float> taps;
+          int rr = 0;
+          if (sq >= 0.3) fd::gaussTaps(sq, taps, rr);
+          if (sq < 0.3 || rr == 0) {
+            w0[c] += cp.weight;
+            continue;
+          }
+          Comp3 q;
+          q.r = rr;
+          q.w = taps;
+          q.weight = cp.weight;
+          q.sigma = cp.sigma;
+          lv[c].push_back(std::move(q));
+        }
+    return combine(in, qw, qh, w0, lv, L2, qw, qh, 0, 0, true);
   }
   // The whole picture W x Hh as one window: levels 2.. built here.
   H mixture(const Plan& pn, H src, int W, int Hh) {
@@ -629,6 +658,23 @@ H recordBoost(gpu::GpuRecorder& r, H E, int w, int h, const fd::SpatialPlan& pl)
   if (!p0 || !p1 || !p2) return -1;
   r.g.dispatch("film_bmax", p0, {GpuGraph::R(E), GpuGraph::RW(partH)}, std::uint32_t(groups), 1, &u, sizeof u);
   r.g.dispatch("film_bcon", p1, {GpuGraph::RW(gH), GpuGraph::RW(partH)}, 1, 1, &u, sizeof u);
+  const H out = r.g.transient(hal::Format::RGBA16F, std::uint32_t(w), std::uint32_t(h));
+  r.g.dispatch("film_bapp", p2, {GpuGraph::R(E), GpuGraph::R(gH), GpuGraph::W(out)}, r.gx(w), r.gy(h), &u, sizeof u);
+  return out;
+}
+
+// The boost curve on another plane of the same frame (the quarter-scale exposure), with the constants recordBoost made from the frame's maximum (still in the
+// statistics buffer).
+H applyBoost(gpu::GpuRecorder& r, H E, int w, int h, const fd::SpatialPlan& pl) {
+  const H gH = r.g.externalBuf(r.gBuf);
+  BoostU u{};
+  u.s[0] = w;
+  u.s[1] = h;
+  u.c[0] = float(pl.boostM);
+  u.c[1] = float(pl.boostA);
+  u.c[2] = float(pl.boostP);
+  const hal::PipelineH p2 = r.pl("film_bapp", {});
+  if (!p2) return -1;
   const H out = r.g.transient(hal::Format::RGBA16F, std::uint32_t(w), std::uint32_t(h));
   r.g.dispatch("film_bapp", p2, {GpuGraph::R(E), GpuGraph::R(gH), GpuGraph::W(out)}, r.gx(w), r.gy(h), &u, sizeof u);
   return out;
@@ -1041,7 +1087,6 @@ FilmWin alignedWindow(const FilmWin& w, int grow, int fw, int fh) {
 bool coversFrame(const FilmWin& w, int fw, int fh) { return w.x0 == 0 && w.y0 == 0 && w.w == fw && w.h == fh; }
 // One mixture over the window `ow` of the input `in` (the window's size): the whole frame builds its levels itself, a window reads the low plane `L2`.
 H mixOver(Mix3& m, const Mix3::Plan& pn, H in, const FilmWin& ow, int fw, int fh, H L2) {
-  if (coversFrame(ow, fw, fh)) return m.mixture(pn, in, fw, fh);
   if (pn.maxLevel == 0) return m.combineWindow(pn, in, -1, ow.w, ow.h, -1, 0, 0, ow.x0, ow.y0);
   const H p1 = m.level1(in, ow.w, ow.h, pn.half);
   int l2w, l2h;
@@ -1082,94 +1127,61 @@ H dirInput(FilmCtx& c, const FilmPlanData& pd, H E2, const FilmWin& ow) {
 }
 }  // namespace
 
-bool filmLowPlan(const FilmResolved& res, int w, int h, FilmLowPlan& out) {
+namespace {
+bool filmLowPlanImpl(const FilmResolved& res, int w, int h, FilmLowPlan& out, bool allowBoost) {
   out = FilmLowPlan{};
   const auto pd = planOf(res);
   if (!pd->error.empty()) return false;
   const fd::SpatialPlan& pl = pd->plan;
   if (!pl.any()) return true;
   out.any = true;
-  if (pl.boost) return false;  // the maximum of the frame is a whole-frame reduction: no window form
+  if (pl.boost && !allowBoost) return false;  // the maximum of the frame is a whole-frame reduction: no window form
   const MixPlans mp = mixPlansOf(res, *pd, w, h);
   out.need[0] = mp.hasPre && mp.pre.maxLevel >= 2;
   out.need[1] = mp.hasHalo && mp.halo.maxLevel >= 2;
   out.need[2] = mp.hasDir && mp.dir.maxLevel >= 2;
-  const int reachPre = mp.hasPre ? Mix3::planReach(mp.pre) : 0, reachHalo = mp.hasHalo ? Mix3::planReach(mp.halo) : 0;
-  out.grow[0] = 0;
-  out.grow[1] = reachPre;
-  out.grow[2] = reachPre + reachHalo;
   filmLowSize(w, h, out.l2w, out.l2h);
   return true;
 }
+}  // namespace
+bool filmLowPlan(const FilmResolved& res, int w, int h, FilmLowPlan& out) { return filmLowPlanImpl(res, w, h, out, false); }
 
-FilmWin filmLowSourceWindow(const FilmLowPlan& lp, int stage, int w, int h, const FilmWin& tile) { return alignedWindow(tile, lp.grow[stage], w, h); }
-
-bool recordFilmLowWindow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmLowPlan& lp, int stage, int w, int h, const FilmWin& tile,
-                         const FilmSrcFn& srcFn, gpu::H p2, gpu::H lowPre, gpu::H lowHalo) {
-  const auto pd = planOf(res);
-  if (!filmPreflight(r, res, tb, *pd)) return false;
-  FilmCtx c(r, res, tb);
-  Mix3 mix3{r};
-  mix3.fastLow = filmFastLow(res);
-  const MixPlans mp = mixPlansOf(res, *pd, w, h);
-  const FilmWin ow = filmLowSourceWindow(lp, stage, w, h, tile);
-  const FilmSrc s = srcFn(ow);
-  if (s.img < 0) return false;
-  H in = c.point(0, false, s.img, c.rawH, ow.w, ow.h, 0, nullptr, 0, 0, s.ox, s.oy);
-  if (in < 0) return false;
-  if (stage >= 1 && mp.hasPre) in = mixOver(mix3, mp.pre, in, ow, w, h, lowPre);
-  if (stage >= 2 && mp.hasHalo) in = mixOver(mix3, mp.halo, in, ow, w, h, lowHalo);
-  H p1;
-  if (stage == 2) {
-    const H q = dirInput(c, *pd, in, ow);
-    if (q < 0) return false;
-    p1 = mp.dir.half ? q : mix3.down(q, ow.w, ow.h);
-  } else {
-    p1 = mix3.down(in, ow.w, ow.h);
-  }
-  const int pw = (ow.w + 1) / 2, ph = (ow.h + 1) / 2;  // size of the plane that is boxed down to level 2
-  mix3.downInto(p1, pw, ph, (tile.x0 - ow.x0) / 4, (tile.y0 - ow.y0) / 4, (tile.w + 3) / 4, (tile.h + 3) / 4, p2, tile.x0 / 4, tile.y0 / 4);
-  return mix3.ok;
-}
-
-gpu::H recordFilmLowBuild(gpu::GpuRecorder& r, const FilmResolved& res, int stage, int w, int h, gpu::H p2) {
-  const auto pd = planOf(res);
-  Mix3 mix3{r};
-  mix3.fastLow = filmFastLow(res);
-  const MixPlans mp = mixPlansOf(res, *pd, w, h);
-  const Mix3::Plan& pn = stage == 0 ? mp.pre : stage == 1 ? mp.halo : mp.dir;
-  const H low = mix3.buildLow(pn, p2, w, h);
-  return mix3.ok ? low : H(-1);
-}
-
-bool recordFilmLow(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmSrcFn& srcFn, int w, int h, FilmPre& out) {
-  out = FilmPre{};
+// The three low planes (level-2 accumulators of the camera, halation and DIR mixtures) from the film input at a quarter of the picture's scale (section 59):
+// E_q = the exposure point pass on it; L2_pre = buildLow(E_q); the halation mixture's input is the camera mixture's output at level 2 (quarterApply),
+// the DIR input the DIR point pass on the halation mixture's output at that scale. 1/16 of the pixels in every step.
+bool recordFilmLowQuarter(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const FilmSrc& qs, int w, int h, FilmPre& out, bool boosted) {
   const auto pd = planOf(res);
   if (!filmPreflight(r, res, tb, *pd)) return false;
   FilmLowPlan lp;
-  if (!filmLowPlan(res, w, h, lp)) {
+  if (!filmLowPlanImpl(res, w, h, lp, boosted)) {
     r.unsupported = true, r.err = "film GPU: highlight boost needs the whole frame";
     return false;
   }
   out.any = lp.any;
-  if (!lp.any) return true;
-  Mix3 mix3{r};
-  H low[3] = {-1, -1, -1};
-  for (int stage = 0; stage < 3; ++stage) {
-    if (!lp.need[stage]) continue;
-    const H p2 = mix3.img(lp.l2w, lp.l2h);
-    for (int y0 = 0; y0 < h; y0 += FilmLowPlan::kBand)
-      for (int x0 = 0; x0 < w; x0 += FilmLowPlan::kBand) {
-        const FilmWin tile{x0, y0, std::min(FilmLowPlan::kBand, w - x0), std::min(FilmLowPlan::kBand, h - y0)};
-        if (!recordFilmLowWindow(r, res, tb, lp, stage, w, h, tile, srcFn, p2, low[0], low[1])) return false;
-      }
-    low[stage] = recordFilmLowBuild(r, res, stage, w, h, p2);
-    if (low[stage] < 0) return false;
+  if (!lp.any || !(lp.need[0] || lp.need[1] || lp.need[2])) return true;
+  if (qs.img < 0) return r.err = "film GPU: no quarter-scale film input", false;
+  FilmCtx c(r, res, tb);
+  Mix3 m{r};
+  m.fastLow = filmFastLow(res);
+  const MixPlans mp = mixPlansOf(res, *pd, w, h);
+  H E = c.point(0, false, qs.img, c.rawH, lp.l2w, lp.l2h, 0, nullptr, 0, 0, qs.ox, qs.oy);
+  if (E < 0) return false;
+  if (pd->plan.boost) {  // the frame's highlight boost (its constants come from the full-resolution exposure, recorded before this)
+    E = applyBoost(r, E, lp.l2w, lp.l2h, pd->plan);
+    if (E < 0) return false;
   }
-  out.lowPre = low[0];
-  out.lowHalo = low[1];
-  out.lowDir = low[2];
-  return true;
+  if (lp.need[0]) out.lowPre = m.buildLow(mp.pre, E, w, h);
+  if (lp.need[1] || lp.need[2]) {
+    if (mp.hasPre) E = m.quarterApply(mp.pre, E, lp.l2w, lp.l2h, lp.need[0] ? out.lowPre : H(-1));
+    if (lp.need[1]) out.lowHalo = m.buildLow(mp.halo, E, w, h);
+  }
+  if (lp.need[2]) {
+    if (mp.hasHalo) E = m.quarterApply(mp.halo, E, lp.l2w, lp.l2h, lp.need[1] ? out.lowHalo : H(-1));
+    const H q = c.point(5, false, E, c.rawH, lp.l2w, lp.l2h);
+    if (q < 0) return false;
+    out.lowDir = m.buildLow(mp.dir, q, w, h);
+  }
+  return m.ok && (!lp.need[0] || out.lowPre >= 0) && (!lp.need[1] || out.lowHalo >= 0) && (!lp.need[2] || out.lowDir >= 0);
 }
 
 bool filmEndsClamped(const FilmResolved& res) {
@@ -1199,6 +1211,7 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
   }
   // ---- exposure and the mixtures, recomputed over the window grown by their reach (aligned): E -> pre -> halo -> E2, and the DIR field Q ----
   H E2 = -1, Q = -1;
+  H lowPre = -1, lowHalo = -1, lowDir = -1;
   int ex = 0, ey = 0;  // origin of the window in the E2 / Q images
   {
     const MixPlans mp = mixPlansOf(res, *pd, fw, fh);
@@ -1208,8 +1221,10 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
       r.unsupported = true, r.err = "film GPU: highlight boost needs the whole frame";
       return none;
     }
-    if (!whole && ((mp.hasPre && mp.pre.maxLevel >= 2 && pre.lowPre < 0) || (mp.hasHalo && mp.halo.maxLevel >= 2 && pre.lowHalo < 0) ||
-                   (mp.hasDir && mp.dir.maxLevel >= 2 && pre.lowDir < 0))) {
+    lowPre = pre.lowPre, lowHalo = pre.lowHalo, lowDir = pre.lowDir;
+    const bool needPre = mp.hasPre && mp.pre.maxLevel >= 2, needHalo = mp.hasHalo && mp.halo.maxLevel >= 2, needDir = mp.hasDir && mp.dir.maxLevel >= 2;
+    const bool needLow = (needPre && lowPre < 0) || (needHalo && lowHalo < 0) || (needDir && lowDir < 0);
+    if (needLow && !pre.quarter) {
       r.err = "film GPU: a film window needs the low planes of the picture";
       return none;
     }
@@ -1221,15 +1236,20 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
       E = recordBoost(r, E, ow.w, ow.h, pl);
       if (E < 0) return none;
     }
+    if (needLow) {  // the low planes of the picture were not built before (a frame that is one window, interactive frames, whole-frame exports): from the quarter-scale input
+      FilmPre made;
+      if (!recordFilmLowQuarter(r, res, tb, pre.quarter(), fw, fh, made, pl.boost)) return none;
+      lowPre = made.lowPre, lowHalo = made.lowHalo, lowDir = made.lowDir;
+    }
     Mix3 mix3{r};  // three channels at once
     mix3.fastLow = filmFastLow(res);
     E2 = E;
-    if (mp.hasPre) E2 = mixOver(mix3, mp.pre, E2, ow, fw, fh, pre.lowPre);
-    if (mp.hasHalo) E2 = mixOver(mix3, mp.halo, E2, ow, fw, fh, pre.lowHalo);
+    if (mp.hasPre) E2 = mixOver(mix3, mp.pre, E2, ow, fw, fh, lowPre);
+    if (mp.hasHalo) E2 = mixOver(mix3, mp.halo, E2, ow, fw, fh, lowHalo);
     if (mp.hasDir) {
       const H qi = dirInput(c, *pd, E2, ow);
       if (qi < 0) return none;
-      Q = mixOver(mix3, mp.dir, qi, ow, fw, fh, pre.lowDir);
+      Q = mixOver(mix3, mp.dir, qi, ow, fw, fh, lowDir);
     }
     if (!mix3.ok || E2 < 0) return none;
     ex = x0 - ow.x0;
@@ -1465,8 +1485,18 @@ FilmImg recordFilmWindow(gpu::GpuRecorder& r, const FilmResolved& res, const Gpu
   return mix.ok ? FilmImg{out, x0, y0} : none;
 }
 
-H recordFilmFrame(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pres, H src, int w, int h) {
-  const FilmPre pre;  // one window = the frame builds the low planes itself
+H recordFilmFrame(gpu::GpuRecorder& r, const FilmResolved& res, const GpuFilmTables& tb, const GpuFilmPlanRes& pres, H src, int w, int h,
+                  const FilmQuarterFn* quarter) {
+  FilmPre pre;  // one window = the frame: its low planes come from the quarter-scale input
+  if (quarter) {
+    pre.quarter = *quarter;
+  } else {  // no reduced source: the 4 x 4 box of the film input itself
+    pre.quarter = [&r, src, w, h]() {
+      Mix3 m{r};
+      const H p1 = m.down(src, w, h);
+      return FilmSrc{m.down(p1, (w + 1) / 2, (h + 1) / 2), 0, 0};
+    };
+  }
   const FilmSrcFn whole = [src](const FilmWin&) { return FilmSrc{src, 0, 0}; };
   return recordFilmWindow(r, res, tb, pres, pre, whole, w, h, FilmWin{0, 0, w, h}).img;
 }
