@@ -78,6 +78,8 @@ enum DI {
   push,
   texture,
   local,
+  // 自动 (editor top bar): a four-point sparkle with a small second one at its upper right
+  auto,
 }
 
 class DIcon extends StatelessWidget {
@@ -228,6 +230,20 @@ class _IconPainter extends CustomPainter {
         canvas.drawCircle(const Offset(17, 16), 6.6, line);
         canvas.restore();
         canvas.drawRRect(fr, line);
+        break;
+      case DI.auto:
+        Path sparkle(double cx, double cy, double r, double pinch) {
+          final q = pinch;
+          return Path()
+            ..moveTo(cx, cy - r)
+            ..quadraticBezierTo(cx + q, cy - q, cx + r, cy)
+            ..quadraticBezierTo(cx + q, cy + q, cx, cy + r)
+            ..quadraticBezierTo(cx - q, cy + q, cx - r, cy)
+            ..quadraticBezierTo(cx - q, cy - q, cx, cy - r)
+            ..close();
+        }
+        canvas.drawPath(sparkle(10, 14, 8, 1.4), line);
+        canvas.drawPath(sparkle(19, 5, 3, 0.6), line);
         break;
       case DI.crop:
         canvas.drawPath(poly([6.5, 2.5, 6.5, 17.5, 21.5, 17.5]), line);

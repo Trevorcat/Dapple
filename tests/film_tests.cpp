@@ -1420,14 +1420,14 @@ void testFilmMatch() {
   // ---- v5 (default): one exposure decision per image shared by all stocks, a per stock + paper print constant, the paper mapping ----
   {
     struct Stat {
-      float median = 0, black = 0, white = 0;
+      float median = 0, black = 0, white = 0, dark = 0, high = 0;  // high: L > 90; dark: L < 8, within a few codes of the paper black
     };
     auto srgbToLinear = [](float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); };
     auto lstats = [&](const EditParams& e, const SourceImage& s) {
       const ImageF img = renderF(e, cam, nullptr, s, false);
       std::vector<float> ls;
       ls.reserve(std::size_t(img.width) * img.height);
-      std::size_t nb = 0, nw = 0;
+      std::size_t nb = 0, nw = 0, nd = 0, nh = 0;
       for (int y = 0; y < img.height; ++y)
         for (int x = 0; x < img.width; ++x) {
           const float* r = img.row(y) + 3 * x;
@@ -1435,6 +1435,8 @@ void testFilmMatch() {
           const float L = Y > 0.008856f ? 116.f * std::cbrt(Y) - 16.f : 903.3f * Y;
           ls.push_back(L);
           nb += L < 3.f;
+          nd += L < 8.f;
+          nh += L > 90.f;
           nw += L > 97.f;
         }
       std::nth_element(ls.begin(), ls.begin() + ls.size() / 2, ls.end());
@@ -1442,6 +1444,8 @@ void testFilmMatch() {
       st.median = ls[ls.size() / 2];
       st.black = float(nb) / float(ls.size());
       st.white = float(nw) / float(ls.size());
+      st.dark = float(nd) / float(ls.size());
+      st.high = float(nh) / float(ls.size());
       return st;
     };
     auto withExposure = [&](EditParams e, const FilmExposure& fe) {
@@ -1526,8 +1530,12 @@ void testFilmMatch() {
       const FilmExposure enw = matchFilmExposure(nw, cam, nullptr, wide, &mnw);
       const Stat sr = lstats(withExposure(rw, ew), wide), sn = lstats(withExposure(nw, enw), wide);
       std::printf("  14 stop ramp on screen: R64 black %.1f%% white %.1f%% (median %.1f)   N400C black %.1f%% white %.1f%% (median %.1f)\n", 100 * sr.black, 100 * sr.white, sr.median, 100 * sn.black, 100 * sn.white, sn.median);
-      CHECK(sr.black > 0.03f && sr.white > 0.03f);
-      CHECK(sn.black < sr.black && sn.black + sn.white < sr.black + sr.white);
+      // At film_black 0 the paper black sits just above display black, so the slide's lost shadows are compressed onto it (not
+      // clipped to pure black): the intent is "the slide loses both ends", which is the white loss plus the share of the frame that
+      // sits at the paper black. The negative keeps more of both.
+      std::printf("  14 stop ramp near the paper black (L<8): R64 %.1f%%  N400C %.1f%%; L>90: R64 %.1f%%  N400C %.1f%%\n", 100 * sr.dark, 100 * sn.dark, 100 * sr.high, 100 * sn.high);
+      CHECK(sr.dark > 0.10f && sr.high > 0.20f);  // shadows compressed onto the paper black, highlights rolled into the shoulder
+      CHECK(sn.high < sr.high && sn.dark + sn.high < sr.dark + sr.high);
     }
     // overrides: film_shoot, film_print, film_black, film_latitude
     {

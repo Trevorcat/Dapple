@@ -26,6 +26,9 @@ enum FailAction { retry, remove, none }
 enum PhotoKind { photo, hdr, pano, live, video, bracket, frame }
 
 /// A photo known to the app (MediaStore, system picker, a future FTP source, or the demo set).
+/// Version of the engine's automatic correction (computeAutoAdjust). 2: Lightroom-style Auto (exposure, tone, vibrance on every photo).
+const int kAutoVersion = 2;
+
 class Photo {
   Photo({
     required this.id,
@@ -38,6 +41,7 @@ class Photo {
     this.previewPath,
     this.edit = EditState.empty,
     this.correction,
+    this.correctionV,
     this.error,
     this.exported = false,
     this.progress = 0,
@@ -78,6 +82,9 @@ class Photo {
 
   /// Result of dapple_session_auto_json()["correction"] (legacy EditParams keys).
   Map<String, dynamic>? correction;
+
+  /// Version of the automatic-correction algorithm that made [correction] ([kAutoVersion]); a stale or missing one is recomputed when the photo is next developed or opened.
+  int? correctionV;
   String? error;
   bool exported;
 
@@ -185,6 +192,7 @@ class Photo {
         'previewPath': previewPath,
         'edit': edit.toJson(),
         'correction': correction,
+        'correctionV': correctionV,
         'error': error,
         'exported': exported,
         'flag': flag,
@@ -210,6 +218,7 @@ class Photo {
         previewPath: j['previewPath'] as String?,
         edit: j['edit'] is Map ? EditState.fromJson((j['edit'] as Map).cast<String, dynamic>()) : EditState.empty,
         correction: (j['correction'] as Map?)?.cast<String, dynamic>(),
+        correctionV: (j['correctionV'] as num?)?.toInt(),
         error: j['error'] as String?,
         exported: (j['exported'] as bool?) ?? false,
         flag: (j['flag'] as bool?) ?? false,

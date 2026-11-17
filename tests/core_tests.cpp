@@ -476,7 +476,11 @@ void testAutoDoesNoHarm() {
   }
   const AutoResult r = computeAutoAdjust(src, cam);
   CHECK(r.correction.temperature == 0.f && r.correction.tint == 0.f);  // plausible as-shot WB is never touched
-  CHECK(r.correction.exposure == 0.f);
+  CHECK(std::fabs(r.correction.exposure) <= 1.5f);
+  CHECK(r.correction.vibrance > 0.f);  // Auto always adds a little vibrance
+  CHECK(r.correction.toneStrength == 0.f);
+  CHECK(r.correction.highlights <= 0.f && r.correction.shadows >= 0.f);
+  { AutoOptions half; half.strength = 0.f; CHECK(computeAutoAdjust(src, cam, half).correction.vibrance == 0.f); }
   CHECK(!r.tone.nearest.empty() && r.tone.histogram.size() == 64);
 }
 

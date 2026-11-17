@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "color.h"
+#include "engine/exec/engine_session.h"
 
 namespace dapple {
 
@@ -57,6 +58,53 @@ std::string fmt(const char* f, double v) {
   return buf;
 }
 
+// Encoded-luminance statistics of one proxy render (what the viewer sees).
+struct RenderStats {
+  float p005 = 0, p05 = 0, p10 = 0, p50 = 0, p90 = 0, p99 = 0, p995 = 0;
+  float hiClip = 0, loClip = 0;  // shares of pixels at >= 254 / <= 1 (8-bit)
+  ToneAnalysis tone;
+};
+
+bool renderStats(const EditParams& p, const CameraProfile& cam, const SourceImage& proxy, RenderStats& out) {
+  ImageF f;
+  std::string err;
+  if (!engine::renderImageF(p, cam, nullptr, proxy, false, f, &err)) return false;
+  const std::size_t n = std::size_t(f.width) * f.height;
+  if (n == 0) return false;
+  constexpr int kBins = 1024;
+  std::vector<std::uint32_t> h(kBins, 0);
+  std::size_t hi = 0, lo = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const float* px = &f.data[3 * i];
+    const float lin = 0.2126729f * srgbDecode(std::clamp(px[0], 0.f, 1.f)) + 0.7151522f * srgbDecode(std::clamp(px[1], 0.f, 1.f)) +
+                      0.0721750f * srgbDecode(std::clamp(px[2], 0.f, 1.f));
+    const float e = srgbEncode(lin);
+    ++h[std::size_t(std::min(kBins - 1, int(e * kBins)))];
+    const float m = std::max({px[0], px[1], px[2]});
+    if (std::lround(m * 255.f) >= 254) ++hi;
+    if (std::lround(m * 255.f) <= 1) ++lo;
+  }
+  auto pct = [&](double q) {
+    double acc = 0;
+    for (int i = 0; i < kBins; ++i) {
+      acc += h[std::size_t(i)];
+      if (acc >= q * double(n)) return float(i + 0.5) / kBins;
+    }
+    return 1.f;
+  };
+  out.p005 = pct(0.005), out.p05 = pct(0.05), out.p10 = pct(0.10), out.p50 = pct(0.5);
+  out.p90 = pct(0.90), out.p99 = pct(0.99), out.p995 = pct(0.995);
+  out.hiClip = float(hi) / float(n);
+  out.loClip = float(lo) / float(n);
+  out.tone = analyzeToneImage(f);
+  return true;
+}
+
+// EV between two encoded luminances.
+float lumaEv(float from, float to) {
+  return std::log2(std::max(srgbDecode(to), 1e-5f) / std::max(srgbDecode(from), 1e-5f));
+}
+
 }  // namespace
 
 AutoResult computeAutoAdjust(const SourceImage& image, const CameraProfile& camera, const AutoOptions& opt) {
@@ -64,10 +112,15 @@ AutoResult computeAutoAdjust(const SourceImage& image, const CameraProfile& came
   const ImageF small = resizeToLongEdge(image.linear, kAnalysisEdge);
   if (small.empty()) return r;
 
-  // Everything below is judged on what the viewer sees: the camera-matched render. The camera's own
-  // rendering is the baseline of "correct"; the correction only acts on clear evidence of a defect.
-  r.tone = analyzeTone(image, camera);
-  const ToneAnalysis& tone = r.tone;
+  SourceImage proxy;
+  proxy.sceneReferred = image.sceneReferred;
+  proxy.linear = resizeToLongEdge(image.linear, 256);
+
+  // Everything is judged on what the viewer sees: the camera-rendered tone, encoded. The correction is a
+  // Lightroom-style "Auto": a moderate, visible move on every photo, re-measured after each step.
+  RenderStats base;
+  if (!renderStats(EditParams{}, camera, proxy, base)) return r;
+  r.tone = base.tone;
 
   const float baseGain = std::exp2(image.sceneReferred ? camera.baselineExposureEv : 0.f);
   const float clipLevel = image.sceneReferred ? 0.99f : 0.995f;
@@ -91,43 +144,83 @@ AutoResult computeAutoAdjust(const SourceImage& image, const CameraProfile& came
   s.p99Luma = hist.percentile(0.99);
   s.clippedFraction = float(clipped) / float(std::size_t(small.width) * small.height);
 
-  const float k = std::clamp(opt.strength, 0.f, 1.f);
+  const float k = std::clamp(opt.strength / 0.6f, 0.f, 1.67f);
   EditParams& c = r.correction;
+  RenderStats st = base;
+  auto rerender = [&]() {
+    RenderStats t;
+    if (renderStats(c, camera, proxy, t)) st = t;
+  };
 
-  // ---- exposure: rescue only frames that are uniformly dark ----
-  // A low-key photo (night scene, dark room, dark subject on black) has a low median but real
-  // highlights; the camera rendered it as the photographer intended and it must stay that way.
-  // Only a frame where *nothing* reaches a normal highlight (p95 of the rendered luminance below
-  // 0.45, median below 0.16) is treated as under-exposed, and it is lifted only part of the way.
-  bool rescued = false;
-  if (opt.exposure && tone.p50 < 0.16f && tone.p95 < 0.45f && tone.p50 > 0.005f) {
-    const float want = 0.20f;  // encoded median to aim for
-    const float ev = std::log2(srgbDecode(want) / srgbDecode(tone.p50));
-    c.exposure = std::clamp(ev * 0.6f, 0.f, 0.8f) * k;
-    if (c.exposure > 0.05f) {
-      rescued = true;
-      r.notes.push_back(fmt("Uniformly dark frame, nothing bright in it: exposure +%.2f EV", c.exposure));
-    } else {
-      c.exposure = 0.f;
+  // ---- exposure ----
+  if (opt.exposure && k > 0.f) {
+    float target = 0.45f;
+    if (base.tone.key == "low") target = 0.22f;
+    else if (base.tone.key == "high") target = 0.70f;
+    // 70 % of the way, upwards only: a bright or high-key frame is intended (and its subject may stand against it), so a high
+    // median never lowers the exposure; bright frames are handled by highlights and whites, and only real clipping lowers it below.
+    float ev = std::max(lumaEv(base.p50, target), 0.f) * 0.7f;
+    if (base.tone.key == "low") ev *= 0.7f;
+    if (base.tone.key == "high") ev = 0.f;
+    ev = std::clamp(ev, 0.f, 1.5f);
+    // Do not push the brightest areas beyond what the highlights rule can recover.
+    if (ev > 0.f) {
+      const float room = lumaEv(std::max(base.p99, 0.05f), 0.985f);
+      ev = std::min(ev, std::max(room, 0.f) + 0.35f);
+    }
+    if (std::fabs(ev) >= 0.1f) {
+      c.exposure = ev * k;
+      rerender();
+      r.notes.push_back(fmt("Exposure %+.2f EV", c.exposure) + fmt(" (median %.2f", base.p50) + fmt(" -> %.2f)", st.p50));
     }
   }
 
-  // ---- tonal class: gentle move towards the photo's own class ----
-  // Empty target = nearest class, and only the part of the deviation beyond the class tolerance is
-  // corrected (see toneTargetCurve), so a photo that is typical of its class is not touched and a
-  // low-key / high-key photo is never pulled towards middle grey.
-  if (opt.tone && !rescued) {
-    // Only when the curve would really move something (more than ~1% of the tonal scale).
-    float moved = 0.f;
-    for (const auto& p : toneTargetCurve(tone, "", 1.f)) moved = std::max(moved, std::fabs(p.second - p.first) / 255.f);
-    if (moved > 0.01f) {
-      c.toneStrength = 60.f * k;
-      c.toneTarget.clear();
-      r.notes.push_back("Tone: eased towards its own class (" + tone.nearest + ") where it falls outside the class tolerance");
+  // ---- tone: highlights, shadows, whites, blacks, contrast, vibrance ----
+  if (opt.tone && k > 0.f) {
+    const bool lowKey = base.tone.key == "low";
+    // Only clipping or a really hot top end: a bright frame with room to spare keeps its highlights (and the subject in front of it).
+    const bool highKey = base.tone.key == "high";  // a white backdrop is the picture: only real clipping is pulled back
+    if ((!highKey && st.p99 > 0.95f) || st.hiClip > 0.005f) {
+      const float need = std::max(highKey ? 0.f : (st.p99 - 0.92f) / 0.06f, st.hiClip / 0.02f);
+      c.highlights = -std::clamp(60.f * need, 20.f, 60.f) * k;
     }
+    if (st.p05 < 0.13f && !lowKey) c.shadows = std::clamp(40.f * (0.13f - st.p05) / 0.09f, 16.f, 40.f) * k;
+    if (c.highlights != 0.f || c.shadows != 0.f) rerender();
+
+    c.whites = std::clamp((0.96f - st.p995) * 160.f, -20.f, 25.f) * k;
+    c.blacks = std::clamp((0.025f - st.p005) * 400.f, -40.f, 15.f) * k;
+    const float spread = st.p90 - st.p10;
+    if (spread < 0.35f) c.contrast = 20.f * std::clamp((0.35f - spread) / 0.15f, 0.25f, 1.f) * k;
+    else if (spread > 0.7f) c.contrast = -15.f * std::clamp((spread - 0.7f) / 0.1f, 0.25f, 1.f) * k;
+    c.vibrance = 10.f * k;
+    rerender();
+    // Highlights are at their limit and the picture still clips: lower the exposure, by at most 0.3 EV.
+    if (st.hiClip > 0.01f && c.highlights <= -59.f * k) {
+      c.exposure = std::max(c.exposure - 0.3f * k, -0.3f * k);
+      rerender();
+    }
+
+    // Verify: never create blown highlights or crushed blacks that were not there.
+    for (int it = 0; it < 4; ++it) {
+      const bool hiBad = st.hiClip > base.hiClip + 0.002f;
+      const bool loBad = st.loClip > base.loClip + 0.002f;
+      if (!hiBad && !loBad) break;
+      if (hiBad) {
+        c.whites -= 10.f;
+        c.highlights -= 10.f;
+        c.exposure -= 0.1f;
+      }
+      if (loBad) {
+        c.blacks += 12.f;
+        c.contrast = std::min(c.contrast, 0.f);
+      }
+      rerender();
+    }
+    r.notes.push_back(fmt("Tone: highlights %+.0f", c.highlights) + fmt(", shadows %+.0f", c.shadows) + fmt(", whites %+.0f", c.whites) +
+                      fmt(", blacks %+.0f", c.blacks) + fmt(", contrast %+.0f", c.contrast));
   }
 
-  // ---- white balance: only on strong evidence ----
+  // ---- white balance ----
   if (opt.whiteBalance) {
     const Mat3& toSrgb = proPhotoToSrgb();
     const float gain = baseGain * std::exp2(c.exposure);
@@ -165,12 +258,9 @@ AutoResult computeAutoAdjust(const SourceImage& image, const CameraProfile& came
     const float cast = std::hypot(s.neutralCastA, s.neutralCastB);
 
     // For a RAW the camera's as-shot white balance is the first piece of evidence: when it is a
-    // plausible illuminant (everything from tungsten to open shade) it is trusted and the pixels are
-    // not second-guessed. Display-referred sources have no such metadata.
+    // plausible illuminant it is trusted and the pixels are not second-guessed.
     const float wbR = image.meta.asShotWb[0], wbB = image.meta.asShotWb[2];
     const bool asShotPlausible = image.sceneReferred && wbR > 1.0f && wbR < 4.5f && wbB > 1.0f && wbB < 5.0f;
-    // Evidence: a large share of the frame is near-neutral, the cast is clearly visible, and nearly all
-    // those pixels agree on it.
     float agree = 0.f;
     if (!casts.empty() && cast > 1e-6f) {
       std::size_t ok = 0;
@@ -178,8 +268,8 @@ AutoResult computeAutoAdjust(const SourceImage& image, const CameraProfile& came
         if ((p.first * s.neutralCastA + p.second * s.neutralCastB) / (std::hypot(p.first, p.second) * cast + 1e-9f) > 0.5f) ++ok;
       agree = float(ok) / float(casts.size());
     }
-    const bool strong = s.neutralCoverage > 0.25f && cast > 0.020f && agree > 0.85f;
-    if (!asShotPlausible && strong) {
+    const bool strong = s.neutralCoverage > 0.15f && cast > 0.012f && agree > 0.75f;
+    if (!asShotPlausible && strong && k > 0.f) {
       // Solve J * [dTemp, dTint] = -cast with a finite-difference Jacobian.
       float g0[2], gt[2], gi[2];
       greyLab(0, 0, g0);
@@ -192,11 +282,10 @@ AutoResult computeAutoAdjust(const SourceImage& image, const CameraProfile& came
         const float ta = -s.neutralCastA, tb = -s.neutralCastB;
         const float dTemp = (ta * j11 - j01 * tb) / det;
         const float dTint = (j00 * tb - ta * j10) / det;
-        constexpr float kPartial = 0.5f;  // keep some of the scene's mood
-        c.temperature = std::clamp(dTemp * kPartial, -12.f, 12.f) * k;
-        c.tint = std::clamp(dTint * kPartial, -12.f, 12.f) * k;
-        r.notes.push_back(fmt("Strong colour cast on a large neutral area: temperature %+.0f", c.temperature) +
-                          fmt(", tint %+.0f", c.tint));
+        constexpr float kPartial = 0.6f;  // keep some of the scene's mood
+        c.temperature = std::clamp(dTemp * kPartial, -15.f, 15.f) * k;
+        c.tint = std::clamp(dTint * kPartial, -15.f, 15.f) * k;
+        r.notes.push_back(fmt("Colour cast on a neutral area: temperature %+.0f", c.temperature) + fmt(", tint %+.0f", c.tint));
       }
     }
   }

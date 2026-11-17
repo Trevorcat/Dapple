@@ -14,7 +14,7 @@ struct AutoOptions {
   bool exposure = true;
   bool tone = true;          // highlights / shadows protection
   bool whiteBalance = true;  // gentle neutral correction on top of as-shot
-  float strength = 1.f;      // 0..1, scales every correction
+  float strength = 1.f;      // amounts scale by strength / 0.6 (clamped 0..1.67): 0.6 gives the designed amounts
 };
 
 // Image statistics the automatic correction is based on. Also the compact

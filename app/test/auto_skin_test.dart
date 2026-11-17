@@ -56,8 +56,11 @@ void main() {
     test('wireParams: the correction is the base only with 自动 on (and the global setting on)', () {
       final app = AppState.demo();
       final ph = app.photos.first;
-      ph.correction = {'contrast': 12.0, 'exposure': 0.4};
+      ph.correction = {'contrast': 12.0, 'exposure': 8.0};
       expect(app.wireParams(ph)['contrast'], 12.0);
+      expect(app.wireParams(ph)['exposure'], 8.0, reason: 'the correction JSON is in wire units already (EV x 20): exposure reaches the engine');
+      ph.edit = ph.edit.withValue('exposure', 5);
+      expect(app.wireParams(ph)['exposure'], 13.0, reason: 'user values are deltas on top of auto');
       ph.edit = ph.edit.copyWith(auto: false);
       expect(app.wireParams(ph).containsKey('contrast'), isFalse);
       ph.edit = ph.edit.copyWith(auto: true);
@@ -120,6 +123,7 @@ void main() {
       testWidgets('top bar fits with 自动 off: ${v.key}', (t) async {
         final (app, id) = await openAt(t, v.value.$1, top: v.value.$2, bottom: v.value.$3);
         expect(k('toolbar-auto'), findsOneWidget);
+        if (const ['phone360', 'landscape805', 'fold_inner'].contains(v.key)) await dump(t, 'auto_on_${v.key}');
         await t.tap(k('toolbar-auto'));
         await settle(t, 4);
         expect(app.editOf(id).auto, isFalse);

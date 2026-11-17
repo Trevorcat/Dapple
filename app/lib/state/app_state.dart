@@ -639,8 +639,8 @@ class AppState extends ChangeNotifier {
     final corr = ph.correction;
     if (settings.autoProcess && ph.edit.auto && corr != null) {
       corr.forEach((k, v) {
-        // `exposure` means EV in the legacy schema but a -100..100 slider in chapter 6: do not mix.
-        if (k != 'exposure') out[k] = v;
+        // The correction JSON (toJson) already carries `exposure` in wire units (EV x 20, the field scale), like every other key.
+        out[k] = v;
       });
     }
     user.forEach((k, v) {
@@ -1294,6 +1294,21 @@ class AppState extends ChangeNotifier {
 
   String previewPathFor(Photo ph) => p.join(previews.path, '${safeFileStem(ph.id)}.jpg');
 
+  /// A stale or missing automatic correction (older algorithm) is recomputed on the open session [s] of [ph]. True when it changed.
+  Future<bool> refreshCorrection(Photo ph, DappleSession s) async {
+    if (isDemo || ph.correctionV == kAutoVersion) return false;
+    try {
+      final auto = await s.auto(settings.toneStrength / 100);
+      ph.correction = (auto['correction'] as Map?)?.cast<String, dynamic>();
+      ph.correctionV = kAutoVersion;
+      changed();
+      return true;
+    } catch (e) {
+      debugPrint('refreshCorrection: $e');
+      return false;
+    }
+  }
+
   Future<void> _develop(Photo ph) async {
     ph.status = PhotoStatus.developing;
     changed(save: false);
@@ -1316,6 +1331,7 @@ class AppState extends ChangeNotifier {
       if (ts > 0 && ph.takenMs == null) ph.takenMs = ts * 1000;
       final auto = await s.auto(settings.toneStrength / 100);
       ph.correction = (auto['correction'] as Map?)?.cast<String, dynamic>();
+      ph.correctionV = kAutoVersion;
       final an = await s.analyze();
       if (an != null) ph.nearest = an['nearest'] as String?;
       final out = previewPathFor(ph);

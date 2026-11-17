@@ -166,7 +166,9 @@ class SessionCache {
       if (testOpener != null) return await testOpener!(ph);
       final src = await _resolve(ph);
       if (src == null) throw '没有源文件';
-      return await DappleSession.open(src.path, full: false, longEdge: 2048, background: background);
+      final s = await DappleSession.open(src.path, full: false, longEdge: 2048, background: background);
+      await _app.refreshCorrection(ph, s); // a correction of an older algorithm is recomputed before the first render
+      return s;
     } catch (e) {
       _open.remove(ph.id);
       _failed.putIfAbsent(ph.id, () => classifySourceError(e)); // the source's own answer (set by _resolve) wins

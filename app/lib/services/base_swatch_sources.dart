@@ -22,7 +22,7 @@ Map<String, dynamic> swatchParams(Map<String, dynamic>? correction, String? base
   final out = <String, dynamic>{};
   if (auto && correction != null) {
     correction.forEach((k, v) {
-      if (k != 'exposure' && !k.startsWith('film')) out[k] = v; // `exposure` is EV in the legacy schema, see AppState.wireParams
+      if (!k.startsWith('film')) out[k] = v; // wire units already (exposure is EV x 20 in toJson), see AppState.wireParams
     });
   }
   if (baseId != null) out['film'] = baseId;
