@@ -37,6 +37,13 @@ const EncTable& encTable() {
   static const EncTable e;
   return e;
 }
+// Unsharp mask in linear light that cannot dig a dark pixel into display black: the result stays above 85 % of the pixel itself up to relative
+// luminance 0.02, falling to 35 % from 0.08 (a bright edge next to a mid-dark pixel otherwise leaves a black halo). film_post.comp unsharpLim().
+inline float unsharpLim(float v, float b, float amount) {
+  const float u = v + amount * (v - b);
+  const float f = 0.85f - 0.5f * std::min(std::max((v - 0.02f) * (1.f / 0.06f), 0.f), 1.f);  // 85 % of the pixel up to 0.02, 35 % from 0.08
+  return std::max(u, v * f);
+}
 inline float encodeSrgb(const EncTable& e, float v) {
   if (v <= 0.f) return 12.92f * v;
   if (v >= 1.f) return 1.f + (v - 1.f) * 0.4396f;
@@ -628,9 +635,9 @@ Status runScan(const CpuCtx&, const void* res, std::span<const ImageView> in, st
       for (int x = lo.x0; x < lo.x1; ++x) {
         float* o = dst + 3 * (x - lo.x0);
         float v0 = l0[x], v1 = l1[x], v2 = l2[x];
-        v0 += amount * (v0 - b0[x]);
-        v1 += amount * (v1 - b1[x]);
-        v2 += amount * (v2 - b2[x]);
+        v0 = unsharpLim(v0, b0[x], amount);
+        v1 = unsharpLim(v1, b1[x], amount);
+        v2 = unsharpLim(v2, b2[x], amount);
         o[0] = encodeSrgb(enc, v0);
         o[1] = encodeSrgb(enc, v1);
         o[2] = encodeSrgb(enc, v2);

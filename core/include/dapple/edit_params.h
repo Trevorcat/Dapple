@@ -137,7 +137,7 @@ struct EditParams {
   float filmPrintEv = 0.f;
   // Automatic film exposure overrides (docs/engine/pipeline-architecture.md section 18), normalised -1..1, 0 = automatic:
   // filmShoot moves the film EV between the under / over edge of the stock's usable range, filmPrint the print / scan exposure
-  // between a dark and a light median, filmBlack the paper black (-1 matte, 0 true Dmax, +1 display black), filmLatitude the
+  // between a dark and a light median, filmBlack the paper black (-1 matte, 0 a scanned negative black just above display black, +1 display black), filmLatitude the
   // in-range fraction the stock is rescued to (0.55 .. 0.80 .. 0.98).
   float filmShoot = 0.f, filmPrint = 0.f, filmBlack = 0.f, filmLatitude = 0.f;
   // Film white balance (胶片白平衡), -1..1: -1 = the scene light fully neutralised (the scene white reaches the film as its own reference

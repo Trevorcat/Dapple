@@ -696,7 +696,7 @@ std::map<std::string, float> gCalMem;
 // "|v2": direct-evaluation constants (the on-disk files of the baked calibration have other keys and are never read)
 std::string calibKeyOf(const std::shared_ptr<const film::FilmLibrary>& lib, const std::string& filmId, const std::string& paperId, float deltaEv, bool scan) {
   return filmId + "|" + (scan ? std::string("none") : paperId) + "|" + std::to_string(std::uintptr_t(lib.get())) + (filmPaperMappingEnabled() ? "|m" : "") +
-         (filmPaperMapStretchesBlack() ? "b" : "") + "|d" + std::to_string(int(std::lround(deltaEv * 1000.f))) + "|v2";
+         (filmPaperMapStretchesBlack() ? "b" : "") + "|d" + std::to_string(int(std::lround(deltaEv * 1000.f))) + "|v3";
 }
 std::string diskKeyOf(const std::string& key, const std::shared_ptr<const film::FilmLibrary>& lib) {  // without the library pointer (the pack hash is in the file name)
   std::string dkey = key;

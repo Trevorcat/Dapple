@@ -13,6 +13,10 @@ namespace dapple::film::detail {
 
 namespace {
 
+// Paper-to-screen mapping at film_black 0 (docs/engine/pipeline-architecture.md, film exposure): the black is a scanned negative's, not the
+// paper's true Dmax. A toe lifts every channel by kToeLift (relative luminance, about 4 / 255 code) fading out over kToeWidth, monotone, so the
+// deepest shadows keep separation and land above display black; a highlight shoulder rolls off the luminance above kShoulderKnee.
+constexpr double kFilmToeLift = 0.004, kFilmToeWidth = 0.02, kFilmShoulderKnee = 0.25, kFilmShoulderStrength = 1.0;
 constexpr double kLog2_10 = 3.32192809488736234787;
 inline double pow10neg(double d) { return std::exp2(-d * kLog2_10); }
 inline double nan0(float v) { return std::isnan(v) ? 0.0 : double(v); }
@@ -580,11 +584,27 @@ Vec3 FilmModel::printScanLinear(const Vec3& d, bool glare) const {
   return scanLinear(dp, glare);
 }
 
+// Paper-to-screen mapping of the display light: the affine white / black map, then the highlight shoulder on the luminance (the colour
+// of every pixel keeps its ratio).
+void FilmModel::applyPost(Vec3& rgb) const {
+  if (!postOn_) return;
+  for (double& v : rgb) {
+    v = std::max(v * postM_ + postQ_, 0.0);
+    if (postToeL_ > 0) v += postToeL_ * std::exp(-v / postToeS_);  // toe: a channel at zero stays above display black, monotone
+  }
+  if (postShoulderM_ <= 0) return;
+  const double y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+  if (y <= postKnee_ || y >= 1.0) return;  // above display white (glare, overshoot) the extension stays as it is
+  const double t = std::min((y - postKnee_) / (1.0 - postKnee_), 1.0);
+  const double yo = postKnee_ + (1.0 - postKnee_) * (t - postShoulderM_ * t * t * (1.0 - t));
+  const double s = yo / y;
+  for (double& v : rgb) v *= s;
+}
+
 Vec3 FilmModel::scanOut(const Vec3& dp) const {
   Vec3 rgb = scanLinear(dp, true);
   if (p_.io.outputGamutCompress) rgb = compressOutput(cam_, *cmax_, rgb);
-  if (postOn_)
-    for (double& v : rgb) v = v * postM_ + postQ_;
+  applyPost(rgb);
   return {srgbOetf(rgb[0]), srgbOetf(rgb[1]), srgbOetf(rgb[2])};
 }
 
@@ -607,8 +627,7 @@ Vec3 FilmModel::printScan(const Vec3& d, Vec3* linRgb) const {
   Vec3 rgb = printScanLinear(d, true);
   if (linRgb) *linRgb = rgb;
   if (p_.io.outputGamutCompress) rgb = compressOutput(cam_, *cmax_, rgb);
-  if (postOn_)
-    for (double& v : rgb) v = v * postM_ + postQ_;
+  applyPost(rgb);
   return {srgbOetf(rgb[0]), srgbOetf(rgb[1]), srgbOetf(rgb[2])};
 }
 
@@ -666,6 +685,8 @@ void FilmModel::buildEnlarger(double cc, double mm, double yy) {
 // displayed black (Dmax) to scanner.blackLevel, a linear map of the display light that keeps the colour of every pixel
 // (relative colorimetric with black point compensation; the paper base tint survives as far as the gamut compression keeps it).
 void FilmModel::buildPostMap() {
+  postShoulderM_ = 0;
+  postToeL_ = 0;
   const auto& sc = p_.scanner;
   Vec3 dLo, dHi;
   if (scanFilm_) {  // the reachable clear film (the lowest density of the curves) and the densest film
@@ -702,7 +723,7 @@ void FilmModel::buildPostMap() {
   };
   const double Yw = shown(dLo), Yb = shown(dHi);
   const double lw = sc.whiteCorrection ? srgbEotf(sc.whiteLevel) : Yw;
-  // black: 0 = the paper's true relative luminance (white scaling only), +1 = display black (v4), -1 = a matte lifted black
+  // black: 0 = the paper's true relative luminance plus the scanned-negative toe (applyPost), +1 = display black (v4), -1 = a matte lifted black
   const double mix = std::clamp(sc.blackCorrection ? 1.0 : sc.blackMix, -1.0, 1.0);
   postOn_ = Yw > Yb + 1e-6;
   if (!postOn_) {
@@ -713,6 +734,10 @@ void FilmModel::buildPostMap() {
   }
   const double ybTrue = Yb * lw / Yw;
   const double ybT = mix >= 0 ? ybTrue + (srgbEotf(sc.blackLevel) - ybTrue) * mix : ybTrue + (0.02 - ybTrue) * (-mix);
+  postToeL_ = kFilmToeLift * (1.0 - std::fabs(mix));  // -1 is the matte 0.02 as it was, +1 display black
+  postToeS_ = kFilmToeWidth;
+  postKnee_ = kFilmShoulderKnee;
+  postShoulderM_ = kFilmShoulderStrength;
   postM_ = (lw - ybT) / (Yw - Yb);
   postQ_ = ybT - postM_ * Yb;
 }

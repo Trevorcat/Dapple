@@ -300,6 +300,8 @@ class FilmModel {
   bool bwOn_ = false;
   bool postOn_ = false;  // paper-to-screen mapping after the gamut compression (scanner.paperReference)
   double postM_ = 1, postQ_ = 0;
+  double postKnee_ = 1, postShoulderM_ = 0, postToeL_ = 0, postToeS_ = 1;  // highlight shoulder of the paper-to-screen mapping
+  void applyPost(Vec3& rgb) const;
   double bwM_ = 1, bwQ_ = 0, bwExposure_ = 1;
   std::vector<double> paperTab_[3];
   void buildBlackWhite();

@@ -57,6 +57,12 @@ const EncTable& encTable() {
   static const EncTable e;
   return e;
 }
+// as film_cpu.cpp unsharpLim()
+inline float unsharpLim(float v, float b, float amount) {
+  const float u = v + amount * (v - b);
+  const float f = 0.85f - 0.5f * std::min(std::max((v - 0.02f) * (1.f / 0.06f), 0.f), 1.f);  // 85 % of the pixel up to 0.02, 35 % from 0.08
+  return std::max(u, v * f);
+}
 inline float encodeSrgb(const EncTable& e, float v) {
   if (v <= 0.f) return 12.92f * v;
   if (v >= 1.f) return 1.f + (v - 1.f) * 0.4396f;
@@ -507,7 +513,7 @@ void renderSpatial(const SpatialRenderArgs& a, const ImageF& in, ImageF& out, Sp
             for (int y = o.y0; y < o.y1; ++y) {
               float* l = lin[c] + y * ls;
               const float* b = LBt[c] + y * ls;
-              for (int x = o.x0; x < o.x1; ++x) l[x] += amount * (l[x] - b[x]);
+              for (int x = o.x0; x < o.x1; ++x) l[x] = unsharpLim(l[x], b[x], amount);
             }
           cur = o;
         }
