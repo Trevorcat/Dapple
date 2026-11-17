@@ -182,7 +182,7 @@ bool runFilmFrame(const FilmResolved& r, const FilmTablesHandle& tb, const float
 
   if (!pl.any()) {  // no spatial effect: the fused point chain (the CPU group of FilmExposure -> FilmDevelop -> FilmPrintScan)
     float mi[12];
-    const fd::KView view = viewOf(tb.raw.get(), tb.curves.get(), tb.print.get(), r.gain, mi);
+    const fd::KView view = viewOf(tb.raw.get(), tb.curves.get(), tb.print.get(), r.gain, mi, r.displayRef);
     parallelFor(H, [&](int y) { ks.block(view, in + std::size_t(y) * inStride, out + std::size_t(y) * outStride, W, 1.f); }, 4);
     T.totalMs = msSince(tStart);
     return true;
@@ -440,9 +440,9 @@ bool FilmBands::init(const FilmFrameArgs& a, InputRows in, std::string* why) {
   if (pl.boost) return no("film: highlight boost (a maximum of the whole frame) is not streamed");
   m.in = std::move(in);
   m.W = m.r.w, m.H = m.r.h;
-  m.viewRaw = viewOf(m.tb.raw.get(), nullptr, nullptr, m.r.gain, m.miRaw);
+  m.viewRaw = viewOf(m.tb.raw.get(), nullptr, nullptr, m.r.gain, m.miRaw, m.r.displayRef);
   m.viewCur = viewOf(nullptr, m.tb.curves.get(), nullptr, nullptr, m.miCur);
-  m.viewAll = viewOf(m.tb.raw.get(), m.tb.curves.get(), m.tb.print.get(), m.r.gain, m.miAll);
+  m.viewAll = viewOf(m.tb.raw.get(), m.tb.curves.get(), m.tb.print.get(), m.r.gain, m.miAll, m.r.displayRef);
   m.spatial = pl.any();
   if (!m.spatial) return true;
   m.preMix = pl.preMix, m.haloMix = pl.haloMix, m.dir = pl.dirDiffuse, m.dirHalf = m.pd->dirHalf;
@@ -604,6 +604,7 @@ bool filmFrameResolved(const FilmFrameArgs& a, FilmResolved& r) {
   r.keepGrain = a.keepGrain ? 1 : 0;
   r.coarse = a.coarse ? 1 : 0;
   r.fullLongEdge = a.fullLongEdge;
+  r.displayRef = a.displayRef ? 1 : 0;
   r.frameIndex = a.frameIndex;
   r.seed = a.frameIndex ? filmSeed(a.frameIndex) : 0u;
   return true;

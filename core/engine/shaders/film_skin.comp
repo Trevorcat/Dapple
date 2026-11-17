@@ -1,0 +1,110 @@
+#version 450
+// Skin protection of a film frame (core/src/film_skin.h, docs/engine/pipeline-architecture.md film section): the film plane (display sRGB, unclamped) with the
+// chroma inside the photo's skin plane limited to 1.25x the chroma of the film's own input; hue and lightness are the film's. Twin of
+// film::skinRef / skinCap / SkinMask::at (core/src/film_skin.h) and of the display inverse in film_point.comp: keep the arithmetic identical.
+// Output RGBA16F, the window of the frame this pass is for (its pixel (0, 0) is the picture's pixel (b.zw)), unclamped like the film plane.
+#extension GL_GOOGLE_include_directive : enable
+#include "film_display_ref.glsl"
+layout(local_size_x = 16, local_size_y = 16, local_size_x_id = 16, local_size_y_id = 17) in;
+
+layout(std140, binding = 0) uniform P {
+  ivec4 a;      // srcW, srcH, dW, dH
+  ivec4 b;      // frame coordinates of the film plane's pixel (0, 0); origin of this window in the picture
+  vec4 geoA;    // cs, sn, fw, fh
+  vec4 geoB;    // ox0, oy0, stepX, stepY
+  vec4 geoC;    // fullW, fullH, 0, 0
+  ivec4 c;      // rot, flip, origin of the film input image's pixel for window pixel (0, 0)
+  vec4 m0, m1, m2;  // ProPhoto -> linear sRGB (columns), times the gain of the frame (white balance x exposure x film exposure)
+  ivec4 mk;     // mask w, h, 1 = the frame has a geometry (0: the identity mapping onto the source grid), 1 = display-referred source (the film input goes through drInverse)
+  vec4 prm;     // film_skin amount, 0, 0, 0
+} u;
+
+layout(binding = 1) uniform sampler2D uF;     // the film plane
+layout(binding = 2) uniform sampler2D uRef;   // the film's input: ungained source pixels through the frame's geometry
+layout(binding = 3, std430) readonly buffer Mask { float mask[]; };
+layout(binding = 4, rgba16f) uniform writeonly image2D uOut;
+
+float h16(float x) {
+  uint v = floatBitsToUint(x);
+  v += 0xFFFu + ((v >> 13) & 1u);
+  return uintBitsToFloat(v & ~0x1FFFu);
+}
+
+float maskAt(vec2 uv) {
+  const int w = u.mk.x, h = u.mk.y;
+  const float fx = clamp(uv.x * float(w) - 0.5, 0.0, float(w - 1)), fy = clamp(uv.y * float(h) - 0.5, 0.0, float(h - 1));
+  const int x0 = min(int(fx), w - 1), y0 = min(int(fy), h - 1), x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+  const float tx = fx - float(x0), ty = fy - float(y0);
+  const float p00 = mask[y0 * w + x0], p01 = mask[y0 * w + x1], p10 = mask[y1 * w + x0], p11 = mask[y1 * w + x1];
+  const float t0 = p00 + (p01 - p00) * tx, t1 = p10 + (p11 - p10) * tx;
+  return t0 + (t1 - t0) * ty;
+}
+
+vec3 skinLab(vec3 lin) {
+  const float X = (0.4124564 * lin.x + 0.3575761 * lin.y + 0.1804375 * lin.z) * (1.0 / 0.95047);
+  const float Y = 0.2126729 * lin.x + 0.7151522 * lin.y + 0.0721750 * lin.z;
+  const float Z = (0.0193339 * lin.x + 0.1191920 * lin.y + 0.9503041 * lin.z) * (1.0 / 1.08883);
+  const float fx = X > 0.008856 ? pow(X, 1.0 / 3.0) : 7.787 * X + 16.0 / 116.0;
+  const float fy = Y > 0.008856 ? pow(Y, 1.0 / 3.0) : 7.787 * Y + 16.0 / 116.0;
+  const float fz = Z > 0.008856 ? pow(Z, 1.0 / 3.0) : 7.787 * Z + 16.0 / 116.0;
+  return vec3(116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz));
+}
+
+vec3 skinFromLab(vec3 lab) {
+  const float fy = (lab.x + 16.0) * (1.0 / 116.0), fx = fy + lab.y * (1.0 / 500.0), fz = fy - lab.z * (1.0 / 200.0);
+  const float gx = fx > 0.206897 ? fx * fx * fx : (fx - 16.0 / 116.0) * (1.0 / 7.787);
+  const float gy = fy > 0.206897 ? fy * fy * fy : (fy - 16.0 / 116.0) * (1.0 / 7.787);
+  const float gz = fz > 0.206897 ? fz * fz * fz : (fz - 16.0 / 116.0) * (1.0 / 7.787);
+  const float X = gx * 0.95047, Y = gy, Z = gz * 1.08883;
+  return vec3(3.2404542 * X - 1.5371385 * Y - 0.4985314 * Z, -0.9692660 * X + 1.8760108 * Y + 0.0415560 * Z,
+              0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z);
+}
+
+vec3 skinCap(vec3 film, vec3 ref, float amount) {
+  const vec3 eo = clamp(film, vec3(0.0), vec3(1.0));
+  vec3 lo;
+  for (int c = 0; c < 3; ++c) lo[c] = eo[c] <= 0.04045 ? eo[c] * (1.0 / 12.92) : pow((eo[c] + 0.055) * (1.0 / 1.055), 2.4);
+  const vec3 labO = skinLab(lo), labR = skinLab(ref);
+  const float Co = sqrt(labO.y * labO.y + labO.z * labO.z), lim = 1.25 * sqrt(labR.y * labR.y + labR.z * labR.z);
+  if (!(Co > lim) || Co < 1e-3) return film;
+  const float s = lim / Co;
+  const vec3 ln = clamp(skinFromLab(vec3(labO.x, labO.y * s, labO.z * s)), vec3(0.0), vec3(1.0));
+  vec3 enc;
+  for (int c = 0; c < 3; ++c) enc[c] = ln[c] <= 0.0031308 ? 12.92 * ln[c] : 1.055 * pow(ln[c], 1.0 / 2.4) - 0.055;
+  return film + amount * (enc - eo);
+}
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= u.a.z || p.y >= u.a.w) return;
+  const ivec2 q = p + u.b.zw;
+  vec3 e = texelFetch(uF, q - u.b.xy, 0).rgb;
+  // photo position of the pixel (film_src.comp / point::mapPixel): the mask lives in the source's normalised space
+  vec2 uv;
+  if (u.mk.z == 0) {
+    uv = (vec2(q) + 0.5) / vec2(u.a.xy);
+  } else {
+    const float pxf = u.geoB.x + (float(q.x) + 0.5) * u.geoB.z;
+    const float pyf = u.geoB.y + (float(q.y) + 0.5) * u.geoB.w;
+    float uu = pxf - u.geoC.x * 0.5;
+    const float vv = pyf - u.geoC.y * 0.5;
+    if (u.c.y != 0) uu = -uu;
+    const float fx = uu * u.geoA.x + vv * u.geoA.y + u.geoA.z * 0.5;
+    const float fy = -uu * u.geoA.y + vv * u.geoA.x + u.geoA.w * 0.5;
+    const float sW = float(u.a.x), sH = float(u.a.y);
+    float sx, sy;
+    if (u.c.x == 0) { sx = fx; sy = fy; }
+    else if (u.c.x == 1) { sx = fy; sy = sH - fx; }
+    else if (u.c.x == 2) { sx = sW - fx; sy = sH - fy; }
+    else { sx = sW - fy; sy = fx; }
+    uv = vec2(sx / sW, sy / sH);
+  }
+  const float m = maskAt(uv) * u.prm.x;
+  if (m > 0.0) {
+    vec3 rgb = texelFetch(uRef, p + u.c.zw, 0).rgb;
+    if (u.mk.w != 0) rgb = drInverse(rgb);
+    const vec3 ref = clamp(u.m0.xyz * rgb.x + u.m1.xyz * rgb.y + u.m2.xyz * rgb.z, vec3(0.0), vec3(1.0));
+    e = skinCap(e, ref, m);
+  }
+  imageStore(uOut, p, vec4(h16(e.x), h16(e.y), h16(e.z), 1.0));
+}

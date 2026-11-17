@@ -16,6 +16,11 @@ Walk::Walk(GpuRecorder& rec, const GpuRun& run, bool wholeFrame) : r(rec), in(ru
   ep.amp = in.blocks.grain.amp;
   ep.period = in.blocks.grain.period;
   ep.grain = in.blocks.grain.active();
+  job.filmRef = [this](int x0, int y0, int w, int h, H& img, int& ox, int& oy) {
+    const filmnode::FilmSrc s = filmInputRect(x0, y0, w, h);
+    img = s.img, ox = s.ox, oy = s.oy;
+    return s.img >= 0;
+  };
 }
 
 SolveRes* Walk::solveOf(NodeId id) {

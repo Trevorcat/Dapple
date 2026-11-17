@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <vector>
 
 #ifdef __ANDROID__
@@ -21,6 +23,7 @@
 #include "../color.h"
 #include "../colour_space.h"
 #include "dapple/decoder.h"
+#include "deband.h"
 #include "file_util.h"
 #include "parallel.h"
 
@@ -242,8 +245,32 @@ class JpegDecoder final : public ImageDecoder {
         }
       });
     };
-    if (deep) convert(static_cast<const std::uint16_t*>(px.get()));
-    else convert(static_cast<const stbi_uc*>(px.get()));
+    if (deep) {
+      convert(static_cast<const std::uint16_t*>(px.get()));
+    } else {
+      // 8-bit source: dequantise the flat gradients first (decoders/deband.h); 16-bit sources are not touched
+      const stbi_uc* src8 = static_cast<const stbi_uc*>(px.get());
+      const char* off = std::getenv("DAPPLE_DEBAND");
+      const Deband8 db(src8, w, h);
+      if (db.active() && !(off && std::string(off) == "off")) {
+        auto interp = [&](int c, float v) {
+          const int i = std::min(int(v), 255);
+          const float f = v - float(i);
+          return f > 0.f && i < 255 ? lut[c][i] + f * (lut[c][i + 1] - lut[c][i]) : lut[c][i];
+        };
+        parallelRows(h, [&](int y) {
+          float* d = out.linear.row(y);
+          for (int x = 0; x < w; ++x) {
+            float cd[3];
+            db.pixel(x, y, cd);
+            const float lin[3] = {interp(0, cd[0]), interp(1, cd[1]), interp(2, cd[2])};
+            toPro.apply(lin, d + 3 * x);
+          }
+        });
+      } else {
+        convert(src8);
+      }
+    }
     if (exif.orientation > 1) {
       out.linear = applyOrientation(out.linear, exif.orientation);
       out.meta.sensorWidth = out.linear.width;

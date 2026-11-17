@@ -7,6 +7,7 @@
 // executor calls them through gpuImplFor(type) in the plan's order.
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <span>
 
@@ -134,6 +135,10 @@ struct GpuJob {
   // a film frame: the film plane, the frame coordinates of its pixel (0, 0), the display stages, the strength of the blend
   H film = -1;
   int filmOx = 0, filmOy = 0;
+  // skin protection (film_skin.h): the mask plane (float SSBO, point::Film::skin) and the film input of a window of the frame (img, the offset of its pixel for the
+  // window's (0, 0)); set by the executor when the frame asks for it
+  H skin = -1;
+  std::function<bool(int x0, int y0, int w, int h, H& img, int& ox, int& oy)> filmRef;
   bool filmClamped = false;              // the film plane is already clamped to 0..1
   DisplayBind disp;
   float strength = 1.f;

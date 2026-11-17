@@ -242,6 +242,7 @@ void resolveFilm(const ParamSet& ps, const FrameGeom& geom, FilmResolved& out) {
   out.seed = ctx.frameIndex ? filmSeed(ctx.frameIndex) : 0u;
   out.quality = std::uint8_t(ps.inputs().quality);
   out.keepGrain = ps.inputs().keepGrain ? 1 : 0;
+  out.displayRef = ctx.sceneReferred || !fd::displayInverseEnabled() ? 0 : 1;  // a display-referred source: the inverse camera rendering in front of the film
 }
 
 // ---- tables -------------------------------------------------------------------------------------------------------------------------
@@ -1083,7 +1084,7 @@ bool tablesFor(const FilmResolved& r, FilmTablesHandle& out, bool advance) {
 }
 
 // ---- KView --------------------------------------------------------------------------------------------------------------------------
-fd::KView viewOf(const RawTable* raw, const CurvesTable* cur, const PrintTable* print, const float* gain, float mInStorage[12]) {
+fd::KView viewOf(const RawTable* raw, const CurvesTable* cur, const PrintTable* print, const float* gain, float mInStorage[12], bool displayRef) {
   fd::KView v{};
   if (raw) {
     const fd::FilmTables& t = raw->t;
@@ -1091,6 +1092,7 @@ fd::KView viewOf(const RawTable* raw, const CurvesTable* cur, const PrintTable* 
     v.rawN = t.rawN;
     v.rawStride = t.rawN + 2;
     v.raw = t.raw.data();
+    if (displayRef) v.dr = &fd::displayInverse();
     if (gain) {
       for (int c = 0; c < 3; ++c)
         for (int i = 0; i < 4; ++i) mInStorage[c * 4 + i] = t.mIn[c * 4 + i] * std::max(0.f, gain[c]);

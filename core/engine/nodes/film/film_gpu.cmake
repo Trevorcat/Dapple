@@ -26,6 +26,7 @@ set(DAPPLE_FILM_GPU_SHADERS
   "film_bcon|film_boost.comp|MODE=1|BB"
   "film_bapp|film_boost.comp|MODE=2|SBI"
   "film_fin|film_fin.comp||SIISBS"
+  "film_skin|film_skin.comp||SSBI"
   "film_dfir|film_dye.comp|MODE=0|SSIB"
   "film_mnoise|film_dye.comp|MODE=1|I")
 set(DAPPLE_FILM_GPU_SOURCES ${CMAKE_CURRENT_LIST_DIR}/film_gpu.cpp)

@@ -7,6 +7,7 @@
 #include "dapple/film.h"
 #include "dapple/look.h"
 #include "edit_params_fields.h"
+#include "film_skin.h"
 
 namespace dapple::engine {
 
@@ -147,6 +148,21 @@ ParamRegistry::ParamRegistry() {
         if (k != ModernKind::None) h.f32(in.edit.filmStrength);  // the strength of the base only matters when it is a modern rendering
       },
       [](ParamInputs& in, int v) { return perturbString(in.edit.filmStock, v, {"", "modern_clean", "modern_vivid"}); });
+  // skin protection: the skin planes of the photo (their content), only while the cap is on
+  add("filmSkinMask", G,
+      [](const ParamInputs& in, Hasher& h) {
+        if (in.edit.filmSkin > 0.f && !in.edit.filmStock.empty()) {
+          h.str(in.edit.filmSkinPhoto);
+          h.u64(film::skinKeyFor(in.edit.filmSkinPhoto));
+        }
+      },
+      [](ParamInputs& in, int v) {
+        if (!in.ctx.filmLib) return false;
+        in.edit.filmSkin = 1.f;
+        if (in.edit.filmStock.empty()) in.edit.filmStock = "kodak_portra_400";
+        in.edit.filmSkinPhoto = v ? "ai:aaaaaaaaaaaaaaaa" : "ai:bbbbbbbbbbbbbbbb";
+        return true;
+      });
   add("filmPaper", G, [](const ParamInputs& in, Hasher& h) { h.str(in.edit.filmPaper); },
       [](ParamInputs& in, int v) { return perturbString(in.edit.filmPaper, v, {"", "none", "kodak_endura_premier"}); });
   add("lutPath", G, [](const ParamInputs& in, Hasher& h) { h.str(in.edit.lutPath); },

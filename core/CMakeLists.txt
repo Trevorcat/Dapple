@@ -34,6 +34,7 @@ add_library(dapple_core STATIC
   src/xmp_preset.cpp
   src/decoders/jpeg_decoder.cpp
   src/decoders/jpeg_dc.cpp
+  src/decoders/deband.cpp
   src/colour_space.cpp
   src/decoders/libraw_decoder.cpp
   src/decoders/dng_opcodes.cpp
@@ -42,6 +43,8 @@ add_library(dapple_core STATIC
   src/exposure_anchor.cpp
   src/film.cpp
   src/film_color.cpp
+  src/film_display_ref.cpp
+  src/film_skin.cpp
   src/film_model.cpp
   src/film_params.cpp
   src/film_match.cpp

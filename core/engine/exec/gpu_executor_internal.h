@@ -236,6 +236,7 @@ class Executor final : public IGpuExecutor {
   std::shared_ptr<DeviceBuffer> ensureGeoAux(const GpuRun& in, int& warpOff);
   std::shared_ptr<DeviceBuffer> ensureBuffer(ResultCache& cache, CacheSlot slot, std::uint64_t key, const void* data, std::size_t bytes);
   bool ensureLocal(const GpuRun& in, std::shared_ptr<DeviceBuffer>& desc, std::shared_ptr<DeviceBuffer>& planes);
+  std::shared_ptr<DeviceBuffer> ensureSkin(const GpuRun& in);  // skin protection: the mask plane of point::Film::skin (null: none)
   LutBind lutBind(GpuGraph& g, const DeviceTables& t);
   bool filmResolve(const GpuRun& in, filmnode::FilmResolved& r);
   std::shared_ptr<DeviceFilm> ensureFilm(const filmnode::FilmResolved& r);

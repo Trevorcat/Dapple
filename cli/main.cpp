@@ -31,6 +31,7 @@
 #include "dapple/ingest.h"
 #include "dapple/lut.h"
 #include "engine/nodes/point/point.h"
+#include "local_eval.h"
 #include "engine/exec/engine_session.h"
 #include "dapple/xmp_preset.h"
 #include "eval.h"
@@ -86,6 +87,7 @@ void usage() {
       "  --full               full-resolution demosaic (default: fast half-size)\n"
       "  --long-edge N        output long edge in pixels, 0 = native (default 2560)\n"
       "  --quality N          JPEG quality 1..100 (default 92)\n"
+      "  --skin-face F.png    skin plane (gray, photo space) for the film_skin param, standing in for the AI person task; --skin-body B.png the same for body skin\n"
       "  --dump-params        print the applied EditParams JSON\n");
 }
 
@@ -96,6 +98,7 @@ struct Options {
   std::string xmp;
   std::string lut;
   float lutAmount = 100.f;
+  std::string skinFace, skinBody;  // film_skin without the AI service: 8-bit planes (the photo's normalised space) put in the raster store as ai:cli:faceskin / :bodyskin
   bool autoAdjust = true;
   float strength = 1.f;
   bool full = false;
@@ -151,6 +154,8 @@ bool parseArgs(const std::vector<std::string>& args, Options& o, std::string& er
     else if (a == "--quality") { if (!number(d)) return false; o.quality = int(d); }
     else if (a == "--dump-params") o.dumpParams = true;
     else if (a == "--params") { if (!value(o.params)) return false; }
+    else if (a == "--skin-face") { if (!value(o.skinFace)) return false; }
+    else if (a == "--skin-body") { if (!value(o.skinBody)) return false; }
     else if (a == "--repeat") { if (!number(d)) return false; o.repeat = int(d); }
     else if (a == "--existing") o.existing = true;
     else if (a == "--settle") { if (!number(d)) return false; o.settleMs = int(d); }
@@ -259,6 +264,21 @@ bool loadLook(const Options& o, Look& look) {
       return false;
     }
     look.params += *parsed;
+  }
+  if (!o.skinFace.empty() || !o.skinBody.empty()) {  // film_skin: planes from files stand in for the AI masks (core/src/film_skin.h)
+    for (int i = 0; i < 2; ++i) {
+      const std::string& f = i == 0 ? o.skinFace : o.skinBody;
+      if (f.empty()) continue;
+      auto img = loadReferenceJpeg(pathFromUtf8(f));
+      if (!img) {
+        std::fprintf(stderr, "skin plane: %s\n", img.error().message.c_str());
+        return false;
+      }
+      std::vector<std::uint8_t> g(std::size_t(img->width) * img->height);
+      for (std::size_t k = 0; k < g.size(); ++k) g[k] = img->data[3 * k];
+      local::rasterSet(i == 0 ? "ai:cli:faceskin" : "ai:cli:bodyskin", img->width, img->height, g.data(), img->width);
+    }
+    look.params.filmSkinPhoto = "ai:cli";
   }
   if (!o.lut.empty()) {
     auto lut = Lut3D::loadCube(pathFromUtf8(o.lut));

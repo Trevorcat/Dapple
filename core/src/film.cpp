@@ -360,6 +360,7 @@ bool FilmSimulator::setParams(const FilmParams& p, std::string* err, FilmTimings
     s.effective = std::move(effective);
     s.film = film;
     s.printPath = !scan;
+    s.view.dr = p.displayRef ? &displayInverse() : nullptr;
     if (replan) {
       s.planKey = plKey;
       ++s.gen;
@@ -420,6 +421,7 @@ bool FilmSimulator::setParams(const FilmParams& p, std::string* err, FilmTimings
   s.model = std::move(model);
   s.tables = std::move(tables);
   s.makeView();
+  s.view.dr = p.displayRef ? &displayInverse() : nullptr;
   s.key = key;
   s.ready = true;
   if (t) {

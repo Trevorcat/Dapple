@@ -288,6 +288,8 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
   out.stats.auxMs = lap();
   std::shared_ptr<DeviceBuffer> LDsc, LPl;
   if (!ensureLocal(in, LDsc, LPl)) return failed(Status::Internal);
+  std::shared_ptr<DeviceBuffer> SK = ensureSkin(in);
+  if (in.frame.film.skin && !SK) return failed(Status::Internal);
   out.stats.localMs = lap();
   // a background frame hands the device to a waiting interactive frame between its uploads and its recording; everything it binds is held
   const double waited0 = turn.waited();
@@ -332,6 +334,7 @@ Status Executor::runWhole(const GpuRun& in, GpuOut& out) {
     w.fplan = &DF->pr;
     w.job.disp = DD->bind(g);
     w.job.strength = P.film.strength;
+    if (SK) w.job.skin = g.externalBuf(SK->buf);
   }
   // frame-global solves: a hit binds the kept image (the plan pruned the sweep and the solve), a miss is copied into a kept image for the next frame
   struct Store {
@@ -507,6 +510,8 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
   if ((P.hdr.active() || P.warp.active()) && !(HD = ensureGeoAux(in, warpOff))) return failed(Status::Internal);
   std::shared_ptr<DeviceBuffer> LDsc, LPl;
   if (!ensureLocal(in, LDsc, LPl)) return failed(Status::Internal);
+  std::shared_ptr<DeviceBuffer> SK = ensureSkin(in);
+  if (in.frame.film.skin && !SK) return failed(Status::Internal);
   std::shared_ptr<DeviceFilm> DF;
   std::shared_ptr<DeviceDisplay> DD;
   if (filmFrame) {
@@ -703,6 +708,7 @@ Status Executor::runTiled(const GpuRun& in, GpuOut& out) {
       w.fplan = &DF->pr;
       w.job.disp = DD->bind(g);
       w.job.strength = P.film.strength;
+      if (SK) w.job.skin = g.externalBuf(SK->buf);
       w.pre.any = filmAny;
       if (filmLow[0]) w.pre.lowPre = g.external(*filmLow[0]);
       if (filmLow[1]) w.pre.lowHalo = g.external(*filmLow[1]);

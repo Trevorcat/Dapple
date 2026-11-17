@@ -113,8 +113,8 @@ FilmExposure matchFilmExposureCached(const EditParams& p, const CameraProfile& c
     float g0[3];
     const float expGain = std::exp2(p.exposure);
     for (int c = 0; c < 3; ++c) g0[c] = cache.gain[c] / expGain;
-    cache.st = sceneLumaStats(proxy.linear, cache.gain);
-    cache.st0 = sceneLumaStats(proxy.linear, g0);
+    cache.st = sceneLumaStats(proxy, cache.gain);
+    cache.st0 = sceneLumaStats(proxy, g0);
     cache.baseKey = baseKey;
     cache.haveBase = true;
     cache.series.clear();

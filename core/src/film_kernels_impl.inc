@@ -51,7 +51,13 @@ static K_INLINE float mitK0(float t) { return ((7.f * t - 12.f) * t * t + 16.f /
 static K_INLINE float mitK1(float t) { return (((-7.f / 3.f * t + 12.f) * t - 20.f) * t + 32.f / 3.f) * (1.f / 6.f); }
 
 // Linear exposure from linear ProPhoto RGB: matrix, chromaticity -> tc, bicubic raw LUT, brightness.
-static K_INLINE f4 pxExposure(const KView& k, const float* rgb, float scale) {
+static K_INLINE f4 pxExposure(const KView& k, const float* rgbIn, float scale) {
+  float rgbDr[3];
+  const float* rgb = rgbIn;
+  if (k.dr) {  // display-referred source: the inverse of the camera rendering first (film_kernels.h)
+    displayInverseApply(*k.dr, rgbIn, rgbDr);
+    rgb = rgbDr;
+  }
   const f4 xyz = ld4(k.mIn) * rgb[0] + ld4(k.mIn + 4) * rgb[1] + ld4(k.mIn + 8) * rgb[2];
   const float b = xyz[0] + xyz[1] + xyz[2];
   // x = X/b, 1-x = (Y+Z)/b, tc1 = y/(1-x) = Y/(Y+Z): one division for both

@@ -126,6 +126,12 @@ EditParams withFilmKey(DappleSession* s, EditParams params, const char* lutPath,
   params.filmPrintEv = 0.f;
   params.filmSceneX = s->source.meta.asShotIlluminantXy[0];  // film white balance: the scene's as-shot illuminant (0 = unknown)
   params.filmSceneY = s->source.meta.asShotIlluminantXy[1];
+  // skin protection: the id prefix of this photo's AI planes (faceskin / bodyskin); the engine looks them up in the raster store and does nothing when they are not there
+  params.filmSkinPhoto.clear();
+  if (params.filmSkin > 0.f && !params.filmStock.empty() && !isModernId(params.filmStock)) {
+    std::call_once(s->photoIdOnce, [s] { s->photoId = aimask::photoIdOf(s->source.linear.data.data(), s->source.linear.width, s->source.linear.height); });
+    params.filmSkinPhoto = "ai:" + s->photoId;
+  }
   if (params.filmStock.empty() || isModernId(params.filmStock) || std::getenv("DAPPLE_FILM_MATCH_OFF")) return params;
   const std::string lutFile = lutPath && lutPath[0] ? lutPath : params.lutPath;
   // DAPPLE_FILM_MATCH_UNCACHED=1: the match as before section 26 (full key, every solve from scratch, no calibration warm-up): the A/B switch of the drag bench

@@ -14,6 +14,7 @@
 
 namespace dapple {
 class Lut3D;
+namespace film { struct SkinMask; }  // core/src/film_skin.h
 struct HdrField;                   // core/src/hdr_field.h
 namespace warp { struct Field; }   // core/src/warp_field.h
 }  // namespace dapple
@@ -44,6 +45,9 @@ struct Hdr {
 // the CPU film stage builds the same from the edit).
 struct Film {
   bool active = false;
+  std::shared_ptr<const dapple::film::SkinMask> skin;  // skin protection: the feathered skin plane of the photo (null = off; film_skin.h)
+  float skinAmount = 0.f;         // EditParams::filmSkin
+  bool displayRef = false;        // the source is display-referred (JPEG / PNG / HEIC): the inverse camera rendering goes in front of the film
   bool displayPlain = true;       // DisplayStages (master / RGB curves, look LUT) are the identity
   float strength = 1.f;           // film strength 0..1 (the film frame is blended with the normal render when < 1)
   std::string stock, paper;

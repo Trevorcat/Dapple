@@ -18,6 +18,7 @@
 #include "color.h"
 #include "dapple/illuminant.h"
 #include "film_internal.h"
+#include "film_kernels.h"
 #include "engine/nodes/point/point.h"
 #include "film_match_render.h"
 
@@ -118,7 +119,7 @@ FilmLatitude filmLatitude(const film::FilmStock& s) {
   return r;
 }
 
-SceneStats sceneLumaStats(const ImageF& lin, const float gain[3]) {
+static SceneStats sceneLumaStatsImpl(const ImageF& lin, const ImageF& clipSrc, const float gain[3]) {
   SceneStats st;
   const std::size_t n = std::size_t(lin.width) * lin.height;
   if (!n) return st;
@@ -128,11 +129,12 @@ SceneStats sceneLumaStats(const ImageF& lin, const float gain[3]) {
   std::size_t clipped = 0;
   for (int j = 0; j < lin.height; ++j) {
     const float* r = lin.row(j);
+    const float* rc = clipSrc.row(j);
     for (int i = 0; i < lin.width; ++i, ++k) {
       const float v = 0.2880f * std::max(0.f, r[3 * i] * gain[0]) + 0.7119f * std::max(0.f, r[3 * i + 1] * gain[1]) +
                       0.0001f * std::max(0.f, r[3 * i + 2] * gain[2]);
       y[k] = std::isfinite(v) ? v : 0.f;
-      const float mx = std::max(r[3 * i], std::max(r[3 * i + 1], r[3 * i + 2]));
+      const float mx = std::max(rc[3 * i], std::max(rc[3 * i + 1], rc[3 * i + 2]));
       if (mx >= kFilmClipLevel) ++clipped;
       else yc.push_back(y[k]);
     }
@@ -177,6 +179,16 @@ SceneStats sceneLumaStats(const ImageF& lin, const float gain[3]) {
     st.p995 = yc[i];
   }
   return st;
+}
+
+SceneStats sceneLumaStats(const ImageF& lin, const float gain[3]) { return sceneLumaStatsImpl(lin, lin, gain); }
+
+SceneStats sceneLumaStats(const SourceImage& src, const float gain[3]) {
+  if (src.sceneReferred || !film::detail::displayInverseEnabled()) return sceneLumaStatsImpl(src.linear, src.linear, gain);
+  ImageF inv(src.linear.width, src.linear.height);
+  const film::detail::DisplayInverse& di = film::detail::displayInverse();
+  for (std::size_t i = 0; i < src.linear.data.size(); i += 3) film::detail::displayInverseApply(di, &src.linear.data[i], &inv.data[i]);
+  return sceneLumaStatsImpl(inv, src.linear, gain);
 }
 
 namespace {
@@ -1092,8 +1104,8 @@ FilmPadInfo filmPadFor(const EditParams& p, const CameraProfile& camera, const L
   in.lib = lib;
   in.film = p.filmStock;
   in.paper = paper;
-  in.st0 = sceneLumaStats(proxy.linear, g0);
-  in.stFull = sceneLumaStats(proxy.linear, gain);
+  in.st0 = sceneLumaStats(proxy, g0);
+  in.stFull = sceneLumaStats(proxy, gain);
   in.keyL0 = keyL0;
   in.shoot = p.filmShoot;
   in.print = p.filmPrint;
@@ -1150,7 +1162,7 @@ FilmExposure matchFilmExposure(const EditParams& p, const CameraProfile& camera,
   FilmMatchInfo local;
   FilmMatchInfo& mi = info ? *info : local;
   const FilmMatchOptions opt = optIn ? *optIn : FilmMatchOptions::fromEnv();
-  const SceneStats st = sceneLumaStats(proxy.linear, gain);
+  const SceneStats st = sceneLumaStats(proxy, gain);
   std::shared_ptr<const film::FilmLibrary> lib = film::defaultLibrary();
   const film::FilmStock* stock = lib ? lib->find(p.filmStock) : nullptr;
 
@@ -1197,7 +1209,7 @@ FilmExposure matchFilmExposure(const EditParams& p, const CameraProfile& camera,
   mi_in.lib = lib;
   mi_in.film = p.filmStock;
   mi_in.paper = paper;
-  mi_in.st0 = sceneLumaStats(proxy.linear, g0);
+  mi_in.st0 = sceneLumaStats(proxy, g0);
   mi_in.stFull = st;
   mi_in.keyL0 = keyL0;
   mi_in.shoot = p.filmShoot;

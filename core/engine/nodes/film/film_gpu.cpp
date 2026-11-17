@@ -105,6 +105,7 @@ PointU pointUniforms(const FilmResolved& r, const GpuFilmTables& tb, int w, int 
   u.lutN[0] = tb.lutN;
   u.misc[0] = tb.curveInvDx;
   u.misc[1] = 1.f;
+  u.misc[2] = r.displayRef ? 1.f : 0.f;  // display-referred source: film_point.comp drInverse in front of the input matrix
   return u;
 }
 

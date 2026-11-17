@@ -72,6 +72,7 @@ struct FilmResolved {
   std::uint8_t coarse = 0;       // coarse print table allowed (interactive frame while a print-table slider moves)
   std::uint8_t clampOut = 0;     // GPU: the frame is followed by a pure clamp (strength 1, no display stages, no vignette): the last film pass may clamp itself
   std::uint8_t scan = 0;         // no paper: scan the developed film
+  std::uint8_t displayRef = 0;   // the source is display-referred (JPEG / PNG / HEIC): film_kernels.h DisplayInverse in front of the input matrix
   FilmFx fx;                     // highlight boost / enlarger diffusion filter (not part of the edit schema: tests, CLI, renderer entry)
 };
 static_assert(sizeof(FilmResolved) <= 256);
@@ -159,6 +160,7 @@ struct FilmFrameArgs {
   bool coarse = false;             // interactive tier while a print-table slider moves (FastOptions::coarseFilm)
   int fullLongEdge = 0;            // scale-aware grain: long edge of the full-resolution render (0 = none)
   std::uint32_t frameIndex = 0;
+  bool displayRef = false;         // display-referred source: the inverse camera rendering in front of the film (film_kernels.h)
 };
 bool filmFrameResolved(const FilmFrameArgs& a, FilmResolved& out);
 

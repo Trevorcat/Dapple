@@ -55,7 +55,8 @@ struct FilmPlanData {
 std::shared_ptr<const FilmPlanData> planOf(const FilmResolved& r);
 
 // KView over the table payloads; `gain` (optional) is folded into the input matrix like FilmSimulator::render does.
-fd::KView viewOf(const RawTable* raw, const CurvesTable* cur, const PrintTable* print, const float* gain, float mInStorage[12]);
+fd::KView viewOf(const RawTable* raw, const CurvesTable* cur, const PrintTable* print, const float* gain, float mInStorage[12],
+                bool displayRef = false);
 
 inline int reflectIdx(int i, int n) {
   if (n == 1) return 0;

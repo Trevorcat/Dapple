@@ -146,7 +146,7 @@ Status runExposure(const CpuCtx& c, const void* res, std::span<const ImageView> 
   if (!pd->error.empty()) return Status::Unsupported;  // (highlight boost needs the global maximum: it runs in FilmBlurExposure)
   const RawTable* raw = payloadAs<RawTable>(c.tables[0]);
   float mi[12];
-  const fd::KView view = viewOf(raw, nullptr, nullptr, r.gain, mi);
+  const fd::KView view = viewOf(raw, nullptr, nullptr, r.gain, mi, r.displayRef);
   const fd::KernelSet& ks = fd::selectKernels();
   const ImageView &src = in[0], &E = out[0];
   const Rect o = rectOf(E);
@@ -842,7 +842,7 @@ NodeDesc glareDesc() {  // decode to linear + blurred log-normal hash field
   return d;
 }
 NodeDesc scanDesc() {  // scanner blur + unsharp mask in linear light, sRGB encode
-  NodeDesc d = imageDesc(NodeType::FilmScan, "FilmScan", Footprint::Window, 1, 1, pitch({"filmPaper", "ctx.quality"}));
+  NodeDesc d = imageDesc(NodeType::FilmScan, "FilmScan", Footprint::Window, 1, 1, pitch({"filmPaper", "ctx.quality", "film_skin", "filmSkinMask"}));  // the skin cap (film_skin.h) follows the scan
   d.outSpace = Space::Display;
   return d;
 }

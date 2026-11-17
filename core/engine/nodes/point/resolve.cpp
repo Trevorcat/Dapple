@@ -10,6 +10,8 @@
 #include "engine/graph/graph.h"
 #include "engine/nodes/film/film_nodes.h"
 #include "engine/nodes/point/kernels.h"
+#include "film_kernels.h"
+#include "film_skin.h"
 #include "hdr_field.h"
 #include "warp_field.h"
 
@@ -554,6 +556,12 @@ Blocks resolveFrame(const Params& rp, int srcW, int srcH, bool sceneReferred, co
     f.active = true;
     f.displayPlain = rp.curves.master.identity && rp.curves.red.identity && rp.curves.green.identity && rp.curves.blue.identity && !(rp.lut && rp.p.lutAmount > 0);
     f.strength = filmRun.strength;
+    f.displayRef = !sceneReferred && film::detail::displayInverseEnabled();
+    // skin protection (film_skin.h): the planes of this photo; not for a region source (its masks live in the parent's frame), a reshaped frame or strength 0
+    if (rp.p.filmSkin > 0.f && filmRun.strength > 0.f && !rp.p.filmSkinPhoto.empty() && !(src && src->parent) && !fp.warp.field) {
+      f.skin = film::skinMaskFor(rp.p.filmSkinPhoto);
+      if (f.skin) f.skinAmount = std::min(rp.p.filmSkin, 1.f);
+    }
     if (!f.displayPlain) {  // the display stages after the film: the curve tables and the look LUT go to the backend as they are
       engine::point::Display& d = fp.display;
       const Curve1D* cs[4] = {&rp.curves.master, &rp.curves.red, &rp.curves.green, &rp.curves.blue};

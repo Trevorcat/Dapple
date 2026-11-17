@@ -23,6 +23,7 @@
 #include "dapple/camera.h"
 #include "engine/nodes/point/point.h"
 #include "gpu_rig.h"
+#include "local_eval.h"
 #include "parity.h"
 #include "engine/nodes/film/film_gpu.h"
 #include "engine/nodes/film/film_node_internal.h"
@@ -690,6 +691,19 @@ void testFrames() {
     bool lut = false;     // the renderer carries the synthetic look LUT
     bool tiled = false;   // GPU side is a tiled export
     bool strict = false;  // the new coverage rows: mean <= 0.1 and p99 <= 1.0 (the film parity budget)
+    bool display = false;  // the source is display-referred (a JPEG): the inverse camera rendering goes in front of the film
+  };
+  // skin protection: an elliptical skin plane in the raster store, as the AI person task would put it ("ai:gputest:faceskin"), 160 x 120
+  auto plantSkin = [](EditParams& p) {
+    std::vector<std::uint8_t> px(160 * 120);
+    for (int y = 0; y < 120; ++y)
+      for (int x = 0; x < 160; ++x) {
+        const float dx = (float(x) + 0.5f) / 160.f - 0.45f, dy = (float(y) + 0.5f) / 120.f - 0.5f;
+        px[std::size_t(y) * 160 + x] = (dx * dx / 0.09f + dy * dy / 0.12f) < 1.f ? 255 : 0;
+      }
+    local::rasterSet("ai:gputest:faceskin", 160, 120, px.data(), 160);
+    p.filmSkin = 1.f;
+    p.filmSkinPhoto = "ai:gputest";
   };
   const std::vector<Case> cases = {
       {"film portra400, all effects", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }, nullptr},
@@ -721,6 +735,13 @@ void testFrames() {
       {"film_wb 0.5 under 3200 K", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmWb = 0.5f; p.filmSceneX = 0.4234f; p.filmSceneY = 0.3990f; }, nullptr, false, false, true},
       {"film_wb 1 under 3200 K, WB edit", [](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmWb = 1.f; p.filmSceneX = 0.4234f; p.filmSceneY = 0.3990f; p.temperature = 25.f; }, nullptr, false, false, true},
       {"film_wb 1 under 7500 K (tungsten stock)", [](EditParams& p) { p.filmStock = "kodak_vision3_500t"; p.filmWb = 1.f; p.filmSceneX = 0.2991f; p.filmSceneY = 0.3149f; }, nullptr, false, false, true},
+      // display-referred source (the inverse camera rendering in front of the film) and skin protection (the chroma cap behind it)
+      {"film portra400 on a display-referred source", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }, nullptr, false, false, true, true},
+      {"film push2 on a display-referred source, strength 60", [](EditParams& p) { p.filmStock = "kodak_portra_800_push2"; p.filmStrength = 60; }, nullptr, false, false, true, true},
+      {"film_skin 1, portra400", [plantSkin](EditParams& p) { p.filmStock = "kodak_portra_400"; plantSkin(p); }, nullptr, false, false, true},
+      {"film_skin 1, portra400, geometry + vignette", [plantSkin](EditParams& p) { p.filmStock = "kodak_portra_400"; p.straighten = 3.f; p.crop = "4:5"; p.vignette = -30; plantSkin(p); }, nullptr, false, false, true},
+      {"film_skin 1, display-referred source, strength 70 + LUT", [plantSkin](EditParams& p) { p.filmStock = "kodak_portra_400"; p.filmStrength = 70; p.lutAmount = 60; plantSkin(p); }, nullptr, true, false, true, true},
+      {"film_skin 1, tiled export", [plantSkin](EditParams& p) { p.filmStock = "kodak_portra_800_push2"; plantSkin(p); }, nullptr, false, true, true},
       {"film tiled export", [](EditParams& p) { p.filmStock = "kodak_portra_400"; }, nullptr, false, true, true},
       {"film tiled export, strength 50 + curves + LUT", [](EditParams& p) {
          p.filmStock = "kodak_portra_400"; p.filmStrength = 50; p.toneCurve = {{0.f, 0.f}, {128.f, 107.f}, {255.f, 255.f}}; p.lutAmount = 60; p.vignette = -20; },
@@ -732,9 +753,14 @@ void testFrames() {
   std::vector<std::pair<int, int>> sizes = {{640, 448}, {1536, 1024}};
   if (hashRun) sizes = {{640, 448}, {1536, 1024}, {641, 449}, {1111, 777}};
   for (const std::pair<int, int>& sz : sizes) {
-    const SourceImage src = dapple::gpu::makeTestImage(sz.first, sz.second);
-    dapple::gpu::Rig rig(ctx, src, cam);
+    const SourceImage srcScene = dapple::gpu::makeTestImage(sz.first, sz.second);
+    SourceImage srcDisplay = srcScene;
+    srcDisplay.sceneReferred = false;
+    dapple::gpu::Rig rigScene(ctx, srcScene, cam), rigDisplay(ctx, srcDisplay, cam);
     for (const Case& c : cases) {
+      if (const char* only = std::getenv("DAPPLE_FILM_ONLY"); only && !std::strstr(c.name, only)) continue;  // DAPPLE_FILM_ONLY=substring: only the cases whose name has it
+      const SourceImage& src = c.display ? srcDisplay : srcScene;
+      dapple::gpu::Rig& rig = c.display ? rigDisplay : rigScene;
       EditParams p;
       p.exposure = 0.3f;
       p.contrast = 15;
@@ -786,6 +812,17 @@ void testFrames() {
                     d.differing * 100, st.gpuMs, st.passes);
         CHECK(d.mean <= 0.5);
         if (c.strict) CHECK(d.mean <= 0.1 && d.p99 <= 1.0);
+        if (std::strncmp(c.name, "film_skin", 9) == 0 && !c.tiled) {  // the cap is on the GPU frame: it is as far from the CPU frame without the cap as the cap is large
+          EditParams off = p;
+          off.filmSkin = 0.f;
+          int w0 = 0, h0 = 0;
+          std::uint8_t* plain = renderFrame8(off, cam, look, src, 41, fo, w0, h0);
+          const dapple::gpu::DeStats dn = dapple::gpu::compareRgba8(gpu, plain, std::size_t(w) * h);
+          const dapple::gpu::DeStats dcpu = dapple::gpu::compareRgba8(cpu, plain, std::size_t(w) * h);
+          std::printf("    cap on the frame: GPU vs CPU without it mean %.4f, CPU with vs without it mean %.4f\n", dn.mean, dcpu.mean);
+          CHECK(dcpu.mean > 0.05 && dn.mean > 1.5 * d.mean);  // the GPU frame is much closer to the CPU frame with the cap than to the one without
+          std::free(plain);
+        }
       }
       std::free(cpu);
       std::free(gpu);

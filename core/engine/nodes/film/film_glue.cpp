@@ -8,6 +8,7 @@
 #include "engine/nodes/point/cpu_impl.h"
 #include "engine/nodes/point/scratch.h"
 #include "engine/nodes/vignette/vignette_kernel.h"
+#include "film_skin.h"
 #include "parallel.h"
 
 namespace dapple::engine::point {
@@ -16,8 +17,9 @@ namespace {
 
 constexpr float kWarmthFilterUnits = 12.f;  // enlarger filtration (CC-like units) at warmth / tint = +-100
 
-film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, SpatialQuality q, float formatScale) {
+film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, SpatialQuality q, float formatScale, bool displayRef) {
   film::FilmParams fp;
+  fp.displayRef = displayRef;
   fp.film = p.filmStock;
   fp.paper = run.paper;
   fp.camera.autoExposure = false;  // the develop pipeline's own exposure slider is the exposure control
@@ -49,7 +51,7 @@ film::FilmParams makeFilmParams(const EditParams& p, const FilmRun& run, Spatial
 // `pitch` = size of an output pixel in source pixels (spatial effects are defined in film-frame micrometres).
 // The arguments of the film nodes for a w x h frame of a srcW x srcH source (the film nodes of point::CpuFrame, whole frame and streamed).
 engine::filmnode::FilmFrameArgs filmNodeArgs(const EditParams& p, const FilmRun& run, const float gain[3], int srcW, int srcH, int w, int h, float pitch,
-                                             SpatialQuality q, const FastOptions* fo) {
+                                             SpatialQuality q, const FastOptions* fo, bool displayRef) {
   const float formatScale = pitch * float(std::max(w, h)) / float(std::max(srcW, srcH));
   engine::filmnode::FilmFrameArgs a;
   a.lib = run.lib.get();
@@ -72,6 +74,7 @@ engine::filmnode::FilmFrameArgs filmNodeArgs(const EditParams& p, const FilmRun&
   a.w = w;
   a.h = h;
   a.quality = q == SpatialQuality::Off ? 0 : (q == SpatialQuality::Interactive ? 1 : 2);
+  a.displayRef = displayRef;
   if (fo) {
     a.keepGrain = fo->keepGrain;
     a.coarse = fo->coarseFilm;
@@ -83,14 +86,14 @@ engine::filmnode::FilmFrameArgs filmNodeArgs(const EditParams& p, const FilmRun&
 
 template <class Fetch>
 bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], const ImageF& src, bool resample, int w,
-                  int h, float pitch, SpatialQuality q, Fetch&& fetch, ImageF& out, const FastOptions* fo = nullptr) {
+                  int h, float pitch, SpatialQuality q, Fetch&& fetch, ImageF& out, const FastOptions* fo = nullptr, bool displayRef = false) {
   if (!run.stock) return false;
   const float formatScale = pitch * float(std::max(w, h)) / float(std::max(src.width, src.height));
   const float evGain = std::exp2(p.filmExposure + p.filmKeyEv);
   const float gainEv[3] = {gain[0] * evGain, gain[1] * evGain, gain[2] * evGain};
   if (engine::filmnode::enabled()) {
     // the film as engine nodes (core/engine/nodes/film): byte-identical with the FilmSimulator below
-    const engine::filmnode::FilmFrameArgs a = filmNodeArgs(p, run, gain, src.width, src.height, w, h, pitch, q, fo);
+    const engine::filmnode::FilmFrameArgs a = filmNodeArgs(p, run, gain, src.width, src.height, w, h, pitch, q, fo, displayRef);
     ScratchImage nodeScratch;
     const ImageF* nin = &src;
     if (resample) {
@@ -105,7 +108,7 @@ bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], 
   }
   film::SimulatorLease lease = film::acquireSimulator(run.lib, p.filmStock, run.paper);
   std::string err;
-  if (!lease->setParams(makeFilmParams(p, run, q, formatScale), &err)) return false;
+  if (!lease->setParams(makeFilmParams(p, run, q, formatScale, displayRef), &err)) return false;
   ScratchImage linScratch;
   const ImageF* in = &src;
   if (resample) {
@@ -121,7 +124,7 @@ bool runFilmStage(const EditParams& p, const FilmRun& run, const float gain[3], 
 
 bool CpuFrame::streamFilm(std::uint8_t* rgba) {
   Impl& m = *impl_;
-  if (m.exact || !(m.fr.stock && m.fr.strength >= 1.f) || !rgba || m.win) return false;
+  if (m.exact || !(m.fr.stock && m.fr.strength >= 1.f) || !rgba || m.win || m.b.film.skin) return false;  // skin protection needs the whole film plane (runFilm)
   if (frameBlocks().anyWindow()) return false;  // a neighbourhood stage of a migrated family runs
   if (m.opt.keepGrain || (m.opt.fullLongEdge > 0 && m.opt.spatial == SpatialQuality::Full)) return false;  // scale-aware / kept grain: node chain only
   const Params& rr = m.r;
@@ -130,7 +133,7 @@ bool CpuFrame::streamFilm(std::uint8_t* rgba) {
   std::string err;
   const float evGain = std::exp2(rr.p.filmExposure + rr.p.filmKeyEv);
   const float gainEv[3] = {m.b.gain[0] * evGain, m.b.gain[1] * evGain, m.b.gain[2] * evGain};
-  if (!(lease && lease->setParams(makeFilmParams(rr.p, m.fr, m.opt.spatial, m.b.geo.pitch()), &err))) return false;
+  if (!(lease && lease->setParams(makeFilmParams(rr.p, m.fr, m.opt.spatial, m.b.geo.pitch(), m.b.film.displayRef), &err))) return false;
   const bool plain = rr.curves.master.identity && rr.curves.red.identity && rr.curves.green.identity && rr.curves.blue.identity &&
                      !(rr.lut && rr.p.lutAmount > 0);
   const engine::vignette::Block vig = engine::vignette::resolve(rr.p, geometryFacts(m.b.geo));
@@ -176,9 +179,7 @@ bool CpuFrame::runFilm(ImageF& F, const local::AuxTarget* aux) {
   const SpatialQuality q = m.exact ? (m.opt.spatial == SpatialQuality::Off ? SpatialQuality::Off : SpatialQuality::Full)
                                    : m.opt.spatial;
   const local::Frame* lf = m.local.get();
-  m.filmOkV = runFilmStage(
-      m.r.p, m.fr, g, m.in, m.b.geo.useGeo || lf, w, h, m.b.geo.pitch(), q,
-      [&](int y, float* row) {
+  auto fetchRow = [&](int y, float* row) {
         if (m.b.geo.useGeo) {
           for (int x = 0; x < w; ++x) m.fetchPixel(x, y, row + 3 * x);
         } else {
@@ -202,8 +203,39 @@ bool CpuFrame::runFilm(ImageF& F, const local::AuxTarget* aux) {
               if (aux->slot[k] >= 0) aux->data[std::size_t(aux->slot[k]) * aux->plane + o] = K[k];
           }
         }
-      },
-      F, &m.opt);
+      };
+  m.filmOkV = runFilmStage(m.r.p, m.fr, g, m.in, m.b.geo.useGeo || lf, w, h, m.b.geo.pitch(), q, fetchRow, F, &m.opt, m.b.film.displayRef);
+  if (m.filmOkV && m.b.film.skin) {
+    // skin protection (film_skin.h): the chroma of the film's picture inside the photo's skin planes is capped against the film's own input
+    const film::SkinMask& sk = *m.b.film.skin;
+    const float amount = m.b.film.skinAmount;
+    const bool resampled = m.b.geo.useGeo || lf;
+    const float evGain = std::exp2(m.r.p.filmExposure + m.r.p.filmKeyEv);
+    const float gEv[3] = {g[0] * evGain, g[1] * evGain, g[2] * evGain};
+    const bool dref = m.b.film.displayRef;
+    parallelFor(
+        h,
+        [&](int y) {
+          thread_local std::vector<float> in;
+          const float* row = m.in.row(y);
+          if (resampled) {
+            in.resize(std::size_t(w) * 3);
+            fetchRow(y, in.data());
+            row = in.data();
+          }
+          float* f = F.row(y);
+          for (int x = 0; x < w; ++x) {
+            float u, v;
+            m.srcUV(x, y, u, v);
+            const float a = sk.at(u, v) * amount;
+            if (a <= 0.f) continue;
+            float ref[3];
+            film::skinRef(row + 3 * x, dref, gEv, ref);
+            film::skinCap(f + 3 * x, ref, a);
+          }
+        },
+        4);
+  }
   return m.filmOkV;
 }
 
@@ -218,6 +250,10 @@ namespace {
 bool CpuFrame::filmStreamBegin(std::string* why) {
   Impl& m = *impl_;
   m.filmRan = true;
+  if (m.b.film.skin) {
+    if (why) *why = "film: skin protection renders the whole frame";
+    return false;
+  }
   if (!m.fr.stock || !m.sourceFn || !engine::filmnode::enabled()) {
     if (why) *why = "film: no stock / no source provider / film nodes off";
     return false;
@@ -230,7 +266,7 @@ bool CpuFrame::filmStreamBegin(std::string* why) {
     for (int c = 0; c < 3; ++c) g[c] = m.b.gain[c];
   }
   const SpatialQuality q = m.exact ? (m.opt.spatial == SpatialQuality::Off ? SpatialQuality::Off : SpatialQuality::Full) : m.opt.spatial;
-  const engine::filmnode::FilmFrameArgs a = filmNodeArgs(m.r.p, m.fr, g, m.in.width, m.in.height, w, h, m.b.geo.pitch(), q, &m.opt);
+  const engine::filmnode::FilmFrameArgs a = filmNodeArgs(m.r.p, m.fr, g, m.in.width, m.in.height, w, h, m.b.geo.pitch(), q, &m.opt, m.b.film.displayRef);
   const local::Frame* lf = m.local.get();
   const float gg[3] = {g[0], g[1], g[2]};
   auto input = [this, w, lf, gg](int y0, int y1, float* rgb) -> bool {

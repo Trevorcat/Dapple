@@ -181,6 +181,22 @@ foreach(id equiv rebake keys keys_small graph concurrent grain_scale grain_scale
   set_tests_properties(film_nodes.${id} PROPERTIES TIMEOUT 900)
 endforeach()
 
+# What the film reads of a picture that is not RAW (8-bit debanding, the inverse camera rendering of a display-referred source) and skin protection
+# (film_skin): docs/engine/pipeline-architecture.md, film section. One ctest entry per id (`--list` prints them).
+add_executable(dapple_film_source_tests engine/film_source_tests.cpp)
+target_link_libraries(dapple_film_source_tests PRIVATE dapple_core dapple_stb)
+target_include_directories(dapple_film_source_tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src ${PROJECT_SOURCE_DIR}/core/include ${PROJECT_SOURCE_DIR}/core ${PROJECT_SOURCE_DIR}/tests)
+target_compile_definitions(dapple_film_source_tests PRIVATE DAPPLE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+if(MSVC)
+  target_compile_options(dapple_film_source_tests PRIVATE /W4 /utf-8)
+else()
+  target_compile_options(dapple_film_source_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+foreach(id deband_ramp deband_edges deband_decoder display_table display_nodes display_scope skin_math skin_no_mask skin_mask)
+  add_test(NAME film_source.${id} COMMAND dapple_film_source_tests ${id} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(film_source.${id} PROPERTIES TIMEOUT 300)
+endforeach()
+
 # Film tables on disk ("warm from disk"): round trip, corruption, version (salt) mismatch, size cap, concurrent processes (it runs itself as child processes).
 add_executable(dapple_film_disk_tests engine/film_disk_tests.cpp)
 target_link_libraries(dapple_film_disk_tests PRIVATE dapple_core)

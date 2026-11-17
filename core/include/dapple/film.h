@@ -228,6 +228,9 @@ struct FilmParams {
   IoParams io;
   SettingsParams settings;
   DebugParams debug;
+  // The input is a display-referred picture (JPEG / PNG / HEIC): the inverse of a typical camera rendering goes in front of the film (core/src/film_kernels.h
+  // DisplayInverse). Run-time only: not part of the JSON, the validation or any table key.
+  bool displayRef = false;
 
   // Range / finiteness validation of every field (what applyJson and FilmSimulator::setParams enforce). Pixel-radius
   // limits that depend on the image size are applied when the spatial plan is built (see film_spatial.cpp).

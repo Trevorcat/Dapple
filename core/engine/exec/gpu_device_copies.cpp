@@ -7,6 +7,7 @@
 #include "dapple/film.h"
 #include "determinism.h"
 #include "engine/exec/gpu_executor_internal.h"
+#include "film_skin.h"
 #include "engine/nodes/film/film_async.h"
 #include "engine/nodes/film/frame_trace.h"
 #include "hdr_field.h"
@@ -314,6 +315,12 @@ bool Executor::ensureLocal(const GpuRun& in, std::shared_ptr<DeviceBuffer>& desc
   return planes != nullptr;
 }
 
+std::shared_ptr<DeviceBuffer> Executor::ensureSkin(const GpuRun& in) {
+  const auto& sk = in.frame.film.skin;
+  if (!sk || sk->a.empty()) return nullptr;
+  return ensureBuffer(in.cache, kDeviceBufferSlot, sk->key ^ 0x534b494eull, sk->a.data(), sk->a.size() * sizeof(float));  // "SKIN"
+}
+
 LutBind Executor::lutBind(GpuGraph& g, const DeviceTables& t) {
   LutBind b;
   b.tone = g.externalBuf(t.tone->buf);
@@ -356,9 +363,10 @@ bool Executor::filmResolve(const GpuRun& in, filmnode::FilmResolved& r) {
   a.coarse = f.coarse;
   a.fullLongEdge = f.fullLongEdge;
   a.frameIndex = f.frameIndex;
+  a.displayRef = f.displayRef;
   // r.lib / r.stock point into the process-wide default library, which outlives the frame
   if (!filmnode::filmFrameResolved(a, r)) return fail(GpuReason::FilmUnavailable, "film stock / paper not available");
-  r.clampOut = f.strength >= 1.f && f.displayPlain && !in.blocks.vignette.active();
+  r.clampOut = f.strength >= 1.f && f.displayPlain && !in.blocks.vignette.active() && !f.skin;  // the skin cap (film_skin.comp) must see the unclamped plane
   // stock selection (wave 8): an interactive frame of a stock whose tables are not cached shows the previous stock until the background bake landed
   // (the repaint hook fires then); frame fields come from this frame, everything the tables depend on from the previous one, so nothing is baked here.
   // An interactive frame never bakes the 33^3 print table: it takes the exact one when cached, else the coarse 17^3 of its own values.

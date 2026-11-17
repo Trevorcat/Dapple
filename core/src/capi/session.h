@@ -72,6 +72,8 @@ struct DappleSession {
   DappleSession(const DappleSession&) = delete;
   DappleSession& operator=(const DappleSession&) = delete;
   dapple::SourceImage source;
+  std::once_flag photoIdOnce;  // photoId: the 16 hex digits of the AI plane ids (aimask::photoIdOf), computed on first use
+  std::string photoId;
   const dapple::CameraProfile* camera = nullptr;  // &cameraOwned: the profile with this file's exposure anchor
   dapple::CameraProfile cameraOwned;
 

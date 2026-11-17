@@ -1,6 +1,10 @@
 // GPU implementation of the point recipe Geometry + Gain + ToneColour + Vignette (+ Grain/Pack8 epilogue) in one pass.
 // Shader: point.comp. Mirrors the CPU point head (point::CpuFrame::headGainTone + LutSampler).
+#include <cstring>
+
+#include "color.h"
 #include "engine/nodes/gpu_common.h"
+#include "film_skin.h"
 #include "hdr_field.h"
 
 namespace dapple::engine::gpu {
@@ -121,6 +125,44 @@ H groupDisplay(GpuRecorder& r, const GroupCall& c) {
     if (!recordPoint(r, pointNode(j, Epilogue{}), M)) return -1;
   }
   if (j.filmClamped && !blend && !c.ep.last && j.filmOx == 0 && j.filmOy == 0) return j.film;  // film_fin would only clamp: film_pd did it
+  // skin protection (film_skin.h): the chroma cap on the film plane, a pass of its own in front of the display stages (the window's film input is gathered again)
+  H filmPlane = j.film;
+  int filmOx = j.filmOx, filmOy = j.filmOy;
+  if (P.film.skin && j.skin >= 0 && j.filmRef) {
+    H ref = -1;
+    int rox = 0, roy = 0;
+    if (!j.filmRef(j.ox, j.oy, j.W, j.Hh, ref, rox, roy)) return r.err = "film skin: no film input", -1;
+    struct SkinU {  // film_skin.comp
+      std::int32_t a[4], b[4];
+      float geoA[4], geoB[4], geoC[4];
+      std::int32_t c[4];
+      float m[3][4];
+      std::int32_t mk[4];
+      float prm[4];
+    } su{};
+    su.a[0] = P.geo.srcW, su.a[1] = P.geo.srcH, su.a[2] = j.W, su.a[3] = j.Hh;
+    su.b[0] = j.filmOx, su.b[1] = j.filmOy, su.b[2] = j.ox, su.b[3] = j.oy;
+    if (P.geo.useGeo) {
+      su.geoA[0] = P.geo.cs, su.geoA[1] = P.geo.sn, su.geoA[2] = P.geo.fw, su.geoA[3] = P.geo.fh;
+      su.geoB[0] = P.geo.ox0, su.geoB[1] = P.geo.oy0, su.geoB[2] = P.geo.stepX, su.geoB[3] = P.geo.stepY;
+      su.geoC[0] = P.geo.fullW, su.geoC[1] = P.geo.fullH;
+      su.c[0] = P.geo.rot, su.c[1] = P.geo.flip ? 1 : 0;
+    }
+    su.c[2] = rox, su.c[3] = roy;
+    const float evGain = std::exp2(P.film.filmEv);
+    const color::Mat3& ps = color::proPhotoToSrgb();
+    for (int col = 0; col < 3; ++col)
+      for (int row = 0; row < 3; ++row) su.m[col][row] = ps.m[row][col] * P.gain[col] * evGain;
+    su.mk[0] = P.film.skin->w, su.mk[1] = P.film.skin->h, su.mk[2] = P.geo.useGeo ? 1 : 0;
+    su.prm[0] = P.film.skinAmount;
+    su.mk[3] = P.film.displayRef ? 1 : 0;
+    const hal::PipelineH sp = r.pl("film_skin", {});
+    if (!sp) return -1;
+    const H fs = r.g.transient(hal::Format::RGBA16F, std::uint32_t(j.W), std::uint32_t(j.Hh));
+    r.g.dispatch("film_skin", sp, {GpuGraph::R(filmPlane), GpuGraph::R(ref), GpuGraph::R(j.skin), GpuGraph::W(fs)}, r.gx(j.W), r.gy(j.Hh), &su, sizeof su);
+    filmPlane = fs;
+    filmOx = j.ox, filmOy = j.oy;
+  }
   struct U {
     std::int32_t a[4];
     float geoB[4], geoC[4], e[4];
@@ -142,8 +184,8 @@ H groupDisplay(GpuRecorder& r, const GroupCall& c) {
   u.e[1] = c.ep.period;
   const DisplayBind& d = j.disp;
   const bool dispOn = d.curveMask != 0 || d.lutN > 0;
-  u.f[0] = j.filmOx;
-  u.f[1] = j.filmOy;
+  u.f[0] = filmOx;
+  u.f[1] = filmOy;
   u.f[2] = dispOn ? int(d.curveMask) : 0;
   u.f[3] = dispOn ? d.lutN : 0;
   u.g[0] = j.strength;
@@ -156,7 +198,7 @@ H groupDisplay(GpuRecorder& r, const GroupCall& c) {
   const hal::PipelineH p = r.pl("film_fin", {{10, c.ep.last ? 1 : 0}, {11, c.ep.last && c.ep.grain ? 1 : 0}, {12, blend ? 1 : 0}, {13, dispOn ? 1 : 0}});
   if (!p) return -1;
   r.g.dispatch("film_fin", p,
-               {GpuGraph::R(j.film), GpuGraph::W(c.D), c.ep.last ? GpuGraph::W(c.ep.out8) : GpuGraph::R(r.dummy(kU8)), GpuGraph::R(blend ? M : r.dummy(kF16)),
+               {GpuGraph::R(filmPlane), GpuGraph::W(c.D), c.ep.last ? GpuGraph::W(c.ep.out8) : GpuGraph::R(r.dummy(kU8)), GpuGraph::R(blend ? M : r.dummy(kF16)),
                 GpuGraph::R(d.curves), GpuGraph::R(d.lut)},
                r.gx(j.W), r.gy(j.Hh), &u, sizeof u);
   return c.D;

@@ -143,6 +143,12 @@ struct EditParams {
   // Film white balance (胶片白平衡), -1..1: -1 = the scene light fully neutralised (the scene white reaches the film as its own reference
   // white), 0 = half of the difference kept (default), +1 = the stock's own balance sees the scene's real light (D = 0.5 - 0.5 * filmWb).
   float filmWb = 0.f;
+  // Skin protection (JSON key "film_skin", 0 or 1; 0 = off, the engine default): with a film stock, the film's chroma gain inside the skin regions of the photo
+  // (AI person-part planes faceskin / bodyskin) is limited to 1.25x the chroma of the film's input, hue and lightness the film's (core/src/film_skin.h).
+  // Needs the planes "<filmSkinPhoto>:faceskin" / ":bodyskin" in the raster store (the app computes them with the AI person task); without them it does nothing.
+  float filmSkin = 0.f;
+  // Internal, not serialised: "ai:<photo>" of the photo (the C layer sets it from the session's photo id when filmSkin > 0 and a film stock is set; "" = none).
+  std::string filmSkinPhoto;
   // Internal, not serialised: CIE xy of the scene's as-shot illuminant (the C layer sets it from the RAW's white balance; 0 = unknown).
   float filmSceneX = 0.f, filmSceneY = 0.f;
 

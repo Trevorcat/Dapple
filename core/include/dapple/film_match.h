@@ -167,6 +167,9 @@ struct SceneStats {
   std::vector<float> logH0;               // sorted log10(Y / 0.184) of the pixels counted (unclipped; all when mostly clipped)
 };
 SceneStats sceneLumaStats(const ImageF& linear, const float gain[3]);
+// The same for a source picture as the film reads it: a display-referred source (JPEG / PNG / HEIC) goes through the inverse camera rendering first
+// (core/src/film_kernels.h DisplayInverse), the clipping fraction still counts the picture's own white.
+SceneStats sceneLumaStats(const SourceImage& src, const float gain[3]);
 
 // Latitude window of film EVs for the scene: p99.5 at or below shoulder - margin, p2 at or above toe + margin
 // (log10 H = log10(Y / 0.184) + EV * log10(2)). Returns false when the stock or the scene has no usable data.
