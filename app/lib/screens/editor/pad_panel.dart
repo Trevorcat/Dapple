@@ -19,7 +19,7 @@ import '../../model/bases.dart';
 import '../../model/pad_model.dart';
 import '../../model/params.dart';
 import '../../theme/tokens.dart';
-import '../../widgets/controls.dart' show HitBox, kHit;
+import '../../widgets/controls.dart' show DCheckbox, HitBox, kHit;
 import '../../widgets/icons.dart';
 import 'editor_controller.dart';
 import 'editor_widgets.dart' show CurvePainter, curveY;
@@ -406,6 +406,49 @@ class HeaderButton extends StatelessWidget {
   }
 }
 
+/// 肤色保护: the checkbox chip of the film window's 分项 header, shown only with a stock chosen. Checked (default): the film's chroma gain is capped
+/// inside the photo's skin (the AI person planes); a photo without people is unchanged either way.
+class SkinCheck extends StatelessWidget {
+  const SkinCheck({super.key, required this.ctl});
+  final EditorController ctl;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final ts = MediaQuery.textScalerOf(context).scale(16) / 16;
+    return ListenableBuilder(
+      listenable: ctl.app.editTick,
+      builder: (context, _) {
+        final on = ctl.edit.filmSkin;
+        return Semantics(
+          checked: on,
+          label: '肤色保护',
+          excludeSemantics: true,
+          onTap: () => ctl.setFilmSkin(!on),
+          child: GestureDetector(
+            key: const ValueKey('film-skin'),
+            behavior: HitTestBehavior.opaque,
+            onTap: () => ctl.setFilmSkin(!on),
+            child: HitBox(
+              child: Container(
+                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                padding: const EdgeInsets.symmetric(horizontal: Sp.m),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(color: c.bg, borderRadius: BorderRadius.circular(Rd.cardLg)),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  DCheckbox(value: on, size: 16 * ts),
+                  const SizedBox(width: Sp.s),
+                  Text('肤色保护', maxLines: 1, style: T.cap(c.text, w: FontWeight.w500)),
+                ]),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 /// One header for every panel layer (audit U6, guidelines 15.2.8): `[‹] title · readout or subtitle …… (reset) · main action`. The title is
 /// always the dock item's name; ‹ (left of the title) appears in any layer below the panel's first one and goes back one layer; the
 /// right end holds at most three buttons, the last one being the layer's main action. A narrow side pane puts the readout / subtitle on
@@ -596,7 +639,9 @@ class _Header extends StatelessWidget {
         if (cat == PadCat.color) ...[('分色', PanelExtra.hsl), ('分级', PanelExtra.grade)],
         if (cat == PadCat.film && (ctl.app.film.stock(ctl.edit.film)?.printed ?? false)) ('相纸', PanelExtra.paper),
       ];
-      final entries = extras.isEmpty
+      // 肤色保护: with a stock chosen, a checkbox chip sits with the film's entries (default on)
+      final skin = cat == PadCat.film && ctl.edit.film != null;
+      final entries = extras.isEmpty && !skin
           ? readout
           : FittedBox(
               fit: BoxFit.scaleDown,
@@ -606,6 +651,7 @@ class _Header extends StatelessWidget {
                   HeaderButton(key: ValueKey('extra-${x.$1}'), label: x.$1, trailingChevron: true, onTap: () => ctl.openExtra(x.$2)),
                   const SizedBox(width: Sp.xs),
                 ],
+                if (skin) SkinCheck(ctl: ctl),
               ]),
             );
       return PanelHeader(
@@ -614,7 +660,7 @@ class _Header extends StatelessWidget {
         textScale: textScale,
         onBack: () => ctl.setItemised(false),
         sub: entries,
-        subTappable: extras.isNotEmpty,
+        subTappable: extras.isNotEmpty || skin,
         buttons: [reset],
       );
     }

@@ -528,6 +528,18 @@ class EditorController extends ChangeNotifier implements GestureSink {
     return e.copyWith(film: null, filmPaper: null, values: m, pads: p);
   }
 
+  /// 自动 (top bar): the engine's automatic correction under the edit, per photo; one undo step.
+  void setAuto(bool on) {
+    if (edit.auto == on) return;
+    _apply((e) => e.copyWith(auto: on));
+  }
+
+  /// 肤色保护 (film window): one undo step.
+  void setFilmSkin(bool on) {
+    if (edit.filmSkin == on) return;
+    _apply((e) => e.copyWith(filmSkin: on));
+  }
+
   void selectPaper(String? paperId) {
     app.applyEdit(id, (e) => e.copyWith(filmPaper: paperId));
     _bump();

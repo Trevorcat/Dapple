@@ -19,6 +19,7 @@ import 'library_prune.dart';
 import 'memory_policy.dart';
 import 'perf_probe.dart';
 import 'session_cache.dart';
+import 'skin_planes.dart';
 
 /// Tonal analysis of a rendered photo: 64-bin histogram + percentiles + nearest class.
 class Analysis {
@@ -114,6 +115,7 @@ double _pow(double a, double e) => a <= 0 ? 1 : math.pow(a, e).toDouble();
 class EditorEngine extends ChangeNotifier {
   EditorEngine(this.app) {
     EditInteraction.depth.addListener(_onInteractionDepth);
+    SkinPlanes.landed.addListener(_onSkinPlanes);
     PerfProbe.start();
     MemoryPolicy.editorOpened(); // memory (pipeline-architecture.md 42.9): a release pending for a closed editor is called off
   }
@@ -277,6 +279,14 @@ class EditorEngine extends ChangeNotifier {
         PerfProbe.log('perfinfo2', DappleSession.perfInfo() ?? const {});
       }
     }
+  }
+
+  /// The AI skin planes of a session landed (肤色保护): the frame in view is rendered again with them.
+  void _onSkinPlanes() {
+    if (!live || _closed) return;
+    _dirty = true;
+    _needFinal = true;
+    _kick();
   }
 
   void _onInteractionDepth() {
@@ -505,6 +515,7 @@ class EditorEngine extends ChangeNotifier {
         openFailure = null;
         final interactive = _interactiveNow;
         final params = app.wireParams(ph);
+        unawaited(SkinPlanes.ensure(s, params)); // 肤色保护: the person planes, once per session, off the frame path
         if (hideLocal) params.remove('local'); // 局部's 对比: the photo without its local areas
         if (hideLocal) params.remove('reshape'); // ... and without its reshaping (形体 is part of the 人像 work)
         final rung = quality.rung;
@@ -997,6 +1008,7 @@ class EditorEngine extends ChangeNotifier {
           final r = rd.rect;
           final local = ui.Rect.fromLTRB(((region.left - r.left) / r.width).clamp(0.0, 1.0), ((region.top - r.top) / r.height).clamp(0.0, 1.0),
               ((region.right - r.left) / r.width).clamp(0.0, 1.0), ((region.bottom - r.top) / r.height).clamp(0.0, 1.0));
+          unawaited(SkinPlanes.ensure(rd.session, wp));
           final frame = await rd.session.renderFrame(wp, region: local, regionLongEdge: out, analysis: false, background: true);
           if (gen != _detailGen || myGen != _gen) {
             frame.dispose();
@@ -1020,7 +1032,9 @@ class EditorEngine extends ChangeNotifier {
       debugPrint('dapple detail: half-resolution session (${neutral ? 'no region: larger than the region cap, refused or cancelled' : 'region skipped, the edit has $blocker'}) zoom ${_zoom.toStringAsFixed(1)}');
       final ds = await app.sessions.detail(ph); // decodes lazily the first time (about a second)
       if (ds == null || gen != _detailGen || myGen != _gen) return;
-      final frame = await ds.renderFrame(app.wireParams(ph), region: region, regionLongEdge: out, analysis: false, background: true);
+      final dwp = app.wireParams(ph);
+      unawaited(SkinPlanes.ensure(ds, dwp));
+      final frame = await ds.renderFrame(dwp, region: region, regionLongEdge: out, analysis: false, background: true);
       if (gen != _detailGen || myGen != _gen) {
         frame.dispose();
         return;
@@ -1133,6 +1147,7 @@ class EditorEngine extends ChangeNotifier {
     _tileGen++;
     _detailGen++;
     EditInteraction.depth.removeListener(_onInteractionDepth);
+    SkinPlanes.landed.removeListener(_onSkinPlanes);
     _idle?.cancel();
     _originalTimer?.cancel();
     _prefetchTimer?.cancel();

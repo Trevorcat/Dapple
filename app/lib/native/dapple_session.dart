@@ -8,6 +8,7 @@ import 'dart:ui' as ui;
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 
+import 'ai_bindings.dart' show AiNative;
 import 'dapple_bindings.dart';
 import 'memory_bindings.dart';
 import '../model/wire_json.dart';
@@ -733,6 +734,7 @@ class DappleSession {
       int quality = 92,
       bool hdr = false,
       String? exportJson,
+      bool skinPlanes = false,
       required String outPath}) {
     final pj = encodeWire(params);
     return Isolate.run(() {
@@ -743,6 +745,7 @@ class DappleSession {
       malloc.free(cp);
       if (s == ffi.nullptr) throw DappleException(_lastError(b));
       try {
+        if (skinPlanes) AiNative.runBlocking(s.address); // 肤色保护: the export has the same planes as the preview; no people = no planes, still fine
         if (hdr) {
           _exportHdrNative(s.address, pj, lutPath, outLongEdge, quality, outPath, exportJson: exportJson);
         } else {

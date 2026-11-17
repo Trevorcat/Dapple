@@ -268,7 +268,15 @@ class EditState {
     this.pads = const {},
     this.local = LocalList.empty,
     this.reshape = Reshape.empty,
+    this.auto = true,
+    this.filmSkin = true,
   });
+
+  /// 自动 (top bar, per photo): the engine's automatic correction is the base of the render. Default on; an old edit without it is on.
+  final bool auto;
+
+  /// 肤色保护 (film window): with a film stock the film's chroma gain is capped inside the AI skin planes. Default on.
+  final bool filmSkin;
 
   /// Portrait reshaping (形体, docs/design/local-adjustments.md 9.2): the engine's "reshape" object. Per photo (never copied or synced).
   final Reshape reshape;
@@ -323,6 +331,8 @@ class EditState {
     Map<String, PadState>? pads,
     LocalList? local,
     Reshape? reshape,
+    bool? auto,
+    bool? filmSkin,
   }) =>
       EditState(
         look: identical(look, _keep) ? this.look : look as String?,
@@ -339,6 +349,8 @@ class EditState {
         pads: pads ?? this.pads,
         local: local ?? this.local,
         reshape: reshape ?? this.reshape,
+        auto: auto ?? this.auto,
+        filmSkin: filmSkin ?? this.filmSkin,
       );
 
   static const Object _keep = Object();
@@ -372,7 +384,7 @@ class EditState {
   }
 
   bool get isAdjusted =>
-      styleAdjusted || toneAdjusted || values.isNotEmpty || crop != 'orig' || rot != 0 || flip || !local.isEmpty || reshape.active;
+      styleAdjusted || toneAdjusted || !auto || values.isNotEmpty || crop != 'orig' || rot != 0 || flip || !local.isEmpty || reshape.active;
 
   bool sameAs(EditState o) =>
       look == o.look &&
@@ -390,7 +402,9 @@ class EditState {
       pads.length == o.pads.length &&
       pads.entries.every((e) => o.pads[e.key]?.same(e.value) ?? false) &&
       local.same(o.local) &&
-      reshape.same(o.reshape);
+      reshape.same(o.reshape) &&
+      auto == o.auto &&
+      filmSkin == o.filmSkin;
 
   /// Copy settings (clipboard): everything except crop / rot / flip / straighten.
   EditState withoutCrop() {
@@ -404,7 +418,8 @@ class EditState {
         film: film,
         filmPaper: filmPaper,
         values: m,
-        pads: pads);
+        pads: pads,
+        filmSkin: filmSkin);
   }
 
   /// Paste = replace everything except the target's own crop.
@@ -425,7 +440,9 @@ class EditState {
         flip: flip,
         pads: clip.pads,
         local: local,
-        reshape: reshape);
+        reshape: reshape,
+        auto: auto,
+        filmSkin: clip.filmSkin);
   }
 
   /// Sync = merge: only what the source overrides, only the chosen categories,
@@ -436,7 +453,7 @@ class EditState {
       out = out.copyWith(look: src.look, lookStrength: src.lookStrength, palette: src.palette);
     }
     if (cats.contains(SyncCat.style) && src.film != null) {
-      out = out.copyWith(film: src.film, filmPaper: src.filmPaper);
+      out = out.copyWith(film: src.film, filmPaper: src.filmPaper, filmSkin: src.filmSkin);
     }
     if (cats.contains(SyncCat.tone) && src.toneAdjusted) {
       out = out.copyWith(toneTarget: src.toneTarget, toneStrength: src.toneStrength);
@@ -479,6 +496,7 @@ class EditState {
     if (film != null) {
       m['film'] = film;
       if (filmPaper != null) m['film_paper'] = filmPaper;
+      m['film_skin'] = filmSkin ? 1 : 0;
     }
     values.forEach((k, v) {
       if (film == null && filmValueKeys.contains(k)) return; // film knobs act only with a stock
@@ -503,6 +521,8 @@ class EditState {
         if (toneStrength != null) 'toneStrength': toneStrength,
         if (film != null) 'film': film,
         if (filmPaper != null) 'filmPaper': filmPaper,
+        if (!filmSkin) 'filmSkin': false,
+        if (!auto) 'auto': false,
         'values': values,
         'crop': crop,
         'rot': rot,
@@ -532,6 +552,8 @@ class EditState {
       pads: _padsFromJson(j['pads']),
       local: LocalList.fromJson(j['local']),
       reshape: Reshape.fromJson(j['reshape']),
+      auto: (j['auto'] as bool?) ?? true,
+      filmSkin: (j['filmSkin'] as bool?) ?? true,
     );
     final m = e.palette == null ? e : migratePalette(e);
     return schema < 2 ? _migrateFilmWb(m) : m;

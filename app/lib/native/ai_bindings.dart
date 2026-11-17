@@ -4,6 +4,7 @@
 // can wait (a tap runs the decoder, a synchronous ensure may recompute) run in a background isolate; the session is passed by its native address.
 // The calls exist in every build of the library; without the runtimes or the models the status says available:false and starting a job fails.
 import 'dart:convert';
+import 'dart:io' show sleep;
 import 'dart:ffi' as ffi;
 import 'dart:isolate';
 import 'dart:typed_data';
@@ -351,6 +352,25 @@ class AiNative {
     final b = AiBindings.instanceOrNull;
     if (b?.start == null || session == 0) return -1;
     return b!.start!(ffi.Pointer.fromAddress(session), tasks, force ? 1 : 0, maxFaces);
+  }
+
+  /// Runs a job to its end on the calling (isolate) thread: for the one-shot export, which has no event loop to wait on. False on any failure or
+  /// timeout; never throws.
+  static bool runBlocking(int session, {int tasks = AiTask.person, int timeoutMs = 60000}) {
+    try {
+      final job = start(session, tasks: tasks);
+      if (job <= 0) return false;
+      final sw = Stopwatch()..start();
+      while (sw.elapsedMilliseconds < timeoutMs) {
+        final p = poll(job);
+        if (p == null) return false;
+        if (p.finished) return p.result?.personFound ?? false;
+        if (p.state == 'unknown') return false;
+        sleep(const Duration(milliseconds: 25));
+      }
+      cancel(job);
+    } catch (_) {}
+    return false;
   }
 
   static String lastError() {

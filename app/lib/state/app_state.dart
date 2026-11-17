@@ -34,7 +34,9 @@ import '../services/library_prune.dart';
 import '../services/live_bridge.dart';
 import '../services/merge_check.dart';
 import '../services/merge_engine.dart';
+import '../services/ai_masks.dart' show AiMasks;
 import '../services/session_cache.dart';
+import '../services/skin_planes.dart';
 import '../services/memory_policy.dart';
 import '../services/tool_models.dart';
 
@@ -635,7 +637,7 @@ class AppState extends ChangeNotifier {
     final user = ph.edit.toWire(defaultLook: settings.defaultLookId, defaultToneStrength: settings.toneStrength);
     final out = <String, dynamic>{};
     final corr = ph.correction;
-    if (settings.autoProcess && corr != null) {
+    if (settings.autoProcess && ph.edit.auto && corr != null) {
       corr.forEach((k, v) {
         // `exposure` means EV in the legacy schema but a -100..100 slider in chapter 6: do not mix.
         if (k != 'exposure') out[k] = v;
@@ -1472,7 +1474,7 @@ class AppState extends ChangeNotifier {
   /// Does the clip of [ph] go through the node graph? (the still has an edit, the automatic correction applies, or a destination crop is asked for)
   bool liveEdited(Photo ph, {String? cropOverride}) => liveClipEdited(
       userEdited: jsonEncode(ph.edit.toJson()) != jsonEncode(freshEdit.toJson()),
-      autoCorrectionApplied: settings.autoProcess && (ph.correction?.isNotEmpty ?? false),
+      autoCorrectionApplied: settings.autoProcess && ph.edit.auto && (ph.correction?.isNotEmpty ?? false),
       cropOverride: cropOverride);
 
   /// The Motion Photo export: the edited still ([exportStill]) + the clip trimmed with [LiveBridge.trim] (with the still's edit when the still is
@@ -1554,6 +1556,8 @@ class AppState extends ChangeNotifier {
     final tag = jsonEncode([params, le, settings.jpegQuality, if (hdr) 'uhdr', if (wideGamut) 'p3', 'meta1', strip]).hashCode.toRadixString(16);
     final out = p.join(exports.path, '${p.basenameWithoutExtension(ph.name)}_dapple_$tag.jpg');
     if (await File(out).exists()) return out;
+    final skin = SkinPlanes.wanted(params);
+    if (skin) await AiMasks.instance.prepare().then<void>((_) {}, onError: (_) {});
     final src = await _resolveWithOriginal(ph);
     if (le == 0 || le > 4096) await MemoryPolicy.beforeExport(ph.id); // full size: the sessions the export does not use go first (42.9)
     try {
@@ -1563,6 +1567,7 @@ class AppState extends ChangeNotifier {
           outLongEdge: le,
           quality: settings.jpegQuality,
           hdr: hdr,
+          skinPlanes: skin,
           exportJson: exportMetaJson(original: src.original, stripLocation: strip, wideGamut: wideGamut),
           outPath: out);
     } finally {

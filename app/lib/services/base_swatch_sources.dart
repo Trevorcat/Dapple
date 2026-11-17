@@ -90,7 +90,7 @@ class LookSwatchSource implements BatchSwatchSource {
   DappleSession? _live;
 
   @override
-  String get key => 'looks|${photo.id}|${photo.path}|${photo.correction?.hashCode ?? 0}|${app.settings.autoProcess}|${baseId ?? ''}';
+  String get key => 'looks|${photo.id}|${photo.path}|${photo.correction?.hashCode ?? 0}|${app.settings.autoProcess && photo.edit.auto}|${baseId ?? ''}';
 
   @override
   int get batchSize => 1;
@@ -103,7 +103,7 @@ class LookSwatchSource implements BatchSwatchSource {
     final s = await app.sessions.get(photo, background: true);
     if (s == null) return List.filled(ids.length, null);
     _live = s;
-    return renderLookBatch(s, photo.correction, app.settings.autoProcess, baseId, ids, longEdge);
+    return renderLookBatch(s, photo.correction, app.settings.autoProcess && photo.edit.auto, baseId, ids, longEdge);
   }
 
   @override
@@ -117,7 +117,7 @@ class SessionSwatchSource implements BatchSwatchSource {
   DappleSession? _live;
 
   @override
-  String get key => '${photo.id}|${photo.path}|${photo.correction?.hashCode ?? 0}|${app.settings.autoProcess}';
+  String get key => '${photo.id}|${photo.path}|${photo.correction?.hashCode ?? 0}|${app.settings.autoProcess && photo.edit.auto}';
 
   @override
   int get batchSize => DappleSession.hasBaseSwatches ? kSwatchBatch : 1;
@@ -130,7 +130,7 @@ class SessionSwatchSource implements BatchSwatchSource {
     final s = await app.sessions.get(photo, background: true);
     if (s == null) return List.filled(ids.length, null);
     _live = s;
-    return _engineSerial(() => renderSwatchBatch(s, photo.correction, app.settings.autoProcess, ids, longEdge));
+    return _engineSerial(() => renderSwatchBatch(s, photo.correction, app.settings.autoProcess && photo.edit.auto, ids, longEdge));
   }
 
   @override

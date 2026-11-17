@@ -818,7 +818,7 @@ class _EditorPageState extends State<EditorPage> with TickerProviderStateMixin, 
                       builder: (context, _) {
                         final pr = _photoRect();
                         // a narrow photo beside the low window's column: the bar keeps its width and reaches over the free area beside the photo, never the column
-                        final barW = fp.low ? math.min(math.max(pr.width - 16, 300.0), fp.photo.right - pr.left - 8) : pr.width - 16;
+                        final barW = fp.low ? math.min(math.max(pr.width - 16, 344.0), fp.photo.right - pr.left - 8) : pr.width - 16;
                         return Positioned(top: pr.top + 8, left: pr.left + 8, width: math.max(0.0, barW), child: EditorTopBar(app: app, ctl: ctl, photoId: () => id, onBack: _onBackButton, onMore: _toggleMenu, immersive: imm));
                       },
                     );

@@ -93,17 +93,27 @@ class EditorTopBar extends StatelessWidget {
               ),
             ),
             if (vertical) const SizedBox(height: 8) else const Spacer(),
-            // the tool: 裁切, its own capsule beside the history and output group
+            // the tools: 裁切, its own capsule beside the history and output group
             if (ed != null)
               IgnorePointer(
                 ignoring: immersive,
                 child: AnimatedOpacity(
                   opacity: immersive ? 0 : 1,
                   duration: const Duration(milliseconds: 150),
-                  child: GlassCapsule(radius: 24, child: CropButton(ctl: ed, app: app, photoId: id)),
+                  child: GlassCapsule(
+                    radius: 24,
+                    child: Flex(
+                      direction: vertical ? Axis.vertical : Axis.horizontal,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        CropButton(ctl: ed, app: app, photoId: id),
+                        AutoToggle(ctl: ed, app: app, photoId: id, vertical: vertical),
+                      ],
+                    ),
+                  ),
                 ),
               ),
-            if (ed != null) vertical ? const SizedBox(height: 8) : const SizedBox(width: 8),
+            if (ed != null) vertical ? const SizedBox(height: 8) : SizedBox(width: MediaQuery.sizeOf(context).width < 380 ? 4 : 8), // 360 dp: back, 裁切 + 自动, history just fit
             IgnorePointer(
               ignoring: immersive,
               child: AnimatedOpacity(
@@ -172,6 +182,71 @@ class EditorTopBar extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+/// The top bar's 自动 switch (per photo, default on): the engine's automatic correction under the edit. On: `accentSoft` disc behind the label and
+/// a small track with the knob at the end; off: bare label, the knob at the start. With 照片到达后自动处理 off in the settings there is no correction
+/// to switch: the control stays in place, off and dimmed like an unavailable history button, and says why to a screen reader.
+class AutoToggle extends StatelessWidget {
+  const AutoToggle({super.key, required this.ctl, required this.app, required this.photoId, this.vertical = false});
+  final EditorController ctl;
+  final AppState app;
+  final String photoId;
+  final bool vertical;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.c;
+    final global = app.settings.autoProcess;
+    final on = global && (app.photoById(photoId)?.edit.auto ?? true);
+    final cur = app.photoById(photoId)?.edit.auto ?? true;
+    final track = on ? c.accent : c.text2;
+    return Semantics(
+      button: true,
+      toggled: on,
+      enabled: global,
+      label: global ? '自动' : '自动，已在设置中关闭',
+      hint: global ? null : '在设置中打开“照片到达后自动处理”',
+      excludeSemantics: true,
+      child: GestureDetector(
+        key: const ValueKey('toolbar-auto'),
+        behavior: HitTestBehavior.opaque,
+        onTap: global ? () => ctl.setAuto(!cur) : null,
+        child: SizedBox(
+          width: vertical ? kHit : 44,
+          height: kHit,
+          child: Center(
+            child: Opacity(
+              opacity: global ? 1 : 0.4,
+              child: Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(color: on ? c.accentSoft : null, shape: BoxShape.circle),
+                alignment: Alignment.center,
+                child: FittedBox(fit: BoxFit.scaleDown, child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Text('自动', maxLines: 1, softWrap: false, style: T.cap(on ? c.accent : c.text, w: on ? FontWeight.w600 : FontWeight.w500)),
+                  const SizedBox(height: 3),
+                  Container(
+                    key: const ValueKey('toolbar-auto-track'),
+                    width: 16,
+                    height: 8,
+                    padding: const EdgeInsets.all(1.5),
+                    alignment: on ? Alignment.centerRight : Alignment.centerLeft,
+                    decoration: BoxDecoration(
+                      color: on ? c.accent : null,
+                      border: on ? null : Border.all(color: track, width: 1),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Container(width: 5, height: 5, decoration: BoxDecoration(color: on ? c.onAccent : track, shape: BoxShape.circle)),
+                  ),
+                ])),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
